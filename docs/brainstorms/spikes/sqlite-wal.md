@@ -13,8 +13,7 @@ Gate 7: "passes checks 2 and 3 with `CGO_ENABLED=0`". Check 2 is S1 (50
 kills inside a transaction). Check 3 is S6 (32 writers, 10 MB lines, 5 s lock).
 
 - **modernc.org/sqlite (C translated to Go): meets gate 7 on linux/amd64.**
-  S1 and S6 passed 3/3, and so did the supporting S2–S4. Its results match
-  the C control.
+  S1 and S6 passed 3/3, as did the supporting S2–S4, like the C control.
 - **ncruces/go-sqlite3 (SQLite compiled to Wasm, then translated to Go): meets
   gate 7 on linux/amd64 only.** It passed 3/3 natively. Under arm64 emulation
   it failed S6 (check 3), S2 and S4, while modernc passed all of them under
@@ -74,19 +73,21 @@ receipt and no other receipts, checks child counts, and re-hashes raw logs.
   readers hold ~1 s read transactions, re-summing 10× (the total must stay
   100,000); one process runs `wal_checkpoint(TRUNCATE)` every 50 ms. TRUNCATE
   copies the WAL into the database and cuts it to 0 bytes. Pass: 0 torn reads;
-  ≥ 500 transfers; ≥ 5 snapshots per reader; ≥ 1 TRUNCATE completing while
-  writers and readers ran; max WAL ≤ 1 GiB; 0-byte WAL after a final TRUNCATE;
-  no errors except **writer BUSY, which is allowed** (Findings 1).
+  ≥ 500 transfers; ≥ 5 snapshots *per reader*; ≥ 1 TRUNCATE that completed
+  inside an open reader snapshot and a writer's active window (clients report
+  timestamps); WAL ≤ 1 GiB; 0-byte WAL after a final TRUNCATE; no errors
+  except **writer BUSY, which is allowed** (Findings 1).
 - **S6 combined check 3.** S2's barrier with 32 writers × 1 transaction: a
   receipt plus one 10 MiB raw-log line, hashed (sha256) by the writer *before*
-  the insert; the verifier re-hashes every line. S2's pass rules plus 32/32
-  hashes equal.
+  the insert; the verifier re-hashes every line. S2's pass rules, plus every
+  acked receipt has a hash, 32 logs hashed, and all 32 hashes equal.
 
 ## Negative controls (1 run per driver): each check can fail
 
-`run.sh` asserts every expected outcome; the final matrix reported
-`surprises: 0` across 108 result lines. Where numbers differ they are
-listed as modernc / ncruces / mattn.
+`run.sh` checks each invocation's exit status and line count, and rejects
+harness errors. Each control must fail with its own failure text. The final
+matrix reported 78 result lines and 0 surprises. Numbers are modernc /
+ncruces / mattn.
 
 | Control | Fault injected | Result (all 3 drivers) |
 |---|---|---|
@@ -95,8 +96,8 @@ listed as modernc / ncruces / mattn.
 | S1 `corrupt` | page 3 overwritten | FAIL: `btreeInitPage() returns error code 11` |
 | S2 `busy0` | busy_timeout=0 | FAIL: 320/320 BUSY |
 | S3 `flip` | byte flipped after hashing | FAIL: 6 sha256 mismatches |
-| S4 `readtorn` | per-row reads outside a transaction | FAIL: 20,573 / 20,823 / 20,210 torn reads |
-| S4 `nockpt` | no checkpoints | FAIL: 0 TRUNCATEs, WAL left at 667 / 599 / 700 MB |
+| S4 `readtorn` | per-row reads outside a transaction | FAIL: 19,723 / 19,897 / 21,744 torn reads |
+| S4 `nockpt` | no checkpoints | FAIL: 0 overlapping TRUNCATEs, WAL left at 587 / 553 / 687 MB |
 | S6 `busy0` | busy_timeout=0 | FAIL: 32/32 BUSY, 0 writers contended |
 | S6 `flip` | bit flipped after hashing | FAIL: 32 sha256 mismatches in the verifier |
 | S1 `syncoff` | synchronous=OFF | PASS, as expected: `kill -9` keeps the OS page cache |
@@ -111,33 +112,31 @@ returning, so it includes the 5 s held lock; in S2, p99 ≈ the hold.
 
 | Driver | S1 crash (check 2) | S2 contention | S3 10 MiB rows | S4 checkpoint | S6 combined (check 3) |
 |---|---|---|---|---|---|
-| modernc | **3/3**: 50/50 kills in txn, 100/100 SIGKILL, 1117–1288 acked, 0 lost, 0 visible, 0 partial, integrity ok | **3/3**: 0 errors, 32/32 contended, 356–457 commits/s after release, p50 0.5–0.7 ms | **3/3**: 0 mismatches | **3/3**: 0 torn, 7.2k–31k transfers, 3–8 TRUNCATEs during run, max WAL 39–386 MB, final 0 B, writer BUSY 1–2 | **3/3**: 0 BUSY, 32/32 contended, 32/32 hashes equal, readers ≥ 5,768 txns, commit p50 5.7–6.0 s, max 7.0–7.5 s |
-| ncruces | **3/3**: same, 990–1280 acked, 0 lost | **3/3**: 0 errors, 32/32, 980–995 commits/s, p50 9–11 ms | **3/3** | **3/3**: 0 torn, 1.6k–2.7k transfers, 7–8 TRUNCATEs, max WAL 8–11 MB, writer BUSY 0 | **3/3**: 0 BUSY, 32/32, 32/32 equal, ≥ 5,290 txns, p50 5.5–5.6 s, max 6.5–6.6 s |
-| mattn (cgo control) | **3/3**: same, 1200–1397 acked, 0 lost | **3/3**: 0 errors, 32/32, 401–466 commits/s, p50 0.5–0.6 ms | **3/3** | **3/3**: 0 torn, 26k–30k transfers, 2–4 TRUNCATEs, max WAL 317–489 MB, writer BUSY 1–3 | **3/3**: 0 BUSY, 32/32, 32/32 equal, ≥ 5,698 txns, p50 5.5–5.7 s, max 6.8–7.2 s |
+| modernc | **3/3**: 50/50 kills in txn, 100/100 SIGKILL, 1129–1199 acked, 0 lost, 0 visible, 0 partial, integrity ok | **3/3**: 0 errors, 32/32 contended, 399–408 commits/s after release, p50 0.6 ms | **3/3**: 0 mismatches | **3/3**: 0 torn, 23k–35k transfers, ≥ 17 snapshots per reader, 1–4 overlapping TRUNCATEs, max WAL 181–421 MB, final 0 B, writer BUSY 2 | **3/3**: 0 BUSY, 32/32 contended, 32/32 logs hashed and equal, readers ≥ 5,914 txns, commit p50 5.8–6.0 s, max 7.2–7.4 s |
+| ncruces | **3/3**: same, 1101–1182 acked, 0 lost | **3/3**: 0 errors, 32/32, 993–1129 commits/s, p50 6–15 ms | **3/3** | **3/3**: 0 torn, 807–1610 transfers, ≥ 17 per reader, 2–7 overlapping, max WAL 5–8 MB, writer BUSY 0–2 | **3/3**: 0 BUSY, 32/32, 32/32 hashed and equal, ≥ 5,435 txns, p50 5.6–6.2 s, max 6.6–7.2 s |
+| mattn (cgo control) | **3/3**: same, 1190–1417 acked, 0 lost | **3/3**: 0 errors, 32/32, 456–526 commits/s, p50 0.5–0.6 ms | **3/3** | **3/3**: 0 torn, 4.3k–24k transfers, ≥ 18 per reader, 1–5 overlapping, max WAL 72–225 MB, writer BUSY 1–4 | **3/3**: 0 BUSY, 32/32, 32/32 hashed and equal, ≥ 5,705 txns, p50 5.7–6.0 s, max 6.8–7.7 s |
 
-S6: all clients were ready 0.36–0.41 s after locking; the 32 × 10 MiB commits
-took 1.9–2.8 s after release. S2 at synchronous=NORMAL (1 run): 655 / 4,604 /
-1,152 commits/s.
+S6: all clients were ready 0.37–0.44 s after locking; 32 × 10 MiB committed in
+2.0–2.9 s after release. S2 at NORMAL (1 run): 829 / 4,628 / 1,054 commits/s.
 
 **S5 build.** With `-trimpath -buildvcs=false`, two builds (one from a clean
 cache) gave identical hashes. No Linux binary has a **PT_INTERP segment**
 (`readelf -lW`), meaning no dynamic loader, and `ldd` says "not a dynamic
-executable". The mattn control requests `/lib64/ld-linux-x86-64.so.2`.
+executable". The mattn control requests `/lib64/ld-linux-x86-64.so.2`; cross-building it
+would need a C cross-compiler and a macOS SDK (not tried).
 The hashes (go1.26.8):
 
 ```text
-1f30cc793a629bf011d7323fa869a72d2d2305e865b0b654c68111640bffcdd1  modernc linux/amd64
-2e099cc434440792d337d792c167e986e3fc83f8fd834d92db10b0c435d6cbdb  modernc linux/arm64
-8a59ec7269209f35fc5411e48b8157c12444b60d5910a50fd45f895e55ebd44b  modernc darwin/arm64 (not run)
-29d5d2203b3b519a239c62d02b8bfea1e00d300d34d30eebeb5ae9e8ae8c87cc  ncruces linux/amd64
-14bdaed8c6248f22cbe261419124952d8d0b51d7f0e79cd258eb35ea22c7fce0  ncruces linux/arm64
-55dd776f4fd04b828739dcc3824c051cf27aefb12f125424cbdb79fc681ac4bd  ncruces darwin/arm64 (not run)
+01a35b82c53fb3a54d11ba48f6b40eaacbb82f23647d59b53b0a460ea1796e5d  modernc linux/amd64
+4d072d837ced690b61fe61f4a9c9bd09cab81e86520bb87c239285efd85322b4  modernc linux/arm64
+d18404cf92a951350e3a52d997b52ad11d6e527df5bcd488dd95f2a42a0b4566  modernc darwin/arm64 (not run)
+d31754435f5a05f96cc95885c7a184e5e7713cd53d0a59abe003bde83c04ed0a  ncruces linux/amd64
+f8b3ae468170606d85bc3181765425f6aa7af399589c2f4f1e2f85c6b578e4ff  ncruces linux/arm64
+38c21911b767e12a71579435aa9bd6913a249617aa0f9c8f9906f4463306b15c  ncruces darwin/arm64 (not run)
 ```
 
-mattn needs cgo; cross-building it needs a C cross-compiler and macOS SDK (not tried).
-
-**linux/arm64 under qemu user emulation (1 run each, up to 41 processes on
-4 CPUs).** modernc passed all five: S1 50/50 kills in a transaction, 0 lost;
+**linux/arm64 under qemu user emulation (1 run each, round-2 harness, up to
+41 processes on 4 CPUs; not rerun in round 3).** modernc passed all five: S1 50/50 kills in a transaction, 0 lost;
 S2 and S6 0 BUSY, 32/32 contended, S6 slowest commit 7.7 s; S3; S4 with 3
 TRUNCATEs. ncruces passed S1 and S3, but **failed S6** (18 BUSY, 14/32
 committed, slowest 10.4 s), **S2** (16 BUSY) and **S4** (324 transfers,
@@ -150,11 +149,11 @@ under the 500 minimum). The first harness version gave the same S2 result
    including the C control, show it.** SQLite documents that FULL, RESTART and
    TRUNCATE checkpoints "block new database writers while pending" while
    waiting for readers. S4 therefore allows writer BUSY and reports it:
-   modernc 1–2, ncruces 0, mattn 1–3 per run. S1, S2 and S6 allow no BUSY at
+   modernc 2, ncruces 0–2, mattn 1–4 per run. S1, S2 and S6 allow no BUSY at
    all. Implication (inference): VIA should not run blocking checkpoints
    while receipts are being written.
 2. **S6 leaves limited busy_timeout margin.** The slowest writer waited
-   6.5–7.5 s of its 10 s timeout on this VM, where fsync takes about 120 µs.
+   6.6–7.7 s of its 10 s timeout on this VM, where fsync takes about 120 µs.
    On slower disks the same load could exceed 10 s. VIA's timeout must
    exceed the hold plus the queue of large commits (inference).
 3. **ncruces behaves differently under contention; the cause is unproven.**
@@ -164,14 +163,14 @@ under the 500 minimum). The first harness version gave the same S2 result
    had the highest S2 throughput and the most TRUNCATEs in S4, with the
    fewest transfers. This fits the polling handler, as do its emulated-arm64
    failures, but no lock-wait trace was taken, so it is a hypothesis.
-4. **S4's overlap minimum was lowered from 3 to 1.** With 1 s readers
-   overlapping, the C control completed only 2–4 TRUNCATEs in 15 s, so 3
-   would fail the control itself. A minimum of 1 still fails `nockpt` (0).
-   The 1 GiB WAL bound is a disk-safety bound; the evidence is the TRUNCATE
-   count and the 0-byte final WAL.
+4. **S4's overlap margin is thin.** With 1 s readers overlapping, the C
+   control completed 2–6 TRUNCATEs in 15 s, of which 1–5 were inside an open
+   reader snapshot and a writer window. The minimum is 1 (first set to 3, which
+   would fail the control). modernc and mattn each had a run with exactly 1, so
+   this check could flake without any driver fault. `nockpt` gets 0. The
+   1 GiB WAL bound is a disk-safety bound, not evidence.
 
-Review response: all seven findings were confirmed in the code and fixed.
-The darwin binaries are still unrun, and only the binaries' hashes are committed.
+Review: all 7 round-2 and 3 round-3 findings were confirmed and fixed.
 
 ## Limitations
 
@@ -181,7 +180,8 @@ The darwin binaries are still unrun, and only the binaries' hashes are committed
   The current drivers need newer Go (modernc v1.59.0 needs ≥1.25; ncruces
   v0.35.6 needs ≥1.26), so `go.mod` pins `toolchain go1.26.8`, which Go
   downloads itself. Revisit if VIA must build with an older Go.
-- 3 runs is not a soak test: races rarer than about 1 in 300 kills would not show.
+- 3 runs is not a soak test: races rarer than about 1 in 300 kills would not
+  show. Only binary hashes are committed, not the binaries.
 
 ## Reproduce
 
