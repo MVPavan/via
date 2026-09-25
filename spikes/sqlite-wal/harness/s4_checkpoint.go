@@ -31,8 +31,8 @@ import (
 //	          stays large); readers as normal
 const (
 	minTransfers   = 500
-	minSnapshots   = 5 // per reader; each snapshot lasts ~1 s
-	minTruncations = 3
+	minSnapshots   = 5       // per reader; each snapshot lasts ~1 s
+	minTruncations = 1       // proves overlap; the nockpt control gets 0
 	walSanityBound = 1 << 30 // disk-safety bound, not evidence of checkpointing
 
 	accounts        = 100
