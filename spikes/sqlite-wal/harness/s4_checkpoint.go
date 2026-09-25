@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -16,10 +17,24 @@ import (
 // transactions. The total balance must never change inside a reader's
 // snapshot, and the WAL must shrink to 0 bytes once readers finish.
 //
-// Negative control (-neg torn): readers sum balances with one statement per
-// account outside a transaction (torn reads must be seen), and automatic and
-// explicit checkpoints are off (the WAL must stay large).
+// Pass requires: no torn reads; transfers and reader snapshots above stated
+// minimums; at least minTruncations TRUNCATE checkpoints completed (busy=0)
+// while writers and readers were running, so they overlapped; max WAL below
+// walSanityBound; and a 0-byte WAL after the final TRUNCATE. Writer BUSY
+// errors are allowed and reported (see below); every other error fails.
+//
+// Negative controls (-neg):
+//
+//	readtorn  readers sum one account per statement outside a transaction
+//	          (torn reads must be seen); checkpoints run as normal
+//	nockpt    no explicit or automatic checkpoints (no truncations, WAL
+//	          stays large); readers as normal
 const (
+	minTransfers   = 500
+	minSnapshots   = 5 // per reader; each snapshot lasts ~1 s
+	minTruncations = 3
+	walSanityBound = 1 << 30 // disk-safety bound, not evidence of checkpointing
+
 	accounts        = 100
 	startBalance    = 1000
 	ckptWriters     = 4
@@ -42,9 +57,9 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	mode := "normal"
 	switch neg {
 	case "":
-	case "torn":
-		mode = "torn"
-		o.noAutoCkpt = true
+	case "readtorn", "nockpt":
+		mode = neg
+		o.noAutoCkpt = neg == "nockpt"
 	default:
 		return fmt.Errorf("unknown negative control %q", neg)
 	}
@@ -75,14 +90,21 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 		rs = append(rs, c)
 	}
 	// Sample the WAL file size while everything runs.
-	var maxWAL atomic.Int64
+	var maxWAL, truncations atomic.Int64
+	var running atomic.Bool
+	running.Store(true)
 	stopSampling := make(chan struct{})
 	sampled := make(chan struct{})
 	go func() {
 		defer close(sampled)
+		prev := int64(0)
 		for {
 			if fi, err := os.Stat(path + "-wal"); err == nil {
 				maxWAL.Store(max(maxWAL.Load(), fi.Size()))
+				if fi.Size() < prev && running.Load() {
+					truncations.Add(1)
+				}
+				prev = fi.Size()
 			}
 			select {
 			case <-stopSampling:
@@ -92,6 +114,8 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 		}
 	}()
 	time.Sleep(ckptRunDuration)
+	running.Store(false)
+	runEnd := time.Now().UnixNano()
 
 	var wr, rr workerReport
 	collect := func(cs []*child, into *workerReport, who string) {
@@ -137,6 +161,19 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	if len(cl) == 0 || json.Unmarshal([]byte(cl[len(cl)-1]), &cr) != nil {
 		r.failf("checkpointer: no report")
 	}
+	// Completed TRUNCATEs that finished while writers and readers were
+	// still running, and the largest WAL left right after one of them.
+	overlapping, walAfterCkpt := 0, 0
+	for _, l := range cl {
+		f := strings.Fields(l)
+		if len(f) != 4 || f[0] != "CKPT" {
+			continue
+		}
+		if atoiMust(f[1]) < int(runEnd) && f[2] == "0" {
+			overlapping++
+			walAfterCkpt = max(walAfterCkpt, atoiMust(f[3]))
+		}
+	}
 
 	db, conn, err := open(ctx, path, o)
 	if err != nil {
@@ -145,7 +182,9 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	defer db.Close()
 	defer conn.Close()
 	var total int
-	conn.QueryRowContext(ctx, "SELECT sum(balance) FROM accounts").Scan(&total)
+	if err := conn.QueryRowContext(ctx, "SELECT sum(balance) FROM accounts").Scan(&total); err != nil {
+		return fmt.Errorf("final balance: %w", err)
+	}
 	if res := integrity(ctx, conn); res != "ok" {
 		r.failf("integrity_check: %s", res)
 	}
@@ -159,6 +198,10 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	r.Metrics["checkpoint_calls"] = cr.Calls
 	r.Metrics["checkpoint_busy_results"] = cr.BusyResult
 	r.Metrics["checkpoint_errors"] = cr.Errors
+	r.Metrics["checkpoint_ok_calls"] = cr.Calls - cr.BusyResult
+	r.Metrics["truncates_completed_during_run"] = overlapping
+	r.Metrics["max_wal_bytes_right_after_truncate"] = walAfterCkpt
+	r.Metrics["wal_shrinks_seen_by_20ms_sampler"] = truncations.Load()
 	r.Metrics["max_wal_bytes"] = maxWAL.Load()
 	r.Metrics["wal_bytes_when_readers_done"] = walBeforeFinal
 	r.Metrics["final_wal_bytes"] = cr.FinalWAL
@@ -173,6 +216,18 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	r.Metrics["writer_first_error"] = wr.FirstErr
 	if n := wr.Other + rr.Busy + rr.Other + cr.Errors; n > 0 {
 		r.failf("%d reader/checkpointer/non-BUSY writer errors; first: %s%s%s", n, wr.FirstErr, rr.FirstErr, cr.FirstErr)
+	}
+	if wr.OK < minTransfers {
+		r.failf("only %d transfers (minimum %d)", wr.OK, minTransfers)
+	}
+	if rr.OK < minSnapshots*ckptReaders {
+		r.failf("only %d reader snapshots (minimum %d)", rr.OK, minSnapshots*ckptReaders)
+	}
+	if overlapping < minTruncations {
+		r.failf("only %d TRUNCATE checkpoints completed while writers and readers ran (minimum %d)", overlapping, minTruncations)
+	}
+	if m := maxWAL.Load(); m > walSanityBound {
+		r.failf("WAL reached %d bytes (bound %d)", m, walSanityBound)
 	}
 	if cr.FinalWAL != 0 || cr.FinalBusy != 0 {
 		r.failf("WAL not truncated after readers finished: %d bytes, busy=%d", cr.FinalWAL, cr.FinalBusy)
@@ -262,7 +317,7 @@ func longReader(ctx context.Context, w workerFlags) error {
 	stop := untilEOF()
 	for !stop() {
 		err := func() error {
-			if w.mode == "torn" {
+			if w.mode == "readtorn" {
 				// One statement per account: each sees a different snapshot.
 				sum := 0
 				for id := 1; id <= accounts; id++ {
@@ -323,16 +378,18 @@ func checkpointer(ctx context.Context, w workerFlags) error {
 		}
 		rep.Calls++
 		rep.BusyResult += busy
+		// "CKPT <unix-nanos when done> <busy> <wal bytes right after>"
+		fmt.Printf("CKPT %d %d %d\n", time.Now().UnixNano(), busy, walSize(w.db))
 		return busy
 	}
 	stop := untilEOF()
 	for !stop() {
-		if w.mode != "torn" {
+		if w.mode != "nockpt" {
 			ckpt()
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if w.mode != "torn" {
+	if w.mode != "nockpt" {
 		rep.FinalBusy = ckpt()
 	}
 	if fi, err := os.Stat(w.db + "-wal"); err == nil {

@@ -75,7 +75,7 @@ func Main(driverName, label, module, extra string) {
 		return
 	}
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	scenario := fs.Int("scenario", 0, "scenario 1-4, or 0 for all")
+	scenario := fs.Int("scenario", 0, "scenario 1-4 or 6 (5 is build.sh), or 0 for all")
 	runs := fs.Int("runs", 3, "runs per scenario")
 	dir := fs.String("dir", "", "directory for database files (must not be tmpfs)")
 	neg := fs.String("neg", "", "negative control to run instead of the real configuration")
@@ -86,7 +86,7 @@ func Main(driverName, label, module, extra string) {
 		os.Exit(2)
 	}
 	fmt.Fprintf(os.Stderr, "driver=%s %s@%s sqlite=%s %s\n", label, module, moduleVersion(module), sqliteVersion(), extra)
-	scenarios := []int{1, 2, 3, 4}
+	scenarios := []int{1, 2, 3, 4, 6}
 	if *scenario != 0 {
 		scenarios = []int{*scenario}
 	}
@@ -96,7 +96,12 @@ func Main(driverName, label, module, extra string) {
 			path, _ := filepath.Abs(filepath.Join(*dir, fmt.Sprintf("%s-s%d-r%d%s.sqlite", label, s, r, *neg)))
 			res := Result{Driver: label, Scenario: s, Run: r, Neg: *neg, Sync: *sync, Metrics: map[string]any{}}
 			start := time.Now()
-			err := scenarioFuncs[s](context.Background(), path, *neg, *sync, &res)
+			f, ok := scenarioFuncs[s]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "unknown scenario %d\n", s)
+				os.Exit(2)
+			}
+			err := f(context.Background(), path, *neg, *sync, &res)
 			res.Seconds = time.Since(start).Seconds()
 			if err != nil {
 				res.Failures = append(res.Failures, "harness error: "+err.Error())
@@ -107,7 +112,7 @@ func Main(driverName, label, module, extra string) {
 			}
 			line, _ := json.Marshal(res)
 			fmt.Println(string(line))
-			for _, suf := range []string{"", "-wal", "-shm"} {
+			for _, suf := range []string{"", "-wal", "-shm", ".manifest.json"} {
 				os.Remove(path + suf)
 			}
 		}
@@ -120,6 +125,7 @@ var scenarioFuncs = map[int]func(ctx context.Context, path, neg, sync string, r 
 	2: contentionScenario,
 	3: blobScenario,
 	4: checkpointScenario,
+	6: combinedScenario,
 }
 
 func runWorker(kind string, w workerFlags) error {
@@ -141,6 +147,8 @@ func runWorker(kind string, w workerFlags) error {
 		return longReader(ctx, w)
 	case "checkpointer":
 		return checkpointer(ctx, w)
+	case "verify":
+		return verifier(ctx, w)
 	}
 	return fmt.Errorf("unknown worker kind %q", kind)
 }
@@ -148,7 +156,8 @@ func runWorker(kind string, w workerFlags) error {
 // failf records a failure, keeping at most 20 so a broken run stays readable.
 func (r *Result) failf(format string, a ...any) {
 	if len(r.Failures) < 20 {
-		r.Failures = append(r.Failures, fmt.Sprintf(format, a...))
+		msg := fmt.Sprintf(format, a...)
+		r.Failures = append(r.Failures, msg[:min(len(msg), 300)])
 	} else if len(r.Failures) == 20 {
 		r.Failures = append(r.Failures, "... more failures omitted")
 	}
