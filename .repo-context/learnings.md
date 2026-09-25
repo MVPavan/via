@@ -18,3 +18,9 @@ in the design record (`docs/`), not here.
   committed `.beads/issues.jsonl` / `interactions.jsonl`; sync Dolt locally.
 - `bd init` inside a checkout nested in another beads repo can bootstrap the
   outer repo's issue database. Initialize from a standalone clone.
+- Claude Code cloud sessions (2026-09-25): `qemu-user-static` installs via apt,
+  but binfmt_misc is not mounted, so a cross-built linux/arm64 binary that
+  re-execs itself fails with "exec format error". Fix (as root):
+  `mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc` then
+  `cat /usr/lib/binfmt.d/qemu-aarch64.conf > /proc/sys/fs/binfmt_misc/register`.
+  Evidence: `docs/brainstorms/spikes/sqlite-wal.md` (Reproduce).
