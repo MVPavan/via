@@ -24,20 +24,24 @@ conflicts rather than working around them. None is mechanically checkable yet
    language. CLI plus `via serve --stdio`; thin SDKs spawn the binary; no
    in-process native binding. Source: `docs/brainstorms/README.md` §13
    (settled inputs), §14.
-5. **Routes: CLI, vendor RPC, ACP only.** Settled input to the language
-   council; it narrows the SDK-layer recommendations in
-   `docs/brainstorms/access-methods.md` §6. Source: `docs/brainstorms/README.md` §13.
-6. **No daemon.** One worker process per run; CLI and `via serve` processes
+5. **No daemon.** One worker process per run; CLI and `via serve` processes
    access the store concurrently. Source: `docs/brainstorms/README.md` §14.
-7. **SQLite behind a small storage interface.** Chosen on requirements
+6. **SQLite behind a small storage interface.** Chosen on requirements
    (embedded, crash-safe, multi-process, static cross-builds). Revisit Turso
    when it reaches 1.0 with stable multi-process WAL.
    Source: `docs/brainstorms/README.md` §14.
-8. **Platforms:** macOS and Linux first, then WSL, native Windows later.
+7. **Platforms:** macOS and Linux first, then WSL, native Windows later.
    Source: `docs/brainstorms/README.md` §14.
 
 ## Provisional
 
+- **Vendor SDK routes: NOT decided.** CLI, vendor RPC and ACP are the default
+  routes because the static-binary rule excludes in-process SDKs. Whether VIA
+  also drives vendor SDKs (e.g. through sidecars) is open. "CLI/RPC/ACP routes
+  only" was an input the orchestrator gave the language council, not an owner
+  decision; `docs/brainstorms/access-methods.md` §6 keeps SDK routes (e.g. the
+  Copilot SDK) in the upgrade path. Source: `docs/brainstorms/README.md` §11,
+  §13; `docs/brainstorms/access-methods.md` §6.
 - **Language: NOT decided.** Go leads at ~60%, conditional on a pure-Go SQLite
   driver passing multi-process WAL with `CGO_ENABLED=0` (prototype gate 7) and
   the other feasibility-spike gates. The prototype plan needs owner discussion
