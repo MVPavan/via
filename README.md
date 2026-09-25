@@ -12,6 +12,9 @@ native arguments unchanged; its results are marked unstructured.
 
 Exploration. Nothing is built yet.
 
+- Workstream handoff: [docs/workstreams/handoff.md](docs/workstreams/handoff.md)
+- Brainstorm record and research: [docs/brainstorms/README.md](docs/brainstorms/README.md)
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
