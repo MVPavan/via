@@ -118,7 +118,8 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	runEnd := time.Now().UnixNano()
 
 	var wr, rr workerReport
-	collect := func(cs []*child, into *workerReport, who string) {
+	var readerReps, writerReps []workerReport
+	collect := func(cs []*child, into *workerReport, reps *[]workerReport, who string) {
 		for _, c := range cs {
 			c.stdin.Close()
 		}
@@ -132,6 +133,7 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 				r.failf("%s %d: no report", who, i+1)
 				continue
 			}
+			*reps = append(*reps, rep)
 			into.OK += rep.OK
 			into.Busy += rep.Busy
 			into.Other += rep.Other
@@ -141,8 +143,8 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 			}
 		}
 	}
-	collect(ws, &wr, "writer")
-	collect(rs, &rr, "reader")
+	collect(ws, &wr, &writerReps, "writer")
+	collect(rs, &rr, &readerReps, "reader")
 	walBeforeFinal := int64(0)
 	if fi, err := os.Stat(path + "-wal"); err == nil {
 		walBeforeFinal = fi.Size()
@@ -161,15 +163,40 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	if len(cl) == 0 || json.Unmarshal([]byte(cl[len(cl)-1]), &cr) != nil {
 		r.failf("checkpointer: no report")
 	}
-	// Completed TRUNCATEs that finished while writers and readers were
-	// still running, and the largest WAL left right after one of them.
-	overlapping, walAfterCkpt := 0, 0
+	// A TRUNCATE counts as overlapping only if it completed inside some
+	// reader's open snapshot [BEGIN, COMMIT] and inside some writer's active
+	// window [first transfer start, last commit]. Clocks are the same host's.
+	inside := func(t int64, lo, hi int64) bool { return lo <= t && t <= hi }
+	readerActive := func(t int64) bool {
+		for _, rep := range readerReps {
+			for _, s := range rep.Spans {
+				if inside(t, s[0], s[1]) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	writerActive := func(t int64) bool {
+		for _, rep := range writerReps {
+			if rep.FirstNS > 0 && inside(t, rep.FirstNS, rep.LastNS) {
+				return true
+			}
+		}
+		return false
+	}
+	overlapping, walAfterCkpt, okDuringRun := 0, 0, 0
 	for _, l := range cl {
 		f := strings.Fields(l)
 		if len(f) != 4 || f[0] != "CKPT" {
 			continue
 		}
-		if atoiMust(f[1]) < int(runEnd) && f[2] == "0" {
+		t := int64(atoiMust(f[1]))
+		if t >= runEnd || f[2] != "0" {
+			continue
+		}
+		okDuringRun++
+		if readerActive(t) && writerActive(t) {
 			overlapping++
 			walAfterCkpt = max(walAfterCkpt, atoiMust(f[3]))
 		}
@@ -199,7 +226,8 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	r.Metrics["checkpoint_busy_results"] = cr.BusyResult
 	r.Metrics["checkpoint_errors"] = cr.Errors
 	r.Metrics["checkpoint_ok_calls"] = cr.Calls - cr.BusyResult
-	r.Metrics["truncates_completed_during_run"] = overlapping
+	r.Metrics["truncates_completed_before_run_end"] = okDuringRun
+	r.Metrics["truncates_overlapping_reader_and_writer"] = overlapping
 	r.Metrics["max_wal_bytes_right_after_truncate"] = walAfterCkpt
 	r.Metrics["wal_shrinks_seen_by_20ms_sampler"] = truncations.Load()
 	r.Metrics["max_wal_bytes"] = maxWAL.Load()
@@ -220,11 +248,18 @@ func checkpointScenario(ctx context.Context, path, neg, sync string, r *Result) 
 	if wr.OK < minTransfers {
 		r.failf("only %d transfers (minimum %d)", wr.OK, minTransfers)
 	}
-	if rr.OK < minSnapshots*ckptReaders {
-		r.failf("only %d reader snapshots (minimum %d)", rr.OK, minSnapshots*ckptReaders)
+	minReader := -1
+	for _, rep := range readerReps {
+		if minReader < 0 || rep.OK < minReader {
+			minReader = rep.OK
+		}
+	}
+	r.Metrics["min_snapshots_per_reader"] = minReader
+	if len(readerReps) != ckptReaders || minReader < minSnapshots {
+		r.failf("a reader completed only %d snapshots (minimum %d per reader, %d reports)", minReader, minSnapshots, len(readerReps))
 	}
 	if overlapping < minTruncations {
-		r.failf("only %d TRUNCATE checkpoints completed while writers and readers ran (minimum %d)", overlapping, minTruncations)
+		r.failf("only %d TRUNCATE checkpoints completed inside an open reader snapshot and a writer's active window (minimum %d)", overlapping, minTruncations)
 	}
 	if m := maxWAL.Load(); m > walSanityBound {
 		r.failf("WAL reached %d bytes (bound %d)", m, walSanityBound)
@@ -272,6 +307,7 @@ func transferWriter(ctx context.Context, w workerFlags) error {
 	stop := untilEOF()
 	for !stop() {
 		a, b, amt := 1+rand.IntN(accounts), 1+rand.IntN(accounts), 1+rand.IntN(50)
+		start := time.Now().UnixNano()
 		err := func() error {
 			if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 				return err
@@ -297,6 +333,10 @@ func transferWriter(ctx context.Context, w workerFlags) error {
 			continue
 		}
 		rep.OK++
+		if rep.FirstNS == 0 {
+			rep.FirstNS = start
+		}
+		rep.LastNS = time.Now().UnixNano()
 	}
 	emit(rep)
 	return nil
@@ -335,17 +375,27 @@ func longReader(ctx context.Context, w workerFlags) error {
 			if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 				return err
 			}
-			defer conn.ExecContext(ctx, "COMMIT")
-			for range 10 {
+			var began int64
+			for i := range 10 {
 				var sum, n int
 				if err := conn.QueryRowContext(ctx, "SELECT sum(balance), count(*) FROM accounts").Scan(&sum, &n); err != nil {
+					conn.ExecContext(ctx, "ROLLBACK")
 					return err
+				}
+				if i == 0 {
+					// The snapshot is taken by the first read, not by BEGIN.
+					began = time.Now().UnixNano()
 				}
 				if sum != want || n != accounts {
 					rep.Bad++
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
+			ending := time.Now().UnixNano()
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return err
+			}
+			rep.Spans = append(rep.Spans, [2]int64{began, ending})
 			return nil
 		}()
 		if err != nil {

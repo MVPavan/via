@@ -60,6 +60,11 @@ type workerReport struct {
 	LatencyUS   []int64 `json:"lat_us,omitempty"`
 	FirstWaitMS int64   `json:"first_wait_ms"` // writer: first BEGIN IMMEDIATE wait
 	FirstErr    string  `json:"first_err,omitempty"`
+	// S4 overlap evidence, as Unix nanoseconds: each reader snapshot's
+	// [BEGIN, COMMIT] span, and a writer's first-start and last-commit times.
+	Spans   [][2]int64 `json:"spans,omitempty"`
+	FirstNS int64      `json:"first_ns,omitempty"`
+	LastNS  int64      `json:"last_ns,omitempty"`
 }
 
 func (w *workerReport) record(err error) {
@@ -213,8 +218,12 @@ func runContention(ctx context.Context, path, neg, sync string, cfg contentionCf
 
 	// Every acked receipt must be present, with its pre-insert hash, and
 	// nothing else may be committed.
+	missingPrep := 0
 	for id := range acked {
 		acked[id] = prep[id]
+		if cfg.size > 0 && prep[id] == "" {
+			missingPrep++
+		}
 	}
 	vrep, err := runVerifier(path, defaultOpts(), manifest{Present: acked, Exact: true})
 	if err != nil {
@@ -251,6 +260,7 @@ func runContention(ctx context.Context, path, neg, sync string, cfg contentionCf
 	r.Metrics["verifier_rows"] = vrep.Receipts
 	r.Metrics["verifier_logs_hashed"] = vrep.LogsChecked
 	r.Metrics["sha_mismatches"] = vrep.ShaMismatch
+	r.Metrics["acked_without_prep_hash"] = missingPrep
 	r.Metrics["wall_after_release_s"] = after
 	r.Metrics["commits_per_s_after_release"] = float64(wt.OK) / after
 	r.Metrics["commit_p50_ms"] = pct(50)
@@ -266,6 +276,14 @@ func runContention(ctx context.Context, path, neg, sync string, cfg contentionCf
 	}
 	if wt.OK != expected || len(acked) != expected {
 		r.failf("commits %d, acked %d, expected %d", wt.OK, len(acked), expected)
+	}
+	if cfg.size > 0 {
+		if missingPrep > 0 {
+			r.failf("%d acked receipts have no pre-insert hash", missingPrep)
+		}
+		if vrep.LogsChecked != expected {
+			r.failf("verifier hashed %d raw logs, expected %d", vrep.LogsChecked, expected)
+		}
 	}
 	if contended != cfg.writers {
 		r.failf("only %d of %d writers waited >= %d ms on their first BEGIN", contended, cfg.writers, contendedWaitMS)
