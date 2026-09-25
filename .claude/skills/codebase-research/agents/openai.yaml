@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codebase Research"
+  short_description: "Graduated research on an external codebase"
+  default_prompt: "Use $codebase-research on <path>; state the depth you want — capability survey, architecture map, or one specific question."
+policy:
+  allow_implicit_invocation: false
