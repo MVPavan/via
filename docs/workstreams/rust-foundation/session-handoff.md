@@ -1,167 +1,182 @@
-# Rust foundation: session handoff (2026-09-26)
+# Rust foundation — paused checkpoint
 
-Read this first to resume. It is self-contained for any harness or model;
-repository rules still come from `AGENTS.md`. Tracking: Beads epic
-`via-jm4` (`bd show via-jm4`). Written by the orchestrator (Claude Opus 5.5)
-at the end of the session that moved VIA work out of the coding-ritual
-submodule; last updated at that session's close, after the owner's spec
-approvals and the S1 plan. The next session starts fresh from here.
+Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
+The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
+reviews or retries until the owner explicitly instructs resumption. The limits
+reset is not authorization to continue. The owner authorized this preservation,
+Beads refresh, handoff and local WIP commit; no push.
 
-## 1. Where things are
+## Recovery and authority
 
-- **Repo:** this checkout (the original VIA clone, now the only place VIA work
-  continues). Branch **`rust-foundation`**, based on `main` (824d064). Nothing
-  from this branch is pushed or merged; pushing and merging need the owner.
-- Commits on the branch: design decisions (f2e3614), specs draft 2 (9dbeac4),
-  Rust S0 workspace and coding standard (be5787d), Codex harness (d158962),
-  Beads (ed4b020, a7173f8), this handoff (371b8d2), `AGENTS.md` Repository
-  section updated to Rust + daemon + roles-as-caller-policy (41b36e7), the
-  owner's spec and testing approvals (f55fce8), and the S1 plan plus this
-  final handoff update (the commit after f55fce8).
-- **Uncommitted on purpose:** `.beads/issues.jsonl` and
-  `.beads/interactions.jsonl`. The Beads database (source of truth) is
-  current; the mirror also carries `via-p2i`, a task from the owner's
-  separate first-principles session, so committing it belongs with that
-  work.
-- **Not ours, leave unstaged:** uncommitted owner edits seen on 2026-09-26:
-  `AGENTS.md` first line ("Apply First Principles Thinking…"),
-  `.claude/skills/skill-router/SKILL.md`, and a new
-  `first-principles-thinking` skill (`.claude/skills/`, `.codex/skills/`).
-- Other branches: `spike/sqlite-wal` (Go SQLite spike, report pending merge;
-  moot for the language choice, still evidence for SQLite WAL) and
-  `claude/repo-context` (merged content). Leave both alone.
-- **Old copy removed (2026-09-26):** the parent `coding-ritual` repo's
-  `coding-ritual-via` worktree was deleted, its `via` submodule config and
-  `via` branch removed, and worktrees pruned. VIA work exists only here. The
-  local Codex trust entry points at this checkout.
-- Gitignored scratch material lives in `scratchpad/` (map in §8).
+Work remains in this repository on branch `rust-foundation`. The checkpoint
+commit containing this document preserves the source as stopped, including
+incomplete fixes; its parent is `a366d4f`. Use Git history to identify the
+checkpoint hash. No source was repaired during closeout. Unrelated changes in
+`.beads/interactions.jsonl` are intentionally excluded from the checkpoint.
 
-## 2. Goal and phase
+Start with this document, [goal.md](goal.md), [roadmap.md](roadmap.md), and live
+Beads. Beads is authoritative for task status/dependencies; generated tracking
+pages are views, not separate task lists. In-progress issues at this checkpoint
+mean unfinished work, **not live workers**. Closeout is `via-jm4.14`.
 
-VIA is one Rust binary: a per-user daemon plus a CLI that spawns and controls
-coding agents (Claude Code, Codex, OpenCode, ACP agents) through one stable
-API. Current phase: **foundation done, S1 planned**: decisions recorded,
-the S1 set of both contracts approved, testing policy confirmed, S0
-workspace built, S1 plan written. **No feature code exists yet.**
+Approved architecture, Rust 1.98.1/edition 2024, coding standards and testing
+policy carry forward. Governing contracts are `docs/specs/via-api-v1.md`,
+`docs/specs/adapter-contract.md`, `docs/specs/runtime-contracts.md` and
+`docs/specs/platform-packaging.md`; verification is in `.repo-context/verification.md`.
+Do not mistake the pending shutdown proposal below for integrated shared specs.
 
-## 3. Decisions in force
+## Scope and owner decisions
 
-Recorded in `docs/brainstorms/README.md` §15, `.repo-context/invariants.md`
-and `.repo-context/CONTEXT.md` (glossary). In short:
+- First release: **Claude Code, Codex and OpenCode**, complete C1 through CLI
+  and `via serve --stdio`: hello, describe, models, spawn, resume, steer, cancel,
+  close, status, wait, result, list, events, unsubscribe, logs, daemon/status,
+  daemon/stop. Capabilities must honestly distinguish supported, partial and
+  unsupported behavior. No ACP, extra harnesses, passthrough, SDK or foreman delivery.
+- Linux is the current required target: fully static `x86_64-unknown-linux-musl`,
+  actual kernel 5.15 baseline and current Linux execution. The macOS system-library
+  packaging exception is approved; artifact production, linkage inspection and
+  native qualification are deferred together under `via-pvj.4`.
+- OpenCode uses free models only. No-login access was demonstrated; no paid
+  substitute is authorized. The chosen profile is anonymous/private with no
+  ambient saved-login fallback. The owner delegated password handling to unblock:
+  temporary generated local-server password inheritance is accepted with one VIA
+  session per server, BasicAuth, ownership checks and no VIA secret logging.
+  Same-user hostile memory isolation is not claimed. Hardening is `via-4sw.4`;
+  required exception controls still belong to current adapter qualification.
+- No owner answer is pending for those decisions. Missing implementation or proof
+  is not an unanswered design question.
 
-| # | Decision |
+## What is preserved
+
+| Area / Beads | Actual state at stop |
 |---|---|
-| D1 | One **VIA daemon** per user owns every agent process, vendor connection and the Store (its only writer). CLI, `via serve --stdio` and thin SDKs are clients over a user-only Unix socket. Auto-start, idle exit, version handshake, one binary (`via daemon …`). The daemon is a process, not a layer |
-| D2 | No leases. OS file lock (`std::fs::File::try_lock`); after a crash Core decides each in-flight turn (resumed / unknown / failed); unknown is never re-sent |
-| D3 | "Never ask": out-of-bound actions are denied, not prompted. Vendor requests get an automatic decline under a deadline; denials are listed in the envelope; the caller resumes, optionally with a new bound |
-| D4 | Raw log per connection (exact bytes) plus event log per turn |
-| D5 | **Session** (one conversation; keeps route and adapter version for life; the bound carries over per turn unless the caller sets a new one on resume, recorded per turn) and **Turn** (one prompt → one envelope, `s_7f3/2`). "Run" is not an entity. Claude's `--max-turns` counts **steps** |
-| D6 | Names: L1 Interface (client + server halves), L2 **Core**, L3 Adapters, L4 Routes, L5 Wire, L6 Host, side Store; contract C1 **VIA API** (public, v1), C2 Adapter, C3 Route (a family), C4 Wire, C5 Host, S Store. Crates `via-cli`, `via-core`, `via-adapters`, `via-routes`, `via-wire`, `via-host`, `via-store` |
-| D7 | Accepted layer-review findings: Core owns deadlines, queues, admission; adapters run vendor cancel sequences; never kill a shared server to cancel one turn; `close(mode, deadline)` passes down; `spawn --require`; three Host process shapes; ACP-only harnesses bound `full` only |
-| D8 | **Rust** 1.98.1, edition 2024. Routes: vendor server where one exists, else vendor CLI, native ACP for breadth; no SDK routes or bridged ACP for now. VIA starts its own servers and never attaches to or stops others. Roles are caller policy |
-| D9 | Open: external sandbox (e.g. `bwrap`) for OpenCode; vendor servers on stdio vs Unix socket |
+| Common S1 design/types, `via-jm4.7.1`–`.3`, `.7.11` | Reviewed design integrated into shared contracts; types approved by Astra medium. Closed evidence remains recorded in Beads. |
+| Fake agent and evidence harness, `via-jm4.7.4` | Fake scenarios, evidence collector/runner and real CLI/daemon/SQLite tests exist. Earlier auto-start, prompt-to-result and F30 disconnect executions passed. Later cleanup/integration changes are interrupted and unaccepted. |
+| Vertical slice, `via-jm4.7.5` | Partial Core/CLI/Adapter/Route/Wire runtime exists. Earlier end-to-end execution is real, but seven integration findings remain without final acceptance. Current all-target compilation fails in tests. |
+| Store, `via-jm4.7.12` | Receipt, submission, acceptance, terminal, raw persistence and anchor journal implemented. Oversized raw allocation and ineffective forged-reference regression corrected and reviewed. Last scoped report: 10 tests and clippy passed. Combined acceptance remains open. |
+| Host, `via-jm4.7.13` | Real anchor/ARM, identity, private control, EOF cleanup and tracked process ownership implemented. Framing cancellation, closed-watch loop, journal deadline and cancellation-safe join ownership fixes reviewed. Last scoped report: 15 tests and clippy passed. Final shutdown/report policy is pending implementation. |
+| Claude, `via-p98.1/.2` | Pinned evidence and reviewed design integrated into `docs/specs/vendors/claude-code.md`. Vendor adapter implementation and required live qualification `.3.4` remain open. |
+| Codex, `via-5lr.1/.2` | Pinned evidence and reviewed design integrated into `docs/specs/vendors/codex.md`. Vendor adapter implementation and required live qualification `.3.4` remain open. |
+| OpenCode, `via-4sw.1/.2` | Pinned free-model evidence and reviewed design integrated into `docs/specs/vendors/opencode.md`. Vendor adapter implementation and required live qualification `.3.4` remain open. |
+| Platform, `via-pvj.3.1` | Actual KVM Ubuntu 22.04 x86_64 kernel 5.15.0-1106-kvm runner established; task closed. No VIA release artifact has been tested there. Platform implementation/qualification remains open. |
+| Later hardening/release, `via-gvg`, `via-d9o` | Not complete; release finish criteria in goal.md remain unchanged. |
 
-## 4. Done, and how it was checked
+The production route currently exercised is fake. Native vendor probes are
+protocol evidence, not implemented VIA adapters or release qualification.
 
-| Work | Where | Checked by |
-|---|---|---|
-| Decisions applied to invariants, glossary, handoff properties, layer/names, routes decision, layer design v2 | `.repo-context/`, `docs/brainstorms/`, `docs/workstreams/handoff.md` | Consistency pass; 0 broken links; Mermaid validated |
-| C1 VIA API v1 + C2 Adapter contract, **draft 2** | `docs/specs/via-api-v1.md`, `docs/specs/adapter-contract.md` | Drafted by Claude Fable 5.1 high; reviewed by GPT-6 Astra medium (SOUND WITH CHANGES, 4 blocking + 15 major; `docs/brainstorms/reviews/contract-specs-astra-r1.md`); every finding fixed or turned into an owner decision. **Owner approved the S1 set** (C1 P1–P6, P8–P10, P12; C2 A1; keys stay separate), 2026-09-26 |
-| Rust coding standard | `.repo-context/coding-style.md` (routed from `AGENTS.md` "Code changes") | Reviewed by Astra medium and GPT-6 Sol high (both SOUND WITH CHANGES); revisions applied. **§10 testing confirmed by the owner** (reconciled option: E2E main, failure-first isolated tests where sharper), 2026-09-26 |
-| S0 workspace: 7 crates, `via` binary, workspace lints, `clippy.toml`, `deny.toml`, nextest config, `scripts/check-layers.py` | repo root, `crates/` | Gate in `.repo-context/verification.md` passes (fmt, clippy `-D warnings`, nextest, cargo-deny, layer check); `via --version` works |
-| Codex harness modelled on the DWS layout | `.codex/` | Hooks fire in a `codex exec` smoke test; see §7 for gaps |
-| Vendor probes P1–P5, P2b | `scratchpad/probes/` | Run once each on cheap models (evidence, not guarantees): §6 |
+## Existing review findings and interrupted fixes
 
-## 5. Owner decisions (2026-09-26) and what still waits
+The [preserved Task 1 review](checkpoint/task1-review.md) records owning-layer
+fixes and the integration findings. Its intermediate wording and source line
+numbers are historical; **no combined Task 1 acceptance exists**.
 
-Decided: the S1 set of the specs is approved as written; `idempotency_key`
-and `op_key` stay separate; the testing policy is confirmed (label and
-approval recorded in the files). Deferred, each to the slice that needs it
-after a fresh probe (Beads `via-jm4.6`): C1 P7 (S3/S4), P11 (S3/S5), P13
-(S2); C2 A2, A3, A6 (S2), A4 (S5), A5 (S6), A7 (S3/S4), A8 (S3/S5).
-
-Still the owner's call: merge/push of `rust-foundation`; merging the
-`spike/sqlite-wal` report; whether to close `via-str`. None blocks S1.
-Remove `NEXTEST_NO_TESTS=pass` from `.repo-context/verification.md` once
-the first tests land.
-
-## 6. Probe evidence (Codex 0.156.1, Claude Code 2.1.283)
-
-| Probe | Observed | Consequence |
-|---|---|---|
-| P1 Codex app-server, `approvalPolicy: never` + read-only | 0 server requests in two turns; write blocked; turns completed | Never-ask works; auto-decline stays as a safety net |
-| P2/P2b Codex `turn/interrupt` during `sleep 120` | Turn `interrupted`; the tool's `sleep` still alive after 60 s; `command/exec/terminate` (-32600, only for client-started commands) and `thread/unsubscribe` do not stop it; tool runs under `bwrap --die-with-parent` in its own process group | Cancel = acknowledged, cleanup uncertain (spec P7) |
-| P3 Codex app-server stdin closed mid-tool | Server exits, tool dies | A daemon crash takes stdio-attached Codex turns with it (spec P12/A7; D9) |
-| P4 Claude parent SIGKILLed mid-tool | Claude survived as an orphan; its tool died. Claude refuses a bare `sleep 120` on its own | Recovery must find and kill orphans by verified identity (coding-style §6) |
-| P5 Claude stream-json input while busy | Second message merged into the running turn; `control_request` interrupt succeeded and killed the tool (`error_during_execution` / `aborted_tools`); init advertises `interrupt_receipt_v1` | Core holds queued prompts; Claude steer unsupported; interrupt supported (spec A3) |
-
-## 7. Known issues and follow-ups
-
-- `via-bki`: in the Codex smoke test the model did not report the Beads
-  SessionStart context in VIA (it did in DWS), and neither repo's model
-  listed `.codex/skills`.
-- `scratchpad/mermaid-check/` needs `npm install` (node_modules not copied).
-- Beads open under `via-jm4`: `.3` (probes; remaining B1–B8 vendor
-  questions listed in C2), `.6` (deferred contract decisions), `.7` (S1).
-  `.2` (spec) and `.4` (standard) are closed. `via-str` (Go spike) is obsolete for the
-  language decision; the owner decides whether to close it.
-- Toolchain installed on this machine: Rust 1.98.1 via rustup (rustfmt,
-  clippy), cargo-nextest 0.9.146, cargo-deny 0.20.2.
-
-## 8. Scratchpad map (gitignored, local only)
-
-| Path | Contents |
+| Finding | Work still requiring completion and verification |
 |---|---|
-| `scratchpad/rust-foundation/decisions.md` | The D1–D9 list given to every worker |
-| `scratchpad/rust-foundation/briefs/` | Worker briefs (A–G, E2, F2, R-*) |
-| `scratchpad/rust-foundation/out/` | Worker reports and the review outputs (`R-astra.md`, `R-sol.md`, `R-spec-astra.md`) |
-| `scratchpad/probes/` | Probe scripts, README, raw outputs under `out/` (private: contain vendor streams) |
-| `scratchpad/codex-schema/` | `codex app-server generate-json-schema` output for 0.156.1 |
-| `scratchpad/headless-bench/`, `scratchpad/acpx-eval/` | Resource benchmarks (native vs acpx), analysis reports |
-| `scratchpad/council/`, `scratchpad/from-coding-ritual/` | Earlier review councils, language council, SDK demo logs |
+| T1-I1 | Half-close input, then bounded concurrent stdout/stderr drain and terminal validation; do not lose tails/duplicate terminals or hang on stderr floods. Wire EOF must preserve both streams. |
+| T1-I2 | Client checks daemon peer UID before sending hello or any handles. Server-side checking alone is insufficient. |
+| T1-I3 | Strict current C1 request envelopes/parameters: jsonrpc, request ID/type, unknown-field rejection and actual DTO validation. |
+| T1-I4 | Remove unauthorized cleanup debug RPC/CLI and prove independent cleanup after daemon-first death through the approved outer snapshot/private-control seam. Debug strings were absent in the last narrow inspection, but Core::verify_cleanup remains and the replacement harness strategy is unreviewed. Reopening Core/Store is not automatically an approved independent read-only proof. |
+| T1-I5 | Emit C1 turn.started/turn.ended and required common event fields while retaining durable C2 evidence; preserve assistant/tool/unknown observations. turn.terminal remained in the last source inspection. |
+| T1-I6 | Complete honest required receipt/envelope capabilities, effective settings, timestamps, usage/cost, model and raw-span shapes; use explicit unavailable/null semantics where appropriate. |
+| T1-I7 | Force stop actually enters forced shutdown immediately; bypassing admission refusal then waiting normal drives does not implement force. |
 
-## 9. How work is run
+Some source edits toward these fixes may already be present. Inspect the frozen
+diff against each finding after resumption; do not reapply changes blindly or
+mark a finding closed from a worker heartbeat, old tests or a string search.
 
-- **Roles** (owner's roster for this workstream): the orchestrator (Claude)
-  briefs, reviews and commits; **GPT-6 Sol high** implements code; **GPT-6
-  Astra medium** reviews substantial work only; the spec was written by
-  **Claude Fable 5.1 high**. The owner reviews specs before code.
-- Codex workers: follow `.repo-context/running-codex.md` (call `codex exec`
-  directly; `< /dev/null`). For Rust builds inside the Codex sandbox, add
-  `-c sandbox_workspace_write.network_access=true` and
-  `-c 'sandbox_workspace_write.writable_roots=["<HOME>/.cargo/registry","<HOME>/.cargo/git","<HOME>/.cargo/advisory-dbs"]'`
-  (the rest of `~/.cargo` is read-only there). Brief pattern: a shared rules
-  file plus a per-task brief listing owned paths, acceptance checks and
-  "do not commit, stage or run bd".
-- Workers must not edit files owned by another concurrent worker; the
-  orchestrator integrates and commits with explicit paths.
-- Owner preferences: discuss before prototypes; show review briefs before
-  sending when asked; share content inline as tables or narrow text (the
-  owner often reads from a remote browser where Mermaid does not render);
-  inline text options rather than pop-up questions; keep reports local.
+Astra high produced a [shutdown ownership correction](checkpoint/shutdown-ownership-seam.md)
+and Sol high returned [PASS on the design](checkpoint/shutdown-ownership-sol-review.md).
+**It is preserved but not integrated into shared specs or accepted implementation.**
+It distinguishes live-daemon caller timeout/cancelled shutdown (retain joins and
+capacity ownership) from final daemon exit. The stop receipt is acceptance only;
+drain keeps existing work deadlines; force enters final shutdown immediately.
+Final shutdown has one total 10-second deadline (F12 starts at first Store
+failure), clean exit 0 requires positive cleanup/joins/durability, and only daemon
+main may select truthful incomplete exit 4. Preserve partial recovery, pending
+and failed joins and wait errors; never infer reaping/quiescence from adoption,
+abort or dropped handles. Blocking Store Drop stays off Tokio workers. No new
+supervisor, RPC or status fields. Positive F19–F22/P-I2 gates remain mandatory.
 
-## 10. Next steps, in order
+## Verification: current versus historical
 
-1. **Confirm the S1 plan with the owner.** `docs/workstreams/rust-foundation/s1-plan.md`
-   (Beads `via-jm4.7`) lists 30 failure modes (§2), testing (§3) and the
-   worker waves (§4). The owner asked for it to be committed and handed
-   off but did not state approval of §2; ask before dispatching. The
-   orchestrator's own choices are listed in §3–§4 (separate test-only
-   fake-agent crate, test-only failpoints feature, Linux only, internal
-   contracts recorded as code).
-2. **W1, two Sol high workers in parallel:** (a) internal interfaces for
-   C3 Route, C4 Wire, C5 Host and the Store as Rust types and signatures,
-   plus crate wiring (update `scripts/check-layers.py` if a new crate is
-   added); (b) the fake agent, the E2E harness with its artifact, and every
-   §2 scenario, written to fail first. Brief pattern: reuse
-   `scratchpad/rust-foundation/briefs/common.md` (shared rules) plus one
-   brief per worker with owned paths, constraints, acceptance scenarios and
-   context pointers; workers do not commit, stage or run `bd`.
-3. **W2:** implementation by owned crate (Store; Host; Wire + fake Route;
-   fake Adapter + Core; CLI + daemon), up to four workers on disjoint paths.
-4. **W3:** integrate to green, run the gate (`.repo-context/verification.md`),
-   Astra medium review, fixes, commit with explicit paths. Remove
-   `NEXTEST_NO_TESTS=pass` from `verification.md` once tests exist.
-5. Then S2 Claude CLI, S3 Codex app-server, S4 cancel/deadlines/recovery,
-   S5 OpenCode, S6 ACP, S7 Claude control route. Settle each deferred
-   decision (`via-jm4.6`) in its slice after a fresh probe.
+Checkpoint preservation checks, 2026-09-26:
+
+- `cargo fmt --all --check`: **PASS**.
+- `cargo check --locked --offline --workspace --all-targets`: **FAIL**, E0599 at
+  `crates/via-cli/tests/s1_prompt_to_result.rs:134` and `:676`.
+  `ScenarioError` lacks Display for `error.to_string()`. Left untouched under
+  the owner's stop instruction; this checkpoint is deliberately WIP.
+- `python3 scripts/check-layers.py`: **PASS**.
+- `python3 .claude/scripts/skill-catalog.py --check`: **PASS**, advisory stale
+  allowlist warnings only.
+- Final Markdown link, diff and staging checks are recorded in closeout Bead
+  `via-jm4.14`. No new runtime acceptance suite or review cycle was started.
+
+Historical earlier snapshots only: workspace fmt/clippy/nextest **51/51**,
+cargo-deny and layers passed before later integration fixes. Store last scoped
+10 tests/clippy, Host last scoped 15 tests/clippy, fake-agent 12 tests and
+collector/runner 4 tests passed at their respective freezes. Three real CLI
+scenarios passed at an earlier integration snapshot. Review still found the
+contract defects above. These are **not** a green certification of this commit,
+full S1 F1–F30 acceptance, or release acceptance.
+
+## Vendor and Linux evidence to retain
+
+| Pin | Evidence and remaining boundary |
+|---|---|
+| Claude Code 2.1.283 | Six conformance cases passed, three partial; resume/schema/interrupt evidence. Required bounds and VIA live qualification remain `via-p98.3.4`. |
+| Codex 0.157.1 | Native steer and persistent resume evidenced. Tool survived interrupt, so cleanup remains uncertain. Denied-write read-only proof and VIA live qualification remain `via-5lr.3.4`. |
+| OpenCode 1.18.32 | Official `opencode/mimo-v2.6-flash-free` worked with private HOME/all XDG including DATA, private DB, no login/payment or spoofed headers. Free conversation probe: 12 pass, 2 unproven; active tool cancellation: 9 pass, child absent before shutdown and owned group/listener cleanup. Earlier free403/paid timeout reports are historical, not current access blockers. |
+
+OpenCode single-step assistant usage repeats step-finish usage; do not double
+count. Multi-step accounting/cost/billing scope remains unproved. `via-4sw.3.4`
+still owns usage/B7/controls/exact permissions/temporary-exception controls and
+hostile-profile/restart qualification through VIA. Non-null max_steps is
+truthfully unsupported at this pin and must fail before I/O with `-32602`,
+`data.kind: invalid_params`; that does not waive the C1 verb surface.
+
+The Linux baseline uses a signed official image, pinned SHA256
+`be270d5d6d81673914a63e838dd80fa35c571a95c4401a0e538dd15a20715721`.
+Task containers and overlays were cleaned; the image/runner are retained locally.
+A baseline boot is infrastructure proof, not a VIA artifact pass.
+
+Local-only evidence lives under `scratchpad/execution/rust-foundation-release/`:
+`s1-review/` source hashes and reports, `s1-design/` prior ownership seams,
+`opencode-evidence/free-tier-report.md`, vendor probes, CLI scenario manifests,
+raw/event logs, Store snapshots and platform artifacts. These paths are
+intentionally gitignored and may not exist on another machine. The committed
+vendor specs and checkpoint review/design snapshots preserve conclusions;
+recover or reproduce raw evidence before relying on it for a new acceptance.
+Do not publish credentials, raw private transcripts or machine-local paths.
+
+## Worker ownership and next action after explicit resume
+
+No active child worker remains. `/root/s1_spine` and `/root/s1_host` stopped on
+usage limits with partial edits preserved. Store, integration reviewer, internal
+design and platform reviewer had finished their assigned turns. Do not restart
+any worker during this pause.
+
+Resume method: `execution` and Beads; risk-appropriate failure-first regressions,
+then the established substantial-increment review workflow. Material designs:
+Astra high designs, Sol high reviews. Code: Sol high implements, Astra medium
+reviews substantial increments. Astra high critiques completed S1 and the release
+candidate, not each small edit. Native named-model agents were available in this
+run; explicit model/effort and native-first routing were owner-authorized, with
+Codex CLI fallback only if unavailable. Recheck availability when resumed.
+
+After explicit resumption, recover the current diff and `via-jm4.7.4/.5/.12/.13`.
+First restore test compilation through the owning implementation worker, then
+integrate the reviewed shutdown correction and complete T1-I1–I7 with bounded
+ownership: Host owns Host source/tests; Store owns Store source/tests; spine owns
+Core/CLI/Adapter/Route/Wire, manifests and shared integration. Coordinate event
+mapping with Store and cleanup evidence with the harness; no overlapping writes.
+Do not redispatch completed research or duplicate existing changes.
+
+`.7.4` and `.7.5` are one Task 1 integration group; `.7.6` waits for both.
+`.7.5` also waits for Store `.7.12` and Host `.7.13`; avoid inventing a circular
+harness-cleanup dependency. Run the prescribed current-tree gates and obtain
+Astra-medium combined review only once the substantial increment is ready.
+Continue the remaining S1 acceptance and milestone critique before adapter
+implementation. Independent later vendor implementation can parallelize after
+its prerequisites, with shared files assigned to one owner. Final finish means
+all goal.md gates evidenced, not merely a build, partial feature or usage reset.

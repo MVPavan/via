@@ -450,8 +450,34 @@ compact constraint list is [`.repo-context/invariants.md`](../../.repo-context/i
   catalog maps model to harness.
 
 Still open: external sandboxing for vendor servers without native bounds;
-stdio versus Unix socket for shared vendor server connections; testing policy
-details (end-to-end-first direction).
+stdio versus Unix socket for shared vendor server connections. Testing policy
+is approved in `.repo-context/coding-style.md` §10.
+
+## 16. First-release scope and execution decisions (2026-09-26)
+
+The owner confirmed that Rust, the foundation decisions, coding standard and
+testing policy are approved, accepted the readiness review's recommendations,
+and restricted the first release to **Claude Code, Codex and OpenCode**.
+Implement the full C1 method surface; unsupported vendor verbs remain explicit
+named refusals. ACP and additional harnesses are later scope. This supersedes
+the old proposed v0/v1/v2 scope ladder, not the capability-truthfulness rule.
+
+S1 scope and the failure-first approach are approved. Build it as small
+integrated increments instead of one large parallel crate implementation.
+The fake-agent slice proves Core plumbing; vendor slices must independently
+prove persistent-session and shared-server behavior. Resolve actual remaining
+contract questions at the slice that needs them; do not re-request settled
+foundation approvals.
+
+The owner's roster: **GPT-6 Astra high** designs material spec/architecture
+decisions and **GPT-6 Sol high** reviews those designs. **GPT-6 Sol high**
+implements code; **GPT-6 Astra medium** reviews coherent, substantial code
+increments. **GPT-6 Astra high** performs critical reviews at major integrated
+milestones, not on every change. The coordinator owns briefs, scope, integration,
+finding disposition and verification. Detailed proposed sequencing and release
+acceptance are in `docs/workstreams/rust-foundation/session-handoff.md` and
+`docs/workstreams/rust-foundation/s1-plan.md`; worker dispatch awaits agreement
+on that sequence. Commit, push and merge remain separately authorized actions.
 
 ## Research execution log
 

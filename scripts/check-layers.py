@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 ALLOWED = {
+    # Test-only executable: it never depends on a VIA production layer.
+    "via-fake-agent": set(),
     "via-cli": {"via-core"},
     "via-core": {"via-adapters", "via-store"},
     "via-adapters": {"via-routes"},

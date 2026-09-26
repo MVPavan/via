@@ -27,6 +27,7 @@ schemars = "1.2"
 insta = "1.48"
 proptest = "1.11"
 tempfile = "3.27"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

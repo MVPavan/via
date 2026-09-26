@@ -4,9 +4,9 @@ Rust 1.98.1 is the chosen toolchain. Run checks from the repo root.
 
 ## Rust gate
 
-Until tests exist, export `NEXTEST_NO_TESTS=pass` before running the gate;
-remove the setting when the first tests land. Nextest's empty-suite behavior
-is a CLI setting. Run in order:
+Runtime tests now exist. Empty-suite success is not permitted. Run the gate
+in order; the paused checkpoint and its actual results are recorded in
+`docs/workstreams/rust-foundation/session-handoff.md`.
 
 ```bash
 cargo fmt --all --check
@@ -16,8 +16,58 @@ cargo deny check
 python3 scripts/check-layers.py
 ```
 
-Testing policy: pending owner decision.
-Live-vendor end-to-end sets are a separate merge gate, defined by that policy.
+Testing policy: approved; `.repo-context/coding-style.md` §10 is authoritative.
+The default gate uses fake vendors, with failure-first isolated tests where
+they provide sharper evidence. Small live-vendor end-to-end sets are a separate
+gate before each adapter slice merges; infrastructure failures are not passes.
+S1 has no live-vendor gate.
+
+## S1 runtime acceptance, when tests and failpoints land
+
+The following commands are required from the repository root for the S1
+implementation. They are future gates, not claims that the scaffold already
+has the feature, script or nonempty suite. Do not set `NEXTEST_NO_TESTS=pass`
+for acceptance; record nonempty test counts, durations, actual feature graph
+and fixture/artifact hashes.
+
+```bash
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo nextest run --locked --workspace
+cargo deny check
+python3 scripts/check-layers.py
+cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings
+cargo nextest run --locked --workspace --features via-cli/test-failpoints
+cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08|09|10|12)_/)'
+cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_(f2[4567]|raw|bounds|store)_/)'
+cargo build --locked --release -p via-cli --no-default-features
+python3 scripts/check-release-features.py target/release/via
+```
+
+`test-failpoints` is default-off and test-only; its feature wiring, code and
+environment parsing must be absent from the release feature graph. The
+planned `scripts/check-release-features.py` must inspect that graph, launch
+release VIA with known activation inputs and verify they are ignored, then
+scan for unique control marker strings as supporting evidence. A string scan
+alone is insufficient. Scenario tests `s1_f01_...` through `s1_f30_...`,
+`s1_raw_...`, `s1_bounds_...` and `s1_store_...` must use real daemon/SQLite
+paths and emit a summary, sha256 manifest, consistent SQLite backup, raw and
+event logs and report under `scratchpad/`. The gate fails for missing
+evidence; never treat a copy of a live WAL file as a consistent backup.
+F22/P-I2 requires both positive cleanup paths and negative identity refusals
+specified in `docs/specs/runtime-contracts.md` §5.2 and §11. A result that
+only records uncertainty does not pass that positive gate. P-OWNER-1's narrow
+macOS system-library linkage exception is owner-approved and recorded in
+`docs/specs/platform-packaging.md` §1 and invariant #4. The current release
+gate requires the fully static Linux artifact on an actual kernel 5.15
+baseline and current Linux configuration; macOS artifact production,
+linkage inspection and native qualification are deferred together under
+`via-pvj.4`, not passed by Linux/WSL or cross-build evidence.
+Path/bootstrap cases from runtime §6.1/§11 cover precedence, unsafe targets,
+same-State/different-runtime writer refusal, client Store mismatch and
+isolated scenarios. Claude and Codex vendor qualification cases remain
+separate live gates; a reviewed design or zero-test selection cannot pass
+them.
 
 ## Checks that apply now
 

@@ -1,27 +1,32 @@
 # VIA — handoff
 
-> Plain-text paths such as `workflow_interpreter/…`, `docs/adr/…`, `docs/research/…`, `.repo-context/…` and `scratchpad/…` refer to the parent repository [MVPavan/coding-ritual](https://github.com/MVPavan/coding-ritual) (branch `dws-workflow`, pinned for links at `09cee1b`), where VIA's exploration started. This repo is a submodule there.
+> VIA exploration started in [MVPavan/coding-ritual](https://github.com/MVPavan/coding-ritual) (historical branch `dws-workflow`, pinned for links at `09cee1b`). The old worktree/submodule setup was removed; work now continues only in this standalone repository. Paths in the historical evidence and reuse sections below are parent-repo references unless explicitly described as local. Current `.repo-context/` and `docs/specs/` references belong to this repository.
 
-Status: architecture decisions recorded 2026-09-25/26; nothing built. Bead: `cr-w53s` (epic).
-Exploration began on branch `via`, cut from `dws-workflow` @ fe6a9f9 (2026-09-24).
+Status: owner-paused S1 checkpoint with partial runtime code and tests;
+integration acceptance and test compilation fixes remain open. Current epic:
+`via-jm4`. After explicit owner resumption, recover from
+[the Rust foundation handoff](rust-foundation/session-handoff.md).
+Historical exploration began on branch `via`, cut from `dws-workflow` @ fe6a9f9
+(2026-09-24), tracked then as `cr-w53s`.
 
 ## What VIA is
 
 A single CLI to run an **explicitly configured agent + prompt** on **any coding
-harness** (Claude Code, Codex, OpenCode, Pi, Gemini, Cursor, …) and get a
+harness** and get a
 **structured result** back —
 so any agent can use sub-agents across harnesses and models, not only within
-Claude or within Codex. VIA is also meant to become the **control plane** the
+Claude or within Codex. The first release supports **Claude Code, Codex and
+OpenCode**. VIA is also meant to become the **control plane** the
 workflow interpreter's foreman calls instead of driving crews itself.
 
 Owner's framing: there will be several top harnesses; some models live only in
 some of them; people will use several at once. VIA is the cross-harness,
 cross-model single interface, with one pattern for spawn / resume / steer /
-end — plus a passthrough mode that forwards native arguments unchanged.
+cancel / close. Passthrough remains a later extension outside the first release.
 
 First open question from the owner: **is it needed, and how much?** The
-assessment below says yes, scoped tightly; initial harness scope still needs
-owner confirmation.
+assessment below says yes, scoped tightly; the owner confirmed the three-harness
+first-release scope on 2026-09-26.
 
 ## Assessment so far (2026-09-24 discussion)
 
@@ -45,15 +50,14 @@ Why to keep it tight:
   declare per-adapter capability, never fake a verb.
 - Passthrough is an escape hatch; results through it are unstructured.
 
-## Properties: decided architecture and remaining proposals
+## Properties: decided architecture
 
 1. **Decided:** One headless VIA daemon per user owns agent processes, vendor
    connections and the Store. CLI, `via serve --stdio` and thin SDKs speak the
    public C1 VIA API to it over a user-only Unix socket. The CLI auto-starts
    it; it exits when idle and rejects client/daemon version mismatches.
-2. **Decided:** One result envelope per turn. Proposed detail includes status,
-   final text, session id and turn number, exit code, usage/cost, tree pins
-   and log reference; denials and auto-declines are required.
+2. **Decided:** One result envelope per turn. The current field definitions
+   are in `docs/specs/via-api-v1.md` §5; denials and auto-declines are required.
 3. **Decided:** Roles are caller policy. VIA takes explicit harness/model,
    effort, instructions, permission bound, cwd, output schema and namespaced
    vendor options. The model catalog maps model to harness.
@@ -72,9 +76,10 @@ Why to keep it tight:
    through the handle. VIA revalidates it against the route and records it per
    turn; nothing changes it silently. External sandboxing for vendors without
    a native bound remains open.
-7. **Proposed:** Adapters are pinned and contract-tested per vendor version;
-   drift is detected; `--passthrough` marks results unstructured.
-8. **Proposed:** `spawn --background` returns the session and turn address;
+7. **Decided:** Adapters are versioned and contract-tested against vendor
+   versions. The exact outside-tested-range policy is resolved in S2 under
+   C1 P13 / C2 A2. Passthrough is outside first-release acceptance.
+8. **Decided:** `spawn --background` returns the session and turn address;
    `via wait` returns that turn's envelope for parallel sub-agents.
 
 Rust 1.98.1, edition 2024, and a single static `via` binary are decided.
@@ -83,11 +88,11 @@ ACP adds breadth. SDK and bridged ACP routes are not used for now. VIA starts
 its own vendor servers and never attaches to or stops servers it did not start.
 See `.repo-context/invariants.md` and `docs/brainstorms/routes-decision.md`.
 
-Scope ladder (proposal):
-- v0: Claude, Codex, OpenCode; `spawn` / `resume` / `result` as a CLI over the
-  daemon; callers supply explicit parameters.
-- v1: background/wait, cancel, steer where supported; foreman calls VIA.
-- v2: more harnesses one at a time, each only with a real use.
+First-release scope (owner, 2026-09-26): Claude Code, Codex and OpenCode;
+the full C1 API, including background/wait, cancel, steer and close, with
+truthful per-route capabilities. ACP, additional harnesses, passthrough,
+thin SDK delivery and foreman integration are outside this release. See the
+current handoff for the implementation sequence and proposed release checks.
 
 ## Evidence already gathered
 
@@ -136,16 +141,16 @@ vendor's own tool. Owner decision: terms uncertainty does not block
 development — build adapters properly and disable any a vendor turns out not to
 permit. Record terms status per adapter.
 
-## Open questions for the next session
+## Remaining decisions
 
-1. Confirm v0 boundaries and which harnesses come first.
-2. Decide whether VIA may wrap a vendor server in an external sandbox when
+1. Decide whether VIA may wrap a vendor server in an external sandbox when
    the vendor has no native bound.
-3. Decide whether shared vendor servers connect to the daemon over stdio or
+2. Decide whether shared vendor servers connect to the daemon over stdio or
    a Unix socket, which could allow rejoining after a daemon crash.
-4. Set testing policy details; end-to-end-first is the current direction.
-5. Decide the relation to agent-matrix: replace its spawn guidance with VIA
-   usage, fold its catalog into the model catalog, or retire it.
+3. Resolve vendor-dependent C1/C2 decisions with probes in their owning slice.
+
+Language, coding standard, testing policy and S1 scope are approved. The
+relationship to agent-matrix and foreman integration are outside this release.
 
 ## Constraints carried over
 

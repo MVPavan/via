@@ -1,0 +1,484 @@
+# Codex app-server adapter contract
+
+Status: **design for Sol-high review**, 2026-09-26; `via-5lr.2.1`.
+Scope: the first-release `codex-app-server` adapter, owned stdio transport,
+and its required shared-server extension. No CLI fallback, socket rejoin,
+new prototype, universal RPC router or extra route is introduced.
+
+Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md), reviewed
+[runtime contracts](../runtime-contracts.md), and the
+[approved goal](../../workstreams/rust-foundation/goal.md). Section 9 contains
+proposed shared-spec amendments for coordinator integration; this packet
+does not itself change C1/C2. Decisions below require independent review
+before dependent implementation.
+
+## 1. Pin and evidence boundary
+
+Pin **`codex-cli 0.157.1`**, app-server v2 method schemas with the v1
+`initialize` handshake, over newline-delimited JSON on owned stdin/stdout.
+The generated v2 schema bundle SHA-256 is
+`2719fccd25a97a7ce355497ca5e9123a63f6dce7f9f83724a5b73fd927811f59`.
+Do not interpret “v2” as a negotiated wire-version number. Initialize once
+per connection, then send `initialized`; use
+`clientInfo:{name:"via",version:<VIA version>}`, no experimental capabilities
+and no notification opt-outs. Record observed binary and adapter versions.
+A failed handshake refuses acquisition. A different binary version follows
+C2's untested-version gate, never silently extends the tested range.
+
+Local primary sources live under
+`scratchpad/execution/rust-foundation-release/codex-evidence/`:
+
+| Source | What it establishes |
+|---|---|
+| `schema-0.157.1/v1/InitializeParams.json` and targeted `v2/*Params.json` / `*Response.json` | Exact request/response fields, not runtime behavior |
+| `decline-validation.json`, root response schemas | Six no-grant reply bodies validate; no live approval exchange was observed |
+| `probe-report.md`, `probe-results.json`, referenced case `result.json`, `raw.jsonl`, `process_trees.jsonl` | C0 owned stdin loss; C2 steer; C3 surviving tool; C4 thread isolation; C5 stored resume; C6 limited environment observation |
+| `evidence.md` | Inspection provenance and remaining questions; its pre-probe unknowns are superseded only by the specific observations above |
+
+C3 observed the same tool alive **65 seconds** after interrupted terminal
+status, with no matching tool completion. C4/C4b **did not prove read-only
+enforcement**: the model never attempted the denied write. C5 used a
+persistent thread; an ephemeral resume failed with `no rollout found`.
+C6 proved only one tool-free turn with seven environment variables. These
+are bounded observations, not guarantees for arbitrary tools/platforms.
+Raw probe artifacts remain private; public fixtures must be sanitized.
+
+## 2. Responsibilities and minimal interface
+
+Keep the existing dependency chain: Core → Adapter → Routes → Wire → Host.
+Core owns receipts, submission intent, queues, deadlines, results and Store
+transactions. Adapter owns canonical mapping, capabilities, normalization
+and cleanup evidence. A concrete `CodexConnection` in Routes owns typed
+methods, request pairing and thread demultiplexing. Wire owns bounded JSONL,
+raw references and transport. Host owns the process, verified identity,
+shared-server leases and whole-server shutdown. Follow runtime §2's opaque
+resource wiring; no Adapter access to SQLite or credentials.
+
+Extend the typed route with only `initialize`, `thread_start`,
+`thread_resume`, `turn_start`, `turn_steer`, `turn_interrupt`,
+`thread_unsubscribe`, and typed server-request replies. A single connection
+task receives all frames; session drivers receive already correlated
+messages. No second transport framework, generic method registry or trait
+hierarchy is justified. Request IDs are connection-local monotonically
+allocated IDs with a distinct server-request direction; exhaustion retires
+the connection after drain, never reuses an ID.
+
+### Shared ownership (A8/P11)
+
+Host acquires a lease on a VIA-started server keyed by
+`(codex, observed_binary_version, config_hash)`. The hash covers the resolved
+binary path and VIA-controlled startup arguments, effective non-secret
+environment/path configuration and protocol pin. It does not hash credential
+contents. The bound, model, instructions and session cwd are thread/turn
+settings, not key components. Never attach to a pre-existing vendor server.
+Reserve ownership before launch and publish the connection only after a
+successful handshake; concurrent equal-key acquisition shares that result.
+
+Each session has one lease and a registered thread ID. One shared server
+uses one of the runtime's four connection/process slots; active turns across
+all adapters still consume the existing four dispatch slots. Initially cap
+loaded Codex leases at 32 daemon-wide and outstanding client RPCs at 64 per
+connection, with eight slots reserved for control. Refuse excess admission
+before submitting input. Idle leases can detach and later reopen; no
+unbounded map of every historical thread remains in memory. A detached
+session with retained correlation still occupies one of the 32 resident
+session slots (§5); releasing its vendor lease does not free that slot.
+
+Releasing one lease calls `thread/unsubscribe`, never closes stdin or kills
+the server. Its `unsubscribed`, `notSubscribed` and `notLoaded` results prove
+detachment only: `CloseReport.vendor_closed` stays false and per-turn
+`exit` stays null for this shared-server route. Keep a lease while a turn
+or cleanup is pending. When the
+last lease releases, Host may retire the owned idle server; daemon stop
+first stops admission and drains/cancels all leases, then performs its
+bounded owned-group shutdown. Follow runtime §5's anchor/identity rules.
+Server loss reaches every associated session; detached historical sessions
+remain reopenable from their stored thread IDs. No per-thread force kill,
+PID guessing from `processId`, or killing a shared server to satisfy one
+session's cancel/close deadline.
+
+## 3. Operations and canonical parameters
+
+| Operation | Wire mapping and acceptance rule |
+|---|---|
+| Open new session | `thread/start` with explicit `model`, `cwd`, `developerInstructions` when supplied, `sandbox`, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`. Register returned `thread.id` before admitting a turn. Verify returned policy/model/cwd against effective settings; mismatch fails closed. |
+| Reopen idle session | `thread/resume` with exact stored `threadId`, canonical thread settings with the current effective bound's sandbox mode, and `excludeTurns:true`. Verify returned `thread.id` and effective policy; identity mismatch is `resume_mismatch`, never create a replacement. Do not restore the spawn-time bound after a bound change. The following turn/start supplies the full current structured policy. `excludeTurns` bounds history hydration and needs live acceptance coverage. |
+| `StartTurn` | `turn/start` with `threadId`, `input:[{type:"text",text:<prompt>}]`, explicit frozen `cwd`, `model`, `effort`, `outputSchema`, `approvalPolicy:"never"`, `approvalsReviewer:"user"` and `sandboxPolicy`. No active turn may exist on that thread. |
+| `Steer` | `turn/steer {threadId,expectedTurnId,input:[{type:"text",text:<text>}]}`. Return `Injected` only when response `turnId` equals the expected active ID. Never call `turn/start` as steer. |
+| `Interrupt` | `turn/interrupt {threadId,turnId}`; `{}` confirms request handling only. A matching `turn/completed` with `status:"interrupted"` is cancellation acknowledgement. See §6. |
+| `Close` | Core cancels queued/active work under C1, then driver detaches with `thread/unsubscribe`. Retain cleanup uncertainty. No thread deletion/archive and no shared stdin close. |
+| `recover` (A7) | Unsupported. Never submit or call `thread/resume` to rejoin an in-flight turn. Return `Dead` only with verified process-death evidence, otherwise `Unknown`; both leave an uncertain submitted turn `unknown` with no resend. |
+
+Core persists submission intent before `StartTurn`. Acceptance requires the
+paired `turn/start` response containing `turn.id`; an early `turn/started`
+notification does not bypass this rule. Route retains bounded early messages
+for that thread, then releases acceptance and observations in order. C2's
+correlation token deduplicates the reply/observation race. Response loss,
+partial write or timeout after intent is `Unknown`; no automatic resend.
+An explicit RPC refusal may be `Rejected` only if no contradictory started
+turn evidence exists. Unknown/duplicate response IDs or conflicting returned
+turn IDs are protocol failure, never reassigned to the next waiter.
+
+While submitting, steer waits for acceptance within its absolute deadline.
+Idle/stale turns receive C1 `no_active_turn` / `turn_mismatch`. The pinned
+probe's stale-ID `-32600` must not be mapped universally to mismatch: use
+the operation, pending expected ID and known error shape; unrecognized
+errors remain vendor/protocol errors. A start response reporting an already
+known active turn violates VIA's start invariant; fail with uncertainty,
+never report a new turn or resend. Controls and health remain serviceable
+while start awaits a response.
+
+Instructions map to `developerInstructions`; this adds instructions at that
+level and does not promise replacement of vendor/system/repository policy.
+Effort values come from the pinned schema and model catalog. Reject an
+unsupported explicit `max_steps`; this route has no matching control.
+`outputSchema:null` is emitted to clear VIA inheritance; final agent text
+must parse and validate before becoming `structured_output`, otherwise use
+`structured_output_missing`. A live clear/change fixture remains required.
+Do not expose arbitrary Codex `config` or raw CLI argument forwarding.
+Reserve C2's existing keys plus `config`, `modelProvider`,
+`excludeTurns`, permission-profile selectors, `serviceTierForTurn`,
+`disabledPluginIds`, `toolOutput`, `clientUserMessageId`, `turnTrigger` and
+thread/start source selectors; initial vendor option allow-list is empty.
+
+### Bound mapping and gate
+
+Always apply the bound on **every** `turn/start`; vendor turn overrides can
+become subsequent defaults. `turn/steer` cannot change a bound. Use the
+matching thread `sandbox` mode at start/resume, then the structured policy:
+
+| VIA bound | `sandboxPolicy` |
+|---|---|
+| `read_only` | `{type:"readOnly",networkAccess:<network>}` |
+| `workspace_write` | `{type:"workspaceWrite",writableRoots:<absolute extra dirs>,networkAccess:<network>,excludeSlashTmp:true,excludeTmpdirEnvVar:true}`; cwd is the implicit workspace root |
+| `full`, network true | `{type:"dangerFullAccess"}` |
+| `full`, network false | Refuse `bound_unsupported`; no network field exists for this variant |
+
+The tmp exclusions avoid silently granting extra writable paths. Their exact
+effect, workspace roots, protected paths and network enforcement need live
+coverage before claiming the limited bounds. **Until that coverage passes,
+`describe` must omit `read_only`/`workspace_write` and refuse those requests
+as `bound_unsupported` with the unverified-enforcement reason.** An
+`allow_untested` version override does not waive this known proof gap.
+`full` grants full access; it is never a fallback for a refused limited
+bound. A8 chooses a bound-free key because policy is per turn; enabling
+mixed-bound sharing remains gated on `via-5lr.3.4`, not on C4's marker
+absence. This keeps the required proof open, rather than weakening the
+release's intended bound support to close the task.
+
+## 4. Never-ask and environment
+
+Explicit `never` plus `approvalsReviewer:"user"` prevents inherited automatic
+approval routing; all server requests use an independent decline path. Do
+not opt into client-managed authentication. A decline contains no caller
+permission, network grant, path grant, credential or policy amendment.
+
+| Request method | Response `result` body |
+|---|---|
+| `item/commandExecution/requestApproval`, `item/fileChange/requestApproval` | `{"decision":"decline"}` |
+| `item/permissions/requestApproval` | `{"permissions":{}}` |
+| `item/tool/requestUserInput` | `{"answers":{}}` |
+| `mcpServer/elicitation/request` | `{"action":"decline","content":null}` |
+| `item/tool/call` | `{"contentItems":[],"success":false}` |
+
+For `account/chatgptAuthTokens/refresh`, `attestation/generate`, legacy
+`applyPatchApproval` / `execCommandApproval`, and unknown methods, return
+JSON-RPC `error:{code:-32601,message:"Method not supported by VIA"}` with
+the exact incoming ID. Do not grant or fetch credentials. Successful
+no-grant writes emit `vendor.request_declined` with method, bounded summary
+and thread/turn association when known. Vendor-reported denials separately
+emit `action.denied`; a model's prose refusal or absent file is not proof
+of a sandbox denial.
+
+Default decline deadline is 1 second from decode, capped by the remaining
+connection deadline; pending server requests are limited to eight and
+64 KiB total. Unknown thread requests are still declined, but only retained
+as connection diagnostics, never broadcast into other sessions. A saturated
+or blocked control writer cannot hang forever: latch overflow/transport
+failure, fail all affected sessions through health and retire the unusable
+connection. This is connection failure, not an assertion of per-thread
+forced cancellation. Successful refusal must precede “declined” reporting.
+
+Start from an explicit environment allow-list: `HOME`, `PATH`, `USER`,
+`LOGNAME`, `LANG`, optional `XDG_RUNTIME_DIR`; VIA supplies a writable,
+user-private `CODEX_SQLITE_HOME` and its Host marker. The server itself uses
+the user's vendor login state; VIA never reads/copies credential contents.
+No wholesale parent environment, tokens, proxy variables, loader injection
+or arbitrary `CODEX_*` forwarding. Changes require named evidence and enter
+the server key. This is a candidate integration policy, not a claim that
+C6 tested tools, authentication refresh, macOS or installed plugins. Never
+silently broaden the allow-list after failure.
+
+## 5. Correlation, events and bounds
+
+Each client response routes by request ID; each known notification routes
+by exact `threadId` and, where present, `turnId`. Server requests additionally
+carry their own request IDs. Install registrations before releasing a
+thread response to its driver. Bound pre-registration buffering by the
+existing 64-frame/4 MiB connection staging limit. Lookup includes retained
+correlation tombstones before classifying a thread or turn as unknown.
+Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
+IDs on known threads may become C2 session-level observations. A previously
+accepted turn must never take either fallback. Untagged connection status
+does not get fabricated thread ownership. Raw extraction uses individual
+event `raw_ref`s, never shared-connection bounding spans.
+
+Retain `(connection generation, threadId, turnId) → (session_id, TurnNo)`
+for every accepted turn until that connection retires. After settlement it
+is a tombstone, retaining unresolved-tool metadata and a bounded session
+observation sender independent of the vendor lease. Unsubscribe, close,
+uncertain settlement and a successor turn do not evict it. Thus an already
+received or later delivered completion after lease release still reaches
+its original turn with `late:true`; unsubscribe does not promise more
+vendor notifications. A detached session's Core event sink remains eligible
+for these late observations even though admission to that session is closed.
+
+Cap active mappings plus tombstones at 1024 entries and 256 KiB per
+connection, charged to the global 16 MiB permit pool; retain at most the
+32 resident session sinks above. This deliberate bound avoids adding Store
+lookups to Routes. Reserve correlation space before writing turn/start.
+If reservation or unresolved-tool metadata admission fails, latch explicit
+connection `overflow`, stop new writes, notify every associated session and
+retire the connection through its owned lifecycle. Never evict a mapping
+to admit another or relabel its evidence session-level. Existing uncertain
+results remain immutable; pending cleanup settles uncertain and active
+turns follow Core's failure precedence. Retirement is a documented loss of
+continuity, not proof that unresolved tools stopped. Release tombstones
+only after raw/control draining ends and the continuity-loss reports have
+been handed to Core (or sticky Store/transport failure records their loss).
+
+Normalize agent-message deltas, completed agent text, tool starts/ends,
+file changes, reasoning summaries, usage and terminal statuses using C2.
+Accumulate final text by item ID; completed text replaces that item's delta
+accumulator instead of duplicating it. Preserve vendor item order. Retain
+only bounded metadata for open tools, keyed by `(threadId,turnId,itemId)`;
+1024 entries and 256 KiB/session, charged to the observation budget. A
+turn-terminal payload may carry partial items (`itemsView`); absence from
+its `items` is not completion evidence. `error {willRetry:true}` is progress
+diagnostic, not a terminal failure. Core applies disposition precedence.
+
+Use runtime §8 limits unchanged: 1 MiB inbound frame including LF,
+64 KiB pipe buffers, 8 MiB raw staging/connection and 32 MiB globally,
+64 framed messages/4 MiB per connection, C2 1024 observations/4 MiB per
+session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
+65,536 nodes. Large text splits on UTF-8 boundaries; unknown notifications
+become `vendor.other` retaining at most 16 KiB with explicit truncation.
+No silent dropped lifecycle events. Large prompts are encoded using the
+runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
+
+One blocked session normalizer must not stop dispatch to other threads or
+the decline/control paths. Partition the existing Route framed-data staging
+into per-thread ingress lanes, each capped at 16 frames/1 MiB within the
+unchanged 64-frame/4 MiB connection aggregate; this adds no buffer tier.
+These ingress lanes precede the existing C2 observation channel. The shared
+receiver uses nonblocking ingress admission: **the first full ingress-lane
+result immediately quarantines that thread's data lane**, without waiting
+for the 10-second C2 observation-stall timer. Latch a per-thread `overflow`
+health report containing the thread/lane generation, triggering original
+turn correlation, first unqueued raw reference and a saturating count of
+omitted observations. The triggering turn identifies lost evidence, not
+the entire failure target.
+
+Core applies sticky continuity loss to **every nonterminal turn whose
+submission belongs to that quarantined thread generation**, including a
+successor A2 when an old, already settled A tool triggers overflow. Resolve
+A2 promptly under C1 disposition precedence and request interrupt through
+reserved control; do not wait for A2's wall deadline. Preserve A's immutable
+envelope and attribute its late-event loss to A. Close same-thread dispatch
+until detach and clean reopen; unsent queued work retains C1 queue/unknown-
+predecessor rules and is never treated as submitted merely by this failure.
+Health includes the generation, so an in-flight start/acceptance race cannot
+escape continuity-loss handling. Existing queued observation prefixes retain
+their ordering. Do not enqueue lost observations into B's lane or start an
+unbounded spill queue.
+
+While quarantined, continue reading and raw-logging A's traffic, pairing
+responses and declining requests on reserved paths; do not produce further
+ordinary A observations. Its bounded correlation/tool metadata remains
+owned by A, with continuity marked incomplete; do not infer quiescence
+from the surviving subset. Core records explicit normalized-event loss
+with the overflow, and `raw_log_incomplete` only if raw bytes were actually
+lost. Raw evidence is otherwise retained exactly. B's ordinary lane and
+control replies remain independently serviceable. Quarantine remains until
+that thread detaches; a later reopen uses a new lane generation and never
+replays or resends the affected input. Retained old-turn tombstones still
+prevent reassignment. If the reserved correlation/health/control path or
+global/raw budget cannot be maintained, escalate explicitly to connection
+overflow, report every affected session and retire the connection.
+
+The normalizer may still wait on its full **C2 observation channel**, as
+C2 A1/§7 requires; its unchanged 10-second no-drain timer takes the same
+quarantine transition if ingress has not already overflowed. Thus C2 stall
+and Route ingress exhaustion are distinct stages, not two deadlines for
+one full queue. A full C2 channel with no further ingress waits for that
+timer; continued ingress may exhaust its staging earlier.
+Independent sticky health delivery bypasses data lanes. Add a 16 MiB global permit pool
+for all Codex observation/staging lanes and retained tool metadata; per-lane
+ceilings never authorize allocations above it. Measure the expanded
+aggregate budget for 32 loaded leases and four active turns; do not
+preallocate 4 MiB for every idle lease or assume S1's RSS result covers this
+extension. Retain the runtime's 256 MiB RSS acceptance target; a failure
+requires design review, not silent ceiling growth.
+
+## 6. Cancellation and cleanup (P7)
+
+Track every started tool's completion; an interrupt response, turn terminal,
+unsubscribe reply, server leader exit, or empty item list alone does not
+establish tool quiescence. `processId` is an opaque vendor identifier, not
+an OS PID or authority to call `command/exec/terminate` for agent tools.
+
+After the matching interrupted terminal, cancellation is acknowledged.
+With complete observation history and no open tool items, cleanup is
+`quiescent` on vendor evidence. Otherwise cleanup is `pending`, the same
+session's dispatch gate remains closed, and Core uses the single absolute
+cleanup deadline `min(acknowledged_at + 60 seconds, turn.wall_deadline)`.
+If no wall budget remains at acknowledgement, settle `uncertain`
+immediately; do not begin another wait. Matching completions
+for all open tools settle it `quiescent`. Deadline expiration, loss of
+observation continuity or detach before proof settles it `uncertain`.
+No timer resets, late event or repeated cancel extends that wait.
+Wall-budget exhaustion during this wait preserves the already acknowledged
+cancellation under C1 disposition precedence; it does not replace it with
+a new deadline failure or grant another 60 seconds.
+
+At `uncertain`, finalize cancellation with `cancel_cleanup_uncertain`; the
+next queued turn may dispatch with `predecessor_cleanup_uncertain`. This
+explicitly allows possible overlap with a surviving tool. Other threads
+remain usable throughout. If no interrupted terminal arrives before the
+control deadline, report outcome `unknown`; never kill the shared server
+to manufacture `forced`. An ordinary completed terminal that wins the
+race stays completed under C1 precedence.
+
+To preserve terminal-envelope immutability, keep the acknowledged
+cancellation's turn nonterminal while cleanup is pending. Status and
+non-waiting cancel expose `acknowledged/pending`; `wait` resolves only
+when the cancelled envelope is committed with settled cleanup. Preserve
+the vendor terminal timestamp separately from settlement. Later tool events
+remain `late:true` evidence and do not rewrite a settled cancelled envelope.
+The `unknown` revision rule remains unchanged. Section 9 proposes this
+necessary shared-contract clarification explicitly.
+
+## 7. Usage and declared capability
+
+Use `thread/tokenUsage/updated` for its exact thread/turn. `tokenUsage.last`
+maps reported input, cached input, output, reasoning output and total counts
+to canonical usage with `scope:"vendor_interval"`, never `turn` until its
+accounting interval is proved. Preserve `total` as separate reported
+`session_cumulative` vendor metadata, including cache-write counts when
+available. Replace snapshots; never sum repeated notifications or subtract
+totals to invent per-turn usage. Missing data is unavailable, not zero.
+Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
+Add `usage_interval_unverified` while using `last`.
+
+Target capability after the corresponding fixture/live gates: spawn,
+stored-conversation resume, steer, cancel and detach-close native;
+recover unsupported; instructions, effort and output-schema native;
+max_steps unsupported; tokens vendor_interval, cost unavailable. Native
+cancel means protocol cancellation with the cleanup semantics above, not
+all tools stopped. Bounds are separately gated in §3. No declaration may
+claim all 0.157.1 behavior tested merely because the handshake passed.
+
+## 8. Exact acceptance fixtures and remaining live proof
+
+These are required implementation assertions, **not tests run by this
+design task**. Use sanitized fixed protocol fixtures and fake monotonic
+time; retain raw-span evidence for every scenario.
+
+| Fixture name | Observable acceptance |
+|---|---|
+| `codex_pin_handshake` | One initialize/initialized per shared connection; unknown version gated; malformed handshake refuses lease; no experimental flag or opt-out. |
+| `codex_start_order` | Notification before response buffers; paired response accepts once; unknown/duplicate/mismatched response IDs fail; lost/partial start yields unknown and exactly one outbound start. |
+| `codex_resume_identity` | Persistent thread reopened with exact ID and excludeTurns; fresh/different ID fails resume_mismatch; no fallback start; schema/history-clear fields encode exactly. After a bound change and server retirement, resume the exact stored thread with the current sandbox mode, verify identity/policy and assert the next start carries the current full sandboxPolicy rather than spawn-time defaults. |
+| `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
+| `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 1 s deadline holds while data lane full; failed write never recorded as successful decline. |
+| `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. |
+| `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation/raw extraction stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
+| `codex_cleanup_60s` | With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; final completion settles early. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
+| `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
+| `codex_bounds_overflow` | Exact boundary/excess frames, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood stays raw-only/bounded; distinguish normalized loss from actual raw gaps. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
+| `codex_usage_snapshot` | Repeated last/total and decreasing/reset counters never sum or become turn-scoped; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
+| `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
+
+Required live work: `via-5lr.3.4` must observe a real attempted prohibited
+write under read-only, and permitted/denied root and network operations
+for every advertised limited-bound combination, including changed and
+concurrent differing bounds on one server. Model noncompliance or marker
+absence is inconclusive. Verify never-ask after explicit reviewer selection,
+the six response paths where inducible, persistent resume after actual
+server retirement with `excludeTurns:true`, output-schema set/clear,
+usage interval if upgrading its scope, and tool/auth/platform environment
+requirements. Repeat existing steer, interrupt and isolation observations
+through the actual adapter. No live socket rejoin is required or authorized;
+`unknown` recovery suffices. Run standard Rust gates when code exists;
+this document requires link/path/hygiene checks and Sol-high review.
+
+## 9. Proposed exact C1/C2 amendments (separate integration)
+
+Apply only after review; retain the reviewed S1 amendments already being
+integrated. These replacements resolve Codex A7/A8/P7/P11; they do not
+change other vendors' decisions.
+
+**C1 §4.2, replace the Codex app-server row and add its footnote:**
+
+> `codex-app-server`: `read_only` and `workspace_write` are protocol-mapped
+> but unverified until the pinned adapter's enforcement fixtures pass;
+> refuse them as `bound_unsupported` meanwhile. `full` is native with
+> `network:true`; `full` with `network:false` is refused. Network control
+> for limited bounds is declared only for verified combinations. See
+> `docs/specs/vendors/codex.md` §3 and required proof `via-5lr.3.4`.
+> Do not infer enforcement from an absent marker when no write was attempted.
+
+Remove the grouped `codex-cli` claim from this first-release table; no
+fallback route is implemented or enabled by this packet.
+
+**C1 P7, §3.5, §5 and §7.3; C2 §2 Interrupt and §7 item 10:**
+
+> For Codex, matching interrupted terminal evidence acknowledges cancel;
+> its RPC response alone does not. With open tools, expose cleanup `pending`
+> and retain a nonterminal turn until the absolute deadline
+> `min(acknowledged_at + 60 seconds, turn.wall_deadline)`. With no remaining
+> wall budget, settle uncertain immediately. Preserve the already
+> acknowledged cancellation under disposition precedence when wall budget
+> expires. Commit the cancelled terminal envelope once cleanup is
+> `quiescent` or `uncertain`; do not later mutate that envelope. At the
+> deadline settle `uncertain`, warn `cancel_cleanup_uncertain`, and permit
+> the next turn with `predecessor_cleanup_uncertain`. No acknowledgement by
+> the control deadline yields outcome `unknown`. Never kill a shared server
+> for a session's cancel deadline. Late tool completion is retained as late
+> evidence; it does not rewrite a settled cancelled result.
+
+**C1 P11; C2 A8 and §6.2 Process shape:**
+
+> Codex uses an owned stdio app-server shared by compatible leases with key
+> `(codex, observed_binary_version, config_hash)`; config_hash includes
+> VIA-controlled startup and environment configuration, not credentials.
+> The bound is excluded because sandboxPolicy is set explicitly on every
+> turn/start. Mixed-bound operation may be enabled only after the pinned
+> enforcement gate passes. Closing one session detaches its thread and
+> never closes shared stdin; only the Host server lifecycle may stop it.
+
+**C2 A7 and §6.2 Recover; retain C1 P12:**
+
+> Codex live recovery is unsupported on owned stdio. Stored thread/resume
+> is conversation continuation after a resolved turn, not live recovery.
+> After restart, submitted/accepted turns become unknown without resend.
+> Dead requires verified process-death evidence; otherwise return Unknown.
+> No socket rejoin or prototype is required for v1.
+
+**C2 §6.2 Open/StartTurn/Auto-decline and §8 B2/B6:**
+
+> Pin 0.157.1. Use persistent threads, never approval policy and explicit
+> user reviewer; send the frozen structured sandbox policy on every turn.
+> Use thread/resume with excludeTurns and verify returned identity.
+> The six no-grant response bodies in vendors/codex.md §4 validate against
+> the pinned schemas; live receipt is not yet proved. Disable notification
+> opt-outs initially. Interrupted tools were alive at 65 seconds with no
+> item/completed; no late-completion guarantee or thread-to-OS-PID mapping
+> is assumed. B6 remains a limitation handled by settled uncertainty.
+
+**C2 §7 item 6, replace the terminal ordering requirement:**
+
+> Emit one vendor-terminal observation per turn, after previously decoded
+> observations of that turn. Tool completion and other evidence can arrive
+> after vendor terminal; retain their original turn IDs and mark them late
+> after Core's terminal commit. Vendor terminal alone does not seal cleanup.

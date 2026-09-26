@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 via-host = { path = "../via-host" }
 via-store = { path = "../via-store" }
+tokio = { workspace = true, features = ["io-util", "sync", "time", "rt"] }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

@@ -6,6 +6,9 @@ Roles, if used, are caller policy. Sources:
 `docs/workstreams/handoff.md`, `docs/brainstorms/README.md`,
 `docs/brainstorms/access-methods.md`.
 
+First-release harnesses: Claude Code, Codex and OpenCode. ACP and other
+harnesses remain extension concepts, not first-release requirements.
+
 ## Harnesses and adapters
 
 **Harness**:
@@ -122,7 +125,8 @@ One of six library responsibility boundaries, L1 Interface through L6 Host. The 
 A boundary named for its providing layer: C2 Adapter, C3 Route, C4 Wire, C5 Host and S Store. The public C1 contract is named VIA API.
 
 **Passthrough**:
-A mode that forwards native harness arguments unchanged; its results are marked unstructured.
+A proposed later mode that forwards native harness arguments unchanged;
+its results would be marked unstructured. Outside the first release.
 
 **Cost provenance**:
 A cost label: `reported` (vendor's figure), `estimated` (VIA computed), or `unavailable`.

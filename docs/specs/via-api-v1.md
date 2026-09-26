@@ -18,6 +18,12 @@ socket; `via serve --stdio` proxies the same messages. Entities: **session**
 life) and **turn** (one prompt → one envelope), addressed `s_7f3/2`. The
 caller generates the session's handle; the daemon stores only its hash.
 
+**First-release scope (owner, 2026-09-26):** Claude Code, Codex and OpenCode;
+all methods below are in scope. Each route truthfully declares native, partial
+or unsupported vendor behavior. ACP references describe future coverage, not
+a release gate. Language, coding standard, testing policy and S1 scope are
+approved; vendor-dependent decisions remain recorded in the tables below.
+
 | Method | CLI | Handle | Retry-safe by | Result |
 |---|---|---|---|---|
 | `hello` | (implicit) | no | — | daemon and API version |
@@ -42,7 +48,7 @@ caller generates the session's handle; the daemon stores only its hash.
 | Identifiers | `s_` + 12 base32; turn `s_…/N`; vendor session id opaque; handle `h_` + 43 base64url, caller-generated, hashed at rest |
 | Envelope | state, failure class, stop reason, cancel outcome and cleanup, final text, structured output, denied actions, auto-declined requests, route and versions, usage and cost with per-field scope, event range, raw spans, `revision` |
 | Events | `type` tag, per-session dense `seq`, `turn` nullable for session events, `late` flag, optional `raw_ref` |
-| Errors | request errors: JSON-RPC `error` with stable `data.kind`; turn failures: `failure.class`. Once a receipt is issued, every later problem resolves the turn, never a request error |
+| Errors | request errors: JSON-RPC `error` with stable `data.kind`; turn failures: `failure.class`. After a receipt, a persistent Store failure that prevents a terminal commit returns `store_error` with `terminal_persisted:false`, never a fabricated terminal envelope |
 | Evolution | additive; unknown request fields rejected; every wire enum decodes unknown values into an explicit `unknown(raw)` fallback |
 
 **Decisions** (recommendation first, alternatives in §10). **Owner,
@@ -58,13 +64,13 @@ decided in the slice that needs them, after re-probing.
 | P4 | `idempotency_key` scope: per Store, session lifetime; same key + same handle hash + same params → same receipt; else `invalid_params` | as written |
 | P5 | Per-session: `model`, `cwd`, `instructions`; per turn: `effort`, `output_schema`, `deadlines`, `max_steps`, `bound` (D5); omitted = inherit from the latest accepted turn | as written |
 | P6 | Queue limit 8; no dispatch while the predecessor is `running`, `cancel.cleanup: pending`, or unresolved; queued turns behind an `unknown` turn are cancelled | as written |
-| P7 | After cancel `acknowledged` with cleanup `pending` (Codex tool survives interrupt, P2b): wait for the tool item's completion or a cleanup deadline (60 s), then record `uncertain` and dispatch with a warning, or block until the caller acts | wait then dispatch with warning; alternative: block |
+| P7 | Codex interrupted terminal evidence acknowledges cancel, but open tools keep the turn nonterminal with cleanup `pending` until tool quiescence or `min(acknowledged_at + 60 s, turn.wall_deadline)`; settle `quiescent` if proved, otherwise `uncertain` and dispatch with a warning. With no remaining wall budget, settle immediately. Late tool completion does not rewrite the settled envelope | as reviewed in `docs/specs/vendors/codex.md` §9 |
 | P8 | Error code table §8.1 | as written |
 | P9 | Deprecation: kept for one minor release minimum; removed only in v2 | as written |
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
-| P11 | Server-sharing key includes the bound only where the bound wraps the whole server (OpenCode, D9); Codex applies `sandboxPolicy` per turn, key omits bound; on bound-keyed routes a bound change on resume is refused (amends D7 wording) | as written; alternative: migrate the session to another server (unproven) |
+| P11 | Codex owned stdio server key is `(codex, observed_binary_version, config_hash)` without bound; `config_hash` includes VIA-controlled startup/environment configuration, not credentials. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode keys include the full effective bound, VIA owner session and durable private namespace; no cross-owner server sharing or live-session migration. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §2 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
-| P13 | Version gate: tested ranges per adapter; outside them every verb is `untested` and bound-bearing verbs are refused unless `allow_untested` (replaces "refuse on major") | as written |
+| P13 | Version gate: tested sets or ranges per route (Claude initially exactly `{2.1.283}`); outside them version status is `untested` and bound-bearing spawn/resume are refused unless immutable session policy `allow_untested` is true. Read/cleanup verbs remain available | as reviewed in `docs/specs/vendors/claude-code.md` §10 |
 
 ## 1. Scope, transport, versioning
 
@@ -72,8 +78,18 @@ decided in the slice that needs them, after re-probing.
   one JSON object per line, UTF-8, line length capped (Proposed 16 MiB).
   Requests carry `id`; notifications flow daemon → client only for follow
   (§3.11). No batches. `via serve --stdio` forwards messages unchanged.
+  Parse JSON with depth at most 64 and 65,536 nodes per document before
+  constructing an unbounded value; reject an excess as the named parse or
+  parameter error. The 16 MiB limit includes the line feed.
 - **Socket (P10).** Directory validated (owner, 0700, no symlink); socket
   0600; both ends verify the peer uid (coding-style §6).
+- **Local paths.** The daemon and CLI resolve `VIA_STATE_DIR` and
+  `VIA_RUNTIME_DIR` once at startup, with defaults, exact layout and locks
+  specified by [runtime §6.1](runtime-contracts.md). These are local process
+  settings, not C1 fields or vendor environment passthrough. `daemon/status`
+  reports the resolved socket and Store paths. The CLI compares the existing
+  daemon's Store path with its expected path after hello/status and exits 4 on
+  mismatch without stopping that daemon.
 - **Handshake (decided).** First request must be `hello`; else
   `handshake_required`.
 
@@ -99,6 +115,8 @@ decided in the slice that needs them, after re-probing.
   verbs one line. Exit codes: 0 success; 2 request error; 3 turn ended
   `failed`, `cancelled` or `unknown`; 4 daemon unreachable; 130 foreground
   wait interrupted (the session keeps running; the receipt was printed).
+  `via daemon` starts the foreground server; `via daemon status` and
+  `via daemon stop` remain client verbs.
 
 ## 2. Identifiers and the caller handle
 
@@ -134,17 +152,17 @@ with their `op_key` for reconciliation.
 
 ### 3.1 `describe` — preflight, no side effects
 
-CLI: `via describe --harness codex --model M --bound workspace-write [--network] [--require steer,cancel] [--vendor codex.k=v]`
+CLI: `via describe --harness codex --model M --bound full --network [--require steer,cancel] [--allow-untested] [--vendor codex.k=v]`
 
 Params: `harness?`, `model?` (one required), `bound?`, `require?`,
-`vendor?`, `cwd?`. Result, a **route plan**; `capabilities` is the DTO of
+`vendor?`, `cwd?`, `allow_untested?` (default false). Result, a **route plan**; `capabilities` is the DTO of
 §4.1:
 
 ```json
 {"harness":"codex","model":{"requested":"gpt-6-sol","resolved":"gpt-6-sol"},
- "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.156.1",
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1",
  "version_status":"tested","capabilities":{…},
- "effective_bound":{"mode":"workspace_write","extra_write_dirs":[],"network":false},
+ "effective_bound":{"mode":"full","extra_write_dirs":[],"network":true},
  "refusals":[],"warnings":[]}
 ```
 
@@ -153,7 +171,7 @@ Never starts a process or server (Q5). Errors: `unknown_model`,
 
 ### 3.2 `spawn` — new session and turn 1
 
-CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background]`
+CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--allow-untested] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background]`
 
 Params: §4 parameters, `handle` (required), `require?`, `label?`,
 `idempotency_key?`. The daemon validates, resolves the model, runs the
@@ -162,7 +180,7 @@ Store transaction, then returns the receipt; dispatch follows.
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","turn":"s_7f3k9q2mzr4c/1","state":"queued",
- "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.156.1",
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1",
  "version_status":"tested","capabilities":{…},
  "effective":{"model":"gpt-6-sol","effort":"high","bound":{…},"deadlines":{"wall_ms":3600000,"idle_ms":600000},"max_steps":null},
  "warnings":[]}
@@ -173,12 +191,18 @@ Errors: `invalid_params` (incl. `vendor_option_conflict`), `unknown_model`,
 `admission_refused`, `store_error`. Idempotency (P4): same key + same handle
 hash + byte-identical params → the stored receipt; different handle or
 params → `invalid_params` with `kind: idempotency_conflict`.
+`allow_untested` is included in that exact retry identity. It waives only
+the tested-version restriction, never unsupported bounds, protocol validation,
+required capabilities, identity continuity, never-ask policy or executable-
+version consistency.
 
 ### 3.3 `resume` — add a turn
 
 CLI: `via resume <session> --prompt "…" [per-turn flags] [--op-key K]`
 
 Params: `session`, `handle`, `prompt`, per-turn parameters (§4), `op_key?`.
+`allow_untested` is inherited session policy; attempting to change it on
+resume is `invalid_params`.
 Result: `{turn, state: "queued"|"running", queue_position, effective: {…},
 warnings}`. Effective values are frozen at acceptance (§7.3). A given
 `bound` is re-validated against the route (D7), recorded on this turn, and
@@ -210,9 +234,19 @@ Params: `session`, `handle`, `turn?`, `force_after_ms?` (Proposed default
 
 `outcome` (§7.4) is protocol acknowledgement only. `cleanup` says whether
 side effects are known to have stopped: `quiescent` (private process group
-exited, or the vendor reported every tool item of the turn completed),
+absence positively proved under §7.5, or the vendor reported every tool
+item of the turn completed),
 `uncertain` (acknowledged but not provable), `pending` (still waiting for
-tool completion or the cleanup deadline). Codex P2/P2b: after
+tool completion or the cleanup deadline). For Codex, the matching
+`turn/completed:interrupted` acknowledges cancel; the interrupt RPC response
+alone does not. With open tools, the turn remains nonterminal while cleanup
+is `pending` until `min(acknowledged_at + 60 s, turn.wall_deadline)`. If
+the wall budget has expired, settle `uncertain` immediately. On tool
+quiescence or that deadline, commit one `cancelled` envelope with cleanup
+`quiescent` or `uncertain`. At uncertainty, warn `cancel_cleanup_uncertain`;
+a successor may dispatch with `predecessor_cleanup_uncertain`. No
+acknowledgement by the control deadline gives outcome `unknown`. Late tool
+completion remains late evidence and does not rewrite that envelope. Codex P2/P2b: after
 `interrupted` the tool's `sleep 120` ran to the 60 s poll limit;
 `command/exec/terminate` does not apply to agent-started tools and
 `thread/unsubscribe` does not stop them, so on a shared server a tool
@@ -236,18 +270,29 @@ Idempotent; a second `close` during closing waits for the first.
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","vendor_session_id":"019…","cwd":"/work/repo","process":{"alive":true,"idle_since":null},
+ "route":"codex-app-server","vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "queue":[{"n":3,"op_key":"k-17","queued_at":"…","effective":{…}}],
  "turns":[{"n":1,"state":"completed","revision":0},{"n":2,"state":"running"},{"n":3,"state":"queued"}],
- "label":null,"created_at":"…","updated_at":"…"}
+"label":null,"created_at":"…","updated_at":"…"}
 ```
+
+`vendor_session_id` is nullable and contains only the last confirmed vendor
+ID. `vendor_identity_verified` is false until the current connection
+generation is confirmed. A first Claude logical open may return with an
+internal expected UUID while the public ID is null/verification false;
+reopening may display the historical confirmed ID with verification false.
+The VIA session/receipt exists independently of vendor confirmation.
 
 ### 3.8 `wait`, 3.9 `result`
 
 `via wait <session|turn> [--timeout-ms N]`; `via result <session|turn>`.
 `wait` blocks until the addressed turn is terminal (`wait_timeout` on
 expiry); `result` returns the envelope now or `turn_not_finished`.
+After a receipt, a persistent Store failure that prevents terminal persistence
+returns `store_error` with `session`, `turn`, last-known `durable_state` and
+`terminal_persisted:false`. It is a request error for the read, not a terminal
+envelope. An already committed, readable terminal result is returned as is.
 
 ### 3.10 `list`
 
@@ -255,7 +300,9 @@ expiry); `result` returns the envelope now or `turn_not_finished`.
 Ordered by `(updated_at desc, session_id)`; `cursor` is an opaque keyset
 cursor over that order (stable across concurrent updates: a session updated
 after the cursor was issued may appear again, never be skipped). Result
-`{sessions: [summary], next_cursor}`.
+`{sessions: [summary], next_cursor}`. The page stops at both requested item
+count and 1 MiB encoded bytes; an individual result that cannot fit the
+bounded response is refused with `admission_refused`, never truncated.
 
 ### 3.11 `events` — page or follow
 
@@ -265,37 +312,64 @@ Params: `session` or `turn`, `after?` (default 0), `limit?` (default 200,
 max 1000), `follow?`, `types?`. Result `{events, next_after, more: bool,
 earliest_seq, subscription?}`. Semantics:
 
-- The page is a Store scan in `seq` order from `after`, filtered by `types`
-  (gaps in `seq` are expected under a filter).
-- `follow: true` registers the subscription at `next_after` in the same
-  Store read transaction, so the replay → live boundary has no gap: the
-  daemon keeps reading the Store from the cursor and pushes each event as
-  `{"method":"event","params":{"subscription":"sub_…","event":{…}}}`; when
-  the cursor reaches the head it continues with live commits.
+- The page is a bounded Store scan in `seq` order from `after`, filtered by
+  `types` (gaps in `seq` are expected under a filter). It stops at both the
+  requested count and 1 MiB encoded bytes. `next_after` is the last scanned
+  seq, including filtered-out events; `more` uses the committed head captured
+  with the page. An individual result exceeding the response bound is
+  `admission_refused`, never a truncated success.
+- `follow: true` serializes cursor registration with commit notifications in
+  the session actor after the bounded Store read. The initial page is queued
+  before live notifications. The daemon rescans durable `seq > scan_cursor`
+  and checks the durable head before waiting for a wake, so notifications are
+  hints and the replay → live boundary has no gap. No subscription row is
+  stored. It pushes each matching event as
+  `{"method":"event","params":{"subscription":"sub_…","event":{…}}}`.
+  The scan cursor advances across filtered events; the delivery cursor advances
+  only after complete notification writes. A seq is never enqueued twice.
 - Session-wide follow (Q1): covers every turn until `session.closed`;
   turn follow ends at that turn's `turn.ended`.
-- Each subscription has a bounded outbox (Proposed 1000 events). If the
-  client lags past it the daemon sends `{"method":"event_end","params":
+- Each subscription has an outbox of at most 1000 events and 1 MiB; at most
+  32 subscriptions exist daemon-wide and 8 per socket, with a 16 MiB total
+  outbox budget. On exhaustion, freeze it, discard unsent entries and reserve
+  one termination notice outside the data outbox. The daemon attempts
+  `{"method":"event_end","params":
   {"subscription","reason":"lagged","resume_after":<seq>}}` and the client
-  re-requests from `resume_after`. Other `reason` values: `terminal`,
-  `unsubscribed`, `closing`.
+  re-requests from `resume_after`. This cursor is the last fully written
+  notification seq or the acknowledged initial-page cursor, not proof that
+  the client read the bytes. Clients should retain their last received seq.
+  Other `reason` values: `terminal`, `unsubscribed`, `closing`, `store_error`.
+  `event_end` is best-effort: finish any started NDJSON frame, attempt the
+  notice within one 2 s absolute writer deadline, then close on timeout.
+  Subscription and outbox ownership is released within 2 s even for a peer
+  that never reads. If several subscriptions fail together, the socket may
+  close after the first notice/deadline.
 - History pruned by retention: `history_pruned` error carrying
   `earliest_seq` when `after < earliest_seq - 1`.
-- `unsubscribe {subscription}`; a connection close drops its subscriptions.
+- `unsubscribe {subscription}` removes unsent entries, finishes any started
+  frame within the same 2 s bound, then queues `event_end:unsubscribed` before
+  the reply. No event for that subscription is enqueued after the reply.
+  Connection close drops its subscriptions immediately in memory. Terminal
+  detection follows the scan even when its event type is filtered out.
 
 ### 3.12 `logs` — raw-log excerpts
 
 `via logs <session|turn> [--after SEQ] [--limit N]`. Returns the bytes each
 addressed event's `raw_ref` points to (lossy UTF-8), in event order:
 `{entries: [{seq, direction, connection_id, offset, len, text}], next_after}`.
-Never another session's traffic (D4); only referenced spans are read.
+Never another session's traffic (D4); only referenced spans are read. Pages
+stop at both requested item count and 1 MiB encoded bytes. A single entry
+too large for the bounded response is `admission_refused`, never silently
+truncated; missing or corrupt referenced raw evidence is `store_error`.
 
 ### 3.13 `models`; 3.14 `daemon/status`, `daemon/stop`
 
 `via models [--harness H]` → `{models: [{model, harness, aliases, source}]}`.
 `via daemon status` → `{daemon_version, pid, started_at, sessions: {idle,
 active, closing}, servers: [{harness, vendor_version, key, sessions}],
-socket_path, store_path}`. `via daemon stop [--drain|--force]`: refuses
+socket_path, store_path, health}`. `health` reports `healthy` or
+`store_failed` with a bounded failure kind and affected IDs from memory,
+without prompts, payloads or handles. `via daemon stop [--drain|--force]`: refuses
 while sessions are active unless `drain` (gate every session `closing`
 for new work, run accepted queued turns to completion, then stop) or
 `force` (close every session with mode `force`; turns end `cancelled` or
@@ -307,6 +381,7 @@ for new work, run accepted queued turns to completion, then stop) or
 |---|---|---|---|
 | `harness` | `claude`, `codex`, `opencode`, `acp:<agent>` | session | optional if `model` resolves |
 | `model` | string | session (P5) | `resolved` reported in the envelope |
+| `allow_untested` | bool, default false | session | immutable after spawn; describe may request a route plan using it; applies only to tested-version restriction (P13) |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused |
 | `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial) |
 | `prompt` | string | per turn | required |
@@ -340,33 +415,56 @@ parameters on `resume` are `invalid_params`.
 
 `support` ∈ `native`, `partial` (with `semantics`), `unsupported` (with
 `reason`). `require` passes only `native` unless written `verb:partial`.
+The JSON above illustrates DTO shape; route-specific current qualification
+and refusals are governed by §4.2.
 
 ### 4.2 Bound combinations and precedence
 
 | Route | `read_only` | `workspace_write` | `full` | `network: false` |
 |---|---|---|---|---|
-| `codex-app-server`, `codex-cli` | native | native (`writableRoots` = extra dirs) | native | native for `read_only` and `workspace_write`; **refused with `full`** (no field on `dangerFullAccess`) |
-| `claude-cli` | unverified: tool-permission based | unverified | native | refused |
-| `opencode-serve` | refused (A4, D9) | refused | native | refused |
+| `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
+| `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test | refused, including limited bounds |
+| `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before namespace allocation/I/O | refused |
 | ACP | refused (D7) | refused | native | refused |
+
+For pinned OpenCode 1.18.32, `describe` declares optional
+`params.max_steps` unsupported with a reason. A non-null effective value is
+refused by Core preflight before namespace allocation or vendor I/O as
+JSON-RPC `-32602`, `data.kind: "invalid_params"`, naming the field and route.
+Null/omitted values follow ordinary inheritance and clearing;
+`allow_untested` does not waive this refusal. This does not remove any C1
+method from the first-release surface (`vendors/opencode.md` §3).
 
 Rules: an unenforceable combination is `bound_unsupported` naming the
 route and the reason. `vendor` options that touch permission, sandbox,
 approval, instructions, cwd, model or session identity are refused as
 `invalid_params` kind `vendor_option_conflict` (reserved key list per
 adapter in C2 §6); canonical parameters always win.
+For Codex, limited bounds are omitted from `describe.capabilities.bounds`
+until `via-5lr.3.4` verifies their enforcement. Its full-access eligibility
+does not qualify mixed-bound sharing. The grouped `codex-cli` route is not
+enabled in this first-release table. For Claude, tool permissions differ from
+Bash OS sandboxing and all-tool containment. `describe` distinguishes the
+temporarily refused limited bounds from the separately pending full recipe;
+full is not refused by CLAUDE-BOUND-1 itself. No candidate is a live
+qualification claim.
 
 ## 5. Result envelope
 
 Immutable once terminal, except `unknown` revised by late evidence (§7.6);
 `revision` counts revisions and `turn.revised` announces them.
+Accumulation is bounded to 1 MiB encoded per turn, including text and
+collections. On overflow Core fails the turn with class `overflow`, persists
+a bounded failure summary and leaves the raw log as evidence; no successful
+result is silently truncated. A terminal envelope that cannot fit the 16 MiB
+socket response limit is a named `admission_refused` read error.
 
 ```json
 {"api_version":1,"session_id":"s_7f3k9q2mzr4c","turn":2,"address":"s_7f3k9q2mzr4c/2","revision":0,
  "state":"cancelled","failure":null,"stop_reason":"interrupted","vendor_stop_reason":"interrupted",
  "cancel":{"outcome":"acknowledged","cleanup":"uncertain","requested_at":"…","settled_at":"…"},
  "harness":"codex","model":{"requested":"gpt-6-sol","resolved":"gpt-6-sol"},"effort":{"requested":"high","resolved":"high"},
- "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.156.1","version_status":"tested",
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1","version_status":"tested",
  "vendor_session_id":"0192f…","cwd":"/work/repo",
  "bound":{"requested":{…},"effective":{…},"inherited":true},
  "final_text":"","structured_output":null,
@@ -412,7 +510,7 @@ envelope except through §7.6. `raw_ref` is `null` for synthesized events.
 
 | Type | Payload | Committed by |
 |---|---|---|
-| `session.opened` / `session.closed` / `session.reopened` | `route`, `vendor_session_id`, `vendor_version` / `reason` / `reason` | Core |
+| `session.opened` / `session.closed` / `session.reopened` | `route`, confirmed `vendor_session_id`, `vendor_version` / `reason` / `route`, confirmed `vendor_session_id`, `vendor_version`, `reason` | Core |
 | `turn.queued` / `turn.submitted` / `turn.started` | `queue_position` / `attempt` / `effective` | Core |
 | `turn.ended` | `state`, `failure?`, `stop_reason`, `cancel?` | **Core only** |
 | `turn.revised` | `revision`, `from_state`, `state`, `evidence` | Core |
@@ -426,6 +524,14 @@ envelope except through §7.6. `raw_ref` is `null` for synthesized events.
 | `warning` | `code`, `message` | either |
 | `process.exited`, `server.lost`, `raw_log.incomplete` | `code`, `signal` / `key` / `connection_id` | Core (from Host / Wire) |
 | `vendor.other` | `vendor_type`, `payload` (bounded) | Adapter |
+
+For a delayed-init CLI such as Claude, `session.opened`/`session.reopened`
+is committed exactly once per connection generation only after matching
+vendor identity confirmation. Core atomically persists the confirmed ID and
+verification flag with that event, before any acceptance derived from the
+same frame. A pre-init startup/resume rejection emits neither event, even
+when it echoes the expected UUID. Matching init confirms identity, not turn
+acceptance; prompt-associated evidence is still required.
 
 Rust: `#[serde(tag = "type")]`, tags set with `rename`, unknown types kept
 as `Other { type, payload }`.
@@ -466,14 +572,16 @@ and the next `resume` reopens the vendor session (`session.reopened`).
 ### 7.3 Queue and dispatch gate
 
 One FIFO per session, capacity 8 (P6). The next turn dispatches only when
-the predecessor is terminal **and** its cleanup is settled: `quiescent`,
-not applicable, or (P7) `pending` resolved by the cleanup deadline
-(Proposed 60 s, or the turn's remaining wall budget if shorter) — then the
-predecessor's cleanup is recorded `uncertain` and the new turn carries
-`predecessor_cleanup_uncertain`. While `pending`, Core waits for the
-vendor's tool-completion notification (Codex `item/completed` for the
-running `commandExecution` item). Behind an `unknown` predecessor the queue
-is cancelled. Admission
+the predecessor is terminal and cleanup is settled: `quiescent`,
+`uncertain` under P7, or not applicable. For Codex, vendor interrupted
+evidence may acknowledge cancel while open tools keep the turn nonterminal
+with `pending` cleanup until `min(acknowledged_at + 60 s,
+turn.wall_deadline)`. If the wall budget is exhausted, settle immediately.
+Core waits for tracked tool completion, then commits the cancelled terminal
+with `quiescent`; otherwise at the deadline it commits `uncertain` and a
+`cancel_cleanup_uncertain` warning. The next turn carries
+`predecessor_cleanup_uncertain`. A late completion does not rewrite the
+settled envelope. Behind an `unknown` predecessor the queue is cancelled. Admission
 (daemon-wide budget, D7) is checked at dispatch. Only turns with no
 `submitted_at` may ever be dispatched automatically (Astra 3).
 
@@ -484,40 +592,54 @@ is cancelled. Admission
 `control_response success` for `interrupt` followed by a `result` with
 `subtype: error_during_execution` and `terminal_reason: aborted_tools`,
 P5), `forced` (Host killed a private process group after the deadline),
-`unknown` (deadline passed on a shared server, or evidence lost). Cleanup
+`unknown` (no acknowledgement by the control deadline on a shared server,
+or evidence lost). A later wall-budget expiry preserves an already
+acknowledged cancellation under §7.6 precedence. Cleanup
 certainty is separate (§3.5).
 
 ### 7.5 Crash recovery (D2, P12)
 
-The new daemon reads the Store. Per turn: `queued` with no `submitted_at`
-→ stays queued; `submitted_at` without `accepted_at` → `unknown`;
-`accepted` → `unknown`, unless the route declares `recover: native` for
-the configured transport and the adapter rejoins (then `running` with
-`session.reopened`); Host finds no process with the VIA marker for a
-per-session route → `failed(daemon_restart)` when the vendor also confirms
-nothing accepted, else `unknown`. Per-session processes can outlive the
-daemon (Claude P4: the orphaned `claude` stayed alive after its parent was
-killed), so recovery finds them by uid, start time, group and marker
-(coding-style §6) and kills the group of any it cannot rejoin; unmatched
-processes are reported, never signalled. A stdio-attached shared server
-dies with the daemon (P3), so its sessions resolve by this table with
-"no survivor".
+The new daemon validates Store and raw evidence and commits recovery before
+admission. Per turn: `queued` with no submission intent stays queued only when
+no predecessor is `unknown`; an intent without accepted evidence becomes
+`unknown`; an accepted turn becomes `unknown` unless a route's rejoin was
+probe-verified on the configured transport. Queued successors of `unknown`
+are cancelled. None of these turns is resent automatically. Process exit,
+including a `Dead` recovery report, does not prove the vendor took no action
+or that submission never happened.
+
+For a private process, Host uses only the persisted full **anchor** identity,
+generation and private socket to find and challenge a live anchor. It verifies
+the control peer and the anchor's own marker/identity before asking that same
+anchor to stop its own group. Vendor child identity is separate process
+evidence, never signalling authority. There is no scan of vendor environments,
+no vendor marker discovery and no daemon-side numeric TERM/KILL of a saved
+pid or pgid. If the anchor is absent or unverified, Host does not signal.
+Cleanup is `uncertain` unless a same-boot, same-PID-namespace, non-signalling
+group query proves `ESRCH` for a persisted Host-created group with full
+identity, generation and pgid > 1 (runtime contract §5.2). `Ok`, `EPERM`,
+other errors or namespace mismatch do not prove absence. Positive group
+absence can make cleanup `quiescent`; it cannot prove vendor terminal state,
+protocol acknowledgement, forced outcome or reaping, and the restarted turn
+remains `unknown`. A stdio-attached shared server dies with the daemon (P3);
+that does not prove its submitted work had no effect.
 
 ### 7.6 Disposition table (evidence → resolution, first matching row wins)
 
 | Evidence | While | Result |
 |---|---|---|
-| Vendor terminal `interrupted`/`cancelled` after a VIA cancel | running | `cancelled`, outcome `acknowledged` |
+| Vendor terminal `interrupted`/`cancelled` after a VIA cancel | running | outcome `acknowledged`; with open tools keep turn nonterminal until P7 cleanup settles, then `cancelled` |
 | Vendor terminal error with cancel-specific markers after a VIA cancel (Claude `aborted_tools`) | running | `cancelled`, `acknowledged` |
 | Vendor terminal `completed` | running | `completed`; `stop_reason` from vendor |
 | Vendor terminal `failed` | running | `failed`, class from vendor code (§8.2) |
 | Core deadline | running | Core cancels (§7.4); result `failed`, class `deadline_wall`/`deadline_idle`, `cancel` filled |
-| Force deadline, private process | running | `cancelled`, `forced`, cleanup `quiescent` after group exit |
+| Force deadline, private process | running | `cancelled`, `forced` only with Host evidence; cleanup `quiescent` only after verified group absence (§7.5) |
 | Force deadline, shared server | running | `unknown`, outcome `unknown` |
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |
 | Transport lost, process alive or unconfirmed | running | `unknown` |
-| Raw-log or event overflow failed the connection | running | as server death / process exit above, plus `raw_log_incomplete` |
+| Codex per-thread ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread dispatch until clean reopen; preserve prior terminal envelopes and other threads; record normalized-event loss separately from any actual raw gap (C2 §4) |
+| Raw-log or event overflow failed the connection | running | resolve by applicable server death/process exit evidence; `raw_log_incomplete` only when raw bytes were actually lost, while normalized-event loss is separately recorded |
 | Submission rejected definitively | submitting | `failed(submit_failed)` |
 | Daemon restart | any | §7.5 |
 | Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; followers whose subscription ended must poll `result` |
@@ -546,13 +668,13 @@ dies with the daemon (P3), so its sessions resolve by this table with
 | -32009 | `harness_unavailable` | binary missing, version refused (P13), server failed to start |
 | -32010 | `unknown_model` | |
 | -32011 | `queue_full` | |
-| -32012 | `admission_refused` | |
+| -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response |
 | -32013 | `no_active_turn` | |
 | -32014 | `turn_mismatch` | |
 | -32015 | `turn_not_finished` | |
 | -32016 | `wait_timeout` | |
 | -32017 | `daemon_stopping` | |
-| -32018 | `store_error` | |
+| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. A persistent raw-reference read failure also uses this kind. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
 
 ### 8.2 Turn failure classes (`failure.class`)
@@ -576,12 +698,26 @@ Adapters never commit a class; they report observations and Core commits
 
 ## 9. Security notes
 
-- Socket and state directory per coding-style §6; one daemon per user; no
-  network listener in v1.
+- Socket and state directory per coding-style §6; one daemon per user. The
+  public C1 API has no network listener in v1: clients use the user-only Unix
+  socket or stdio proxy. A VIA-owned vendor server may use a private,
+  authenticated loopback HTTP listener with verified process/listener
+  provenance. VIA never attaches to an unrelated vendor listener.
 - Handle: caller-generated, hashed at rest, never returned or traced.
-- Credentials (invariant 1): never read, stored or forwarded. Generated
-  server passwords (OpenCode) live only in daemon memory and the server's
-  environment.
+- VIA never reads, copies, reuses or logs user/provider credentials. For the
+  full-bound OpenCode route, VIA generates a fresh password per owned server,
+  retains it in daemon memory and injects it only into that server's launch
+  environment; VIA does not persist or emit it in Store, argv, diagnostics or
+  transport captures/metadata. As an owner-authorized temporary exception,
+  vendor tool children may inherit that generated instance password. Each
+  server/password/private namespace belongs to one VIA session; cross-session
+  sharing is prohibited. Loopback Basic Auth and listener provenance are
+  mandatory. Full-bound sessions do not isolate hostile same-user processes;
+  this exception does not authorize access to user/provider credentials.
+  Revisit at the next vendor-pin/security review and before changing sharing,
+  listener exposure, credential reuse or the advertised trust boundary.
+  OC01/OC02/OC12 control tests in `vendors/opencode.md` remain required;
+  complete child-environment scrubbing is deferred to `via-4sw.4`.
 - Prompts and outputs are private local data; retention is daemon config
   (Proposed 30 days); vendor processes get a per-adapter environment
   allow-list, never the caller's environment.
@@ -592,14 +728,14 @@ Adapters never commit a class; they report observations and Core commits
 Confirmed by review (Astra): Q1 session-wide follow; Q2 VIA validates
 structured output; Q3 `wait` = latest turn at acceptance; Q4 15-minute
 process shutdown, configurable; Q5 catalog-only `describe`. D9 stays open.
-Owner, 2026-09-26: P12 approved as written; P7, P11 and P13 are decided in
-the slice that needs them.
+Owner, 2026-09-26: P12 approved as written; P7/P11 and P13 are resolved by
+the reviewed Codex and Claude vendor packets. Vendor live gates remain open.
 
 | # | Question | Recommendation / alternatives |
 |---|---|---|
-| P7 | dispatch after `pending` cleanup | wait for tool completion or 60 s, then warn; alternative: block until the caller resumes with `--after-uncertain` |
-| P11 | server key vs per-turn bound | refuse bound change on bound-keyed routes; alternative: session migration (unproven) |
+| P7 | Codex pending cleanup | reviewed §3.5/§7.3 rule: settle at `min(acknowledged_at + 60 s, wall_deadline)`; do not add `--after-uncertain` |
+| P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation awaits enforcement proof; OpenCode key includes full bound, owning VIA session and durable private namespace, refusing bound changes or cross-owner sharing |
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
-| P13 | version gate | tested ranges + `allow_untested`; alternative: refuse outright |
-| Q6 | Claude steer semantics: P5 shows busy input merged into the running turn's single `result`; declare `partial: merged_into_active_turn` or `unsupported`? | `unsupported` until a second probe on the pinned version shows the merge is deterministic |
+| P13 | version gate | tested sets/ranges + immutable `allow_untested`; Claude initial set exactly `{2.1.283}` |
+| Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |
 | Q7 | Outbox and channel sizes (1000 events; C2 A1 limits) | as written, config-tunable |

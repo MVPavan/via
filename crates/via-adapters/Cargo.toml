@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 via-routes = { path = "../via-routes" }
+tokio = { workspace = true, features = ["time", "sync"] }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

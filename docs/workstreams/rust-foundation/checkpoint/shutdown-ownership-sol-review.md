@@ -1,0 +1,9 @@
+> Preserved at the owner-directed pause, 2026-09-26. Historical snapshot: source line numbers and intermediate dispositions below may predate the frozen code. Refer to `../session-handoff.md` for current status. Artifact filenames without a repository path refer to the original local-only scratchpad directory.
+
+> Design correction received Astra-high design and Sol-high PASS. Shared-spec integration, implementation and acceptance remain pending. Preservation here does not apply the proposed amendments.
+
+# S1 shutdown-ownership seam — independent Sol review
+
+**PASS as a design correction; implementation and positive acceptance remain open.** `shutdown-ownership-seam.md` §1 retains unfinished registry joins after a caller timeout or cancellation of the shutdown future while the daemon lives; it does not release capacity from a timed-out wait. §2 correctly treats C1 `{"stopping":true}` as request acceptance only, preserves `--drain` turns' existing work deadlines, and applies one final 10-second deadline (F12 starts at first Store failure). Only daemon main may select incomplete exit 4; OS adoption, handle drop, abort and SIGKILL prove neither reaping nor quiescence. Clean exit still needs positive group absence, joins and Store/raw durability.
+
+The proposed Host report (§3) fixes real current losses: `host.rs` shutdown's `recovery?` can erase pending counts, `join_owned_tasks` ignores JoinErrors, and the reaper ignores `anchor.wait()` failure. Preserve partial recovery plus pending/failed/failure fields on every path. Current CLI server's pre-cleanup stopping reply and unbounded join/drop also need the stated main-owned bounded exit. §4's regressions retain F19–F22/P-I2 positive cases, including post-exit anchor absence proof; incomplete exit is not a substitute. No new RPC, supervisor or indefinite-reaper guarantee is required. No source/shared edit or test ran.

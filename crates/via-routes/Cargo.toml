@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 via-wire = { path = "../via-wire" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

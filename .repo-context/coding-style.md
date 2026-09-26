@@ -109,7 +109,8 @@ the set.
   admitted and keep ownership until it completes.
 - **Channels are bounded;** unbounded channels are not used. At each channel,
   a comment says what happens when it is full (wait, drop and count, or
-  fail).
+  fail). C2 observations have both 1024-item and 4 MiB/session limits; their
+  control lane and sticky health failure path cannot wait behind data.
 - **Pipe reads never wait for consumers.** One reader task per vendor pipe
   reads continuously. Raw-log staging is bounded in bytes. If lossless
   recording cannot keep up, or a raw-log write fails, the connection fails:
@@ -140,28 +141,50 @@ the set.
 
 ## 6. Processes, environment and the socket
 
-- Start vendor processes with `process-wrap`'s process-group wrapper,
-  explicitly (the dependency alone creates no group), with the VIA marker
-  variable, an argv array (never `sh -c` or a command string), an explicit
-  cwd, and a recorded pid, pgid, uid and process start time. Host keeps the
-  child handle and reaps every child it starts. Killing means the whole
-  group, with timed escalation.
-- **Process identity after a crash.** Before signalling a recovered pid or
-  pgid, positively confirm uid, process start time, group and marker. If
-  identity is uncertain, report an orphan and do not signal. Implement and
-  test discovery separately on Linux and macOS. Never attach to, signal or
-  reap a process VIA did not start.
+- Start one small Host anchor per private process group as an internal
+  entrypoint of the same `via` binary, using `process-wrap`'s explicit group
+  wrapper. The anchor launches the vendor in its inherited group with an argv
+  array and explicit cwd. It holds the vendor child handle and reaps that
+  child while alive; the daemon reaps the anchor. Detach the anchor's own
+  stdin/stdout/stderr pipe copies to `/dev/null` before spawn success ACK,
+  using safe stdio replacement. Failed detachment gives no successful
+  acquisition and starts bounded own-group cleanup. On forced group KILL,
+  the anchor/reaper dies too; remaining children are adopted/reaped by the OS
+  and must never be reported as Host-reaped.
+- **Process identity after a crash.** Persist a fresh immutable generation in
+  anchor intent, then the full anchor identity and an atomic `ArmIntent`
+  (`identified` → `arm_intent`) before sending ARM once. An uncertain commit,
+  partial ARM write or lost acknowledgement prohibits ARM resend. Recovery
+  challenges only the saved private socket and verifies the live anchor's
+  peer uid/pid, start, boot, namespace, group and private marker before asking
+  it to signal its own group. Vendor child identity is distinct process
+  evidence, never signalling authority. Never perform a vendor-environment
+  scan or daemon-side numeric TERM/KILL. Without a verified anchor, do not
+  signal; cleanup is uncertain unless a same-boot/namespace, non-signalling
+  group query returns `ESRCH` for the persisted Host-created group with full
+  identity, generation and pgid > 1. Process exit alone does not prove
+  non-submission or group absence. Implement and test native identity and
+  positive absence on each platform before claiming it.
 - **Environment.** Build each vendor's environment from an explicit,
   reviewed per-adapter allow-list plus the VIA marker; never pass the
-  caller's full environment. Invariant 1: never read, copy or log vendor
-  credentials.
+  caller's full environment. The marker is launch data only and is never
+  recovered by reading vendor environments. The anchor's private marker and
+  control token are never inherited by the vendor. Invariant 1: never read,
+  copy or log vendor credentials.
 - **Socket and state directory.** Validate the state/runtime directory's
   owner, mode (`0700`) and file type, and reject symlinks. Create the socket
   with restrictive permissions (`0600`) from the start. Take the
   single-instance lock before checking or replacing a stale socket; never
   unlink the lock file while in use. Both ends verify the peer uid before
-  any protocol traffic; implement and test this on Linux and macOS.
-- Only the daemon's `main` installs signal handlers.
+  any protocol traffic; implement and test this on Linux and macOS. Use the
+  exact layout, path precedence and two-lock order in
+  `docs/specs/runtime-contracts.md` §6.1. Set daemon umask 0077 before
+  threads/file creation, retain validated directory identities, and never
+  open the same Store under two runtime roots as competing writers.
+- Only the daemon's `main` and the same binary's internal Host-anchor
+  entrypoint install signal handlers. The anchor retains its TERM handler
+  through own-group TERM so it can escalate to own-group KILL. No vendor
+  signal handler is installed by VIA.
 
 ## 7. Store
 
