@@ -1,8 +1,8 @@
 # Invariants
 
 Owner-decided or recorded constraints. Changing one needs the owner; surface
-conflicts rather than working around them. None is mechanically checkable yet
-(no code exists), so `check-invariants` has nothing to run.
+conflicts rather than working around them. Add mechanical checks as the
+implementation develops.
 
 ## Decided
 
@@ -13,8 +13,9 @@ conflicts rather than working around them. None is mechanically checkable yet
    adapter properly, disable it if the vendor does not permit the route, and
    record terms status per adapter (not a gate).
    Source: `docs/brainstorms/README.md` §7; `docs/workstreams/handoff.md`.
-2. **One route per managed run.** The route chosen at spawn serves every later
-   verb on that run. Source: `docs/brainstorms/access-methods.md` §3.
+2. **One route per session.** The route chosen at spawn serves every later
+   turn and verb in that session. The adapter version also stays fixed. Source:
+   `docs/brainstorms/README.md` §15 (D5).
 3. **Declared verbs, named refusals.** Each adapter declares each verb
    (`native`, `partial` with semantics, `unsupported`); unsupported verbs are
    refused by name. Never fake a verb: process kill is not graceful cancel, a
@@ -24,31 +25,39 @@ conflicts rather than working around them. None is mechanically checkable yet
    language. CLI plus `via serve --stdio`; thin SDKs spawn the binary; no
    in-process native binding. Source: `docs/brainstorms/README.md` §13
    (settled inputs), §14.
-5. **No daemon.** One worker process per run; CLI and `via serve` processes
-   access the store concurrently. Source: `docs/brainstorms/README.md` §14.
+5. **One VIA daemon per user.** It owns agent processes, vendor connections and
+   the Store as its only writer. The CLI, `via serve --stdio` and thin SDKs are
+   clients over a user-only Unix socket; the CLI auto-starts the daemon, which
+   exits when idle. One binary includes the `via daemon` subcommand and refuses
+   client/daemon version mismatches. Source: `docs/brainstorms/README.md` §15
+   (D1).
 6. **SQLite behind a small storage interface.** Chosen on requirements
-   (embedded, crash-safe, multi-process, static cross-builds). Revisit Turso
-   when it reaches 1.0 with stable multi-process WAL.
-   Source: `docs/brainstorms/README.md` §14.
+   (embedded, crash-safe, static cross-builds). The daemon is the Store's only
+   writer. Revisit Turso when it reaches a stable 1.0.
+   Source: `docs/brainstorms/README.md` §15 (D1); §14.
 7. **Platforms:** macOS and Linux first, then WSL, native Windows later.
    Source: `docs/brainstorms/README.md` §14.
+8. **Language: Rust.** Stable 1.98.1, edition 2024, in the single `via` binary.
+   Source: `docs/brainstorms/README.md` §15 (D8).
+9. **Vendor SDK routes: not used for now.** Use vendor servers where available,
+   otherwise vendor CLIs; native ACP is for breadth. No bridged ACP or acpx
+   runtime dependency for now. Revisit under the conditions in
+   `docs/brainstorms/routes-decision.md`. Source:
+   `docs/brainstorms/README.md` §15 (D8).
+10. **Never ask.** A session begins with out-of-bound actions denied, not
+    prompted. L3 automatically declines vendor requests under a deadline and
+    reports denials and declines in the turn envelope. The bound carries over
+    unchanged unless the caller explicitly sets a new one on resume through
+    the handle. VIA revalidates it against the route and records it per turn;
+    nothing changes it silently. Source: `docs/brainstorms/README.md` §15
+    (D3, D5).
+11. **Own vendor servers.** VIA starts its own vendor servers and never
+    attaches to or stops servers it did not start.
+    Source: `docs/brainstorms/README.md` §15 (D8).
 
 ## Provisional
 
-- **Vendor SDK routes: NOT decided.** CLI, vendor RPC and ACP are the default
-  routes because the static-binary rule excludes in-process SDKs. Whether VIA
-  also drives vendor SDKs (e.g. through sidecars) is open. "CLI/RPC/ACP routes
-  only" was an input the orchestrator gave the language council, not an owner
-  decision; `docs/brainstorms/access-methods.md` §6 keeps SDK routes (e.g. the
-  Copilot SDK) in the upgrade path. Source: `docs/brainstorms/README.md` §11,
-  §13; `docs/brainstorms/access-methods.md` §6.
-- **Language: NOT decided.** Go leads at ~60%, conditional on a pure-Go SQLite
-  driver passing multi-process WAL with `CGO_ENABLED=0` (prototype gate 7) and
-  the other feasibility-spike gates. The prototype plan needs owner discussion
-  before it starts. Source: `docs/brainstorms/README.md` §13, §14;
-  `docs/brainstorms/lang-council/chair.md`.
-- **Handoff properties** (one envelope, role selection, uniform verbs,
-  durable run record, per-spawn isolation, pinned adapters, passthrough marked
-  unstructured, background/wait) and the v0 scope ladder are proposals pending
-  owner confirmation. Source: `docs/workstreams/handoff.md`;
-  open decisions in `docs/brainstorms/README.md` §8.
+- **Remaining handoff proposals** (envelope detail, per-spawn isolation,
+  pinned adapters, passthrough marked unstructured, background/wait) and the
+  v0 scope ladder await owner confirmation. Source:
+  `docs/workstreams/handoff.md`.

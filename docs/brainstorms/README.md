@@ -31,8 +31,8 @@ and vendor pages; those checks are noted inline. Everything else is as reported.
   layer (profiles, inspector, model catalog, ledger) behind uniform verbs and one
   result envelope, with per-adapter capability declarations.
 - VIA has two consumers with different needs: ad-hoc delegation (no task or
-  epic) and the foreman (graph-owned execution policy, session reuse, pinned run
-  identity in `contracts/run_identity.py`). The envelope and ledger must work
+  epic) and the foreman (graph-owned execution policy, session reuse, pinned
+  identity in `contracts/run_identity.py`). The envelope and Store must work
   without a task identity, or VIA mints one. Settle before naming the envelope.
 - "Foreman calls VIA" should mean sharing a library, not shelling out to the CLI.
 - Codex steering may already exist via the frozen app-server path
@@ -78,8 +78,8 @@ and vendor pages; those checks are noted inline. Everything else is as reported.
   **Microsoft Conductor** (see §3).
 - Verdict: VIA's niche is partly occupied but open. The differentiator is
   honest lifecycle claims: contract-tested adapters, declared verb support,
-  named refusals, durable run identity.
-- Borrowable: separate VIA run id from vendor session id; resume fails loudly;
+  named refusals, durable session and turn identity.
+- Borrowable: separate VIA session id from vendor session id; resume fails loudly;
   persist a launch receipt before dispatch and never auto-resend an ambiguous
   prompt; label cost as reported / estimated / unavailable; keep "agent says
   done" apart from process exit and independent grading.
@@ -208,22 +208,25 @@ Codex and Cursor are unclear (Cursor's AUP is the sharpest conflict).
 
 [access-methods.md](access-methods.md), written by Opus 5.5 medium, reviewed by
 GPT-6 Sol high in two rounds (REWORK → ACCEPT WITH FIXES → fixes applied).
+The route plan below is historical; §15 defers SDK and bridged ACP routes.
 - Three layers: CLI by default; the vendor's own control surface (SDK or RPC)
   as the upgrade; one generic ACP adapter for breadth.
 - v0 executable set: Claude and Codex via CLI. OpenCode is v0-conditional on a
   defined, probed external sandbox (`opencode run` cannot enforce write bounds).
 - v1: Codex app-server (only first-party mid-turn steer/interrupt); Pi RPC
   (cancel = `clear_queue` + `abort` + wait for `agent_settled`; one process per
-  run); Oh My Pi its own RPC adapter; Copilot SDK; Muse `muse serve`; Cursor SDK
+  session); Oh My Pi its own RPC adapter; Copilot SDK; Muse `muse serve`; Cursor SDK
   built but disabled pending terms; Claude Agent SDK only when steer/interrupt
   is needed; generic ACP for OpenCode, Qwen, Kilo, Devin, Cline, Goose, Grok,
   Droid, Hermes, Gemini (API key).
-- One route per managed run: ACP cancel reaches only ACP-spawned sessions.
+- One route per session: ACP cancel reaches only ACP-spawned sessions.
 - Avoid stacked bridges when the layer beneath is reachable. ACP permission
   requests are optional for agents; write/network bounds need agent settings or
   an external sandbox.
 
 ## 10. Tech-stack council (summary)
+
+Historical verdict, superseded by the daemon and Rust decisions in §15.
 
 Members (independent, isolated): Claude Opus 5.5 high, Claude Fable 5.1 high
 (both `claude -p --effort high`), GPT-6 Sol high (`codex exec`). Judge: GPT-6
@@ -236,14 +239,14 @@ Claude Agent SDK, Antigravity); protocol-specific clients for other RPC (Pi's
 protocol is not JSON-RPC 2.0 — share transport, not schema); HTTPX; Pydantic
 v2; `sqlite3` WAL with short transactions; `structlog`; `argparse`; pytest with
 fake processes and replay fixtures; distributed with `uv tool` / `pipx`.
-Detached per-run workers (no mandatory daemon), subject to a recovery
+Detached per-turn workers (no mandatory daemon), subject to a recovery
 prototype. Python and versioned JSON process interfaces. No TypeScript sidecar
 initially. Confidence moderate: lifecycle correctness unmeasured.
 
 Key rulings: asyncio over AnyIO; test the official Codex async SDK before
 writing a raw client; reuse the Python crew layer selectively (parsers, argv,
 fixtures, invariants), not wholesale — profiles, catalog and ledger depend on
-interpreter types and Linux-only pieces; a separate VIA run store does not by
+interpreter types and Linux-only pieces; a separate VIA Store does not by
 itself violate ADR 0006, but ownership must be documented; TypeScript/Node is
 the credible runner-up; Go/Rust do not remove process-tree cleanup work.
 
@@ -254,7 +257,7 @@ across resume.
 
 Next step proposed by the judge: a one-day Python worker prototype — fake
 CLI, ACP and Pi-style peers plus one async SDK smoke test, at 1/8/32 concurrent
-runs, with noisy output, oversized records, DB contention, crashes, and
+turns, with noisy output, oversized records, DB contention, crashes, and
 cancelling a child with a grandchild.
 
 ## 11. SDK landscape (summary)
@@ -306,6 +309,9 @@ Implications:
 
 ## 12. Owner priorities for the stack decision (2026-09-24)
 
+Historical inputs to the language council; later decisions in §15 supersede
+open items here.
+
 - Mid-turn steering: **not very important.**
 - Static binary distribution: **important.**
 - Foreman calling VIA in-process as a library: **undecided.**
@@ -320,6 +326,9 @@ official ACP SDK and could expose a Python library via PyO3 if the foreman needs
 in-process calls.
 
 ## 13. Rust vs Go perspective council (2026-09-25)
+
+Historical evaluation. Rust was chosen on 2026-09-26 (§15); the Go lean and
+prototype gates below are no longer pending language-selection gates.
 
 [lang-council/](lang-council). Every pass Opus 5.5 medium (`claude -p --effort
 medium`, read-only): five lens advisors (Contrarian, First Principles,
@@ -341,7 +350,7 @@ Go's lack of sum types and absent-vs-zero JSON ambiguity is the strongest
 pro-Rust point and must be tested, not assumed; `serve --stdio` and recovery
 are long-lived concurrent code, so concurrency is not trivial.
 
-Blind spots: n=1 prototype runs cannot measure throughput (≥3 per language);
+Blind spots: n=1 prototype trials cannot measure throughput (≥3 per language);
 porting the Python profiles/inspector is the largest v0 cost in either
 language; keep the contract-test harness language-neutral (Python black-box);
 no Go or Rust toolchain installed yet.
@@ -350,21 +359,25 @@ Owner questions that flip the result: in-process foreman binding (yes → Rust);
 who installs VIA; Windows in the first release.
 
 Next step: paired feasibility spike with a shared black-box pytest suite and
-seven pass/fail gates (grandchild cancel, kill -9 recovery, 32 concurrent runs
+seven pass/fail gates (grandchild cancel, kill -9 recovery, 32 concurrent turns
 with a 10 MB line and DB lock, planted ACP schema faults, FD/task leak over
 1,000 cycles, static cross-builds, pure-Go SQLite under WAL).
 
 ## 14. Owner decisions (2026-09-25)
+
+Historical snapshot. Process topology, language and route policy were revised
+on 2026-09-26 (§15).
 
 - **Distribution:** open-source tool; anyone installs it and uses it from any
   language. Static binary distribution is a real requirement.
 - **Foreman / programmatic use:** no in-process native binding needed; a small
   thin SDK over the binary is fine.
 - **Platforms:** macOS and Linux first, then WSL, native Windows later.
-- **Process architecture:** no daemon. One worker process per run; CLI and
-  `via serve` processes access the store concurrently.
+- **Process architecture (superseded):** this snapshot proposed one worker
+  process per turn, with CLI and `via serve` writing the Store concurrently.
+  The daemon decision in §15 replaces it.
 - **Database:** not tied to SQLite by history — chosen on requirements
-  (embedded, crash-safe transactions, multi-process access, small queries,
+  (embedded, crash-safe transactions, small queries,
   static cross-builds). **SQLite** behind a small storage interface. Alternatives
   checked (2026-09-25):
   - Turso (Rust SQLite rewrite, MIT): pre-1.0 (`v0.8.0-pre.12`, 2026-09-22);
@@ -375,16 +388,74 @@ with a 10 MB line and DB lock, planted ACP schema faults, FD/task leak over
     Revisit when Turso reaches 1.0 with stable multi-process WAL.
   - libSQL: superseded by Turso as the vendor's direction; no advantage.
   - LMDB: multi-process capable but key-value only.
-  - bbolt, BadgerDB, redb, sled, DuckDB: single-process file locks — need a
-    daemon, which is ruled out.
-- **Language:** the chair's conditions 1 and 3 now hold; the Go lean (~60%)
-  stands, subject to a pure-Go SQLite driver passing multi-process WAL with
-  `CGO_ENABLED=0` (prototype gate 7). Turso is not a deciding factor.
+  - bbolt, BadgerDB, redb, sled, DuckDB: single-process file locks were
+    rejected under the former process topology; reassessment was not part of
+    the 2026-09-26 decision.
+- **Language (superseded):** the Go lean (~60%) depended on a pure-Go SQLite
+  driver passing multi-process WAL with `CGO_ENABLED=0` (prototype gate 7).
+  Turso was not a deciding factor. Rust is now decided (§15).
 - **Next:** discuss the prototype plan with the owner before starting it.
 
-## Research run log
+## 15. Owner decisions (2026-09-26)
 
-| Run | Codex session id |
+These decisions supersede conflicting earlier research and proposals. The
+compact constraint list is [`.repo-context/invariants.md`](../../.repo-context/invariants.md).
+
+- **D1 — topology:** One VIA daemon per user owns agent processes, vendor
+  connections and the Store as sole writer. CLI, `via serve --stdio` and thin
+  SDKs are C1 JSON-RPC clients over a user-only Unix socket. The CLI
+  auto-starts the daemon; it exits when idle. One binary contains `via daemon`
+  and a client/daemon version handshake refuses mismatches. The daemon is a
+  process containing L1's server half plus L2–L6 and Store, not another layer.
+- **D2 — recovery:** An OS file lock admits one daemon. There are no per-turn
+  leases, fencing tokens or takeover protocol. After a crash, Host reports
+  surviving marked vendor processes and Core classifies in-flight turns as
+  resumed, unknown or failed. Unknown outcomes are never resubmitted. Clients
+  time out a hung daemon and restart it.
+- **D3 — permissions:** Sessions start with out-of-bound actions denied. L3
+  automatically declines vendor requests, including unknown types, within a
+  deadline and emits canonical events. Denials and declines appear in the turn
+  envelope. The permission bound carries over to every turn unchanged unless
+  the caller explicitly sets a new one on resume through the caller handle.
+  VIA revalidates a new bound against the route and records it per turn.
+  Nothing changes the bound silently.
+- **D4 — logs:** L5 writes exact bytes, direction and offsets to a raw log per
+  connection. L3/L4 split normalized events per turn by vendor session id,
+  with raw offsets. `via logs` shows only the requested session's or turn's
+  events; C2 promises per-session order only.
+- **D5 — vocabulary (clarified 2026-09-26):** A session is a resumable
+  conversation and owns its queue, route, adapter version and caller handle.
+  Its route and adapter version stay fixed for life; its permission bound
+  follows the D3 rule above. A turn is one prompt, agent tool calls and result
+  envelope, addressed by session id and number. `spawn` starts turn 1;
+  `resume` adds one. Model steps are inside a turn. The caller
+  handle is bearer authority for mutations; the retired lifecycle term is
+  described in the glossary.
+- **D6 — names:** L1 Interface, L2 Core, L3 Adapters, L4 Routes, L5 Wire and
+  L6 Host, plus Store. C1 is the public VIA API; C2–C5 and S are named after
+  their providing layer. See [layers-and-names.md](layers-and-names.md).
+- **D7 — boundaries:** C3 has common `open`, `close`, `health` and typed
+  protocol calls. Core owns deadlines and admission; L3 owns vendor cancel
+  sequences; Host escalates by timer and never kills a shared server to cancel
+  one turn. `close(mode, deadline)` reaches Host through C2–C5. L5 drains
+  pipes into bounded buffers. Preflight refuses absent required verbs by name;
+  the spawn receipt states the selected route and capabilities. Store
+  transactions are short and do not span vendor I/O.
+- **D8 — other choices:** Rust 1.98.1, edition 2024, in one static binary.
+  Prefer vendor servers where available, otherwise vendor CLI; native ACP is
+  for breadth. SDK and bridged ACP routes are deferred under the revisit
+  conditions in [routes-decision.md](routes-decision.md); acpx is not a runtime
+  dependency. VIA starts its own vendor servers and never attaches to or stops
+  others. Roles are caller policy; VIA accepts explicit parameters and a model
+  catalog maps model to harness.
+
+Still open: external sandboxing for vendor servers without native bounds;
+stdio versus Unix socket for shared vendor server connections; testing policy
+details (end-to-end-first direction).
+
+## Research execution log
+
+| Research task | Codex session id |
 |---|---|
 | ACP | `01a0d41e-1bdb-7e33-bbc1-5c9bd1299dae` |
 | A2A | `01a0d420-a484-79f1-9fc9-7e2e6d9ad028` |

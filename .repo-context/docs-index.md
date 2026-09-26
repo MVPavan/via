@@ -6,6 +6,9 @@ Routing map: read a path only when its trigger applies.
 |---|---|
 | Starting or resuming VIA design work | `docs/workstreams/handoff.md`, then `docs/brainstorms/README.md` |
 | Checking what the owner has decided | `docs/brainstorms/README.md` §12, §14; summary in `.repo-context/invariants.md` |
+| Public C1 VIA API contract | `docs/specs/via-api-v1.md` |
+| Internal C2 adapter contract | `docs/specs/adapter-contract.md` |
+| Writing Rust code: coding standard | `.repo-context/coding-style.md` |
 | Choosing a route (CLI, SDK, RPC, ACP) for an adapter | `docs/brainstorms/access-methods.md` §1, §3, §6 |
 | Defining the envelope, run record, capabilities, isolation | `docs/brainstorms/access-methods.md` §5 |
 | Judging whether a route fits the subscription/credential rule | `docs/brainstorms/access-methods.md` §7; `docs/brainstorms/README.md` §7 |
