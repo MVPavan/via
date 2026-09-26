@@ -203,7 +203,9 @@ the set.
   owns and must never do. Comments explain why, not what. No `TODO` without
   a bead id.
 
-## 10. Testing (PROPOSED, pending owner confirmation)
+## 10. Testing
+
+Confirmed by the owner, 2026-09-26.
 
 - **Failure modes first.** Each slice's plan lists how it can fail before any
   code is written. Each failure mode maps to a test, and the slice report

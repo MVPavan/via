@@ -1,10 +1,11 @@
 # VIA API v1 (contract C1)
 
-Status: draft 2 for owner review, 2026-09-26. Public contract between
+Status: draft 2, 2026-09-26; the owner approved the S1 set on 2026-09-26
+(see Decisions below). Public contract between
 callers and VIA; implemented by L1 (`via-cli`, server half) over L2
-(`via-core`). Inputs: `scratchpad/rust-foundation/decisions.md`
-(authoritative), review `scratchpad/rust-foundation/out/R-spec-astra.md`,
-probes P1–P5 (`scratchpad/probes/out/`, single runs on cheap models: evidence,
+(`via-core`). Inputs: `docs/brainstorms/README.md` §15
+(authoritative), review `docs/brainstorms/reviews/contract-specs-astra-r1.md`,
+probes P1–P5 (summaries in `docs/workstreams/rust-foundation/session-handoff.md` §6; single runs on cheap models: evidence,
 not guarantees), `.repo-context/coding-style.md` §3, §5–§7. Companion:
 `docs/specs/adapter-contract.md` (C2). Labels: **decided** = owner
 decision; **Proposed** = drafted here, listed in §10.
@@ -44,7 +45,10 @@ caller generates the session's handle; the daemon stores only its hash.
 | Errors | request errors: JSON-RPC `error` with stable `data.kind`; turn failures: `failure.class`. Once a receipt is issued, every later problem resolves the turn, never a request error |
 | Evolution | additive; unknown request fields rejected; every wire enum decodes unknown values into an explicit `unknown(raw)` fallback |
 
-**Decisions to confirm** (recommendation first, alternatives in §10):
+**Decisions** (recommendation first, alternatives in §10). **Owner,
+2026-09-26:** P1–P6, P8–P10 and P12 approved as written; `idempotency_key`
+and `op_key` stay separate. P7 (S3/S4), P11 (S3/S5) and P13 (S2) are
+decided in the slice that needs them, after re-probing.
 
 | # | Decision | Recommendation |
 |---|---|---|
@@ -588,6 +592,8 @@ Adapters never commit a class; they report observations and Core commits
 Confirmed by review (Astra): Q1 session-wide follow; Q2 VIA validates
 structured output; Q3 `wait` = latest turn at acceptance; Q4 15-minute
 process shutdown, configurable; Q5 catalog-only `describe`. D9 stays open.
+Owner, 2026-09-26: P12 approved as written; P7, P11 and P13 are decided in
+the slice that needs them.
 
 | # | Question | Recommendation / alternatives |
 |---|---|---|

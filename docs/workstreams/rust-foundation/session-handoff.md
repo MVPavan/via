@@ -13,13 +13,20 @@ submodule.
   from this branch is pushed or merged; pushing and merging need the owner.
 - Commits on the branch: design decisions (f2e3614), specs draft 2 (9dbeac4),
   Rust S0 workspace and coding standard (be5787d), Codex harness (d158962),
-  Beads (ed4b020, a7173f8), plus this handoff.
+  Beads (ed4b020, a7173f8), this handoff (371b8d2), `AGENTS.md` Repository
+  section updated to Rust + daemon + roles-as-caller-policy (41b36e7), then
+  the owner's spec and testing approvals applied (the commit after 41b36e7).
+- **Not ours, leave unstaged:** uncommitted owner edits seen on 2026-09-26:
+  `AGENTS.md` first line ("Apply First Principles Thinking…"),
+  `.claude/skills/skill-router/SKILL.md`, and a new
+  `first-principles-thinking` skill (`.claude/skills/`, `.codex/skills/`).
 - Other branches: `spike/sqlite-wal` (Go SQLite spike, report pending merge;
   moot for the language choice, still evidence for SQLite WAL) and
   `claude/repo-context` (merged content). Leave both alone.
-- **Stale copy:** the parent `coding-ritual` repo has a worktree
-  (`coding-ritual-via`, parent-repo path) with VIA as a submodule at `via/`.
-  It holds the same commits plus its own Beads database. Do not work there.
+- **Old copy removed (2026-09-26):** the parent `coding-ritual` repo's
+  `coding-ritual-via` worktree was deleted, its `via` submodule config and
+  `via` branch removed, and worktrees pruned. VIA work exists only here. The
+  local Codex trust entry points at this checkout.
 - Gitignored scratch material lives in `scratchpad/` (map in §8).
 
 ## 2. Goal and phase
@@ -52,30 +59,24 @@ and `.repo-context/CONTEXT.md` (glossary). In short:
 | Work | Where | Checked by |
 |---|---|---|
 | Decisions applied to invariants, glossary, handoff properties, layer/names, routes decision, layer design v2 | `.repo-context/`, `docs/brainstorms/`, `docs/workstreams/handoff.md` | Consistency pass; 0 broken links; Mermaid validated |
-| C1 VIA API v1 + C2 Adapter contract, **draft 2** | `docs/specs/via-api-v1.md`, `docs/specs/adapter-contract.md` | Drafted by Claude Fable 5.1 high; reviewed by GPT-6 Astra medium (SOUND WITH CHANGES, 4 blocking + 15 major); every finding fixed or turned into an owner decision |
-| Rust coding standard | `.repo-context/coding-style.md` (routed from `AGENTS.md` "Code changes") | Reviewed by Astra medium and GPT-6 Sol high (both SOUND WITH CHANGES); revisions applied |
+| C1 VIA API v1 + C2 Adapter contract, **draft 2** | `docs/specs/via-api-v1.md`, `docs/specs/adapter-contract.md` | Drafted by Claude Fable 5.1 high; reviewed by GPT-6 Astra medium (SOUND WITH CHANGES, 4 blocking + 15 major; `docs/brainstorms/reviews/contract-specs-astra-r1.md`); every finding fixed or turned into an owner decision. **Owner approved the S1 set** (C1 P1–P6, P8–P10, P12; C2 A1; keys stay separate), 2026-09-26 |
+| Rust coding standard | `.repo-context/coding-style.md` (routed from `AGENTS.md` "Code changes") | Reviewed by Astra medium and GPT-6 Sol high (both SOUND WITH CHANGES); revisions applied. **§10 testing confirmed by the owner** (reconciled option: E2E main, failure-first isolated tests where sharper), 2026-09-26 |
 | S0 workspace: 7 crates, `via` binary, workspace lints, `clippy.toml`, `deny.toml`, nextest config, `scripts/check-layers.py` | repo root, `crates/` | Gate in `.repo-context/verification.md` passes (fmt, clippy `-D warnings`, nextest, cargo-deny, layer check); `via --version` works |
 | Codex harness modelled on the DWS layout | `.codex/` | Hooks fire in a `codex exec` smoke test; see §7 for gaps |
 | Vendor probes P1–P5, P2b | `scratchpad/probes/` | Run once each on cheap models (evidence, not guarantees): §6 |
 
-## 5. Waiting on the owner (next session starts here)
+## 5. Owner decisions (2026-09-26) and what still waits
 
-1. **Spec approval.** Summaries sit at the top of both spec files. Decisions
-   P1–P13 (C1) and A1–A8 (C2), all recommended "as written". The one real
-   choice: **P7**, after a Codex cancel whose tool keeps running, either
-   wait up to 60 s and then dispatch the next turn with a warning
-   (recommended) or block until the caller acts.
-2. **Testing policy.** `.repo-context/coding-style.md` §10 is marked PROPOSED.
-   Owner's direction: never write unit tests after the code; end-to-end
-   tests as the main mechanism with a verifiable, repeatable artifact; if
-   something must be tested in isolation, list its failure modes first. Both
-   reviewers objected to a blanket "E2E only". The reconciled proposal
-   allows small failure-first tests where sharper or cheaper (byte framer,
-   state machines, migrations, message mapping), and a smallest failing
-   reproduction before every bug fix. Confirm or amend, then remove the
-   PROPOSED label and `NEXTEST_NO_TESTS=pass` once tests land.
-3. **Merge/push** of `rust-foundation`, and the `spike/sqlite-wal` report
-   merge: owner's call.
+Decided: the S1 set of the specs is approved as written; `idempotency_key`
+and `op_key` stay separate; the testing policy is confirmed (label and
+approval recorded in the files). Deferred, each to the slice that needs it
+after a fresh probe (Beads `via-jm4.6`): C1 P7 (S3/S4), P11 (S3/S5), P13
+(S2); C2 A2, A3, A6 (S2), A4 (S5), A5 (S6), A7 (S3/S4), A8 (S3/S5).
+
+Still the owner's call: merge/push of `rust-foundation`; merging the
+`spike/sqlite-wal` report; whether to close `via-str`. None blocks S1.
+Remove `NEXTEST_NO_TESTS=pass` from `.repo-context/verification.md` once
+the first tests land.
 
 ## 6. Probe evidence (Codex 0.156.1, Claude Code 2.1.283)
 
@@ -92,14 +93,10 @@ and `.repo-context/CONTEXT.md` (glossary). In short:
 - `via-bki`: in the Codex smoke test the model did not report the Beads
   SessionStart context in VIA (it did in DWS), and neither repo's model
   listed `.codex/skills`.
-- The spec status lines cite `scratchpad/rust-foundation/decisions.md` and a
-  scratchpad review path; both are gitignored. Re-point them to
-  `docs/brainstorms/README.md` §15 and copy the reviews into
-  `docs/brainstorms/reviews/` when the specs are finalised.
 - `scratchpad/mermaid-check/` needs `npm install` (node_modules not copied).
-- Beads issues open under `via-jm4`: `.2` (spec, awaiting owner), `.3`
-  (probes; remaining B1–B8 vendor questions listed in C2), `.4` (standard;
-  testing section awaiting owner). `via-str` (Go spike) is obsolete for the
+- Beads open under `via-jm4`: `.3` (probes; remaining B1–B8 vendor
+  questions listed in C2), `.6` (deferred contract decisions), `.7` (S1).
+  `.2` (spec) and `.4` (standard) are closed. `via-str` (Go spike) is obsolete for the
   language decision; the owner decides whether to close it.
 - Toolchain installed on this machine: Rust 1.98.1 via rustup (rustfmt,
   clippy), cargo-nextest 0.9.146, cargo-deny 0.20.2.
@@ -138,14 +135,14 @@ and `.repo-context/CONTEXT.md` (glossary). In short:
 
 ## 10. Next steps, in order
 
-1. Get the owner's answers on §5 items 1–2; apply them (spec edits by the
-   spec author or orchestrator; standard §10 by the orchestrator).
-2. Plan **S1**: the six-layer skeleton plus daemon (socket, lock, handshake,
+1. Done: owner answers applied (§5).
+2. Plan **S1** (Beads `via-jm4.7`): the six-layer skeleton plus daemon (socket, lock, handshake,
    auto-start), Store schema v1, and a fake agent, with **failure modes
    listed first**, each mapped to an end-to-end scenario. S1 acceptance from
    the plan: two callers at once; `kill -9` the daemon mid-turn and the
    restarted daemon marks the turn `unknown`; a hanging agent hits its
    deadline and its tree is killed; a flooding agent never stalls the reader.
+   Show the owner the failure-mode list before dispatching workers.
 3. Dispatch S1 to Sol high workers with disjoint owned paths; Astra medium
    reviews the slice; run the gate; commit.
 4. Then S2 Claude CLI, S3 Codex app-server, S4 cancel/deadlines/recovery,

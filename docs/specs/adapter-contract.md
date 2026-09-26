@@ -1,12 +1,13 @@
 # Adapter contract (C2)
 
-Status: draft 2 for owner review, 2026-09-26. Internal contract between L2
+Status: draft 2, 2026-09-26; the owner approved A1 on 2026-09-26, and
+A2–A8 are decided in the vendor slice that needs them. Internal contract between L2
 Core (`via-core`) and L3 Adapters (`via-adapters`). Inputs:
-`scratchpad/rust-foundation/decisions.md` (authoritative), review
-`scratchpad/rust-foundation/out/R-spec-astra.md`, probes P1–P5 and P2b
-(`scratchpad/probes/out/`; single runs, evidence not guarantees),
+`docs/brainstorms/README.md` §15 (authoritative), review
+`docs/brainstorms/reviews/contract-specs-astra-r1.md`, probes P1–P5 and P2b
+(summaries in `docs/workstreams/rust-foundation/session-handoff.md` §6; single runs, evidence not guarantees),
 `.repo-context/coding-style.md` §1, §3, §5–§7, the Codex app-server schema
-0.156.1 (`scratchpad/codex-schema/`, local copy), research notes under
+0.156.1 (regenerate with `codex app-server generate-json-schema`), research notes under
 `docs/brainstorms/research/`. Public shapes (events, failure classes,
 capabilities DTO) are defined in `docs/specs/via-api-v1.md` (C1) and
 referenced here. Labels: **decided**, **Proposed**, **(docs)** = from
@@ -38,7 +39,11 @@ turns vendor traffic into **observations**. Core alone commits states,
 | Adapter | route choice, capability declaration, version gate, vendor mapping, reserved-key refusal, auto-decline, cancel sequence, quiescence evidence, observation normalization, vendor-code → class hint |
 | Routes / Wire / Host | typed protocol calls and request pairing / framing, transport, raw tap, bounded staging / processes, servers, identity, kill tree |
 
-| # | Decision to confirm | Recommendation / alternative |
+**Owner, 2026-09-26:** A1 approved as written. A2 (S2), A3 (S2), A4 (S5),
+A5 (S6), A6 (S2), A7 (S3/S4) and A8 (S3/S5) are decided in the slice that
+needs them, after re-probing.
+
+| # | Decision | Recommendation / alternative |
 |---|---|---|
 | A1 | Backpressure: per-session observation channel of 1024 items; a full channel blocks only that session's normalizer; control commands travel on a separate channel and stay serviceable; Core failing to drain for `event_stall_ms` (10 s) fails the turn `overflow` and interrupts it; L5 staging overflow fails the connection (coding-style §5) | as written; alternative: drop-and-count with `raw_log_incomplete` |
 | A2 | Version gate = tested ranges per route; outside: `version_status: untested`, all verbs still declared but bound-bearing verbs refused unless `allow_untested`; protocol handshake failure = `refused` (C1 P13) | as written; alternative: refuse outright |
