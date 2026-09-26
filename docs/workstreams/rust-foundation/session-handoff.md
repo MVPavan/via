@@ -4,7 +4,8 @@ Read this first to resume. It is self-contained for any harness or model;
 repository rules still come from `AGENTS.md`. Tracking: Beads epic
 `via-jm4` (`bd show via-jm4`). Written by the orchestrator (Claude Opus 5.5)
 at the end of the session that moved VIA work out of the coding-ritual
-submodule.
+submodule; last updated at that session's close, after the owner's spec
+approvals and the S1 plan. The next session starts fresh from here.
 
 ## 1. Where things are
 
@@ -14,8 +15,14 @@ submodule.
 - Commits on the branch: design decisions (f2e3614), specs draft 2 (9dbeac4),
   Rust S0 workspace and coding standard (be5787d), Codex harness (d158962),
   Beads (ed4b020, a7173f8), this handoff (371b8d2), `AGENTS.md` Repository
-  section updated to Rust + daemon + roles-as-caller-policy (41b36e7), then
-  the owner's spec and testing approvals applied (the commit after 41b36e7).
+  section updated to Rust + daemon + roles-as-caller-policy (41b36e7), the
+  owner's spec and testing approvals (f55fce8), and the S1 plan plus this
+  final handoff update (the commit after f55fce8).
+- **Uncommitted on purpose:** `.beads/issues.jsonl` and
+  `.beads/interactions.jsonl`. The Beads database (source of truth) is
+  current; the mirror also carries `via-p2i`, a task from the owner's
+  separate first-principles session, so committing it belongs with that
+  work.
 - **Not ours, leave unstaged:** uncommitted owner edits seen on 2026-09-26:
   `AGENTS.md` first line ("Apply First Principles Thinking…"),
   `.claude/skills/skill-router/SKILL.md`, and a new
@@ -33,9 +40,9 @@ submodule.
 
 VIA is one Rust binary: a per-user daemon plus a CLI that spawns and controls
 coding agents (Claude Code, Codex, OpenCode, ACP agents) through one stable
-API. Current phase: **foundation**: decisions recorded, contracts drafted, S0
-workspace built. **No feature code exists yet, by design:** the owner reviews
-the contract specs before implementation starts.
+API. Current phase: **foundation done, S1 planned**: decisions recorded,
+the S1 set of both contracts approved, testing policy confirmed, S0
+workspace built, S1 plan written. **No feature code exists yet.**
 
 ## 3. Decisions in force
 
@@ -135,15 +142,26 @@ the first tests land.
 
 ## 10. Next steps, in order
 
-1. Done: owner answers applied (§5).
-2. Plan **S1** (Beads `via-jm4.7`): the six-layer skeleton plus daemon (socket, lock, handshake,
-   auto-start), Store schema v1, and a fake agent, with **failure modes
-   listed first**, each mapped to an end-to-end scenario. S1 acceptance from
-   the plan: two callers at once; `kill -9` the daemon mid-turn and the
-   restarted daemon marks the turn `unknown`; a hanging agent hits its
-   deadline and its tree is killed; a flooding agent never stalls the reader.
-   Show the owner the failure-mode list before dispatching workers.
-3. Dispatch S1 to Sol high workers with disjoint owned paths; Astra medium
-   reviews the slice; run the gate; commit.
-4. Then S2 Claude CLI, S3 Codex app-server, S4 cancel/deadlines/recovery,
-   S5 OpenCode, S6 ACP, S7 Claude control route.
+1. **Confirm the S1 plan with the owner.** `docs/workstreams/rust-foundation/s1-plan.md`
+   (Beads `via-jm4.7`) lists 30 failure modes (§2), testing (§3) and the
+   worker waves (§4). The owner asked for it to be committed and handed
+   off but did not state approval of §2; ask before dispatching. The
+   orchestrator's own choices are listed in §3–§4 (separate test-only
+   fake-agent crate, test-only failpoints feature, Linux only, internal
+   contracts recorded as code).
+2. **W1, two Sol high workers in parallel:** (a) internal interfaces for
+   C3 Route, C4 Wire, C5 Host and the Store as Rust types and signatures,
+   plus crate wiring (update `scripts/check-layers.py` if a new crate is
+   added); (b) the fake agent, the E2E harness with its artifact, and every
+   §2 scenario, written to fail first. Brief pattern: reuse
+   `scratchpad/rust-foundation/briefs/common.md` (shared rules) plus one
+   brief per worker with owned paths, constraints, acceptance scenarios and
+   context pointers; workers do not commit, stage or run `bd`.
+3. **W2:** implementation by owned crate (Store; Host; Wire + fake Route;
+   fake Adapter + Core; CLI + daemon), up to four workers on disjoint paths.
+4. **W3:** integrate to green, run the gate (`.repo-context/verification.md`),
+   Astra medium review, fixes, commit with explicit paths. Remove
+   `NEXTEST_NO_TESTS=pass` from `verification.md` once tests exist.
+5. Then S2 Claude CLI, S3 Codex app-server, S4 cancel/deadlines/recovery,
+   S5 OpenCode, S6 ACP, S7 Claude control route. Settle each deferred
+   decision (`via-jm4.6`) in its slice after a fresh probe.
