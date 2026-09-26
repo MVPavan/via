@@ -1,6 +1,6 @@
 <!-- BD:GENERATED START -->
 # Backlog (parked, vetted)
-_generated from bd @ 2026-09-26T18:21:09Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
+_generated from bd @ 2026-09-26T18:22:50Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
 _none._
 <!-- BD:GENERATED END -->
 

@@ -1,6 +1,6 @@
 <!-- BD:GENERATED START -->
 # Progress — rust-foundation
-_generated from bd @ 2026-09-26T18:21:09Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
+_generated from bd @ 2026-09-26T18:22:50Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
 _Roadmap: [goal.md](../goal.md) · Brainstorm: [roadmap.md](../../../../docs/workstreams/rust-foundation/roadmap.md)_
 ## [P1] Linux and macOS platform and packaging contract
 - `via-pvj.1` Define target packaging and verification contract — Owner Linux-first/mac deferral and temporary generated OpenCode password inheritance dispositions Astra-drafted/Sol-R2-reviewed and integrated by Sol sync. Docs/link/layer checks pass. Required Linux baseline runner still unverified, not passed; current artifact/native gates remain open. OpenCode no-login env refresh is separate pending design delta.  (2026-09-26T13:15:51Z)
@@ -19,6 +19,7 @@ _Roadmap: [goal.md](../goal.md) · Brainstorm: [roadmap.md](../../../../docs/wor
 - `via-jm4.11` Record goal activation and orchestrator-only execution policy — Sol-high worker updated goal/handoff activation and orchestrator-only bounded-context policy. Coordinator verified active/status/180-word summary wording against current files; git diff --check passes. Worker reported zero broken links. No runtime changes.  (2026-09-26T11:41:44Z)
 - `via-jm4.12` Refresh active implementation handoff and goal checkpoint — Sol refreshed goal/handoff from live Beads and reports with active handles, completed types/design and unresolved review/provider/platform gates. Scope/finish criteria unchanged; links0broken/diff clean.  (2026-09-26T12:42:56Z)
 - `via-jm4.13` Apply owner Linux-first platform and OpenCode decisions — Owner Linux-first/mac deferral and temporary generated OpenCode password inheritance dispositions Astra-drafted/Sol-R2-reviewed and integrated by Sol sync. Docs/link/layer checks pass. Required Linux baseline runner still unverified, not passed; current artifact/native gates remain open. OpenCode no-login env refresh is separate pending design delta.  (2026-09-26T13:15:51Z)
+- `via-jm4.14` Preserve owner-directed pause and Rust foundation checkpoint — Owner-directed preservation complete in local WIP commit 4261697; goal paused and no workers restarted. Handoff and review/design snapshots committed, Beads pause notes exported, current fmt/layer/catalog/link/diff checks recorded. Offline all-target build failure preserved explicitly. Seven integration findings remain unaccepted; no push. This closes only checkpoint work, not development.  (2026-09-26T18:22:50Z)
 
 ## [S2] Claude Code adapter and conformance
 - `via-p98.1` Claude Code: pinned protocol and behavior evidence — Pinned 2.1.283 conformance packet complete: six cases pass, three partial with explicit evidence and cleanup. Bounds and max_steps wording remain design/implementation validation; no general OS bounds claimed. conformance-report.md and conformance.json preserve raw references.  (2026-09-26T12:11:18Z)

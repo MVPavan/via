@@ -1,6 +1,6 @@
 <!-- BD:GENERATED START -->
 # Checklist — rust-foundation
-_generated from bd @ 2026-09-26T18:21:09Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
+_generated from bd @ 2026-09-26T18:22:50Z — DO NOT EDIT (run: BD_RENDER=1 bash <beads-skill-dir>/scripts/bd-render-tracking.sh)_
 _Roadmap: [goal.md](../goal.md) · Brainstorm: [roadmap.md](../../../../docs/workstreams/rust-foundation/roadmap.md)_
 ## [P1] Linux and macOS platform and packaging contract
 - [x] `via-pvj.1` Define target packaging and verification contract
@@ -33,7 +33,7 @@ _Roadmap: [goal.md](../goal.md) · Brainstorm: [roadmap.md](../../../../docs/wor
   - 📝 Native worker /root/goal_inventory_sol_high; requested gpt-6-sol/high; owned artifact docs/workstreams/rust-foundation/goal.md. Root orchestrates only. Completion requires primary artifact/check evidence plus configured review.
 - [x] `via-jm4.12` Refresh active implementation handoff and goal checkpoint
 - [x] `via-jm4.13` Apply owner Linux-first platform and OpenCode decisions
-- [ ] `via-jm4.14` Preserve owner-directed pause and Rust foundation checkpoint  🔄 in progress
+- [x] `via-jm4.14` Preserve owner-directed pause and Rust foundation checkpoint
   - 📝 Checkpoint preservation complete: goal paused, stopped workers recorded, source left unchanged, seven integration findings and reviewed/unintegrated shutdown seam preserved in committed-document candidates. Current fmt/layer/catalog checks pass (catalog advisory warnings); Markdown broken links 0; git diff --check passes. All-target offline cargo check fails E0599 at test lines 134 and 676 (ScenarioError lacks Display); no new runtime tests, implementation fixes or review cycle. Local WIP commit pending; no push authorized.
 
 ## [S2] Claude Code adapter and conformance
