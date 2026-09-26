@@ -71,11 +71,12 @@ Deliver correct work with the smallest necessary change, done right the first ti
 
 - Shared policy lives here; `.repo-context/` holds shared repository guidance.
   Runtime configuration owns model settings and enforcement.
-- VIA is an open-source, cross-harness CLI: one static binary that runs a role
-  and prompt on any coding-agent harness and returns a structured result
-  envelope. Design record: `docs/workstreams/handoff.md` and `docs/brainstorms/`.
-- The implementation language is not yet final; prototypes need owner discussion
-  before they start.
+- VIA is an open-source, cross-harness CLI and per-user daemon, written in Rust:
+  one static binary that runs a prompt on any coding-agent harness with
+  explicit parameters and returns a structured result envelope (roles are
+  caller policy). Design record: `docs/brainstorms/README.md` §15,
+  `.repo-context/invariants.md` and `docs/specs/`.
+- Prototypes need owner discussion before they start.
 - Use repo-relative paths in committed material; temporary artifacts go in
   gitignored `scratchpad/`. This repository is public: keep secrets, credentials
   and personal data out of every commit.
