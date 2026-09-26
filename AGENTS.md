@@ -1,6 +1,6 @@
 # Agent Operating Guide
 
-Deliver correct work with the smallest necessary change, done right the first time.
+Apply First Principles Thinking to every problem; deliver correct work with the smallest necessary change, done right the first time.
 
 ## Authority
 
