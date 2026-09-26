@@ -7,3 +7,6 @@
 
 # Local scratch (temporary artifacts)
 scratchpad/
+
+# Rust build output
+target/

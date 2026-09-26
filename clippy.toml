@@ -1,0 +1,5 @@
+# Tests may use direct assertions and unwraps while production code may not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+disallowed-methods = [{ path = "tokio::sync::mpsc::unbounded_channel", reason = "coding-style §5: channels are bounded" }]

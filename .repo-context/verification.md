@@ -1,8 +1,23 @@
 # Verification
 
-The implementation language and toolchain are undecided, so there are no
-build, test or lint commands yet. Do not invent them; add them here when the
-owner approves a language and prototype plan. Run from the repo root.
+Rust 1.98.1 is the chosen toolchain. Run checks from the repo root.
+
+## Rust gate
+
+Until tests exist, export `NEXTEST_NO_TESTS=pass` before running the gate;
+remove the setting when the first tests land. Nextest's empty-suite behavior
+is a CLI setting. Run in order:
+
+```bash
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo nextest run --locked --workspace
+cargo deny check
+python3 scripts/check-layers.py
+```
+
+Testing policy: pending owner decision.
+Live-vendor end-to-end sets are a separate merge gate, defined by that policy.
 
 ## Checks that apply now
 

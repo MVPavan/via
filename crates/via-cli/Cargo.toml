@@ -1,0 +1,17 @@
+[package]
+name = "via-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "via"
+path = "src/main.rs"
+
+[dependencies]
+via-core = { path = "../via-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[advisories]
+
+[licenses]
+# Widely used permissive licenses are compatible with Apache-2.0 distribution;
+# review any new license before admitting it.
+unused-allowed-license = "allow"
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
