@@ -56,10 +56,12 @@ the historical checkpoint; its findings table is updated by this section.
   (3 runs); F08–F12 line 17 passed; release check passes. T2-C (restart
   handoff of surviving queued turns, cancellation behind `unknown`, keyed
   replay after restart; [t2/c.md](t2/c.md)) merged at `81d5dd7` (Sol r2
-  SOUND); gate 170 / 2, failpoints 193 / 2. Now T2-D ([t2/d.md](t2/d.md),
-  same session and branch): runtime §8's 4-slot active-connection limit,
-  which T2-C found missing. Then Sol high review of Task 2 and close
-  `.7.6`; then
+  SOUND); gate 170 / 2, failpoints 193 / 2. T2-D ([t2/d.md](t2/d.md):
+  runtime §8's 4-slot connection limit, slots owned per process group
+  until proved absent, recovered and unread unproven groups held; Store
+  schema v3) merged at `3955933` (Sol r3 SOUND); gate 173 / 2,
+  failpoints 203 / 2 (3 runs), F08–F12 17. Now: Sol high slice review of
+  Task 2 (`scratchpad/reviews/task2/`), then close `.7.6`; then
   Task 3 (`.7.7`, carries the F12 remainder and deferred items), Task 4
   (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
