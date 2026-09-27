@@ -183,6 +183,21 @@ fn transact(
     Ok(reply)
 }
 
+/// Refuses a socket whose listener is not `uid` before any protocol byte (and
+/// so any handle) is written (C1 §1, coding-style §6). The kernel's peer
+/// credential is read through Tokio, the same source the daemon's check uses.
+fn verified_peer(stream: UnixStream, uid: u32) -> anyhow::Result<UnixStream> {
+    stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(stream)?;
+    let peer = stream.peer_cred()?.uid();
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    if peer != uid {
+        bail!("daemon socket peer is not the current user");
+    }
+    Ok(stream)
+}
+
 fn same_store(expected: &Path, reported: &str) -> anyhow::Result<bool> {
     let reported = Path::new(reported);
     if reported.file_name() != Some(std::ffi::OsStr::new("store.sqlite3")) {
@@ -211,6 +226,7 @@ pub(crate) fn request(method: &str, params: &Value, auto_start: bool) -> anyhow:
         }
         Err(error) => return Err(error.into()),
     };
+    let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -265,4 +281,21 @@ pub(crate) fn call(
     } else {
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use super::verified_peer;
+
+    #[tokio::test]
+    async fn verified_peer_compares_the_kernel_peer_uid() -> anyhow::Result<()> {
+        let uid = rustix::process::geteuid().as_raw();
+        let (local, _remote) = UnixStream::pair()?;
+        verified_peer(local, uid)?;
+        let (local, _remote) = UnixStream::pair()?;
+        assert!(verified_peer(local, uid.wrapping_add(1)).is_err());
+        Ok(())
+    }
 }

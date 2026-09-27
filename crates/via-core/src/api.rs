@@ -39,6 +39,28 @@ pub struct ReadParams {
     pub address: String,
 }
 
+/// Strict C1 session-address parameters for the current `events` and `logs`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadParams {
+    /// Session whose durable history is read.
+    pub session: SessionId,
+}
+
+/// Strict C1 `daemon/status` parameters; the method takes none.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusParams {}
+
+/// Strict C1 `daemon/stop` parameters currently accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStopParams {
+    /// Stop even while sessions are active.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// Named C1 request error without sensitive input in its message.
 #[derive(Clone, Copy, Debug)]
 pub struct ApiError {
