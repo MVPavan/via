@@ -333,6 +333,12 @@ pub struct Store {
     raw_join: Option<JoinHandle<()>>,
 }
 
+/// Releases a stalled raw worker when dropped.
+#[cfg(feature = "test-failpoints")]
+pub struct RawStall {
+    _release: mpsc::Sender<()>,
+}
+
 /// One unopened pair of Store capabilities passed intact to Wire bootstrap.
 pub struct RuntimeResources {
     raw: RawFactory,
@@ -409,6 +415,9 @@ enum RawCommand {
         bytes: Vec<u8>,
         reply: oneshot::Sender<Result<DurableRaw, StoreError>>,
     },
+    /// Test-only fault: holds the raw worker until the paired sender drops.
+    #[cfg(feature = "test-failpoints")]
+    Stall(Receiver<()>),
     Shutdown,
 }
 
@@ -485,6 +494,17 @@ impl Store {
     /// Returns a bounded, cloneable client for Core lifecycle operations.
     pub fn client(&self) -> StoreClient {
         self.client.clone()
+    }
+
+    /// Test-only fault: every raw append queued after this call waits until the
+    /// returned guard drops. Drop the guard before the Store owner, whose drop
+    /// joins the raw worker.
+    #[cfg(feature = "test-failpoints")]
+    pub fn stall_raw_worker(&self) -> RawStall {
+        let (release, held) = mpsc::channel();
+        // The queue is bounded; a full queue only delays the stall behind real appends.
+        let _ = self.raw_sender.send(RawCommand::Stall(held));
+        RawStall { _release: release }
     }
 
     /// Returns the unopened lower-layer bundle for Adapter and Route pass-through.

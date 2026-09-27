@@ -15,6 +15,10 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 
+[features]
+# Test-only fault hooks (runtime-contracts `test-failpoints`); default off.
+test-failpoints = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }

@@ -226,3 +226,6 @@ pub use runtime::{
     ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent,
     SubmissionRecord, TerminalRecord,
 };
+
+#[cfg(feature = "test-failpoints")]
+pub use runtime::RawStall;
