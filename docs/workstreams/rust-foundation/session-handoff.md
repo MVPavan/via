@@ -30,15 +30,15 @@ the historical checkpoint; its findings table is updated by this section.
   Gate green: 116 passed, 2 skipped (root-only peer test; the
   scheduling-dependent queued-handoff force test, ignored until
   `test-failpoints` exists). Deferred test/Store items are on `via-jm4.7.7`.
-- Contract text still to record (implemented, not yet in specs): prelaunch
-  force is `requested`/`quiescent`; force after a Store failure is
-  `failed(store)` with `cancel` filled; a `wait` pending at final shutdown
-  ends `daemon_stopping`; `session.closed.reason` `daemon_stop_force`;
-  `vendor.other.truncated`; force abandoning a post-ARM acquisition marks
-  the raw log incomplete conservatively (bytes *may* be lost); the 256
-  unresolved-turn cap refuses with `admission_refused`.
-- Next: Sol high review of all of Task 1 (`via-jm4.7.5`) → fix → record the
-  contract text above → close Task 1. Then split `via-core/src/engine.rs`
+- Task 1 Sol high review ([task1-sol-high-review.md](task1-sol-high-review.md)):
+  ACCEPT AFTER CHANGES. Findings 1–3 (force disposition, post-ARM
+  acquisition errors and raw completeness, peer-UID acceptance evidence)
+  sent to the W4-H cloud session as "T1-close" (report
+  `w4/reports/T1-close.md`); finding 4 (close idle/drained sessions) is on
+  `via-jm4.7.7`. Approved contract text recorded in C1/runtime (`4b0b192`);
+  raw-completeness wording is left to T1-close.
+- Next: Sol medium review of T1-close → merge → gate → close Task 1
+  (`via-jm4.7.5`). Then split `via-core/src/engine.rs`
   by responsibility; then `.7.6`–`.7.8` (failpoint controller first), then
   `.7.9`. After a reboot, restore tmux session `via` (windows `main`, and
   `watch` running `scratchpad/cloud/watch-branches.sh`).
