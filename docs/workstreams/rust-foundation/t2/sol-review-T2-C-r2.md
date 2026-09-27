@@ -1,0 +1,6 @@
+**Verdict: SOUND (merge).** No T2-C blocker remains in the round-1 diff.
+
+1. `crates/via-core/src/engine/drive.rs:502` latches and returns `Latched` when the commit is uncertain, even if read-back found the durable terminal. The `crates/via-core/src/engine/recovery.rs:106` accepts only `Committed`, so startup fails before serving (`crates/via-cli/src/server.rs:201`). Live dispatcher and force callers already handle `Latched` in the same branches as `Committed`; their behavior is unchanged. The restart scenario (`crates/via-cli/tests/s1_crash_points.rs:2085`) checks for the handoff startup error and a durable cancellation. The worker’s reported revert result confirms it detects the original failure.
+2. The 130-session test (`crates/via-core/tests/restart_handoff.rs:181`) checks that starts spill past the 128-entry channel, retries them, and verifies all 130 turns complete. Its four-permit semaphore is local to that test.
+
+Read-only checks: inspected the specified refs and contracts; `git diff --check 6b8a316 1501e44` passed. I did not rerun tests or run `bd`.
