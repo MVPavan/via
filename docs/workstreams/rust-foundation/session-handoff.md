@@ -13,11 +13,17 @@ the historical checkpoint; its findings table is updated by this section.
   `rust-foundation` at `4f9d6e3`; gate green, 64 tests. Worker reports in
   `w1/reports/`.
 - GPT-6 Sol medium reviewed each W1 merge: A unsound, B and C sound with
-  changes. Findings and their owners: [w2/README.md](w2/README.md).
-- Next: W1-D (shutdown seam, T1-I7, T1-I4, stop drain) and W2-E (T1-I5 end
-  to end, evidence gaps, failure classes), both Opus 5.5 high cloud
-  sessions in parallel. Then a Sol high review of Task 1 and close
-  `via-jm4.7.5`; then `.7.6`–`.7.8`, then `.7.9` (Fable 5.1 high / Astra).
+  changes ([w2/sol-reviews/](w2/sol-reviews/)); three small fixes landed
+  locally (`9f00443`).
+- W2 ([w2/README.md](w2/README.md)): W1-D (shutdown seam, T1-I7, T1-I4,
+  stop drain) and W2-E (T1-I5 end to end, evidence gaps, failure classes)
+  merged; gate green, 86 tests. Sol medium: W1-D unsound, W2-E sound with
+  changes.
+- Next: W3 ([w3/README.md](w3/README.md)), W3-F (stop/shutdown/cancel) and
+  W3-G (raw waits, uncertain commits), Opus 5.5 high cloud sessions in
+  parallel. Then a Sol high review of Task 1 and close `via-jm4.7.5`; then
+  `.7.6`–`.7.8` (failpoint controller with `.7.6`/`.7.7`), then `.7.9`
+  (Fable 5.1 high / Astra).
 
 Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
 The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
