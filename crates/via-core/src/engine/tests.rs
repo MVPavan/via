@@ -477,6 +477,37 @@ fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
     });
 }
 
+/// Design §4, force accepted after the dispatch decision but before the
+/// grant: the grant is refused, so the turn is cancelled without submission
+/// and its queued-only session closes. T2-B submitted a turn decided `Run`
+/// without checking force.
+#[test]
+fn a_force_between_the_decision_and_the_grant_refuses_the_grant() {
+    let Some(root) = child("a_force_between_the_decision_and_the_grant_refuses_the_grant") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_grant
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine.faults.release.notify_one();
+        });
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.anchors, 0);
+    });
+}
+
 /// Design §4, grant before force: the granted turn is submitted, then the
 /// already-latched force reaches Route before any launch; the turn ends under
 /// the C1 §7.6 force row (`cancelled`, `requested`) and the session closes.
@@ -613,13 +644,13 @@ fn slot_retirement_racing_receipts_keeps_one_event_head() {
 }
 
 /// Design §7: waiting turns cost no reads of their own. Eight sessions each
-/// hold eight queued turns behind a predecessor whose reads keep failing;
-/// over three seconds each dispatcher reads only on its backoff timer
-/// (250 ms doubling), never once per waiting turn per 250 ms as T2-B did.
+/// hold eight queued turns whose predecessor reads keep failing; over three
+/// seconds each dispatcher reads only on its backoff timer (250 ms doubling),
+/// not on T2-B's fixed 250 ms recheck (96 reads here at T2-B's head).
 #[test]
-fn waiting_turns_are_read_per_session_on_backoff_not_per_turn() {
+fn waiting_turns_are_read_per_session_on_backoff() {
     const SESSIONS: usize = 8;
-    let Some(root) = child("waiting_turns_are_read_per_session_on_backoff_not_per_turn") else {
+    let Some(root) = child("waiting_turns_are_read_per_session_on_backoff") else {
         return;
     };
     run(async {

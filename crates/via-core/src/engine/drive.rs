@@ -149,6 +149,11 @@ impl Engine {
     /// until Store confirms the submission. A failed or uncertain submission
     /// latches Store failure and the turn stays queued with no vendor I/O.
     async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
+        #[cfg(test)]
+        if self.faults.hold_before_grant.load(Ordering::Acquire) {
+            self.faults.granted.notify_one();
+            self.faults.release.notified().await;
+        }
         if !self.grant() {
             return Step::Next;
         }

@@ -105,6 +105,8 @@ struct Faults {
     submission_reply_lost: AtomicBool,
     /// This many `queued → cancelled` commits fail, writing nothing.
     cancel_fails: AtomicUsize,
+    /// A turn decided `Run` waits for `release` before its grant.
+    hold_before_grant: AtomicBool,
     /// A granted turn waits for `release` before its submission commit.
     hold_after_grant: AtomicBool,
     granted: tokio::sync::Notify,
