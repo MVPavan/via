@@ -187,6 +187,13 @@ feature. `Cargo.lock` is unchanged, and I added no dependencies.
   submission that left nothing durable. The later task that settles
   uncertain submissions should reconcile the durable submission head before
   it reports the state.
+- **Deferred (Sol W4-I r2 review):**
+  `a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_state`
+  is a characterization test of the `submit` helper and its C1 reads.
+  Round-1 production code already recorded `Failed(Queued)`, so it has no
+  genuine round-1 red result; its reported failure came from removing that
+  behaviour artificially. No regression drives a submission failure through
+  `drive`.
 - Daemon-wide Store health, cleanup and Store reply bounds belong to Task 3
   (`via-jm4.7.7`), as the W4 README says; the Sol review agrees.
 - There is no true end-to-end test through the `via` binary until failpoints
@@ -297,6 +304,104 @@ Run with `XDG_RUNTIME_DIR` set to a private 0700 directory:
 | fmt | clean |
 | clippy | clean |
 | nextest | 107 passed, 1 skipped (the existing root-only `#[ignore]`) |
+| deny | ok |
+| check-layers | exit 0 |
+| Markdown links | 0 broken in this report |
+
+## Round 3
+
+The review is [`../sol-review-W4-I-r2.md`](../sol-review-W4-I-r2.md). I merged
+`origin/rust-foundation` first; the merge changed docs only. This round fixes
+both merge blockers in commit `78b4a52`. The deferred item is recorded under
+Open.
+
+### R3-1. Capacity was reported as a Store failure
+
+**Failure mode.** With the set full of ordinary in-flight turns, `spawn`
+returned `store_error` although no Store operation had failed. C1 §8.1
+assigns resource admission refusal to `admission_refused`.
+
+**Fix.** `journal::admission` replaces the boolean `admits`. When the set is
+still full after settlement:
+- it returns the new `ApiError::TURNS_AT_CAPACITY` (-32012
+  `admission_refused`, "too many unresolved turns") if no failed turn
+  remains;
+- it returns `store_error` while a turn whose terminal could not be made
+  durable is still retained.
+
+**Tests.**
+- `in_flight_turns_count_toward_the_bound` now expects
+  `(-32012, "admission_refused")`.
+- `failed_turns_are_bounded_and_each_keeps_store_error` still covers the
+  actual Store failure: a full set of failed turns is `store_error`.
+
+### R3-2. Settlement could starve a durable terminal
+
+**Failure mode.** The sweep read failed turns one by one in `HashMap` order
+under one 2 s budget. Slow early reads could use up the budget before a later
+durable terminal was checked, and admission then stayed closed.
+
+**Rejected alternative.** I first read all failed turns concurrently. The
+full gate then failed intermittently (1 in 6 isolated runs), because Store's
+command queue holds 128 and `send` uses `try_send`. The overflow reads
+returned `Unavailable`, so the durable turn could be missed. That fan-out
+would also crowd out live turns' commits.
+
+**Fix.**
+- A new read-only Store command, `StoreClient::terminated(turns)`, returns
+  which of up to 1000 turns have a committed terminal envelope. It runs as
+  one indexed `EXISTS` per key, in one worker operation that uses one queue
+  slot.
+- `TurnJournal` gains `terminated`.
+- `settle_failed` asks once for the whole failed set, bounded by
+  `SETTLE_BOUND` (2 s). A failed or expired query keeps every turn.
+- Every candidate is inspected whatever the order or the number of entries.
+
+**Regression.**
+`a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound`:
+1. It sets up 255 failed turns and one failed turn whose terminal is durable.
+2. In the fault journal, every other turn's per-turn `result` read stalls for
+   3 s, past the bound.
+3. It expects `admission` to succeed in under 3 s, the durable turn to be
+   forgotten and the rest to be kept.
+
+After the fix, 10 of 10 isolated runs pass.
+
+### Output before the fix
+
+The new `admission` entry point was first added with round-2 semantics (a
+sequential sweep and always `store_error`), and the new tests were run
+against it:
+
+```
+FAIL in_flight_turns_count_toward_the_bound
+  left: (-32018, "store_error")   right: (-32012, "admission_refused")
+FAIL [2.136s] a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound
+  called `Result::unwrap()` on an `Err` value: ApiError { code: -32018, kind: "store_error", … }
+Summary 11 tests run: 9 passed, 2 failed
+```
+
+### Files changed
+
+- `crates/via-core/src/api.rs`: `TURNS_AT_CAPACITY`.
+- `crates/via-core/src/engine.rs` (shared): one line in `spawn`, which now
+  calls `journal::admission(..)?`.
+- `crates/via-core/src/engine/journal.rs`, `crates/via-core/src/engine/journal/tests.rs`.
+- **Outside my owned paths, called out:**
+  `crates/via-store/src/runtime.rs` and `crates/via-store/src/runtime/sql.rs`
+  add the `Terminated` command, `StoreClient::terminated` and
+  `read_terminated`. The command only reads. No schema change and no new
+  dependency.
+
+### Gate
+
+Run with `XDG_RUNTIME_DIR` set to a private 0700 directory:
+
+| Check | Result |
+|---|---|
+| fmt | clean |
+| clippy | clean |
+| nextest | 108 passed, 1 skipped (the existing root-only `#[ignore]`) |
 | deny | ok |
 | check-layers | exit 0 |
 | Markdown links | 0 broken in this report |
