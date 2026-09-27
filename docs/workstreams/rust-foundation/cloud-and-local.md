@@ -122,3 +122,10 @@ Coordination rules (proposed):
   switch to Custom once OpenCode's hosts are known). Each cloud session
   reports its model and effort first and pushes only its own branch; it
   does not run `bd`, and the orchestrator records Beads changes locally.
+- Local control runs in tmux session `via`: `scratchpad/cloud/launch.sh
+  <name> <model> <effort> <brief>` starts each cloud session from its own
+  window (log `scratchpad/cloud/<name>-launch.log`), and window `watch`
+  (`watch-branches.sh`) records new remote branches in
+  `scratchpad/cloud/new-branches.log`. Both survive the orchestrator
+  session closing; the cloud sessions themselves run on Anthropic's side
+  regardless.
