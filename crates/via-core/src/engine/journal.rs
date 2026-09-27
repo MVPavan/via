@@ -37,12 +37,14 @@ pub(super) trait TurnJournal: Sync {
         record: EventRecord,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Commits the terminal envelope and `turn.ended` together; with `closed`,
-    /// that `session.closed` event follows in the same transaction.
+    /// that `session.closed` event follows in the same transaction unless
+    /// another turn of the session is queued or running. True when the close
+    /// was written.
     fn commit_terminal(
         &self,
         record: TerminalRecord,
         closed: Option<Value>,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Reads a bounded page of durable events from `from_seq`.
     fn events(
         &self,
@@ -87,10 +89,10 @@ impl TurnJournal for StoreClient {
         &self,
         record: TerminalRecord,
         closed: Option<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         match closed {
             Some(closed) => Self::commit_closing_terminal(self, record, closed).await,
-            None => Self::commit_terminal(self, record).await,
+            None => Self::commit_terminal(self, record).await.map(|()| false),
         }
     }
 
@@ -411,10 +413,12 @@ pub(super) async fn reconcile(
 /// A terminal record that is durable. `uncertain` when Store reported an
 /// unknown outcome and only the read-back found it: the commit itself was
 /// uncertain, which latches Store failure (runtime §7), while the committed
-/// result stays readable.
+/// result stays readable. `closed` when a requested `session.closed` is known
+/// written; Store refuses it while another turn of the session is unfinished.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Durable {
     pub(super) uncertain: bool,
+    pub(super) closed: bool,
 }
 
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
@@ -426,9 +430,15 @@ pub(super) async fn commit_terminal(
 ) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
     match journal.commit_terminal(record, closed).await {
-        Ok(()) => Ok(Durable { uncertain: false }),
+        Ok(closed) => Ok(Durable {
+            uncertain: false,
+            closed,
+        }),
         Err(error) if may_have_committed(&error) => match journal.result(&session, turn).await {
-            Ok(Some(_)) => Ok(Durable { uncertain: true }),
+            Ok(Some(_)) => Ok(Durable {
+                uncertain: true,
+                closed: false,
+            }),
             Ok(None) | Err(_) => Err(ApiError::STORE),
         },
         Err(_) => Err(ApiError::STORE),

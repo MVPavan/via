@@ -1689,3 +1689,106 @@ fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
         },
     )
 }
+
+/// Round 2, decision 3: under force, the queued turn's cancellation read is
+/// paused at `core.force.cancel_read` and never released. The read expires at
+/// final shutdown's read cutoff (4 s before its 10 s deadline), the turn stays
+/// unresolved, and the daemon finishes shutdown within its bound with exit 4.
+#[test]
+fn s1_f12_stalled_force_path_read_expires_within_the_shutdown_bound() -> TestResult {
+    scenario(
+        "s1_f12_stalled_force_read",
+        &accepting_fixture(),
+        |paths, evidence| {
+            let point = "core.force.cancel_read";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "stalled")?;
+            let mut args = spawn_args("f10").to_vec();
+            args.extend(["--handle", HANDLE]);
+            let spawn = paths.run(evidence, "spawn", &args)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            wait_file(&paths.sync.join("accepted.entered"))?;
+            let resume = paths.run(
+                evidence,
+                "resume",
+                &[
+                    "resume", &session, "--prompt", "q", "--handle", HANDLE, "--json",
+                ],
+            )?;
+            check(resume.status.success(), || {
+                format!("resume exited {}", resume.status)
+            })?;
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--force", "--json"])?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let stopped = Instant::now();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+                .ok_or_else(|| ScenarioError::Timeout("shutdown outlived its bound".to_owned()))?;
+            let elapsed = stopped.elapsed();
+            let trace =
+                fs::read_to_string(evidence.dir.join("daemon-stalled.trace")).map_err(infra)?;
+            check(
+                status.code() == Some(4)
+                    && elapsed < FINAL_SHUTDOWN + Duration::from_secs(1)
+                    && trace.contains("\"unresolved_turns\":1"),
+                || format!("shutdown ended {status} after {elapsed:?}; trace {trace}"),
+            )?;
+            let types = paths.event_types(&session)?;
+            check(!types.iter().any(|kind| kind == "session.closed"), || {
+                format!("events {types:?}")
+            })?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Round 2, item 4: startup recovery's terminal commit loses its reply. The
+/// commit was uncertain, so startup fails before admission even though the
+/// terminal is durable; the next restart reads that durable `unknown` result,
+/// recovers nothing twice and admits.
+#[test]
+fn s1_f10_lost_recovery_terminal_reply_fails_startup_then_admits() -> TestResult {
+    scenario(
+        "s1_f10_lost_recovery_terminal_reply",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let intent = "core.intent.after_commit";
+            arm(paths, intent, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, intent, "pause", &daemon)?;
+            daemon.kill()?;
+            paths.failpoints.disarm(intent).map_err(infra)?;
+            drop(daemon);
+            // Recovery commits `cancel.requested` and `cancel.settled`, then the
+            // terminal: the third Core lifecycle commit of the new daemon.
+            let lost = "store.commit.reply_lost";
+            paths.failpoints.arm(lost, 3, "fail_io").map_err(infra)?;
+            let (status, trace) = refused_start(paths, evidence, "refused")?;
+            check(
+                !status.success() && trace.contains("crash recovery failed"),
+                || format!("startup ended {status}: {trace}"),
+            )?;
+            let turn = paths.turn(&session)?;
+            check(turn.state == "unknown" && turn.envelope.is_some(), || {
+                format!("the recovered terminal is not durable: {}", turn.state)
+            })?;
+            paths.failpoints.disarm(lost).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}

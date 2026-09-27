@@ -204,7 +204,7 @@ impl Engine {
         .await;
         // Recovery must be certain before admission: an uncertain commit, even
         // one read back as durable, fails startup instead (runtime §7).
-        if matches!(committed, Ok(journal::Durable { uncertain: false })) {
+        if committed.is_ok_and(|durable| !durable.uncertain) {
             head.committed(1);
             Ok(())
         } else {

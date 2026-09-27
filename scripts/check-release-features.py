@@ -36,6 +36,7 @@ POINTS = [
     "core.recovery.page_boundary",
     "host.recovery.absence_commit",
     "host.anchor.after_arm_intent_commit",
+    "core.force.cancel_read",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 MARKERS = [*ACTIVATION, *POINTS, "failpoint controller"]

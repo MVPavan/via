@@ -77,16 +77,18 @@ pub struct Engine {
     sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
     /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
-    /// Set by Core's first failed or uncertain state write (runtime §7), under
-    /// `admission`: admission and dispatch stop and final shutdown runs in
-    /// force mode.
+    /// Phase two of the latch, set under `admission` after `failure_pending`
+    /// (runtime §7): the latch is ordered after every receipt inside it.
     store_failed: AtomicBool,
+    /// Phase one of the latch: a failed or uncertain write was observed; set
+    /// under the `stop` mutex before the observer awaits anything.
+    failure_pending: AtomicBool,
     /// Sessions with dispatch state when force was accepted, for final
     /// shutdown's closure pass.
     force_sessions: StdMutex<Option<Vec<SessionId>>>,
     /// Until when a force-path read may retry: final shutdown's deadline less
     /// the part kept for Host cleanup and forced terminals.
-    read_retries_until: OnceLock<tokio::time::Instant>,
+    read_retries_until: watch::Sender<Option<tokio::time::Instant>>,
     /// Sessions whose dispatcher daemon main must start.
     starts: mpsc::Sender<SessionId>,
     /// Daemon main's end of `starts`, taken once.
@@ -224,8 +226,9 @@ impl Engine {
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
             store_failed: AtomicBool::new(false),
+            failure_pending: AtomicBool::new(false),
             force_sessions: StdMutex::new(None),
-            read_retries_until: OnceLock::new(),
+            read_retries_until: watch::Sender::new(None),
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
             pending_starts: StdMutex::new(HashSet::new()),
@@ -248,41 +251,74 @@ impl Engine {
     }
 
     /// Latches Store failure after Core's first failed or uncertain state
-    /// write (runtime §7), taking `admission` first: the latch is ordered
-    /// against every receipt and every `session.closed` decision, which run
-    /// under it. The caller holds no slot, session or head lock.
-    pub(super) async fn latch(&self) {
-        let admission = self.admission.lock().await;
-        self.latch_held(&admission);
+    /// write (runtime §7), in two phases (design §3.2). Phase one runs now,
+    /// before anything is awaited: `failure_pending` and the force signal are
+    /// published under the `stop` mutex, so no grant, no pre-ARM gate and no
+    /// new receipt passes from here on. Phase two, the returned future,
+    /// finalizes the latch under `admission`, ordered after any receipt
+    /// already inside it. The caller holds no slot, session or head lock.
+    pub(super) fn latch(&self) -> impl Future<Output = ()> + '_ {
+        self.fail_pending();
+        async move {
+            let admission = self.admission.lock().await;
+            self.latch_held(&admission);
+        }
     }
 
-    /// [`Engine::latch`] for a caller already holding `admission`: new work
-    /// and every grant are refused, and the stop mode becomes `Force`, so
-    /// running turns take the forced path and daemon main starts final
-    /// shutdown, which then reports an unclean exit.
+    /// [`Engine::latch`] for a caller already holding `admission`: both phases
+    /// at once.
     pub(super) fn latch_held(&self, _admission: &Admission<'_>) {
-        if self.store_failed.swap(true, Ordering::AcqRel) {
+        self.fail_pending();
+        self.store_failed.store(true, Ordering::Release);
+    }
+
+    /// Phase one of the latch: marks the failure pending and sends the force
+    /// signal under the `stop` mutex, which the grant takes, so running turns
+    /// take the forced path and daemon main starts final shutdown, which then
+    /// reports an unclean exit.
+    fn fail_pending(&self) {
+        let mut stop = lock(&self.stop);
+        if self.failure_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        *lock(&self.stop) = Some(StopMode::Force);
+        *stop = Some(StopMode::Force);
         self.force_requested_at
             .get_or_init(|| rfc3339(SystemTime::now()));
         self.force.send_replace(true);
     }
 
+    /// Whether phase two finalized the latch under `admission`.
+    #[cfg(test)]
+    fn latch_finalized(&self) -> bool {
+        self.store_failed.load(Ordering::Acquire)
+    }
+
     /// Final shutdown began with this absolute deadline: force-path reads
     /// stop retrying in time for Host cleanup and forced terminals.
     pub fn begin_final_shutdown(&self, deadline: tokio::time::Instant) {
-        let _ = self.read_retries_until.set(
-            deadline
-                .checked_sub(READ_RETRY_RESERVE)
-                .unwrap_or_else(tokio::time::Instant::now),
-        );
+        let by = deadline
+            .checked_sub(READ_RETRY_RESERVE)
+            .unwrap_or_else(tokio::time::Instant::now);
+        self.read_retries_until
+            .send_if_modified(|until| until.is_none() && until.replace(by).is_none());
     }
 
-    /// Until when a force-path read may retry, once final shutdown began.
+    /// Until when a force-path read may run or retry, once final shutdown began.
     fn read_retries_until(&self) -> Option<tokio::time::Instant> {
-        self.read_retries_until.get().copied()
+        *self.read_retries_until.borrow()
+    }
+
+    /// Resolves at the force-path read cutoff; never before final shutdown began.
+    async fn read_cutoff(&self) {
+        let mut until = self.read_retries_until.subscribe();
+        let by = match until.wait_for(Option::is_some).await {
+            Ok(by) => *by,
+            Err(_) => None,
+        };
+        match by {
+            Some(by) => tokio::time::sleep_until(by).await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Test hook: once `flag` is armed, signals `granted` and waits for `release`.
@@ -294,9 +330,9 @@ impl Engine {
         }
     }
 
-    /// Whether Store failure is latched.
+    /// Whether a Store failure was observed: pending or finalized.
     pub fn store_failed(&self) -> bool {
-        self.store_failed.load(Ordering::Acquire)
+        self.failure_pending.load(Ordering::Acquire) || self.store_failed.load(Ordering::Acquire)
     }
 
     /// Wakes when a force stop is accepted or Store failure latches; daemon

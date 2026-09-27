@@ -58,6 +58,8 @@ enum Cancelled {
     Unread,
     /// Store failure is latched: by this commit, or before it could run.
     Latched,
+    /// A read outlived final shutdown's read cutoff: nothing was written.
+    Expired,
 }
 
 /// What the dispatcher does after one step.
@@ -111,7 +113,7 @@ impl Engine {
             let step = match self.decide(&session, turn).await {
                 Decision::Run => self.dispatch(&slot, &session, turn).await,
                 Decision::Cancel => match self.cancel_queued(&slot, &session, turn, false).await {
-                    Cancelled::Committed | Cancelled::Latched => Step::Next,
+                    Cancelled::Committed | Cancelled::Latched | Cancelled::Expired => Step::Next,
                     Cancelled::Unread => Step::Wait,
                 },
                 Decision::Wait => Step::Wait,
@@ -211,6 +213,11 @@ impl Engine {
                     .await
                 {
                     Cancelled::Committed | Cancelled::Latched => break,
+                    Cancelled::Expired => {
+                        // No further reads for this turn: it stays unresolved.
+                        self.unresolved.fail(session, turn, TurnState::Queued);
+                        break;
+                    }
                     Cancelled::Unread => {
                         if !self.retry_read(&mut backoff).await {
                             self.unresolved.fail(session, turn, TurnState::Queued);
@@ -401,30 +408,41 @@ impl Engine {
         turn: TurnNumber,
         closing: bool,
     ) -> Cancelled {
-        #[cfg(test)]
-        self.hold(&self.faults.hold_cancel_read).await;
-        #[cfg(test)]
-        let unread = self
-            .faults
-            .cancel_read_fails
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok();
-        #[cfg(not(test))]
-        let unread = false;
-        let queued = if unread {
-            None
-        } else {
-            self.store.queued_turn(session, turn).await.ok().flatten()
+        // Both reads run under final shutdown's read cutoff (design §2.3).
+        let reads = async {
+            #[cfg(test)]
+            self.hold(&self.faults.hold_cancel_read).await;
+            #[cfg(feature = "test-failpoints")]
+            if via_store::failpoint::hit_async("core.force.cancel_read")
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            #[cfg(test)]
+            if self
+                .faults
+                .cancel_read_fails
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return None;
+            }
+            let queued = self.store.queued_turn(session, turn).await.ok().flatten()?;
+            // Settle an unknown head now, so the commit below reads nothing.
+            slot.head.lock(&self.store, session).await.ok()?;
+            Some(queued)
+        };
+        let queued = tokio::select! {
+            biased;
+            queued = reads => queued,
+            () = self.read_cutoff() => return Cancelled::Expired,
         };
         let Some(queued) = queued else {
             return Cancelled::Unread;
         };
-        // Settle an unknown head now, so the commit below reads nothing.
-        if slot.head.lock(&self.store, session).await.is_err() {
-            return Cancelled::Unread;
-        }
         let (started, record, terminal) = queued_cancellation(slot, session, turn, queued);
         #[cfg(test)]
         if closing {
@@ -502,7 +520,7 @@ impl Engine {
             close_session,
         )
         .await;
-        if !matches!(finished, Ok(Durable { uncertain: false })) {
+        if !finished.as_ref().is_ok_and(|durable| !durable.uncertain) {
             self.latch_with(held).await;
         }
         finished.map(drop)
@@ -605,7 +623,6 @@ impl Engine {
         } else {
             None
         };
-        let events = if closed.is_some() { 2 } else { 1 };
         let committed = journal::commit_terminal(
             journal,
             TerminalRecord {
@@ -619,7 +636,10 @@ impl Engine {
         )
         .await;
         match committed {
-            Ok(Durable { uncertain: false }) => head.committed(events),
+            Ok(Durable {
+                uncertain: false,
+                closed,
+            }) => head.committed(1 + u64::from(closed)),
             // Uncertain or failed: re-read the head before the session's next event.
             Ok(_) | Err(_) => head.lost(),
         }

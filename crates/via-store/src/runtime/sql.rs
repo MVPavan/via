@@ -225,7 +225,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
             send_commit(reply, commit_event(conn, root, &record));
         }
         Command::Terminal(record, reply) => {
-            send_commit(reply, commit_terminal(conn, root, &record, None));
+            send_commit(reply, commit_terminal(conn, root, &record, None).map(drop));
         }
         Command::SessionClosed(session, closed, reply) => {
             send_commit(reply, commit_session_closed(conn, &session, &closed));
@@ -710,26 +710,26 @@ fn commit_event(
 }
 
 /// Commits `session.closed` alone once every turn of the session has a
-/// terminal, and marks the session closed.
+/// terminal, and marks the session closed. A session already closed or
+/// holding a queued or running turn commits nothing and reports the close as
+/// not written; that is not a Store failure.
 fn commit_session_closed(
     conn: &mut Connection,
     session: &SessionId,
     closed: &Value,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
     let open: bool = tx
         .query_row(
-            "SELECT state!='closed' AND NOT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running')) FROM sessions WHERE id=?1",
+            "SELECT state!='closed' FROM sessions WHERE id=?1",
             [session.as_str()],
             |row| row.get(0),
         )
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    if !open {
-        return Err(StoreError::Constraint(
-            "session is closed or holds unfinished turns",
-        ));
+    if !open || unfinished_turns(&tx, session)? {
+        return Ok(false);
     }
     insert_event(&tx, session, closed, None)?;
     tx.execute(
@@ -738,7 +738,8 @@ fn commit_session_closed(
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    Ok(true)
 }
 
 /// Commits the terminal and, when `closed` is given, the session's
@@ -748,7 +749,7 @@ fn commit_terminal(
     root: &Path,
     record: &TerminalRecord,
     closed: Option<&Value>,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let state = record
         .envelope
         .get("state")
@@ -779,20 +780,41 @@ fn commit_terminal(
         &record.event,
         record.raw_ref.as_ref(),
     )?;
-    if let Some(closed) = closed {
-        insert_event(&tx, &record.session_id, closed, None)?;
-    }
+    // `session.closed` only when no other turn of the session is queued or
+    // running (this turn is already terminal); otherwise the terminal commits
+    // alone and the close is reported as not written.
+    let closed = match closed {
+        Some(closed) if !unfinished_turns(&tx, &record.session_id)? => {
+            insert_event(&tx, &record.session_id, closed, None)?;
+            true
+        }
+        Some(_) | None => false,
+    };
     // C1 §7.1: a session with queued or running work stays active; closed is final.
     tx.execute(
         "UPDATE sessions SET state=CASE
             WHEN ?2 OR state='closed' THEN 'closed'
             WHEN EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running')) THEN 'active'
             ELSE 'idle' END WHERE id=?1",
-        params![record.session_id.as_str(), closed.is_some()],
+        params![record.session_id.as_str(), closed],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    Ok(closed)
+}
+
+/// Whether any turn of the session is queued or running.
+fn unfinished_turns(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+) -> Result<bool, StoreError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running'))",
+        [session.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))
 }
 
 fn read_result(

@@ -317,10 +317,12 @@ impl Engine {
             return false;
         };
         match self.store.commit_session_closed(session, closed).await {
-            Ok(()) => {
+            Ok(true) => {
                 guard.committed(1);
                 true
             }
+            // Store found the session closed or a turn unfinished: nothing written.
+            Ok(false) => false,
             Err(error) => {
                 if journal::may_have_committed(&error) {
                     guard.lost();

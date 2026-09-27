@@ -72,7 +72,7 @@ impl TurnJournal for FaultJournal {
         &self,
         record: TerminalRecord,
         closed: Option<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         TurnJournal::commit_terminal(&self.store, record, closed).await
     }
 

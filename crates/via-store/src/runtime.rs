@@ -520,9 +520,9 @@ enum Command {
     ClosingTerminal(
         TerminalRecord,
         Value,
-        oneshot::Sender<Result<(), StoreError>>,
+        oneshot::Sender<Result<bool, StoreError>>,
     ),
-    SessionClosed(SessionId, Value, oneshot::Sender<Result<(), StoreError>>),
+    SessionClosed(SessionId, Value, oneshot::Sender<Result<bool, StoreError>>),
     Result(
         SessionId,
         TurnNumber,
@@ -817,23 +817,26 @@ impl StoreClient {
 
     /// Atomically commits a terminal envelope and final event, then the
     /// session-level `closed` event after it, and marks the session closed.
+    /// While another turn of the session is queued or running the terminal
+    /// commits alone: `Ok(false)` reports that the close was not written.
     pub async fn commit_closing_terminal(
         &self,
         record: TerminalRecord,
         closed: Value,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::ClosingTerminal(record, closed, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
     /// Commits a session's `session.closed` event alone and marks it closed;
-    /// refused while the session is closed or holds queued or running work.
+    /// `Ok(false)`, writing nothing, while the session is closed or holds
+    /// queued or running work.
     pub async fn commit_session_closed(
         &self,
         session_id: &SessionId,
         closed: Value,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::SessionClosed(session_id.clone(), closed, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?

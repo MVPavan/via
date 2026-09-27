@@ -728,7 +728,7 @@ fn a_receipt_in_flight_when_another_turn_latches_completes_before_the_latch() {
         let (receipted, ()) = tokio::join!(
             async {
                 let receipted = spawn(&engine, None).await;
-                (receipted, engine.store_failed())
+                (receipted, engine.latch_finalized())
             },
             async {
                 engine.faults.granted.notified().await;
@@ -746,7 +746,10 @@ fn a_receipt_in_flight_when_another_turn_latches_completes_before_the_latch() {
         assert!(engine.store_failed(), "the other turn latched");
         match receipted {
             Ok(receipted) => {
-                assert!(!latched_at_return, "a receipt succeeded after the latch");
+                assert!(
+                    !latched_at_return,
+                    "a receipt succeeded after the latch finalized"
+                );
                 let (session, _) = receipted.enqueued.unwrap();
                 assert_eq!(starts.try_recv().unwrap(), session, "its start was sent");
                 assert!(engine.unresolved.turns().contains(&(session, turn(1))));
@@ -858,5 +861,138 @@ fn a_failed_read_under_force_retries_then_cancels_and_closes() {
         assert!(!engine.store_failed(), "a read failure never latches");
         let report = shutdown(&engine).await;
         assert!(report.is_clean(), "{report:?}");
+    });
+}
+
+/// Round 2, decision 1: the latch's first phase is synchronous. A holds
+/// `admission` inside its receipt; B's submission reply is lost, so B marks
+/// the failure pending and waits for `admission` to finalize; C's dispatcher
+/// reaches `Run` meanwhile and its grant is refused: no `turn.submitted`, no
+/// vendor launch. Released, A completes and is counted, the latch finalizes,
+/// and the shutdown is unclean. Round 1's latch waited for `admission` before
+/// publishing anything, so C was granted.
+#[test]
+fn a_pending_failure_refuses_grants_while_a_receipt_holds_admission() {
+    let Some(root) = child("a_pending_failure_refuses_grants_while_a_receipt_holds_admission")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let b = new_session(&engine).await;
+        let c = new_session(&engine).await;
+        while starts.try_recv().is_ok() {}
+        engine
+            .faults
+            .submission_reply_lost
+            .store(true, Ordering::Release);
+        engine.faults.hold_receipt.store(true, Ordering::Release);
+        let (a, ()) = tokio::join!(spawn(&engine, None), async {
+            engine.faults.granted.notified().await;
+            let ((), ()) = tokio::join!(
+                // B's lost submission reply marks the failure pending, then
+                // waits for `admission`, which A holds.
+                dispatch(&engine, &b),
+                async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    assert!(engine.store_failed(), "the failure is pending");
+                    assert!(!engine.latch_finalized(), "A still holds admission");
+                    dispatch(&engine, &c).await;
+                    assert_eq!(
+                        event_types(&engine, &c).await,
+                        ["turn.queued"],
+                        "C was not granted"
+                    );
+                    engine.faults.release.notify_one();
+                }
+            );
+        });
+        let (a, _) = a.unwrap().enqueued.unwrap();
+        assert_eq!(starts.try_recv().unwrap(), a, "A's start was sent");
+        assert!(
+            engine.unresolved.turns().contains(&(a, turn(1))),
+            "A is counted"
+        );
+        assert!(engine.latch_finalized());
+        assert_eq!(spawn(&engine, None).await.unwrap_err().kind, "store_error");
+        let report = shutdown(&engine).await;
+        assert_eq!(report.anchors, 0, "C launched nothing: {report:?}");
+        assert!(report.store_failed && !report.is_clean(), "{report:?}");
+    });
+}
+
+/// Round 2, decision 2: an older durable queued turn left by an earlier daemon
+/// is not in this daemon's memory. A new resume queues turn 2; force cancels
+/// it as the session's last known turn, and Store refuses `session.closed`
+/// in the same transaction because turn 1 is still queued. The closure pass
+/// then counts the session unclosed: no `session.closed`, exit 4.
+#[test]
+fn force_never_closes_a_session_with_an_older_queued_turn() {
+    let Some(root) = child("force_never_closes_a_session_with_an_older_queued_turn") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            new_session(&earlier).await
+        };
+        let engine = open(&root);
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        dispatch(&engine, &session).await;
+        let types = event_types(&engine, &session).await;
+        assert_eq!(
+            types,
+            ["turn.queued", "turn.queued", "turn.ended"],
+            "{types:?}"
+        );
+        assert!(
+            !engine.store_failed(),
+            "a refused close is not a Store failure"
+        );
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+        assert!(!report.is_clean(), "{report:?}");
+        assert!(
+            !event_types(&engine, &session)
+                .await
+                .contains(&"session.closed".to_owned())
+        );
+    });
+}
+
+/// Round 2, decision 3: a force-path read that stalls past final shutdown's
+/// read cutoff is abandoned: the turn stays unresolved, no further read is
+/// issued, and the dispatcher returns in time for the shutdown's bound.
+#[test]
+fn a_stalled_force_path_read_expires_at_the_cutoff() {
+    let Some(root) = child("a_stalled_force_path_read_expires_at_the_cutoff") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine.request_stop(&force()).await.unwrap();
+        // Never released: the read stalls.
+        engine
+            .faults
+            .hold_cancel_read
+            .store(true, Ordering::Release);
+        let started = tokio::time::Instant::now();
+        // The cutoff is 4 s before this deadline: 500 ms from now.
+        engine.begin_final_shutdown(started + Duration::from_millis(4_500));
+        dispatch(&engine, &session).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dispatcher took {elapsed:?}"
+        );
+        assert_eq!(event_types(&engine, &session).await, ["turn.queued"]);
+        let report = shutdown(&engine).await;
+        assert!(
+            report.unresolved_turns >= 1 && !report.is_clean(),
+            "{report:?}"
+        );
     });
 }

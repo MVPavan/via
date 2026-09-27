@@ -11,7 +11,10 @@ Status: accepted with changes. This version folds in:
   in Store-failed mode, and a pre-ARM launch gate (§3.1);
 - the round-1 code review (`sol-review-T2-B2.md`) and its decisions: an
   uncertain terminal commit latches; `admission` is the latch barrier (§3.2);
-  a force closure pass (§2.4); force-path reads retry (§2.3).
+  a force closure pass (§2.4); force-path reads retry (§2.3);
+- the round-2 code review (`sol-review-T2-B2-r2.md`) and its decisions: a
+  two-phase latch (§3.2); Store refuses `session.closed` while another turn
+  is unfinished (§2.3); force-path reads are bounded by the cutoff (§2.3).
 
 This note is normative for Step 2.
 
@@ -153,13 +156,25 @@ N waiting turns in one session cost one timer, not N.
   before a cancellation (the queued facts or the head) retries with the
   dispatcher backoff until final shutdown's read budget ends. That budget is
   the shared deadline less 4 s, kept for Host cleanup and forced terminals.
-  Only when the budget ends is the turn left unresolved.
+  Each force-path read itself also runs under that cutoff, including a read
+  that started before final shutdown began. A read still pending at the
+  cutoff is abandoned: the turn is left unresolved (exit 4) and no further
+  read is issued for it.
 - `session.closed` (`reason: "daemon_stop_force"`) is committed only after
   every turn of the session has a durable force disposition, only when the
   session has no other unresolved turn, and never once Store failure is
   latched (§3). In a queued-only session it
   rides on the last cancellation, in the same transaction. Store's closing
-  terminal accepts `queued → cancelled`. A session with a forced running
+  terminal accepts `queued → cancelled`. Store itself refuses the close:
+  every transaction that can write `session.closed` checks, in the same
+  transaction, for any other queued or running turn of the session. Those
+  transactions are the closing terminal, the closing `queued → cancelled`
+  and `commit_session_closed`. If another such turn exists, the transaction
+  commits its own row without `session.closed` and reports that the close
+  was not written. That is not a Store failure, and the closure pass then
+  counts the session unclosed (exit 4). This catches an older queued turn
+  that an earlier daemon left, which is not in this daemon's memory. A
+  session with a forced running
   turn is closed by that turn's terminal in final shutdown, if its queued
   turns were all durably cancelled by then.
 - If any cancellation or the close is uncommitted, the session is not
@@ -239,15 +254,26 @@ latches Store failure (runtime §7). Restart recovery settles it; a keyed
 retry after restart learns its receipt. An unkeyed caller must not resend
 the request."
 
-### 3.2 The latch barrier is `admission`
+### 3.2 Two-phase latch; the ordering barrier is `admission`
 
-The latch is set while holding `admission`. A caller that already holds it
-(spawn, resume, a closing commit) sets it directly. Any other caller first
-releases any slot, session or head lock, then acquires `admission`.
+**Phase one (pending).** The code that observes a failed or uncertain write,
+before awaiting anything, sets `failure_pending` and sends the force signal
+synchronously under the `stop` mutex. From then on:
 
-- Receipt commits run under `admission`, so a receipt either completes
-  before the latch, including its enqueue and start request, or is refused
-  after it.
+- `grant` refuses, because it takes the same mutex and checks
+  `failure_pending` and the latch;
+- the pre-ARM gate refuses, because it watches the force signal;
+- spawn and resume refuse with `store_error` at admission entry.
+
+**Phase two (finalized).** The observer then finalizes the latch under
+`admission`: directly if it already holds `admission` (spawn, resume, a
+closing commit), otherwise by acquiring it after releasing any slot, session
+or head lock. `Engine::store_failed()` reports a failure that is pending or
+finalized; every check that stops work uses it.
+
+- Receipt commits run under `admission`. A receipt already inside
+  `admission` completes, is counted and has its start sent before the latch
+  finalizes. One entering after `failure_pending` is refused.
 - A commit that carries `session.closed` holds `admission` from its latch
   and force check through the commit, so it never closes after a latch.
 - Daemon main's final start drain begins only after the force signal that
