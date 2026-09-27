@@ -284,7 +284,9 @@ finalized; every check that stops work uses it.
   `admission` completes, is counted and has its start sent before the latch
   finalizes. One entering after `failure_pending` is refused.
 - A commit that carries `session.closed` holds `admission` from its latch
-  and force check through the commit, so it never closes after a latch.
+  and force check through the commit. Once `failure_pending` is observed no
+  new one starts; one that passed its check earlier may finish, guarded by
+  Store's same-transaction refusal (§3, "Closure after a failure").
 - Daemon main's final start drain begins only after the force signal that
   the latch (or force acceptance) sends under `admission`. Any late receipt
   is therefore already in the channel or the pending set.
