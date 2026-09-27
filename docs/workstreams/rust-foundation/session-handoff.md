@@ -43,19 +43,24 @@ the historical checkpoint; its findings table is updated by this section.
   shared types), `engine/drive.rs`, `engine/stop.rs`, `engine/terminal.rs`
   (Sol SOUND; merged `0f3650f`; 122 passed, 2 ignored).
 - Now: S1 Task 2 (`via-jm4.7.6`, [t2/README.md](t2/README.md)).
-  T2-A (failpoints + F8/F10, Opus 5.5 high, session
-  `session_014hFuihQE3oLoUQXqJqMu4P`, branch
-  `claude/task-t2a-report-x4b9yl`): Sol r3 SOUND WITH CHANGES; round 4
-  (deadline → uncertain, not fatal; paginated anchor inventory) in progress.
-  T2-B (multi-turn, resume, queues, retries + F13/F14/F17/F28, Opus 5.5
-  medium, branch `claude/t2-b-rust-foundation-juogko`): Sol r3 UNSOUND,
-  third round of fix-induced dispatch blockers, so it stopped patching and
-  moved to T2-B2 ([t2/b2.md](t2/b2.md), Opus 5.5 high, session
-  `session_011RDNGQPpgG3RwXuw349DaK`): a dispatch design note, Sol review of
-  the note, then implementation on T2-B's branch. Then Task 3 (`.7.7`),
-  Task 4 (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux
-  session `via` (windows `main`, and `watch` running
-  `scratchpad/cloud/watch-branches.sh`).
+  T2-A (failpoints + F8/F10 + startup recovery, Opus 5.5 high) merged at
+  `836b6ce` after five review rounds (`t2/sol-review-T2-A*.md`, r5 SOUND).
+  Gate: 130 passed / 2 skipped; with `test-failpoints` 142 / 2; F08–F12
+  line 11 passed; release feature check passes. T2-B (Opus 5.5 medium)
+  stopped after three UNSOUND rounds; T2-B2 ([t2/b2.md](t2/b2.md), Opus 5.5
+  high, session `session_011RDNGQPpgG3RwXuw349DaK`, branch
+  `claude/t2-b2-step-1-3pslux`) redesigned dispatch
+  ([t2/dispatch-design.md](t2/dispatch-design.md), Sol high design reviews
+  `t2/sol-review-T2-B2-design*.md`) and is implementing it. Per runtime §7 a
+  failed or uncertain Core state write latches Store failure (force
+  shutdown, exit 4); there is no in-daemon orphan reconciler. After T2-B2
+  merges, the orchestrator's integration step on `.7.6`: startup hands
+  surviving queued turns to dispatchers and cancels those behind an
+  `unknown` predecessor; keyed receipt replay after restart end to end; fix
+  the Task 4 failpoint gate line (exits "no tests"). Then Sol high review
+  of Task 2, then Task 3 (`.7.7`), Task 4 (`.7.8`), final critique
+  (`.7.9`). After a reboot, restore tmux session `via` (windows `main`, and
+  `watch` running `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).

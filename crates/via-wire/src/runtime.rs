@@ -74,17 +74,41 @@ impl WireRuntime {
     }
 
     /// Drains Host controls and tasks before the Store owner is released.
-    pub async fn shutdown(&self, deadline: Deadline) -> WireShutdown {
-        summarize_shutdown(self.host.shutdown(deadline).await)
+    pub async fn shutdown(
+        &self,
+        deadline: Deadline,
+        turns: &[(via_store::SessionId, via_store::TurnNumber)],
+    ) -> WireShutdown {
+        summarize_shutdown(self.host.shutdown(deadline, turns).await)
     }
 
-    /// Reconciles committed anchors only through Host's verified path.
-    pub async fn recover(&self, deadline: Deadline) -> Result<Vec<WireRecovery>, WireError> {
+    /// Reconciles one page of up to `limit` committed anchors after the
+    /// `after` id, only through Host's verified path.
+    pub async fn recover_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
         self.host
-            .recover(deadline)
+            .recover_page(after, limit, deadline)
             .await
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(WireError::Host)
+    }
+}
+
+impl WireError {
+    /// Durable Store state could not be read or written, as opposed to a
+    /// deadline or process evidence that merely stays unproven.
+    pub fn is_store_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Raw(_)
+                | Self::Host(
+                    via_host::HostError::Store(_) | via_host::HostError::StoreUnavailable(_)
+                )
+        )
     }
 }
 
@@ -273,6 +297,12 @@ impl WireConnection {
             .await?;
             written += next;
         }
+        // The whole frame (in S1 first the start carrying the prompt) is in the
+        // vendor's stdin; nothing it answered is recorded yet.
+        #[cfg(feature = "test-failpoints")]
+        via_store::failpoint::hit_async("wire.prompt.after_write")
+            .await
+            .map_err(WireError::Io)?;
         Ok(SendOutcome::Written)
     }
 
@@ -522,18 +552,44 @@ fn summarize_shutdown(report: via_host::ShutdownReport) -> WireShutdown {
         recovery: report
             .recovery
             .into_iter()
-            .map(normalize_recovery)
+            .map(|turn| WireTurnRecovery {
+                owner_session: turn.owner_session,
+                owner_turn: turn.owner_turn,
+                cleanup: match turn.cleanup {
+                    via_host::CleanupEvidence::GroupAbsent(_) => super::WireCleanup::Quiescent,
+                    via_host::CleanupEvidence::Uncertain(_) => super::WireCleanup::Uncertain,
+                },
+                forced: turn.forced,
+            })
             .collect(),
+        anchors: report.anchors,
+        uncertain_anchors: report.uncertain_anchors,
         pending_tasks: report.pending_tasks,
         failed_tasks: report.failed_tasks,
         failure: report.failure.map(|error| error.to_string()),
     }
 }
 
+/// Passive per-turn shutdown evidence without process signalling authority.
+pub struct WireTurnRecovery {
+    /// Owning VIA session.
+    pub owner_session: via_store::SessionId,
+    /// Owning turn.
+    pub owner_turn: via_store::TurnNumber,
+    /// Quiescent only when every anchor of the turn was proved absent.
+    pub cleanup: super::WireCleanup,
+    /// Host stopped a group of the turn while its vendor was live.
+    pub forced: bool,
+}
+
 /// Passive shutdown evidence with no process-control capability.
 pub struct WireShutdown {
-    /// Committed anchors reconciled before any failure.
-    pub recovery: Vec<WireRecovery>,
+    /// Per-turn evidence for the requested turns, before any failure.
+    pub recovery: Vec<WireTurnRecovery>,
+    /// Committed anchors reconciled.
+    pub anchors: usize,
+    /// Reconciled anchors without positive absence proof.
+    pub uncertain_anchors: usize,
     /// Host-owned child/status tasks not joined by the bounded deadline.
     pub pending_tasks: usize,
     /// Host-owned tasks that panicked, were cancelled or failed their child wait.
@@ -550,6 +606,8 @@ mod shutdown_tests {
     fn recovery_failure_and_pending_owner_both_survive_the_summary() {
         let summary = summarize_shutdown(via_host::ShutdownReport {
             recovery: Vec::new(),
+            anchors: 0,
+            uncertain_anchors: 0,
             pending_tasks: 1,
             failed_tasks: 2,
             failure: Some(via_host::HostError::StoreUnavailable(

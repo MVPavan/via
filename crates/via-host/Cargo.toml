@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only failpoint controller (runtime-contracts §11); default off.
+test-failpoints = ["via-store/test-failpoints"]
+
 [dependencies]
 via-store = { path = "../via-store" }
 tokio = { workspace = true, features = ["process", "net", "io-util", "time", "sync", "rt", "signal"] }

@@ -707,6 +707,20 @@ impl Engine {
             }
             return Err(SubmitFailure::Failed);
         }
+        // Submission intent is durable and no agent I/O has happened yet. An
+        // injected failure here is a failed write after the commit: the turn
+        // leaves the queue at `running`, unresolved, and no vendor I/O follows.
+        #[cfg(feature = "test-failpoints")]
+        if submitted.is_ok()
+            && via_store::failpoint::hit_async("core.intent.after_commit")
+                .await
+                .is_err()
+        {
+            self.unresolved.fail(session, turn, TurnState::Running);
+            slot.pop(turn);
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            return Err(SubmitFailure::Failed);
+        }
         submitted
     }
 
@@ -788,6 +802,14 @@ impl Engine {
         .to_value()
         .map_err(|_| None)?;
         let vendor_turn_id = observation.vendor_turn_id.as_str().to_owned();
+        // The vendor accepted; its acceptance is not yet recorded.
+        #[cfg(feature = "test-failpoints")]
+        if via_store::failpoint::hit_async("core.accept.before_commit")
+            .await
+            .is_err()
+        {
+            return Err(None);
+        }
         let committed = self
             .store
             .commit_acceptance(AcceptanceRecord {

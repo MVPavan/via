@@ -31,6 +31,7 @@ use via_store::{
 mod drive;
 mod journal;
 mod queue;
+mod recovery;
 mod stop;
 mod terminal;
 #[cfg(test)]
@@ -166,6 +167,9 @@ impl Engine {
         binary: PathBuf,
         start_capacity: usize,
     ) -> Result<Self, String> {
+        // Test builds only: the named failpoints activate before any Store write.
+        #[cfg(feature = "test-failpoints")]
+        via_store::failpoint::activate_from_environment()?;
         let owner = Store::open(state).map_err(|error| error.to_string())?;
         let store = owner.client();
         let adapter = AdapterRuntime::new(

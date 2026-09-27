@@ -109,15 +109,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
-    let state = paths.state.clone();
-    let runtime = paths.runtime.clone();
-    let binary = std::env::current_exe()?;
-    let engine = Arc::new(
-        tokio::task::spawn_blocking(move || Engine::open(&state, &runtime, fake, binary))
-            .await?
-            .map_err(anyhow::Error::msg)?,
-    );
+    let engine = open_engine(&paths).await?;
     // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
     let mut starts = engine
         .take_starts()
@@ -183,6 +175,28 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         failed: failed_joins,
     };
     Ok(final_shutdown(engine, joins, mode).await)
+}
+
+/// Opens the Engine off the Tokio workers and commits crash recovery before
+/// the first request is accepted (C1 §7.5).
+async fn open_engine(paths: &super::client::Paths) -> anyhow::Result<Arc<Engine>> {
+    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
+    let state = paths.state.clone();
+    let runtime = paths.runtime.clone();
+    let binary = std::env::current_exe()?;
+    let engine = Arc::new(
+        tokio::task::spawn_blocking(move || Engine::open(&state, &runtime, fake, binary))
+            .await?
+            .map_err(anyhow::Error::msg)?,
+    );
+    let recovered = engine
+        .recover()
+        .await
+        .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
+    if recovered > 0 {
+        tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
+    }
+    Ok(engine)
 }
 
 /// Runs one session's dispatcher, which drives its turns independently of

@@ -218,14 +218,17 @@ pub enum CommitOutcome<T> {
     Uncertain(StoreFailureKind),
 }
 
+#[cfg(feature = "test-failpoints")]
+pub mod failpoint;
 mod runtime;
 
 pub use runtime::{
-    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord,
-    DurableRaw, EventRecord, GroupAbsenceRecord, OperationRecord, Predecessors, ProcessJournal,
-    QueuedTurn, RawFactory, RawStream, RawWriter, ReceiptRecord, ResumeRecord, RuntimeResources,
-    SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient, StoreError,
-    StoredEvent, StoredSpawnKey, SubmissionRecord, TerminalRecord,
+    ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt,
+    AnchorOwner, AnchorPhase, AnchorRecord, DurableRaw, EventRecord, GroupAbsenceRecord,
+    OperationRecord, Predecessors, ProcessJournal, QueuedTurn, RawFactory, RawStream, RawWriter,
+    ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey,
+    SpawnRecord, Store, StoreClient, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    TerminalRecord, UnfinishedTurn,
 };
 
 #[cfg(feature = "test-failpoints")]

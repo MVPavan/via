@@ -125,13 +125,23 @@ impl FakeRoute {
     }
 
     /// Drains Host controls and reapers before Core releases the Store owner.
-    pub async fn shutdown(&self, deadline: Deadline) -> WireShutdown {
-        self.wire.shutdown(deadline).await
+    pub async fn shutdown(
+        &self,
+        deadline: Deadline,
+        turns: &[(crate::SessionId, crate::TurnNumber)],
+    ) -> WireShutdown {
+        self.wire.shutdown(deadline, turns).await
     }
 
-    /// Returns passive Host recovery facts without exposing a signal handle.
-    pub async fn recover(&self, deadline: Deadline) -> Result<Vec<WireRecovery>, WireError> {
-        self.wire.recover(deadline).await
+    /// Returns one page of passive Host recovery facts without exposing a
+    /// signal handle: up to `limit` anchors after the `after` id.
+    pub async fn recover_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.wire.recover_page(after, limit, deadline).await
     }
 
     async fn drive(
