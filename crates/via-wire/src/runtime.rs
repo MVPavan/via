@@ -106,6 +106,9 @@ pub enum WireError {
     /// A pipe operation crossed its absolute deadline.
     #[error("vendor pipe deadline elapsed")]
     Deadline,
+    /// A raw evidence append was not confirmed by its absolute deadline.
+    #[error("raw evidence append deadline elapsed")]
+    RawDeadline,
     /// Frame contract failure.
     #[error("vendor frame failure: {0:?}")]
     Frame(WireFailure),
@@ -185,8 +188,12 @@ impl WireConnection {
                     return Ok(SendOutcome::Indeterminate);
                 }
             };
-            self.record(RawStream::Stdin, frame[written..written + next].to_vec())
-                .await?;
+            self.record(
+                RawStream::Stdin,
+                frame[written..written + next].to_vec(),
+                deadline,
+            )
+            .await?;
             written += next;
         }
         Ok(SendOutcome::Written)
@@ -215,7 +222,7 @@ impl WireConnection {
                 let bytes: Vec<u8> = self.buffered.drain(..=index).collect();
                 let bounded = BoundedBytes::try_from_frame(bytes).map_err(WireError::Frame)?;
                 let token = self
-                    .record(RawStream::Stdout, bounded.as_bytes().to_vec())
+                    .record(RawStream::Stdout, bounded.as_bytes().to_vec(), deadline)
                     .await?;
                 return Frame::new(bounded, token.raw_ref().clone())
                     .map(Some)
@@ -227,7 +234,7 @@ impl WireConnection {
             if self.stdout_eof && !self.buffered.is_empty() {
                 self.unterminated_stdout = true;
                 let tail = std::mem::take(&mut self.buffered);
-                self.record(RawStream::Stdout, tail).await?;
+                self.record(RawStream::Stdout, tail, deadline).await?;
             }
             if self.stdout_eof && self.stderr_eof {
                 return if self.unterminated_stdout {
@@ -242,20 +249,28 @@ impl WireConnection {
 
     /// Records every remaining byte of both pipes, unframed, until both reach EOF or
     /// the cleanup deadline. Used after a failure, when framing no longer decides
-    /// protocol meaning. A failed append never stops the drain: later bytes are read
-    /// and discarded, and the result says the raw log is incomplete.
+    /// protocol meaning. A failed or expired append never stops the drain: later
+    /// bytes are read and discarded until the same deadline, and the result says the
+    /// raw log is incomplete.
     pub async fn drain_to_eof(&mut self, deadline: Deadline) -> RawEvidence {
         self.stdin.take();
         // A retained oversized line may exceed the raw unit cap; store it in 64 KiB units.
         let retained = std::mem::take(&mut self.buffered);
         for chunk in retained.chunks(DRAIN_UNIT_BYTES) {
             // A failure latches `Incomplete`; the remaining chunks are discarded.
-            let _recorded = self.record(RawStream::Stdout, chunk.to_vec()).await;
+            let _recorded = self
+                .record(RawStream::Stdout, chunk.to_vec(), deadline)
+                .await;
         }
         while !(self.stdout_eof && self.stderr_eof) {
+            // A read that is always ready must not extend the drain past its bound.
+            if tokio::time::Instant::now() >= deadline.instant() {
+                self.evidence = RawEvidence::Incomplete;
+                break;
+            }
             match Box::pin(self.read_either(deadline, true)).await {
                 // A raw failure is latched and later reads are discarded.
-                Ok(()) | Err(WireError::Raw(_)) => {}
+                Ok(()) | Err(WireError::Raw(_) | WireError::RawDeadline) => {}
                 // Bytes may remain unread in the pipes.
                 Err(_) => {
                     self.evidence = RawEvidence::Incomplete;
@@ -268,15 +283,25 @@ impl WireConnection {
 
     /// Durably appends one unit unless the log already lost bytes; any failure
     /// latches `Incomplete`, because the unit's bytes can no longer be recorded.
-    async fn record(&mut self, stream: RawStream, bytes: Vec<u8>) -> Result<DurableRaw, WireError> {
+    /// The wait for Store's worker ends at `deadline`, so a stalled worker cannot
+    /// hold the caller past its bound; an unconfirmed unit counts as lost.
+    async fn record(
+        &mut self,
+        stream: RawStream,
+        bytes: Vec<u8>,
+        deadline: Deadline,
+    ) -> Result<DurableRaw, WireError> {
         if self.evidence == RawEvidence::Incomplete {
             return Err(WireError::Frame(WireFailure::RawStore));
         }
-        let result = self.raw.append(stream, bytes).await;
+        let result = match timeout_at(deadline.instant(), self.raw.append(stream, bytes)).await {
+            Ok(appended) => appended.map_err(WireError::Raw),
+            Err(_) => Err(WireError::RawDeadline),
+        };
         if result.is_err() {
             self.evidence = RawEvidence::Incomplete;
         }
-        Ok(result?)
+        result
     }
 
     /// Reads one chunk from whichever open pipe is ready; stderr is always raw-logged
@@ -294,7 +319,8 @@ impl WireConnection {
                     self.stdout_eof = true;
                 } else if stdout_raw {
                     if self.evidence == RawEvidence::Complete {
-                        self.record(RawStream::Stdout, out[..count].to_vec()).await?;
+                        self.record(RawStream::Stdout, out[..count].to_vec(), deadline)
+                            .await?;
                     }
                 } else {
                     self.buffered.extend_from_slice(&out[..count]);
@@ -305,7 +331,8 @@ impl WireConnection {
                 if count == 0 {
                     self.stderr_eof = true;
                 } else if !stdout_raw || self.evidence == RawEvidence::Complete {
-                    self.record(RawStream::Stderr, err[..count].to_vec()).await?;
+                    self.record(RawStream::Stderr, err[..count].to_vec(), deadline)
+                        .await?;
                 }
             }
         }

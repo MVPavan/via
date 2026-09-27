@@ -43,6 +43,11 @@ pub(super) fn raw_loop(dir: &Path, receiver: &Receiver<RawCommand>) {
                 }
                 let _ = reply.send(result);
             }
+            // Returns once the test's guard drops its sender.
+            #[cfg(feature = "test-failpoints")]
+            RawCommand::Stall(held) => {
+                let _ = held.recv();
+            }
             RawCommand::Shutdown => break,
         }
     }

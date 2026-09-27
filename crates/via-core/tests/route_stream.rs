@@ -15,7 +15,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -30,6 +30,8 @@ use via_store::{SpawnRecord, Store};
 const SESSION: &str = "s_0123456789ab";
 const CONNECTION: &str = "c_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STREAM_CHILD";
+/// Bound on one child case; the turn deadline is 20 s and cleanup adds 3 s.
+const CHILD_LIMIT: Duration = Duration::from_secs(60);
 
 /// The real `via` binary serves as Host's anchor; a workspace test build makes it.
 fn via_binary() -> PathBuf {
@@ -58,14 +60,27 @@ fn run_child(name: &str, script: &str, lines: &[Value]) {
     let scenario = root.path().join("scenario.ndjson");
     let body: Vec<String> = lines.iter().map(ToString::to_string).collect();
     fs::write(&scenario, body.join("\n") + "\n").unwrap();
-    let status = Command::new(env::current_exe().unwrap())
+    let mut child = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, root.path())
         .env("VIA_FAKE_AGENT_BINARY", &vendor)
         .env("VIA_FAKE_SCENARIO", &scenario)
         .env("VIA_FAKE_SYNC_DIR", &dirs[2])
-        .status()
+        .spawn()
         .unwrap();
+    // A hung child is a failure, not a stuck suite.
+    let limit = Instant::now() + CHILD_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{name} child did not finish within {CHILD_LIMIT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(status.success(), "{name} child failed: {status}");
 }
 
@@ -294,4 +309,46 @@ fn failing_raw_append_keeps_draining_and_reports_incomplete_evidence() {
         "{failure:?}"
     );
     assert!(failure.raw_incomplete, "{failure:?}");
+}
+
+#[test]
+fn stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline() {
+    let lines = [json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
+    let Some(root) = child_root() else {
+        // Emit acceptance, wait for the test to stall Store's raw worker, then emit
+        // an oversized line that only the failure drain records.
+        return run_child(
+            "stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline",
+            "read -r start\n\
+             /usr/bin/head -n 1 \"$VIA_FAKE_SCENARIO\"\n\
+             while [ ! -e \"$VIA_FAKE_SYNC_DIR/release\" ]; do /bin/sleep 0.01; done\n\
+             /usr/bin/head -c 1100000 /dev/zero | /usr/bin/tr '\\0' x\n\
+             echo\n",
+            &lines,
+        );
+    };
+    let mut child = Child::open(&root);
+    let mut stall = None;
+    let mut released = None;
+    let (observed, result) = child.execute(|store, root, observation| {
+        if matches!(observation, FakeObservation::Accepted(_)) {
+            stall = Some(store.as_ref().unwrap().stall_raw_worker());
+            released = Some(Instant::now());
+            fs::write(root.join("sync/release"), b"").unwrap();
+        }
+    });
+    let elapsed = released.unwrap().elapsed();
+    // The Store owner's drop joins the raw worker; release it first.
+    drop(stall);
+    assert_eq!(observed.len(), 1, "only acceptance was recorded");
+    let Err(AdapterError::Route(failure)) = result else {
+        panic!("expected a route failure, got {result:?}");
+    };
+    assert!(
+        matches!(failure.cause, RouteError::Protocol { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.raw_incomplete, "{failure:?}");
+    // Route's cleanup bound is 3 s; the 20 s turn deadline must not be reached.
+    assert!(elapsed < Duration::from_secs(8), "cleanup took {elapsed:?}");
 }
