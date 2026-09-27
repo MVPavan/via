@@ -9,13 +9,14 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::Mutex as StdMutex,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime},
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    EventRecord, StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalRecord,
+    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalRecord,
 };
 
 use super::{Accepted, TurnRecord, lock};
@@ -36,12 +37,14 @@ pub(super) trait TurnJournal: Sync {
         record: EventRecord,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Commits the terminal envelope and `turn.ended` together; with `closed`,
-    /// that `session.closed` event follows in the same transaction.
+    /// that `session.closed` event follows in the same transaction unless
+    /// another turn of the session is queued or running. True when the close
+    /// was written.
     fn commit_terminal(
         &self,
         record: TerminalRecord,
         closed: Option<Value>,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Reads a bounded page of durable events from `from_seq`.
     fn events(
         &self,
@@ -60,6 +63,17 @@ pub(super) trait TurnJournal: Sync {
         session: &SessionId,
         turn: TurnNumber,
     ) -> impl Future<Output = Result<Option<Value>, StoreError>> + Send;
+    /// Reads a queued turn's prompt and `turn.queued` facts.
+    fn queued_turn(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> impl Future<Output = Result<Option<QueuedTurn>, StoreError>> + Send;
+    /// Reads the session's durable next event sequence.
+    fn next_seq(
+        &self,
+        session: &SessionId,
+    ) -> impl Future<Output = Result<Option<u64>, StoreError>> + Send;
 }
 
 impl TurnJournal for StoreClient {
@@ -75,10 +89,10 @@ impl TurnJournal for StoreClient {
         &self,
         record: TerminalRecord,
         closed: Option<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         match closed {
             Some(closed) => Self::commit_closing_terminal(self, record, closed).await,
-            None => Self::commit_terminal(self, record).await,
+            None => Self::commit_terminal(self, record).await.map(|()| false),
         }
     }
 
@@ -104,6 +118,72 @@ impl TurnJournal for StoreClient {
         turn: TurnNumber,
     ) -> Result<Option<Value>, StoreError> {
         Self::result(self, session, turn).await
+    }
+
+    async fn queued_turn(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<QueuedTurn>, StoreError> {
+        Self::queued_turn(self, session, turn).await
+    }
+
+    async fn next_seq(&self, session: &SessionId) -> Result<Option<u64>, StoreError> {
+        Self::next_seq(self, session).await
+    }
+}
+
+/// A session's next event sequence, shared by every writer of the session, so
+/// its events stay dense while one turn runs and later turns queue (C1 §6.1).
+/// Each writer allocates and commits under the lock. After a commit whose
+/// outcome is unknown the head is unknown until re-read from the Store.
+pub(super) struct Head(Mutex<Option<u64>>);
+
+impl Head {
+    pub(super) fn new(next: Option<u64>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(next)))
+    }
+
+    /// Locks the head, first re-reading the durable next sequence when unknown.
+    pub(super) async fn lock(
+        &self,
+        journal: &impl TurnJournal,
+        session: &SessionId,
+    ) -> Result<HeadGuard<'_>, StoreError> {
+        let mut guard = self.0.lock().await;
+        let next = match *guard {
+            Some(next) => next,
+            None => journal
+                .next_seq(session)
+                .await?
+                .ok_or(StoreError::Constraint("session does not exist"))?,
+        };
+        *guard = Some(next);
+        Ok(HeadGuard { guard, next })
+    }
+}
+
+/// The locked head; a guard dropped without an outcome leaves it unchanged,
+/// as for a commit that definitely did not happen.
+pub(super) struct HeadGuard<'a> {
+    guard: MutexGuard<'a, Option<u64>>,
+    next: u64,
+}
+
+impl HeadGuard<'_> {
+    /// The sequence the next event takes.
+    pub(super) fn next(&self) -> u64 {
+        self.next
+    }
+
+    /// `count` events committed from `next`.
+    pub(super) fn committed(mut self, count: u64) {
+        *self.guard = Some(self.next + count);
+    }
+
+    /// A commit's outcome is unknown: re-read the head before the next event.
+    pub(super) fn lost(mut self) {
+        *self.guard = None;
     }
 }
 
@@ -161,6 +241,13 @@ impl Unresolved {
     /// Forgets a turn whose terminal is known committed.
     pub(super) fn resolve(&self, session: &SessionId, turn: TurnNumber) {
         lock(&self.0).remove(&(session.clone(), turn));
+    }
+
+    /// Whether another turn of `session` than `turn` is still unresolved.
+    pub(super) fn others(&self, session: &SessionId, turn: TurnNumber) -> bool {
+        lock(&self.0)
+            .keys()
+            .any(|(unresolved, number)| unresolved == session && *number != turn)
     }
 
     /// Whether another receipt keeps the set within its bound.
@@ -244,7 +331,12 @@ pub(super) async fn commit_event(
     if record.store_failed {
         return;
     }
-    let seq = record.seq + 1;
+    let shared = Arc::clone(&record.head);
+    let Ok(head) = shared.lock(journal, &record.session).await else {
+        record.store_failed = true;
+        return;
+    };
+    let seq = head.next();
     let at = rfc3339(SystemTime::now());
     let event = Event {
         seq,
@@ -271,6 +363,7 @@ pub(super) async fn commit_event(
     if let Err(error) = committed {
         record.store_failed = true;
         if may_have_committed(&error) {
+            head.lost();
             record.uncertain = Some(UncertainEvent {
                 seq,
                 raw_ref,
@@ -279,14 +372,16 @@ pub(super) async fn commit_event(
         }
         return;
     }
-    record.seq = seq;
+    head.committed(1);
     if let Some(reference) = &raw_ref {
         RawSpan::include(&mut record.spans, reference);
     }
 }
 
-/// Settles an uncertain event against the durable head: a durable event
-/// advances `record` exactly as a confirmed commit would; an absent one leaves it.
+/// Settles an uncertain event against the durable stream: a durable event
+/// advances `record` exactly as a confirmed commit would; an absent one leaves
+/// it. Another writer of the session may have taken the sequence since, so
+/// only an event of this turn at that sequence is its own.
 pub(super) async fn reconcile(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
@@ -295,10 +390,13 @@ pub(super) async fn reconcile(
         return Ok(());
     };
     let head = journal.events(&record.session, uncertain.seq, 1).await?;
+    let own_turn = json!(record.turn.get());
     match head.first() {
         None => Ok(()),
-        Some(event) if event.seq == uncertain.seq && event.raw_ref == uncertain.raw_ref => {
-            record.seq = uncertain.seq;
+        Some(event) if event.seq != uncertain.seq || event.event.get("turn") != Some(&own_turn) => {
+            Ok(())
+        }
+        Some(event) if event.raw_ref == uncertain.raw_ref => {
             if let Some(reference) = &uncertain.raw_ref {
                 RawSpan::include(&mut record.spans, reference);
             }
@@ -307,9 +405,20 @@ pub(super) async fn reconcile(
             }
             Ok(())
         }
-        // Core is the running turn's only writer; another head is not its event.
+        // Core is the running turn's only writer; another event of it there is not its own.
         Some(_) => Err(StoreError::CorruptEvidence),
     }
+}
+
+/// A terminal record that is durable. `uncertain` when Store reported an
+/// unknown outcome and only the read-back found it: the commit itself was
+/// uncertain, which latches Store failure (runtime §7), while the committed
+/// result stays readable. `closed` when a requested `session.closed` is known
+/// written; Store refuses it while another turn of the session is unfinished.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Durable {
+    pub(super) uncertain: bool,
+    pub(super) closed: bool,
 }
 
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
@@ -318,12 +427,18 @@ pub(super) async fn commit_terminal(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
-) -> Result<(), ApiError> {
+) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
     match journal.commit_terminal(record, closed).await {
-        Ok(()) => Ok(()),
+        Ok(closed) => Ok(Durable {
+            uncertain: false,
+            closed,
+        }),
         Err(error) if may_have_committed(&error) => match journal.result(&session, turn).await {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => Ok(Durable {
+                uncertain: true,
+                closed: false,
+            }),
             Ok(None) | Err(_) => Err(ApiError::STORE),
         },
         Err(_) => Err(ApiError::STORE),

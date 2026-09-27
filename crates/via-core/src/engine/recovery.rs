@@ -11,6 +11,7 @@ use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, TerminalRecord, UnfinishedTurn};
 
+use super::journal::Head;
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
@@ -115,29 +116,28 @@ impl Engine {
         let History {
             last_seq,
             queued_at,
+            queued_seq,
             started,
             spans,
         } = self.history(&session, turn).await?;
-        // Acceptance is reported only when both its evidence and its event committed.
-        let accepted = match (correlation, started) {
-            (Some(vendor_turn_id), Some((at, raw_ref))) => Some(Accepted {
-                at,
-                raw_ref,
-                vendor_turn_id,
-            }),
-            _ => None,
-        };
+        let accepted = recovered_acceptance(correlation, started);
+        // Recovery runs before admission: this turn's writes are the session's only ones.
+        let head = Head::new(Some(last_seq + 1));
         let mut record = TurnRecord {
             session: session.clone(),
             turn,
-            seq: last_seq,
+            head: std::sync::Arc::clone(&head),
             accepted,
             spans,
             store_failed: false,
             uncertain: None,
         };
         let cancel = self.settle_recovered(&mut record, reconciled).await?;
-        let seq = record.seq + 1;
+        let head = head
+            .lock(&self.store, &session)
+            .await
+            .map_err(|_| ApiError::STORE)?;
+        let seq = head.next();
         let ended_at = rfc3339(SystemTime::now());
         let terminal = Terminal {
             state: "unknown",
@@ -187,10 +187,10 @@ impl Engine {
             record.spans,
             timestamps,
             None,
-            seq,
+            (queued_seq, seq),
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
-        journal::commit_terminal(
+        let committed = journal::commit_terminal(
             &self.store,
             TerminalRecord {
                 session_id: session,
@@ -201,7 +201,16 @@ impl Engine {
             },
             None,
         )
-        .await
+        .await;
+        // Recovery must be certain before admission: an uncertain commit, even
+        // one read back as durable, fails startup instead (runtime §7).
+        if committed.is_ok_and(|durable| !durable.uncertain) {
+            head.committed(1);
+            Ok(())
+        } else {
+            head.lost();
+            Err(ApiError::STORE)
+        }
     }
 
     /// Records the recovery stop of the turn's orphaned execution (C1 §7.5):
@@ -231,6 +240,7 @@ impl Engine {
     async fn history(&self, session: &SessionId, turn: TurnNumber) -> Result<History, ApiError> {
         let mut last_seq = 0;
         let mut queued_at = None;
+        let mut queued_seq = None;
         let mut started = None;
         let mut spans = Vec::new();
         loop {
@@ -250,7 +260,10 @@ impl Engine {
                 }
                 let at = stored.event.get("at").and_then(Value::as_str);
                 match stored.event.get("type").and_then(Value::as_str) {
-                    Some("turn.queued") => queued_at = at.map(str::to_owned),
+                    Some("turn.queued") => {
+                        queued_at = at.map(str::to_owned);
+                        queued_seq = Some(stored.seq);
+                    }
                     Some("turn.started") => {
                         started = at.map(str::to_owned).zip(stored.raw_ref.clone());
                     }
@@ -264,9 +277,25 @@ impl Engine {
         Ok(History {
             last_seq,
             queued_at: queued_at.ok_or(ApiError::STORE)?,
+            queued_seq: queued_seq.ok_or(ApiError::STORE)?,
             started,
             spans,
         })
+    }
+}
+
+/// Acceptance is reported only when both its evidence and its event committed.
+fn recovered_acceptance(
+    correlation: Option<String>,
+    started: Option<(String, RawRef)>,
+) -> Option<Accepted> {
+    match (correlation, started) {
+        (Some(vendor_turn_id), Some((at, raw_ref))) => Some(Accepted {
+            at,
+            raw_ref,
+            vendor_turn_id,
+        }),
+        _ => None,
     }
 }
 
@@ -275,6 +304,8 @@ struct History {
     /// The session's last committed sequence.
     last_seq: u64,
     queued_at: String,
+    /// Sequence of the turn's `turn.queued`: the envelope's `first_seq`.
+    queued_seq: u64,
     /// `turn.started` time and raw span, when acceptance's event committed.
     started: Option<(String, RawRef)>,
     spans: Vec<RawSpan>,

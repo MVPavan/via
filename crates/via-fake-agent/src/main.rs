@@ -26,6 +26,15 @@ struct Script {
     steps: Vec<Step>,
 }
 
+/// One script, or several for a multi-turn deployment: each launch runs the
+/// first script whose `expected_request` its start request contains.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Fixture {
+    Many { scripts: Vec<Script> },
+    One(Script),
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Step {
@@ -119,10 +128,13 @@ fn main() {
 fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
     let script_path = PathBuf::from(env::var(SCRIPT_ENV)?);
     let sync_dir = PathBuf::from(env::var(SYNC_ENV)?);
-    let script: Script = serde_json::from_slice(&fs::read(script_path)?)?;
+    let scripts = match serde_json::from_slice(&fs::read(script_path)?)? {
+        Fixture::Many { scripts } => scripts,
+        Fixture::One(script) => vec![script],
+    };
     let mut input = BufReader::new(io::stdin());
     let mut grandchildren = Vec::new();
-    let start = read_start(&mut input, &script.expected_request)?;
+    let (start, script) = read_start(&mut input, scripts)?;
     let (input_tx, input_rx) = mpsc::sync_channel(8);
     thread::spawn(move || read_remaining(input, &input_tx));
     let mut terminal_emitted = false;
@@ -187,25 +199,17 @@ fn read_frame<R: BufRead>(input: &mut R) -> Result<Option<Value>, Box<dyn std::e
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-fn read_expected<R: BufRead>(
-    input: &mut R,
-    expected: &Value,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let actual = read_frame(input)?.ok_or("request ended before expected message")?;
-    if !contains_expected(&actual, expected) {
-        return Err(format!(
-            "request mismatch: expected selected fields {expected}, received {actual}"
-        )
-        .into());
-    }
-    Ok(actual)
-}
-
+/// Reads the start request and selects the first script that expects it.
 fn read_start<R: BufRead>(
     input: &mut R,
-    expected: &Value,
-) -> Result<StartRequest, Box<dyn std::error::Error>> {
-    let request: StartRequest = serde_json::from_value(read_expected(input, expected)?)?;
+    scripts: Vec<Script>,
+) -> Result<(StartRequest, Script), Box<dyn std::error::Error>> {
+    let actual = read_frame(input)?.ok_or("request ended before expected message")?;
+    let script = scripts
+        .into_iter()
+        .find(|script| contains_expected(&actual, &script.expected_request))
+        .ok_or_else(|| format!("request mismatch: no script expects {actual}"))?;
+    let request: StartRequest = serde_json::from_value(actual)?;
     if request.kind != "start"
         || request.id != 1
         || request.session_id.is_empty()
@@ -214,7 +218,7 @@ fn read_start<R: BufRead>(
     {
         return Err("invalid typed start request".into());
     }
-    Ok(request)
+    Ok((request, script))
 }
 
 fn read_interrupt(

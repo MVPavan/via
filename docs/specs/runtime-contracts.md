@@ -676,7 +676,13 @@ transaction with its `user_version` bump. No automatic repair/downgrade.
 Newer-version refusal must leave database bytes untouched: first inspect an
 existing database through a read-only connection, close it, then open the
 sole writable connection only for a supported version. Avoid journal-mode
-changes before that inspection. Schema v1:
+changes before that inspection. Before the first release no Store format is
+supported across schema versions: a Store whose `user_version` is older than
+the build's is an unreleased development format, is never migrated, and is
+refused at open with a named error telling the user to recreate the dev Store
+(remove `store.sqlite3` from the State directory); its bytes are left
+untouched. Migrations as described above start with the first released
+schema. Schema v2 (v1 was the unreleased single-turn format):
 
 | Table | Key, constraints and stored content |
 |---|---|
@@ -1144,7 +1150,10 @@ The private S1 fixture invocation uses existing argument spelling
 first-release public harness or a new flag. No release-gated failpoint
 activation is implied by selecting that fake fixture route.
 
-Fixture shape is `{"expected_request":{...},"steps":[...]}`. The selected
+Fixture shape is `{"expected_request":{...},"steps":[...]}`, or
+`{"scripts":[...]}` of such scripts for multi-turn and multi-session
+deployments: each launch runs the first script whose `expected_request` its
+start request contains, and fails when none does. The selected
 `expected_request` fields may be a subset, but the fake must also validate
 the full typed start schema, positive turn, ID 1 and no second start.
 Positive scenarios emit all fields required by §3.1. Explicit negative

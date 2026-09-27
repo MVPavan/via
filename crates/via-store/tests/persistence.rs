@@ -462,3 +462,65 @@ fn events_keep_dense_seq_and_cited_raw_span() {
     assert_eq!(submitted, "2026-01-01T00:00:00.000Z");
     assert_eq!(accepted, "2026-01-01T00:00:01.000Z");
 }
+
+/// Runtime §6: the unreleased schema-v1 dev format is not migrated. Opening it
+/// fails with a named, actionable error and leaves its bytes untouched.
+#[test]
+fn unreleased_v1_store_is_refused_with_a_recreate_instruction() {
+    let root = TempDir::new().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let db = root.path().join("store.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&db).unwrap();
+    let Err(error) = Store::open(root.path()) else {
+        panic!("a v1 Store opened");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("schema v1") && message.contains("recreate"),
+        "{message}"
+    );
+    assert_eq!(fs::read(&db).unwrap(), before);
+}
+
+/// Runtime §6: at most eight queued turns per session, checked inside the
+/// receipt transaction itself, not only by Core before it.
+#[test]
+fn a_ninth_queued_turn_is_refused_inside_the_receipt_transaction() {
+    let root = TempDir::new().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    let rt = runtime();
+    let at = "2026-01-01T00:00:00.000Z";
+    let mut first = spawn([1; 32]);
+    first.initial_event = json!({"type":"turn.queued","seq":1,"at":at});
+    rt.block_on(client.commit_spawn(first)).unwrap();
+    let resume = |turn: u32| via_store::ResumeRecord {
+        session_id: session(),
+        turn: TurnNumber::try_from(turn).unwrap(),
+        prompt: "p".to_owned(),
+        event: json!({"type":"turn.queued","seq":turn,"at":at,"raw_ref":null}),
+        operation: None,
+    };
+    // Turn 1 and turns 2..=8 are the eight queued turns.
+    for turn in 2..=8 {
+        rt.block_on(client.commit_resume(resume(turn))).unwrap();
+    }
+    let refused = rt.block_on(client.commit_resume(resume(9)));
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{refused:?}"
+    );
+    let snapshot = rt
+        .block_on(client.session_snapshot(&session()))
+        .unwrap()
+        .unwrap();
+    assert_eq!((snapshot.turns, snapshot.queued), (8, 8));
+}

@@ -2,12 +2,13 @@
 
 use super::{
     AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, EventRecord,
-    MetadataExt, OptionalExtension, Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord,
-    Receiver, SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
-    SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn, Value,
-    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, fs, oneshot, params, read_anchor_owners, read_anchor_records,
-    read_raw_ref, validate_raw_ref,
+    MetadataExt, OperationRecord, OptionalExtension, Path, Predecessors, QueuedTurn,
+    RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT,
+    SessionId, SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
+    StoredSpawnKey, SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber,
+    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
+    commit_arm_intent, commit_group_absence, commit_vendor_facts, fs, oneshot, params,
+    read_anchor_owners, read_anchor_records, read_raw_ref, validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -74,9 +75,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| StoreError::Open(error.to_string()))?;
-    if version > SCHEMA_VERSION {
-        return Err(StoreError::Open("newer Store schema".to_owned()));
-    }
+    check_schema_version(version)?;
     if version == 0 {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -88,9 +87,19 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 next_seq INTEGER NOT NULL CHECK(next_seq>=2));
              CREATE TABLE turns (
                 session_id TEXT NOT NULL REFERENCES sessions(id), number INTEGER NOT NULL,
-                prompt TEXT NOT NULL, state TEXT NOT NULL, submitted_at TEXT,
+                prompt TEXT NOT NULL, state TEXT NOT NULL, queued_at TEXT,
+                queued_seq INTEGER NOT NULL, submitted_at TEXT,
                 accepted_at TEXT, correlation TEXT, envelope TEXT,
                 PRIMARY KEY(session_id,number));
+             CREATE UNIQUE INDEX turns_one_running ON turns(session_id) WHERE state='running';
+             CREATE TABLE spawn_keys (
+                key TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                identity BLOB NOT NULL, receipt TEXT NOT NULL);
+             CREATE TABLE operations (
+                session_id TEXT NOT NULL REFERENCES sessions(id), op_key TEXT NOT NULL,
+                verb TEXT NOT NULL, identity BLOB NOT NULL, turn INTEGER NOT NULL,
+                result TEXT NOT NULL, PRIMARY KEY(session_id,op_key),
+                FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number));
              CREATE TABLE events (
                 session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
                 event TEXT NOT NULL, connection_id TEXT, raw_offset INTEGER, raw_len INTEGER,
@@ -103,7 +112,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
                 absence_time TEXT,
                 FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
-             PRAGMA user_version=1;",
+             PRAGMA user_version=2;",
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
         tx.commit()
@@ -112,123 +121,161 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per variant of the closed Store command enum"
-)]
 pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver<Command>) {
     let mut commits = 0_u32;
     while let Ok(command) = receiver.recv() {
-        let wrote = match command {
-            Command::Spawn(record, reply) => {
-                send_commit(reply, commit_spawn(&mut conn, record));
-                true
-            }
-            Command::Submission(record, reply) => {
-                send_commit(reply, commit_submission(&mut conn, &record));
-                true
-            }
-            Command::Acceptance(record, reply) => {
-                send_commit(reply, commit_acceptance(&mut conn, root, &record));
-                true
-            }
-            Command::Event(record, reply) => {
-                send_commit(reply, commit_event(&mut conn, root, &record));
-                true
-            }
-            Command::Terminal(record, reply) => {
-                send_commit(reply, commit_terminal(&mut conn, root, &record, None));
-                true
-            }
-            Command::ClosingTerminal(record, closed, reply) => {
-                send_commit(
-                    reply,
-                    commit_terminal(&mut conn, root, &record, Some(&closed)),
-                );
-                true
-            }
-            Command::Result(session, turn, reply) => {
-                let _ = reply.send(read_result(&conn, &session, turn));
-                false
-            }
-            Command::Terminated(turns, reply) => {
-                let _ = reply.send(read_terminated(&conn, turns));
-                false
-            }
-            Command::Events(session, from, limit, reply) => {
-                let _ = reply.send(read_events(&conn, &session, from, limit));
-                false
-            }
-            Command::Logs(session, reply) => {
-                let _ = reply.send(read_logs(&conn, root, &session));
-                false
-            }
-            Command::Unfinished(reply) => {
-                let _ = reply.send(read_unfinished(&conn));
-                false
-            }
-            Command::AnchorOwners(after, limit, reply) => {
-                let _ = reply.send(read_anchor_owners(&conn, after.as_deref(), limit));
-                false
-            }
-            Command::Authenticate(session, hash, reply) => {
-                let _ = reply.send(authenticate(&conn, &session, &hash));
-                false
-            }
-            Command::AnchorIntent(intent, reply) => {
-                let _ = reply.send(as_commit(commit_anchor_intent(&mut conn, &intent)));
-                true
-            }
-            Command::AnchorIdentified(id, generation, version, identity, reply) => {
-                let _ = reply.send(as_commit(commit_anchor_identified(
-                    &mut conn,
-                    &id,
-                    &generation,
-                    version,
-                    &identity,
-                )));
-                true
-            }
-            Command::ArmIntent(id, generation, version, reply) => {
-                let _ = reply.send(as_commit(commit_arm_intent(
-                    &mut conn,
-                    &id,
-                    &generation,
-                    version,
-                )));
-                true
-            }
-            Command::VendorFacts(id, generation, pid, reply) => {
-                let _ = reply.send(as_commit(commit_vendor_facts(
-                    &mut conn,
-                    &id,
-                    &generation,
-                    pid,
-                )));
-                true
-            }
-            Command::GroupAbsence(proof, reply) => {
-                let _ = reply.send(as_commit(commit_group_absence(&mut conn, &proof)));
-                true
-            }
-            Command::AnchorRecords(after, limit, reply) => {
-                let _ = reply.send(
-                    read_anchor_records(&conn, after.as_deref(), limit)
-                        .map_err(|error| error.kind()),
-                );
-                false
-            }
-            Command::Shutdown => break,
+        if matches!(command, Command::Shutdown) {
+            break;
+        }
+        // Reads are served first; anything else is a mutation.
+        let Some(command) = serve_read(&conn, root, command) else {
+            continue;
         };
-        if wrote {
-            commits += 1;
-            if commits >= 1000 {
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
-                commits = 0;
-            }
+        serve_write(&mut conn, root, command);
+        commits += 1;
+        if commits >= 1000 {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+            commits = 0;
         }
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+}
+
+/// Serves a read command; returns any other command unserved.
+fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Command> {
+    match command {
+        Command::SpawnKey(key, reply) => {
+            let _ = reply.send(read_spawn_key(conn, &key));
+        }
+        Command::Operation(session, op_key, reply) => {
+            let _ = reply.send(read_operation(conn, &session, &op_key));
+        }
+        Command::Snapshot(session, reply) => {
+            let _ = reply.send(read_snapshot(conn, &session));
+        }
+        Command::QueuedTurn(session, turn, reply) => {
+            let _ = reply.send(read_queued_turn(conn, &session, turn));
+        }
+        Command::Predecessors(session, turn, reply) => {
+            let _ = reply.send(read_predecessors(conn, &session, turn));
+        }
+        Command::NextSeq(session, reply) => {
+            let _ = reply.send(read_next_seq(conn, &session));
+        }
+        Command::Result(session, turn, reply) => {
+            let _ = reply.send(read_result(conn, &session, turn));
+        }
+        Command::Terminated(turns, reply) => {
+            let _ = reply.send(read_terminated(conn, turns));
+        }
+        Command::Events(session, from, limit, reply) => {
+            let _ = reply.send(read_events(conn, &session, from, limit));
+        }
+        Command::Logs(session, reply) => {
+            let _ = reply.send(read_logs(conn, root, &session));
+        }
+        Command::Authenticate(session, hash, reply) => {
+            let _ = reply.send(authenticate(conn, &session, &hash));
+        }
+        Command::Unfinished(reply) => {
+            let _ = reply.send(read_unfinished(conn));
+        }
+        Command::AnchorOwners(after, limit, reply) => {
+            let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit));
+        }
+        Command::AnchorRecords(after, limit, reply) => {
+            let _ = reply.send(
+                read_anchor_records(conn, after.as_deref(), limit).map_err(|error| error.kind()),
+            );
+        }
+        command @ (Command::Spawn(..)
+        | Command::Resume(..)
+        | Command::Submission(..)
+        | Command::Acceptance(..)
+        | Command::Event(..)
+        | Command::Terminal(..)
+        | Command::ClosingTerminal(..)
+        | Command::SessionClosed(..)
+        | Command::AnchorIntent(..)
+        | Command::AnchorIdentified(..)
+        | Command::ArmIntent(..)
+        | Command::VendorFacts(..)
+        | Command::GroupAbsence(..)
+        | Command::Shutdown) => return Some(command),
+    }
+    None
+}
+
+/// Serves one mutation command.
+fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
+    match command {
+        Command::Spawn(record, key, reply) => {
+            send_commit(reply, commit_spawn(conn, record, key));
+        }
+        Command::Resume(record, reply) => {
+            send_commit(reply, commit_resume(conn, &record));
+        }
+        Command::Submission(record, reply) => {
+            send_commit(reply, commit_submission(conn, &record));
+        }
+        Command::Acceptance(record, reply) => {
+            send_commit(reply, commit_acceptance(conn, root, &record));
+        }
+        Command::Event(record, reply) => {
+            send_commit(reply, commit_event(conn, root, &record));
+        }
+        Command::Terminal(record, reply) => {
+            send_commit(reply, commit_terminal(conn, root, &record, None).map(drop));
+        }
+        Command::SessionClosed(session, closed, reply) => {
+            send_commit(reply, commit_session_closed(conn, &session, &closed));
+        }
+        Command::ClosingTerminal(record, closed, reply) => {
+            send_commit(reply, commit_terminal(conn, root, &record, Some(&closed)));
+        }
+        Command::AnchorIntent(intent, reply) => {
+            let _ = reply.send(as_commit(commit_anchor_intent(conn, &intent)));
+        }
+        Command::AnchorIdentified(id, generation, version, identity, reply) => {
+            let _ = reply.send(as_commit(commit_anchor_identified(
+                conn,
+                &id,
+                &generation,
+                version,
+                &identity,
+            )));
+        }
+        Command::ArmIntent(id, generation, version, reply) => {
+            let _ = reply.send(as_commit(commit_arm_intent(
+                conn,
+                &id,
+                &generation,
+                version,
+            )));
+        }
+        Command::VendorFacts(id, generation, pid, reply) => {
+            let _ = reply.send(as_commit(commit_vendor_facts(conn, &id, &generation, pid)));
+        }
+        Command::GroupAbsence(proof, reply) => {
+            let _ = reply.send(as_commit(commit_group_absence(conn, &proof)));
+        }
+        // `writer_loop` serves reads and Shutdown before any mutation.
+        Command::SpawnKey(..)
+        | Command::Operation(..)
+        | Command::Snapshot(..)
+        | Command::QueuedTurn(..)
+        | Command::NextSeq(..)
+        | Command::Predecessors(..)
+        | Command::Result(..)
+        | Command::Terminated(..)
+        | Command::Events(..)
+        | Command::Logs(..)
+        | Command::Authenticate(..)
+        | Command::Unfinished(..)
+        | Command::AnchorOwners(..)
+        | Command::AnchorRecords(..)
+        | Command::Shutdown => {}
+    }
 }
 
 /// Replies to a Core lifecycle mutation after its transaction ended. The
@@ -263,13 +310,19 @@ fn json(value: &Value) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|error| StoreError::Write(error.to_string()))
 }
 
-fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRecord, StoreError> {
+fn commit_spawn(
+    conn: &mut Connection,
+    record: SpawnRecord,
+    key: Option<SpawnKey>,
+) -> Result<ReceiptRecord, StoreError> {
     if seq(&record.initial_event)? != 1 {
         return Err(StoreError::Constraint("initial event sequence must be one"));
     }
     let receipt = json(&record.receipt)?;
     let params_json = json(&record.params)?;
     let event = json(&record.initial_event)?;
+    // Core's queued event always carries its time; bare fixtures of lower layers may not.
+    let queued_at = record.initial_event.get("at").and_then(Value::as_str);
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
@@ -279,8 +332,8 @@ fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRec
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.execute(
-        "INSERT INTO turns(session_id,number,prompt,state) VALUES (?1,1,?2,'queued')",
-        params![record.session_id.as_str(), record.prompt],
+        "INSERT INTO turns(session_id,number,prompt,state,queued_at,queued_seq) VALUES (?1,1,?2,'queued',?3,1)",
+        params![record.session_id.as_str(), record.prompt, queued_at],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.execute(
@@ -288,6 +341,13 @@ fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRec
         params![record.session_id.as_str(), event],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
+    if let Some(key) = key {
+        tx.execute(
+            "INSERT INTO spawn_keys(key,session_id,identity,receipt) VALUES (?1,?2,?3,?4)",
+            params![key.key, record.session_id.as_str(), key.identity, receipt],
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    }
     // Every row is written but uncommitted: none may survive a crash here.
     #[cfg(feature = "test-failpoints")]
     crate::failpoint::hit("store.spawn.before_commit")
@@ -301,6 +361,194 @@ fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRec
     Ok(ReceiptRecord {
         receipt: record.receipt,
     })
+}
+
+fn read_spawn_key(conn: &Connection, key: &str) -> Result<Option<StoredSpawnKey>, StoreError> {
+    let row: Option<(String, Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT session_id,identity,receipt FROM spawn_keys WHERE key=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    row.map(|(session, identity, receipt)| {
+        Ok(StoredSpawnKey {
+            session_id: SessionId::try_from(session.as_str())
+                .map_err(|_| StoreError::CorruptEvidence)?,
+            identity,
+            receipt: serde_json::from_str(&receipt).map_err(|_| StoreError::CorruptEvidence)?,
+        })
+    })
+    .transpose()
+}
+
+/// Commits a queued turn at the session's next number with its `turn.queued`
+/// event and, when keyed, the `op_key` result, in one transaction.
+fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), StoreError> {
+    let session = &record.session_id;
+    let queued_at = event_at(&record.event)?;
+    let queued_seq = i64::try_from(seq(&record.event)?).map_err(|_| StoreError::CorruptEvidence)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let (state, turns, queued): (String, u32, u32) = tx
+        .query_row(
+            "SELECT state,(SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
+                (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued')
+             FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?
+        .ok_or(StoreError::Constraint("session does not exist"))?;
+    if state == "closed" {
+        return Err(StoreError::Constraint("session is closed"));
+    }
+    if record.turn.get() != turns + 1 {
+        return Err(StoreError::Constraint("turn is not the session's next"));
+    }
+    if queued >= SESSION_QUEUE_LIMIT {
+        return Err(StoreError::Constraint("session queue is full"));
+    }
+    tx.execute(
+        "INSERT INTO turns(session_id,number,prompt,state,queued_at,queued_seq) VALUES (?1,?2,?3,'queued',?4,?5)",
+        params![session.as_str(), record.turn.get(), record.prompt, queued_at, queued_seq],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
+    insert_event(&tx, session, &record.event, None)?;
+    if let Some(operation) = &record.operation {
+        tx.execute(
+            "INSERT INTO operations(session_id,op_key,verb,identity,turn,result) VALUES (?1,?2,'resume',?3,?4,?5)",
+            params![
+                session.as_str(),
+                operation.op_key,
+                operation.identity,
+                record.turn.get(),
+                json(&operation.result)?
+            ],
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    }
+    tx.execute(
+        "UPDATE sessions SET state='active' WHERE id=?1",
+        [session.as_str()],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
+    tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))
+}
+
+fn read_operation(
+    conn: &Connection,
+    session: &SessionId,
+    op_key: &str,
+) -> Result<Option<OperationRecord>, StoreError> {
+    let row: Option<(Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT identity,result FROM operations WHERE session_id=?1 AND op_key=?2",
+            params![session.as_str(), op_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    row.map(|(identity, result)| {
+        Ok(OperationRecord {
+            op_key: op_key.to_owned(),
+            identity,
+            result: serde_json::from_str(&result).map_err(|_| StoreError::CorruptEvidence)?,
+        })
+    })
+    .transpose()
+}
+
+fn read_snapshot(
+    conn: &Connection,
+    session: &SessionId,
+) -> Result<Option<SessionSnapshot>, StoreError> {
+    conn.query_row(
+        "SELECT state,
+            (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
+            (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued')
+         FROM sessions WHERE id=?1",
+        [session.as_str()],
+        |row| {
+            Ok(SessionSnapshot {
+                closed: row.get::<_, String>(0)? == "closed",
+                turns: row.get(1)?,
+                queued: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| StoreError::Write(error.to_string()))
+}
+
+fn read_queued_turn(
+    conn: &Connection,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<Option<QueuedTurn>, StoreError> {
+    let row: Option<(String, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT prompt,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
+            params![session.as_str(), turn.get()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    row.map(|(prompt, queued_at, queued_seq)| {
+        Ok(QueuedTurn {
+            prompt,
+            queued_at: queued_at.ok_or(StoreError::CorruptEvidence)?,
+            queued_seq: u64::try_from(queued_seq).map_err(|_| StoreError::CorruptEvidence)?,
+        })
+    })
+    .transpose()
+}
+
+fn read_predecessors(
+    conn: &Connection,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<Predecessors, StoreError> {
+    let unresolved: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND number<?2 AND state IN ('queued','running'))",
+            params![session.as_str(), turn.get()],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let envelope: Option<Option<String>> = conn
+        .query_row(
+            "SELECT envelope FROM turns WHERE session_id=?1 AND number<?2 AND submitted_at IS NOT NULL ORDER BY number DESC LIMIT 1",
+            params![session.as_str(), turn.get()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let last_submitted = envelope
+        .flatten()
+        .map(|envelope| serde_json::from_str(&envelope).map_err(|_| StoreError::CorruptEvidence))
+        .transpose()?;
+    Ok(Predecessors {
+        unresolved,
+        last_submitted,
+    })
+}
+
+fn read_next_seq(conn: &Connection, session: &SessionId) -> Result<Option<u64>, StoreError> {
+    let next: Option<i64> = conn
+        .query_row(
+            "SELECT next_seq FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    next.map(|next| u64::try_from(next).map_err(|_| StoreError::CorruptEvidence))
+        .transpose()
 }
 
 fn commit_submission(conn: &mut Connection, record: &SubmissionRecord) -> Result<(), StoreError> {
@@ -461,6 +709,39 @@ fn commit_event(
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
 
+/// Commits `session.closed` alone once every turn of the session has a
+/// terminal, and marks the session closed. A session already closed or
+/// holding a queued or running turn commits nothing and reports the close as
+/// not written; that is not a Store failure.
+fn commit_session_closed(
+    conn: &mut Connection,
+    session: &SessionId,
+    closed: &Value,
+) -> Result<bool, StoreError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let open: bool = tx
+        .query_row(
+            "SELECT state!='closed' FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    if !open || unfinished_turns(&tx, session)? {
+        return Ok(false);
+    }
+    insert_event(&tx, session, closed, None)?;
+    tx.execute(
+        "UPDATE sessions SET state='closed' WHERE id=?1",
+        [session.as_str()],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
+    tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    Ok(true)
+}
+
 /// Commits the terminal and, when `closed` is given, the session's
 /// `session.closed` event after it, in the same transaction.
 fn commit_terminal(
@@ -468,7 +749,7 @@ fn commit_terminal(
     root: &Path,
     record: &TerminalRecord,
     closed: Option<&Value>,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let state = record
         .envelope
         .get("state")
@@ -486,7 +767,7 @@ fn commit_terminal(
         .map_err(|error| StoreError::Write(error.to_string()))?;
     let changed = tx
         .execute(
-            "UPDATE turns SET state=?3,envelope=?4 WHERE session_id=?1 AND number=?2 AND state='running' AND (?3!='completed' OR correlation IS NOT NULL)",
+            "UPDATE turns SET state=?3,envelope=?4 WHERE session_id=?1 AND number=?2 AND (?3!='completed' OR correlation IS NOT NULL) AND (state='running' OR (state='queued' AND ?3='cancelled'))",
             params![record.session_id.as_str(), record.turn.get(), state, envelope],
         )
         .map_err(|error| StoreError::Write(error.to_string()))?;
@@ -499,19 +780,41 @@ fn commit_terminal(
         &record.event,
         record.raw_ref.as_ref(),
     )?;
-    if let Some(closed) = closed {
-        insert_event(&tx, &record.session_id, closed, None)?;
-    }
+    // `session.closed` only when no other turn of the session is queued or
+    // running (this turn is already terminal); otherwise the terminal commits
+    // alone and the close is reported as not written.
+    let closed = match closed {
+        Some(closed) if !unfinished_turns(&tx, &record.session_id)? => {
+            insert_event(&tx, &record.session_id, closed, None)?;
+            true
+        }
+        Some(_) | None => false,
+    };
+    // C1 §7.1: a session with queued or running work stays active; closed is final.
     tx.execute(
-        "UPDATE sessions SET state=?2 WHERE id=?1",
-        params![
-            record.session_id.as_str(),
-            if closed.is_some() { "closed" } else { "idle" }
-        ],
+        "UPDATE sessions SET state=CASE
+            WHEN ?2 OR state='closed' THEN 'closed'
+            WHEN EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running')) THEN 'active'
+            ELSE 'idle' END WHERE id=?1",
+        params![record.session_id.as_str(), closed],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    Ok(closed)
+}
+
+/// Whether any turn of the session is queued or running.
+fn unfinished_turns(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+) -> Result<bool, StoreError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running'))",
+        [session.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))
 }
 
 fn read_result(

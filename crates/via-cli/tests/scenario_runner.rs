@@ -91,3 +91,42 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
     assert!(report.artifact.join("sha256.manifest").is_file());
     Ok(())
 }
+
+/// `via-jm4.7.6`: an infrastructure failure, from the action or from a cleanup
+/// that panics after a passing action, is recorded as `infrastructure_failure`,
+/// never as a pass or an ordinary failure.
+#[test]
+fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<dyn Error>> {
+    let (sandbox, fixture) = fixture()?;
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let evidence = Evidence::new("runner_infrastructure_action", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |_| {
+            Err(ScenarioError::Infrastructure(
+                "fixture host is unavailable".to_owned(),
+            ))
+        },
+        |evidence| collect_available(evidence, sandbox.path()),
+    );
+    assert_eq!(report.outcome, "infrastructure_failure");
+    assert!(report.require_pass().is_err());
+    assert_eq!(
+        outcome(&report.artifact)?["outcome"],
+        "infrastructure_failure"
+    );
+    let evidence = Evidence::new("runner_infrastructure_cleanup", via, &fixture)?;
+    let report = run_scenario(
+        evidence,
+        |_| Ok(()),
+        |_| -> Result<(), ScenarioError> { panic!("cleanup lost its supervisor") },
+    );
+    assert_eq!(report.outcome, "infrastructure_failure");
+    assert!(report.detail.contains("cleanup panicked"));
+    assert!(report.require_pass().is_err());
+    assert_eq!(
+        outcome(&report.artifact)?["outcome"],
+        "infrastructure_failure"
+    );
+    Ok(())
+}

@@ -19,10 +19,12 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 use via_core::{
     ApiError, DaemonStatusParams, DaemonStopParams, Deadline, Engine, FakeConfig, HelloParams,
-    ReadParams, SessionReadParams, SpawnParams, SteerParams, StopMode,
+    ReadParams, Receipted, ResumeParams, SessionId, SessionReadParams, SpawnParams, SteerParams,
+    StopMode, WaitParams,
 };
 
 const MAX_LINE: usize = 16 * 1024 * 1024;
@@ -107,24 +109,13 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
-    let state = paths.state.clone();
-    let runtime = paths.runtime.clone();
-    let binary = std::env::current_exe()?;
-    let engine = Arc::new(
-        tokio::task::spawn_blocking(move || Engine::open(&state, &runtime, fake, binary))
-            .await?
-            .map_err(anyhow::Error::msg)?,
-    );
-    // C1 §7.5: recovery commits before the first request is accepted.
-    let recovered = engine
-        .recover()
-        .await
-        .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
-    if recovered > 0 {
-        tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
-    }
-    let (drive_tx, mut drive_rx) = mpsc::channel::<(String, String)>(16);
+    let engine = open_engine(&paths).await?;
+    // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
+    let mut starts = engine
+        .take_starts()
+        .context("Engine start channel already taken")?;
+    // A force stop or a latched Store failure (runtime §7) ends serving at once.
+    let mut forced = engine.force_signal();
     // An accepted stop wakes main at once; Core holds the authoritative mode.
     let stop = Arc::new(Notify::new());
     let (closing_tx, closing) = watch::channel(false);
@@ -146,7 +137,6 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 if stream.peer_cred()?.uid() != rustix::process::geteuid().as_raw() { continue; }
                 let client = Client {
                     engine: Arc::clone(&engine),
-                    drives: drive_tx.clone(),
                     stop: Arc::clone(&stop),
                     closing: closing.clone(),
                     socket_path: socket.clone(),
@@ -154,10 +144,13 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 };
                 clients.spawn(handle_client(stream, client));
             }
-            Some((session, prompt)) = drive_rx.recv() => {
-                spawn_drive(&mut drives, &engine, session, prompt);
+            Some(session) = starts.recv() => {
+                spawn_dispatcher(&mut drives, &engine, session);
+                // Capacity just returned: a start that found the channel full goes in.
+                engine.retry_starts();
             }
             () = stop.notified() => stopping = engine.stop_mode(),
+            _ = forced.wait_for(|forced| *forced) => stopping = engine.stop_mode(),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
                 if let Err(error) = result {
                     tracing::error!(%error, "client task failed");
@@ -174,26 +167,47 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     drop(listener);
     // Best effort: a stale socket refuses connections and the next daemon replaces it.
     let _ = fs::remove_file(&socket);
-    drop(drive_tx);
     let joins = Joins {
         clients,
         drives,
-        queued: drive_rx,
+        starts,
         closing: closing_tx,
         failed: failed_joins,
     };
     Ok(final_shutdown(engine, joins, mode).await)
 }
 
-/// Drives one receipted turn independently of its client connection.
-fn spawn_drive(
+/// Opens the Engine off the Tokio workers and commits crash recovery before
+/// the first request is accepted (C1 §7.5).
+async fn open_engine(paths: &super::client::Paths) -> anyhow::Result<Arc<Engine>> {
+    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
+    let state = paths.state.clone();
+    let runtime = paths.runtime.clone();
+    let binary = std::env::current_exe()?;
+    let engine = Arc::new(
+        tokio::task::spawn_blocking(move || Engine::open(&state, &runtime, fake, binary))
+            .await?
+            .map_err(anyhow::Error::msg)?,
+    );
+    let recovered = engine
+        .recover()
+        .await
+        .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
+    if recovered > 0 {
+        tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
+    }
+    Ok(engine)
+}
+
+/// Runs one session's dispatcher, which drives its turns independently of
+/// any client connection.
+fn spawn_dispatcher(
     drives: &mut JoinSet<Result<(), ApiError>>,
     engine: &Arc<Engine>,
-    session: String,
-    prompt: String,
+    session: SessionId,
 ) {
     let engine = Arc::clone(engine);
-    drives.spawn(async move { engine.drive(&session, prompt).await });
+    drives.spawn(async move { engine.dispatcher(session).await });
 }
 
 /// Whether a joined drive ended without error; a failure is logged.
@@ -215,9 +229,8 @@ fn drive_joined(result: Result<Result<(), ApiError>, tokio::task::JoinError>) ->
 struct Joins {
     clients: JoinSet<anyhow::Result<()>>,
     drives: JoinSet<Result<(), ApiError>>,
-    /// Receipted turns handed off but not yet driven; a client holds a permit
-    /// from before its receipt commits until it hands the turn off.
-    queued: mpsc::Receiver<(String, String)>,
+    /// Sessions whose dispatcher was requested but not yet started.
+    starts: mpsc::Receiver<SessionId>,
     closing: watch::Sender<bool>,
     failed: usize,
 }
@@ -233,27 +246,35 @@ struct Joins {
 async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i32 {
     let started = Instant::now();
     let deadline = started + FINAL_SHUTDOWN;
+    // Force-path reads stop retrying in time for Host cleanup and terminals.
+    engine.begin_final_shutdown(deadline);
     let Joins {
         mut clients,
         mut drives,
-        mut queued,
+        mut starts,
         closing,
         failed: mut failed_joins,
     } = joins;
     closing.send_replace(true);
-    // A force can land between a spawn receipt and daemon main taking its drive:
-    // every receipted turn is driven, so a force stop still settles it. `recv`
-    // ends once no client can hand off another turn; a spawn still committing
-    // past the deadline leaves its turn unresolved, which Core reports.
-    queued.close();
+    // A force can land between a receipt and daemon main starting its
+    // session's dispatcher: every requested dispatcher is started, so a force
+    // stop still settles its turns. Stop and the Store-failed latch are set
+    // under `admission`, which every receipt holds through its enqueue and
+    // start request, and daemon main gets here only after one of them: a
+    // receipt either put its start in the channel or pending set already, or
+    // was refused. Starts only drain now; any slot still `Starting` at the
+    // deadline makes the shutdown incomplete.
     let mut queued_drives = 0_usize;
-    let _ = timeout_at(deadline, async {
-        while let Some((session, prompt)) = queued.recv().await {
-            spawn_drive(&mut drives, &engine, session, prompt);
+    loop {
+        while let Ok(session) = starts.try_recv() {
+            spawn_dispatcher(&mut drives, &engine, session);
             queued_drives += 1;
         }
-    })
-    .await;
+        if !engine.starts_pending() || Instant::now() >= deadline {
+            break;
+        }
+        engine.retry_starts();
+    }
     // Force-stopped drives return after Route's bounded force cleanup; their
     // terminals commit below.
     let joined = timeout_at(deadline, async {
@@ -297,6 +318,9 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         "host_failure":host.map_or(Some("final shutdown deadline expired"), |host| host.failure.as_deref()),
         "uncommitted_turns":host.map(|host| host.uncommitted_turns),
         "unresolved_turns":host.map(|host| host.unresolved_turns),
+        "store_failed":host.map(|host| host.store_failed),
+        "unstarted_dispatchers":host.map(|host| host.unstarted_dispatchers),
+        "unclosed_sessions":host.map(|host| host.unclosed_sessions),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
@@ -346,7 +370,6 @@ async fn drop_blocking<T: Send + 'static>(value: T, deadline: Instant) -> &'stat
 /// What one client connection shares with daemon main.
 struct Client {
     engine: Arc<Engine>,
-    drives: mpsc::Sender<(String, String)>,
     stop: Arc<Notify>,
     /// Final shutdown began: stop reading new requests.
     closing: watch::Receiver<bool>,
@@ -384,19 +407,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
         };
         let method = method.as_str();
         if !hello_done && method != "hello" {
-            send(
-                &mut write,
-                &error(
-                    &id,
-                    Refusal::from(ApiError {
-                        code: -32000,
-                        kind: "handshake_required",
-                        message: "hello must be first",
-                        unpersisted: None,
-                    }),
-                ),
-            )
-            .await?;
+            send(&mut write, &error(&id, Refusal::from(HANDSHAKE_REQUIRED))).await?;
             continue;
         }
         if hello_done && method == "daemon/stop" {
@@ -415,19 +426,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
                     json!({"api_version":1,"daemon_version":env!("CARGO_PKG_VERSION"),"daemon_pid":std::process::id(),"deprecations":[]})
                 }
                 Ok(_) => {
-                    send(
-                        &mut write,
-                        &error(
-                            &id,
-                            Refusal::from(ApiError {
-                                code: -32001,
-                                kind: "version_mismatch",
-                                message: "client and daemon versions differ",
-                                unpersisted: None,
-                            }),
-                        ),
-                    )
-                    .await?;
+                    send(&mut write, &error(&id, Refusal::from(VERSION_MISMATCH))).await?;
                     continue;
                 }
                 Err(refusal) => {
@@ -436,7 +435,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
                 }
             }
         } else {
-            match dispatch(method, params, &client).await {
+            match dispatch(method, params, &line, &client).await {
                 Ok(value) => value,
                 Err(refusal) => {
                     send(&mut write, &error(&id, refusal)).await?;
@@ -488,10 +487,14 @@ async fn stop_request(
     Ok(true)
 }
 
-async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value, Refusal> {
+async fn dispatch(
+    method: &str,
+    params: Value,
+    line: &[u8],
+    client: &Client,
+) -> Result<Value, Refusal> {
     let Client {
         engine,
-        drives,
         socket_path,
         store_path,
         ..
@@ -504,21 +507,20 @@ async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value,
                 "socket_path":socket_path,"store_path":store_path,"health":"healthy","sessions":{"idle":0,"active":engine.active(),"closing":0},"servers":[]}),
             )
         }
-        "spawn" => {
-            let params = typed::<SpawnParams>(params)?;
-            // Reserved before the receipt commits, so final shutdown waits for
-            // this handoff; the queue closes only in final shutdown.
-            let handoff = drives
-                .reserve()
-                .await
-                .map_err(|_| ApiError::DAEMON_STOPPING)?;
-            let (receipt, session, prompt) = engine.spawn(params).await?;
-            handoff.send((session, prompt));
+        "spawn" | "resume" => {
+            // Core enqueues the new turn with its session's dispatcher under
+            // admission; a replayed retry enqueues nothing.
+            let raw = raw_params(line)?;
+            let Receipted { receipt, .. } = if method == "spawn" {
+                engine.spawn(typed::<SpawnParams>(params)?, raw).await?
+            } else {
+                engine.resume(typed::<ResumeParams>(params)?, raw).await?
+            };
             Ok(receipt)
         }
         "steer" => Ok(engine.steer(typed::<SteerParams>(params)?).await?),
         "result" => Ok(engine.result(&typed::<ReadParams>(params)?.address).await?),
-        "wait" => Ok(engine.wait(&typed::<ReadParams>(params)?.address).await?),
+        "wait" => Ok(engine.wait(typed::<WaitParams>(params)?).await?),
         "events" => Ok(engine
             .events(typed::<SessionReadParams>(params)?.session.as_str())
             .await?),
@@ -530,15 +532,37 @@ async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value,
             kind: "method_not_found",
             message: "method not found",
             unpersisted: None,
+            kind2: None,
+            commit_outcome: None,
         })),
     }
 }
+
+const HANDSHAKE_REQUIRED: ApiError = ApiError {
+    code: -32000,
+    kind: "handshake_required",
+    message: "hello must be first",
+    unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
+};
+
+const VERSION_MISMATCH: ApiError = ApiError {
+    code: -32001,
+    kind: "version_mismatch",
+    message: "client and daemon versions differ",
+    unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
+};
 
 const PARSE_ERROR: ApiError = ApiError {
     code: -32700,
     kind: "parse_error",
     message: "invalid JSON",
     unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
 };
 
 const INVALID_REQUEST: ApiError = ApiError {
@@ -546,6 +570,8 @@ const INVALID_REQUEST: ApiError = ApiError {
     kind: "invalid_request",
     message: "invalid JSON-RPC request",
     unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
 };
 
 /// A request error plus the optional C1 `data.kind2` refinement.
@@ -589,6 +615,19 @@ fn parse_request(request: Value) -> Result<(Value, String, Value), (Value, Refus
         Some(_) => return Err((id, ApiError::INVALID_PARAMS.into())),
     };
     Ok((id, method, params))
+}
+
+/// The request's `params` bytes exactly as sent, the source of a C1 P4
+/// byte-identical retry identity. A repeated `params` member is refused.
+fn raw_params(line: &[u8]) -> Result<&str, Refusal> {
+    #[derive(Deserialize)]
+    struct Request<'a> {
+        #[serde(borrow)]
+        params: Option<&'a RawValue>,
+    }
+    let request: Request<'_> =
+        serde_json::from_slice(line).map_err(|_| Refusal::from(ApiError::INVALID_PARAMS))?;
+    Ok(request.params.map_or("{}", RawValue::get))
 }
 
 /// Decodes by-name parameters into a strict DTO; unknown members are reported

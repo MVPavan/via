@@ -201,7 +201,10 @@ impl WireConnection {
         mut cancel: watch::Receiver<bool>,
     ) -> Result<Self, WireError> {
         let launch = LaunchPipes::default();
-        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch));
+        // The same signal gates ARM inside Host: set before its last check,
+        // nothing launches.
+        let gate = cancel.clone();
+        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &gate));
         let acquired = tokio::select! {
             // A force already set when the acquisition's own result is observed
             // came first.
@@ -214,7 +217,13 @@ impl WireConnection {
                     Ok(Err(_)) | Err(_) => Err(WireError::Cancelled),
                 }
             }
-            acquired = &mut acquire => acquired.map_err(WireError::Host),
+            acquired = &mut acquire => acquired.map_err(|error| {
+                if matches!(error, via_host::HostError::Stopped) {
+                    WireError::Cancelled
+                } else {
+                    WireError::Host(error)
+                }
+            }),
         };
         let AcquiredProcess {
             pipes,

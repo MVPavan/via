@@ -770,9 +770,11 @@ fn check_whole_queued_session(paths: &Paths) -> Result<(), ScenarioError> {
 }
 
 /// F8 / `store.commit.reply_lost`: the spawn commits but its reply is lost.
-/// The caller gets `store_error`, never a receipt; one whole session exists
-/// and the unacknowledged turn is never dispatched. (Keyed replay of that
-/// receipt needs spawn idempotency keys, which T2-B adds.)
+/// The caller gets `store_error` with `commit_outcome: unknown` and
+/// `retry: same_key_only`, never a receipt; one whole session exists. The
+/// uncertain commit latches Store failure (runtime §7): the daemon shuts
+/// itself down in force mode and exits 4, and the unacknowledged turn is never
+/// dispatched, by it or by the restarted daemon.
 #[test]
 fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult {
     scenario(
@@ -781,14 +783,16 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
         |paths, evidence| {
             let point = "store.commit.reply_lost";
             arm(paths, point, "fail_io")?;
-            let daemon = Daemon::start(paths, evidence, "final")?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
             let client = paths.spawn_pending(evidence, "spawn-lost", "f08");
             acknowledged(paths, evidence, point, "fail_io", &daemon)?;
             let (status, stdout, stderr) = client.finish()?;
+            let error: Value = serde_json::from_slice(&stderr).unwrap_or_default();
             check(
                 !status.success()
                     && stdout.is_empty()
-                    && error_kind(&stderr).as_deref() == Some("store_error"),
+                    && error["data"]
+                        == json!({"kind":"store_error","commit_outcome":"unknown","retry":"same_key_only"}),
                 || {
                     format!(
                         "lost reply returned {status}: {}",
@@ -796,8 +800,12 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
                     )
                 },
             )?;
+            latched_exit(&mut daemon, evidence, "latched")?;
             check_whole_queued_session(paths)?;
             let session = paths.only_session()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence)?;
             let turn = paths.turn(&session)?;
             check(
@@ -1426,6 +1434,358 @@ fn s1_f10_failed_absence_commit_fails_startup() -> TestResult {
                 format!("recovery committed after a Store failure: {}", turn.state)
             })?;
             paths.failpoints.disarm(commit).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Waits for a daemon that latched Store failure to end its own final
+/// shutdown with exit 4, and returns its shutdown summary.
+fn latched_exit(
+    daemon: &mut Daemon<'_>,
+    evidence: &Evidence,
+    run: &str,
+) -> Result<Value, ScenarioError> {
+    let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+        .ok_or_else(|| ScenarioError::Timeout("the latched daemon never exited".to_owned()))?;
+    let trace =
+        fs::read_to_string(evidence.dir.join(format!("daemon-{run}.trace"))).map_err(infra)?;
+    let summary = trace
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let line: Value = serde_json::from_str(line).ok()?;
+            line.get("daemon_shutdown").cloned()
+        })
+        .ok_or_else(|| fail("no daemon_shutdown summary"))?;
+    check(
+        status.code() == Some(4)
+            && summary["store_failed"] == true
+            && summary["mode"] == "force"
+            && summary["disposition"] == "incomplete",
+        || format!("latched daemon ended {status}; summary {summary}"),
+    )?;
+    Ok(summary)
+}
+
+/// Runtime §7 (T2-B2): a submission commit whose reply is lost after the
+/// grant latches Store failure. No vendor launches, the turn is not retried,
+/// and the daemon exits 4; the restarted daemon recovers it `unknown`.
+#[test]
+fn s1_f10_uncertain_submission_latches_and_launches_nothing() -> TestResult {
+    scenario(
+        "s1_f10_uncertain_submission_latches",
+        &prompted_fixture(),
+        |paths, evidence| {
+            // The spawn's receipt is the first Core lifecycle commit; the
+            // submission is the second.
+            let point = "store.commit.reply_lost";
+            paths.failpoints.arm(point, 2, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            paths
+                .failpoints
+                .wait_ack(point, 2, "fail_io", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            let turn = paths.turn(&session)?;
+            let types = paths.event_types(&session)?;
+            check(
+                turn.state == "running"
+                    && turn.submitted_at.is_some()
+                    && types == ["turn.queued", "turn.submitted"],
+                || format!("turn {} with events {types:?}", turn.state),
+            )?;
+            check(
+                paths.anchors_for(&session)? == 0 && !paths.sync.join("prompted.entered").exists(),
+                || "a vendor launched after the uncertain submission".to_owned(),
+            )?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Committed anchors of a session whose vendor was spawned (vendor facts).
+fn vendor_launches(paths: &Paths, session: &str) -> Result<i64, ScenarioError> {
+    paths
+        .store()?
+        .query_row(
+            "SELECT count(*) FROM anchors WHERE owner_session=?1 AND vendor_pid IS NOT NULL",
+            [session],
+            |row| row.get(0),
+        )
+        .map_err(infra)
+}
+
+/// T2-B2 design §3.1: a force accepted while the acquisition waits at the
+/// pre-ARM gate (after `ArmIntent` committed) wins: no ARM is sent, no vendor
+/// launches, and the turn ends as a force before launch (`cancelled`,
+/// `requested`); the session closes and the shutdown is clean.
+#[test]
+fn s1_f10_force_at_the_pre_arm_gate_launches_nothing() -> TestResult {
+    scenario(
+        "s1_f10_force_at_pre_arm_gate",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let point = "host.anchor.after_arm_intent_commit";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "forced")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--force", "--json"])?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            paths.failpoints.release(point, 1).map_err(infra)?;
+            let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+                .ok_or_else(|| ScenarioError::Timeout("force stop never exited".to_owned()))?;
+            check_pre_launch_force(paths, &session, true)?;
+            check(status.code() == Some(0), || format!("daemon exit {status}"))?;
+            // A later daemon runs a normal turn, which also leaves raw evidence.
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// T2-B2 design §3.1 with the Store-failed latch: while one turn waits at the
+/// pre-ARM gate, another session's lost receipt reply latches; on release the
+/// gate refuses ARM, nothing launches, no `session.closed` commits, and the
+/// daemon exits 4.
+#[test]
+fn s1_f10_latch_at_the_pre_arm_gate_launches_nothing() -> TestResult {
+    scenario(
+        "s1_f10_latch_at_pre_arm_gate",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let gate = "host.anchor.after_arm_intent_commit";
+            arm(paths, gate, "pause")?;
+            // Spawn, then its submission; the second spawn's receipt is third.
+            let lost = "store.commit.reply_lost";
+            paths.failpoints.arm(lost, 3, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, gate, "pause", &daemon)?;
+            let second = paths.run(evidence, "spawn-lost", &spawn_args("f10"))?;
+            check(
+                !second.status.success()
+                    && error_kind(&second.stderr).as_deref() == Some("store_error"),
+                || "the lost receipt was not store_error".to_owned(),
+            )?;
+            paths.failpoints.release(gate, 1).map_err(infra)?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            check_pre_launch_force(paths, &session, false)?;
+            paths.failpoints.disarm(gate).map_err(infra)?;
+            paths.failpoints.disarm(lost).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// The turn ended as a force before launch: submitted, `cancelled` with
+/// `requested`, no vendor spawned and no prompt read; `session.closed`
+/// follows only when `closed`.
+fn check_pre_launch_force(paths: &Paths, session: &str, closed: bool) -> Result<(), ScenarioError> {
+    check(
+        vendor_launches(paths, session)? == 0 && !paths.sync.join("prompted.entered").exists(),
+        || "a vendor launched past the pre-ARM gate".to_owned(),
+    )?;
+    let turn = paths.turn(session)?;
+    let envelope: Value =
+        serde_json::from_str(turn.envelope.as_deref().unwrap_or("null")).map_err(infra)?;
+    check(
+        envelope["state"] == "cancelled"
+            && envelope["cancel"]["outcome"] == "requested"
+            && envelope["timestamps"]["accepted_at"].is_null(),
+        || format!("envelope {envelope}"),
+    )?;
+    let mut expected = vec![
+        "turn.queued",
+        "turn.submitted",
+        "cancel.requested",
+        "cancel.settled",
+        "turn.ended",
+    ];
+    if closed {
+        expected.push("session.closed");
+    }
+    let types = paths.event_types(session)?;
+    check(types == expected, || format!("events {types:?}"))
+}
+
+/// Round 1, decision 1 (runtime §7): the terminal commit succeeds but its
+/// reply is lost. The read-back finds the terminal, so a waiter gets the
+/// committed envelope; the uncertain commit itself still latches Store
+/// failure, and the daemon exits 4.
+#[test]
+fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
+    scenario(
+        "s1_f12_lost_terminal_reply",
+        &accepting_fixture(),
+        |paths, evidence| {
+            // Spawn, submission and acceptance are the first three Core
+            // lifecycle commits; the terminal is the fourth.
+            let point = "store.commit.reply_lost";
+            paths.failpoints.arm(point, 4, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let receipt = json_line(&spawn.stdout)?;
+            let address = receipt["turn"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no turn"))?
+                .to_owned();
+            wait_file(&paths.sync.join("accepted.entered"))?;
+            let out = evidence.dir.join("wait.stdout");
+            let mut waiter = paths.command();
+            waiter
+                .args(["wait", &address, "--json"])
+                .stdin(Stdio::null())
+                .stdout(File::create(&out).map_err(infra)?)
+                .stderr(File::create(evidence.dir.join("wait.stderr")).map_err(infra)?);
+            let mut waiter = waiter.spawn().map_err(infra)?;
+            // The waiter is attached before the terminal commits.
+            thread::sleep(Duration::from_millis(300));
+            fs::write(paths.sync.join("accepted.release"), b"").map_err(infra)?;
+            paths
+                .failpoints
+                .wait_ack(point, 4, "fail_io", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            let exit = wait_child(&mut waiter, FINAL_SHUTDOWN)?
+                .ok_or_else(|| ScenarioError::Timeout("the waiter never returned".to_owned()))?;
+            let envelope = json_line(&fs::read(&out).map_err(infra)?)?;
+            check(exit.success() && envelope["state"] == "completed", || {
+                format!("waiter ended {exit} with {envelope}")
+            })?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Round 2, decision 3: under force, the queued turn's cancellation read is
+/// paused at `core.force.cancel_read` and never released. The read expires at
+/// final shutdown's read cutoff (4 s before its 10 s deadline), the turn stays
+/// unresolved, and the daemon finishes shutdown within its bound with exit 4.
+#[test]
+fn s1_f12_stalled_force_path_read_expires_within_the_shutdown_bound() -> TestResult {
+    scenario(
+        "s1_f12_stalled_force_read",
+        &accepting_fixture(),
+        |paths, evidence| {
+            let point = "core.force.cancel_read";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "stalled")?;
+            let mut args = spawn_args("f10").to_vec();
+            args.extend(["--handle", HANDLE]);
+            let spawn = paths.run(evidence, "spawn", &args)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            wait_file(&paths.sync.join("accepted.entered"))?;
+            let resume = paths.run(
+                evidence,
+                "resume",
+                &[
+                    "resume", &session, "--prompt", "q", "--handle", HANDLE, "--json",
+                ],
+            )?;
+            check(resume.status.success(), || {
+                format!("resume exited {}", resume.status)
+            })?;
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--force", "--json"])?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let stopped = Instant::now();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+                .ok_or_else(|| ScenarioError::Timeout("shutdown outlived its bound".to_owned()))?;
+            let elapsed = stopped.elapsed();
+            let trace =
+                fs::read_to_string(evidence.dir.join("daemon-stalled.trace")).map_err(infra)?;
+            check(
+                status.code() == Some(4)
+                    && elapsed < FINAL_SHUTDOWN + Duration::from_secs(1)
+                    && trace.contains("\"unresolved_turns\":1"),
+                || format!("shutdown ended {status} after {elapsed:?}; trace {trace}"),
+            )?;
+            let types = paths.event_types(&session)?;
+            check(!types.iter().any(|kind| kind == "session.closed"), || {
+                format!("events {types:?}")
+            })?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Round 2, item 4: startup recovery's terminal commit loses its reply. The
+/// commit was uncertain, so startup fails before admission even though the
+/// terminal is durable; the next restart reads that durable `unknown` result,
+/// recovers nothing twice and admits.
+#[test]
+fn s1_f10_lost_recovery_terminal_reply_fails_startup_then_admits() -> TestResult {
+    scenario(
+        "s1_f10_lost_recovery_terminal_reply",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let intent = "core.intent.after_commit";
+            arm(paths, intent, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, intent, "pause", &daemon)?;
+            daemon.kill()?;
+            paths.failpoints.disarm(intent).map_err(infra)?;
+            drop(daemon);
+            // Recovery commits `cancel.requested` and `cancel.settled`, then the
+            // terminal: the third Core lifecycle commit of the new daemon.
+            let lost = "store.commit.reply_lost";
+            paths.failpoints.arm(lost, 3, "fail_io").map_err(infra)?;
+            let (status, trace) = refused_start(paths, evidence, "refused")?;
+            check(
+                !status.success() && trace.contains("crash recovery failed"),
+                || format!("startup ended {status}: {trace}"),
+            )?;
+            let turn = paths.turn(&session)?;
+            check(turn.state == "unknown" && turn.envelope.is_some(), || {
+                format!("the recovered terminal is not durable: {}", turn.state)
+            })?;
+            paths.failpoints.disarm(lost).map_err(infra)?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
             completes_normally(paths, evidence).map(drop)

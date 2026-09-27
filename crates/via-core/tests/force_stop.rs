@@ -1,6 +1,7 @@
 //! Force stop through Core's public Engine over a real Store and Host, where the
-//! test controls when the drive starts: a force accepted before the drive's
-//! execution launches anything (C1 §7.4, §7.6 force row, §6 lifecycle events).
+//! test controls when the session's dispatcher starts: a force accepted before
+//! it grants a turn, or during the turn's execution (C1 §7.4, §7.6 force row,
+//! §6 lifecycle events).
 //! Each case re-executes this binary with its fake settings, since Core reads
 //! them from the environment once at daemon startup.
 #![expect(
@@ -74,14 +75,16 @@ fn open(root: &Path) -> Engine {
     .unwrap()
 }
 
-/// W1-D Sol finding 3: with no anchor intent nothing was launched, so no
-/// vendor could have acknowledged the cancel. The turn ends `cancelled` with
-/// `requested`/`quiescent`, never `acknowledged`, and the forced turn commits
-/// `cancel.requested`, `cancel.settled`, `turn.ended` and `session.closed`.
+/// T2-B2 design §4: a force accepted before the dispatch grant cancels the
+/// still-queued turn without submission (C1 §7.2 `queued → cancelled`) and,
+/// its session holding only queued work, commits `session.closed` with it.
+/// Nothing launched, so the shutdown is clean. (A turn granted before force
+/// is covered by Core's `a_turn_granted_before_force_...` unit test: it
+/// submits, then ends `cancelled` with `requested`/`quiescent`.)
 #[test]
-fn force_before_launch_claims_no_acknowledgement() {
+fn force_before_dispatch_cancels_the_queued_turn_without_submission() {
     let Some(root) = env::var_os(CHILD) else {
-        return run_child("force_before_launch_claims_no_acknowledgement");
+        return run_child("force_before_dispatch_cancels_the_queued_turn_without_submission");
     };
     let root = PathBuf::from(root);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -95,10 +98,10 @@ fn force_before_launch_claims_no_acknowledgement() {
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, _) = engine.spawn(params, "{}").await.unwrap().enqueued.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         assert_eq!(engine.request_stop(&force).await.unwrap(), StopMode::Force);
-        engine.drive(&session, prompt).await.unwrap();
+        engine.dispatcher(session.clone()).await.unwrap();
         let report = engine
             .shutdown(Deadline::at(
                 tokio::time::Instant::now() + Duration::from_secs(5),
@@ -111,14 +114,13 @@ fn force_before_launch_claims_no_acknowledgement() {
         assert_eq!(envelope["state"], "cancelled", "{envelope}");
         assert!(envelope["failure"].is_null(), "{envelope}");
         assert_eq!(envelope["stop_reason"], "interrupted", "{envelope}");
-        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
-        assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+        assert!(envelope["cancel"].is_null(), "{envelope}");
         assert!(
-            envelope["timestamps"]["accepted_at"].is_null(),
+            envelope["timestamps"]["submitted_at"].is_null(),
             "{envelope}"
         );
 
-        let page = engine.events(&session).await.unwrap();
+        let page = engine.events(session.as_str()).await.unwrap();
         let events: Vec<Value> = page["events"].as_array().unwrap().clone();
         let types: Vec<&str> = events
             .iter()
@@ -126,26 +128,17 @@ fn force_before_launch_claims_no_acknowledgement() {
             .collect();
         assert_eq!(
             types,
-            [
-                "turn.queued",
-                "turn.submitted",
-                "cancel.requested",
-                "cancel.settled",
-                "turn.ended",
-                "session.closed",
-            ],
+            ["turn.queued", "turn.ended", "session.closed"],
             "{page}"
         );
         for (index, event) in events.iter().enumerate() {
             assert_eq!(event["seq"], json!(index + 1), "dense seq: {event}");
         }
-        assert_eq!(events[3]["outcome"], envelope["cancel"]["outcome"]);
-        assert_eq!(events[3]["cleanup"], envelope["cancel"]["cleanup"]);
-        assert_eq!(events[4]["cancel"], envelope["cancel"]);
-        assert!(events[5]["turn"].is_null(), "session event: {}", events[5]);
+        assert_eq!(events[2]["reason"], "daemon_stop_force", "{page}");
+        assert!(events[2]["turn"].is_null(), "session event: {}", events[2]);
         assert_eq!(
             envelope["events"],
-            json!({"first_seq":1,"last_seq":5,"count":5}),
+            json!({"first_seq":1,"last_seq":2,"count":2}),
             "the turn's range ends at turn.ended"
         );
         drop(engine);
@@ -195,11 +188,11 @@ fn force_during_stalled_acquisition_settles_the_turn() {
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, _) = engine.spawn(params, "{}").await.unwrap().enqueued.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         let forced_at = std::cell::Cell::new(None);
         let (driven, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(8), engine.drive(&session, prompt)),
+            tokio::time::timeout(Duration::from_secs(8), engine.dispatcher(session.clone())),
             async {
                 // Acquisition is then waiting for the anchor's ready frame.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -291,10 +284,10 @@ fn force_over_stand_in_within(
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, _) = engine.spawn(params, "{}").await.unwrap().enqueued.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         let (driven, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), engine.drive(&session, prompt)),
+            tokio::time::timeout(Duration::from_secs(10), engine.dispatcher(session.clone())),
             async {
                 wait_flag(&root.join("runtime"), barrier).await;
                 engine.request_stop(&force).await.unwrap();
@@ -307,7 +300,7 @@ fn force_over_stand_in_within(
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
-        let events = engine.events(&session).await.unwrap()["events"]
+        let events = engine.events(session.as_str()).await.unwrap()["events"]
             .as_array()
             .unwrap()
             .clone();
