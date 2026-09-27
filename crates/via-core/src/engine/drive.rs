@@ -500,7 +500,10 @@ impl Engine {
         self.queued.fetch_sub(1, Ordering::AcqRel);
         self.active.fetch_sub(1, Ordering::AcqRel);
         if durable.uncertain {
+            // The terminal is durable, but the commit itself was uncertain:
+            // a Store failure, so the restart handoff fails startup (§10).
             self.latch_with(admission.as_ref()).await;
+            return Cancelled::Latched;
         }
         Cancelled::Committed
     }

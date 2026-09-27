@@ -512,4 +512,3 @@ the handoff completes.
    enqueues it like any other queued turn, so it runs exactly once. A keyed
    retry after the restart replays the stored receipt and enqueues nothing
    (`enqueued: None`).
-

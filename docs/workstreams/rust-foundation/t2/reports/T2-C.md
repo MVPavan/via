@@ -118,3 +118,59 @@ failures below are that run's output.
 3. **A cleanup-pending terminal is only synthetic here.** The fake route
    never produces a terminal envelope with `cleanup: pending`, so decision
    1 is tested at Core level on such a row.
+
+## Round 1
+
+Sol high's review (`../sol-review-T2-C.md`) returned SOUND WITH CHANGES
+with one blocker. I merged `origin/rust-foundation` (`f2aba29`, docs only)
+and applied the decisions as given.
+
+| # | Item | Change | Regression; failure with the fix reverted |
+|---|---|---|---|
+| 1 | **Blocker:** an uncertain `queued → cancelled` whose read-back found the terminal returned `Cancelled::Committed` after latching, so the handoff could finish and the daemon serve | `cancel_queued` returns `Cancelled::Latched` after latching an uncertain commit, while still retiring the durable turn. `hand_off_queued` then returns `Err` and startup fails; the dispatcher's latched path is unchanged | `s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits`: turn 1 is held, turn 2 queued; kill. On restart `store.commit.reply_lost` hits the 4th lifecycle commit, after recovery's `cancel.requested`, `cancel.settled` and terminal: the handoff's cancellation of turn 2. Startup fails with "restart handoff failed", and turn 2 is durably `cancelled`. The next restart admits with turn 1 `unknown`, turn 2 `cancelled` and no turn 2 anchor. Reverted: the handoff reports `cancelled=1`, the daemon starts serving, and it then latches and exits 4 (`startup ended exit status: 4 … handed off … cancelled=1 … "store_failed":true`), which is not a startup failure |
+| 2 | Deferred coverage: more than 128 recovered `Starting` sessions | Test only | `starts_beyond_the_channel_spill_into_the_pending_set_and_all_run` (`tests/restart_handoff.rs`): two earlier Engines leave 130 sessions × 1 queued turn. The handoff enqueues 130 and `starts_pending()` is true (the channel holds 128). Daemon main's receive-then-retry loop starts 130 dispatchers, every turn completes, there is no latch, and `active: 0` |
+| 3 | Extra blank line at the end of `dispatch-design.md` | Removed | `git diff --check` is clean |
+
+### Finding outside T2-C: concurrent turns are not limited to connection slots
+
+I first ran item 2's test with all 130 dispatchers unthrottled, as daemon
+main starts them. That exposed a gap that existed before this round and
+lies outside it. Runtime §8's "active private connections: 4 daemon-wide —
+queue eligible work; do not create a child until a slot is reserved" is not
+implemented, so every started dispatcher launches at once:
+
+- **Raw queue:** Store's raw append queue is a 128-deep channel fed with
+  `try_send`. At 130 concurrent turns about half failed as
+  `failed(store)`, "fake raw store failed" (66, 67 and 69 of 130 completed
+  in three runs).
+- **Store request queue:** under full-suite load the 64-deep Store request
+  queue also overflowed. That latches Store failure, and forced turns then
+  have no terminal (`turn_not_finished` after the dispatchers returned;
+  2 of 5 full runs).
+
+The test now runs the dispatchers four at a time behind a semaphore,
+standing in for the missing slot limit, so it exercises what T2-C owns: the
+start spill and drain, and every handed-off turn running. The same gap
+affects normal operation whenever many sessions dispatch at once, for
+example after a restart with many surviving queued turns. The slot limit
+belongs to the bounds work (F24 and `s1_bounds_*`, or `via-jm4.7.7`), and I
+propose tracking it there. Nothing in this round depends on it.
+
+**Files (Round 1):** `via-core/src/engine/drive.rs` (`cancel_queued`),
+`via-core/tests/restart_handoff.rs` (`leave_queued` takes a turn count;
+the new test), `via-cli/tests/s1_crash_points.rs` (the new scenario),
+`dispatch-design.md` (the trailing line).
+
+**Gate (Round 1):**
+
+| Check | Result |
+|---|---|
+| fmt, `git diff --check`, both clippy configurations, deny, layers | pass |
+| `cargo nextest run --locked --workspace` | 170 passed, 2 skipped |
+| `… --features via-cli/test-failpoints`, 5 full runs | 5 of 5: 193 passed, 2 skipped |
+| `… -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 17 passed |
+| release build and `check-release-features.py` | pass |
+
+These counts are from the final code. Before the semaphore was added, two
+of five full runs failed the item-2 test, as described in the finding
+above.

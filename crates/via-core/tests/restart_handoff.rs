@@ -79,8 +79,8 @@ fn open(root: &Path) -> Engine {
     .unwrap()
 }
 
-/// Receipts `sessions` sessions of eight queued turns each, dispatching none.
-async fn leave_queued(root: &Path, sessions: usize) -> Vec<SessionId> {
+/// Receipts `sessions` sessions of `turns` queued turns each, dispatching none.
+async fn leave_queued(root: &Path, sessions: usize, turns: u32) -> Vec<SessionId> {
     let engine = open(root);
     let mut made = Vec::new();
     for _ in 0..sessions {
@@ -92,7 +92,7 @@ async fn leave_queued(root: &Path, sessions: usize) -> Vec<SessionId> {
             .unwrap()
             .enqueued
             .unwrap();
-        for _ in 1..TURNS {
+        for _ in 1..turns {
             let raw = json!({"session":session.as_str(),"handle":HANDLE,"prompt":"p"});
             let params: ResumeParams = serde_json::from_value(raw.clone()).unwrap();
             engine.resume(params, &raw.to_string()).await.unwrap();
@@ -118,8 +118,8 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
         .unwrap();
     runtime.block_on(async {
         // Each earlier Engine stays within its own 128 bound.
-        let mut sessions = leave_queued(&root, 9).await;
-        sessions.extend(leave_queued(&root, SESSIONS - 9).await);
+        let mut sessions = leave_queued(&root, 9, TURNS).await;
+        sessions.extend(leave_queued(&root, SESSIONS - 9, TURNS).await);
         let engine = std::sync::Arc::new(open(&root));
         assert_eq!(engine.recover().await.unwrap(), 0);
         let handoff = engine.hand_off_queued().await.unwrap();
@@ -165,6 +165,77 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
                     .unwrap();
                 assert_eq!(envelope["state"], "completed", "{envelope}");
             }
+        }
+        assert_eq!(engine.active(), 0);
+    });
+}
+
+/// T2-C round 1: more than 128 recovered `Starting` sessions (130 × 1 queued
+/// turn). The handoff's starts overflow the 128-capacity channel into the
+/// pending-start set; daemon main's receive-then-retry loop drains all 130,
+/// and every turn runs to `completed`. The dispatchers run at most four at a
+/// time here, as runtime §8's active-connection slots would queue them: that
+/// slot limit is not implemented yet, and 130 unthrottled turns overflow
+/// Store's raw and request queues (reported in T2-C round 1).
+#[test]
+fn starts_beyond_the_channel_spill_into_the_pending_set_and_all_run() {
+    const MANY: usize = 130;
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("starts_beyond_the_channel_spill_into_the_pending_set_and_all_run");
+    };
+    let root = PathBuf::from(root);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut sessions = leave_queued(&root, 65, 1).await;
+        sessions.extend(leave_queued(&root, MANY - 65, 1).await);
+        let engine = std::sync::Arc::new(open(&root));
+        engine.recover().await.unwrap();
+        let handoff = engine.hand_off_queued().await.unwrap();
+        assert_eq!(handoff.enqueued, MANY);
+        assert!(
+            engine.starts_pending(),
+            "starts past 128 wait in the pending set"
+        );
+        let mut starts = engine.take_starts().unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let mut dispatchers = tokio::task::JoinSet::new();
+        let mut started = 0;
+        loop {
+            while let Ok(session) = starts.try_recv() {
+                let engine = std::sync::Arc::clone(&engine);
+                let slots = std::sync::Arc::clone(&slots);
+                dispatchers.spawn(async move {
+                    let _slot = slots.acquire_owned().await.unwrap();
+                    engine.dispatcher(session).await
+                });
+                started += 1;
+            }
+            if !engine.starts_pending() {
+                break;
+            }
+            engine.retry_starts();
+        }
+        assert_eq!(
+            started, MANY,
+            "every recovered session's dispatcher started"
+        );
+        let joined = tokio::time::timeout(Duration::from_secs(240), async {
+            while let Some(result) = dispatchers.join_next().await {
+                result.unwrap().unwrap();
+            }
+        })
+        .await;
+        assert!(joined.is_ok(), "every turn ran");
+        assert!(!engine.store_failed());
+        for session in &sessions {
+            let envelope = engine
+                .result(&format!("{}/1", session.as_str()))
+                .await
+                .unwrap();
+            assert_eq!(envelope["state"], "completed", "{envelope}");
         }
         assert_eq!(engine.active(), 0);
     });

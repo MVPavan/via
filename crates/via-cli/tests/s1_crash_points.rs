@@ -2076,3 +2076,52 @@ fn s1_t2c_unkeyed_lost_resume_receipt_runs_once_after_restart() -> TestResult {
         },
     )
 }
+
+/// T2-C round 1 (design §10.3): the handoff's `queued → cancelled` commit
+/// loses its reply. The commit is uncertain although its terminal is
+/// durable, so the handoff fails startup. The next restart finds that turn
+/// `cancelled` and admits.
+#[test]
+fn s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits() -> TestResult {
+    scenario(
+        "s1_t2c_lost_handoff_cancellation",
+        &json!({"scripts":[t2c_script(1, "c1", Some("hold")), t2c_script(2, "c2", None)]}),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = t2c_spawn(paths, evidence, "spawn", "c1", None)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            wait_file(&paths.sync.join("hold.entered"))?;
+            let resume = t2c_resume(paths, evidence, "resume", &session, "c2")?;
+            check(resume.status.success(), || "resume refused".to_owned())?;
+            daemon.kill()?;
+            drop(daemon);
+            // Recovery commits turn 1's `cancel.requested`, `cancel.settled`
+            // and terminal; the handoff's cancellation of turn 2 is fourth.
+            let lost = "store.commit.reply_lost";
+            paths.failpoints.arm(lost, 4, "fail_io").map_err(infra)?;
+            let (status, trace) = refused_start(paths, evidence, "refused")?;
+            check(
+                !status.success() && trace.contains("restart handoff failed"),
+                || format!("startup ended {status}: {trace}"),
+            )?;
+            let (state, _) = turn_n(paths, &session, 2)?;
+            check(state == "cancelled", || {
+                format!("the uncertain cancellation is not durable: {state}")
+            })?;
+            paths.failpoints.disarm(lost).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let (first, _) = turn_n(paths, &session, 1)?;
+            let (second, _) = turn_n(paths, &session, 2)?;
+            check(first == "unknown" && second == "cancelled", || {
+                format!("after restart: turn 1 {first}, turn 2 {second}")
+            })?;
+            check(anchors_of_turn(paths, &session, 2)? == 0, || {
+                "turn 2 launched".to_owned()
+            })?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
