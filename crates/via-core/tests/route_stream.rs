@@ -74,11 +74,15 @@ fn run_child(name: &str, script: &str, lines: &[Value]) {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if Instant::now() >= limit {
+        let expired = Instant::now() >= limit;
+        if expired {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{name} child did not finish within {CHILD_LIMIT:?}");
         }
+        assert!(
+            !expired,
+            "{name} child did not finish within {CHILD_LIMIT:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(status.success(), "{name} child failed: {status}");

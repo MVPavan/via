@@ -27,9 +27,12 @@ use via_adapters::{
     VendorTerminalStatus,
 };
 use via_store::{
-    AcceptanceRecord, EventRecord, SpawnRecord, Store, StoreClient, SubmissionRecord,
-    TerminalRecord,
+    AcceptanceRecord, SpawnRecord, Store, StoreClient, SubmissionRecord, TerminalRecord,
 };
+
+mod journal;
+
+use journal::{TurnJournal, UncertainEvent, Unresolved};
 
 /// One daemon's durable state and opaque vendor runtime.
 pub struct Engine {
@@ -44,6 +47,8 @@ pub struct Engine {
     force: watch::Sender<bool>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
+    /// Receipted turns whose terminal could not be made durable.
+    unresolved: Unresolved,
 }
 
 /// The C1 §3.14 stop mode Core accepted.
@@ -154,6 +159,7 @@ impl Engine {
             stop: StdMutex::new(None),
             force: watch::Sender::new(false),
             forced: StdMutex::new(Vec::new()),
+            unresolved: Unresolved::default(),
         })
     }
 
@@ -276,6 +282,7 @@ impl Engine {
             accepted: None,
             spans: Vec::new(),
             store_failed: false,
+            uncertain: None,
         };
         let outcome = match self.execute(&mut record, connection.clone(), prompt).await {
             Driven::Finished(outcome) => outcome,
@@ -304,14 +311,44 @@ impl Engine {
         self.finish(&started, record, terminal).await
     }
 
-    /// Commits `turn.ended` at the sequence after every event `record` committed,
-    /// with the terminal envelope whose raw spans bound every committed reference.
+    /// Commits the turn's terminal; one that cannot be made durable is recorded so
+    /// that reads report `store_error` instead of a running turn.
     async fn finish(
         &self,
+        started: &Started,
+        record: TurnRecord,
+        terminal: Terminal,
+    ) -> Result<(), ApiError> {
+        Self::finish_turn(&self.store, &self.unresolved, started, record, terminal).await
+    }
+
+    /// `finish` over any journal, so the Store/Core boundary is testable.
+    async fn finish_turn(
+        journal: &impl TurnJournal,
+        unresolved: &Unresolved,
+        started: &Started,
+        record: TurnRecord,
+        terminal: Terminal,
+    ) -> Result<(), ApiError> {
+        let committed = Self::commit_turn_ended(journal, started, record, terminal).await;
+        if committed.is_err() {
+            unresolved.insert(&started.session, started.turn);
+        }
+        committed
+    }
+
+    /// Commits `turn.ended` at the sequence after every event `record` committed,
+    /// with the terminal envelope whose raw spans bound every committed reference.
+    /// An uncertain event commit is settled against the durable head first.
+    async fn commit_turn_ended(
+        journal: &impl TurnJournal,
         started: &Started,
         mut record: TurnRecord,
         terminal: Terminal,
     ) -> Result<(), ApiError> {
+        journal::reconcile(journal, &mut record)
+            .await
+            .map_err(|_| ApiError::STORE)?;
         if let Some(reference) = &terminal.raw_ref {
             RawSpan::include(&mut record.spans, reference);
         }
@@ -353,16 +390,17 @@ impl Engine {
             seq,
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
-        self.store
-            .commit_terminal(TerminalRecord {
+        journal::commit_terminal(
+            journal,
+            TerminalRecord {
                 session_id: started.session.clone(),
                 turn: started.turn,
                 envelope,
                 event,
                 raw_ref,
-            })
-            .await
-            .map_err(|_| ApiError::STORE)
+            },
+        )
+        .await
     }
 
     /// Drives the adapter under the turn deadline, committing each observation it
@@ -436,7 +474,14 @@ impl Engine {
                         RawSpan::include(&mut record.spans, &accepted.raw_ref);
                         record.accepted = Some(accepted);
                     }
-                    Err(_) => record.store_failed = true,
+                    Err(uncertain) => {
+                        record.store_failed = true;
+                        record.uncertain = uncertain.map(|accepted| UncertainEvent {
+                            seq: record.seq + 1,
+                            raw_ref: Some(accepted.raw_ref.clone()),
+                            accepted: Some(accepted),
+                        });
+                    }
                 }
             }
             FakeObservation::Data {
@@ -456,42 +501,7 @@ impl Engine {
         body: EventBody,
         raw_ref: Option<RawRef>,
     ) {
-        if record.store_failed {
-            return;
-        }
-        let seq = record.seq + 1;
-        let at = rfc3339(SystemTime::now());
-        let event = Event {
-            seq,
-            session_id: &record.session,
-            turn: Some(record.turn.get()),
-            late: false,
-            at: &at,
-            raw_ref: raw_ref.as_ref(),
-            body,
-        }
-        .to_value();
-        let committed = match event {
-            Ok(event) => self
-                .store
-                .commit_event(EventRecord {
-                    session_id: record.session.clone(),
-                    turn: record.turn,
-                    event,
-                    raw_ref: raw_ref.clone(),
-                })
-                .await
-                .is_ok(),
-            Err(_) => false,
-        };
-        if !committed {
-            record.store_failed = true;
-            return;
-        }
-        record.seq = seq;
-        if let Some(reference) = &raw_ref {
-            RawSpan::include(&mut record.spans, reference);
-        }
+        journal::commit_event(&self.store, record, body, raw_ref).await;
     }
 
     /// Commits submission intent with `turn.submitted` (seq 2) before any agent I/O.
@@ -536,13 +546,14 @@ impl Engine {
     }
 
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
+    /// A failure carries the acceptance when Store may have committed it.
     async fn accept(
         &self,
         session: &SessionId,
         turn: TurnNumber,
         seq: u64,
         observation: FakeAcceptanceObservation,
-    ) -> Result<Accepted, ApiError> {
+    ) -> Result<Accepted, Option<Accepted>> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
             seq,
@@ -555,9 +566,11 @@ impl Engine {
                 effective: Effective::fake("fake"),
             },
         }
-        .to_value()?;
+        .to_value()
+        .map_err(|_| None)?;
         let vendor_turn_id = observation.vendor_turn_id.as_str().to_owned();
-        self.store
+        let committed = self
+            .store
             .commit_acceptance(AcceptanceRecord {
                 session_id: session.clone(),
                 turn,
@@ -565,13 +578,16 @@ impl Engine {
                 correlation: vendor_turn_id.clone(),
                 event,
             })
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        Ok(Accepted {
+            .await;
+        let accepted = Accepted {
             at,
             raw_ref: observation.raw_ref,
             vendor_turn_id,
-        })
+        };
+        match committed {
+            Ok(()) => Ok(accepted),
+            Err(error) => Err(journal::may_have_committed(&error).then_some(accepted)),
+        }
     }
 
     /// Final shutdown: Host closes live controls, reconciles every anchor and
@@ -649,10 +665,8 @@ impl Engine {
     /// Reads a committed terminal result without waiting.
     pub async fn result(&self, address: &str) -> Result<Value, ApiError> {
         let (session, turn) = parse_address(address)?;
-        self.store
-            .result(&session, turn)
-            .await
-            .map_err(|_| ApiError::STORE)?
+        journal::read_result(&self.store, &self.unresolved, &session, turn)
+            .await?
             .ok_or(ApiError::TURN_NOT_FINISHED)
     }
 
@@ -661,11 +675,8 @@ impl Engine {
         let (session, turn) = parse_address(address)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if let Some(result) = self
-                .store
-                .result(&session, turn)
-                .await
-                .map_err(|_| ApiError::STORE)?
+            if let Some(result) =
+                journal::read_result(&self.store, &self.unresolved, &session, turn).await?
             {
                 return Ok(result);
             }
@@ -786,6 +797,8 @@ struct TurnRecord {
     accepted: Option<Accepted>,
     spans: Vec<RawSpan>,
     store_failed: bool,
+    /// The event commit Store left uncertain, settled before `turn.ended`.
+    uncertain: Option<UncertainEvent>,
 }
 
 /// Maps a normalized observation onto its C1 §6.1 event payload.
