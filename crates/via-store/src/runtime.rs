@@ -383,6 +383,10 @@ enum Command {
         TurnNumber,
         oneshot::Sender<Result<Option<Value>, StoreError>>,
     ),
+    Terminated(
+        Vec<(SessionId, TurnNumber)>,
+        oneshot::Sender<Result<Vec<(SessionId, TurnNumber)>, StoreError>>,
+    ),
     Events(
         SessionId,
         u64,
@@ -600,6 +604,20 @@ impl StoreClient {
     ) -> Result<Option<Value>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Result(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Returns those of at most 1000 `turns` whose terminal envelope has
+    /// committed, in one Store operation.
+    pub async fn terminated(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+        if turns.len() > 1000 {
+            return Err(StoreError::Constraint("at most 1000 turns per query"));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Terminated(turns, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

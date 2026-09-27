@@ -1,7 +1,11 @@
 //! Uncertain commits at the Store/Core boundary, injected by a closed fault
 //! backend over a real Store.
 
-use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Value, json};
 use via_store::{
@@ -9,7 +13,7 @@ use via_store::{
     SubmissionRecord, TerminalRecord,
 };
 
-use super::{TurnJournal, UNRESOLVED_LIMIT, Unresolved, commit_event, read_result};
+use super::{TurnJournal, UNRESOLVED_LIMIT, Unresolved, admission, commit_event, read_result};
 use crate::api::{Event, EventBody, FailureClass};
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
 use crate::{
@@ -37,6 +41,8 @@ struct FaultJournal {
     head_unreadable: bool,
     /// Submission commits report an uncertain outcome and leave nothing durable.
     submission_fails: bool,
+    /// Result reads of every session but `SESSION` stall past the settle bound.
+    delayed_results: bool,
 }
 
 fn injected() -> StoreError {
@@ -78,11 +84,21 @@ impl TurnJournal for FaultJournal {
         self.store.events(session, from_seq, limit).await
     }
 
+    async fn terminated(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+        self.store.terminated(turns).await
+    }
+
     async fn result(
         &self,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<Option<Value>, StoreError> {
+        if self.delayed_results && session.as_str() != SESSION {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
         self.store.result(session, turn).await
     }
 }
@@ -225,6 +241,7 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
         event: EventFault::CommittedThenUncertain,
         head_unreadable: false,
         submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved, &raw_ref)
@@ -263,6 +280,7 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
         event: EventFault::UncertainNotCommitted,
         head_unreadable: false,
         submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved, &raw_ref)
@@ -285,6 +303,7 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
         event: EventFault::CommittedThenUncertain,
         head_unreadable: true,
         submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     let finished = observe_then_finish(&journal, &unresolved, &raw_ref).await;
@@ -386,6 +405,7 @@ async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
         event: EventFault::CommittedThenUncertain,
         head_unreadable: true,
         submission_fails: false,
+        delayed_results: false,
     };
     let mut record = record();
     commit_event(&journal, &mut record, EventBody::CancelRequested {}, None).await;
@@ -422,6 +442,7 @@ async fn a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_stat
         event: EventFault::UncertainNotCommitted,
         head_unreadable: false,
         submission_fails: true,
+        delayed_results: false,
     };
     let submitted = Engine::submit(&journal, &engine.unresolved, &session(), turn()).await;
     assert_eq!(submitted.unwrap_err().kind, "store_error");
@@ -499,9 +520,9 @@ async fn in_flight_turns_count_toward_the_bound() {
     for n in 0..UNRESOLVED_LIMIT {
         engine.unresolved.receipt(&numbered(n), turn());
     }
-    // No turn has failed, yet the set is full: a new receipt is refused.
+    // No turn has failed, yet the set is full: capacity, not a Store failure (C1 §8.1).
     let refused = engine.spawn(spawn_params()).await.unwrap_err();
-    assert_eq!(refused.kind, "store_error");
+    assert_eq!((refused.code, refused.kind), (-32012, "admission_refused"));
     assert_eq!(engine.unresolved.turns().len(), UNRESOLVED_LIMIT);
     engine.unresolved.resolve(&numbered(0), turn());
     // Admitted past the bound; the fake harness is not configured in this test.
@@ -543,4 +564,42 @@ fn unpersisted_error_is_c1_store_error() {
     let error = ApiError::unpersisted(&session(), turn(), TurnState::Running);
     assert_eq!((error.code, error.kind), (-32018, "store_error"));
     assert_eq!(ApiError::STORE.data(), json!({"kind":"store_error"}));
+}
+
+#[tokio::test]
+async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    for n in 1..UNRESOLVED_LIMIT {
+        engine.unresolved.receipt(&numbered(n), turn());
+        engine
+            .unresolved
+            .fail(&numbered(n), turn(), TurnState::Running);
+    }
+    receipt(&engine.store, &session(), true).await;
+    engine.unresolved.receipt(&session(), turn());
+    engine
+        .unresolved
+        .fail(&session(), turn(), TurnState::Running);
+    Engine::commit_turn_ended(&engine.store, &started(), record(), store_failure(), false)
+        .await
+        .unwrap();
+    // Every other failed turn's read stalls past the bound.
+    let journal = FaultJournal {
+        store: engine.store.clone(),
+        event: EventFault::UncertainNotCommitted,
+        head_unreadable: false,
+        submission_fails: false,
+        delayed_results: true,
+    };
+    let started = Instant::now();
+    admission(&journal, &engine.unresolved).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let retained = engine.unresolved.turns();
+    assert_eq!(retained.len(), UNRESOLVED_LIMIT - 1);
+    assert!(!retained.contains(&(session(), turn())));
 }

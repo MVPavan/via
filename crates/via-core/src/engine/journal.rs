@@ -49,6 +49,11 @@ pub(super) trait TurnJournal: Sync {
         from_seq: u64,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<StoredEvent>, StoreError>> + Send;
+    /// Returns those of `turns` whose terminal has committed, in one bounded read.
+    fn terminated(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> impl Future<Output = Result<Vec<(SessionId, TurnNumber)>, StoreError>> + Send;
     /// Reads a committed terminal envelope, if any.
     fn result(
         &self,
@@ -84,6 +89,13 @@ impl TurnJournal for StoreClient {
         limit: u32,
     ) -> Result<Vec<StoredEvent>, StoreError> {
         Self::events(self, session, from_seq, limit).await
+    }
+
+    async fn terminated(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+        Self::terminated(self, turns).await
     }
 
     async fn result(
@@ -187,23 +199,38 @@ impl Unresolved {
     }
 }
 
-/// Whether another receipt fits the bound. When the set is full, failed turns
-/// whose terminals have since become durable are forgotten first, with Store
-/// reads bounded by [`SETTLE_BOUND`]; a read that fails or times out keeps its turn.
-pub(super) async fn admits(journal: &impl TurnJournal, unresolved: &Unresolved) -> bool {
+/// Admits another receipt within the bound. When the set is full, failed turns
+/// whose terminals have since become durable are forgotten first. A set still
+/// full of in-flight turns is C1 `admission_refused`; one that still retains a
+/// failed turn is `store_error`.
+pub(super) async fn admission(
+    journal: &impl TurnJournal,
+    unresolved: &Unresolved,
+) -> Result<(), ApiError> {
     if unresolved.admits() {
-        return true;
+        return Ok(());
     }
-    let settle = async {
-        for (session, turn) in unresolved.failed_turns() {
-            if let Ok(Some(_)) = journal.result(&session, turn).await {
-                unresolved.settle(&session, turn);
-            }
+    settle_failed(journal, unresolved).await;
+    if unresolved.admits() {
+        Ok(())
+    } else if unresolved.failed_turns().is_empty() {
+        Err(ApiError::TURNS_AT_CAPACITY)
+    } else {
+        Err(ApiError::STORE)
+    }
+}
+
+/// Asks Store in one operation which failed turns now have a durable terminal,
+/// so every candidate is inspected however many there are, and forgets those.
+/// The query is bounded by [`SETTLE_BOUND`]; a failed or expired query keeps
+/// every turn.
+async fn settle_failed(journal: &impl TurnJournal, unresolved: &Unresolved) {
+    let query = journal.terminated(unresolved.failed_turns());
+    if let Ok(Ok(terminated)) = tokio::time::timeout(SETTLE_BOUND, query).await {
+        for (session, turn) in terminated {
+            unresolved.settle(&session, turn);
         }
-    };
-    // Safe to ignore: an expired bound only leaves unread turns retained.
-    let _ = tokio::time::timeout(SETTLE_BOUND, settle).await;
-    unresolved.admits()
+    }
 }
 
 /// Commits one non-lifecycle event of the running turn at the next sequence.

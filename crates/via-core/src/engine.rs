@@ -221,9 +221,7 @@ impl Engine {
             return Err(ApiError::DAEMON_STOPPING);
         }
         // Bounds the turns retained for their `store_error` reads.
-        if !journal::admits(&self.store, &self.unresolved).await {
-            return Err(ApiError::STORE);
-        }
+        journal::admission(&self.store, &self.unresolved).await?;
         if params.harness != "fake" || !self.adapter.fake_available() {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }

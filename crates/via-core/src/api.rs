@@ -167,6 +167,13 @@ impl ApiError {
         message: "sessions are active",
         unpersisted: None,
     };
+    /// The daemon already retains its bound of turns without a durable terminal.
+    pub const TURNS_AT_CAPACITY: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "too many unresolved turns",
+        unpersisted: None,
+    };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
         code: -32018,

@@ -143,6 +143,10 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 let _ = reply.send(read_result(&conn, &session, turn));
                 false
             }
+            Command::Terminated(turns, reply) => {
+                let _ = reply.send(read_terminated(&conn, turns));
+                false
+            }
             Command::Events(session, from, limit, reply) => {
                 let _ = reply.send(read_events(&conn, &session, from, limit));
                 false
@@ -488,6 +492,27 @@ fn read_result(
         .flatten();
     raw.map(|value| serde_json::from_str(&value).map_err(|_| StoreError::CorruptEvidence))
         .transpose()
+}
+
+fn read_terminated(
+    conn: &Connection,
+    turns: Vec<(SessionId, TurnNumber)>,
+) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT 1 FROM turns WHERE session_id=?1 AND number=?2 AND envelope IS NOT NULL",
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let mut terminated = Vec::new();
+    for (session, turn) in turns {
+        let found = statement
+            .exists(params![session.as_str(), turn.get()])
+            .map_err(|error| StoreError::Write(error.to_string()))?;
+        if found {
+            terminated.push((session, turn));
+        }
+    }
+    Ok(terminated)
 }
 
 fn read_events(
