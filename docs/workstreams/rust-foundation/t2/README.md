@@ -9,6 +9,8 @@ Review loop: `../cloud-and-local.md` §6.
 |---|---|---|---|
 | T2-A | `test-failpoints` controller; F8, F10 | Opus 5.5 high | `a.md` |
 | T2-B | Multi-turn sessions, `resume`, per-session queue, retries; F13, F14, F17, F28; `wait.timeout_ms`; harness gaps | Opus 5.5 medium | `b.md` |
+| T2-B2 | Per-session dispatcher redesign replacing T2-B's drives; Store-failed latch (runtime §7) | Opus 5.5 high | `b2.md`, `dispatch-design.md` |
+| T2-C | Restart handoff of surviving queued turns; keyed replay after restart | Opus 5.5 high (T2-B2 session) | `c.md` |
 
 Shared files: `via-core/src/engine/drive.rs` and Store's spawn/submission
 commit path. T2-A's hunks there are failpoint call sites only; T2-B owns

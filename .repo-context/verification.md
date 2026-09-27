@@ -48,6 +48,10 @@ cargo build --locked --release -p via-cli --no-default-features
 python3 scripts/check-release-features.py target/release/via
 ```
 
+The `s1_(f2[4567]|raw|bounds|store)_` selection is Task 4's scenario set
+(`via-jm4.7.8`). Until those scenarios exist it exits 4 with "no tests to
+run"; that is expected and is not a pass.
+
 `test-failpoints` is default-off and test-only; its feature wiring, code and
 environment parsing must be absent from the release feature graph.
 `scripts/check-release-features.py` inspects that graph, launches release VIA
