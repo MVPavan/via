@@ -38,7 +38,8 @@ The T2-B features stay as they are:
 - receipts;
 - `op_key` and `idempotency_key` replay;
 - `queue_full` and `admission_refused`;
-- cancellation behind an `unknown` or `cleanup: pending` predecessor;
+- cancellation behind an `unknown` predecessor (a `cleanup: pending` one
+  waits, T2-C);
 - the shared event head;
 - the `Unresolved` bookkeeping.
 
@@ -119,8 +120,13 @@ Each decision reads Store at most once for the queue head:
 4. `predecessors(session, head)` (one read) gives `Run`, `Cancel` or `Wait`
    by T2-B round 3's rule (C1 §7.3, P6):
    - any unresolved earlier turn means `Wait`;
-   - a latest submitted earlier turn that is durably `unknown` or has
-     `cleanup: pending` means `Cancel`;
+   - a latest submitted earlier turn with `cleanup: pending` means `Wait`.
+     C1 §7.3 dispatches only after the predecessor's cleanup is settled:
+     `quiescent`, `uncertain` under P7, or not applicable. Under P7 a
+     pending-cleanup turn is nonterminal, so the unresolved check already
+     waits; this rule covers a terminal envelope that still says `pending`;
+   - a latest submitted earlier turn that is durably `unknown` means
+     `Cancel` (P6: behind `unknown` the queue is cancelled);
    - anything else means `Run`.
 
    Turns cancelled while queued are passed over. A failed read means
@@ -344,9 +350,13 @@ Engine owns one bounded channel of session starts (capacity
 receiver once. It replaces T2-B's per-turn handoff channel and its adoption
 channel. A start is requested only on a slot's `None → Starting` transition.
 
-A start that finds the channel full goes into a bounded **pending-start
-set**. It holds at most one entry per `Starting` slot, each with at least
-one counted queued turn, so at most 128. The set is kept in Engine, where
+A start that finds the channel full goes into the **pending-start set**. It
+holds at most one entry per `Starting` slot, and each such slot has at least
+one counted queued turn. In operation that is at most 128. The set itself
+has no 128 ceiling: after a restart the handoff (§10) gives one pending start
+per recovered `Starting` session, even when the durable queued work exceeds
+128 queued or 256 unresolved turns. The 128-capacity channel drains those
+starts once daemon main begins serving. The set is kept in Engine, where
 the send fails, and daemon main owns its retry:
 
 - **In operation:** after every start it receives, which is exactly when
@@ -398,7 +408,7 @@ turn left by an earlier daemon is unresolved without an owner.
 | Resource | Bound |
 |---|---|
 | Tasks | 1 dispatcher per session with queued or owned work (at most 256, the unresolved-turn bound); none per waiting turn |
-| Memory | one `TurnNumber` per queued turn (at most 8 per session, 128 daemon-wide); pending starts at most 128; slots retired when their dispatcher exits unleased |
+| Memory | one `TurnNumber` per queued turn (at most 8 per session, 128 daemon-wide in operation; after a restart, all surviving queued turns, §10); pending starts: one per `Starting` session; slots retired when their dispatcher exits unleased |
 | Store reads per dispatcher wake | 1 (`predecessors` of the head). Submission adds 1 read and 1 commit; a cancellation adds 1 read and 1 commit |
 | Periodic reads | only after a failed read or while waiting on an unowned predecessor: at most 1 per 250 ms–5 s per dispatcher in that state; none while waiting on a wake |
 | Writes after a failed write | none from dispatch; final shutdown makes one best-effort terminal commit per forced turn |
@@ -407,7 +417,7 @@ turn left by an earlier daemon is unresolved without an owner.
 
 | Contract | Design |
 |---|---|
-| C1 §7.3: one FIFO, capacity 8, one running, gate on predecessor terminal and settled cleanup | §2.2 on the queue head; `unknown` or `cleanup: pending` cancels; only unsubmitted turns dispatch |
+| C1 §7.3: one FIFO, capacity 8, one running, gate on predecessor terminal and settled cleanup | §2.2 on the queue head; `cleanup: pending` waits; `unknown` cancels; only unsubmitted turns dispatch |
 | C1 §7.2 `queued → cancelled` | §2.2 step 5; §2.3 under force |
 | C1 §3.14 idle, drain and force; `session.closed` with `daemon_stop_force` | §2.3, §4, §6 |
 | C1 §8.1 and runtime §7: an unknown receipt outcome | §3: `store_error` with `commit_outcome`, the latch, exit 4; restart recovery settles it |
@@ -459,12 +469,14 @@ the handoff completes.
    `predecessors(session, turn)` read settles it:
    - **Cancel:** no earlier turn is unresolved, and the latest submitted
      earlier turn is durably `unknown` (including one recovery just
-     settled) or has `cleanup: pending`. The turn is committed
+     settled) with settled cleanup. The turn is committed
      `queued → cancelled` (C1 §7.2, P6). A cancelled turn's successor
      reads the same latest submitted predecessor, so the whole queue
      behind it is cancelled.
-   - **Enqueue:** otherwise, meaning an earlier turn is still queued (and
-     was enqueued just before this one) or the predecessor settled cleanly.
+   - **Enqueue:** otherwise. That covers an earlier turn still queued
+     (enqueued just before this one), a predecessor that settled cleanly,
+     and a predecessor with `cleanup: pending`, which §2.2 makes `Wait`,
+     never `Cancel`.
      The turn is registered as a receipted turn would be: counted in
      `queued`, `active` and `Unresolved`, enqueued in its session's slot,
      and its dispatcher start is requested through the start channel (§5).
@@ -481,11 +493,21 @@ the handoff completes.
 4. **Over the daemon-wide bound.** The surviving queued turns are all
    counted, even beyond 128 queued (or 256 unresolved); none is dropped or
    refused. Each session holds at most 8, as Store enforced when they were
-   receipted. Admission refuses new turns (`admission_refused`, "too many
-   queued turns" or "too many unresolved turns") until the count falls
-   back under the bound as turns are dispatched. Starts beyond the
-   channel's capacity wait in the pending set (§5).
-5. **Keyed and unkeyed receipts.** A receipt whose commit outcome was
+   receipted. New receipts are refused (`admission_refused`, "too many
+   queued turns" or "too many unresolved turns") until the counts fall
+   back under the limits as turns are dispatched. The pending-start set has
+   no 128 ceiling (§5): there is one pending start per recovered `Starting`
+   session, and the 128-capacity channel drains them after daemon main
+   begins serving.
+5. **Startup cost.** Before admission the handoff makes:
+
+   - one page read per 256 queued turns;
+   - one predecessor read per queued turn;
+   - one cancellation commit per cancelled turn.
+
+   None of this has a fixed wall-time bound. That is consistent with
+   recovery, which also runs before admission.
+6. **Keyed and unkeyed receipts.** A receipt whose commit outcome was
    unknown (§3) is a durable queued row, if it committed. The handoff
    enqueues it like any other queued turn, so it runs exactly once. A keyed
    retry after the restart replays the stored receipt and enqueues nothing

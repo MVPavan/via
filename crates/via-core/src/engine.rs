@@ -39,6 +39,7 @@ mod tests;
 
 use journal::{Head, UncertainEvent, Unresolved};
 use queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
+pub use recovery::Handoff;
 pub use stop::{EngineShutdown, StopMode};
 
 /// A committed receipt and, when this request created or adopted the turn,

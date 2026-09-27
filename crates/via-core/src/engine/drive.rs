@@ -51,7 +51,7 @@ enum Decision {
 }
 
 /// How a queued turn's cancellation ended.
-enum Cancelled {
+pub(super) enum Cancelled {
     /// Durably cancelled; the turn left the queue.
     Committed,
     /// A read failed before the commit: nothing was written.
@@ -169,6 +169,15 @@ impl Engine {
             self.faults.grant_paused.notify_one();
             self.faults.grant_release.notified().await;
         }
+        // The queue head is decided `Run` and not yet granted: a crash here
+        // leaves it durably `queued` for the restart handoff (design §10).
+        #[cfg(feature = "test-failpoints")]
+        if via_store::failpoint::hit_async("core.dispatch.before_grant")
+            .await
+            .is_err()
+        {
+            return Step::Wait;
+        }
         if !self.grant() {
             return Step::Next;
         }
@@ -247,9 +256,10 @@ impl Engine {
     /// C1 P6/§7.3 from durable state. While any earlier turn is unresolved
     /// (queued, including an orphan awaiting reconciliation, or running, or
     /// with no durable terminal) the turn waits; so does it when Store cannot
-    /// answer. Otherwise the latest submitted earlier turn decides: durably
-    /// `unknown` or cleanup `pending` cancels, anything else runs. Turns
-    /// cancelled while queued never ran and are passed over.
+    /// answer. Otherwise the latest submitted earlier turn decides: cleanup
+    /// `pending` waits (C1 §7.3 dispatches only after cleanup settles), durably
+    /// `unknown` cancels (P6), anything else runs. Turns cancelled while
+    /// queued never ran and are passed over.
     async fn decide(&self, session: &SessionId, turn: TurnNumber) -> Decision {
         let Ok(predecessors) = self.predecessors(session, turn).await else {
             return Decision::Wait;
@@ -258,11 +268,10 @@ impl Engine {
             return Decision::Wait;
         }
         match predecessors.last_submitted {
-            Some(envelope)
-                if envelope["state"] == "unknown" || envelope["cancel"]["cleanup"] == "pending" =>
-            {
-                Decision::Cancel
-            }
+            // C1 §7.3: dispatch needs settled cleanup; pending cleanup waits.
+            Some(envelope) if envelope["cancel"]["cleanup"] == "pending" => Decision::Wait,
+            // P6: behind an `unknown` predecessor the queue is cancelled.
+            Some(envelope) if envelope["state"] == "unknown" => Decision::Cancel,
             _ => Decision::Run,
         }
     }
@@ -401,7 +410,7 @@ impl Engine {
     /// `closing` (the last queued turn under force), `admission` is held from
     /// the latch and close check through the commit, and `session.closed`
     /// rides on it when no other turn of the session is unresolved.
-    async fn cancel_queued(
+    pub(super) async fn cancel_queued(
         &self,
         slot: &Slot,
         session: &SessionId,

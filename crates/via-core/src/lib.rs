@@ -78,7 +78,7 @@ pub enum C1TurnState {
 mod api;
 mod engine;
 
-pub use engine::{Engine, EngineShutdown, Receipted, StopMode};
+pub use engine::{Engine, EngineShutdown, Handoff, Receipted, StopMode};
 
 /// Hidden executable entrypoint forwarded through the architecture layers.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

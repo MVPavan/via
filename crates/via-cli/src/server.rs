@@ -196,6 +196,19 @@ async fn open_engine(paths: &super::client::Paths) -> anyhow::Result<Arc<Engine>
     if recovered > 0 {
         tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
     }
+    // Design §10: every surviving queued turn is cancelled or enqueued
+    // before admission; a Store failure here fails startup.
+    let handoff = engine
+        .hand_off_queued()
+        .await
+        .map_err(|error| anyhow::anyhow!("restart handoff failed: {error}"))?;
+    if handoff.enqueued + handoff.cancelled > 0 {
+        tracing::warn!(
+            enqueued = handoff.enqueued,
+            cancelled = handoff.cancelled,
+            "handed off queued turns left by an earlier daemon"
+        );
+    }
     Ok(engine)
 }
 

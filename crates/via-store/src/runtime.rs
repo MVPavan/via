@@ -545,6 +545,11 @@ enum Command {
         u32,
         oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
     ),
+    QueuedTurns(
+        Option<(SessionId, TurnNumber)>,
+        u32,
+        oneshot::Sender<Result<Vec<(SessionId, TurnNumber)>, StoreError>>,
+    ),
     Authenticate(
         SessionId,
         [u8; 32],
@@ -902,6 +907,21 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::AnchorOwners(after, limit, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads one page of up to `limit` (1 to 256) durable `queued` turns in
+    /// `(session, turn)` order after `after`, for the restart handoff.
+    pub async fn queued_turns_page(
+        &self,
+        after: Option<(SessionId, TurnNumber)>,
+        limit: u32,
+    ) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreError::Constraint("queued page limit must be 1 to 256"));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::QueuedTurns(after, limit, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

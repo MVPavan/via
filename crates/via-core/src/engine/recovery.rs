@@ -11,6 +11,9 @@ use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, TerminalRecord, UnfinishedTurn};
 
+use std::sync::atomic::Ordering;
+
+use super::drive::Cancelled;
 use super::journal::Head;
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
@@ -20,6 +23,17 @@ use crate::{ApiError, Cleanup, Deadline, RawRef, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
 const PAGE: u32 = 1000;
+/// Queued turns read per page by the restart handoff (Store's page bound).
+const HANDOFF_PAGE: u32 = 256;
+
+/// What the restart handoff did with the queued turns it found.
+#[derive(Debug, Default)]
+pub struct Handoff {
+    /// Enqueued with their session's dispatcher.
+    pub enqueued: usize,
+    /// Committed `queued → cancelled` behind an `unknown` predecessor.
+    pub cancelled: usize,
+}
 /// Startup budget for Host's anchor reconciliation (its native stop is 3 s).
 const HOST_RECOVERY: Duration = Duration::from_secs(5);
 
@@ -48,6 +62,67 @@ impl Engine {
                     .await
                     .map_err(|error| format!("store_error: {}", error.kind))?;
                 recovered += 1;
+            }
+        }
+    }
+
+    /// The restart handoff (design §10), after `recover` and before
+    /// admission. Every durable `queued` turn is read in bounded pages, in
+    /// `(session, turn)` order. Behind a durably `unknown` latest submitted
+    /// predecessor whose cleanup is settled, with nothing unresolved in
+    /// between, the turn is committed `queued → cancelled`
+    /// (C1 §7.2, P6). Every other turn is registered like a receipt (counted
+    /// queued, active and unresolved, even past the daemon-wide bound) and
+    /// enqueued, with its dispatcher start requested. Nothing is resent. Any
+    /// Store failure fails startup: the daemon never admits on a partial
+    /// handoff.
+    pub async fn hand_off_queued(&self) -> Result<Handoff, String> {
+        let mut handoff = Handoff::default();
+        let mut after = None;
+        loop {
+            let page = self
+                .store
+                .queued_turns_page(after.clone(), HANDOFF_PAGE)
+                .await
+                .map_err(|error| format!("store_error: {error}"))?;
+            let full = page.len() == HANDOFF_PAGE as usize;
+            after = page.last().cloned();
+            for (session, turn) in page {
+                let predecessors = self
+                    .store
+                    .predecessors(&session, turn)
+                    .await
+                    .map_err(|error| format!("store_error: {error}"))?;
+                // The dispatcher's rule (§2.2): only behind an `unknown`
+                // predecessor with settled cleanup; pending cleanup waits.
+                let cancel = !predecessors.unresolved
+                    && predecessors.last_submitted.is_some_and(|envelope| {
+                        envelope["state"] == "unknown" && envelope["cancel"]["cleanup"] != "pending"
+                    });
+                let slot = self.slot_for(&session);
+                self.unresolved.receipt(&session, turn);
+                self.active.fetch_add(1, Ordering::AcqRel);
+                self.queued.fetch_add(1, Ordering::AcqRel);
+                if cancel {
+                    if !matches!(
+                        self.cancel_queued(&slot, &session, turn, false).await,
+                        Cancelled::Committed
+                    ) {
+                        return Err(format!(
+                            "store_error: queued turn {session}/{} could not be cancelled",
+                            turn.get()
+                        ));
+                    }
+                    handoff.cancelled += 1;
+                } else {
+                    if slot.enqueue(turn) {
+                        self.request_start(session.clone());
+                    }
+                    handoff.enqueued += 1;
+                }
+            }
+            if !full {
+                return Ok(handoff);
             }
         }
     }

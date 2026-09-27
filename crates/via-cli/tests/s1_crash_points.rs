@@ -4,7 +4,8 @@
 //!
 //! F8: a crash inside `spawn`'s write leaves session, turn 1, handle hash and
 //! queued event together or not at all, and a lost reply leaves one whole
-//! session that is never dispatched. F10: a crash after submission intent,
+//! session, whose turn the restarted daemon hands off and runs exactly once
+//! (T2-C). F10: a crash after submission intent,
 //! after the prompt reached the agent or before acceptance was recorded
 //! restarts as `unknown` and is never sent again; the submission record
 //! precedes any agent I/O.
@@ -689,13 +690,13 @@ fn s1_f08_crash_inside_spawn_write_leaves_nothing() -> TestResult {
 
 /// F8: a crash right after `spawn`'s commit, before any reply, leaves session,
 /// turn 1, handle hash and the queued event all durable together; after
-/// restart the handle authenticates and the unacknowledged turn is never
-/// dispatched.
+/// restart the handle authenticates, and the unacknowledged turn is handed off
+/// (T2-C, design §10) and runs exactly once.
 #[test]
 fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
     scenario(
         "s1_f08_crash_after_spawn_commit",
-        &reply_steps("after"),
+        &f08_and_after(),
         |paths, evidence| {
             let point = "store.spawn.after_commit";
             arm(paths, point, "crash")?;
@@ -709,9 +710,10 @@ fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
             })?;
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
-            let _daemon = Daemon::start(paths, evidence, "final")?;
+            // Durable state as the crash left it, before any restart.
             check_whole_queued_session(paths)?;
             let session = paths.only_session()?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
             let steer = |name: &str, handle: &str| {
                 let mut command = paths.command();
                 command
@@ -729,13 +731,33 @@ fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
                     && wrong.as_deref() == Some("invalid_handle"),
                 || format!("handle hash not committed with the session: {right:?} {wrong:?}"),
             )?;
-            completes_normally(paths, evidence)?;
-            let turn = paths.turn(&session)?;
-            check(
-                turn.state == "queued" && turn.submitted_at.is_none(),
-                || format!("unacknowledged turn was dispatched: {}", turn.state),
-            )
+            runs_once_after_restart(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
         },
+    )
+}
+
+/// Fake scripts for the scenario's `f08` turn and the later `after` turn.
+fn f08_and_after() -> Value {
+    json!({"scripts":[t2c_script(1, "f08", None), t2c_script(1, "after", None)]})
+}
+
+/// T2-C (design §10): a committed turn whose receipt was never acknowledged
+/// is handed off by the restarted daemon and runs exactly once.
+fn runs_once_after_restart(
+    paths: &Paths,
+    evidence: &Evidence,
+    session: &str,
+) -> Result<(), ScenarioError> {
+    let envelope = t2c_wait(paths, evidence, &format!("{session}/1"))?;
+    let types = paths.event_types(session)?;
+    let submissions = types
+        .iter()
+        .filter(|kind| *kind == "turn.submitted")
+        .count();
+    check(
+        envelope["state"] == "completed" && submissions == 1 && paths.anchors_for(session)? == 1,
+        || format!("the handed-off turn did not run exactly once: {envelope} {types:?}"),
     )
 }
 
@@ -773,13 +795,14 @@ fn check_whole_queued_session(paths: &Paths) -> Result<(), ScenarioError> {
 /// The caller gets `store_error` with `commit_outcome: unknown` and
 /// `retry: same_key_only`, never a receipt; one whole session exists. The
 /// uncertain commit latches Store failure (runtime §7): the daemon shuts
-/// itself down in force mode and exits 4, and the unacknowledged turn is never
-/// dispatched, by it or by the restarted daemon.
+/// itself down in force mode and exits 4 without dispatching the
+/// unacknowledged turn. The restarted daemon hands it off (T2-C, design §10)
+/// and it runs exactly once.
 #[test]
 fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult {
     scenario(
         "s1_f08_lost_spawn_reply",
-        &reply_steps("after"),
+        &f08_and_after(),
         |paths, evidence| {
             let point = "store.commit.reply_lost";
             arm(paths, point, "fail_io")?;
@@ -806,12 +829,8 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
             let _daemon = Daemon::start(paths, evidence, "final")?;
-            completes_normally(paths, evidence)?;
-            let turn = paths.turn(&session)?;
-            check(
-                turn.state == "queued" && paths.anchors_for(&session)? == 0,
-                || format!("unacknowledged turn was dispatched: {}", turn.state),
-            )
+            runs_once_after_restart(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
         },
     )
 }
@@ -1789,6 +1808,271 @@ fn s1_f10_lost_recovery_terminal_reply_fails_startup_then_admits() -> TestResult
             let _daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
             completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// One turn's fake script: acceptance, an optional gate, then completion.
+fn t2c_script(turn: u32, prompt: &str, gate: Option<&str>) -> Value {
+    let vendor = format!("fake-turn-{turn}");
+    let mut steps =
+        vec![json!({"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":vendor}})];
+    if let Some(name) = gate {
+        steps.push(json!({"action":"gate","name":name}));
+    }
+    steps.push(json!({"action":"emit","message":{"type":"terminal","vendor_turn_id":vendor,"status":"completed","final_text":"done","stop_reason":"end_turn"}}));
+    json!({"expected_request":{"type":"start","id":1,"turn":turn,"prompt":prompt},"steps":steps})
+}
+
+/// A session's turn `n`: state and envelope.
+fn turn_n(paths: &Paths, session: &str, n: u32) -> Result<(String, Value), ScenarioError> {
+    let (state, envelope): (String, Option<String>) = paths
+        .store()?
+        .query_row(
+            "SELECT state,envelope FROM turns WHERE session_id=?1 AND number=?2",
+            rusqlite::params![session, n],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(infra)?;
+    let envelope = serde_json::from_str(envelope.as_deref().unwrap_or("null")).map_err(infra)?;
+    Ok((state, envelope))
+}
+
+/// Committed anchors (launch attempts) of a session's turn `n`.
+fn anchors_of_turn(paths: &Paths, session: &str, n: u32) -> Result<i64, ScenarioError> {
+    paths
+        .store()?
+        .query_row(
+            "SELECT count(*) FROM anchors WHERE owner_session=?1 AND owner_turn=?2",
+            rusqlite::params![session, n],
+            |row| row.get(0),
+        )
+        .map_err(infra)
+}
+
+/// `via spawn` with an explicit handle, and optionally an idempotency key.
+fn t2c_spawn(
+    paths: &Paths,
+    evidence: &Evidence,
+    name: &str,
+    prompt: &str,
+    key: Option<&str>,
+) -> Result<Captured, ScenarioError> {
+    let mut args = spawn_args(prompt).to_vec();
+    args.extend(["--handle", HANDLE]);
+    if let Some(key) = key {
+        args.extend(["--idempotency-key", key]);
+    }
+    paths.run(evidence, name, &args)
+}
+
+/// `via resume` with the scenario handle.
+fn t2c_resume(
+    paths: &Paths,
+    evidence: &Evidence,
+    name: &str,
+    session: &str,
+    prompt: &str,
+) -> Result<Captured, ScenarioError> {
+    paths.run(
+        evidence,
+        name,
+        &[
+            "resume", session, "--prompt", prompt, "--handle", HANDLE, "--json",
+        ],
+    )
+}
+
+/// Waits for a turn's durable envelope through `via wait`.
+fn t2c_wait(paths: &Paths, evidence: &Evidence, address: &str) -> Result<Value, ScenarioError> {
+    let name = format!("wait-{}", address.replace('/', "-"));
+    let wait = paths.run(evidence, &name, &["wait", address, "--json"])?;
+    json_line(&wait.stdout)
+}
+
+/// T2-C 1 (design §10): a crash with turn 1 running and turn 2 queued behind
+/// it. On restart turn 1 is `unknown` with `daemon_restart`, and the handoff
+/// cancels turn 2 before admission (C1 §7.5, P6). Neither is launched again.
+/// On `rust-foundation` before T2-C, turn 2 stayed `queued` with no owner.
+#[test]
+fn s1_t2c_crash_with_a_queued_successor_cancels_it_on_restart() -> TestResult {
+    scenario(
+        "s1_t2c_queued_successor_cancelled",
+        &json!({"scripts":[t2c_script(1, "c1", Some("hold")), t2c_script(2, "c2", None)]}),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = t2c_spawn(paths, evidence, "spawn", "c1", None)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            wait_file(&paths.sync.join("hold.entered"))?;
+            let resume = t2c_resume(paths, evidence, "resume", &session, "c2")?;
+            check(resume.status.success(), || "resume refused".to_owned())?;
+            daemon.kill()?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let (state, first) = turn_n(paths, &session, 1)?;
+            check(
+                state == "unknown" && first["failure"]["class"] == "daemon_restart",
+                || format!("turn 1: {state} {first}"),
+            )?;
+            let (state, second) = turn_n(paths, &session, 2)?;
+            check(
+                state == "cancelled"
+                    && second["state"] == "cancelled"
+                    && second["timestamps"]["submitted_at"].is_null(),
+                || format!("turn 2 was not cancelled before admission: {state} {second}"),
+            )?;
+            check(
+                anchors_of_turn(paths, &session, 1)? == 1
+                    && anchors_of_turn(paths, &session, 2)? == 0,
+                || "a turn launched after the restart".to_owned(),
+            )?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// T2-C 2 (design §10): turn 1's terminal committed, and the daemon crashed
+/// while turn 2 was decided `Run` but not yet granted
+/// (`core.dispatch.before_grant`), leaving it durably `queued`. On restart
+/// the handoff enqueues turn 2, which is dispatched and completes. On
+/// `rust-foundation` before T2-C, turn 2 stayed `queued` forever.
+#[test]
+fn s1_t2c_queued_successor_after_a_committed_terminal_runs_on_restart() -> TestResult {
+    scenario(
+        "s1_t2c_queued_successor_runs",
+        &json!({"scripts":[t2c_script(1, "r1", Some("hold")), t2c_script(2, "r2", None)]}),
+        |paths, evidence| {
+            let point = "core.dispatch.before_grant";
+            paths.failpoints.arm(point, 2, "pause").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = t2c_spawn(paths, evidence, "spawn", "r1", None)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            wait_file(&paths.sync.join("hold.entered"))?;
+            let resume = t2c_resume(paths, evidence, "resume", &session, "r2")?;
+            check(resume.status.success(), || "resume refused".to_owned())?;
+            fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
+            paths
+                .failpoints
+                .wait_ack(point, 2, "pause", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            let (first, _) = turn_n(paths, &session, 1)?;
+            let (second, _) = turn_n(paths, &session, 2)?;
+            check(first == "completed" && second == "queued", || {
+                format!("before the crash: turn 1 {first}, turn 2 {second}")
+            })?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{session}/2"))?;
+            check(envelope["state"] == "completed", || {
+                format!("turn 2 after restart: {envelope}")
+            })?;
+            check(anchors_of_turn(paths, &session, 2)? == 1, || {
+                "turn 2 did not launch exactly once".to_owned()
+            })
+        },
+    )
+}
+
+/// T2-C 3 (design §10): a keyed spawn's receipt reply is lost. The caller gets
+/// `store_error` with `commit_outcome: unknown` and `retry: same_key_only`,
+/// and the daemon exits 4. After a restart the same keyed request returns
+/// the same session and turn, and the turn runs exactly once. On
+/// `rust-foundation` before T2-C the replay succeeded but the turn never ran.
+#[test]
+fn s1_t2c_keyed_receipt_replay_after_restart_runs_once() -> TestResult {
+    scenario(
+        "s1_t2c_keyed_replay_after_restart",
+        &json!({"scripts":[t2c_script(1, "k1", None)]}),
+        |paths, evidence| {
+            let point = "store.commit.reply_lost";
+            arm(paths, point, "fail_io")?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let lost = t2c_spawn(paths, evidence, "spawn-lost", "k1", Some("key-1"))?;
+            let error: Value = serde_json::from_slice(&lost.stderr).unwrap_or_default();
+            check(
+                !lost.status.success()
+                    && error["data"]
+                        == json!({"kind":"store_error","commit_outcome":"unknown","retry":"same_key_only"}),
+                || format!("lost receipt: {error}"),
+            )?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let session = paths.only_session()?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let replay = t2c_spawn(paths, evidence, "spawn-replay", "k1", Some("key-1"))?;
+            let receipt = json_line(&replay.stdout)?;
+            check(
+                receipt["session_id"] == session.as_str()
+                    && receipt["turn"] == format!("{session}/1"),
+                || format!("replay returned {receipt}"),
+            )?;
+            let envelope = t2c_wait(paths, evidence, &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("the replayed turn: {envelope}")
+            })?;
+            let again = t2c_spawn(paths, evidence, "spawn-replay-2", "k1", Some("key-1"))?;
+            check(json_line(&again.stdout)? == receipt, || {
+                "a second replay differs".to_owned()
+            })?;
+            check(
+                paths.anchors_for(&session)? == 1 && paths.counts()?[1] == 1,
+                || "the keyed turn did not run exactly once".to_owned(),
+            )
+        },
+    )
+}
+
+/// T2-C 4 (design §10): an unkeyed resume's receipt reply is lost (the fifth
+/// Core lifecycle commit, after turn 1's receipt, submission, acceptance
+/// and terminal); the daemon exits 4. After a restart the committed queued
+/// turn 2 runs exactly once. On `rust-foundation` before T2-C it stayed
+/// `queued`.
+#[test]
+fn s1_t2c_unkeyed_lost_resume_receipt_runs_once_after_restart() -> TestResult {
+    scenario(
+        "s1_t2c_unkeyed_lost_resume",
+        &json!({"scripts":[t2c_script(1, "u1", None), t2c_script(2, "u2", None)]}),
+        |paths, evidence| {
+            let point = "store.commit.reply_lost";
+            paths.failpoints.arm(point, 5, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let spawn = t2c_spawn(paths, evidence, "spawn", "u1", None)?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            let first = t2c_wait(paths, evidence, &format!("{session}/1"))?;
+            check(first["state"] == "completed", || format!("turn 1: {first}"))?;
+            let lost = t2c_resume(paths, evidence, "resume-lost", &session, "u2")?;
+            let error: Value = serde_json::from_slice(&lost.stderr).unwrap_or_default();
+            check(
+                !lost.status.success() && error["data"]["commit_outcome"] == "unknown",
+                || format!("lost resume receipt: {error}"),
+            )?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            let (state, _) = turn_n(paths, &session, 2)?;
+            check(state == "queued", || {
+                format!("turn 2 before restart: {state}")
+            })?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let second = t2c_wait(paths, evidence, &format!("{session}/2"))?;
+            check(second["state"] == "completed", || {
+                format!("turn 2: {second}")
+            })?;
+            check(anchors_of_turn(paths, &session, 2)? == 1, || {
+                "turn 2 did not launch exactly once".to_owned()
+            })
         },
     )
 }

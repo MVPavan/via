@@ -338,26 +338,54 @@ fn a_turn_behind_a_settled_terminal_runs_however_its_drive_ended() {
     });
 }
 
-/// C1 §7.3: while the predecessor is durably `unknown`, or its cleanup is
-/// pending, each successor is cancelled without submission.
+/// C1 P6: while the predecessor is durably `unknown`, each successor is
+/// cancelled without submission.
 #[test]
-fn successors_are_cancelled_behind_an_unknown_or_cleanup_pending_predecessor() {
-    let Some(root) =
-        child("successors_are_cancelled_behind_an_unknown_or_cleanup_pending_predecessor")
-    else {
+fn successors_are_cancelled_behind_an_unknown_predecessor() {
+    let Some(root) = child("successors_are_cancelled_behind_an_unknown_predecessor") else {
         return;
     };
     run(async {
         let engine = open(&root);
-        for state in [Some("unknown"), Some("pending")] {
-            let session = new_session(&engine).await;
-            resume(&engine, &session, None).await;
-            end_turn_one(&engine, &session, state).await;
-            assert!(!submitted(&engine, &session, 2).await, "{state:?}");
-            resume(&engine, &session, None).await;
-            assert!(!submitted(&engine, &session, 3).await, "{state:?}");
-        }
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        end_turn_one(&engine, &session, Some("unknown")).await;
+        assert!(!submitted(&engine, &session, 2).await);
+        resume(&engine, &session, None).await;
+        assert!(!submitted(&engine, &session, 3).await);
         assert_eq!(engine.active(), 0);
+    });
+}
+
+/// C1 §7.3 (T2-C review decision 1): a predecessor whose cleanup is still
+/// `pending` gives Wait, not Cancel: the successor stays queued, neither
+/// submitted nor cancelled. Store can hold such an envelope only as this
+/// synthetic terminal row (under P7 a pending-cleanup turn is nonterminal
+/// and the unresolved check already waits), so the decision is tested here.
+/// T2-B cancelled the successor.
+#[test]
+fn a_successor_waits_behind_a_cleanup_pending_predecessor() {
+    let Some(root) = child("a_successor_waits_behind_a_cleanup_pending_predecessor") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        end_turn_one(&engine, &session, Some("pending")).await;
+        let waited =
+            tokio::time::timeout(Duration::from_secs(1), engine.dispatcher(session.clone())).await;
+        assert!(waited.is_err(), "the dispatcher keeps waiting");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.queued", "turn.submitted", "turn.ended"],
+            "turn 2 is neither submitted nor cancelled"
+        );
+        let pending = engine
+            .result(&format!("{}/2", session.as_str()))
+            .await
+            .unwrap_err();
+        assert_eq!(pending.kind, "turn_not_finished");
     });
 }
 
