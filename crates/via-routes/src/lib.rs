@@ -476,8 +476,9 @@ mod runtime;
 
 pub use runtime::{FakeRoute, FakeRouteResult};
 pub use via_wire::{
-    ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
-    SessionId, WireCleanup, WireError, WireRecovery, WireShutdown, WireTurnRecovery,
+    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
+    RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
+    WireTurnRecovery,
 };
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.

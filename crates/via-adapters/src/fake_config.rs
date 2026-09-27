@@ -75,6 +75,7 @@ impl FakeConfig {
             cwd: self.cwd.clone(),
             env,
             owner,
+            capacity: None,
         })
     }
 }

@@ -95,6 +95,7 @@ impl Fixture {
                 session_id: SessionId::try_from("s_0123456789ab").unwrap(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },
+            capacity: None,
         }
     }
 }

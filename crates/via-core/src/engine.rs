@@ -38,7 +38,7 @@ mod terminal;
 mod tests;
 
 use journal::{Head, UncertainEvent, Unresolved};
-use queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
+use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
 pub use stop::{EngineShutdown, StopMode};
 
@@ -96,6 +96,11 @@ pub struct Engine {
     start_receiver: StdMutex<Option<mpsc::Receiver<SessionId>>>,
     /// Starts that found `starts` full; daemon main retries them.
     pending_starts: StdMutex<HashSet<SessionId>>,
+    /// Connection slots (design §11): a `Run` turn reserves one before its
+    /// grant; at launch Host takes it for the group's life. FIFO waiters.
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Slots held for groups an earlier daemon left unproven (design §11).
+    recovered: recovery::RecoveredSlots,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -181,6 +186,20 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The daemon-wide connection-slot pool (design §11). Test builds only:
+/// `VIA_TEST_CONNECTION_SLOTS` lowers it.
+fn connection_slots() -> Arc<tokio::sync::Semaphore> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTION_SLOTS));
+    #[cfg(feature = "test-failpoints")]
+    if let Some(lowered) = std::env::var("VIA_TEST_CONNECTION_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        slots.forget_permits(CONNECTION_SLOTS.saturating_sub(lowered));
+    }
+    slots
+}
+
 impl Engine {
     /// Opens the sole Store owner and passes unopened lower resources to Adapter/Wire.
     pub fn open(
@@ -238,6 +257,8 @@ impl Engine {
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
             pending_starts: StdMutex::new(HashSet::new()),
+            slots: connection_slots(),
+            recovered: recovery::RecoveredSlots::default(),
             #[cfg(test)]
             faults: Faults::default(),
         })

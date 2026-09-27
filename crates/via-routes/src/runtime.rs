@@ -133,6 +133,11 @@ impl FakeRoute {
         self.wire.shutdown(deadline, turns).await
     }
 
+    /// Hands Host capacity for a group it did not launch (design §11).
+    pub fn hold_capacity(&self, anchor_id: String, token: via_wire::CapacityToken) {
+        self.wire.hold_capacity(anchor_id, token);
+    }
+
     /// Returns one page of passive Host recovery facts without exposing a
     /// signal handle: up to `limit` anchors after the `after` id.
     pub async fn recover_page(

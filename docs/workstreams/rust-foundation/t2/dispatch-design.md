@@ -519,19 +519,48 @@ Normative. Runtime §8 sets this bound: "Active private connections: 4
 daemon-wide (one vendor + one anchor each). Queue eligible work; do not
 create a child until a slot is reserved."
 
-- **Pool.** Engine owns one pool of 4 slots, a `tokio::sync::Semaphore`.
-  Unit tests may lower it; raising it is out of scope.
+A slot is capacity for a live process group, not for `run` (Sol review
+`sol-review-T2-D-design.md`, decisions 1 and 2). Runtime §5: "A timed-out
+wait releases no admission capacity."
+
+- **Pool.** Engine owns one pool of 4 slots, a `tokio::sync::Semaphore`
+  handing out owned permits. Tests may lower it (unit tests directly;
+  daemon tests through `VIA_TEST_CONNECTION_SLOTS`, parsed only in
+  `test-failpoints` builds). Raising it is out of scope.
 - **Reservation order.** A dispatcher whose decision is `Run` (§2.2 step 6)
-  reserves a slot before its grant and its submission commit. If the grant
-  is then refused, the slot is released at once. A turn waiting for a slot
-  therefore has no `submitted_at`, launches nothing, stays `queued`, and
-  stays counted in `queued`, `active` and `Unresolved`.
-- **Release.** The slot is an RAII permit held across the grant, the
-  submission commit and `run`. It is released when `run` returns: the
-  turn's connection is closed, including Route's force close for a forced
-  turn, and its terminal outcome is handled (committed, failed and latched,
-  or handed to final shutdown's forced list). It is released on every path,
-  including an early return and a dropped future.
+  reserves a slot before its grant and its submission commit. A turn
+  waiting for a slot therefore has no `submitted_at`, launches nothing,
+  stays `queued`, and stays counted in `queued`, `active` and `Unresolved`.
+- **Ownership.** Each permit has exactly one owner at a time and is
+  released exactly once. The dispatcher owns it from reservation through
+  the grant, the submission commit and the launch. It passes down with the
+  process spec as a type-erased drop token (`CapacityToken`, defined in
+  `via-host`), so no lower layer depends on a Core type. Once the anchor
+  process is spawned, the group exists and Host's per-anchor ledger owns
+  the token.
+- **Release.** The permit is released only in two cases:
+  1. no group was created: a refused grant, a failed submission commit, or
+     a launch that fails before the anchor spawns drops it at once;
+  2. Host has positively proved the group absent (`GroupAbsent`, from a
+     close or from reconciliation), which drops the ledger's token.
+
+  None of these release it: a dispatcher future dropped after launch, a
+  `run` that returns with cleanup `uncertain`, a forced turn handed to
+  final shutdown, or a launch that fails after the anchor spawned (its anchor stops the
+  group on EOF, but nothing has proved that). Final shutdown's
+  reconciliation proves absence for its anchors and releases their permits
+  then.
+- **Recovered groups.** After startup recovery reconciles the anchor
+  inventory, and before the restart handoff (§10) dispatches, every
+  committed anchor whose absence recovery did not prove (an uncertain
+  report, or none) holds a slot until a later Host absence proof. Past the
+  pool, these groups share the permits they could reserve: a permit frees
+  only once fewer such groups than held permits remain. With 4 or more, no
+  new child starts until cleanup proves room. Anchors that a
+  reconciliation deadline left unread hold nothing. This round adds no
+  re-probe loop for recovered groups; the orchestrator records that on
+  `via-jm4.7.7`, so such a slot is held until the daemon's next
+  reconciliation (shutdown or restart).
 - **Wakes.** A waiting dispatcher wakes on a slot release (the semaphore
   hands the permit to the oldest waiter) and on the force signal. The force
   signal also carries force acceptance and phase one of the Store-failed
@@ -553,6 +582,7 @@ create a child until a slot is reserved."
   mutex is taken after it. No code holds `admission` while waiting for a
   slot; receipts, the latch finalization and closes never reserve slots.
   A dispatcher that holds a slot and latches (it then awaits `admission`)
-  therefore cannot deadlock.
+  therefore cannot deadlock. Host's ledger is a short `std` mutex taken
+  with no other lock held, only to insert or remove a token.
 - **Scope.** Two items are recorded on `via-jm4.7.8` (Task 4 bounds): raw
   staging overflow classification, and Store request-side refusal.

@@ -153,8 +153,8 @@ pub use runtime::{
     FakeTurnRecovery,
 };
 pub use via_routes::{
-    ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
-    SessionId, WireCleanup,
+    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
+    RuntimeResources, SessionId, WireCleanup,
 };
 
 /// Fake terminal status as vendor evidence; Core chooses the C1 disposition.

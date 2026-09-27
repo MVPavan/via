@@ -82,6 +82,11 @@ impl WireRuntime {
         summarize_shutdown(self.host.shutdown(deadline, turns).await)
     }
 
+    /// Hands Host capacity for a group it did not launch (design §11).
+    pub fn hold_capacity(&self, anchor_id: String, token: via_host::CapacityToken) {
+        self.host.hold_capacity(anchor_id, token);
+    }
+
     /// Reconciles one page of up to `limit` committed anchors after the
     /// `after` id, only through Host's verified path.
     pub async fn recover_page(

@@ -173,10 +173,11 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
 /// T2-C round 1: more than 128 recovered `Starting` sessions (130 × 1 queued
 /// turn). The handoff's starts overflow the 128-capacity channel into the
 /// pending-start set; daemon main's receive-then-retry loop drains all 130,
-/// and every turn runs to `completed`. The dispatchers run at most four at a
-/// time here, as runtime §8's active-connection slots would queue them: that
-/// slot limit is not implemented yet, and 130 unthrottled turns overflow
-/// Store's raw and request queues (reported in T2-C round 1).
+/// and every turn runs to `completed`. All 130 dispatchers start at once, as
+/// daemon main starts them; the Engine's four connection slots (design §11)
+/// queue their turns, so Store's raw and request queues never overflow: no
+/// latch and no `failed(store)`. Before T2-D, about half ended
+/// `failed(store)` or the Store-failed latch was set.
 #[test]
 fn starts_beyond_the_channel_spill_into_the_pending_set_and_all_run() {
     const MANY: usize = 130;
@@ -200,17 +201,12 @@ fn starts_beyond_the_channel_spill_into_the_pending_set_and_all_run() {
             "starts past 128 wait in the pending set"
         );
         let mut starts = engine.take_starts().unwrap();
-        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
         let mut dispatchers = tokio::task::JoinSet::new();
         let mut started = 0;
         loop {
             while let Ok(session) = starts.try_recv() {
                 let engine = std::sync::Arc::clone(&engine);
-                let slots = std::sync::Arc::clone(&slots);
-                dispatchers.spawn(async move {
-                    let _slot = slots.acquire_owned().await.unwrap();
-                    engine.dispatcher(session).await
-                });
+                dispatchers.spawn(async move { engine.dispatcher(session).await });
                 started += 1;
             }
             if !engine.starts_pending() {
