@@ -423,7 +423,7 @@ pub struct RouteMessage {
 
 mod runtime;
 
-pub use runtime::{FakeRoute, FakeRouteResult, RouteAcceptance};
+pub use runtime::{FakeRoute, FakeRouteResult};
 pub use via_wire::{
     ConnectionId, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
     RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
