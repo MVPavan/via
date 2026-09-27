@@ -38,7 +38,8 @@ The T2-B features stay as they are:
 - receipts;
 - `op_key` and `idempotency_key` replay;
 - `queue_full` and `admission_refused`;
-- cancellation behind an `unknown` or `cleanup: pending` predecessor;
+- cancellation behind an `unknown` predecessor (a `cleanup: pending` one
+  waits, T2-C);
 - the shared event head;
 - the `Unresolved` bookkeeping.
 
@@ -119,8 +120,13 @@ Each decision reads Store at most once for the queue head:
 4. `predecessors(session, head)` (one read) gives `Run`, `Cancel` or `Wait`
    by T2-B round 3's rule (C1 §7.3, P6):
    - any unresolved earlier turn means `Wait`;
-   - a latest submitted earlier turn that is durably `unknown` or has
-     `cleanup: pending` means `Cancel`;
+   - a latest submitted earlier turn with `cleanup: pending` means `Wait`.
+     C1 §7.3 dispatches only after the predecessor's cleanup is settled:
+     `quiescent`, `uncertain` under P7, or not applicable. Under P7 a
+     pending-cleanup turn is nonterminal, so the unresolved check already
+     waits; this rule covers a terminal envelope that still says `pending`;
+   - a latest submitted earlier turn that is durably `unknown` means
+     `Cancel` (P6: behind `unknown` the queue is cancelled);
    - anything else means `Run`.
 
    Turns cancelled while queued are passed over. A failed read means
@@ -144,9 +150,10 @@ Each decision reads Store at most once for the queue head:
      handling applies: later events are dropped, the terminal is `failed`
      with class `store`, and a terminal that does not commit is recorded
      failed so reads give `store_error`. The failure also latches.
-8. **`Wait`:** an earlier turn is unresolved in Store with no owner in this
-   daemon, because an earlier daemon left it (§6). Wait for a wake or the
-   timer.
+8. **`Wait`:** an earlier turn is unresolved in Store and owned elsewhere
+   in this daemon, or the read failed. Wait for a wake or the timer. The
+   restart handoff (§10) leaves no unresolved turn without an owner, so the
+   old "an earlier daemon left it" case no longer arises.
 
 The retry timer is per dispatcher and for reads only: 250 ms, doubling up to
 5 s, reset by any successful step. It replaces the per-turn 250 ms poll, so
@@ -343,9 +350,13 @@ Engine owns one bounded channel of session starts (capacity
 receiver once. It replaces T2-B's per-turn handoff channel and its adoption
 channel. A start is requested only on a slot's `None → Starting` transition.
 
-A start that finds the channel full goes into a bounded **pending-start
-set**. It holds at most one entry per `Starting` slot, each with at least
-one counted queued turn, so at most 128. The set is kept in Engine, where
+A start that finds the channel full goes into the **pending-start set**. It
+holds at most one entry per `Starting` slot, and each such slot has at least
+one counted queued turn. In operation that is at most 128. The set itself
+has no 128 ceiling: after a restart the handoff (§10) gives one pending start
+per recovered `Starting` session, even when the durable queued work exceeds
+128 queued or 256 unresolved turns. The 128-capacity channel drains those
+starts once daemon main begins serving. The set is kept in Engine, where
 the send fails, and daemon main owns its retry:
 
 - **In operation:** after every start it receives, which is exactly when
@@ -387,19 +398,17 @@ Final shutdown runs in this order:
 
 Any of these makes the exit 4.
 
-**Limit (Task 3):** a predecessor that an earlier daemon left unresolved
-keeps its successors waiting. A drain waits until a force stop, the turn
-stays counted unresolved, and the exit is never 0. Restart recovery (C1
-§7.5) resolves such predecessors. Dispatching or cancelling the queued turns
-that survive a restart is the orchestrator's T2 integration step, not
-T2-B2's.
+**Earlier-daemon predecessors (resolved by §10):** startup recovery (C1
+§7.5) turns every running turn into `unknown`. The restart handoff then
+cancels or enqueues every queued turn before admission. After that, no
+turn left by an earlier daemon is unresolved without an owner.
 
 ## 7. Bounds
 
 | Resource | Bound |
 |---|---|
 | Tasks | 1 dispatcher per session with queued or owned work (at most 256, the unresolved-turn bound); none per waiting turn |
-| Memory | one `TurnNumber` per queued turn (at most 8 per session, 128 daemon-wide); pending starts at most 128; slots retired when their dispatcher exits unleased |
+| Memory | one `TurnNumber` per queued turn (at most 8 per session, 128 daemon-wide in operation; after a restart, all surviving queued turns, §10); pending starts: one per `Starting` session; slots retired when their dispatcher exits unleased |
 | Store reads per dispatcher wake | 1 (`predecessors` of the head). Submission adds 1 read and 1 commit; a cancellation adds 1 read and 1 commit |
 | Periodic reads | only after a failed read or while waiting on an unowned predecessor: at most 1 per 250 ms–5 s per dispatcher in that state; none while waiting on a wake |
 | Writes after a failed write | none from dispatch; final shutdown makes one best-effort terminal commit per forced turn |
@@ -408,7 +417,7 @@ T2-B2's.
 
 | Contract | Design |
 |---|---|
-| C1 §7.3: one FIFO, capacity 8, one running, gate on predecessor terminal and settled cleanup | §2.2 on the queue head; `unknown` or `cleanup: pending` cancels; only unsubmitted turns dispatch |
+| C1 §7.3: one FIFO, capacity 8, one running, gate on predecessor terminal and settled cleanup | §2.2 on the queue head; `cleanup: pending` waits; `unknown` cancels; only unsubmitted turns dispatch |
 | C1 §7.2 `queued → cancelled` | §2.2 step 5; §2.3 under force |
 | C1 §3.14 idle, drain and force; `session.closed` with `daemon_stop_force` | §2.3, §4, §6 |
 | C1 §8.1 and runtime §7: an unknown receipt outcome | §3: `store_error` with `commit_outcome`, the latch, exit 4; restart recovery settles it |
@@ -444,3 +453,62 @@ has the path:
    observed. A closing cancellation already past its check completes; Store
    writes `session.closed` only when no other turn is queued or running,
    and the exit is 4.
+
+## 10. Restart handoff (T2-C)
+
+Normative, per C1 §7.5 and runtime §7 (restart paragraph). It runs in
+startup after recovery has committed (T2-A: every durable running turn is
+now `unknown`) and before admission. The daemon accepts no request until
+the handoff completes.
+
+1. **Paged read.** Every durable `queued` turn is read in `(session, turn)`
+   order with a bounded page (`Store::queued_turns_page(after, limit)`, at
+   most 256 per page). Each page is handled before the next is read, so
+   memory holds one page plus the turns already enqueued.
+2. **Decision per turn, in number order within a session.** One
+   `predecessors(session, turn)` read settles it:
+   - **Cancel:** no earlier turn is unresolved, and the latest submitted
+     earlier turn is durably `unknown` (including one recovery just
+     settled) with settled cleanup. The turn is committed
+     `queued → cancelled` (C1 §7.2, P6). A cancelled turn's successor
+     reads the same latest submitted predecessor, so the whole queue
+     behind it is cancelled.
+   - **Enqueue:** otherwise. That covers an earlier turn still queued
+     (enqueued just before this one), a predecessor that settled cleanly,
+     and a predecessor with `cleanup: pending`, which §2.2 makes `Wait`,
+     never `Cancel`.
+     The turn is registered as a receipted turn would be: counted in
+     `queued`, `active` and `Unresolved`, enqueued in its session's slot,
+     and its dispatcher start is requested through the start channel (§5).
+     Daemon main starts the dispatchers once it serves. The dispatcher then
+     decides as in §2.2.
+
+   No `unknown` turn is resent. The handoff only cancels or enqueues turns
+   that were never submitted.
+3. **Store failure fails startup.** A failed read, or a failed or uncertain
+   cancellation commit, fails startup (runtime §7: startup never dispatches
+   from an uncommitted view). The daemon never admits on a partial handoff.
+   The next start repeats the handoff from Store: turns already cancelled
+   are terminal, and the rest are still queued.
+4. **Over the daemon-wide bound.** The surviving queued turns are all
+   counted, even beyond 128 queued (or 256 unresolved); none is dropped or
+   refused. Each session holds at most 8, as Store enforced when they were
+   receipted. New receipts are refused (`admission_refused`, "too many
+   queued turns" or "too many unresolved turns") until the counts fall
+   back under the limits as turns are dispatched. The pending-start set has
+   no 128 ceiling (§5): there is one pending start per recovered `Starting`
+   session, and the 128-capacity channel drains them after daemon main
+   begins serving.
+5. **Startup cost.** Before admission the handoff makes:
+
+   - one page read per 256 queued turns;
+   - one predecessor read per queued turn;
+   - one cancellation commit per cancelled turn.
+
+   None of this has a fixed wall-time bound. That is consistent with
+   recovery, which also runs before admission.
+6. **Keyed and unkeyed receipts.** A receipt whose commit outcome was
+   unknown (§3) is a durable queued row, if it committed. The handoff
+   enqueues it like any other queued turn, so it runs exactly once. A keyed
+   retry after the restart replays the stored receipt and enqueues nothing
+   (`enqueued: None`).

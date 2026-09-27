@@ -183,6 +183,9 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         Command::AnchorOwners(after, limit, reply) => {
             let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit));
         }
+        Command::QueuedTurns(after, limit, reply) => {
+            let _ = reply.send(read_queued_turns(conn, after.as_ref(), limit));
+        }
         Command::AnchorRecords(after, limit, reply) => {
             let _ = reply.send(
                 read_anchor_records(conn, after.as_deref(), limit).map_err(|error| error.kind()),
@@ -273,6 +276,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         | Command::Authenticate(..)
         | Command::Unfinished(..)
         | Command::AnchorOwners(..)
+        | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
         | Command::Shutdown => {}
     }
@@ -483,6 +487,38 @@ fn read_snapshot(
     )
     .optional()
     .map_err(|error| StoreError::Write(error.to_string()))
+}
+
+/// One page of durable `queued` turns in `(session, turn)` order after `after`.
+fn read_queued_turns(
+    conn: &Connection,
+    after: Option<&(SessionId, TurnNumber)>,
+    limit: u32,
+) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+    let (session, number) = after.map_or((None, 0), |(session, turn)| {
+        (Some(session.as_str()), turn.get())
+    });
+    let mut query = conn
+        .prepare_cached(
+            "SELECT session_id,number FROM turns WHERE state='queued'
+             AND (?1 IS NULL OR session_id>?1 OR (session_id=?1 AND number>?2))
+             ORDER BY session_id,number LIMIT ?3",
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let rows = query
+        .query_map(params![session, number, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let mut turns = Vec::new();
+    for row in rows {
+        let (session, number) = row.map_err(|error| StoreError::Write(error.to_string()))?;
+        turns.push((
+            SessionId::try_from(session.as_str()).map_err(|_| StoreError::CorruptEvidence)?,
+            TurnNumber::try_from(number).map_err(|_| StoreError::CorruptEvidence)?,
+        ));
+    }
+    Ok(turns)
 }
 
 fn read_queued_turn(
