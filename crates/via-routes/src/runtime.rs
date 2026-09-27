@@ -73,7 +73,7 @@ impl FakeRoute {
     }
 
     /// Drains Host controls and reapers before Core releases the Store owner.
-    pub async fn shutdown(&self, deadline: Deadline) -> Result<WireShutdown, WireError> {
+    pub async fn shutdown(&self, deadline: Deadline) -> WireShutdown {
         self.wire.shutdown(deadline).await
     }
 

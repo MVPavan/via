@@ -67,6 +67,10 @@ through a reserved health path even when normal observations are full.
 `TaskTracker` alone is insufficient unless each task also reports its result.
 Raw and SQLite threads have retained join handles. Dropping a requester or
 timing out a response does not cancel an already admitted mutation.
+While the daemon lives, no caller deadline or cancelled shutdown future
+abandons an owner: unfinished joins stay in the owner's registry until their
+result is collected. Final daemon process exit is a separate boundary with
+its own clean/incomplete policy (§6.2).
 
 | Owner | Resources and hidden complexity | Explicit upper-layer surface |
 |---|---|---|
@@ -390,6 +394,14 @@ impl Host {
         -> impl Future<Output = Result<AcquiredProcess, HostError>> + Send;
     pub fn recover(&self, intents: Vec<ProcessIntent>, deadline: Deadline)
         -> impl Future<Output = Vec<RecoveryReport>> + Send;
+    /// Returned on every path, including an expired deadline or journal failure.
+    pub fn shutdown(&self, deadline: Deadline) -> impl Future<Output = ShutdownReport> + Send;
+}
+pub struct ShutdownReport {
+    pub recovery: Vec<RecoveryReport>, // facts established before any failure
+    pub pending_tasks: usize,          // retained tasks whose result was not collected
+    pub failed_tasks: usize,           // panicked/cancelled tasks and failed child waits
+    pub failure: Option<HostError>,    // named deadline, Store or recovery failure
 }
 impl ProcessControl {
     pub fn close(&self, request: CloseRequest)
@@ -574,7 +586,12 @@ extension of permissible vendor work. Explicit close's absolute deadline
 includes its cleanup allowance: TERM no later than deadline minus 3 s and
 KILL no later than deadline minus 1 s; already expired deadlines skip TERM
 grace and attempt KILL immediately. Report uncertain by the caller's deadline
-if absence is unproven; retain supervision/reaping ownership afterward.
+if absence is unproven; retain supervision/reaping ownership afterward while
+the daemon lives. A timed-out wait releases no admission capacity and grants
+no fresh wall budget. Final daemon exit follows §6.2's explicit incomplete
+policy and makes no continuing-reaper guarantee after the process boundary.
+A reaper that finishes after a failed child wait is a failed task, not
+successful reaping.
 
 After ordinary child/group exit, §5.2's `GroupAbsent` supports quiescent within the
 documented group boundary. An exit of only the leader does not. Ack is
@@ -640,7 +657,8 @@ sender proves neither commit nor child exit. Current Store `Drop` joins both
 workers synchronously: on a failure path it must run on an owned blocking
 path, not a Tokio worker. That placement does not bound kernel I/O or the
 join, nor does it satisfy the later persistent-failure shutdown gate. No
-second shutdown owner or fake bounded shutdown API is introduced here.
+second shutdown owner or fake bounded shutdown API is introduced here; the
+daemon's single bounded final shutdown is §6.2.
 
 `CommitBatch` is a closed enum for create-session/turn, append-turn, submission,
 acceptance/events, resolution, keyed control intent/result, session close,
@@ -807,6 +825,62 @@ must use matching settings. The foreground server entrypoint is `via daemon`
 with no child verb or double-fork. Auto-start uses the same entrypoint;
 `via daemon status` and `via daemon stop` remain client verbs.
 
+### 6.2 Daemon stop, final shutdown and exit
+
+C1 `daemon/stop` replies `{"stopping":true}` once the request is accepted and
+Core's admission gate is closed (new `spawn` → `daemon_stopping`). The reply
+is acceptance only: it never proves that processes stopped, Store flushed or
+the daemon exited, and the CLI may report only "stopping requested" from
+it. A lost reply or caller disconnect does not cancel an accepted stop.
+Without `drain` or `force`, a stop with active turns is refused
+`admission_refused`; `drain` with `force` is `invalid_params`. A later
+`force` escalates an accepted drain; any other repeat keeps the accepted mode.
+
+- **Idle** (no active turn) and **force** enter final shutdown immediately
+  after acceptance. Force closes every running turn with mode `force`: Core
+  abandons the execution, whose released Host control lets the anchor's
+  reviewed EOF cleanup stop the group, then commits the turn in final
+  shutdown (C1 §7.6 force row) once Host has reconciled its anchor.
+- **Drain** keeps serving reads while accepted turns finish under their own
+  existing work deadlines; the drain phase gets no invented 10 s deadline.
+  When accepted and active work has settled, final shutdown begins.
+
+Final shutdown has **one absolute 10 s deadline** covering client closes,
+Host control closes, anchor reconciliation, task joins, final durable
+records, raw sync and the Store join; no phase receives a fresh budget. F12
+measures the same total from first Store failure and does not restart it
+when final shutdown begins. Order: stop listening and admission; settle or
+classify turns; request owned-group cleanup; collect process/task evidence;
+commit final records while the Store owner is alive; then join Store off the
+Tokio workers.
+
+**Clean** shutdown requires positive group absence for every committed
+anchor, no pending or failed owned join, every final record committed and
+the Store (writer and raw thread) joined. The daemon then emits its bounded
+summary, releases resources and locks and exits **0**. **Incomplete**: at the
+deadline, or after a failure that precludes clean completion, the daemon
+snapshots the remaining uncertainty, aborts unfinished tasks, reports those
+that did not join and exits **4**. Only daemon main selects this path; a
+library timeout or dropped handle never exits the process or detaches work.
+A Store join that does not finish is abandoned to process exit, whose
+termination releases the locks; this is crash-like termination with
+conservative recovery (§7), never a successful flush. Abort, handle drop,
+lost control, pending SIGKILL and OS adoption prove neither reaping nor
+quiescence, and VIA promises no reaping after its own process exits. An
+uninterruptible kernel operation can still defeat the process-exit bound;
+that is an unmet bound or infrastructure failure, never a pass.
+
+The best-effort final summary is one bounded JSON line on the daemon's
+stderr, `{"daemon_shutdown":{…}}`, separating stop mode, elapsed time,
+pending and failed joins, committed anchors, owners with uncertain cleanup,
+the named Host failure, force-stopped turns whose terminal did not commit,
+Store join status and the `clean`/`incomplete` disposition. `GroupAbsent`
+is not reaped, and a joined status task is not group absence. It adds no
+`daemon/status` field, RPC or durable report; it may be lost on Store failure
+or abrupt death, and the outer harness captures exit status and diagnostics.
+A result that cannot persist keeps F12's named `store_error` and
+`terminal_persisted:false`; no envelope is invented or replaced.
+
 ## 7. F12: persistent Store failure and crash reconciliation
 
 First SQLite/state write failure or uncertain Store commit latches daemon health to
@@ -840,7 +914,7 @@ Host independently stops private groups using §5 within 3 s of failure
 notification; this does not wait for Store. Drain reads until EOF/deadline.
 The daemon remains available for diagnostic/read requests for at most 5 s
 after first failure, attempts raw/Store flush and task joins within a total
-10 s shutdown bound, then exits nonzero. No successful graceful-stop result
+10 s shutdown bound measured from first failure (§6.2), then exits 4. No successful graceful-stop result
 is returned for failed flush/join. Synchronous disk I/O can hang in the kernel:
 it cannot be cancelled by a Rust timeout. Retain/report the unjoined thread;
 the outer process supervisor enforces the process-exit bound in tests. The
@@ -1004,6 +1078,7 @@ macOS linkage gate. No design text here claims those live gates have passed.
 | C2 §2 SessionCx/SessionDriver | Opaque resource wiring instead of Adapter-accessible raw handle; separate control/health lanes; acceptance correlation token; health failures and Host cleanup travel upward/downward through C2/C3/C4 rather than Core calling Host directly. |
 | C2 §2 Recover wording | “Core asks Host” means Adapter/Route/Wire forwards cleanup; `Dead` is process evidence only, never proof of non-submission or no action. |
 | C2 A1 and §4 | Keep 1024 items/10 s unchanged; add byte budgets, splitting rules, independent sticky health failure delivery and acceptance deduplication. |
+| C1 §3.14, runtime §§2, 5, 6.2, 7 | Stop receipt is acceptance only; drain keeps work deadlines, force and idle enter final shutdown at once; one absolute 10 s final deadline; clean exit 0 only with positive cleanup, joins and durability, otherwise truthful incomplete exit 4 chosen by daemon main. Live-daemon deadlines and cancelled shutdown futures never abandon owners; Host's shutdown report keeps pending/failed joins and the named failure on every path. |
 | Coding standard §§5–6 | Permit signal setup in the same binary's internal Host-anchor entrypoint in addition to daemon main. Document anchor group creation and vendor inherited membership; distinguish durable anchor identity from vendor child facts. Force group KILL kills the anchor/reaper, so remaining child reaping is by the OS, never falsely reported as Host-reaped. Marker remains explicit vendor environment data but is never recovered by reading vendor environments. |
 | Platform packet §5/§5.1 and P-I2–P-I4 | Match anchor-based authority, all-three-fd detachment, persisted generation/ArmIntent and §5.2 positive absence predicate. Keep native positive cleanup and negative identity-refusal requirements, with no uncertainty-only substitute. |
 
@@ -1125,7 +1200,9 @@ No valid identity, a guessed PID/PGID, present/reused group, permission
 error or namespace mismatch can prove absence. A lost Stop reply does not
 establish forced/acknowledged outcome.
 
-The entire outer teardown, including normal-stop fallback and observation,
+The harness implements this seam itself from the snapshot; it never reopens
+Core or the Store owner and uses no daemon debug RPC or CLI verb. The entire
+outer teardown, including normal-stop fallback and observation,
 has a 10 s deadline. Anchor Stop uses the earliest of its existing deadline,
 now + 3 s or the outer deadline. Observe at most every 20 ms and supervise
 at most four active groups. This test budget does not extend Host's native

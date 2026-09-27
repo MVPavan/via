@@ -106,7 +106,11 @@ the set.
   entries, and at shutdown close and await their trackers within a bound,
   reporting any that did not finish. `TaskTracker` does not abort tasks and
   `spawn_blocking` work cannot be aborted: bound how much blocking work is
-  admitted and keep ownership until it completes.
+  admitted and keep ownership until it completes. This holds throughout live
+  daemon operation, including after a caller deadline or a cancelled
+  shutdown. Only daemon main's explicit final incomplete exit (runtime
+  contract §6.2) may leave OS-adopted children, and it never claims
+  quiescence or Host reaping for them.
 - **Channels are bounded;** unbounded channels are not used. At each channel,
   a comment says what happens when it is full (wait, drop and count, or
   fail). C2 observations have both 1024-item and 4 MiB/session limits; their

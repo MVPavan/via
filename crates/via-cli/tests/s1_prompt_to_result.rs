@@ -1,5 +1,7 @@
 //! First S1 process-boundary scenario. Activate when the runtime spine lands.
 
+#[path = "support/outer_cleanup.rs"]
+mod outer_cleanup;
 #[path = "support/scenario.rs"]
 mod scenario;
 mod support;
@@ -21,57 +23,14 @@ use support::evidence::Evidence;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// Runtime §11.2 outer cleanup after the daemon exited: a read-only anchor
+/// snapshot, verified anchor control and `ESRCH` absence, never a Core reopen.
 fn verify_anchors_after_daemon(cx: &Context<'_>) -> Result<Value, ScenarioError> {
-    let db = cx.state.join("store.sqlite3");
-    let store = rusqlite::Connection::open_with_flags(
-        &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(infra)?;
-    let mut query = store.prepare("SELECT anchor_id,generation,phase,socket_path,pid,pgid,uid,boot_id,pid_namespace,start_ticks,absence_time FROM anchors ORDER BY anchor_id").map_err(infra)?;
-    let rows = query.query_map([], |row| Ok(json!({
-        "anchor_id":row.get::<_, String>(0)?,"generation":row.get::<_, String>(1)?,
-        "phase":row.get::<_, String>(2)?,"socket_path":row.get::<_, String>(3)?,
-        "pid":row.get::<_, Option<i64>>(4)?,"pgid":row.get::<_, Option<i64>>(5)?,
-        "uid":row.get::<_, i64>(6)?,"boot_id":row.get::<_, String>(7)?,
-        "pid_namespace":row.get::<_, String>(8)?,"start_ticks":row.get::<_, Option<i64>>(9)?,
-        "absence_time":row.get::<_, Option<String>>(10)?,
-    }))).map_err(infra)?;
-    let snapshot: Vec<Value> = rows.collect::<Result<_, _>>().map_err(infra)?;
-    drop(query);
-    drop(store);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(infra)?;
-    let fake = via_core::FakeConfig::from_environment().map_err(infra)?;
-    let engine =
-        via_core::Engine::open(cx.state, cx.runtime, fake, cx.via.to_path_buf()).map_err(infra)?;
-    let mut recovered = runtime.block_on(engine.verify_cleanup()).map_err(infra)?;
-    drop(engine);
-    drop(runtime);
-    let records = recovered["records"]
-        .as_array()
-        .ok_or_else(|| infra("missing recovery records"))?;
-    let exact = snapshot.len() == records.len()
-        && snapshot.iter().all(|stored| {
-            stored["phase"] == "arm_intent"
-                && stored["pid"].as_i64().is_some()
-                && stored["pgid"].as_i64().is_some()
-                && stored["start_ticks"].as_i64().is_some()
-                && records.iter().any(|record| {
-                    record["anchor_id"] == stored["anchor_id"]
-                        && record["generation"] == stored["generation"]
-                        && record["cleanup"] == "group_absent"
-                })
-        });
-    recovered["store_snapshot"] = json!(snapshot);
-    if !exact {
-        recovered["status"] = json!("unverified");
-        recovered["absence_proven"] = json!(false);
-        recovered["reason"] = json!("Store identity snapshot and Host recovery differ");
-    }
-    Ok(recovered)
+    let rows = outer_cleanup::snapshot(&cx.state.join("store.sqlite3")).map_err(infra)?;
+    Ok(outer_cleanup::verify(
+        &rows,
+        Instant::now() + Duration::from_secs(10),
+    ))
 }
 
 struct Daemon<'a> {

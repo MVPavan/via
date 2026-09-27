@@ -466,9 +466,10 @@ fn shutdown_closes_live_control_joins_tasks_and_preserves_absence_evidence() {
             .shutdown(Deadline::at(
                 tokio::time::Instant::now() + Duration::from_secs(3),
             ))
-            .await
-            .unwrap();
+            .await;
+        assert!(shutdown.failure.is_none(), "{shutdown:?}");
         assert_eq!(shutdown.pending_tasks, 0, "{shutdown:?}");
+        assert_eq!(shutdown.failed_tasks, 0, "{shutdown:?}");
         assert_eq!(shutdown.recovery.len(), 1);
         assert!(
             matches!(
@@ -509,14 +510,19 @@ fn expired_shutdown_keeps_live_owner_for_later_verified_cleanup() {
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
-        assert!(host.shutdown(Deadline::at(started)).await.is_err());
+        let expired = host.shutdown(Deadline::at(started)).await;
         assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(expired.failure.is_some(), "{expired:?}");
+        assert!(
+            expired.pending_tasks > 0,
+            "live reaper stays owned: {expired:?}"
+        );
         let later = host
             .shutdown(Deadline::at(
                 tokio::time::Instant::now() + Duration::from_secs(3),
             ))
-            .await
-            .unwrap();
+            .await;
+        assert!(later.failure.is_none(), "{later:?}");
         assert_eq!(later.pending_tasks, 0, "{later:?}");
         assert!(matches!(
             later.recovery[0].cleanup,

@@ -43,16 +43,8 @@ impl WireRuntime {
     }
 
     /// Drains Host controls and tasks before the Store owner is released.
-    pub async fn shutdown(&self, deadline: Deadline) -> Result<WireShutdown, WireError> {
-        let report = self.host.shutdown(deadline).await?;
-        Ok(WireShutdown {
-            recovery: report
-                .recovery
-                .into_iter()
-                .map(normalize_recovery)
-                .collect(),
-            pending_tasks: report.pending_tasks,
-        })
+    pub async fn shutdown(&self, deadline: Deadline) -> WireShutdown {
+        summarize_shutdown(self.host.shutdown(deadline).await)
     }
 
     /// Reconciles committed anchors only through Host's verified path.
@@ -315,10 +307,51 @@ fn normalize_recovery(report: via_host::RecoveryReport) -> WireRecovery {
     }
 }
 
+/// Keeps pending/failed joins and the named failure together on every path.
+fn summarize_shutdown(report: via_host::ShutdownReport) -> WireShutdown {
+    WireShutdown {
+        recovery: report
+            .recovery
+            .into_iter()
+            .map(normalize_recovery)
+            .collect(),
+        pending_tasks: report.pending_tasks,
+        failed_tasks: report.failed_tasks,
+        failure: report.failure.map(|error| error.to_string()),
+    }
+}
+
 /// Passive shutdown evidence with no process-control capability.
 pub struct WireShutdown {
-    /// Every committed anchor in the Store journal.
+    /// Committed anchors reconciled before any failure.
     pub recovery: Vec<WireRecovery>,
     /// Host-owned child/status tasks not joined by the bounded deadline.
     pub pending_tasks: usize,
+    /// Host-owned tasks that panicked, were cancelled or failed their child wait.
+    pub failed_tasks: usize,
+    /// Bounded description of the deadline, Store or recovery failure, if any.
+    pub failure: Option<String>,
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_failure_and_pending_owner_both_survive_the_summary() {
+        let summary = summarize_shutdown(via_host::ShutdownReport {
+            recovery: Vec::new(),
+            pending_tasks: 1,
+            failed_tasks: 2,
+            failure: Some(via_host::HostError::StoreUnavailable(
+                via_store::StoreFailureKind::Open,
+            )),
+        });
+        assert_eq!((summary.pending_tasks, summary.failed_tasks), (1, 2));
+        assert!(
+            summary
+                .failure
+                .is_some_and(|failure| failure.contains("journal"))
+        );
+    }
 }
