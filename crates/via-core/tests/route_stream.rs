@@ -30,6 +30,8 @@ use via_store::{SpawnRecord, Store};
 const SESSION: &str = "s_0123456789ab";
 const CONNECTION: &str = "c_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STREAM_CHILD";
+/// The ordinary turn deadline of each case.
+const TURN: Duration = Duration::from_secs(20);
 /// Bound on one child case; the turn deadline is 20 s and cleanup adds 3 s.
 const CHILD_LIMIT: Duration = Duration::from_secs(60);
 
@@ -132,10 +134,11 @@ impl Child {
         }
     }
 
-    /// Runs one turn, calling `on_observation` with the Store owner, the sandbox
-    /// root and each observation as it arrives.
+    /// Runs one turn under a `turn` deadline, calling `on_observation` with the
+    /// Store owner, the sandbox root and each observation as it arrives.
     fn execute(
         &mut self,
+        turn: Duration,
         mut on_observation: impl FnMut(&mut Option<Store>, &Path, &FakeObservation),
     ) -> (Vec<FakeObservation>, Result<(), AdapterError>) {
         let Self {
@@ -145,7 +148,7 @@ impl Child {
             runtime,
         } = self;
         let (sender, mut receiver) = mpsc::channel(4);
-        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
+        let deadline = Deadline::at(tokio::time::Instant::now() + turn);
         let mut observed = Vec::new();
         let result = runtime.block_on(async {
             let execute = adapter.execute(
@@ -213,7 +216,7 @@ fn route_forwards_every_observation_in_order_with_its_raw_ref() {
         );
     };
     let mut child = Child::open(&root);
-    let (observed, result) = child.execute(|_, _, _| {});
+    let (observed, result) = child.execute(TURN, |_, _, _| {});
     result.unwrap();
     // Everything except the terminal, which travels in the route result.
     let expected: Vec<&Value> = lines
@@ -297,7 +300,7 @@ fn failing_raw_append_keeps_draining_and_reports_incomplete_evidence() {
         );
     };
     let mut child = Child::open(&root);
-    let (observed, result) = child.execute(|store, root, observation| {
+    let (observed, result) = child.execute(TURN, |store, root, observation| {
         if matches!(observation, FakeObservation::Accepted(_)) {
             // Dropping the owner stops Store's raw writer; later appends fail.
             drop(store.take());
@@ -334,7 +337,7 @@ fn stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline() {
     let mut child = Child::open(&root);
     let mut stall = None;
     let mut released = None;
-    let (observed, result) = child.execute(|store, root, observation| {
+    let (observed, result) = child.execute(TURN, |store, root, observation| {
         if matches!(observation, FakeObservation::Accepted(_)) {
             stall = Some(store.as_ref().unwrap().stall_raw_worker());
             released = Some(Instant::now());
@@ -355,4 +358,49 @@ fn stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline() {
     assert!(failure.raw_incomplete, "{failure:?}");
     // Route's cleanup bound is 3 s; the 20 s turn deadline must not be reached.
     assert!(elapsed < Duration::from_secs(8), "cleanup took {elapsed:?}");
+}
+
+#[test]
+fn raw_append_stalled_past_the_turn_deadline_is_a_wall_deadline() {
+    let lines = [
+        json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}),
+        json!({"type":"text","vendor_turn_id":"fake-turn-1","text":"stalled"}),
+    ];
+    let Some(root) = child_root() else {
+        // Emit acceptance, wait for the test to stall Store's raw worker, then emit
+        // an ordinary line whose append outlives the turn deadline.
+        return run_child(
+            "raw_append_stalled_past_the_turn_deadline_is_a_wall_deadline",
+            "read -r start\n\
+             /usr/bin/head -n 1 \"$VIA_FAKE_SCENARIO\"\n\
+             while [ ! -e \"$VIA_FAKE_SYNC_DIR/release\" ]; do /bin/sleep 0.01; done\n\
+             /usr/bin/tail -n 1 \"$VIA_FAKE_SCENARIO\"\n\
+             /bin/sleep 30\n",
+            &lines,
+        );
+    };
+    let mut child = Child::open(&root);
+    let mut stall = None;
+    let started = Instant::now();
+    let turn = Duration::from_secs(3);
+    let (observed, result) = child.execute(turn, |store, root, observation| {
+        if matches!(observation, FakeObservation::Accepted(_)) {
+            stall = Some(store.as_ref().unwrap().stall_raw_worker());
+            fs::write(root.join("sync/release"), b"").unwrap();
+        }
+    });
+    let elapsed = started.elapsed();
+    drop(stall);
+    assert_eq!(observed.len(), 1, "only acceptance was recorded");
+    let Err(AdapterError::Route(failure)) = result else {
+        panic!("expected a route failure, got {result:?}");
+    };
+    // C1 §7.6: the turn's own deadline expired, so Core classifies `deadline_wall`.
+    assert!(
+        matches!(failure.cause, RouteError::Deadline { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.raw_incomplete, "{failure:?}");
+    // The turn deadline plus Route's 3 s cleanup bound, never the vendor's 30 s.
+    assert!(elapsed < Duration::from_secs(10), "turn took {elapsed:?}");
 }

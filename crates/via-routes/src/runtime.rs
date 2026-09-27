@@ -330,9 +330,11 @@ async fn forward(
 /// Keeps a Wire failure's cause for Core's C1 class decision.
 fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
     match error {
-        // A raw append the Store worker did not confirm in time is a Store failure.
-        WireError::Raw(_) | WireError::RawDeadline => RouteError::Store { turn },
-        WireError::Deadline => RouteError::Deadline { turn },
+        WireError::Raw(_) => RouteError::Store { turn },
+        // Every Wire call that reports a cause runs under the turn's work deadline,
+        // so an append it outlived is C1 `deadline_wall`. The failure drain runs
+        // under the cleanup deadline and reports lost bytes only, never a cause.
+        WireError::Deadline | WireError::RawDeadline => RouteError::Deadline { turn },
         WireError::Frame(WireFailure::FrameTooLarge) => {
             protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
         }
