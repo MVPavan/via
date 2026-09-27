@@ -336,8 +336,32 @@ impl<'a> Daemon<'a> {
         Ok(daemon)
     }
 
+    /// `start` with the connection-slot pool lowered to `slots` (design §11).
+    /// `fake` replaces the fake vendor binary path when given.
+    fn start_slots(
+        paths: &'a Paths,
+        evidence: &Evidence,
+        run: &str,
+        slots: usize,
+        fake: Option<&std::path::Path>,
+    ) -> Result<Self, ScenarioError> {
+        let mut daemon = Self::spawn_with(paths, evidence, run, Some(slots), fake)?;
+        daemon.wait_ready()?;
+        Ok(daemon)
+    }
+
     /// Starts a daemon without waiting for it to admit requests.
     fn spawn(paths: &'a Paths, evidence: &Evidence, run: &str) -> Result<Self, ScenarioError> {
+        Self::spawn_with(paths, evidence, run, None, None)
+    }
+
+    fn spawn_with(
+        paths: &'a Paths,
+        evidence: &Evidence,
+        run: &str,
+        slots: Option<usize>,
+        fake: Option<&std::path::Path>,
+    ) -> Result<Self, ScenarioError> {
         let trace = if run == "final" {
             evidence.dir.join("daemon.trace")
         } else {
@@ -345,6 +369,12 @@ impl<'a> Daemon<'a> {
         };
         let mut command = paths.command();
         paths.failpoints.activate(&mut command);
+        if let Some(slots) = slots {
+            command.env("VIA_TEST_CONNECTION_SLOTS", slots.to_string());
+        }
+        if let Some(fake) = fake {
+            command.env("VIA_FAKE_AGENT_BINARY", fake);
+        }
         command
             .arg("daemon")
             .stdin(Stdio::null())
@@ -2124,4 +2154,410 @@ fn s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits() -> TestRes
             completes_normally(paths, evidence).map(drop)
         },
     )
+}
+
+/// Six sessions whose turn 1 (prompt `s<i>`) holds at its own gate
+/// `hold<i>`, for T2-D: a fake gate admits one agent.
+fn six_held() -> Value {
+    let scripts: Vec<Value> = (0..6)
+        .map(|index| t2c_script(1, &format!("s{index}"), Some(&format!("hold{index}"))))
+        .collect();
+    json!({"scripts":scripts})
+}
+
+/// Releases every T2-D gate.
+fn release_six(paths: &Paths) -> Result<(), ScenarioError> {
+    for index in 0..6 {
+        fs::write(paths.sync.join(format!("hold{index}.release")), b"").map_err(infra)?;
+    }
+    Ok(())
+}
+
+/// Spawns six sessions and waits until four turns are accepted and holding.
+fn spawn_six_held(paths: &Paths, evidence: &Evidence) -> Result<Vec<String>, ScenarioError> {
+    let mut sessions = Vec::new();
+    for index in 0..6 {
+        let prompt = format!("s{index}");
+        let spawn = t2c_spawn(paths, evidence, &format!("spawn-{index}"), &prompt, None)?;
+        sessions.push(
+            json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store_count(
+        paths,
+        "SELECT count(*) FROM turns WHERE accepted_at IS NOT NULL",
+    )? < 4
+    {
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(
+                "four turns never started".to_owned(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Longer than a launch: a fifth would have been created by now.
+    thread::sleep(Duration::from_millis(500));
+    Ok(sessions)
+}
+
+fn store_count(paths: &Paths, query: &str) -> Result<i64, ScenarioError> {
+    paths
+        .store()?
+        .query_row(query, [], |row| row.get(0))
+        .map_err(infra)
+}
+
+/// Four slots in use, two turns waiting for one: exactly four anchors, and
+/// the other two turns `queued` with no `submitted_at` and no anchor.
+fn check_four_running_two_waiting(paths: &Paths) -> Result<(), ScenarioError> {
+    let anchors = store_count(paths, "SELECT count(*) FROM anchors")?;
+    let waiting = store_count(
+        paths,
+        "SELECT count(*) FROM turns WHERE state='queued' AND submitted_at IS NULL",
+    )?;
+    let running = store_count(paths, "SELECT count(*) FROM turns WHERE state='running'")?;
+    check(anchors == 4 && waiting == 2 && running == 4, || {
+        format!("anchors {anchors}, waiting {waiting}, running {running}")
+    })
+}
+
+/// T2-D 1 (design §11, runtime §8): six held turns and four connection slots.
+/// Exactly four anchors exist at once; the other two turns stay `queued` with
+/// no `submitted_at` and no anchor until a slot frees, and then all six
+/// complete. Before T2-D all six launched at once.
+#[test]
+fn s1_t2d_six_turns_share_four_connection_slots() -> TestResult {
+    scenario("s1_t2d_four_slots", &six_held(), |paths, evidence| {
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        let sessions = spawn_six_held(paths, evidence)?;
+        check_four_running_two_waiting(paths)?;
+        release_six(paths)?;
+        for session in &sessions {
+            let envelope = t2c_wait(paths, evidence, &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("{session}: {envelope}")
+            })?;
+        }
+        let anchors = store_count(paths, "SELECT count(*) FROM anchors")?;
+        check(anchors == 6, || format!("{anchors} launches for six turns"))
+    })
+}
+
+/// T2-D 2 (design §11): a force stop while two turns wait for a slot. The
+/// waiting turns are `cancelled` without submission, the four running ones
+/// end under the force row, every session closes, and the exit is clean.
+#[test]
+fn s1_t2d_force_while_turns_wait_for_a_slot() -> TestResult {
+    scenario("s1_t2d_force_waiting", &six_held(), |paths, evidence| {
+        let mut daemon = Daemon::start(paths, evidence, "forced")?;
+        let sessions = spawn_six_held(paths, evidence)?;
+        check_four_running_two_waiting(paths)?;
+        let stop = paths.run(evidence, "stop", &["daemon", "stop", "--force", "--json"])?;
+        check(stop.status.success(), || "force stop refused".to_owned())?;
+        let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+            .ok_or_else(|| ScenarioError::Timeout("force stop never exited".to_owned()))?;
+        check(status.code() == Some(0), || format!("daemon exit {status}"))?;
+        let (mut forced, mut never_submitted) = (0, 0);
+        for session in &sessions {
+            let (state, envelope) = turn_n(paths, session, 1)?;
+            check(state == "cancelled", || {
+                format!("{session}: {state} {envelope}")
+            })?;
+            if envelope["timestamps"]["submitted_at"].is_null() {
+                check(
+                    envelope["cancel"].is_null() && anchors_of_turn(paths, session, 1)? == 0,
+                    || format!("a waiting turn launched: {envelope}"),
+                )?;
+                never_submitted += 1;
+            } else {
+                check(envelope["cancel"]["outcome"] == "forced", || {
+                    format!("a running turn: {envelope}")
+                })?;
+                forced += 1;
+            }
+            let types = paths.event_types(session)?;
+            check(
+                types.last().map(String::as_str) == Some("session.closed"),
+                || format!("{session} not closed: {types:?}"),
+            )?;
+        }
+        check((forced, never_submitted) == (4, 2), || {
+            format!("forced {forced}, cancelled while waiting {never_submitted}")
+        })?;
+        drop(daemon);
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        completes_normally(paths, evidence).map(drop)
+    })
+}
+
+/// T2-D 3 (design §11, §3.2): the Store-failed latch while two turns wait for
+/// a slot. A seventh spawn's receipt reply is lost (the 15th lifecycle
+/// commit, after six receipts, four submissions and four acceptances). The
+/// waiting turns get no grant and no launch, and the daemon exits 4.
+#[test]
+fn s1_t2d_latch_while_turns_wait_for_a_slot() -> TestResult {
+    scenario("s1_t2d_latch_waiting", &six_held(), |paths, evidence| {
+        let lost = "store.commit.reply_lost";
+        paths.failpoints.arm(lost, 15, "fail_io").map_err(infra)?;
+        let mut daemon = Daemon::start(paths, evidence, "latched")?;
+        let sessions = spawn_six_held(paths, evidence)?;
+        check_four_running_two_waiting(paths)?;
+        let seventh = t2c_spawn(paths, evidence, "spawn-lost", "s0", None)?;
+        check(
+            !seventh.status.success()
+                && error_kind(&seventh.stderr).as_deref() == Some("store_error"),
+            || "the seventh receipt was not store_error".to_owned(),
+        )?;
+        latched_exit(&mut daemon, evidence, "latched")?;
+        let mut waiting = 0;
+        for session in &sessions {
+            let (state, envelope) = turn_n(paths, session, 1)?;
+            if state == "queued" {
+                check(
+                    envelope.is_null() && anchors_of_turn(paths, session, 1)? == 0,
+                    || format!("a waiting turn was granted: {envelope}"),
+                )?;
+                waiting += 1;
+            }
+        }
+        let anchors = store_count(paths, "SELECT count(*) FROM anchors")?;
+        let submitted = store_count(
+            paths,
+            "SELECT count(*) FROM turns WHERE submitted_at IS NOT NULL",
+        )?;
+        check(waiting == 2 && anchors == 4 && submitted == 4, || {
+            format!("waiting {waiting}, anchors {anchors}, submitted {submitted}")
+        })?;
+        paths.failpoints.disarm(lost).map_err(infra)?;
+        drop(daemon);
+        release_six(paths)?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        completes_normally(paths, evidence).map(drop)
+    })
+}
+
+/// Two quick sessions for the lowered-pool T2-D tests: prompts `s0` and `s1`.
+fn two_quick() -> Value {
+    json!({"scripts":[t2c_script(1, "s0", None), t2c_script(1, "s1", None)]})
+}
+
+/// Spawns one session with `prompt` and returns its id.
+fn spawn_session(
+    paths: &Paths,
+    evidence: &Evidence,
+    name: &str,
+    prompt: &str,
+) -> Result<String, ScenarioError> {
+    let spawn = t2c_spawn(paths, evidence, name, prompt, None)?;
+    Ok(json_line(&spawn.stdout)?["session_id"]
+        .as_str()
+        .ok_or_else(|| fail("receipt has no session"))?
+        .to_owned())
+}
+
+/// A turn that waits for a connection slot: still `queued`, never submitted
+/// and never launched, well past the time a launch takes.
+fn still_waiting(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
+    thread::sleep(Duration::from_millis(1_000));
+    let (state, envelope) = turn_n(paths, session, 1)?;
+    let submitted = store_count(
+        paths,
+        "SELECT count(*) FROM turns WHERE submitted_at IS NOT NULL",
+    )?;
+    let anchors = anchors_of_turn(paths, session, 1)?;
+    check(
+        state == "queued" && envelope.is_null() && anchors == 0,
+        || {
+            format!(
+                "the waiting turn launched: {state} {envelope}, {anchors} anchors, {submitted} submitted"
+            )
+        },
+    )
+}
+
+/// A force stop, exiting `code`, that ends the waiting turn `cancelled`
+/// without submission.
+fn force_cancels_waiting(
+    paths: &Paths,
+    evidence: &Evidence,
+    daemon: &mut Daemon<'_>,
+    session: &str,
+    code: i32,
+) -> Result<(), ScenarioError> {
+    let stop = paths.run(evidence, "stop", &["daemon", "stop", "--force", "--json"])?;
+    check(stop.status.success(), || "force stop refused".to_owned())?;
+    let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
+        .ok_or_else(|| ScenarioError::Timeout("force stop never exited".to_owned()))?;
+    check(status.code() == Some(code), || {
+        format!("daemon exit {status}")
+    })?;
+    let (state, envelope) = turn_n(paths, session, 1)?;
+    check(
+        state == "cancelled"
+            && envelope["timestamps"]["submitted_at"].is_null()
+            && anchors_of_turn(paths, session, 1)? == 0,
+        || format!("the waiting turn: {state} {envelope}"),
+    )
+}
+
+/// T2-D Sol decision 1 (design §11, runtime §5): a slot is capacity for a
+/// live process group. With one slot, turn A completes but its absence-proof
+/// commit fails, so its cleanup stays uncertain and Host keeps the slot:
+/// turn B in another session is not submitted or launched. Only the force
+/// stop's reconciliation proves A absent, and the force cancels B unsent.
+/// Released when the run returned, B launched at once.
+#[test]
+fn s1_t2d_uncertain_cleanup_keeps_its_connection_slot() -> TestResult {
+    scenario(
+        "s1_t2d_uncertain_keeps_slot",
+        &two_quick(),
+        |paths, evidence| {
+            let commit = "host.recovery.absence_commit";
+            paths.failpoints.arm(commit, 1, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start_slots(paths, evidence, "uncertain", 1, None)?;
+            let first = spawn_session(paths, evidence, "spawn-a", "s0")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{first}/1"))?;
+            let unproven = "SELECT count(*) FROM anchors WHERE absence_time IS NULL";
+            check(store_count(paths, unproven)? == 1, || {
+                format!("turn A's group was proved absent: {envelope}")
+            })?;
+            let second = spawn_session(paths, evidence, "spawn-b", "s1")?;
+            still_waiting(paths, &second)?;
+            force_cancels_waiting(paths, evidence, &mut daemon, &second, 0)?;
+            check(store_count(paths, unproven)? == 0, || {
+                "shutdown never proved turn A's group absent".to_owned()
+            })?;
+            paths.failpoints.disarm(commit).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// T2-D Sol decision 2 (design §11): a group an earlier daemon left, whose
+/// absence recovery cannot prove, counts. An ended turn's synthetic anchor
+/// with no identity recovers `UnverifiedAnchor`; after a restart with one
+/// slot, a new turn is neither submitted nor launched, and the force stop
+/// cancels it unsent (exit 4: the group is still unproven). Without the reservation it launched at once.
+#[test]
+fn s1_t2d_unproven_recovered_group_reduces_capacity() -> TestResult {
+    scenario("s1_t2d_recovered_group", &two_quick(), |paths, evidence| {
+        let daemon = Daemon::start(paths, evidence, "first")?;
+        let ended = spawn_session(paths, evidence, "spawn-a", "s0")?;
+        let envelope = t2c_wait(paths, evidence, &format!("{ended}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        drop(daemon);
+        let changed = rusqlite::Connection::open(paths.state.join("store.sqlite3"))
+            .map_err(infra)?
+            .execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
+                 SELECT 'unverified-0','g-unverified-0',a.marker,'/nonexistent',a.owner_session,1,a.uid,a.boot_id,a.pid_namespace,'intent',1
+                 FROM anchors a WHERE a.owner_session=?1 LIMIT 1",
+                [&ended],
+            )
+            .map_err(infra)?;
+        check(changed == 1, || "no anchor to copy".to_owned())?;
+        let mut daemon = Daemon::start_slots(paths, evidence, "restarted", 1, None)?;
+        let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
+        still_waiting(paths, &waiting)?;
+        // The group is still unproven at shutdown: `incomplete`, exit 4.
+        force_cancels_waiting(paths, evidence, &mut daemon, &waiting, 4)?;
+        drop(daemon);
+        delete_synthetic(paths, "unverified-")?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        completes_normally(paths, evidence).map(drop)
+    })
+}
+
+/// T2-D round 1, decision 1 (design §11): a failed acquisition proves its
+/// group absent before it returns. With one slot, turn A's vendor binary is
+/// missing, so the anchor refuses ARM (`VendorSpawnFailed`) and A ends
+/// `unknown` (or `failed`).
+/// Host then proves A's group absent and releases the slot, so turn B in
+/// another session launches and completes. Before, A's slot stayed held
+/// until shutdown and B never launched.
+#[test]
+fn s1_t2d_failed_acquisition_releases_its_proved_absent_slot() -> TestResult {
+    scenario(
+        "s1_t2d_failed_acquisition",
+        &two_quick(),
+        |paths, evidence| {
+            let vendor = paths.state.with_file_name("vendor");
+            let hidden = paths.state.with_file_name("vendor.hidden");
+            fs::copy(&paths.fake, &vendor).map_err(infra)?;
+            let _daemon = Daemon::start_slots(paths, evidence, "final", 1, Some(&vendor))?;
+            fs::rename(&vendor, &hidden).map_err(infra)?;
+            let failed = spawn_session(paths, evidence, "spawn-a", "s0")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{failed}/1"))?;
+            check(
+                envelope["state"] == "unknown" || envelope["state"] == "failed",
+                || format!("turn A with no vendor: {envelope}"),
+            )?;
+            fs::rename(&hidden, &vendor).map_err(infra)?;
+            let next = spawn_session(paths, evidence, "spawn-b", "s1")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{next}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("turn B after A's failed launch: {envelope}")
+            })?;
+            let unproven = store_count(
+                paths,
+                "SELECT count(*) FROM anchors WHERE absence_time IS NULL",
+            )?;
+            check(unproven == 0, || {
+                format!("{unproven} anchors left unproven")
+            })
+        },
+    )
+}
+
+/// T2-D round 1, decision 2 (design §11): a recovery deadline counts the
+/// anchors it left unread. 300 proven-absent synthetic anchors sort first;
+/// one with no identity and no absence proof sorts after the first page.
+/// Reconciliation is held at the page boundary past its deadline, so paging
+/// stops before that anchor. Startup still admits, and with one slot a new
+/// turn stays `queued`, unsent, with no anchor. The force stop cancels it;
+/// exit 4, since the anchor is still unproven. Before, the unread anchor
+/// held nothing and the turn launched at once.
+#[test]
+fn s1_t2d_recovery_deadline_counts_unread_unproven_anchors() -> TestResult {
+    scenario("s1_t2d_unread_anchors", &two_quick(), |paths, evidence| {
+        let daemon = Daemon::start(paths, evidence, "first")?;
+        let ended = spawn_session(paths, evidence, "spawn-a", "s0")?;
+        let envelope = t2c_wait(paths, evidence, &format!("{ended}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        drop(daemon);
+        insert_proven_absent(paths, &ended, "0-synthetic", 300)?;
+        let changed = rusqlite::Connection::open(paths.state.join("store.sqlite3"))
+            .map_err(infra)?
+            .execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
+                 SELECT '1-unproven','g-1-unproven',a.marker,'/nonexistent',a.owner_session,1,a.uid,a.boot_id,a.pid_namespace,'intent',1
+                 FROM anchors a WHERE a.owner_session=?1 LIMIT 1",
+                [&ended],
+            )
+            .map_err(infra)?;
+        check(changed == 1, || "no anchor to copy".to_owned())?;
+        let boundary = "core.recovery.page_boundary";
+        arm(paths, boundary, "pause")?;
+        let mut daemon = Daemon::spawn_with(paths, evidence, "restarted", Some(1), None)?;
+        acknowledged(paths, evidence, boundary, "pause", &daemon)?;
+        // The deadline began before the acknowledgement: 5 s after it has passed.
+        thread::sleep(Duration::from_millis(5_200));
+        paths.failpoints.release(boundary, 1).map_err(infra)?;
+        daemon.wait_ready()?;
+        paths.failpoints.disarm(boundary).map_err(infra)?;
+        let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
+        still_waiting(paths, &waiting)?;
+        force_cancels_waiting(paths, evidence, &mut daemon, &waiting, 4)?;
+        drop(daemon);
+        delete_synthetic(paths, "0-synthetic")?;
+        delete_synthetic(paths, "1-unproven")?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        completes_normally(paths, evidence).map(drop)
+    })
 }

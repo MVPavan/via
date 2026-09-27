@@ -34,6 +34,19 @@ pub(super) struct Submission {
     clock: Instant,
 }
 
+/// One private connection per turn; turn 1 keeps the session's own name.
+fn connection_id(
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<ConnectionId, <ConnectionId as TryFrom<&str>>::Error> {
+    let suffix = session.as_str().trim_start_matches("s_");
+    let connection = match turn.get() {
+        1 => format!("c_{suffix}"),
+        n => format!("c_{suffix}t{n}"),
+    };
+    ConnectionId::try_from(connection.as_str())
+}
+
 /// Why a granted turn's submission did not commit.
 pub(super) enum SubmitFailure {
     /// A read before the commit failed; nothing was written.
@@ -164,6 +177,13 @@ impl Engine {
     /// until Store confirms the submission. A failed or uncertain submission
     /// latches Store failure and the turn stays queued with no vendor I/O.
     async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
+        // Design §11: a connection slot before the grant. It is dropped at
+        // once if nothing launches; at launch Host takes it for the group's
+        // life. Force or the latch gives up the wait: the queued path, never
+        // submitted.
+        let Some(connection) = self.reserve_connection().await else {
+            return Step::Next;
+        };
         #[cfg(test)]
         if self.faults.hold_before_grant.swap(false, Ordering::AcqRel) {
             self.faults.grant_paused.notify_one();
@@ -196,9 +216,20 @@ impl Engine {
         };
         slot.pop(turn);
         self.queued.fetch_sub(1, Ordering::AcqRel);
-        self.run(slot, submission).await;
+        self.run(slot, submission, connection).await;
         self.active.fetch_sub(1, Ordering::AcqRel);
         Step::Next
+    }
+
+    /// Waits for a connection slot, FIFO daemon-wide; `None` once force is
+    /// accepted or Store failure is pending, which the force signal carries.
+    async fn reserve_connection(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let mut force = self.force.subscribe();
+        tokio::select! {
+            biased;
+            _ = force.wait_for(|forced| *forced) => None,
+            permit = Arc::clone(&self.slots).acquire_owned() => permit.ok(),
+        }
     }
 
     /// Under force (design §2.3): commits every queued turn `queued →
@@ -301,7 +332,12 @@ impl Engine {
 
     /// Executes a submitted turn to its terminal, or hands it to final shutdown
     /// after a force stop.
-    async fn run(&self, slot: &Slot, submission: Submission) {
+    async fn run(
+        &self,
+        slot: &Slot,
+        submission: Submission,
+        capacity: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let Submission {
             session,
             turn,
@@ -316,13 +352,7 @@ impl Engine {
             first_seq: queued.queued_seq,
             submitted: Some((rfc3339(submitted), clock)),
         };
-        // One private connection per turn; turn 1 keeps the session's own name.
-        let suffix = session.as_str().trim_start_matches("s_");
-        let connection = match turn.get() {
-            1 => format!("c_{suffix}"),
-            n => format!("c_{suffix}t{n}"),
-        };
-        let Ok(connection) = ConnectionId::try_from(connection.as_str()) else {
+        let Ok(connection) = connection_id(&session, turn) else {
             self.unresolved.fail(&session, turn, TurnState::Running);
             return;
         };
@@ -339,7 +369,13 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + wall);
         let deadline_at = rfc3339(SystemTime::now() + wall);
         let outcome = match self
-            .execute(&mut record, connection.clone(), queued.prompt, deadline)
+            .execute(
+                &mut record,
+                connection.clone(),
+                queued.prompt,
+                deadline,
+                Box::new(capacity),
+            )
             .await
         {
             Driven::Finished(outcome) => outcome,
@@ -675,6 +711,7 @@ impl Engine {
         connection: ConnectionId,
         prompt: String,
         deadline: Deadline,
+        capacity: via_adapters::CapacityToken,
     ) -> Driven {
         // Full: Adapter waits under the turn deadline; this loop keeps draining until
         // the adapter finishes.
@@ -687,6 +724,7 @@ impl Engine {
             observed_tx,
             deadline,
             self.force.subscribe(),
+            capacity,
         ));
         // No branch is cancelled mid-commit: an observation arm runs to completion
         // before the next poll, and the adapter's own sends wait for capacity.

@@ -512,3 +512,96 @@ the handoff completes.
    enqueues it like any other queued turn, so it runs exactly once. A keyed
    retry after the restart replays the stored receipt and enqueues nothing
    (`enqueued: None`).
+
+## 11. Connection slots (T2-D, runtime §8)
+
+Normative. Runtime §8 sets this bound: "Active private connections: 4
+daemon-wide (one vendor + one anchor each). Queue eligible work; do not
+create a child until a slot is reserved."
+
+A slot is capacity for a live process group, not for `run` (Sol review
+`sol-review-T2-D-design.md`, decisions 1 and 2). Runtime §5: "A timed-out
+wait releases no admission capacity."
+
+- **Pool.** Engine owns one pool of 4 slots, a `tokio::sync::Semaphore`
+  handing out owned permits. Tests may lower it (unit tests directly;
+  daemon tests through `VIA_TEST_CONNECTION_SLOTS`, parsed only in
+  `test-failpoints` builds). Raising it is out of scope.
+- **Reservation order.** A dispatcher whose decision is `Run` (§2.2 step 6)
+  reserves a slot before its grant and its submission commit. A turn
+  waiting for a slot therefore has no `submitted_at`, launches nothing,
+  stays `queued`, and stays counted in `queued`, `active` and `Unresolved`.
+- **Ownership.** Each permit has exactly one owner at a time and is
+  released exactly once. The dispatcher owns it from reservation through
+  the grant, the submission commit and the launch. It passes down with the
+  process spec as a type-erased drop token (`CapacityToken`, defined in
+  `via-host`), so no lower layer depends on a Core type. Once the anchor
+  process is spawned, the group exists and Host's per-anchor ledger owns
+  the token.
+- **Release.** The permit is released only in two cases:
+  1. no group was created: a refused grant, a failed submission commit, or
+     a launch that fails before the anchor spawns drops it at once;
+  2. Host has positively proved the group absent (`GroupAbsent`, from a
+     close, from a failed acquisition, or from reconciliation), which drops
+     the ledger's token.
+
+  None of these release it: a dispatcher future dropped after launch, or a
+  `run` that returns with cleanup `uncertain`, or a forced turn handed to
+  final shutdown. Final shutdown's reconciliation proves absence for its
+  anchors and releases their permits then.
+- **Failed acquisition (round 1).** Once the anchor has spawned and been
+  identified, a failed acquisition runs the same bounded absence
+  verification as close before the error returns. Such failures include a
+  Configure refusal, an ARM failure such as a missing vendor executable, a
+  protocol error, or the acquisition deadline. The verification runs within
+  close's 3 s cleanup allowance, with the anchor control already dropped so
+  the anchor exits on EOF. Only `GroupAbsent` settles the ledger entry;
+  uncertainty keeps the token. An anchor that spawned but failed before it
+  was identified cannot be probed, so it keeps its token.
+- **Recovered groups.** After startup recovery reconciles the anchor
+  inventory, and before the restart handoff (§10) dispatches, every
+  committed anchor whose absence recovery did not prove (an uncertain
+  report, or none) holds a slot until a later Host absence proof. Past the
+  pool, these groups share the permits they could reserve: a permit frees
+  only once fewer such groups than held permits remain. With 4 or more, no
+  new child starts until cleanup proves room.
+- **Unread anchors (round 1).** When reconciliation stops paging at its
+  deadline, startup still proceeds (T2-A round 3; C1 §7.5 and runtime §7
+  allow uncertain cleanup). Core then makes one bounded Store query: the
+  committed anchors after the last reconciled cursor with no absence proof
+  (`absence_time IS NULL`), counted through the `anchors_unproven` partial
+  index (schema v3) and saturated at the pool size. These holdings are
+  never released during admission, so a saturated count holds the same
+  permits as an exact one (round 2). The count joins the recovered
+  holdings as unidentified groups, through the same accounting capped at
+  the pool. They have no Host ledger entry, and nothing releases them
+  before the next full reconciliation (final shutdown or restart). A
+  failure of that query is a Store failure and fails startup (runtime §7).
+  This round adds no re-probe loop for recovered or unidentified groups; the orchestrator
+  records both on `via-jm4.7.7`, so such a slot is held until the daemon's
+  next reconciliation (shutdown or restart).
+- **Wakes.** A waiting dispatcher wakes on a slot release (the semaphore
+  hands the permit to the oldest waiter) and on the force signal. The force
+  signal also carries force acceptance and phase one of the Store-failed
+  latch (§3.2). On force or the latch while waiting, the dispatcher gives
+  up the wait and takes the existing queued path: cancelled without
+  submission under force (§2.3), or left `queued` and unresolved under the
+  latch (§3).
+- **Fairness.** Waiters are served FIFO daemon-wide, because the tokio
+  semaphore queues acquirers in order.
+- **Wall deadline.** Waiting for a slot does not count against the turn's
+  wall deadline. The deadline starts at submission (C1 §7.4 and the
+  deadlines in §4 apply to a submitted turn), and a waiting turn has not
+  been submitted.
+- **Drain.** Waiting turns are accepted queued work. A drain waits for them
+  to get a slot and run to their terminal, like any other queued turn
+  (§6).
+- **Lock order.** The slot is acquired with no other lock held: no
+  `admission`, `sessions`, slot-state or head lock. The grant's `stop`
+  mutex is taken after it. No code holds `admission` while waiting for a
+  slot; receipts, the latch finalization and closes never reserve slots.
+  A dispatcher that holds a slot and latches (it then awaits `admission`)
+  therefore cannot deadlock. Host's ledger is a short `std` mutex taken
+  with no other lock held, only to insert or remove a token.
+- **Scope.** Two items are recorded on `via-jm4.7.8` (Task 4 bounds): raw
+  staging overflow classification, and Store request-side refusal.

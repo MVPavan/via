@@ -7,8 +7,8 @@ use super::{
     SessionId, SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
     StoredSpawnKey, SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber,
     UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
-    commit_arm_intent, commit_group_absence, commit_vendor_facts, fs, oneshot, params,
-    read_anchor_owners, read_anchor_records, read_raw_ref, validate_raw_ref,
+    commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
+    oneshot, params, read_anchor_owners, read_anchor_records, read_raw_ref, validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -112,7 +112,8 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
                 absence_time TEXT,
                 FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
-             PRAGMA user_version=2;",
+             CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
+             PRAGMA user_version=3;",
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
         tx.commit()
@@ -182,6 +183,9 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         }
         Command::AnchorOwners(after, limit, reply) => {
             let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit));
+        }
+        Command::UnprovenAnchors(after, limit, reply) => {
+            let _ = reply.send(count_unproven_anchors(conn, after.as_deref(), limit));
         }
         Command::QueuedTurns(after, limit, reply) => {
             let _ = reply.send(read_queued_turns(conn, after.as_ref(), limit));
@@ -276,6 +280,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         | Command::Authenticate(..)
         | Command::Unfinished(..)
         | Command::AnchorOwners(..)
+        | Command::UnprovenAnchors(..)
         | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
         | Command::Shutdown => {}

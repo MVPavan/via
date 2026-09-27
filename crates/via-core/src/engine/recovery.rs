@@ -5,6 +5,7 @@
 //! vendor, and process exit proves neither non-submission nor inaction.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -15,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use super::drive::Cancelled;
 use super::journal::Head;
+use super::queue::CONNECTION_SLOTS;
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
@@ -139,6 +141,18 @@ impl Engine {
             // every recovered turn uncertain, and startup continues.
             if tokio::time::Instant::now() >= deadline.instant() {
                 reconciled.incomplete = true;
+                // Design §11: the unread anchors without absence proof still
+                // count against the pool, as unidentified groups. One indexed
+                // query saturating at the pool (never released during
+                // admission, so no more are needed); its failure is a Store
+                // failure and fails startup.
+                let pool = u32::try_from(CONNECTION_SLOTS).unwrap_or(u32::MAX);
+                let unread = self
+                    .store
+                    .unproven_anchors_up_to(after, pool)
+                    .await
+                    .map_err(|error| format!("store_error: {error}"))?;
+                self.recovered.hold_unidentified(&self.slots, unread);
                 return Ok(reconciled);
             }
             let owners = self
@@ -163,6 +177,7 @@ impl Engine {
                 Err(_) => Vec::new(),
             };
             reconciled.add(&owners, &reports);
+            self.hold_unproven(&owners, &reports);
             if owners.len() < ANCHOR_PAGE_LIMIT as usize {
                 return Ok(reconciled);
             }
@@ -171,6 +186,23 @@ impl Engine {
             via_store::failpoint::hit_async("core.recovery.page_boundary")
                 .await
                 .map_err(|error| format!("store_error: {error}"))?;
+        }
+    }
+
+    /// Design §11: a group an earlier daemon left, whose absence recovery did
+    /// not prove, holds a connection slot until a later Host absence proof
+    /// drops its token. Past the pool the groups share the permits held, so
+    /// no new child starts until cleanup proves room.
+    fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
+        for owner in owners {
+            let proved = reports.iter().any(|report| {
+                report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
+            });
+            if !proved {
+                let token = self.recovered.hold(&self.slots);
+                self.adapter
+                    .hold_capacity(owner.anchor_id.clone(), Box::new(token));
+            }
         }
     }
 
@@ -386,6 +418,57 @@ struct History {
     spans: Vec<RawSpan>,
 }
 
+/// Connection slots held for unproven recovered groups (design §11): at most
+/// one permit per group, never more than the pool. A group's token, dropped
+/// when Host proves it absent, releases a permit only once fewer groups than
+/// permits remain.
+#[derive(Clone, Default)]
+pub(super) struct RecoveredSlots(Arc<Mutex<Recovered>>);
+
+#[derive(Default)]
+struct Recovered {
+    permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    groups: usize,
+}
+
+impl RecoveredSlots {
+    fn hold(&self, slots: &Arc<tokio::sync::Semaphore>) -> RecoveredGroup {
+        let mut recovered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        recovered.groups += 1;
+        if let Ok(permit) = Arc::clone(slots).try_acquire_owned() {
+            recovered.permits.push(permit);
+        }
+        RecoveredGroup(self.clone())
+    }
+
+    /// Counts `groups` a recovery deadline left unread. They have no Host
+    /// ledger entry, so nothing releases them before the next full
+    /// reconciliation (final shutdown or restart).
+    fn hold_unidentified(&self, slots: &Arc<tokio::sync::Semaphore>, groups: u64) {
+        let mut recovered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        recovered.groups += usize::try_from(groups).unwrap_or(usize::MAX);
+        while recovered.permits.len() < recovered.groups {
+            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+                return;
+            };
+            recovered.permits.push(permit);
+        }
+    }
+}
+
+/// One unproven recovered group's share of [`RecoveredSlots`].
+struct RecoveredGroup(RecoveredSlots);
+
+impl Drop for RecoveredGroup {
+    fn drop(&mut self) {
+        let mut recovered = (self.0).0.lock().unwrap_or_else(PoisonError::into_inner);
+        recovered.groups -= 1;
+        if recovered.permits.len() > recovered.groups {
+            recovered.permits.pop();
+        }
+    }
+}
+
 /// Host's cleanup evidence for running turns, checked against every
 /// committed anchor; anchors of already-ended turns are only counted.
 #[derive(Default)]
@@ -442,7 +525,11 @@ impl Reconciled {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchorOwner, Cleanup, FakeRecovery, Reconciled, SessionId, TurnNumber};
+    use std::sync::Arc;
+
+    use super::{
+        AnchorOwner, Cleanup, FakeRecovery, Reconciled, RecoveredSlots, SessionId, TurnNumber,
+    };
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
         AnchorOwner {
@@ -529,5 +616,38 @@ mod tests {
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
         assert_eq!(reconciled.cleanup(&other, turn), (true, false));
         assert_eq!(reconciled.turns.len(), 2);
+    }
+
+    /// Design §11: more unproven recovered groups than slots hold every
+    /// slot, and a slot frees only once fewer groups than slots remain.
+    #[test]
+    fn recovered_groups_past_the_pool_free_a_slot_only_when_fewer_remain() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let recovered = RecoveredSlots::default();
+        let mut groups: Vec<_> = (0..3).map(|_| recovered.hold(&slots)).collect();
+        assert_eq!(slots.available_permits(), 0);
+        groups.pop();
+        assert_eq!(slots.available_permits(), 0, "two groups still fill both");
+        groups.pop();
+        assert_eq!(slots.available_permits(), 1);
+        groups.pop();
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    /// Design §11: unidentified groups a recovery deadline left unread are
+    /// never released, and count with the identified ones past the pool.
+    #[test]
+    fn unidentified_groups_stay_counted_when_identified_ones_are_proved_absent() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        let recovered = RecoveredSlots::default();
+        let mut groups: Vec<_> = (0..3).map(|_| recovered.hold(&slots)).collect();
+        recovered.hold_unidentified(&slots, 5);
+        assert_eq!(slots.available_permits(), 0);
+        groups.clear();
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "five unread groups still fill four"
+        );
     }
 }

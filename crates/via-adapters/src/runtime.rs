@@ -105,15 +105,18 @@ impl AdapterRuntime {
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
         force: watch::Receiver<bool>,
+        capacity: via_routes::CapacityToken,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
         let owner = ProcessOwner {
             session_id: session_id.clone(),
             turn,
         };
-        let process = self
+        let mut process = self
             .fake
             .process_spec(owner)
             .map_err(|_| AdapterError::Unavailable)?;
+        // Host owns the connection slot for the group's life (design §11).
+        process.capacity = Some(capacity);
         let start = FakeStart::new(session_id.as_str().to_owned(), turn, prompt)
             .map_err(|_| AdapterError::Protocol)?;
         // Full: Route waits for capacity under the turn deadline while this loop
@@ -195,6 +198,12 @@ impl AdapterRuntime {
             failed_tasks: report.failed_tasks,
             failure: report.failure,
         }
+    }
+
+    /// Hands Host capacity for a group it did not launch, such as one an
+    /// earlier daemon left unproved (design §11).
+    pub fn hold_capacity(&self, anchor_id: String, token: via_routes::CapacityToken) {
+        self.route.hold_capacity(anchor_id, token);
     }
 
     /// Recovers one page of committed anchors, up to `limit` after the

@@ -61,6 +61,11 @@ impl EnvAllowList {
     }
 }
 
+/// Type-erased capacity a caller hands Host with a launch (T2-D, runtime §8):
+/// Host owns it for the process group's life and drops it only when no group
+/// was created or when it has positively proved the group absent.
+pub type CapacityToken = Box<dyn Send + 'static>;
+
 /// Immutable launch parameters for a VIA-owned private process.
 pub struct PrivateProcessSpec {
     /// Executable path, passed directly without a shell.
@@ -73,6 +78,8 @@ pub struct PrivateProcessSpec {
     pub env: EnvAllowList,
     /// Durable owning turn.
     pub owner: ProcessOwner,
+    /// Capacity held for the group's life; dropped at once if no group starts.
+    pub capacity: Option<CapacityToken>,
 }
 
 /// Requested scope of private process closure.

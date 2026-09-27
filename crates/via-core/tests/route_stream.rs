@@ -169,6 +169,7 @@ impl Child {
                 sender,
                 deadline,
                 force,
+                Box::new(()),
             );
             tokio::pin!(execute);
             loop {
@@ -450,6 +451,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
             sender,
             deadline,
             force,
+            Box::new(()),
         );
         tokio::pin!(execute);
         // Force only once backpressure is observed: the channel is full, so the
@@ -529,6 +531,7 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
             sender,
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
             force,
+            Box::new(()),
         );
         // The stand-in writes flags beside its anchor directory.
         let flags = root.clone();
@@ -581,6 +584,7 @@ fn stalled_acquisition_with_force(
             sender,
             Deadline::at(deadline),
             force,
+            Box::new(()),
         );
         let (result, ()) = tokio::join!(execute, async {
             force_at(&root, deadline).await;

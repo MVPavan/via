@@ -2,7 +2,7 @@
 //! protocol messages or manages processes.
 
 pub use via_host::{
-    CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
+    CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
     PrivateProcessSpec, ProcessOwner, TurnNumber,
 };
 pub use via_store::{ConnectionId, Deadline, RawRef, RuntimeResources, SessionId};

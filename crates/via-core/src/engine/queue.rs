@@ -22,6 +22,9 @@ pub(super) const SESSION_QUEUE_LIMIT: u32 = via_store::SESSION_QUEUE_LIMIT;
 /// dispatcher-start channel's capacity.
 pub(super) const DAEMON_QUEUE_LIMIT: usize = 128;
 
+/// Active private connections daemon-wide (runtime §8, design §11).
+pub(super) const CONNECTION_SLOTS: usize = 4;
+
 /// First delay after a failed Store read or while waiting on an unowned predecessor.
 const RETRY_MIN: Duration = Duration::from_millis(250);
 

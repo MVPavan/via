@@ -40,7 +40,7 @@ POINTS = [
     "core.dispatch.before_grant",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
-MARKERS = [*ACTIVATION, *POINTS, "failpoint controller"]
+MARKERS = [*ACTIVATION, *POINTS, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {
     "expected_request": {"type": "start", "id": 1, "turn": 1, "prompt": "release"},
     "steps": [

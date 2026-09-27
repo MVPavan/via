@@ -1,7 +1,7 @@
 //! Daemon-side anchor launch, durable gate and verified cleanup.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
@@ -33,6 +33,10 @@ use crate::{
     protocol::{self, Bootstrap, Reply, Request, VendorConfig},
 };
 
+/// Absence verification after a failed acquisition: close's cleanup
+/// allowance (Route bounds every close by 3 s).
+const FAILED_ACQUIRE_CLEANUP: Duration = Duration::from_secs(3);
+
 /// One daemon-side Host instance tied to a validated private anchor directory.
 #[derive(Clone)]
 pub struct Host {
@@ -40,6 +44,34 @@ pub struct Host {
     anchor_binary: PathBuf,
     anchor_dir: PathBuf,
     tasks: Arc<StdMutex<HostTasks>>,
+    capacity: Capacity,
+}
+
+/// Capacity tokens by anchor id: one per group that may still live, dropped
+/// exactly once, when Host proves that group absent (runtime §5: a timed-out
+/// wait releases no admission capacity).
+#[derive(Clone, Default)]
+struct Capacity(Arc<StdMutex<HashMap<String, crate::CapacityToken>>>);
+
+impl Capacity {
+    fn hold(&self, anchor_id: String, token: crate::CapacityToken) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(anchor_id, token);
+    }
+
+    /// Releases the anchor's capacity once its group is proved absent.
+    fn settle(&self, anchor_id: &str, cleanup: &CleanupEvidence) {
+        if matches!(cleanup, CleanupEvidence::GroupAbsent(_)) {
+            let token = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(anchor_id);
+            drop(token);
+        }
+    }
 }
 
 /// Owned tasks and live controls, plus facts kept until the daemon exits.
@@ -209,6 +241,7 @@ pub struct ProcessControl {
     journal: ProcessJournal,
     exit: ExitReceiver,
     stop: Arc<StopFacts>,
+    capacity: Capacity,
 }
 
 /// Process facts and cleanup evidence from a close request.
@@ -305,6 +338,7 @@ impl Host {
             anchor_binary,
             anchor_dir,
             tasks: Arc::new(StdMutex::new(HostTasks::default())),
+            capacity: Capacity::default(),
         })
     }
 
@@ -352,12 +386,45 @@ impl Host {
         {
             return Err(HostError::Invalid("reserved vendor marker environment key"));
         }
-        timeout_at(deadline.instant(), self.acquire_inner(spec, launch, stop))
-            .await
-            .map_err(|_| HostError::Deadline)?
+        let mut started = None;
+        let acquired = timeout_at(
+            deadline.instant(),
+            self.acquire_inner(spec, launch, stop, &mut started),
+        )
+        .await
+        .map_err(|_| HostError::Deadline)
+        .flatten();
+        if acquired.is_err()
+            && let Some((anchor_id, generation, identity)) = started
+        {
+            // Design §11: a failed acquisition whose anchor spawned proves the
+            // group absent before it returns, as close does and within close's
+            // cleanup allowance. The anchor control is dropped by now, so the
+            // anchor exits on EOF and stops its group. Only `GroupAbsent`
+            // releases the anchor's capacity; uncertainty keeps it.
+            let cleanup = Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP);
+            let evidence = wait_absence(&self.journal, &anchor_id, &generation, &identity, cleanup)
+                .await
+                .unwrap_or(CleanupEvidence::Uncertain(
+                    CleanupReason::EvidenceStoreFailure,
+                ));
+            self.capacity.settle(&anchor_id, &evidence);
+        }
+        acquired
     }
 
-    async fn start_anchor(&self, owner: crate::ProcessOwner) -> Result<StartedAnchor, HostError> {
+    /// Holds capacity for a group this Host did not launch, such as one an
+    /// earlier daemon left whose absence recovery did not prove; a later
+    /// absence proof for `anchor_id` releases it.
+    pub fn hold_capacity(&self, anchor_id: String, token: crate::CapacityToken) {
+        self.capacity.hold(anchor_id, token);
+    }
+
+    async fn start_anchor(
+        &self,
+        owner: crate::ProcessOwner,
+        capacity: Option<crate::CapacityToken>,
+    ) -> Result<StartedAnchor, HostError> {
         let anchor_id = linux::random_hex()?;
         let generation = linux::random_hex()?;
         let marker = linux::random_hex()?;
@@ -397,6 +464,11 @@ impl Host {
         drop(config);
 
         let (pipes, anchor_process_id) = self.spawn_anchor(&config_path)?;
+        // The group exists from here: its capacity stays with Host until
+        // absence is proved. A failure above dropped it with no group.
+        if let Some(token) = capacity {
+            self.capacity.hold(anchor_id.clone(), token);
+        }
         let mut stream = connect_anchor(&socket_path).await?;
         let ready = protocol::read_frame::<Reply>(&mut stream, 1024)
             .await?
@@ -480,9 +552,10 @@ impl Host {
 
     async fn acquire_inner(
         &self,
-        spec: PrivateProcessSpec,
+        mut spec: PrivateProcessSpec,
         launch: &LaunchPipes,
         stop: &watch::Receiver<bool>,
+        started: &mut Option<(String, String, ProcessIdentity)>,
     ) -> Result<AcquiredProcess, HostError> {
         let StartedAnchor {
             anchor_id,
@@ -491,7 +564,10 @@ impl Host {
             mut stream,
             pipes,
             version,
-        } = self.start_anchor(spec.owner.clone()).await?;
+        } = self
+            .start_anchor(spec.owner.clone(), spec.capacity.take())
+            .await?;
+        *started = Some((anchor_id.clone(), generation.clone(), identity.clone()));
         let mut vendor_env = spec.env.entries().to_vec();
         vendor_env.push(("VIA_PROCESS_MARKER".into(), linux::random_hex()?.into()));
         let vendor = VendorConfig::from_parts(&spec.program, &spec.args, &spec.cwd, &vendor_env);
@@ -555,6 +631,7 @@ impl Host {
             journal: self.journal.clone(),
             exit: exits.clone(),
             stop: Arc::default(),
+            capacity: self.capacity.clone(),
         };
         self.track_control(&control, sender);
         Ok(AcquiredProcess {
@@ -671,6 +748,7 @@ impl Host {
                     journal: self.journal.clone(),
                     exit: tracked.exit,
                     stop: tracked.stop,
+                    capacity: self.capacity.clone(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -776,6 +854,7 @@ impl Host {
             let owner_session = record.intent.owner_session.clone();
             let owner_turn = record.intent.owner_turn;
             let cleanup = self.recover_one(record, deadline).await?;
+            self.capacity.settle(&anchor_id, &cleanup);
             let forced = self
                 .tasks
                 .lock()
@@ -964,6 +1043,7 @@ impl ProcessControl {
         .unwrap_or(CleanupEvidence::Uncertain(
             CleanupReason::EvidenceStoreFailure,
         ));
+        self.capacity.settle(&self.anchor_id, &cleanup);
         CloseReport {
             cleanup,
             vendor_exit: *self.exit.borrow(),
