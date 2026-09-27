@@ -39,11 +39,15 @@ the historical checkpoint; its findings table is updated by this section.
   Deferred items are on `via-jm4.7.6` (harness gaps) and `via-jm4.7.7`
   (session closure on stop, shutdown phase budget, failpoint-deterministic
   timing tests, Store-failure lifecycle).
-- Next: W5 ([w5/README.md](w5/README.md)) splits `via-core/src/engine.rs`
-  (Opus 5.5 medium, cloud); then Task 2 (`via-jm4.7.6`, failpoint
-  controller first), Task 3 (`.7.7`), Task 4 (`.7.8`), final critique
-  (`.7.9`). After a reboot, restore tmux session `via` (windows `main`, and
-  `watch` running `scratchpad/cloud/watch-branches.sh`).
+- W5-S split `via-core/src/engine.rs` into `engine.rs` (API entry points,
+  shared types), `engine/drive.rs`, `engine/stop.rs`, `engine/terminal.rs`
+  (Sol SOUND; merged `0f3650f`; 122 passed, 2 ignored).
+- Now: S1 Task 2 (`via-jm4.7.6`, [t2/README.md](t2/README.md)): T2-A
+  failpoint controller + F8/F10 (Opus 5.5 high) and T2-B multi-turn
+  sessions, resume, queues, retries + F13/F14/F17/F28 (Opus 5.5 medium), in
+  parallel cloud sessions. Then Task 3 (`.7.7`), Task 4 (`.7.8`), final
+  critique (`.7.9`). After a reboot, restore tmux session `via` (windows
+  `main`, and `watch` running `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
