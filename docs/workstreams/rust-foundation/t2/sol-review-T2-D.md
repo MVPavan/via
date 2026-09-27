@@ -1,0 +1,15 @@
+**Verdict: UNSOUND.** The normal dispatch path reserves a permit before grant and submission, transfers it to Host after anchor spawn, and releases it on a refused grant, a failed submission, or Host’s `GroupAbsent` proof. Forced turns retain Host ownership through final shutdown, and the restart handoff runs after recovery. I found no double release on those paths. Two lifecycle gaps block the merge.
+
+### Merge blockers
+
+1. **Failed acquisition can exhaust the pool during normal operation.** Host records the permit when the anchor spawns (`crates/via-host/src/host.rs:440`), but an acquisition error returns through Wire without an absence check (`crates/via-wire/src/runtime.rs:237`). An invalid or missing vendor executable can fail at ARM (`crates/via-host/src/anchor.rs:279`). The anchor may then exit, yet its slot remains held until shutdown or restart. Four such failures can leave later turns queued indefinitely. A Configure refusal is less likely with a valid spec, but follows the same path. **Fix:** make Host’s failed-acquisition path perform bounded absence verification and settle that anchor’s ledger entry only on `GroupAbsent`; retain the token on uncertainty. Add a regression using an ARM launch failure followed by another eligible turn.
+
+2. **A recovery deadline can permit launches alongside uncounted earlier groups.** Reconciliation returns success when paging expires (`crates/via-core/src/engine/recovery.rs:139`); only anchors in pages already read receive recovered capacity (`crates/via-core/src/engine/recovery.rs:183`). An unread, live anchor can therefore coexist with four newly launched groups, violating runtime §8. **Fix:** fail startup on incomplete anchor inventory, before the queued-turn handoff or admission. Add a regression with a live anchor beyond the last reconciled page. The existing deadline test that expects startup to proceed will need updating.
+
+### Deferrable
+
+The lack of a periodic re-probe remains a liveness limitation after genuinely uncertain cleanup: capacity may stay unavailable until shutdown or restart (`docs/workstreams/rust-foundation/t2/dispatch-design.md:547`). Given the recorded follow-up on `via-jm4.7.7`, it is acceptable for this merge **after** the failed-acquisition path above is fixed. Unread anchors holding no slot are **not** acceptable; that is blocker 2.
+
+`RecoveredSlots` preserves the pool count when recovered groups exceed available permits (`crates/via-core/src/engine/recovery.rs:421`); its unit test checks release as the group count falls. The type-erased token passes downward without a Core dependency in Host, and `VIA_TEST_CONNECTION_SLOTS` is feature-gated with a release marker check (`crates/via-core/src/engine.rs:189`, `scripts/check-release-features.py:43`). The six-turn, force, latch, uncertain-cleanup, recovered-group, and 130-session regressions detect their stated original failures. They do not cover either blocker.
+
+**Checks:** I inspected the requested refs and contracts; `git diff --check 964d867...9bc790a` passed. I did not run build or tests in this read-only review. The working tree’s existing Beads changes were untouched.
