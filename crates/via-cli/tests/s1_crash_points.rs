@@ -831,7 +831,53 @@ fn restarted_unknown(
         || format!("turn was submitted again: {types:?}"),
     )?;
     restart_cleanup(paths, session, &envelope, &types)?;
+    let ended: String = paths
+        .store()?
+        .query_row(
+            "SELECT event FROM events WHERE session_id=?1 ORDER BY seq DESC LIMIT 1",
+            [session],
+            |row| row.get(0),
+        )
+        .map_err(infra)?;
+    let ended: Value = serde_json::from_str(&ended).map_err(infra)?;
+    check(
+        envelope["failure"]["class"] == "daemon_restart"
+            && ended["failure"]["class"] == "daemon_restart"
+            && ended["state"] == "unknown",
+        || {
+            format!(
+                "recovered turn lacks daemon_restart: {} / {ended}",
+                envelope["failure"]
+            )
+        },
+    )?;
     Ok(envelope)
+}
+
+/// Starts a daemon that must refuse to come up. Its accept loop starts only
+/// after recovery succeeds, so its exit proves no request was admitted.
+fn refused_start(
+    paths: &Paths,
+    evidence: &Evidence,
+    run: &str,
+) -> Result<(ExitStatus, String), ScenarioError> {
+    let trace = evidence.dir.join(format!("daemon-{run}.trace"));
+    let mut command = paths.command();
+    paths.failpoints.activate(&mut command);
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(&trace).map_err(infra)?);
+    let mut child = command.spawn().map_err(infra)?;
+    let Some(status) = wait_child(&mut child, Duration::from_secs(15))? else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(fail(
+            "daemon admitted requests after a failed reconciliation",
+        ));
+    };
+    Ok((status, fs::read_to_string(&trace).map_err(infra)?))
 }
 
 /// C1 §7.5: before admission Host reconciled the crashed daemon's anchors and
@@ -1087,4 +1133,77 @@ fn failpoint_harness_rejects_stale_acknowledgements() -> TestResult {
         Err(error) if error.contains("unexpected acknowledgement") => Ok(()),
         other => Err(format!("another daemon's acknowledgement was accepted: {other:?}").into()),
     }
+}
+
+/// F10 / C1 §7.5: when Host cannot reconcile the committed anchors (here its
+/// anchor inventory is unreadable), startup fails with a named error before
+/// admission and commits no recovery; once the inventory is readable again
+/// the turn recovers as `unknown`.
+#[test]
+fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
+    scenario(
+        "s1_f10_failed_host_reconciliation",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let point = "wire.prompt.after_write";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            wait_file(&paths.sync.join("prompted.entered"))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let tamper = |phase: &str| {
+                let store =
+                    rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+                store
+                    .execute(
+                        "UPDATE anchors SET phase=?2 WHERE owner_session=?1",
+                        [session.as_str(), phase],
+                    )
+                    .map_err(infra)
+            };
+            let phase: String = paths
+                .store()?
+                .query_row(
+                    "SELECT phase FROM anchors WHERE owner_session=?1",
+                    [&session],
+                    |row| row.get(0),
+                )
+                .map_err(infra)?;
+            check(tamper("unreadable")? == 1, || {
+                "no anchor to tamper".to_owned()
+            })?;
+            let (status, trace) = refused_start(paths, evidence, "refused")?;
+            check(
+                !status.success() && trace.contains("host_reconciliation_failed"),
+                || format!("startup did not fail by name ({status}): {trace}"),
+            )?;
+            let turn = paths.turn(&session)?;
+            let types = paths.event_types(&session)?;
+            check(
+                turn.state == "running"
+                    && turn.envelope.is_none()
+                    && types == ["turn.queued", "turn.submitted"],
+                || {
+                    format!(
+                        "recovery committed without reconciliation: {} {types:?}",
+                        turn.state
+                    )
+                },
+            )?;
+            tamper(&phase)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
 }

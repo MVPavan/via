@@ -6,7 +6,8 @@ use super::{
     Receiver, SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
     SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn, Value,
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, fs, oneshot, params, read_anchor_records, read_raw_ref, validate_raw_ref,
+    commit_vendor_facts, fs, oneshot, params, read_anchor_owners, read_anchor_records,
+    read_raw_ref, validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -164,6 +165,10 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
             }
             Command::Unfinished(reply) => {
                 let _ = reply.send(read_unfinished(&conn));
+                false
+            }
+            Command::AnchorOwners(reply) => {
+                let _ = reply.send(read_anchor_owners(&conn));
                 false
             }
             Command::Authenticate(session, hash, reply) => {

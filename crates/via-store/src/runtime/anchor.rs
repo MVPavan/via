@@ -1,8 +1,9 @@
 //! Durable anchor identity, ARM intent and absence journal.
 
 use super::{
-    AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord, Connection,
-    GroupAbsenceRecord, PathBuf, SessionId, StoreError, TransactionBehavior, TurnNumber, params,
+    AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord,
+    Connection, GroupAbsenceRecord, PathBuf, SessionId, StoreError, TransactionBehavior,
+    TurnNumber, params,
 };
 
 pub(super) fn commit_anchor_intent(
@@ -157,7 +158,7 @@ pub(super) fn commit_group_absence(
 pub(super) fn read_anchor_records(conn: &Connection) -> Result<Vec<AnchorRecord>, StoreError> {
     let mut query = conn.prepare(
         "SELECT anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,
-                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors ORDER BY anchor_id LIMIT 10000"
+                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors ORDER BY anchor_id LIMIT 10001"
     ).map_err(|error| StoreError::Write(error.to_string()))?;
     let rows = query
         .query_map([], |row| {
@@ -216,6 +217,50 @@ pub(super) fn read_anchor_records(conn: &Connection) -> Result<Vec<AnchorRecord>
             })
         })
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    rows.map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
-        .collect()
+    let records = rows
+        .map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A partial inventory would let recovery skip a live group: fail instead.
+    if records.len() > ANCHOR_INVENTORY_LIMIT {
+        return Err(StoreError::Constraint(
+            "anchor inventory exceeds 10000 records",
+        ));
+    }
+    Ok(records)
 }
+
+/// Every committed anchor with its owning turn, for recovery's coverage
+/// check; no marker, identity or control path.
+pub(super) fn read_anchor_owners(conn: &Connection) -> Result<Vec<AnchorOwner>, StoreError> {
+    let mut query = conn
+        .prepare(
+            "SELECT anchor_id,owner_session,owner_turn FROM anchors ORDER BY anchor_id LIMIT 10001",
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let rows = query
+        .query_map([], |row| {
+            let owner: String = row.get(1)?;
+            let session =
+                SessionId::try_from(owner.as_str()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let turn = TurnNumber::try_from(row.get::<_, u32>(2)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(AnchorOwner {
+                anchor_id: row.get(0)?,
+                session_id: session,
+                turn,
+            })
+        })
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let owners = rows
+        .map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    if owners.len() > ANCHOR_INVENTORY_LIMIT {
+        return Err(StoreError::Constraint(
+            "anchor inventory exceeds 10000 records",
+        ));
+    }
+    Ok(owners)
+}
+
+/// Bound of one complete anchor inventory; beyond it reads fail explicitly.
+const ANCHOR_INVENTORY_LIMIT: usize = 10_000;

@@ -223,10 +223,10 @@ pub mod failpoint;
 mod runtime;
 
 pub use runtime::{
-    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord,
-    DurableRaw, EventRecord, GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter,
-    ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent,
-    SubmissionRecord, TerminalRecord, UnfinishedTurn,
+    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase,
+    AnchorRecord, DurableRaw, EventRecord, GroupAbsenceRecord, ProcessJournal, RawFactory,
+    RawStream, RawWriter, ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient,
+    StoreError, StoredEvent, SubmissionRecord, TerminalRecord, UnfinishedTurn,
 };
 
 #[cfg(feature = "test-failpoints")]

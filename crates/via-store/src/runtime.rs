@@ -146,6 +146,16 @@ pub struct UnfinishedTurn {
     pub correlation: Option<String>,
 }
 
+/// A committed anchor and its owning turn; no marker, identity or control path.
+pub struct AnchorOwner {
+    /// Opaque committed anchor identifier.
+    pub anchor_id: String,
+    /// Owning session.
+    pub session_id: SessionId,
+    /// Owning turn.
+    pub turn: TurnNumber,
+}
+
 /// One durable event returned in sequence order.
 pub struct StoredEvent {
     /// Dense per-session sequence.
@@ -408,6 +418,7 @@ enum Command {
     ),
     Logs(SessionId, oneshot::Sender<Result<Value, StoreError>>),
     Unfinished(oneshot::Sender<Result<Vec<UnfinishedTurn>, StoreError>>),
+    AnchorOwners(oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>),
     Authenticate(
         SessionId,
         [u8; 32],
@@ -657,6 +668,14 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
+    /// Returns every committed anchor id with its owning turn (at most
+    /// 10000; more is an explicit error), for recovery's coverage check.
+    pub async fn anchor_owners(&self) -> Result<Vec<AnchorOwner>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AnchorOwners(reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
     /// Reads committed raw excerpts for one session in event order.
     pub async fn logs(&self, session_id: &SessionId) -> Result<Value, StoreError> {
         let (reply, receive) = oneshot::channel();
@@ -796,7 +815,7 @@ mod sql;
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, read_anchor_records,
+    commit_vendor_facts, read_anchor_owners, read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, validate_regular, validate_state, writer_loop};

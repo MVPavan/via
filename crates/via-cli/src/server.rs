@@ -120,7 +120,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let recovered = engine
         .recover()
         .await
-        .map_err(|error| anyhow::anyhow!("crash recovery failed: {}", error.kind))?;
+        .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
     if recovered > 0 {
         tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
     }

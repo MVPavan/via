@@ -329,3 +329,102 @@ The shared-file hunks are unchanged since Round 1.
 - keyed receipt replay and queued-successor cancellation (T2-B);
 - recovered raw-log incompleteness (`via-jm4.7.7`);
 - the recovered envelope's `failure: null` versus `daemon_restart`.
+
+## Round 3
+
+Response to [../sol-review-T2-A-r2.md](../sol-review-T2-A-r2.md) (SOUND WITH
+CHANGES). I merged `origin/rust-foundation` (`63661b6`, docs only) first.
+
+**B1: startup reconciliation must finish before admission.**
+`Engine::recover` now returns a named error instead of discarding Host's
+result. `serve` fails startup with `crash recovery failed: <name>`, and the
+accept loop never starts. There are three named errors:
+
+- `host_reconciliation_failed`: Host recovery returned an error.
+- `host_reconciliation_incomplete`: Host returned at or after its 5 s
+  deadline, when later anchors may have got a report without a stop attempt.
+- `host_reconciliation_incomplete`: some committed anchor has no report.
+  Coverage is checked against a new Store read, `StoreClient::anchor_owners`,
+  which returns the ids and owning turns of all committed anchors and no
+  marker, identity or path.
+
+Store changes:
+
+- Neither anchor read is silently capped now. `read_anchor_records`, which
+  Host uses, and the new owners read both fetch 10,001 rows and fail
+  explicitly past 10,000 (`anchor inventory exceeds 10000 records`). A
+  failure fails startup through the paths above.
+
+Per-turn cleanup is computed from that inventory (`Reconciled`):
+
+- Every anchor of the turn needs a report: an unreported anchor makes the
+  turn `uncertain` and is counted missing, and any missing anchor fails
+  startup before recovery commits anything.
+- A report's own verified `Uncertain` stays `uncertain`.
+- `forced` comes only from the reports.
+- A turn with no committed anchor intent is `quiescent`, because no process
+  could exist.
+
+**B2: `daemon_restart`.** New `FailureClass::DaemonRestart`, which
+serializes as `daemon_restart`. A recovered turn commits it in both the
+envelope and `turn.ended`, and the state stays `unknown`.
+
+**Regressions.**
+
+- `recovery::tests` (isolated, 2):
+  - An anchor missing from the reports is counted missing, and its turn is
+    `(quiescent=false, forced=false)`.
+  - A verified `Uncertain` report stays uncertain, and full proof is
+    `quiescent`.
+- `s1_f10_failed_host_reconciliation_refuses_admission` (real binary): the
+  daemon crashes after the prompt write, and the harness makes the anchor row
+  unreadable by writing an invalid phase. The restarted daemon exits before
+  admission with:
+
+  ```
+  crash recovery failed: host_reconciliation_failed: adapter runtime failed: host acquisition failed: process journal unavailable: Write
+  ```
+
+  Nothing was committed: the turn is still `running`, has no envelope, and
+  its events are only `[turn.queued, turn.submitted]`. After the row is
+  restored, a restart recovers the turn as `unknown`.
+- All F10 restart checks now also require `failure.class: daemon_restart` in
+  the envelope and in `turn.ended`.
+
+**Before** (Round 2 code with the new tests, in a throwaway worktree;
+`scratchpad/t2a/r3-before.txt`): 4 of 5 F10 tests failed.
+
+- The three restart tests failed with
+  `recovered turn lacks daemon_restart: null`.
+- The new test failed with
+  `daemon admitted requests after a failed reconciliation`: Round 2's `.ok()`
+  let the daemon come up.
+
+After the fix, all pass.
+
+**Not covered deterministically:** the omitted-report and deadline branches
+have no end-to-end test. Host always reports every record it lists, so these
+branches are covered by the isolated `Reconciled` tests and by code review.
+Deterministic end-to-end tests for Host's uncertain and forced paths stay
+deferred to the planned Host seam.
+
+**Files (Round 3):**
+
+- `crates/via-core/src/engine/recovery.rs`
+- `crates/via-core/src/api.rs` (`DaemonRestart`)
+- `crates/via-cli/src/server.rs` (named error)
+- `crates/via-store/src/runtime.rs` (`AnchorOwner`, `anchor_owners`)
+- `crates/via-store/src/runtime/anchor.rs` (explicit bound, owners read)
+- `crates/via-store/src/runtime/sql.rs` (one read arm)
+- `crates/via-store/src/lib.rs`
+- `crates/via-cli/tests/s1_crash_points.rs`
+
+**Gate (Round 3):**
+
+- fmt, both clippy runs, `cargo deny` and the layer check pass.
+- Default nextest: 128 passed, 2 skipped.
+- nextest with the failpoint feature: 137 passed, 2 skipped.
+- The F08–F12 line: 8 passed; the F08/F10 selection passed in 3 more runs.
+- The release build and `check-release-features.py` pass.
+- The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
+  (Task 4).
