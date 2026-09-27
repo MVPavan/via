@@ -188,7 +188,10 @@ Store transaction, then returns the receipt; dispatch follows.
 
 Errors: `invalid_params` (incl. `vendor_option_conflict`), `unknown_model`,
 `harness_unavailable`, `missing_capability`, `bound_unsupported`,
-`admission_refused`, `store_error`. Idempotency (P4): same key + same handle
+`admission_refused`, `store_error`. When the daemon already retains its
+bound of unresolved turns (runtime contract §8), `spawn` is refused
+`admission_refused` if all are in flight, and `store_error` while any retained
+turn failed to persist its terminal. Idempotency (P4): same key + same handle
 hash + byte-identical params → the stored receipt; different handle or
 params → `invalid_params` with `kind: idempotency_conflict`.
 `allow_untested` is included in that exact retry identity. It waives only
@@ -293,6 +296,8 @@ After a receipt, a persistent Store failure that prevents terminal persistence
 returns `store_error` with `session`, `turn`, last-known `durable_state` and
 `terminal_persisted:false`. It is a request error for the read, not a terminal
 envelope. An already committed, readable terminal result is returned as is.
+A `wait` whose result is still absent once final shutdown has committed its
+last record ends `daemon_stopping`.
 
 ### 3.10 `list`
 
@@ -376,7 +381,8 @@ for new work, run accepted queued turns to completion, then stop) or
 `unknown`). `drain` with `force` is `invalid_params`; after acceptance new
 work is refused `daemon_stopping`. The result `{"stopping":true}` only
 acknowledges acceptance; it is not evidence that work stopped or the daemon
-exited. Drain runs accepted turns under their existing deadlines; force and
+exited. A session closed by `force` commits `session.closed` with
+`reason: "daemon_stop_force"`. Drain runs accepted turns under their existing deadlines; force and
 an idle stop then share one final 10 s shutdown deadline. The daemon exits 0
 only after positive cleanup, joins and durable records, otherwise 4
 (runtime contract §6.2).
@@ -529,7 +535,7 @@ envelope except through §7.6. `raw_ref` is `null` for synthesized events.
 | `usage.updated` | as envelope `usage` | Adapter |
 | `warning` | `code`, `message` | either |
 | `process.exited`, `server.lost`, `raw_log.incomplete` | `code`, `signal` / `key` / `connection_id` | Core (from Host / Wire) |
-| `vendor.other` | `vendor_type`, `payload` (bounded) | Adapter |
+| `vendor.other` | `vendor_type`, `payload` (bounded to 16 KiB), `truncated` (`true` when the payload was cut to that bound, C2 A1) | Adapter |
 
 For a delayed-init CLI such as Claude, `session.opened`/`session.reopened`
 is committed exactly once per connection generation only after matching
@@ -593,7 +599,9 @@ settled envelope. Behind an `unknown` predecessor the queue is cancelled. Admiss
 
 ### 7.4 Cancel outcomes
 
-`requested` (sent, no ack), `acknowledged` (vendor evidence: Codex
+`requested` (sent, no ack; also a force accepted before any vendor launch,
+where nothing exists to acknowledge; cleanup is then `quiescent` when Host's
+journal is complete, since nothing was launched, runtime contract §6.2), `acknowledged` (vendor evidence: Codex
 `turn/completed` status `interrupted`; ACP `stopReason: cancelled`; Claude
 `control_response success` for `interrupt` followed by a `result` with
 `subtype: error_during_execution` and `terminal_reason: aborted_tools`,
@@ -639,7 +647,7 @@ that does not prove its submitted work had no effect.
 | Vendor terminal `completed` | running | `completed`; `stop_reason` from vendor |
 | Vendor terminal `failed` | running | `failed`, class from vendor code (§8.2) |
 | Core deadline | running | Core cancels (§7.4); result `failed`, class `deadline_wall`/`deadline_idle`, `cancel` filled |
-| Force deadline, private process | running | `cancelled`, `forced` only with Host evidence; cleanup `quiescent` only after verified group absence (§7.5) |
+| Force deadline, private process | running | `cancelled`, `forced` only with Host evidence; cleanup `quiescent` only after verified group absence (§7.5). If a turn event already failed to commit, the result is `failed(store)` instead, with `cancel` still filled |
 | Force deadline, shared server | running | `unknown`, outcome `unknown` |
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |

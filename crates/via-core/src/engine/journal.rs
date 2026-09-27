@@ -122,8 +122,9 @@ pub(super) struct UncertainEvent {
 }
 
 /// Most receipted turns without a terminal known durable, in flight or failed,
-/// that the daemon retains. While this many are retained, spawn refuses new work
-/// with `store_error`, so no accepted turn loses its C1 `store_error` read.
+/// that the daemon retains. While this many are retained, spawn refuses new work:
+/// `admission_refused` when all are in flight, `store_error` while a failed turn
+/// is retained, so no accepted turn loses its C1 `store_error` read.
 pub(super) const UNRESOLVED_LIMIT: usize = 256;
 
 /// Bound on the Store reads that settle failed turns before admission is refused.
