@@ -37,6 +37,17 @@ pub(super) struct Submission {
     clock: Instant,
 }
 
+/// A queued turn's dispatch decision from its predecessors' durable state.
+enum Dispatch {
+    Run,
+    Wait,
+    Cancel,
+}
+
+/// Longest a waiting turn goes before re-reading its predecessors: bounds the
+/// retry after a failed read and the wait for an orphan's reconciliation.
+const DISPATCH_RECHECK: Duration = Duration::from_millis(250);
+
 /// How a drive's execution ended.
 enum Driven {
     /// The adapter returned its outcome.
@@ -87,10 +98,27 @@ impl Engine {
         let slot = self.slot(&session).ok_or(ApiError::STORE)?;
         slot.turn(turn).await;
         let _finish = Finish::new(&slot, turn);
-        if !self.dispatchable(&session, turn).await {
-            let cancelled = self.cancel_queued(&slot, &session, turn).await;
-            queued.leave();
-            return cancelled;
+        let mut changes = slot.subscribe();
+        let mut force = self.force.subscribe();
+        loop {
+            let cancel = match self.dispatch(&session, turn).await {
+                Dispatch::Run => break,
+                Dispatch::Cancel => true,
+                // `daemon/stop --force` closes the session: a waiting turn is cancelled.
+                Dispatch::Wait => *force.borrow(),
+            };
+            if cancel {
+                let cancelled = self.cancel_queued(&slot, &session, turn).await;
+                queued.leave();
+                return cancelled;
+            }
+            // An orphan predecessor may be committed; reconciling it lets it run.
+            self.reconcile_orphans().await;
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = force.wait_for(|forced| *forced) => {}
+                () = tokio::time::sleep(DISPATCH_RECHECK) => {}
+            }
         }
         let submission =
             Self::submit(&self.store, &self.unresolved, &session, turn, &slot.head).await;
@@ -98,20 +126,47 @@ impl Engine {
         self.run(&slot, submission?).await
     }
 
-    /// C1 P6/§7.3 from durable state: a turn may run only when no earlier turn
-    /// is unresolved (queued, running, or its terminal not durable) and the
-    /// latest submitted one is terminal, not `unknown`, with settled cleanup.
-    /// Turns cancelled while queued never ran and are passed over. A Store
-    /// that cannot answer permits nothing.
-    async fn dispatchable(&self, session: &SessionId, turn: TurnNumber) -> bool {
-        match self.store.predecessors(session, turn).await {
-            Ok(predecessors) if !predecessors.unresolved => {
-                predecessors.last_submitted.is_none_or(|envelope| {
-                    envelope["state"] != "unknown" && envelope["cancel"]["cleanup"] != "pending"
-                })
-            }
-            _ => false,
+    /// C1 P6/§7.3 from durable state. While any earlier turn is unresolved
+    /// (queued, including an orphan awaiting reconciliation, or running, or
+    /// with no durable terminal) the turn waits; so does it when Store cannot
+    /// answer. Otherwise the latest submitted earlier turn decides: durably
+    /// `unknown` or cleanup `pending` cancels, anything else runs. Turns
+    /// cancelled while queued never ran and are passed over.
+    async fn dispatch(&self, session: &SessionId, turn: TurnNumber) -> Dispatch {
+        let Ok(predecessors) = self.predecessors(session, turn).await else {
+            return Dispatch::Wait;
+        };
+        if predecessors.unresolved {
+            return Dispatch::Wait;
         }
+        match predecessors.last_submitted {
+            Some(envelope)
+                if envelope["state"] == "unknown" || envelope["cancel"]["cleanup"] == "pending" =>
+            {
+                Dispatch::Cancel
+            }
+            _ => Dispatch::Run,
+        }
+    }
+
+    /// The Store read behind a dispatch decision; the test fault backend can fail it.
+    async fn predecessors(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<via_store::Predecessors, via_store::StoreError> {
+        #[cfg(test)]
+        if self
+            .faults
+            .predecessors_unreadable
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(via_store::StoreError::Unavailable);
+        }
+        self.store.predecessors(session, turn).await
     }
 
     /// Executes a submitted turn to its terminal.

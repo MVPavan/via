@@ -1,6 +1,6 @@
 //! Per-session dispatch (C1 §7.3): one turn runs at a time, in FIFO order.
 //! Whether a turn may run once its predecessors' drives are done is decided
-//! from their durable state (`Engine::dispatchable`), never remembered here.
+//! from their durable state (`Engine::dispatch`), never remembered here.
 
 use std::sync::Arc;
 
@@ -38,8 +38,13 @@ impl Slot {
         let _ = done.wait_for(|done| *done >= turn.get() - 1).await;
     }
 
+    /// Wakes when any turn of the session finishes its drive.
+    pub(super) fn subscribe(&self) -> watch::Receiver<u32> {
+        self.done.subscribe()
+    }
+
     /// Records that `turn` has no drive left: it finished, or no drive of this
-    /// daemon will run it unless a keyed retry adopts it.
+    /// daemon runs it until the orphan is adopted.
     pub(super) fn finish(&self, turn: TurnNumber) {
         self.done
             .send_modify(|done| *done = (*done).max(turn.get()));

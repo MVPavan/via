@@ -693,6 +693,11 @@ that does not prove its submitted work had no effect.
 | -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. A persistent raw-reference read failure also uses this kind. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
 
+A receipt whose commit outcome is `unknown` is never lost: once Store reads
+succeed the daemon reconciles it itself, keyed or not, and a committed turn
+runs exactly once; only a keyed caller can safely retry to learn its receipt,
+so an unkeyed caller must not resend the request.
+
 ### 8.2 Turn failure classes (`failure.class`)
 
 | Class | Meaning | Set by |

@@ -122,6 +122,10 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             .map_err(anyhow::Error::msg)?,
     );
     let (drive_tx, mut drive_rx) = mpsc::channel::<Handoff>(16);
+    // Orphans the daemon found committed itself; the Engine gives this out once.
+    let mut adopted = engine
+        .take_adoptions()
+        .context("Engine adoption channel already taken")?;
     // An accepted stop wakes main at once; Core holds the authoritative mode.
     let stop = Arc::new(Notify::new());
     let (closing_tx, closing) = watch::channel(false);
@@ -154,6 +158,9 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             Some((session, turn)) = drive_rx.recv() => {
                 spawn_drive(&mut drives, &engine, session, turn);
             }
+            Some((session, turn)) = adopted.recv() => {
+                spawn_drive(&mut drives, &engine, session, turn);
+            }
             () = stop.notified() => stopping = engine.stop_mode(),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
                 if let Err(error) = result {
@@ -176,6 +183,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         clients,
         drives,
         queued: drive_rx,
+        adopted,
         closing: closing_tx,
         failed: failed_joins,
     };
@@ -215,6 +223,8 @@ struct Joins {
     /// Receipted turns handed off but not yet driven; a client holds a permit
     /// from before its receipt commits until it hands the turn off.
     queued: mpsc::Receiver<Handoff>,
+    /// Turns the Engine adopted itself; none are added once a stop is accepted.
+    adopted: mpsc::Receiver<Handoff>,
     closing: watch::Sender<bool>,
     failed: usize,
 }
@@ -234,6 +244,7 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         mut clients,
         mut drives,
         mut queued,
+        mut adopted,
         closing,
         failed: mut failed_joins,
     } = joins;
@@ -251,6 +262,10 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         }
     })
     .await;
+    while let Ok((session, turn)) = adopted.try_recv() {
+        spawn_drive(&mut drives, &engine, session, turn);
+        queued_drives += 1;
+    }
     // Force-stopped drives return after Route's bounded force cleanup; their
     // terminals commit below.
     let joined = timeout_at(deadline, async {

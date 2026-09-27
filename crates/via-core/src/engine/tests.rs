@@ -231,6 +231,12 @@ fn an_unknown_receipt_outcome_is_store_error_and_its_keyed_retry_adopts_it_once(
 /// drive without a clean disposition, as a drive whose terminal commit could
 /// not be confirmed does.
 async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>) {
+    end_turn(engine, session, 1, state).await;
+}
+
+/// `end_turn_one` for turn `n`; `pending` is a cancelled terminal whose
+/// cleanup is still pending.
+async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&str>) {
     let at = rfc3339(std::time::SystemTime::now());
     let slot = engine.slot(session).unwrap();
     let head = slot.head.lock(&engine.store, session).await.unwrap();
@@ -238,7 +244,7 @@ async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>)
         Event {
             seq,
             session_id: session,
-            turn: Some(1),
+            turn: Some(n),
             late: false,
             at: &at,
             raw_ref: None,
@@ -252,7 +258,7 @@ async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>)
         .store
         .commit_submission(SubmissionRecord {
             session_id: session.clone(),
-            turn: turn(1),
+            turn: turn(n),
             event: event(seq, EventBody::TurnSubmitted { attempt: 1 }),
         })
         .await
@@ -263,15 +269,18 @@ async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>)
             .store
             .commit_terminal(TerminalRecord {
                 session_id: session.clone(),
-                turn: turn(1),
-                envelope: json!({"state":state,"cancel":null}),
+                turn: turn(n),
+                envelope: match state {
+                    "pending" => json!({"state":"cancelled","cancel":{"cleanup":"pending"}}),
+                    state => json!({"state":state,"cancel":null}),
+                },
                 event: event(
                     seq + 1,
                     EventBody::TurnEnded {
-                        state: if state == "unknown" {
-                            "unknown"
-                        } else {
-                            "failed"
+                        state: match state {
+                            "unknown" => "unknown",
+                            "pending" => "cancelled",
+                            _ => "failed",
                         },
                         failure: None,
                         stop_reason: "error",
@@ -287,7 +296,7 @@ async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>)
     head.committed(count);
     engine.queued.fetch_sub(1, Ordering::AcqRel);
     engine.active.fetch_sub(1, Ordering::AcqRel);
-    drop(super::queue::Finish::new(&slot, turn(1)));
+    drop(super::queue::Finish::new(&slot, turn(n)));
 }
 
 async fn submitted(engine: &Engine, session: &SessionId, n: u32) -> bool {
@@ -332,18 +341,18 @@ fn a_turn_behind_a_settled_terminal_runs_however_its_drive_ended() {
     });
 }
 
-/// Item 4: while the predecessor is `unknown` or unresolved, each successor is
-/// cancelled without submission.
+/// C1 §7.3: while the predecessor is durably `unknown`, or its cleanup is
+/// pending, each successor is cancelled without submission.
 #[test]
-fn successors_are_cancelled_while_the_predecessor_is_unknown_or_unresolved() {
+fn successors_are_cancelled_behind_an_unknown_or_cleanup_pending_predecessor() {
     let Some(root) =
-        child("successors_are_cancelled_while_the_predecessor_is_unknown_or_unresolved")
+        child("successors_are_cancelled_behind_an_unknown_or_cleanup_pending_predecessor")
     else {
         return;
     };
     run(async {
         let engine = open(&root);
-        for state in [Some("unknown"), None] {
+        for state in [Some("unknown"), Some("pending")] {
             let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
             resume(&engine, &session, None).await;
             end_turn_one(&engine, &session, state).await;
@@ -351,5 +360,119 @@ fn successors_are_cancelled_while_the_predecessor_is_unknown_or_unresolved() {
             resume(&engine, &session, None).await;
             assert!(!submitted(&engine, &session, 3).await, "{state:?}");
         }
+    });
+}
+
+/// Round 3 blocker 1: a successor that starts while its predecessor is an
+/// orphan (committed, reply lost, outcome unknown) waits rather than cancel;
+/// once the keyed retry adopts and runs the predecessor, the successor runs.
+#[test]
+fn a_successor_waits_for_an_orphan_predecessor_to_be_adopted_then_runs() {
+    let Some(root) = child("a_successor_waits_for_an_orphan_predecessor_to_be_adopted_then_runs")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        end_turn_one(&engine, &session, Some("failed")).await;
+        engine
+            .faults
+            .receipt_reply_lost
+            .store(true, Ordering::Release);
+        engine
+            .faults
+            .reconcile_unreadable
+            .store(true, Ordering::Release);
+        let (params, raw) = resume_raw(&session, Some("r-2"));
+        assert_eq!(
+            engine.resume(params, &raw).await.unwrap_err().data(),
+            unknown_outcome()
+        );
+        let third = resume(&engine, &session, None).await;
+        assert_eq!(third.drive, Some((session.clone(), turn(3))));
+        let address = format!("{}/3", session.as_str());
+        let (ran, ()) = tokio::join!(submitted(&engine, &session, 3), async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let pending = engine.result(&address).await.unwrap_err();
+            assert_eq!(pending.kind, "turn_not_finished", "turn 3 stays queued");
+            // Reconciliation still fails, so only this keyed retry can adopt
+            // turn 2, which then runs and settles.
+            let adopted = resume(&engine, &session, Some("r-2")).await;
+            assert_eq!(adopted.drive, Some((session.clone(), turn(2))));
+            end_turn(&engine, &session, 2, Some("failed")).await;
+        });
+        assert!(ran, "turn 3 submits after its adopted predecessor");
+    });
+}
+
+/// Round 3 blocker 2: a failed predecessor read leaves the turn queued; the
+/// decision is retried and the turn later runs.
+#[test]
+fn a_failed_predecessor_read_waits_and_the_turn_later_runs() {
+    let Some(root) = child("a_failed_predecessor_read_waits_and_the_turn_later_runs") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        resume(&engine, &session, None).await;
+        end_turn_one(&engine, &session, Some("failed")).await;
+        engine
+            .faults
+            .predecessors_unreadable
+            .store(2, Ordering::Release);
+        assert!(
+            submitted(&engine, &session, 2).await,
+            "the turn runs once the read succeeds"
+        );
+        assert_eq!(
+            engine
+                .faults
+                .predecessors_unreadable
+                .load(Ordering::Acquire),
+            0
+        );
+    });
+}
+
+/// Round 3 blocker 3: an unkeyed receipt that committed but whose reply was
+/// lost, with reconciliation reads failing for a while, is still reconciled by
+/// the daemon itself and handed off exactly once.
+#[test]
+fn an_unkeyed_committed_receipt_is_reconciled_and_handed_off_once() {
+    let Some(root) = child("an_unkeyed_committed_receipt_is_reconciled_and_handed_off_once") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut adoptions = engine.take_adoptions().unwrap();
+        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        engine
+            .faults
+            .receipt_reply_lost
+            .store(true, Ordering::Release);
+        engine
+            .faults
+            .reconcile_unreadable
+            .store(true, Ordering::Release);
+        let (params, raw) = resume_raw(&session, None);
+        assert_eq!(
+            engine.resume(params, &raw).await.unwrap_err().data(),
+            unknown_outcome()
+        );
+        // Still unreadable: the next admission reconciles nothing.
+        spawn(&engine, None).await.unwrap();
+        assert!(adoptions.try_recv().is_err());
+        engine
+            .faults
+            .reconcile_unreadable
+            .store(false, Ordering::Release);
+        spawn(&engine, None).await.unwrap();
+        assert_eq!(adoptions.try_recv().unwrap(), (session.clone(), turn(2)));
+        spawn(&engine, None).await.unwrap();
+        assert!(adoptions.try_recv().is_err(), "handed off exactly once");
+        // Four sessions' first turns plus the adopted turn 2.
+        assert_eq!(engine.active(), 5);
     });
 }

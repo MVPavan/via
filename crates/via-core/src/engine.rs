@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::api::{
     Cancel, Capabilities, DEFAULT_WAIT_MS, Effective, Event, EventBody, Exit, Failure,
@@ -77,6 +77,10 @@ pub struct Engine {
     /// Turns whose receipt commit outcome stayed unknown: possibly committed,
     /// never registered or driven. A keyed retry that finds one adopts it.
     orphans: StdMutex<HashSet<(SessionId, TurnNumber)>>,
+    /// Orphans the daemon itself found committed, for daemon main to drive.
+    adopted: mpsc::Sender<(SessionId, TurnNumber)>,
+    /// Daemon main's end of `adopted`, taken once.
+    adoptions: StdMutex<Option<mpsc::Receiver<(SessionId, TurnNumber)>>>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -90,6 +94,8 @@ struct Faults {
     receipt_reply_lost: AtomicBool,
     /// Reads that reconcile an uncertain receipt commit fail.
     reconcile_unreadable: AtomicBool,
+    /// This many dispatch reads of a turn's predecessors fail.
+    predecessors_unreadable: AtomicUsize,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -150,6 +156,7 @@ impl Engine {
             owner.runtime_resources(),
         )
         .map_err(|error| error.to_string())?;
+        let (adopted, adoptions) = mpsc::channel(DAEMON_QUEUE_LIMIT);
         Ok(Self {
             _store_owner: owner,
             store,
@@ -165,6 +172,8 @@ impl Engine {
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
             orphans: StdMutex::new(HashSet::new()),
+            adopted,
+            adoptions: StdMutex::new(Some(adoptions)),
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -173,7 +182,8 @@ impl Engine {
     /// Settles a receipt commit that reported failure (C1 §8.1): Ok when Store
     /// shows the turn committed, so the caller registers and hands it off;
     /// otherwise `store_error` with `commit_outcome`. An unknown outcome leaves
-    /// the turn an orphan for its keyed retry to adopt.
+    /// the turn an orphan, which its keyed retry or the daemon's own
+    /// reconciliation adopts once Store reads succeed.
     async fn receipt_outcome(
         &self,
         error: &StoreError,
@@ -206,8 +216,46 @@ impl Engine {
         self.store.session_snapshot(session).await
     }
 
-    /// Registers a replayed turn whose original receipt outcome was unknown:
-    /// its keyed retry proved it committed, so it is handed off, exactly once.
+    /// Reconciles orphans once Store reads succeed, taking admission so no
+    /// receipt of the same number is in flight.
+    pub(super) async fn reconcile_orphans(&self) {
+        if lock(&self.orphans).is_empty() {
+            return;
+        }
+        let _admission = self.admission.lock().await;
+        self.reconcile_orphans_held().await;
+    }
+
+    /// Reconciles every orphan, keyed or not, against Store while admission is
+    /// held: a committed one is registered and sent to daemon main exactly
+    /// once, one Store shows never committed is forgotten, and one it cannot
+    /// read yet stays. After a stop is accepted nothing more is adopted.
+    async fn reconcile_orphans_held(&self) {
+        if lock(&self.stop).is_some() {
+            return;
+        }
+        let orphans: Vec<_> = lock(&self.orphans).iter().cloned().collect();
+        for (session, turn) in orphans {
+            match self.reconcile_read(&session).await {
+                Ok(Some(snapshot)) if snapshot.turns >= turn.get() => {
+                    // Capacity first: a full channel leaves the orphan for a later pass.
+                    let Ok(permit) = self.adopted.try_reserve() else {
+                        continue;
+                    };
+                    if let Some(drive) = self.adopt(&session, turn) {
+                        permit.send(drive);
+                    }
+                }
+                Ok(_) => {
+                    lock(&self.orphans).remove(&(session, turn));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Registers an orphan found committed, by its keyed retry or the
+    /// daemon's reconciliation, so that it is handed off exactly once.
     fn adopt(&self, session: &SessionId, turn: TurnNumber) -> Option<(SessionId, TurnNumber)> {
         if !lock(&self.orphans).remove(&(session.clone(), turn)) {
             return None;
@@ -244,6 +292,12 @@ impl Engine {
         self.unresolved.receipt(session, turn);
         self.active.fetch_add(1, Ordering::AcqRel);
         self.queued.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Daemon main's receiver of turns the daemon adopted itself after an
+    /// unknown receipt outcome; each must be driven like a handed-off turn.
+    pub fn take_adoptions(&self) -> Option<mpsc::Receiver<(SessionId, TurnNumber)>> {
+        lock(&self.adoptions).take()
     }
 
     /// Returns the number of receipted turns still being driven.
@@ -289,6 +343,7 @@ impl Engine {
             }
             None => None,
         };
+        self.reconcile_orphans_held().await;
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -414,6 +469,7 @@ impl Engine {
         if snapshot.closed {
             return Err(ApiError::SESSION_CLOSED);
         }
+        self.reconcile_orphans_held().await;
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }

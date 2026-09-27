@@ -199,3 +199,42 @@ broken.
 - A turn behind an `unknown` predecessor is cancelled for as long as that
   predecessor stays unknown. Revision by late evidence is Task 3.
 - Out of scope, as before: `status` and restart recovery.
+
+## Round 3
+
+Sol medium re-review (`../sol-review-T2-B-r2.md`, UNSOUND): the round-1
+blockers were fixed, but the round-2 dispatch decision could permanently
+cancel valid queued work. I merged `origin/rust-foundation` (`c8b571e`, docs
+only) and applied the orchestrator decisions.
+
+| Item | Failure mode | Regression and its output before the fix | Fix |
+|---|---|---|---|
+| R3-1 wait, not cancel | A successor saw an orphan predecessor (a committed receipt whose reply was lost, still `queued`) and cancelled itself. A later adoption of the predecessor could not restore it. | `engine::tests::a_successor_waits_for_an_orphan_predecessor_to_be_adopted_then_runs`: turn 3's drive starts, and after 400 ms the keyed retry adopts turn 2, which then settles. Before: panic at the "turn 3 stays queued" check, because turn 3 was already cancelled. | `Engine::dispatch` returns `Run`, `Wait` or `Cancel` from the durable read. Any unresolved earlier turn (queued, orphan, running, or no durable terminal) means `Wait`. Only a latest submitted predecessor that is durably `unknown` or has `cleanup: pending` means `Cancel` (C1 §7.3). A waiting drive rechecks when any drive of the session finishes, or every 250 ms (`DISPATCH_RECHECK`), or on a force stop. Under `daemon/stop --force` a waiting turn is cancelled without submission, since the session closes. |
+| R3-2 read failure | Any failure of the predecessor read was mapped to a durable cancellation. | `a_failed_predecessor_read_waits_and_the_turn_later_runs`: 2 injected read failures (`Faults.predecessors_unreadable`). Before: the "the turn runs once the read succeeds" check failed because the turn was cancelled. | A read failure means `Wait`, and the read is retried on the recheck interval. It never cancels. |
+| R3-3 unkeyed orphan | An unkeyed receipt with an unknown outcome could only be adopted by a keyed replay, which it would never get. | `an_unkeyed_committed_receipt_is_reconciled_and_handed_off_once`: lost reply, reconciliation unreadable across one admission, then readable. Before: `try_recv` found no adoption. | `reconcile_orphans` reconciles every orphan, keyed or not, while holding admission. It runs at each spawn and resume (after the keyed-replay lookup, so a keyed retry still adopts through its own receipt) and on each wait recheck. A committed orphan is registered and sent to daemon main exactly once: capacity on a bounded adoption channel (128) is reserved first, and removal from the orphan set happens under its lock. A turn Store shows never committed is forgotten. A turn that cannot be read yet stays. Nothing is adopted after a stop is accepted. Daemon main drives adoptions like handoffs, including a drain of the channel in final shutdown. C1 §8.1 now says committed work always runs and only keyed callers may retry. |
+
+The round-2 test `successors_are_cancelled_while_the_predecessor_is_unknown_or_unresolved`
+is renamed `..._behind_an_unknown_or_cleanup_pending_predecessor`, because
+an unresolved predecessor now means wait. It covers `unknown` and
+`cleanup: pending`.
+
+**Files (round 3):** `via-core/src/engine.rs` (orphan reconciliation,
+adoption channel, `take_adoptions`, predecessor-read fault),
+`engine/drive.rs` (`Dispatch`, the wait loop and `DISPATCH_RECHECK`; this is
+the shared drive hunk), `engine/queue.rs` (`subscribe`),
+`engine/tests.rs`, `via-cli/src/server.rs` (adoption receiver in daemon main
+and final shutdown), and `docs/specs/via-api-v1.md` §8.1.
+
+**Gate (round 3):** fmt, clippy `-D warnings`, deny and check-layers pass.
+nextest ran 145 passed, 2 skipped (the same two ignored). Markdown links: 0
+broken.
+
+**Still open:**
+- A turn waits for as long as a predecessor stays unresolved. If the
+  predecessor's terminal can never be made durable (persistent Store
+  failure), `daemon/stop --drain` waits on that turn until a force stop.
+  Only a force stop or restart recovery (Task 3) ends it.
+- Orphans are held in memory. After a daemon restart, a committed orphan
+  stays `queued` until Task 3's recovery.
+- The end-to-end `store.commit.reply_lost` test waits for T2-A's failpoint
+  controller.
