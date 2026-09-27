@@ -47,8 +47,12 @@ impl TurnJournal for FaultJournal {
         Err(injected())
     }
 
-    async fn commit_terminal(&self, record: TerminalRecord) -> Result<(), StoreError> {
-        self.store.commit_terminal(record).await
+    async fn commit_terminal(
+        &self,
+        record: TerminalRecord,
+        closed: Option<Value>,
+    ) -> Result<(), StoreError> {
+        TurnJournal::commit_terminal(&self.store, record, closed).await
     }
 
     async fn events(
@@ -183,7 +187,15 @@ async fn observe_then_finish(
     };
     commit_event(journal, &mut record, body, Some(raw_ref.clone())).await;
     assert!(record.store_failed, "the injected fault reached Core");
-    Engine::finish_turn(journal, unresolved, &started(), record, store_failure()).await
+    Engine::finish_turn(
+        journal,
+        unresolved,
+        &started(),
+        record,
+        store_failure(),
+        false,
+    )
+    .await
 }
 
 fn event_types(events: &[StoredEvent]) -> Vec<(u64, String)> {

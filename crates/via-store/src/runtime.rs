@@ -373,6 +373,11 @@ enum Command {
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
     Terminal(TerminalRecord, oneshot::Sender<Result<(), StoreError>>),
+    ClosingTerminal(
+        TerminalRecord,
+        Value,
+        oneshot::Sender<Result<(), StoreError>>,
+    ),
     Result(
         SessionId,
         TurnNumber,
@@ -572,6 +577,18 @@ impl StoreClient {
     pub async fn commit_terminal(&self, record: TerminalRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Terminal(record, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Atomically commits a terminal envelope and final event, then the
+    /// session-level `closed` event after it, and marks the session closed.
+    pub async fn commit_closing_terminal(
+        &self,
+        record: TerminalRecord,
+        closed: Value,
+    ) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ClosingTerminal(record, closed, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

@@ -229,6 +229,10 @@ pub struct RouteFailure {
     pub exit: Option<ExitReport>,
     /// True when bytes read from or written to the vendor are missing from the raw log.
     pub raw_incomplete: bool,
+    /// Cleanup certainty of Route's forced group close, when it ran one.
+    pub cleanup: Option<WireCleanup>,
+    /// Host stopped the group while its vendor was live (Host force evidence).
+    pub forced: bool,
 }
 
 #[derive(Deserialize)]

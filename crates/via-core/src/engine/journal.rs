@@ -6,7 +6,7 @@
 //! takes the next sequence. A receipted turn whose terminal cannot be made
 //! durable reads as C1 `store_error`, never as a running turn.
 
-use std::{collections::HashSet, future::Future, sync::Mutex as StdMutex, time::SystemTime};
+use std::{collections::HashMap, future::Future, sync::Mutex as StdMutex, time::SystemTime};
 
 use serde_json::Value;
 use via_store::{EventRecord, StoreClient, StoreError, StoredEvent, TerminalRecord};
@@ -23,10 +23,12 @@ pub(super) trait TurnJournal: Sync {
         &self,
         record: EventRecord,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// Commits the terminal envelope and `turn.ended` together.
+    /// Commits the terminal envelope and `turn.ended` together; with `closed`,
+    /// that `session.closed` event follows in the same transaction.
     fn commit_terminal(
         &self,
         record: TerminalRecord,
+        closed: Option<Value>,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Reads a bounded page of durable events from `from_seq`.
     fn events(
@@ -48,8 +50,15 @@ impl TurnJournal for StoreClient {
         Self::commit_event(self, record).await
     }
 
-    async fn commit_terminal(&self, record: TerminalRecord) -> Result<(), StoreError> {
-        Self::commit_terminal(self, record).await
+    async fn commit_terminal(
+        &self,
+        record: TerminalRecord,
+        closed: Option<Value>,
+    ) -> Result<(), StoreError> {
+        match closed {
+            Some(closed) => Self::commit_closing_terminal(self, record, closed).await,
+            None => Self::commit_terminal(self, record).await,
+        }
     }
 
     async fn events(
@@ -84,17 +93,39 @@ pub(super) struct UncertainEvent {
     pub(super) accepted: Option<Accepted>,
 }
 
-/// Receipted turns whose terminal could not be made durable (C1 `store_error`).
+/// Receipted turns with no terminal known to have committed. An entry is
+/// `false` while the turn has not tried its terminal and `true` once its
+/// terminal could not be made durable (C1 `store_error`); it is removed when a
+/// terminal is known committed. Final shutdown is clean only when it is empty.
 #[derive(Default)]
-pub(super) struct Unresolved(StdMutex<HashSet<(SessionId, TurnNumber)>>);
+pub(super) struct Unresolved(StdMutex<HashMap<(SessionId, TurnNumber), bool>>);
 
 impl Unresolved {
-    pub(super) fn insert(&self, session: &SessionId, turn: TurnNumber) {
-        lock(&self.0).insert((session.clone(), turn));
+    /// Tracks a receipted turn until its terminal is known committed.
+    pub(super) fn receipt(&self, session: &SessionId, turn: TurnNumber) {
+        lock(&self.0).insert((session.clone(), turn), false);
     }
 
-    fn contains(&self, session: &SessionId, turn: TurnNumber) -> bool {
-        lock(&self.0).contains(&(session.clone(), turn))
+    /// Records that the turn's terminal could not be made durable.
+    pub(super) fn fail(&self, session: &SessionId, turn: TurnNumber) {
+        lock(&self.0).insert((session.clone(), turn), true);
+    }
+
+    /// Forgets a turn whose terminal is known committed.
+    pub(super) fn resolve(&self, session: &SessionId, turn: TurnNumber) {
+        lock(&self.0).remove(&(session.clone(), turn));
+    }
+
+    /// Every turn not yet known to have a durable terminal.
+    pub(super) fn turns(&self) -> Vec<(SessionId, TurnNumber)> {
+        lock(&self.0).keys().cloned().collect()
+    }
+
+    fn failed(&self, session: &SessionId, turn: TurnNumber) -> bool {
+        lock(&self.0)
+            .get(&(session.clone(), turn))
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -176,14 +207,15 @@ pub(super) async fn reconcile(
     }
 }
 
-/// Commits the terminal record; an uncertain failure is settled by reading back
-/// the durable result.
+/// Commits the terminal record (and `closed`, if any, atomically with it); an
+/// uncertain failure is settled by reading back the durable result.
 pub(super) async fn commit_terminal(
     journal: &impl TurnJournal,
     record: TerminalRecord,
+    closed: Option<Value>,
 ) -> Result<(), ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
-    match journal.commit_terminal(record).await {
+    match journal.commit_terminal(record, closed).await {
         Ok(()) => Ok(()),
         Err(error) if may_have_committed(&error) => match journal.result(&session, turn).await {
             Ok(Some(_)) => Ok(()),
@@ -203,7 +235,7 @@ pub(super) async fn read_result(
 ) -> Result<Option<Value>, ApiError> {
     match journal.result(session, turn).await {
         Ok(Some(result)) => Ok(Some(result)),
-        Ok(None) if unresolved.contains(session, turn) => Err(ApiError::STORE),
+        Ok(None) if unresolved.failed(session, turn) => Err(ApiError::STORE),
         Ok(None) => Ok(None),
         Err(_) => Err(ApiError::STORE),
     }

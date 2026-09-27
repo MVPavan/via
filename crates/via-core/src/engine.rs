@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex as StdMutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -24,7 +24,7 @@ use crate::{
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, FakeAcceptanceObservation,
     FakeObservation, FakeTerminalEvidence, Observation, RouteError, RuntimeConfig, ToolStatus,
-    VendorTerminalStatus,
+    VendorTerminalStatus, WireCleanup,
 };
 use via_store::{
     AcceptanceRecord, SpawnRecord, Store, StoreClient, SubmissionRecord, TerminalRecord,
@@ -47,8 +47,11 @@ pub struct Engine {
     force: watch::Sender<bool>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
-    /// Receipted turns whose terminal could not be made durable.
+    /// Receipted turns with no terminal known to have committed; a turn whose
+    /// terminal could not be made durable reads as `store_error`.
     unresolved: Unresolved,
+    /// Set once final shutdown committed its last record; nothing commits after.
+    finalized: AtomicBool,
 }
 
 /// The C1 §3.14 stop mode Core accepted.
@@ -88,6 +91,8 @@ pub struct EngineShutdown {
     pub failure: Option<String>,
     /// Force-stopped turns whose cancelled terminal record did not commit.
     pub uncommitted_turns: usize,
+    /// Receipted turns with no durable terminal record at final shutdown.
+    pub unresolved_turns: usize,
 }
 
 impl EngineShutdown {
@@ -98,6 +103,7 @@ impl EngineShutdown {
             && self.failed_tasks == 0
             && self.failure.is_none()
             && self.uncommitted_turns == 0
+            && self.unresolved_turns == 0
     }
 }
 
@@ -107,6 +113,9 @@ struct ForcedTurn {
     record: TurnRecord,
     requested_at: String,
 }
+
+/// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
+const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 
 /// How a drive's execution ended.
 enum Driven {
@@ -160,6 +169,7 @@ impl Engine {
             force: watch::Sender::new(false),
             forced: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
+            finalized: AtomicBool::new(false),
         })
     }
 
@@ -192,6 +202,11 @@ impl Engine {
             self.force.send_replace(true);
         }
         Ok(mode)
+    }
+
+    /// The accepted `daemon/stop` mode, if any; daemon main reads it on notice.
+    pub fn stop_mode(&self) -> Option<StopMode> {
+        *lock(&self.stop)
     }
 
     /// Returns the number of receipted turns still being driven.
@@ -248,6 +263,7 @@ impl Engine {
             })
             .await
             .map_err(|_| ApiError::STORE)?;
+        self.unresolved.receipt(&session, turn);
         self.active.fetch_add(1, Ordering::AcqRel);
         Ok((stored.receipt, session.as_str().to_owned(), params.prompt))
     }
@@ -284,9 +300,17 @@ impl Engine {
             store_failed: false,
             uncertain: None,
         };
-        let outcome = match self.execute(&mut record, connection.clone(), prompt).await {
+        let wall = Duration::from_millis(FAKE_WALL_MS);
+        let deadline = Deadline::at(tokio::time::Instant::now() + wall);
+        let deadline_at = rfc3339(SystemTime::now() + wall);
+        let outcome = match self
+            .execute(&mut record, connection.clone(), prompt, deadline)
+            .await
+        {
             Driven::Finished(outcome) => outcome,
             Driven::Forced { requested_at } => {
+                self.commit_event(&mut record, EventBody::CancelRequested {}, None)
+                    .await;
                 // Final shutdown commits the cancelled terminal once Host has evidence.
                 lock(&self.forced).push(ForcedTurn {
                     started,
@@ -296,6 +320,16 @@ impl Engine {
                 return Ok(());
             }
         };
+        // C1 §7.6: Core's deadline cancels the turn; Route force-closed its group.
+        let deadline_stop = match &outcome {
+            Err(AdapterError::Route(route))
+                if matches!(route.cause, RouteError::Deadline { .. }) =>
+            {
+                let quiescent = route.cleanup == Some(WireCleanup::Quiescent);
+                Some(stop_outcome(quiescent, route.forced))
+            }
+            _ => None,
+        };
         let mut terminal = classify(record.accepted.is_some(), outcome);
         if terminal.raw_incomplete {
             let body = EventBody::RawLogIncomplete {
@@ -304,22 +338,59 @@ impl Engine {
             self.commit_event(&mut record, body, None).await;
             terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
         }
+        if let Some((outcome, cleanup)) = deadline_stop {
+            self.commit_event(&mut record, EventBody::CancelRequested {}, None)
+                .await;
+            terminal.cancel = Some(
+                self.settle(&mut record, deadline_at, outcome, cleanup)
+                    .await,
+            );
+        }
         if record.store_failed {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
-        self.finish(&started, record, terminal).await
+        self.finish(&started, record, terminal, false).await
+    }
+
+    /// Commits `cancel.settled` for a cancel Core requested at `requested_at`
+    /// and returns the envelope's C1 §3.5 `cancel` object.
+    async fn settle(
+        &self,
+        record: &mut TurnRecord,
+        requested_at: String,
+        outcome: &'static str,
+        cleanup: &'static str,
+    ) -> Cancel {
+        self.commit_event(record, EventBody::CancelSettled { outcome, cleanup }, None)
+            .await;
+        Cancel {
+            outcome,
+            cleanup,
+            requested_at,
+            settled_at: rfc3339(SystemTime::now()),
+        }
     }
 
     /// Commits the turn's terminal; one that cannot be made durable is recorded so
-    /// that reads report `store_error` instead of a running turn.
+    /// that reads report `store_error` instead of a running turn. With
+    /// `close_session`, `session.closed` commits in the same transaction.
     async fn finish(
         &self,
         started: &Started,
         record: TurnRecord,
         terminal: Terminal,
+        close_session: bool,
     ) -> Result<(), ApiError> {
-        Self::finish_turn(&self.store, &self.unresolved, started, record, terminal).await
+        Self::finish_turn(
+            &self.store,
+            &self.unresolved,
+            started,
+            record,
+            terminal,
+            close_session,
+        )
+        .await
     }
 
     /// `finish` over any journal, so the Store/Core boundary is testable.
@@ -329,22 +400,27 @@ impl Engine {
         started: &Started,
         record: TurnRecord,
         terminal: Terminal,
+        close_session: bool,
     ) -> Result<(), ApiError> {
-        let committed = Self::commit_turn_ended(journal, started, record, terminal).await;
-        if committed.is_err() {
-            unresolved.insert(&started.session, started.turn);
+        let committed =
+            Self::commit_turn_ended(journal, started, record, terminal, close_session).await;
+        match committed {
+            Ok(()) => unresolved.resolve(&started.session, started.turn),
+            Err(_) => unresolved.fail(&started.session, started.turn),
         }
         committed
     }
 
     /// Commits `turn.ended` at the sequence after every event `record` committed,
     /// with the terminal envelope whose raw spans bound every committed reference.
-    /// An uncertain event commit is settled against the durable head first.
+    /// An uncertain event commit is settled against the durable head first. With
+    /// `close_session`, `session.closed` follows in the same transaction.
     async fn commit_turn_ended(
         journal: &impl TurnJournal,
         started: &Started,
         mut record: TurnRecord,
         terminal: Terminal,
+        close_session: bool,
     ) -> Result<(), ApiError> {
         journal::reconcile(journal, &mut record)
             .await
@@ -390,6 +466,23 @@ impl Engine {
             seq,
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
+        let closed = if close_session {
+            let closed = Event {
+                seq: seq + 1,
+                session_id: &started.session,
+                turn: None,
+                late: false,
+                at: &rfc3339(SystemTime::now()),
+                raw_ref: None,
+                body: EventBody::SessionClosed {
+                    reason: FORCE_CLOSE_REASON,
+                },
+            }
+            .to_value()?;
+            Some(closed)
+        } else {
+            None
+        };
         journal::commit_terminal(
             journal,
             TerminalRecord {
@@ -399,6 +492,7 @@ impl Engine {
                 event,
                 raw_ref,
             },
+            closed,
         )
         .await
     }
@@ -411,12 +505,11 @@ impl Engine {
         record: &mut TurnRecord,
         connection: ConnectionId,
         prompt: String,
+        deadline: Deadline,
     ) -> Driven {
         // Full: Adapter waits under the turn deadline; this loop keeps draining until
         // the adapter finishes.
         let (observed_tx, mut observed_rx) = mpsc::channel::<FakeObservation>(64);
-        let deadline =
-            Deadline::at(tokio::time::Instant::now() + Duration::from_millis(FAKE_WALL_MS));
         let mut forced = self.force.subscribe();
         let mut execute = Box::pin(self.adapter.execute(
             record.session.clone(),
@@ -591,8 +684,9 @@ impl Engine {
     }
 
     /// Final shutdown: Host closes live controls, reconciles every anchor and
-    /// joins its tasks; then force-stopped turns commit `cancelled` with that
-    /// evidence. Every step shares the caller's single absolute deadline.
+    /// joins its tasks; then force-stopped turns commit their terminal with that
+    /// evidence, and every receipted turn is checked for a durable terminal.
+    /// Every step shares the caller's single absolute deadline.
     pub async fn shutdown(&self, deadline: Deadline) -> EngineShutdown {
         let report = self.adapter.shutdown(deadline).await;
         let forced = std::mem::take(&mut *lock(&self.forced));
@@ -601,32 +695,39 @@ impl Engine {
             let evidence = report.recovery.iter().find(|record| {
                 record.session_id == turn.started.session && record.turn == turn.started.turn
             });
-            // C1 §7.6: `forced` only with Host evidence, `quiescent` only after
-            // verified group absence. A complete journal without an anchor intent
-            // for the turn means no process was ever launched for it.
-            let (outcome, cleanup) = match evidence.map(|record| record.cleanup) {
-                Some(Cleanup::Quiescent) => ("forced", "quiescent"),
-                None if report.failure.is_none() => ("acknowledged", "quiescent"),
-                Some(Cleanup::Uncertain | Cleanup::Pending) | None => ("requested", "uncertain"),
+            // C1 §7.6: `forced` only with Host force evidence and `quiescent` only
+            // after verified group absence. A complete journal without an anchor
+            // intent for the turn means nothing was launched: no vendor could
+            // acknowledge, so the cancel stays `requested`, with nothing to clean.
+            let (outcome, cleanup) = match evidence {
+                Some(record) => stop_outcome(record.cleanup == Cleanup::Quiescent, record.forced),
+                None if report.failure.is_none() => ("requested", "quiescent"),
+                None => ("requested", "uncertain"),
             };
-            let terminal = Terminal {
-                state: "cancelled",
-                failure: None,
-                stop_reason: "interrupted",
-                vendor_stop_reason: None,
-                final_text: String::new(),
-                exit: None,
-                raw_ref: None,
-                raw_incomplete: false,
-                warnings: Vec::new(),
-                cancel: Some(Cancel {
-                    outcome,
-                    cleanup,
-                    requested_at: turn.requested_at,
-                    settled_at: rfc3339(SystemTime::now()),
-                }),
+            let commit = async {
+                let mut record = turn.record;
+                let cancel = self
+                    .settle(&mut record, turn.requested_at, outcome, cleanup)
+                    .await;
+                let mut terminal = Terminal {
+                    state: "cancelled",
+                    failure: None,
+                    stop_reason: "interrupted",
+                    vendor_stop_reason: None,
+                    final_text: String::new(),
+                    exit: None,
+                    raw_ref: None,
+                    raw_incomplete: false,
+                    warnings: Vec::new(),
+                    cancel: Some(cancel),
+                };
+                if record.store_failed {
+                    // C1 §8.2: the durable stream already lost an event; a
+                    // cancellation must not present it as a complete record.
+                    terminal.fail(FailureClass::Store, "a turn event could not be recorded");
+                }
+                self.finish(&turn.started, record, terminal, true).await
             };
-            let commit = self.finish(&turn.started, turn.record, terminal);
             if !matches!(
                 tokio::time::timeout_at(deadline.instant(), commit).await,
                 Ok(Ok(()))
@@ -634,6 +735,8 @@ impl Engine {
                 uncommitted_turns += 1;
             }
         }
+        let unresolved_turns = self.unresolved_turns(deadline).await;
+        self.finalized.store(true, Ordering::Release);
         EngineShutdown {
             anchors: report.recovery.len(),
             uncertain_owners: report
@@ -645,7 +748,25 @@ impl Engine {
             failed_tasks: report.failed_tasks,
             failure: report.failure,
             uncommitted_turns,
+            unresolved_turns,
         }
+    }
+
+    /// Counts receipted turns with no durable terminal, re-reading the Store for
+    /// each one not known to have committed (a failed commit may still have).
+    async fn unresolved_turns(&self, deadline: Deadline) -> usize {
+        let turns = self.unresolved.turns();
+        let mut unresolved = 0;
+        for (session, turn) in turns {
+            let read =
+                tokio::time::timeout_at(deadline.instant(), self.store.result(&session, turn));
+            if let Ok(Ok(Some(_))) = read.await {
+                self.unresolved.resolve(&session, turn);
+            } else {
+                unresolved += 1;
+            }
+        }
+        unresolved
     }
 
     /// Authenticates before reporting fake's unsupported mutation capability.
@@ -671,14 +792,22 @@ impl Engine {
     }
 
     /// Waits for a durable terminal result independently of client lifetime.
+    ///
+    /// Once final shutdown committed its last record, a result still missing
+    /// can never commit in this daemon: the wait ends `daemon_stopping`.
     pub async fn wait(&self, address: &str) -> Result<Value, ApiError> {
         let (session, turn) = parse_address(address)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
+            // Read before the Store: a result committed before finalization is seen.
+            let finalized = self.finalized.load(Ordering::Acquire);
             if let Some(result) =
                 journal::read_result(&self.store, &self.unresolved, &session, turn).await?
             {
                 return Ok(result);
+            }
+            if finalized {
+                return Err(ApiError::DAEMON_STOPPING);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ApiError::WAIT_TIMEOUT);
@@ -705,6 +834,17 @@ impl Engine {
     pub async fn logs(&self, session: &str) -> Result<Value, ApiError> {
         let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
         self.store.logs(&id).await.map_err(|_| ApiError::STORE)
+    }
+}
+
+/// C1 §7.4 outcome and §3.5 cleanup of a stop Core ordered: `forced` needs
+/// Host force evidence and proved group absence; otherwise the cancel was only
+/// `requested`, and cleanup is `quiescent` only with proved absence.
+fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'static str) {
+    match (quiescent, forced) {
+        (true, true) => ("forced", "quiescent"),
+        (true, false) => ("requested", "quiescent"),
+        (false, _) => ("requested", "uncertain"),
     }
 }
 
@@ -1004,6 +1144,8 @@ mod tests {
             evidence: None,
             exit: None,
             raw_incomplete,
+            cleanup: None,
+            forced: false,
         })
     }
 
