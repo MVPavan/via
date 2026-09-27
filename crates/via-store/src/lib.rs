@@ -222,7 +222,7 @@ mod runtime;
 
 pub use runtime::{
     AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord,
-    DurableRaw, GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter,
+    DurableRaw, EventRecord, GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter,
     ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent,
     SubmissionRecord, TerminalRecord,
 };

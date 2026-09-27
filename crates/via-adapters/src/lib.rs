@@ -3,7 +3,9 @@
 
 use std::num::NonZeroU64;
 
-pub use via_routes::{Deadline, RawRef, RouteError, TurnNumber};
+pub use via_routes::{
+    Deadline, MAX_OBSERVATION_BYTES, RawRef, RouteError, RouteFailure, ToolStatus, TurnNumber,
+};
 
 /// Correlates a start reply with its acceptance observation within one turn.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -171,6 +173,58 @@ pub struct FakeAcceptanceObservation {
     pub vendor_turn_id: VendorTurnId,
     /// Exact accepted frame.
     pub raw_ref: RawRef,
+}
+
+/// One normalized C2 observation Core commits as a C1 §6.1 event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Observation {
+    /// Incremental assistant text, at most one C2 payload bound per piece.
+    AssistantText {
+        /// Text in decode order; pieces of one vendor frame share its raw span.
+        text: String,
+    },
+    /// A tool started inside the turn.
+    ToolStarted {
+        /// Vendor tool identifier.
+        tool_id: String,
+        /// Tool name.
+        name: String,
+        /// Bounded input summary.
+        input_summary: String,
+    },
+    /// A tool ended inside the turn.
+    ToolEnded {
+        /// Vendor tool identifier.
+        tool_id: String,
+        /// Vendor completion status.
+        status: ToolStatus,
+        /// Bounded output summary.
+        output_summary: String,
+        /// Exit code when present.
+        exit_code: Option<i32>,
+    },
+    /// Unknown vendor notification with its bounded payload prefix.
+    VendorOther {
+        /// Original vendor type tag.
+        vendor_type: String,
+        /// Encoded message prefix of at most 16 KiB.
+        payload: String,
+        /// Explicit marker that the prefix omitted bytes.
+        truncated: bool,
+    },
+}
+
+/// Adapter output to Core, in the order the driver decoded it (C2 §4).
+pub enum FakeObservation {
+    /// The paired acceptance, always before any other observation of the turn.
+    Accepted(FakeAcceptanceObservation),
+    /// A data observation and the synced frame it came from.
+    Data {
+        /// Normalized payload.
+        observation: Observation,
+        /// Exact source frame.
+        raw_ref: RawRef,
+    },
 }
 
 /// Final fake evidence after the vendor exited; no Core state is chosen here.

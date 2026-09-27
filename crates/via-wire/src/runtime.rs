@@ -8,7 +8,19 @@ use super::{
     BoundedBytes, ConnectionId, Deadline, Frame, PrivateProcessSpec, SendOutcome, WireFailure,
 };
 use via_host::{AcquiredProcess, ExitReceiver, Host, ProcessControl};
-use via_store::{RawFactory, RawStream, RawWriter, RuntimeResources};
+use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
+
+/// Raw unit size for a retained line recorded by the failure drain.
+const DRAIN_UNIT_BYTES: usize = 64 * 1024;
+
+/// Whether every byte exchanged with the vendor reached the durable raw log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawEvidence {
+    /// Every byte read or written was durably recorded.
+    Complete,
+    /// Some bytes were lost or left unread; counters cannot make the log complete.
+    Incomplete,
+}
 
 /// Deployment paths for the sole Host anchor service.
 pub struct RuntimeConfig {
@@ -117,6 +129,8 @@ pub struct WireConnection {
     unterminated_stdout: bool,
     buffered: Vec<u8>,
     raw: RawWriter,
+    /// Latched `Incomplete` once any byte read from or written to the vendor was not recorded.
+    evidence: RawEvidence,
     control: ProcessControl,
     exits: ExitReceiver,
 }
@@ -143,6 +157,7 @@ impl WireConnection {
             unterminated_stdout: false,
             buffered: Vec::new(),
             raw,
+            evidence: RawEvidence::Complete,
             control,
             exits,
         })
@@ -154,11 +169,11 @@ impl WireConnection {
         frame: &[u8],
         deadline: Deadline,
     ) -> Result<SendOutcome, WireError> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Ok(SendOutcome::NotWritten);
-        };
         let mut written = 0;
         while written < frame.len() {
+            let Some(stdin) = self.stdin.as_mut() else {
+                return Ok(SendOutcome::NotWritten);
+            };
             let next = match timeout_at(deadline.instant(), stdin.write(&frame[written..])).await {
                 Ok(Ok(0)) => {
                     self.stdin.take();
@@ -178,8 +193,7 @@ impl WireConnection {
                     return Ok(SendOutcome::Indeterminate);
                 }
             };
-            self.raw
-                .append(RawStream::Stdin, frame[written..written + next].to_vec())
+            self.record(RawStream::Stdin, frame[written..written + next].to_vec())
                 .await?;
             written += next;
         }
@@ -202,11 +216,14 @@ impl WireConnection {
     pub async fn next_frame(&mut self, deadline: Deadline) -> Result<Option<Frame>, WireError> {
         loop {
             if let Some(index) = self.buffered.iter().position(|byte| *byte == b'\n') {
+                // An oversized line stays buffered so the failure drain records it.
+                if index >= super::MAX_STDOUT_FRAME_BYTES {
+                    return Err(WireError::Frame(WireFailure::FrameTooLarge));
+                }
                 let bytes: Vec<u8> = self.buffered.drain(..=index).collect();
                 let bounded = BoundedBytes::try_from_frame(bytes).map_err(WireError::Frame)?;
                 let token = self
-                    .raw
-                    .append(RawStream::Stdout, bounded.as_bytes().to_vec())
+                    .record(RawStream::Stdout, bounded.as_bytes().to_vec())
                     .await?;
                 return Frame::new(bounded, token.raw_ref().clone())
                     .map(Some)
@@ -216,10 +233,9 @@ impl WireConnection {
                 return Err(WireError::Frame(WireFailure::FrameTooLarge));
             }
             if self.stdout_eof && !self.buffered.is_empty() {
-                self.raw
-                    .append(RawStream::Stdout, std::mem::take(&mut self.buffered))
-                    .await?;
                 self.unterminated_stdout = true;
+                let tail = std::mem::take(&mut self.buffered);
+                self.record(RawStream::Stdout, tail).await?;
             }
             if self.stdout_eof && self.stderr_eof {
                 return if self.unterminated_stdout {
@@ -232,24 +248,50 @@ impl WireConnection {
         }
     }
 
-    /// Records every remaining byte of both pipes, unframed, until both reach EOF.
-    /// Used after a failure, when framing no longer decides protocol meaning.
-    pub async fn drain_to_eof(&mut self, deadline: Deadline) -> Result<(), WireError> {
+    /// Records every remaining byte of both pipes, unframed, until both reach EOF or
+    /// the cleanup deadline. Used after a failure, when framing no longer decides
+    /// protocol meaning. A failed append never stops the drain: later bytes are read
+    /// and discarded, and the result says the raw log is incomplete.
+    pub async fn drain_to_eof(&mut self, deadline: Deadline) -> RawEvidence {
         self.stdin.take();
-        // An oversized partial frame may exceed the raw unit cap; store it in read-sized units.
-        for chunk in std::mem::take(&mut self.buffered).chunks(8192) {
-            self.raw.append(RawStream::Stdout, chunk.to_vec()).await?;
+        // A retained oversized line may exceed the raw unit cap; store it in 64 KiB units.
+        let retained = std::mem::take(&mut self.buffered);
+        for chunk in retained.chunks(DRAIN_UNIT_BYTES) {
+            // A failure latches `Incomplete`; the remaining chunks are discarded.
+            let _recorded = self.record(RawStream::Stdout, chunk.to_vec()).await;
         }
         while !(self.stdout_eof && self.stderr_eof) {
-            Box::pin(self.read_either(deadline, true)).await?;
+            match Box::pin(self.read_either(deadline, true)).await {
+                // A raw failure is latched and later reads are discarded.
+                Ok(()) | Err(WireError::Raw(_)) => {}
+                // Bytes may remain unread in the pipes.
+                Err(_) => {
+                    self.evidence = RawEvidence::Incomplete;
+                    break;
+                }
+            }
         }
-        Ok(())
+        self.evidence
+    }
+
+    /// Durably appends one unit unless the log already lost bytes; any failure
+    /// latches `Incomplete`, because the unit's bytes can no longer be recorded.
+    async fn record(&mut self, stream: RawStream, bytes: Vec<u8>) -> Result<DurableRaw, WireError> {
+        if self.evidence == RawEvidence::Incomplete {
+            return Err(WireError::Frame(WireFailure::RawStore));
+        }
+        let result = self.raw.append(stream, bytes).await;
+        if result.is_err() {
+            self.evidence = RawEvidence::Incomplete;
+        }
+        Ok(result?)
     }
 
     /// Reads one chunk from whichever open pipe is ready; stderr is always raw-logged
     /// at once, so neither stream waits for the other. At most one 8 KiB chunk is
     /// staged per call. Reads are cancel-safe, but dropping this future during a raw
     /// append loses that chunk; Route awaits it to completion or to the deadline.
+    /// Once the raw log is incomplete, drain-mode chunks are read and discarded.
     async fn read_either(&mut self, deadline: Deadline, stdout_raw: bool) -> Result<(), WireError> {
         let mut out = [0; 8192];
         let mut err = [0; 8192];
@@ -259,7 +301,9 @@ impl WireConnection {
                 if count == 0 {
                     self.stdout_eof = true;
                 } else if stdout_raw {
-                    self.raw.append(RawStream::Stdout, out[..count].to_vec()).await?;
+                    if self.evidence == RawEvidence::Complete {
+                        self.record(RawStream::Stdout, out[..count].to_vec()).await?;
+                    }
                 } else {
                     self.buffered.extend_from_slice(&out[..count]);
                 }
@@ -268,8 +312,8 @@ impl WireConnection {
                 let count = read.map_err(|_| WireError::Deadline)??;
                 if count == 0 {
                     self.stderr_eof = true;
-                } else {
-                    self.raw.append(RawStream::Stderr, err[..count].to_vec()).await?;
+                } else if !stdout_raw || self.evidence == RawEvidence::Complete {
+                    self.record(RawStream::Stderr, err[..count].to_vec()).await?;
                 }
             }
         }
@@ -285,7 +329,8 @@ impl WireConnection {
             timeout_at(deadline.instant(), self.exits.changed())
                 .await
                 .map_err(|_| WireError::Deadline)?
-                .map_err(|_| WireError::Deadline)?;
+                // Host dropped its exit supervision: transport loss, not a deadline.
+                .map_err(|_| WireError::Frame(WireFailure::Transport))?;
         }
     }
 

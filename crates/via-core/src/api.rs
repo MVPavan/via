@@ -345,6 +345,14 @@ pub(crate) struct Warning {
     message: &'static str,
 }
 
+impl Warning {
+    /// Announces that bytes exchanged with the vendor are missing from the raw log.
+    pub(crate) const RAW_LOG_INCOMPLETE: Self = Self {
+        code: "raw_log_incomplete",
+        message: "the raw log lost bytes for this turn",
+    };
+}
+
 /// C1 §3.2 spawn receipt.
 #[derive(Serialize)]
 pub(crate) struct Receipt {
@@ -371,10 +379,23 @@ pub(crate) struct Bound {
     inherited: bool,
 }
 
+/// C1 §8.2 `failure.class` values Core commits for the fake route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureClass {
+    DeadlineWall,
+    SubmitFailed,
+    VendorError,
+    ProcessExited,
+    Protocol,
+    Overflow,
+    Store,
+}
+
 /// C1 §5 `failure`.
 #[derive(Clone, Serialize)]
 pub(crate) struct Failure {
-    pub(crate) class: &'static str,
+    pub(crate) class: FailureClass,
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) vendor_code: Option<String>,
@@ -452,24 +473,21 @@ pub(crate) struct RawSpan {
 }
 
 impl RawSpan {
-    /// Bounds the given event references per connection, in first-seen order.
-    pub(crate) fn bounding<'a>(references: impl IntoIterator<Item = &'a RawRef>) -> Vec<Self> {
-        let mut spans: Vec<Self> = Vec::new();
-        for reference in references {
-            let id = reference.connection_id();
-            if let Some(span) = spans.iter_mut().find(|span| &span.connection_id == id) {
-                span.first_offset = span.first_offset.min(reference.offset());
-                span.last_offset = span.last_offset.max(reference.end_offset());
-            } else {
-                spans.push(Self {
-                    connection_id: id.clone(),
-                    path: format!("raw/{}.raw", id.as_str()),
-                    first_offset: reference.offset(),
-                    last_offset: reference.end_offset(),
-                });
-            }
+    /// Widens the per-connection bounding spans, in first-seen order, to cover one
+    /// committed event reference.
+    pub(crate) fn include(spans: &mut Vec<Self>, reference: &RawRef) {
+        let id = reference.connection_id();
+        if let Some(span) = spans.iter_mut().find(|span| &span.connection_id == id) {
+            span.first_offset = span.first_offset.min(reference.offset());
+            span.last_offset = span.last_offset.max(reference.end_offset());
+        } else {
+            spans.push(Self {
+                connection_id: id.clone(),
+                path: format!("raw/{}.raw", id.as_str()),
+                first_offset: reference.offset(),
+                last_offset: reference.end_offset(),
+            });
         }
-        spans
     }
 }
 
@@ -530,10 +548,6 @@ impl Bound {
 /// C1 §6.1 event payloads Core commits today.
 #[derive(Serialize)]
 #[serde(tag = "type")]
-#[expect(
-    clippy::enum_variant_names,
-    reason = "only turn events are committed until session and adapter events land"
-)]
 pub(crate) enum EventBody {
     #[serde(rename = "turn.queued")]
     TurnQueued { queue_position: u32 },
@@ -547,6 +561,34 @@ pub(crate) enum EventBody {
         failure: Option<Failure>,
         stop_reason: &'static str,
     },
+    #[serde(rename = "assistant.text")]
+    AssistantText {
+        text: String,
+        #[serde(rename = "final")]
+        is_final: bool,
+    },
+    #[serde(rename = "tool.started")]
+    ToolStarted {
+        tool_id: String,
+        name: String,
+        input_summary: String,
+    },
+    #[serde(rename = "tool.ended")]
+    ToolEnded {
+        tool_id: String,
+        status: &'static str,
+        output_summary: String,
+        exit_code: Option<i32>,
+    },
+    /// C2 A1 keeps an explicit `truncated` marker beside the bounded payload.
+    #[serde(rename = "vendor.other")]
+    VendorOther {
+        vendor_type: String,
+        payload: String,
+        truncated: bool,
+    },
+    #[serde(rename = "raw_log.incomplete")]
+    RawLogIncomplete { connection_id: ConnectionId },
 }
 
 /// C1 §6.1 event with every common field.
@@ -602,7 +644,40 @@ pub(crate) fn rfc3339(time: SystemTime) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{UNIX_EPOCH, rfc3339};
+    use serde_json::json;
+
+    use super::{ConnectionId, EventBody, UNIX_EPOCH, rfc3339};
+
+    #[test]
+    fn observation_events_use_c1_tags_and_fields() {
+        let connection = ConnectionId::try_from("c_01").unwrap();
+        let bodies = [
+            (
+                EventBody::AssistantText {
+                    text: "t".to_owned(),
+                    is_final: false,
+                },
+                json!({"type":"assistant.text","text":"t","final":false}),
+            ),
+            (
+                EventBody::VendorOther {
+                    vendor_type: "note".to_owned(),
+                    payload: "{".to_owned(),
+                    truncated: true,
+                },
+                json!({"type":"vendor.other","vendor_type":"note","payload":"{","truncated":true}),
+            ),
+            (
+                EventBody::RawLogIncomplete {
+                    connection_id: connection,
+                },
+                json!({"type":"raw_log.incomplete","connection_id":"c_01"}),
+            ),
+        ];
+        for (body, expected) in bodies {
+            assert_eq!(serde_json::to_value(body).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn rfc3339_formats_utc_milliseconds() {

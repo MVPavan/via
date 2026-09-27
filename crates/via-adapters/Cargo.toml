@@ -11,5 +11,8 @@ via-routes = { path = "../via-routes" }
 tokio = { workspace = true, features = ["time", "sync"] }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

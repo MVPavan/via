@@ -129,8 +129,8 @@ mod runtime;
 // Route needs the narrow connection handle returned by WireRuntime; its constructor
 // and Host process control remain private to Wire.
 pub use runtime::{
-    RuntimeConfig, WireCloseReport, WireConnection, WireError, WireRecovery, WireRuntime,
-    WireShutdown,
+    RawEvidence, RuntimeConfig, WireCloseReport, WireConnection, WireError, WireRecovery,
+    WireRuntime, WireShutdown,
 };
 
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.
