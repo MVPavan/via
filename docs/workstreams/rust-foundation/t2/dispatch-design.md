@@ -6,7 +6,9 @@ Status: accepted with changes. This version folds in:
 - the orchestrator's decisions after it;
 - the orchestrator's correction after Sol's re-review. Runtime §7 latches
   Store failure on the first failed or uncertain state write, which
-  replaces failed-write retries and the in-daemon orphan machinery.
+  replaces failed-write retries and the in-daemon orphan machinery;
+- Sol's round-3 check (`sol-review-T2-B2-design-r3.md`): no `session.closed`
+  in Store-failed mode, and a pre-ARM launch gate (§3.1).
 
 This note is normative for Step 2.
 
@@ -146,8 +148,9 @@ N waiting turns in one session cost one timer, not N.
   no `turn.submitted` and no vendor I/O. The first failed or uncertain
   cancellation latches, and §3 then applies to the rest.
 - `session.closed` (`reason: "daemon_stop_force"`) is committed only after
-  every turn of the session has a durable force disposition, and only when
-  the session has no other unresolved turn. In a queued-only session it
+  every turn of the session has a durable force disposition, only when the
+  session has no other unresolved turn, and never once Store failure is
+  latched (§3). In a queued-only session it
   rides on the last cancellation, in the same transaction. Store's closing
   terminal accepts `queued → cancelled`. A session with a forced running
   turn is closed by that turn's terminal in final shutdown, if its queued
@@ -186,6 +189,11 @@ Once set:
   and starts final shutdown in force mode. `EngineShutdown.store_failed`
   makes the shutdown unclean, so the process exits 4.
 - An uncertain submission never leads to vendor I/O.
+- **No `session.closed` in Store-failed mode.** No path commits it once the
+  latch is set, including a forced running turn's terminal batch in final
+  shutdown. An uncertain resume receipt may have committed a queued turn
+  that Core never registered, so closure cannot be proved. Those sessions
+  stay open in Store, the exit is 4, and restart recovery settles them.
 
 An uncertain or failed receipt commit returns C1 §8.1 `store_error` with
 `commit_outcome` (`not_committed` or `unknown`) and `retry: same_key_only`
@@ -195,6 +203,27 @@ C1 §8.1 paragraph reads: "A receipt whose commit outcome is `unknown`
 latches Store failure (runtime §7). Restart recovery settles it; a keyed
 retry after restart learns its receipt. An unkeyed caller must not resend
 the request."
+
+### 3.1 Pre-ARM launch gate
+
+The latch sets the same force signal the running turn already watches. A
+grant can precede the latch, and Route's force check can precede it too, so
+the signal is checked once more at the last point before a vendor can
+launch. Host's `acquire_inner` checks it immediately before the ARM send:
+after `commit_arm_intent` and before `launch.put(pipes)`. The signal
+reaches Host through Wire's `open` and `acquire_retaining`.
+
+- **Signal set before the check:** no ARM. The acquisition fails, dropping
+  the anchor control so the anchor exits on EOF and stops its group, and
+  the turn ends as a force before launch (`launched: false`).
+- **Signal set after the check:** ARM won and the launch is in flight. The
+  existing forced-turn cleanup applies (`launched: true`).
+
+The gate applies to an ordinary force stop as well as to the latch. The
+test seam is the runtime §11 failpoint `host.anchor.after_arm_intent_commit`,
+which sits just before the check: set the latch or force while paused,
+release, and assert that the fake agent records no launch and the turn has
+the pre-launch force outcome.
 
 The rest of F12 stays with Task 3 (`via-jm4.7.7`): `daemon/status` health,
 the 5 s diagnostic window, and the failure-resolution batch for queued
@@ -258,6 +287,7 @@ never lets a drain finish clean.
 | Queued turn | refused `sessions_active` | runs in order under its own deadline | cancelled without submission (§2.3) | kept `queued`, unresolved |
 | Running turn | refused | runs to its terminal | existing forced-turn path | forced path, one best-effort terminal |
 | Queued-only session | refused | runs | turns cancelled, then `session.closed` | not closed |
+| Session of a forced running turn | refused | runs | closed with the forced terminal if every other turn is settled | not closed (§3) |
 | Waiting behind an unowned predecessor | refused | the drain waits (Task 3) | cancelled | kept `queued` |
 
 Final shutdown runs in this order:
@@ -295,6 +325,7 @@ T2-B2's.
 | C1 §3.14 idle, drain and force; `session.closed` with `daemon_stop_force` | §2.3, §4, §6 |
 | C1 §8.1 and runtime §7: an unknown receipt outcome | §3: `store_error` with `commit_outcome`, the latch, exit 4; restart recovery settles it |
 | Runtime §7: the first failed state write stops admission and dispatch | §3 |
+| Runtime §7: stop and launch fencing on failure; no vendor launch after the latch | §3.1 |
 | C1 §7.5 crash recovery | Out of scope (Task 3) |
 
 ## 9. Step 2 tests (in addition to the existing T2-B tests)
@@ -318,3 +349,8 @@ has the path:
    events.
 7. **Load bound:** many waiting turns with reads failing; the Store reads
    stay within §7, with no growth per waiting turn.
+8. **Pre-ARM gate:** paused at `host.anchor.after_arm_intent_commit`, force
+   or the latch is set, then released; no ARM, no vendor launch recorded by
+   the fake agent, and the pre-launch force outcome.
+9. **No close in Store-failed mode:** a forced running turn's terminal after
+   the latch commits without `session.closed`.
