@@ -87,7 +87,7 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 
 pub use api::{
     ApiError, DaemonStatusParams, DaemonStopParams, ReadParams, SessionReadParams, SpawnParams,
-    SteerParams, hash_handle, parse_address,
+    SteerParams, Unpersisted, hash_handle, parse_address,
 };
 
 impl Serialize for C1TurnState {

@@ -19,7 +19,7 @@ use crate::api::{
 };
 use crate::{
     ApiError, ConnectionId, DaemonStopParams, Deadline, FakeConfig, RawRef, SessionId, SpawnParams,
-    SteerParams, TurnNumber, hash_handle, parse_address,
+    SteerParams, TurnNumber, TurnState, hash_handle, parse_address,
 };
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, FakeAcceptanceObservation,
@@ -220,6 +220,10 @@ impl Engine {
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
+        // Bounds the failed turns retained for their `store_error` reads.
+        if !self.unresolved.admits() {
+            return Err(ApiError::STORE);
+        }
         if params.harness != "fake" || !self.adapter.fake_available() {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }
@@ -279,7 +283,14 @@ impl Engine {
         let _active = Active(&self.active);
         let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        let (queued_at, submitted, submitted_clock) = self.submit(&session, turn).await?;
+        let (queued_at, submitted, submitted_clock) = match self.submit(&session, turn).await {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                // Only `turn.queued` is known durable; the turn never reaches `finish`.
+                self.unresolved.fail(&session, turn, TurnState::Queued);
+                return Err(error);
+            }
+        };
         let started = Started {
             session: session.clone(),
             turn,
@@ -406,7 +417,7 @@ impl Engine {
             Self::commit_turn_ended(journal, started, record, terminal, close_session).await;
         match committed {
             Ok(()) => unresolved.resolve(&started.session, started.turn),
-            Err(_) => unresolved.fail(&started.session, started.turn),
+            Err(_) => unresolved.fail(&started.session, started.turn, TurnState::Running),
         }
         committed
     }

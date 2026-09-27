@@ -13,7 +13,7 @@ use via_store::{EventRecord, StoreClient, StoreError, StoredEvent, TerminalRecor
 
 use super::{Accepted, TurnRecord, lock};
 use crate::api::{Event, EventBody, RawSpan, rfc3339};
-use crate::{ApiError, RawRef, SessionId, TurnNumber};
+use crate::{ApiError, RawRef, SessionId, TurnNumber, TurnState};
 
 /// Core's narrow Store port for one turn: `StoreClient` in production, a closed
 /// fault backend in unit tests.
@@ -93,22 +93,38 @@ pub(super) struct UncertainEvent {
     pub(super) accepted: Option<Accepted>,
 }
 
+/// Most receipted turns whose terminal could not be made durable that the daemon
+/// retains; while this many are retained, spawn refuses new work with
+/// `store_error`, so no affected turn loses its C1 `store_error` read.
+pub(super) const FAILED_TURNS_LIMIT: usize = 256;
+
+/// What Core knows of a receipted turn with no terminal known to be durable.
+#[derive(Clone, Copy)]
+enum Entry {
+    /// The turn has not tried its terminal.
+    Pending,
+    /// Its terminal could not be made durable; the last committed turn state.
+    Failed(TurnState),
+}
+
 /// Receipted turns with no terminal known to have committed. An entry is
-/// `false` while the turn has not tried its terminal and `true` once its
-/// terminal could not be made durable (C1 `store_error`); it is removed when a
-/// terminal is known committed. Final shutdown is clean only when it is empty.
+/// removed once a terminal is known committed, including a failed turn whose
+/// terminal a later read finds durable. Failed entries are bounded by
+/// [`FAILED_TURNS_LIMIT`] plus the turns in flight when it was reached. Final
+/// shutdown is clean only when the set is empty.
 #[derive(Default)]
-pub(super) struct Unresolved(StdMutex<HashMap<(SessionId, TurnNumber), bool>>);
+pub(super) struct Unresolved(StdMutex<HashMap<(SessionId, TurnNumber), Entry>>);
 
 impl Unresolved {
     /// Tracks a receipted turn until its terminal is known committed.
     pub(super) fn receipt(&self, session: &SessionId, turn: TurnNumber) {
-        lock(&self.0).insert((session.clone(), turn), false);
+        lock(&self.0).insert((session.clone(), turn), Entry::Pending);
     }
 
-    /// Records that the turn's terminal could not be made durable.
-    pub(super) fn fail(&self, session: &SessionId, turn: TurnNumber) {
-        lock(&self.0).insert((session.clone(), turn), true);
+    /// Records that the turn's terminal could not be made durable after its last
+    /// committed lifecycle state `durable`.
+    pub(super) fn fail(&self, session: &SessionId, turn: TurnNumber, durable: TurnState) {
+        lock(&self.0).insert((session.clone(), turn), Entry::Failed(durable));
     }
 
     /// Forgets a turn whose terminal is known committed.
@@ -116,16 +132,35 @@ impl Unresolved {
         lock(&self.0).remove(&(session.clone(), turn));
     }
 
+    /// Whether another receipt keeps failed turns within their bound.
+    pub(super) fn admits(&self) -> bool {
+        let failed = lock(&self.0)
+            .values()
+            .filter(|entry| matches!(entry, Entry::Failed(_)))
+            .count();
+        failed < FAILED_TURNS_LIMIT
+    }
+
     /// Every turn not yet known to have a durable terminal.
     pub(super) fn turns(&self) -> Vec<(SessionId, TurnNumber)> {
         lock(&self.0).keys().cloned().collect()
     }
 
-    fn failed(&self, session: &SessionId, turn: TurnNumber) -> bool {
-        lock(&self.0)
-            .get(&(session.clone(), turn))
-            .copied()
-            .unwrap_or(false)
+    /// The last committed state of a turn whose terminal could not be made durable.
+    fn failed(&self, session: &SessionId, turn: TurnNumber) -> Option<TurnState> {
+        match lock(&self.0).get(&(session.clone(), turn)) {
+            Some(Entry::Failed(durable)) => Some(*durable),
+            Some(Entry::Pending) | None => None,
+        }
+    }
+
+    /// Forgets a failed turn whose terminal a read found durable after all.
+    fn settle(&self, session: &SessionId, turn: TurnNumber) {
+        let mut entries = lock(&self.0);
+        let key = (session.clone(), turn);
+        if matches!(entries.get(&key), Some(Entry::Failed(_))) {
+            entries.remove(&key);
+        }
     }
 }
 
@@ -225,8 +260,9 @@ pub(super) async fn commit_terminal(
     }
 }
 
-/// Reads a durable terminal result as is; an unresolved turn without one is
-/// `store_error` rather than a turn that looks still running.
+/// Reads a durable terminal result as is; a turn whose terminal could not be
+/// made durable is C1 `store_error` with its last committed state, never a turn
+/// that looks still running.
 pub(super) async fn read_result(
     journal: &impl TurnJournal,
     unresolved: &Unresolved,
@@ -234,10 +270,14 @@ pub(super) async fn read_result(
     turn: TurnNumber,
 ) -> Result<Option<Value>, ApiError> {
     match journal.result(session, turn).await {
-        Ok(Some(result)) => Ok(Some(result)),
-        Ok(None) if unresolved.failed(session, turn) => Err(ApiError::STORE),
-        Ok(None) => Ok(None),
-        Err(_) => Err(ApiError::STORE),
+        Ok(Some(result)) => {
+            unresolved.settle(session, turn);
+            Ok(Some(result))
+        }
+        read => match unresolved.failed(session, turn) {
+            Some(durable) => Err(ApiError::unpersisted(session, turn, durable)),
+            None => read.map_err(|_| ApiError::STORE),
+        },
     }
 }
 
