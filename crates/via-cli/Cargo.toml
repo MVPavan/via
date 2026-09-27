@@ -25,7 +25,8 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
-rustix = { workspace = true, features = ["process", "thread"] }
+rustix = { workspace = true, features = ["process", "thread", "net", "time"] }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

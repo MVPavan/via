@@ -80,6 +80,8 @@ enum DaemonCommand {
     },
     Stop {
         #[arg(long)]
+        drain: bool,
+        #[arg(long)]
         force: bool,
         #[arg(long)]
         json: bool,
@@ -112,6 +114,9 @@ fn main() -> ExitCode {
             4
         }
     };
+    // The daemon already bounded its final shutdown; never wait here for a
+    // blocking task (such as a stalled Store join) it abandoned to process exit.
+    runtime.shutdown_background();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
@@ -122,8 +127,14 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             command: Some(DaemonCommand::Status { .. }),
         } => client::call("daemon/status", &json!({}), true, true),
         Command::Daemon {
-            command: Some(DaemonCommand::Stop { force, .. }),
-        } => client::call("daemon/stop", &json!({"force": force}), true, true),
+            command: Some(DaemonCommand::Stop { drain, force, .. }),
+        } => client::call(
+            "daemon/stop",
+            &json!({"drain": drain, "force": force}),
+            // Stopping never starts a daemon.
+            false,
+            true,
+        ),
         Command::Spawn(args) => {
             let handle = client::read_handle(
                 args.handle_file.as_deref(),

@@ -2,21 +2,24 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex as StdMutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::api::{
-    Bound, Capabilities, Cost, Effective, Envelope, Event, EventBody, EventRange, Exit,
+    Bound, Cancel, Capabilities, Cost, Effective, Envelope, Event, EventBody, EventRange, Exit,
     FAKE_WALL_MS, Failure, RawSpan, Receipt, Requested, RoutePlan, Timestamps, Usage, VendorFields,
-    rfc3339,
+    Warning, rfc3339,
 };
 use crate::{
-    ApiError, ConnectionId, Deadline, FakeConfig, RawRef, SessionId, SpawnParams, SteerParams,
-    TurnNumber, hash_handle, parse_address,
+    ApiError, ConnectionId, DaemonStopParams, Deadline, FakeConfig, RawRef, SessionId, SpawnParams,
+    SteerParams, TurnNumber, hash_handle, parse_address,
 };
 use via_adapters::{
     AdapterRuntime, AdapterRuntimeConfig, Cleanup, FakeAcceptanceObservation, FakeTerminalEvidence,
@@ -33,6 +36,83 @@ pub struct Engine {
     adapter: AdapterRuntime,
     active: AtomicUsize,
     admission: tokio::sync::Mutex<()>,
+    /// Accepted `daemon/stop` mode; set under `admission`, never cleared.
+    stop: StdMutex<Option<StopMode>>,
+    /// Tells running drives to abandon their execution (C1 §3.14 `force`).
+    force: watch::Sender<bool>,
+    /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
+    forced: StdMutex<Vec<ForcedTurn>>,
+}
+
+/// The C1 §3.14 stop mode Core accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopMode {
+    /// No active work: final shutdown at once.
+    Idle,
+    /// Admission closed; accepted turns finish under their own deadlines first.
+    Drain,
+    /// Every running turn is closed with mode `force`; final shutdown at once.
+    Force,
+}
+
+impl StopMode {
+    /// The mode word used in the daemon's final shutdown summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Drain => "drain",
+            Self::Force => "force",
+        }
+    }
+}
+
+/// Passive final-shutdown facts for the daemon's exit decision.
+#[derive(Debug)]
+pub struct EngineShutdown {
+    /// Committed anchors Host reconciled.
+    pub anchors: usize,
+    /// Process owners whose group absence is unproved.
+    pub uncertain_owners: usize,
+    /// Host tasks whose result was not collected by the deadline.
+    pub pending_tasks: usize,
+    /// Host tasks that panicked, were cancelled or failed their child wait.
+    pub failed_tasks: usize,
+    /// Named Host deadline, Store or recovery failure.
+    pub failure: Option<String>,
+    /// Force-stopped turns whose cancelled terminal record did not commit.
+    pub uncommitted_turns: usize,
+}
+
+impl EngineShutdown {
+    /// Clean only with positive cleanup, every join collected and every record committed.
+    pub fn is_clean(&self) -> bool {
+        self.uncertain_owners == 0
+            && self.pending_tasks == 0
+            && self.failed_tasks == 0
+            && self.failure.is_none()
+            && self.uncommitted_turns == 0
+    }
+}
+
+/// Committed facts of a turn whose execution a force stop abandoned.
+struct ForcedTurn {
+    started: Started,
+    seq: u64,
+    accepted: Option<Accepted>,
+    requested_at: String,
+}
+
+/// Durable facts established once a turn's submission committed.
+struct Started {
+    session: SessionId,
+    turn: TurnNumber,
+    queued_at: String,
+    submitted_at: String,
+    submitted_clock: Instant,
+}
+
+fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Engine {
@@ -62,7 +142,41 @@ impl Engine {
             adapter,
             active: AtomicUsize::new(0),
             admission: tokio::sync::Mutex::new(()),
+            stop: StdMutex::new(None),
+            force: watch::Sender::new(false),
+            forced: StdMutex::new(Vec::new()),
         })
+    }
+
+    /// Accepts a C1 §3.14 `daemon/stop` and closes admission to new work.
+    ///
+    /// A plain stop is refused while turns are active. A repeated request keeps
+    /// the accepted mode, except that `force` escalates a drain.
+    pub async fn request_stop(&self, params: &DaemonStopParams) -> Result<StopMode, ApiError> {
+        if params.drain && params.force {
+            return Err(ApiError::INVALID_PARAMS);
+        }
+        let _admission = self.admission.lock().await;
+        let mut stop = lock(&self.stop);
+        let requested = if params.force {
+            StopMode::Force
+        } else if params.drain {
+            StopMode::Drain
+        } else {
+            StopMode::Idle
+        };
+        let mode = match *stop {
+            Some(current) if requested != StopMode::Force => current,
+            None if requested == StopMode::Idle && self.active() > 0 => {
+                return Err(ApiError::SESSIONS_ACTIVE);
+            }
+            _ => requested,
+        };
+        *stop = Some(mode);
+        if mode == StopMode::Force {
+            self.force.send_replace(true);
+        }
+        Ok(mode)
     }
 
     /// Returns the number of receipted turns still being driven.
@@ -73,6 +187,9 @@ impl Engine {
     /// Commits a receipt before authorizing any process launch.
     pub async fn spawn(&self, params: SpawnParams) -> Result<(Value, String, String), ApiError> {
         let _admission = self.admission.lock().await;
+        if lock(&self.stop).is_some() {
+            return Err(ApiError::DAEMON_STOPPING);
+        }
         if params.harness != "fake" || !self.adapter.fake_available() {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }
@@ -132,7 +249,13 @@ impl Engine {
         let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
         let (queued_at, submitted, submitted_clock) = self.submit(&session, turn).await?;
-        let submitted_at = rfc3339(submitted);
+        let started = Started {
+            session: session.clone(),
+            turn,
+            queued_at,
+            submitted_at: rfc3339(submitted),
+            submitted_clock,
+        };
         let mut seq = 2;
         let connection = ConnectionId::try_from(
             format!("c_{}", session.as_str().trim_start_matches("s_")).as_str(),
@@ -141,19 +264,38 @@ impl Engine {
         let (accepted_tx, mut accepted_rx) = mpsc::channel::<FakeAcceptanceObservation>(1);
         let deadline =
             Deadline::at(tokio::time::Instant::now() + Duration::from_millis(FAKE_WALL_MS));
-        let execute = self.adapter.execute(
+        let mut forced = self.force.subscribe();
+        let mut execute = Box::pin(self.adapter.execute(
             session.clone(),
             turn,
             connection,
             prompt,
             accepted_tx,
             deadline,
-        );
-        tokio::pin!(execute);
+        ));
         let mut accepted: Option<Accepted> = None;
         let mut acceptance_open = true;
         let outcome = loop {
             tokio::select! {
+                biased;
+                // The watch guard is released before the handler's awaits.
+                true = async { forced.wait_for(|forced| *forced).await.is_ok() } => {
+                    // Force stop: dropping the execution releases its Host control, so
+                    // the anchor's reviewed EOF cleanup stops the whole group. Final
+                    // shutdown commits the cancelled terminal once Host has evidence.
+                    drop(execute);
+                    if accepted.is_none() && let Ok(observation) = accepted_rx.try_recv() {
+                        seq += 1;
+                        accepted = Some(self.accept(&session, turn, seq, observation).await?);
+                    }
+                    lock(&self.forced).push(ForcedTurn {
+                        started,
+                        seq,
+                        accepted,
+                        requested_at: rfc3339(SystemTime::now()),
+                    });
+                    return Ok(());
+                }
                 message = accepted_rx.recv(), if accepted.is_none() && acceptance_open => {
                     if let Some(observation) = message {
                         seq += 1;
@@ -171,16 +313,26 @@ impl Engine {
                 }
             }
         };
-        seq += 1;
+        let terminal = classify(accepted.is_some(), outcome);
+        self.finish(&started, seq + 1, terminal, accepted).await
+    }
+
+    /// Commits `turn.ended` (at `seq`) with the terminal envelope.
+    async fn finish(
+        &self,
+        started: &Started,
+        seq: u64,
+        terminal: Terminal,
+        accepted: Option<Accepted>,
+    ) -> Result<(), ApiError> {
         let ended_at = rfc3339(SystemTime::now());
         // Monotonic, so wall-clock steps cannot distort or drop the duration.
-        let elapsed = submitted_clock.elapsed();
-        let terminal = classify(accepted.is_some(), outcome);
+        let elapsed = started.submitted_clock.elapsed();
         let raw_ref = terminal.raw_ref.clone();
         let event = Event {
             seq,
-            session_id: &session,
-            turn: Some(turn.get()),
+            session_id: &started.session,
+            turn: Some(started.turn.get()),
             late: false,
             at: &ended_at,
             raw_ref: raw_ref.as_ref(),
@@ -188,19 +340,20 @@ impl Engine {
                 state: terminal.state,
                 failure: terminal.failure.clone(),
                 stop_reason: terminal.stop_reason,
+                cancel: terminal.cancel.clone(),
             },
         }
         .to_value()?;
         let timestamps = Timestamps {
-            queued_at,
-            submitted_at: Some(submitted_at),
+            queued_at: started.queued_at.clone(),
+            submitted_at: Some(started.submitted_at.clone()),
             accepted_at: accepted.as_ref().map(|accepted| accepted.at.clone()),
             ended_at,
         };
         let duration_ms = u64::try_from(elapsed.as_millis()).ok();
         let envelope = terminal_envelope(
-            &session,
-            turn,
+            &started.session,
+            started.turn,
             terminal,
             accepted,
             timestamps,
@@ -210,8 +363,8 @@ impl Engine {
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         self.store
             .commit_terminal(TerminalRecord {
-                session_id: session,
-                turn,
+                session_id: started.session.clone(),
+                turn: started.turn,
                 envelope,
                 event,
                 raw_ref,
@@ -300,52 +453,60 @@ impl Engine {
         })
     }
 
-    /// Returns Host-verified cleanup facts for every committed anchor.
-    pub async fn verify_cleanup(&self) -> Result<Value, ApiError> {
-        let _admission = self.admission.lock().await;
-        if self.active() != 0 {
-            return Err(ApiError {
-                code: -32012,
-                kind: "admission_refused",
-                message: "turns are active",
+    /// Final shutdown: Host closes live controls, reconciles every anchor and
+    /// joins its tasks; then force-stopped turns commit `cancelled` with that
+    /// evidence. Every step shares the caller's single absolute deadline.
+    pub async fn shutdown(&self, deadline: Deadline) -> EngineShutdown {
+        let report = self.adapter.shutdown(deadline).await;
+        let forced = std::mem::take(&mut *lock(&self.forced));
+        let mut uncommitted_turns = 0;
+        for turn in forced {
+            let evidence = report.recovery.iter().find(|record| {
+                record.session_id == turn.started.session && record.turn == turn.started.turn
             });
+            // C1 §7.6: `forced` only with Host evidence, `quiescent` only after
+            // verified group absence. A complete journal without an anchor intent
+            // for the turn means no process was ever launched for it.
+            let (outcome, cleanup) = match evidence.map(|record| record.cleanup) {
+                Some(Cleanup::Quiescent) => ("forced", "quiescent"),
+                None if report.failure.is_none() => ("acknowledged", "quiescent"),
+                Some(Cleanup::Uncertain | Cleanup::Pending) | None => ("requested", "uncertain"),
+            };
+            let terminal = Terminal {
+                state: "cancelled",
+                failure: None,
+                stop_reason: "interrupted",
+                vendor_stop_reason: None,
+                final_text: String::new(),
+                exit: None,
+                raw_ref: None,
+                cancel: Some(Cancel {
+                    outcome,
+                    cleanup,
+                    requested_at: turn.requested_at,
+                    settled_at: rfc3339(SystemTime::now()),
+                }),
+            };
+            let commit = self.finish(&turn.started, turn.seq + 1, terminal, turn.accepted);
+            if !matches!(
+                tokio::time::timeout_at(deadline.instant(), commit).await,
+                Ok(Ok(()))
+            ) {
+                uncommitted_turns += 1;
+            }
         }
-        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(5));
-        let reports = self
-            .adapter
-            .recover(deadline)
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        let count = reports.len();
-        let absent = reports
-            .iter()
-            .all(|report| report.cleanup == Cleanup::Quiescent);
-        let anchors: Vec<Value> = reports.into_iter().map(|report| json!({
-            "anchor_id":report.anchor_id,"generation":report.generation,
-            "session_id":report.session_id,"turn":report.turn.get(),
-            "cleanup":if report.cleanup == Cleanup::Quiescent { "group_absent" } else { "uncertain" },
-        })).collect();
-        Ok(
-            json!({"inventory_committed":true,"count":count,"absence_proven":absent,
-            "status":if count == 0 {"no_anchors"} else if absent {"quiescent"} else {"unverified"},
-            "records":anchors}),
-        )
-    }
-
-    /// Drains Host-owned controls and reapers before the Store owner is released.
-    pub async fn shutdown(&self) -> Result<Value, ApiError> {
-        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(10));
-        let report = self
-            .adapter
-            .shutdown(deadline)
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        let absent = report
-            .recovery
-            .iter()
-            .all(|record| record.cleanup == Cleanup::Quiescent);
-        let count = report.recovery.len();
-        Ok(json!({"anchors":count,"absence_proven":absent,"pending_tasks":report.pending_tasks}))
+        EngineShutdown {
+            anchors: report.recovery.len(),
+            uncertain_owners: report
+                .recovery
+                .iter()
+                .filter(|record| record.cleanup != Cleanup::Quiescent)
+                .count(),
+            pending_tasks: report.pending_tasks,
+            failed_tasks: report.failed_tasks,
+            failure: report.failure,
+            uncommitted_turns,
+        }
     }
 
     /// Authenticates before reporting fake's unsupported mutation capability.
@@ -431,6 +592,14 @@ fn terminal_envelope(
             .chain(terminal.raw_ref.as_ref()),
     );
     let plan = RoutePlan::fake();
+    let mut warnings = plan.warnings();
+    if terminal
+        .cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.cleanup == "uncertain")
+    {
+        warnings.push(Warning::CANCEL_CLEANUP_UNCERTAIN);
+    }
     Envelope {
         api_version: 1,
         session_id: session.clone(),
@@ -441,7 +610,7 @@ fn terminal_envelope(
         failure: terminal.failure,
         stop_reason: terminal.stop_reason,
         vendor_stop_reason: terminal.vendor_stop_reason,
-        cancel: None,
+        cancel: terminal.cancel,
         harness: "fake",
         model: Requested {
             requested: "fake".to_owned(),
@@ -451,7 +620,7 @@ fn terminal_envelope(
             requested: None,
             resolved: None,
         },
-        warnings: plan.warnings(),
+        warnings,
         plan,
         vendor_session_id: None,
         cwd: None,
@@ -495,6 +664,7 @@ struct Terminal {
     final_text: String,
     exit: Option<Exit>,
     raw_ref: Option<RawRef>,
+    cancel: Option<Cancel>,
 }
 
 fn classify(
@@ -512,6 +682,7 @@ fn classify(
                 final_text: String::new(),
                 exit: None,
                 raw_ref: None,
+                cancel: None,
             };
         }
     };
@@ -555,6 +726,7 @@ fn classify(
             signal: evidence.exit.signal,
         }),
         raw_ref: Some(evidence.terminal_raw),
+        cancel: None,
     }
 }
 

@@ -120,16 +120,18 @@ impl AdapterRuntime {
     }
 
     /// Drains lower process owners before Store shutdown and returns passive facts.
-    pub async fn shutdown(&self, deadline: Deadline) -> Result<FakeShutdown, AdapterError> {
-        let report = self.route.shutdown(deadline).await?;
-        Ok(FakeShutdown {
+    pub async fn shutdown(&self, deadline: Deadline) -> FakeShutdown {
+        let report = self.route.shutdown(deadline).await;
+        FakeShutdown {
             recovery: report
                 .recovery
                 .into_iter()
                 .map(normalize_recovery)
                 .collect(),
             pending_tasks: report.pending_tasks,
-        })
+            failed_tasks: report.failed_tasks,
+            failure: report.failure,
+        }
     }
 
     /// Recovers committed anchors without giving Core process signalling authority.
@@ -204,4 +206,8 @@ pub struct FakeShutdown {
     pub recovery: Vec<FakeRecovery>,
     /// Host tasks still pending at the shutdown deadline.
     pub pending_tasks: usize,
+    /// Host tasks that panicked, were cancelled or failed their child wait.
+    pub failed_tasks: usize,
+    /// Bounded description of the deadline, Store or recovery failure, if any.
+    pub failure: Option<String>,
 }

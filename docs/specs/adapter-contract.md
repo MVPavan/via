@@ -108,7 +108,10 @@ committed TurnState; the existing acceptance/observation contract still
 applies. Recovery delegates downward through the same wrappers and returns
 passive facts, never a Host or journal handle. Store must outlive active
 driver cleanup and raw/terminal commits; its currently blocking Drop is not
-a bounded async shutdown guarantee (runtime §6).
+a bounded async shutdown guarantee (runtime §6). Shutdown delegates down the
+same wrappers and returns a passive report on every path: reconciled anchor
+facts, pending and failed Host joins and a bounded named failure, never a
+Host handle and never an error that drops those counts (runtime §6.2).
 
 ```rust
 pub enum Adapter { Claude(claude::Adapter), Codex(codex::Adapter), OpenCode(opencode::Adapter), Acp(acp::Adapter) }

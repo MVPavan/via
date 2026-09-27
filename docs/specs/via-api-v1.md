@@ -373,7 +373,13 @@ without prompts, payloads or handles. `via daemon stop [--drain|--force]`: refus
 while sessions are active unless `drain` (gate every session `closing`
 for new work, run accepted queued turns to completion, then stop) or
 `force` (close every session with mode `force`; turns end `cancelled` or
-`unknown`).
+`unknown`). `drain` with `force` is `invalid_params`; after acceptance new
+work is refused `daemon_stopping`. The result `{"stopping":true}` only
+acknowledges acceptance; it is not evidence that work stopped or the daemon
+exited. Drain runs accepted turns under their existing deadlines; force and
+an idle stop then share one final 10 s shutdown deadline. The daemon exits 0
+only after positive cleanup, joins and durable records, otherwise 4
+(runtime contract §6.2).
 
 ## 4. Canonical parameters
 

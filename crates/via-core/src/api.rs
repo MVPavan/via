@@ -58,11 +58,14 @@ pub struct SessionReadParams {
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusParams {}
 
-/// Strict C1 `daemon/stop` parameters currently accepted.
+/// Strict C1 §3.14 `daemon/stop` parameters; `drain` and `force` exclude each other.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStopParams {
-    /// Stop even while sessions are active.
+    /// Refuse new work, let accepted turns finish, then stop.
+    #[serde(default)]
+    pub drain: bool,
+    /// Close every session with mode `force` and stop at once.
     #[serde(default)]
     pub force: bool,
 }
@@ -110,6 +113,18 @@ impl ApiError {
         code: -32009,
         kind: "harness_unavailable",
         message: "harness is unavailable",
+    };
+    /// The daemon accepted a stop and admits no new work.
+    pub const DAEMON_STOPPING: Self = Self {
+        code: -32017,
+        kind: "daemon_stopping",
+        message: "the daemon is stopping",
+    };
+    /// Active sessions refuse a plain stop (C1 §3.14).
+    pub const SESSIONS_ACTIVE: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "sessions are active",
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
@@ -345,6 +360,23 @@ pub(crate) struct Warning {
     message: &'static str,
 }
 
+impl Warning {
+    /// C1 §3.5: a settled cancel whose group absence is unproved.
+    pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self {
+        code: "cancel_cleanup_uncertain",
+        message: "process group cleanup after cancellation is unconfirmed",
+    };
+}
+
+/// C1 §3.5/§7.4 cancel outcome with separate cleanup certainty.
+#[derive(Clone, Serialize)]
+pub(crate) struct Cancel {
+    pub(crate) outcome: &'static str,
+    pub(crate) cleanup: &'static str,
+    pub(crate) requested_at: String,
+    pub(crate) settled_at: String,
+}
+
 /// C1 §3.2 spawn receipt.
 #[derive(Serialize)]
 pub(crate) struct Receipt {
@@ -490,8 +522,8 @@ pub(crate) struct Envelope {
     pub(crate) failure: Option<Failure>,
     pub(crate) stop_reason: &'static str,
     pub(crate) vendor_stop_reason: Option<String>,
-    /// No cancel exists on this route, so it is always `null`.
-    pub(crate) cancel: Option<Value>,
+    /// Only a forced daemon stop cancels on this route; otherwise `null`.
+    pub(crate) cancel: Option<Cancel>,
     pub(crate) harness: &'static str,
     pub(crate) model: Requested<String>,
     pub(crate) effort: Requested<Option<String>>,
@@ -546,6 +578,8 @@ pub(crate) enum EventBody {
         state: &'static str,
         failure: Option<Failure>,
         stop_reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancel: Option<Cancel>,
     },
 }
 

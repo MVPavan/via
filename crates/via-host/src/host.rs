@@ -47,13 +47,16 @@ struct HostTasks {
     controls: Vec<TrackedControl>,
 }
 
+/// Owned task outcome: an `Err` is a failed task, such as a failed child wait.
+type TaskResult = Result<(), ()>;
+
 struct TrackedTask {
-    handle: Mutex<JoinHandle<()>>,
+    handle: Mutex<JoinHandle<TaskResult>>,
     joined: AtomicBool,
 }
 
 impl TrackedTask {
-    fn new(handle: JoinHandle<()>) -> Arc<Self> {
+    fn new(handle: JoinHandle<TaskResult>) -> Arc<Self> {
         Arc::new(Self {
             handle: Mutex::new(handle),
             joined: AtomicBool::new(false),
@@ -191,13 +194,18 @@ pub struct RecoveryReport {
     pub cleanup: CleanupEvidence,
 }
 
-/// Bounded shutdown result; unfinished tasks retain their Host owner.
+/// Bounded shutdown result, returned on every path; unfinished tasks retain
+/// their Host owner while the daemon lives.
 #[derive(Debug)]
 pub struct ShutdownReport {
-    /// Passive evidence for every committed anchor intent.
+    /// Passive evidence for committed anchor intents established before any failure.
     pub recovery: Vec<RecoveryReport>,
-    /// Reaper or status tasks still running when the deadline expired.
+    /// Retained reaper or status tasks whose result was not collected by the deadline.
     pub pending_tasks: usize,
+    /// Collected tasks that panicked, were cancelled or failed their child wait.
+    pub failed_tasks: usize,
+    /// The named deadline, Store or recovery failure that precluded a complete report.
+    pub failure: Option<HostError>,
 }
 
 impl Host {
@@ -356,10 +364,9 @@ impl Host {
                 .take()
                 .ok_or(HostError::Protocol("missing vendor stderr pipe"))?,
         };
-        // Reap the anchor regardless of later journal/control failures.
-        let task = tokio::spawn(async move {
-            let _ = anchor.wait().await;
-        });
+        // Reap the anchor regardless of later journal/control failures; a failed
+        // wait is a failed task, never successful reaping.
+        let task = tokio::spawn(async move { anchor.wait().await.map(drop).map_err(drop) });
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -474,6 +481,7 @@ impl Host {
                     _ => break,
                 }
             }
+            Ok(())
         });
         let mut tasks = self
             .tasks
@@ -490,9 +498,18 @@ impl Host {
     }
 
     /// Closes known live controls, reconciles the journal, and joins owned tasks.
-    pub async fn shutdown(&self, deadline: Deadline) -> Result<ShutdownReport, HostError> {
+    ///
+    /// The report survives every failure: an expired deadline or recovery error
+    /// keeps pending and failed join counts, and unjoined tasks stay owned here.
+    pub async fn shutdown(&self, deadline: Deadline) -> ShutdownReport {
         if Instant::now() >= deadline.instant() {
-            return Err(HostError::Deadline);
+            let (pending_tasks, failed_tasks) = join_owned_tasks(&self.tasks, deadline).await;
+            return ShutdownReport {
+                recovery: Vec::new(),
+                pending_tasks,
+                failed_tasks,
+                failure: Some(HostError::Deadline),
+            };
         }
         let controls = {
             let mut tasks = self
@@ -525,12 +542,18 @@ impl Host {
                     .await;
             }
         }
-        let recovery = self.recover(deadline).await;
-        let pending_tasks = join_owned_tasks(&self.tasks, deadline).await;
-        Ok(ShutdownReport {
-            recovery: recovery?,
+        let (recovery, failure) = match self.recover(deadline).await {
+            Ok(recovery) => (recovery, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let (pending_tasks, failed_tasks) = join_owned_tasks(&self.tasks, deadline).await;
+        let failure = failure.or((pending_tasks > 0).then_some(HostError::Deadline));
+        ShutdownReport {
+            recovery,
             pending_tasks,
-        })
+            failed_tasks,
+            failure,
+        }
     }
 
     /// Reconciles committed anchor records without resending Configure or ARM.
@@ -622,24 +645,45 @@ impl Host {
     }
 }
 
-async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) -> usize {
+/// Collects owned task results until the deadline; returns `(pending, failed)`.
+///
+/// A task leaves the registry only once its result was collected, so a
+/// cancelled caller or an expired deadline never detaches it.
+async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) -> (usize, usize) {
     let running = tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .running
         .clone();
+    let mut failed = 0;
     for task in running {
         if task.joined.load(Ordering::Acquire) {
             continue;
         }
-        let Ok(mut handle) = timeout_at(deadline.instant(), task.handle.lock()).await else {
-            break;
+        // An expired deadline still collects tasks that already finished.
+        let handle = if Instant::now() >= deadline.instant() {
+            task.handle.try_lock().ok()
+        } else {
+            timeout_at(deadline.instant(), task.handle.lock())
+                .await
+                .ok()
+        };
+        let Some(mut handle) = handle else {
+            continue;
         };
         if task.joined.load(Ordering::Acquire) {
             continue;
         }
-        if timeout_at(deadline.instant(), &mut *handle).await.is_ok() {
+        let outcome = if handle.is_finished() {
+            Ok((&mut *handle).await)
+        } else {
+            timeout_at(deadline.instant(), &mut *handle).await
+        };
+        if let Ok(result) = outcome {
             task.joined.store(true, Ordering::Release);
+            if !matches!(result, Ok(Ok(()))) {
+                failed += 1;
+            }
         }
     }
     let mut owned = tasks
@@ -648,7 +692,7 @@ async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) 
     owned
         .running
         .retain(|task| !task.joined.load(Ordering::Acquire));
-    owned.running.len()
+    (owned.running.len(), failed)
 }
 
 impl ProcessControl {
@@ -898,6 +942,7 @@ mod tests {
         let (release, held) = tokio::sync::oneshot::channel::<()>();
         let tracked = TrackedTask::new(tokio::spawn(async move {
             let _ = held.await;
+            Ok(())
         }));
         tasks
             .lock()
@@ -937,7 +982,116 @@ mod tests {
                 Deadline::at(Instant::now() + Duration::from_secs(1))
             )
             .await,
-            0
+            (0, 0)
         );
+    }
+
+    /// Host over a private temporary Store; `open` false drops the Store owner
+    /// so every journal read fails.
+    fn host_fixture(open: bool) -> (Host, Option<via_store::Store>, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "via-host-unit-{}-{}",
+            std::process::id(),
+            linux::random_hex().unwrap_or_default()
+        ));
+        let create = |path: &PathBuf| {
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(path)
+                .is_ok()
+        };
+        assert!(create(&root) && create(&root.join("state")) && create(&root.join("anchors")));
+        let store = via_store::Store::open(&root.join("state")).ok();
+        let journal = store
+            .as_ref()
+            .map(|store| store.runtime_resources().into_wire_parts().1);
+        let host = journal
+            .and_then(|journal| {
+                Host::new(journal, PathBuf::from("/bin/true"), root.join("anchors")).ok()
+            })
+            .unwrap_or_else(|| unreachable!("fixture Host must open"));
+        (host, open.then_some(store).flatten(), root)
+    }
+
+    fn hold(host: &Host) -> tokio::sync::oneshot::Sender<()> {
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        host.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+            .push(TrackedTask::new(tokio::spawn(async move {
+                let _ = held.await;
+                Ok(())
+            })));
+        release
+    }
+
+    #[tokio::test]
+    async fn panicked_or_failed_tasks_count_as_failed_not_joined() {
+        let tasks = Arc::new(StdMutex::new(HostTasks::default()));
+        let panicked: JoinHandle<TaskResult> =
+            tokio::spawn(async { std::panic::panic_any("owned task panicked") });
+        // A reaper whose child wait failed reports Err, never success.
+        let failed_wait: JoinHandle<TaskResult> = tokio::spawn(async { Err(()) });
+        let ok: JoinHandle<TaskResult> = tokio::spawn(async { Ok(()) });
+        tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+            .extend([panicked, failed_wait, ok].map(TrackedTask::new));
+        let joined = join_owned_tasks(
+            &tasks,
+            Deadline::at(Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+        assert_eq!(joined, (0, 2), "panic and failed wait must be failed joins");
+    }
+
+    #[tokio::test]
+    async fn held_task_past_deadline_is_reported_pending_and_kept_owned() {
+        let (host, _store, root) = host_fixture(true);
+        let release = hold(&host);
+        let report = host
+            .shutdown(Deadline::at(Instant::now() + Duration::from_millis(50)))
+            .await;
+        assert_eq!((report.pending_tasks, report.failed_tasks), (1, 0));
+        assert!(
+            matches!(report.failure, Some(HostError::Deadline)),
+            "{report:?}"
+        );
+        // An already expired deadline still returns the report, not only an error.
+        let expired = host.shutdown(Deadline::at(Instant::now())).await;
+        assert_eq!(expired.pending_tasks, 1);
+        assert!(matches!(expired.failure, Some(HostError::Deadline)));
+        assert!(release.send(()).is_ok(), "task must still own its receiver");
+        let later = host
+            .shutdown(Deadline::at(Instant::now() + Duration::from_secs(1)))
+            .await;
+        assert_eq!(
+            (later.pending_tasks, later.failed_tasks),
+            (0, 0),
+            "{later:?}"
+        );
+        assert!(later.failure.is_none(), "{later:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_failure_keeps_pending_owner_in_report() {
+        let (host, store, root) = host_fixture(false);
+        assert!(store.is_none());
+        let release = hold(&host);
+        let report = host
+            .shutdown(Deadline::at(Instant::now() + Duration::from_millis(100)))
+            .await;
+        assert!(
+            matches!(report.failure, Some(HostError::StoreUnavailable(_))),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.pending_tasks, 1,
+            "error path must keep the pending owner"
+        );
+        drop(release);
+        let _ = fs::remove_dir_all(root);
     }
 }

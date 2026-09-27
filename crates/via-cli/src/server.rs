@@ -2,10 +2,11 @@
 
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io,
+    io::{self, Write},
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -15,15 +16,19 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::mpsc,
     task::JoinSet,
+    time::{Instant, timeout_at},
 };
 
 use serde::de::DeserializeOwned;
 use via_core::{
-    ApiError, DaemonStatusParams, DaemonStopParams, Engine, FakeConfig, HelloParams, ReadParams,
-    SessionReadParams, SpawnParams, SteerParams,
+    ApiError, DaemonStatusParams, DaemonStopParams, Deadline, Engine, FakeConfig, HelloParams,
+    ReadParams, SessionReadParams, SpawnParams, SteerParams, StopMode,
 };
 
 const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// One absolute budget for all of final shutdown (runtime §6, C1 §3.14).
+const FINAL_SHUTDOWN: Duration = Duration::from_secs(10);
 
 fn validate_dir(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -106,10 +111,17 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             .map_err(anyhow::Error::msg)?,
     );
     let (drive_tx, mut drive_rx) = mpsc::channel::<(String, String)>(16);
-    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let (stop_tx, mut stop_rx) = mpsc::channel::<StopMode>(4);
     let mut clients = JoinSet::new();
     let mut drives = JoinSet::new();
-    loop {
+    let mut stopping = None;
+    // Drain keeps serving until accepted work settles; force and idle stop at once.
+    let mode = loop {
+        match stopping {
+            Some(StopMode::Force) => break StopMode::Force,
+            Some(mode) if engine.active() == 0 && drives.is_empty() => break mode,
+            _ => {}
+        }
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
@@ -125,7 +137,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 let engine = Arc::clone(&engine);
                 drives.spawn(async move { engine.drive(&session, prompt).await });
             }
-            Some(()) = stop_rx.recv() => break,
+            Some(mode) = stop_rx.recv() => stopping = Some(mode),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
                 if let Err(error) = result { tracing::error!(%error, "client task failed"); }
             }
@@ -133,25 +145,92 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 if let Err(error) = result { tracing::error!(%error, "turn task failed"); }
             }
         }
-    }
+    };
+    drop(listener);
+    // Best effort: a stale socket refuses connections and the next daemon replaces it.
+    let _ = fs::remove_file(&socket);
+    Ok(final_shutdown(engine, clients, drives, mode).await)
+}
+
+/// Joins the daemon's owned work under one absolute deadline and decides the
+/// process exit: 0 only for a clean shutdown, otherwise 4 (incomplete).
+///
+/// Only daemon main takes the incomplete exit. Unjoined tasks are aborted and
+/// reported, a blocked Store join is abandoned to process exit, and nothing is
+/// claimed from abort, handle drop or OS adoption.
+async fn final_shutdown(
+    engine: Arc<Engine>,
+    mut clients: JoinSet<anyhow::Result<()>>,
+    mut drives: JoinSet<Result<(), ApiError>>,
+    mode: StopMode,
+) -> i32 {
+    let started = Instant::now();
+    let deadline = started + FINAL_SHUTDOWN;
     clients.abort_all();
-    while clients.join_next().await.is_some() {}
-    while drives.join_next().await.is_some() {}
-    let shutdown = engine.shutdown().await;
-    tokio::task::spawn_blocking(move || drop(engine)).await?;
-    let shutdown = shutdown.map_err(anyhow::Error::msg)?;
-    if shutdown["absence_proven"] != true || shutdown["pending_tasks"] != 0 {
-        bail!("daemon shutdown left unverified process cleanup");
+    let mut failed_joins = 0_usize;
+    let joined = timeout_at(deadline, async {
+        while let Some(result) = clients.join_next().await {
+            if result.is_err_and(|error| !error.is_cancelled()) {
+                failed_joins += 1;
+            }
+        }
+        // Force-stopped drives return at once; their terminals commit below.
+        while let Some(result) = drives.join_next().await {
+            if !matches!(result, Ok(Ok(()))) {
+                failed_joins += 1;
+            }
+        }
+    })
+    .await;
+    let mut pending_joins = 0;
+    if joined.is_err() {
+        pending_joins = clients.len() + drives.len();
+        clients.abort_all();
+        drives.abort_all();
     }
-    fs::remove_file(&socket)?;
-    Ok(0)
+    let report = timeout_at(deadline, engine.shutdown(Deadline::at(deadline))).await;
+    // Store Drop blocks on its writer and raw threads: keep it off Tokio workers
+    // and bounded; a stalled join is left to process exit, never waited out.
+    let store = match Arc::try_unwrap(engine) {
+        Ok(engine) => drop_blocking(engine, deadline).await,
+        Err(_) => "not_released",
+    };
+    let host = report.as_ref().ok();
+    let clean = pending_joins == 0
+        && failed_joins == 0
+        && store == "joined"
+        && host.is_some_and(via_core::EngineShutdown::is_clean);
+    let summary = json!({"daemon_shutdown":{
+        "mode":mode.as_str(),
+        "elapsed_ms":u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "pending_joins":pending_joins + host.map_or(0, |host| host.pending_tasks),
+        "failed_joins":failed_joins + host.map_or(0, |host| host.failed_tasks),
+        "anchors":host.map(|host| host.anchors),
+        "uncertain_owners":host.map(|host| host.uncertain_owners),
+        "host_failure":host.map_or(Some("final shutdown deadline expired"), |host| host.failure.as_deref()),
+        "uncommitted_turns":host.map(|host| host.uncommitted_turns),
+        "store":store,
+        "disposition":if clean {"clean"} else {"incomplete"},
+    }});
+    // Best-effort bounded diagnostic; the exit status is the authoritative result.
+    let _ = writeln!(io::stderr().lock(), "{summary}");
+    if clean { 0 } else { 4 }
+}
+
+/// Drops `value` on the blocking pool, waiting at most until `deadline`.
+async fn drop_blocking<T: Send + 'static>(value: T, deadline: Instant) -> &'static str {
+    match timeout_at(deadline, tokio::task::spawn_blocking(move || drop(value))).await {
+        Ok(Ok(())) => "joined",
+        Ok(Err(_)) => "join_failed",
+        Err(_) => "join_timed_out",
+    }
 }
 
 async fn handle_client(
     stream: UnixStream,
     engine: Arc<Engine>,
     drives: mpsc::Sender<(String, String)>,
-    stop: mpsc::Sender<()>,
+    stop: mpsc::Sender<StopMode>,
     socket_path: &Path,
     store_path: &Path,
 ) -> anyhow::Result<()> {
@@ -192,6 +271,12 @@ async fn handle_client(
                 ),
             )
             .await?;
+            continue;
+        }
+        if hello_done && method == "daemon/stop" {
+            if stop_request(&engine, params, &mut write, &id, &stop).await? {
+                break;
+            }
             continue;
         }
         let response = if method == "hello" {
@@ -237,14 +322,42 @@ async fn handle_client(
             &json!({"jsonrpc":"2.0","id":id,"result":response}),
         )
         .await?;
-        if method == "daemon/stop" {
-            stop.send(())
-                .await
-                .map_err(|_| anyhow::anyhow!("daemon stop receiver closed"))?;
-            break;
-        }
     }
     Ok(())
+}
+
+/// Handles C1 `daemon/stop`; returns whether the stop was accepted.
+///
+/// The `{"stopping":true}` receipt is acceptance only, and a lost reply never
+/// cancels an accepted stop.
+async fn stop_request(
+    engine: &Engine,
+    params: Value,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    id: &Value,
+    stop: &mpsc::Sender<StopMode>,
+) -> anyhow::Result<bool> {
+    let mode = match typed::<DaemonStopParams>(params) {
+        Ok(params) => engine.request_stop(&params).await.map_err(Refusal::from),
+        Err(refusal) => Err(refusal),
+    };
+    let mode = match mode {
+        Ok(mode) => mode,
+        Err(refusal) => {
+            send(write, &error(id, refusal)).await?;
+            return Ok(false);
+        }
+    };
+    // Safe to ignore: a caller disconnect never cancels the accepted stop.
+    let _ = send(
+        write,
+        &json!({"jsonrpc":"2.0","id":id,"result":{"stopping":true}}),
+    )
+    .await;
+    stop.send(mode)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon stop receiver closed"))?;
+    Ok(true)
 }
 
 async fn dispatch(
@@ -262,17 +375,6 @@ async fn dispatch(
                 json!({"daemon_version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),
                 "socket_path":socket_path,"store_path":store_path,"health":"healthy","sessions":{"idle":0,"active":engine.active(),"closing":0},"servers":[]}),
             )
-        }
-        "daemon/stop" => {
-            let params: DaemonStopParams = typed(params)?;
-            if engine.active() > 0 && !params.force {
-                return Err(Refusal::from(ApiError {
-                    code: -32012,
-                    kind: "admission_refused",
-                    message: "sessions are active",
-                }));
-            }
-            Ok(json!({"stopping":true}))
         }
         "spawn" => {
             let (receipt, session, prompt) = engine.spawn(typed::<SpawnParams>(params)?).await?;
@@ -402,5 +504,30 @@ async fn read_line_limit<R: tokio::io::AsyncRead + Unpin>(
         if line.last() == Some(&b'\n') {
             return Ok(line.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stalled_blocking_drop_is_abandoned_at_the_deadline() {
+        struct Stalled(std::sync::mpsc::Receiver<()>);
+        impl Drop for Stalled {
+            fn drop(&mut self) {
+                let _ = self.0.recv_timeout(Duration::from_secs(5));
+            }
+        }
+        let (release, held) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let outcome = drop_blocking(Stalled(held), started + Duration::from_millis(100)).await;
+        assert_eq!(outcome, "join_timed_out");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(release);
+        assert_eq!(
+            drop_blocking((), Instant::now() + Duration::from_secs(1)).await,
+            "joined"
+        );
     }
 }
