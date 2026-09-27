@@ -95,10 +95,10 @@ fn force_before_launch_claims_no_acknowledgement() {
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, turn) = engine.spawn(params, "{}").await.unwrap().drive.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         assert_eq!(engine.request_stop(&force).await.unwrap(), StopMode::Force);
-        engine.drive(&session, prompt).await.unwrap();
+        engine.drive(session.clone(), turn).await.unwrap();
         let report = engine
             .shutdown(Deadline::at(
                 tokio::time::Instant::now() + Duration::from_secs(5),
@@ -118,7 +118,7 @@ fn force_before_launch_claims_no_acknowledgement() {
             "{envelope}"
         );
 
-        let page = engine.events(&session).await.unwrap();
+        let page = engine.events(session.as_str()).await.unwrap();
         let events: Vec<Value> = page["events"].as_array().unwrap().clone();
         let types: Vec<&str> = events
             .iter()
@@ -195,11 +195,11 @@ fn force_during_stalled_acquisition_settles_the_turn() {
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, turn) = engine.spawn(params, "{}").await.unwrap().drive.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         let forced_at = std::cell::Cell::new(None);
         let (driven, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(8), engine.drive(&session, prompt)),
+            tokio::time::timeout(Duration::from_secs(8), engine.drive(session.clone(), turn)),
             async {
                 // Acquisition is then waiting for the anchor's ready frame.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -291,10 +291,10 @@ fn force_over_stand_in_within(
             "handle":format!("h_{}", "A".repeat(43)),
         }))
         .unwrap();
-        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let (session, turn) = engine.spawn(params, "{}").await.unwrap().drive.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         let (driven, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), engine.drive(&session, prompt)),
+            tokio::time::timeout(Duration::from_secs(10), engine.drive(session.clone(), turn)),
             async {
                 wait_flag(&root.join("runtime"), barrier).await;
                 engine.request_stop(&force).await.unwrap();
@@ -307,7 +307,7 @@ fn force_over_stand_in_within(
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
-        let events = engine.events(&session).await.unwrap()["events"]
+        let events = engine.events(session.as_str()).await.unwrap()["events"]
             .as_array()
             .unwrap()
             .clone();

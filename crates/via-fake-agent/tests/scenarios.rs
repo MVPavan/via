@@ -335,3 +335,33 @@ fn normal_reply_fixture_fails_when_input_never_closes() -> TestResult {
     assert_eq!(wait_for_exit(&mut child)?.code(), Some(2));
     Ok(())
 }
+
+#[test]
+fn a_multi_script_fixture_runs_the_script_its_start_request_selects() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let script = |prompt: &str| {
+        json!({"expected_request":{"type":"start","prompt":prompt},
+            "steps":[{"action":"emit","message":{"type":"text","text":format!("{prompt} ran")}}]})
+    };
+    let fixture = json!({"scripts":[script("first"), script("second")]});
+    for prompt in ["second", "first"] {
+        let mut child = fake(&fixture, root.path())?;
+        send_start(&mut child, prompt)?;
+        drop(child.0.stdin.take());
+        let mut stdout = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .ok_or("fake stdout unexpectedly closed")?
+            .read_to_string(&mut stdout)?;
+        assert!(wait_for_exit(&mut child)?.success());
+        let line: serde_json::Value = serde_json::from_str(stdout.trim())?;
+        assert_eq!(line["text"], format!("{prompt} ran"));
+    }
+    let mut child = fake(&fixture, root.path())?;
+    send_start(&mut child, "unscripted")?;
+    drop(child.0.stdin.take());
+    assert!(!wait_for_exit(&mut child)?.success());
+    Ok(())
+}

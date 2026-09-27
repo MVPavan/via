@@ -78,7 +78,7 @@ pub enum C1TurnState {
 mod api;
 mod engine;
 
-pub use engine::{Engine, EngineShutdown, StopMode};
+pub use engine::{Engine, EngineShutdown, Receipted, StopMode};
 
 /// Hidden executable entrypoint forwarded through the architecture layers.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
@@ -86,8 +86,9 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 }
 
 pub use api::{
-    ApiError, DaemonStatusParams, DaemonStopParams, ReadParams, SessionReadParams, SpawnParams,
-    SteerParams, Unpersisted, hash_handle, parse_address,
+    ApiError, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, ReadParams, ReceiptOutcome,
+    ResumeParams, SessionReadParams, SpawnParams, SteerParams, Unpersisted, WaitParams,
+    hash_handle, parse_address, retry_identity,
 };
 
 impl Serialize for C1TurnState {

@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,11 +30,13 @@ impl Evidence {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scratchpad/execution/rust-foundation-release/s1-harness/runs");
         fs::create_dir_all(&root)?;
+        // Evidence holds Store backups and raw vendor bytes: private whatever the umask.
         let dir = tempfile::Builder::new()
             .prefix(&format!("{scenario}-"))
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(root)?
             .keep();
-        fs::create_dir(dir.join("raw"))?;
+        fs::DirBuilder::new().mode(0o700).create(dir.join("raw"))?;
         Ok(Self {
             dir,
             scenario: scenario.to_owned(),

@@ -222,9 +222,10 @@ mod runtime;
 
 pub use runtime::{
     AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord,
-    DurableRaw, EventRecord, GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter,
-    ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent,
-    SubmissionRecord, TerminalRecord,
+    DurableRaw, EventRecord, GroupAbsenceRecord, OperationRecord, Predecessors, ProcessJournal,
+    QueuedTurn, RawFactory, RawStream, RawWriter, ReceiptRecord, ResumeRecord, RuntimeResources,
+    SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient, StoreError,
+    StoredEvent, StoredSpawnKey, SubmissionRecord, TerminalRecord,
 };
 
 #[cfg(feature = "test-failpoints")]

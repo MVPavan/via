@@ -210,6 +210,16 @@ fn same_store(expected: &Path, reported: &str) -> anyhow::Result<bool> {
 }
 
 pub(crate) fn request(method: &str, params: &Value, auto_start: bool) -> anyhow::Result<Value> {
+    request_within(method, params, auto_start, Duration::from_secs(30))
+}
+
+/// `request` whose reply may take up to `read` (a `wait` with its own bound).
+pub(crate) fn request_within(
+    method: &str,
+    params: &Value,
+    auto_start: bool,
+    read: Duration,
+) -> anyhow::Result<Value> {
     let paths = paths()?;
     let socket = paths.runtime.join("via.sock");
     let stream = match UnixStream::connect(&socket) {
@@ -227,7 +237,7 @@ pub(crate) fn request(method: &str, params: &Value, auto_start: bool) -> anyhow:
         Err(error) => return Err(error.into()),
     };
     let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(read))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -275,7 +285,24 @@ pub(crate) fn call(
     auto_start: bool,
     json_output: bool,
 ) -> anyhow::Result<i32> {
-    let response = request(method, params, auto_start)?;
+    call_within(
+        method,
+        params,
+        auto_start,
+        json_output,
+        Duration::from_secs(30),
+    )
+}
+
+/// `call` whose reply may take up to `read`.
+pub(crate) fn call_within(
+    method: &str,
+    params: &Value,
+    auto_start: bool,
+    json_output: bool,
+    read: Duration,
+) -> anyhow::Result<i32> {
+    let response = request_within(method, params, auto_start, read)?;
     Ok(if emit_response(&response, json_output)?.is_some() {
         0
     } else {
