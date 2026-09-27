@@ -2,12 +2,13 @@
 
 use super::{
     AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, EventRecord,
-    MetadataExt, OperationRecord, OptionalExtension, Path, QueuedTurn, RAW_UNIT_LIMIT, RawRef,
-    RawStream, ReceiptRecord, Receiver, ResumeRecord, SCHEMA_VERSION, SessionId, SessionSnapshot,
-    SpawnKey, SpawnRecord, StoreError, StoreFailureKind, StoredEvent, StoredSpawnKey,
-    SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, Value,
-    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref, validate_raw_ref,
+    MetadataExt, OperationRecord, OptionalExtension, Path, Predecessors, QueuedTurn,
+    RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT,
+    SessionId, SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
+    StoredSpawnKey, SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, Value,
+    check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
+    commit_group_absence, commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref,
+    validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -74,9 +75,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| StoreError::Open(error.to_string()))?;
-    if version > SCHEMA_VERSION {
-        return Err(StoreError::Open("newer Store schema".to_owned()));
-    }
+    check_schema_version(version)?;
     if version == 0 {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -113,7 +112,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
                 absence_time TEXT,
                 FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
-             PRAGMA user_version=1;",
+             PRAGMA user_version=2;",
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
         tx.commit()
@@ -156,6 +155,9 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         }
         Command::QueuedTurn(session, turn, reply) => {
             let _ = reply.send(read_queued_turn(conn, &session, turn));
+        }
+        Command::Predecessors(session, turn, reply) => {
+            let _ = reply.send(read_predecessors(conn, &session, turn));
         }
         Command::NextSeq(session, reply) => {
             let _ = reply.send(read_next_seq(conn, &session));
@@ -251,6 +253,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         | Command::Snapshot(..)
         | Command::QueuedTurn(..)
         | Command::NextSeq(..)
+        | Command::Predecessors(..)
         | Command::Result(..)
         | Command::Terminated(..)
         | Command::Events(..)
@@ -356,11 +359,13 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    let (state, turns): (String, u32) = tx
+    let (state, turns, queued): (String, u32, u32) = tx
         .query_row(
-            "SELECT state,(SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1) FROM sessions WHERE id=?1",
+            "SELECT state,(SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
+                (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued')
+             FROM sessions WHERE id=?1",
             [session.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|error| StoreError::Write(error.to_string()))?
@@ -370,6 +375,9 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
     }
     if record.turn.get() != turns + 1 {
         return Err(StoreError::Constraint("turn is not the session's next"));
+    }
+    if queued >= SESSION_QUEUE_LIMIT {
+        return Err(StoreError::Constraint("session queue is full"));
     }
     tx.execute(
         "INSERT INTO turns(session_id,number,prompt,state,queued_at,queued_seq) VALUES (?1,?2,?3,'queued',?4,?5)",
@@ -429,8 +437,7 @@ fn read_snapshot(
     conn.query_row(
         "SELECT state,
             (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
-            (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
-            (SELECT count(*) FROM turns WHERE session_id=?1 AND state IN ('queued','running'))
+            (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued')
          FROM sessions WHERE id=?1",
         [session.as_str()],
         |row| {
@@ -438,7 +445,6 @@ fn read_snapshot(
                 closed: row.get::<_, String>(0)? == "closed",
                 turns: row.get(1)?,
                 queued: row.get(2)?,
-                nonterminal: row.get(3)?,
             })
         },
     )
@@ -467,6 +473,36 @@ fn read_queued_turn(
         })
     })
     .transpose()
+}
+
+fn read_predecessors(
+    conn: &Connection,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<Predecessors, StoreError> {
+    let unresolved: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND number<?2 AND state IN ('queued','running'))",
+            params![session.as_str(), turn.get()],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let envelope: Option<Option<String>> = conn
+        .query_row(
+            "SELECT envelope FROM turns WHERE session_id=?1 AND number<?2 AND submitted_at IS NOT NULL ORDER BY number DESC LIMIT 1",
+            params![session.as_str(), turn.get()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let last_submitted = envelope
+        .flatten()
+        .map(|envelope| serde_json::from_str(&envelope).map_err(|_| StoreError::CorruptEvidence))
+        .transpose()?;
+    Ok(Predecessors {
+        unresolved,
+        last_submitted,
+    })
 }
 
 fn read_next_seq(conn: &Connection, session: &SessionId) -> Result<Option<u64>, StoreError> {

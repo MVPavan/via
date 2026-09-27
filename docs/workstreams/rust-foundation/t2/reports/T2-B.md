@@ -157,3 +157,45 @@ not exist on this base (T2-A).
    `c_<session>t<N>`, which keeps existing tests and evidence names stable.
 8. `resume` prints only the receipt. C1 P1 defines foreground waiting for
    `spawn` only.
+
+## Round 2
+
+Sol medium (`../sol-review-T2-B.md`, UNSOUND) found three merge blockers and
+the sticky-cancel item. I merged `origin/rust-foundation` (`a7b60c2`, docs
+only) and applied the orchestrator decisions. Round 1 open items 1 (schema),
+2 (key bound) and 3 (sticky cancel) are closed below. The missing §8.1
+fields from item 6 are also done.
+
+| Item | Failure mode | Regression and its output before the fix | Fix |
+|---|---|---|---|
+| B1 uncertain receipt | SQLite commits the spawn or resume, then reports an uncertain outcome. Core returned `store_error` before registering the turn. A keyed retry then replayed a receipt for a turn nobody would drive. | `engine::tests::a_committed_{spawn,resume}_whose_reply_is_lost_is_handed_off_once` and `an_unknown_receipt_outcome_is_store_error_and_its_keyed_retry_adopts_it_once`. Output before: `unwrap()` on `store_error` (both), and `left: {"kind":"store_error"}` vs `right: {…"commit_outcome":"unknown","retry":"same_key_only"}`. | `receipt_outcome`: a definite failure is `store_error` with `commit_outcome: not_committed`. An uncertain one is reconciled with a Store read (turn N exists → committed; admission is held, so only this request could have created it). If committed, the turn is registered and handed off once. If still unknown, it is `store_error` with `commit_outcome: unknown` and `retry: same_key_only`, and the turn is kept as an orphan. The keyed retry that replays it adopts it (registers and hands off) exactly once. Later retries hand off nothing. An unknown resume marks its number done in the slot, so successors check durable state instead of waiting on a drive that does not exist. |
+| B2 schema | A Store already at v1 skipped the new tables. | `persistence::unreleased_v1_store_is_refused_with_a_recreate_instruction`: before, `a v1 Store opened`. | `SCHEMA_VERSION = 2`. Any older nonzero version is refused while still read-only, leaving its bytes untouched, with "Store schema v1 is an unreleased development format with no migration; stop the daemon and recreate the Store by removing store.sqlite3 from the State directory". The rule is in runtime §6. |
+| B3 queue ceiling | Only Core checked the 8-per-session ceiling. | `persistence::a_ninth_queued_turn_is_refused_inside_the_receipt_transaction`: before, `Ok(())`. | `commit_resume` counts the session's queued turns inside its transaction and refuses a ninth (`Constraint`). `via_store::SESSION_QUEUE_LIMIT` is the one constant, and Core keeps its check to answer `queue_full`. |
+| Sticky cancel | `cancel_queue` was set by any unclean drive and never cleared. | `engine::tests::a_turn_behind_a_settled_terminal_runs_however_its_drive_ended`: before, the assertion "turn 2 was dispatched" failed. `successors_are_cancelled_while_the_predecessor_is_unknown_or_unresolved` passed before and after; it is the kept behaviour. | The slot now only orders drives. `Engine::dispatchable` reads Store `predecessors`. A turn runs only if no earlier turn is queued or running, and the latest submitted earlier turn is terminal, not `unknown`, and not `cleanup: pending`. Turns cancelled while queued are passed over. A Store read failure permits nothing. |
+| Key bound | The check counted UTF-8 bytes and allowed spaces and control characters. | `api::tests::retry_keys_are_one_to_sixty_four_printable_ascii_characters`: before, `unwrap_err()` on `Ok(Some(" "))`. | Keys are 1–64 bytes, each 0x21–0x7E. C1 §3 records this in the `op_key` sentence and the `spawn` params. |
+
+The fault backend is `#[cfg(test)]` only (`Engine.faults`): it loses a
+receipt commit's reply after it succeeds, and makes the reconcile read fail.
+Production builds have no such seam. The `store.commit.reply_lost` end-to-end
+test waits for T2-A's controller.
+
+**Files (round 2):** `via-core` `api.rs`, `lib.rs`, `engine.rs`,
+`engine/{drive,queue,tests}.rs`; `via-store` `lib.rs`, `runtime.rs`,
+`runtime/sql.rs`, `tests/persistence.rs`; `via-cli/src/server.rs`
+(`commit_outcome` field; two error literals moved to consts for the line
+limit); `docs/specs/runtime-contracts.md` §6; `docs/specs/via-api-v1.md` §3,
+§3.2. `ApiError.commit_outcome` is a one-byte `ReceiptOutcome` enum, which
+keeps the refusal type under clippy's `result_large_err` bound. The shared
+drive hunk in `drive.rs` changed again (`drive`/`dispatchable`/`run`).
+
+**Gate (round 2):** fmt, clippy `-D warnings`, deny and check-layers pass.
+nextest ran 142 passed, 2 skipped (the same two ignored). Markdown links: 0
+broken.
+
+**Still open:**
+- An *unkeyed* receipt whose outcome stays unknown can never be adopted,
+  since C1 says retry with the same key only. If it did commit, it stays
+  queued and unresolved, so later turns of that session are cancelled.
+- A turn behind an `unknown` predecessor is cancelled for as long as that
+  predecessor stays unknown. Revision by late evidence is Task 3.
+- Out of scope, as before: `status` and restart recovery.

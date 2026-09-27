@@ -676,7 +676,13 @@ transaction with its `user_version` bump. No automatic repair/downgrade.
 Newer-version refusal must leave database bytes untouched: first inspect an
 existing database through a read-only connection, close it, then open the
 sole writable connection only for a supported version. Avoid journal-mode
-changes before that inspection. Schema v1:
+changes before that inspection. Before the first release no Store format is
+supported across schema versions: a Store whose `user_version` is older than
+the build's is an unreleased development format, is never migrated, and is
+refused at open with a named error telling the user to recreate the dev Store
+(remove `store.sqlite3` from the State directory); its bytes are left
+untouched. Migrations as described above start with the first released
+schema. Schema v2 (v1 was the unreleased single-turn format):
 
 | Table | Key, constraints and stored content |
 |---|---|

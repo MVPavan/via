@@ -115,6 +115,17 @@ pub struct ApiError {
     pub unpersisted: Option<Box<Unpersisted>>,
     /// C1 §8.1 `invalid_params.data.kind2` refinement.
     pub kind2: Option<&'static str>,
+    /// C1 §8.1 `store_error` before a receipt: what happened to its commit.
+    pub commit_outcome: Option<ReceiptOutcome>,
+}
+
+/// C1 §8.1 `data.commit_outcome` of a `store_error` before a receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptOutcome {
+    /// The receipt definitely did not commit.
+    NotCommitted,
+    /// The receipt may have committed; only the same keyed retry can tell.
+    Unknown,
 }
 
 /// A receipted turn whose terminal could not be made durable (C1 `store_error`).
@@ -147,11 +158,32 @@ impl ApiError {
         }
     }
 
+    /// C1 §8.1 `store_error` for a receipt commit that definitely did not happen.
+    pub const RECEIPT_NOT_COMMITTED: Self = Self {
+        commit_outcome: Some(ReceiptOutcome::NotCommitted),
+        ..Self::STORE
+    };
+
+    /// C1 §8.1 `store_error` for a receipt commit whose outcome is unknown.
+    pub const RECEIPT_UNKNOWN: Self = Self {
+        commit_outcome: Some(ReceiptOutcome::Unknown),
+        ..Self::STORE
+    };
+
     /// The C1 §9 JSON-RPC `error.data` object: `kind` plus the kind's own fields.
     pub fn data(&self) -> Value {
         let mut data = json!({"kind":self.kind});
         if let Some(kind2) = self.kind2 {
             data["kind2"] = json!(kind2);
+        }
+        match self.commit_outcome {
+            Some(ReceiptOutcome::NotCommitted) => data["commit_outcome"] = json!("not_committed"),
+            Some(ReceiptOutcome::Unknown) => {
+                data["commit_outcome"] = json!("unknown");
+                // Only the same keyed request can find out what happened.
+                data["retry"] = json!("same_key_only");
+            }
+            None => {}
         }
         if let Some(turn) = &self.unpersisted {
             data["session"] = json!(turn.session.as_str());
@@ -169,6 +201,7 @@ impl ApiError {
         message: "invalid parameters",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// A caller handle did not authorize a mutation.
     pub const INVALID_HANDLE: Self = Self {
@@ -177,6 +210,7 @@ impl ApiError {
         message: "invalid session handle",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The selected route has no such control capability.
     pub const UNSUPPORTED_VERB: Self = Self {
@@ -185,6 +219,7 @@ impl ApiError {
         message: "verb is unsupported on this route",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The fake route is not configured or selected.
     pub const HARNESS_UNAVAILABLE: Self = Self {
@@ -193,6 +228,7 @@ impl ApiError {
         message: "harness is unavailable",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The daemon accepted a stop and admits no new work.
     pub const DAEMON_STOPPING: Self = Self {
@@ -201,6 +237,7 @@ impl ApiError {
         message: "the daemon is stopping",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// Active sessions refuse a plain stop (C1 §3.14).
     pub const SESSIONS_ACTIVE: Self = Self {
@@ -209,6 +246,7 @@ impl ApiError {
         message: "sessions are active",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The daemon already retains its bound of turns without a durable terminal.
     pub const TURNS_AT_CAPACITY: Self = Self {
@@ -217,6 +255,7 @@ impl ApiError {
         message: "too many unresolved turns",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
@@ -225,6 +264,7 @@ impl ApiError {
         message: "durable storage failed",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
@@ -233,6 +273,7 @@ impl ApiError {
         message: "turn has not finished",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// A wait deadline elapsed while the turn remains active.
     pub const WAIT_TIMEOUT: Self = Self {
@@ -241,6 +282,7 @@ impl ApiError {
         message: "wait timed out",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The requested session is absent.
     pub const SESSION_NOT_FOUND: Self = Self {
@@ -249,6 +291,7 @@ impl ApiError {
         message: "session does not exist",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The session is closed or closing.
     pub const SESSION_CLOSED: Self = Self {
@@ -257,6 +300,7 @@ impl ApiError {
         message: "session is closed",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The session exists but has no such turn.
     pub const TURN_NOT_FOUND: Self = Self {
@@ -265,6 +309,7 @@ impl ApiError {
         message: "turn does not exist",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The session already holds its bound of queued turns (C1 P6).
     pub const QUEUE_FULL: Self = Self {
@@ -273,6 +318,7 @@ impl ApiError {
         message: "the session queue is full",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// The daemon already holds its bound of queued turns (runtime §8).
     pub const QUEUED_AT_CAPACITY: Self = Self {
@@ -281,6 +327,7 @@ impl ApiError {
         message: "too many queued turns",
         unpersisted: None,
         kind2: None,
+        commit_outcome: None,
     };
     /// A retry key was reused with another handle or other params (C1 P4).
     pub const IDEMPOTENCY_CONFLICT: Self = Self {
@@ -289,6 +336,7 @@ impl ApiError {
         message: "retry key reused with different parameters",
         unpersisted: None,
         kind2: Some("idempotency_conflict"),
+        commit_outcome: None,
     };
 }
 
@@ -333,13 +381,20 @@ pub fn parse_address(address: &str) -> Result<(SessionId, Option<TurnNumber>), A
     ))
 }
 
-/// Longest `idempotency_key` or `op_key` accepted (C1 §3 bounds `op_key`).
+/// Longest `idempotency_key` or `op_key` accepted (C1 §3).
 pub(crate) const RETRY_KEY_LIMIT: usize = 64;
 
-/// Checks a retry key's C1 bound.
+/// Checks a retry key's C1 §3 bound: 1–64 printable ASCII characters
+/// (0x21–0x7E), so its characters are its bytes.
 pub(crate) fn retry_key(key: Option<&str>) -> Result<Option<&str>, ApiError> {
     match key {
-        Some(key) if key.is_empty() || key.len() > RETRY_KEY_LIMIT => Err(ApiError::INVALID_PARAMS),
+        Some(key)
+            if key.is_empty()
+                || key.len() > RETRY_KEY_LIMIT
+                || !key.bytes().all(|byte| byte.is_ascii_graphic()) =>
+        {
+            Err(ApiError::INVALID_PARAMS)
+        }
         key => Ok(key),
     }
 }
@@ -903,7 +958,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{ConnectionId, EventBody, UNIX_EPOCH, retry_identity, rfc3339};
+    use super::{ConnectionId, EventBody, UNIX_EPOCH, retry_identity, retry_key, rfc3339};
 
     #[test]
     fn observation_events_use_c1_tags_and_fields() {
@@ -957,6 +1012,35 @@ mod tests {
             identity.as_bytes()
         );
         assert_ne!(retry_identity(raw, &[0; 32]).unwrap(), identity.as_bytes());
+    }
+
+    /// C1 §3: `idempotency_key` and `op_key` are 1–64 printable ASCII
+    /// characters (0x21–0x7E), so characters equal bytes.
+    #[test]
+    fn retry_keys_are_one_to_sixty_four_printable_ascii_characters() {
+        let longest = "~".repeat(64);
+        for key in ["k", "!", longest.as_str(), "k-17_A.b:c"] {
+            assert_eq!(retry_key(Some(key)).unwrap(), Some(key), "{key}");
+        }
+        let too_long = "k".repeat(65);
+        // 32 two-byte characters: 64 bytes, but not ASCII.
+        let wide = "é".repeat(32);
+        for key in [
+            "",
+            " ",
+            "a b",
+            "k\u{7f}",
+            "tab\t",
+            too_long.as_str(),
+            wide.as_str(),
+        ] {
+            assert_eq!(
+                retry_key(Some(key)).unwrap_err().kind,
+                "invalid_params",
+                "{key:?}"
+            );
+        }
+        assert_eq!(retry_key(None).unwrap(), None);
     }
 
     #[test]

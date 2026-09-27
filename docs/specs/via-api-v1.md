@@ -145,7 +145,8 @@ it is shown. The CLI stores nothing.
 
 `session` = session id; `turn` = turn address or session id (latest turn at
 call acceptance). Timestamps RFC 3339 UTC; durations ms. `op_key`
-(optional string ≤ 64 chars) on `resume`, `steer`, `close`: the daemon
+(optional; 1–64 printable ASCII characters, 0x21–0x7E, so characters equal
+bytes) on `resume`, `steer`, `close`: the daemon
 keeps `op_key → result` for the session's lifetime and replays it on a
 repeat, so a lost response is safe to retry; `status` lists queued turns
 with their `op_key` for reconciliation.
@@ -174,7 +175,8 @@ Never starts a process or server (Q5). Errors: `unknown_model`,
 CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--allow-untested] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background]`
 
 Params: §4 parameters, `handle` (required), `require?`, `label?`,
-`idempotency_key?`. The daemon validates, resolves the model, runs the
+`idempotency_key?` (the same bound as `op_key`: 1–64 printable ASCII
+characters, 0x21–0x7E). The daemon validates, resolves the model, runs the
 preflight, commits session + turn 1 (`queued`) + handle hash + key in one
 Store transaction, then returns the receipt; dispatch follows.
 

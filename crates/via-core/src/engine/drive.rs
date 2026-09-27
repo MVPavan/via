@@ -85,9 +85,9 @@ impl Engine {
         let _active = Active(&self.active);
         let mut queued = Queued(Some(&self.queued));
         let slot = self.slot(&session).ok_or(ApiError::STORE)?;
-        let cancel = slot.turn(turn).await;
-        let mut finish = Finish::new(&slot, turn);
-        if cancel {
+        slot.turn(turn).await;
+        let _finish = Finish::new(&slot, turn);
+        if !self.dispatchable(&session, turn).await {
             let cancelled = self.cancel_queued(&slot, &session, turn).await;
             queued.leave();
             return cancelled;
@@ -95,14 +95,27 @@ impl Engine {
         let submission =
             Self::submit(&self.store, &self.unresolved, &session, turn, &slot.head).await;
         queued.leave();
-        let (clean, finished) = self.run(&slot, submission?).await;
-        finish.clean = clean;
-        finished
+        self.run(&slot, submission?).await
     }
 
-    /// Executes a submitted turn to its terminal; returns whether it ended
-    /// cleanly enough for its successor to dispatch.
-    async fn run(&self, slot: &Slot, submission: Submission) -> (bool, Result<(), ApiError>) {
+    /// C1 P6/§7.3 from durable state: a turn may run only when no earlier turn
+    /// is unresolved (queued, running, or its terminal not durable) and the
+    /// latest submitted one is terminal, not `unknown`, with settled cleanup.
+    /// Turns cancelled while queued never ran and are passed over. A Store
+    /// that cannot answer permits nothing.
+    async fn dispatchable(&self, session: &SessionId, turn: TurnNumber) -> bool {
+        match self.store.predecessors(session, turn).await {
+            Ok(predecessors) if !predecessors.unresolved => {
+                predecessors.last_submitted.is_none_or(|envelope| {
+                    envelope["state"] != "unknown" && envelope["cancel"]["cleanup"] != "pending"
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Executes a submitted turn to its terminal.
+    async fn run(&self, slot: &Slot, submission: Submission) -> Result<(), ApiError> {
         let Submission {
             session,
             turn,
@@ -123,9 +136,8 @@ impl Engine {
             1 => format!("c_{suffix}"),
             n => format!("c_{suffix}t{n}"),
         };
-        let Ok(connection) = ConnectionId::try_from(connection.as_str()) else {
-            return (false, Err(ApiError::STORE));
-        };
+        let connection =
+            ConnectionId::try_from(connection.as_str()).map_err(|_| ApiError::STORE)?;
         let mut record = TurnRecord {
             session: session.clone(),
             turn,
@@ -166,7 +178,7 @@ impl Engine {
                     launched,
                     close,
                 });
-                return (false, Ok(()));
+                return Ok(());
             }
         };
         // C1 §7.6: Core's deadline cancels the turn; Route force-closed its group.
@@ -199,13 +211,12 @@ impl Engine {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
-        let settled = terminal.state != "unknown";
-        let finished = self.finish(&started, record, terminal, false).await;
-        (settled && finished.is_ok(), finished)
+        self.finish(&started, record, terminal, false).await
     }
 
-    /// Cancels a turn that was never submitted because its predecessor did not
-    /// end cleanly (C1 §7.2 `queued` → `cancelled`): no vendor I/O happened.
+    /// Cancels a turn that was never submitted because a predecessor is
+    /// unknown or unresolved (C1 §7.2 `queued` → `cancelled`): no vendor I/O
+    /// happened.
     async fn cancel_queued(
         &self,
         slot: &Slot,

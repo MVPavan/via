@@ -18,7 +18,26 @@ use tokio::sync::oneshot;
 
 use crate::{CommitOutcome, ConnectionId, RawRef, SessionId, StoreFailureKind, TurnNumber};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Most queued turns one session holds, enforced inside the receipt
+/// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
+pub const SESSION_QUEUE_LIMIT: u32 = 8;
+
+/// Refuses a Store whose schema this build neither creates nor reads. Older
+/// versions are unreleased dev formats with no migration (runtime §6).
+fn check_schema_version(version: i64) -> Result<(), StoreError> {
+    if version > SCHEMA_VERSION {
+        return Err(StoreError::Open("newer Store schema".to_owned()));
+    }
+    if version != 0 && version < SCHEMA_VERSION {
+        return Err(StoreError::Open(format!(
+            "Store schema v{version} is an unreleased development format with no migration; \
+             stop the daemon and recreate the Store by removing store.sqlite3 from the State directory"
+        )));
+    }
+    Ok(())
+}
 const RAW_MAGIC: &[u8; 8] = b"VIARAW01";
 const INDEX_ENTRY_LEN: usize = 45;
 const RAW_UNIT_LIMIT: usize = 1_048_576;
@@ -134,8 +153,14 @@ pub struct SessionSnapshot {
     pub turns: u32,
     /// Queued turns of the session, without submission intent.
     pub queued: u32,
-    /// The session's queued and running turns.
-    pub nonterminal: u32,
+}
+
+/// Durable state of a turn's predecessors, from which Core decides dispatch.
+pub struct Predecessors {
+    /// An earlier turn is still queued or running: no terminal is durable.
+    pub unresolved: bool,
+    /// Terminal envelope of the latest earlier turn that was submitted.
+    pub last_submitted: Option<Value>,
 }
 
 /// Durable facts of a queued turn that its submission needs.
@@ -455,6 +480,11 @@ enum Command {
         oneshot::Sender<Result<Option<QueuedTurn>, StoreError>>,
     ),
     NextSeq(SessionId, oneshot::Sender<Result<Option<u64>, StoreError>>),
+    Predecessors(
+        SessionId,
+        TurnNumber,
+        oneshot::Sender<Result<Predecessors, StoreError>>,
+    ),
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
@@ -531,9 +561,7 @@ impl Store {
             let version: i64 = readonly
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|error| StoreError::Open(error.to_string()))?;
-            if version > SCHEMA_VERSION {
-                return Err(StoreError::Open("newer Store schema".to_owned()));
-            }
+            check_schema_version(version)?;
             readonly
                 .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
                 .map_err(|error| StoreError::Open(error.to_string()))
@@ -694,6 +722,17 @@ impl StoreClient {
     ) -> Result<Option<QueuedTurn>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::QueuedTurn(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads the durable state of the turns before `turn`.
+    pub async fn predecessors(
+        &self,
+        session_id: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Predecessors, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Predecessors(session_id.clone(), turn, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

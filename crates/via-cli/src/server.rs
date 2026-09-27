@@ -381,20 +381,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
         };
         let method = method.as_str();
         if !hello_done && method != "hello" {
-            send(
-                &mut write,
-                &error(
-                    &id,
-                    Refusal::from(ApiError {
-                        code: -32000,
-                        kind: "handshake_required",
-                        message: "hello must be first",
-                        unpersisted: None,
-                        kind2: None,
-                    }),
-                ),
-            )
-            .await?;
+            send(&mut write, &error(&id, Refusal::from(HANDSHAKE_REQUIRED))).await?;
             continue;
         }
         if hello_done && method == "daemon/stop" {
@@ -413,20 +400,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
                     json!({"api_version":1,"daemon_version":env!("CARGO_PKG_VERSION"),"daemon_pid":std::process::id(),"deprecations":[]})
                 }
                 Ok(_) => {
-                    send(
-                        &mut write,
-                        &error(
-                            &id,
-                            Refusal::from(ApiError {
-                                code: -32001,
-                                kind: "version_mismatch",
-                                message: "client and daemon versions differ",
-                                unpersisted: None,
-                                kind2: None,
-                            }),
-                        ),
-                    )
-                    .await?;
+                    send(&mut write, &error(&id, Refusal::from(VERSION_MISMATCH))).await?;
                     continue;
                 }
                 Err(refusal) => {
@@ -542,9 +516,28 @@ async fn dispatch(
             message: "method not found",
             unpersisted: None,
             kind2: None,
+            commit_outcome: None,
         })),
     }
 }
+
+const HANDSHAKE_REQUIRED: ApiError = ApiError {
+    code: -32000,
+    kind: "handshake_required",
+    message: "hello must be first",
+    unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
+};
+
+const VERSION_MISMATCH: ApiError = ApiError {
+    code: -32001,
+    kind: "version_mismatch",
+    message: "client and daemon versions differ",
+    unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
+};
 
 const PARSE_ERROR: ApiError = ApiError {
     code: -32700,
@@ -552,6 +545,7 @@ const PARSE_ERROR: ApiError = ApiError {
     message: "invalid JSON",
     unpersisted: None,
     kind2: None,
+    commit_outcome: None,
 };
 
 const INVALID_REQUEST: ApiError = ApiError {
@@ -560,6 +554,7 @@ const INVALID_REQUEST: ApiError = ApiError {
     message: "invalid JSON-RPC request",
     unpersisted: None,
     kind2: None,
+    commit_outcome: None,
 };
 
 /// A request error plus the optional C1 `data.kind2` refinement.

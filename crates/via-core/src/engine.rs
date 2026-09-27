@@ -2,7 +2,7 @@
 //! Adapter owns vendor I/O.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, OnceLock, PoisonError,
@@ -25,6 +25,7 @@ use crate::{
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
 use via_store::{
     OperationRecord, ResumeRecord, SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient,
+    StoreError,
 };
 
 mod drive;
@@ -32,6 +33,8 @@ mod journal;
 mod queue;
 mod stop;
 mod terminal;
+#[cfg(test)]
+mod tests;
 
 use journal::{Head, UncertainEvent, Unresolved};
 use queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
@@ -71,6 +74,22 @@ pub struct Engine {
     sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
     /// Receipted turns of this daemon not yet out of the queue.
     queued: AtomicUsize,
+    /// Turns whose receipt commit outcome stayed unknown: possibly committed,
+    /// never registered or driven. A keyed retry that finds one adopts it.
+    orphans: StdMutex<HashSet<(SessionId, TurnNumber)>>,
+    /// Test-only in-process Store fault backend; production builds have none.
+    #[cfg(test)]
+    faults: Faults,
+}
+
+/// Receipt-commit faults injected in unit tests.
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    /// The next receipt commit succeeds, but its reply reports an unknown outcome.
+    receipt_reply_lost: AtomicBool,
+    /// Reads that reconcile an uncertain receipt commit fail.
+    reconcile_unreadable: AtomicBool,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -145,7 +164,72 @@ impl Engine {
             finalized: AtomicBool::new(false),
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
+            orphans: StdMutex::new(HashSet::new()),
+            #[cfg(test)]
+            faults: Faults::default(),
         })
+    }
+
+    /// Settles a receipt commit that reported failure (C1 §8.1): Ok when Store
+    /// shows the turn committed, so the caller registers and hands it off;
+    /// otherwise `store_error` with `commit_outcome`. An unknown outcome leaves
+    /// the turn an orphan for its keyed retry to adopt.
+    async fn receipt_outcome(
+        &self,
+        error: &StoreError,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<(), ApiError> {
+        if !journal::may_have_committed(error) {
+            return Err(ApiError::RECEIPT_NOT_COMMITTED);
+        }
+        // Admission is held: only this request could have created `turn`.
+        match self.reconcile_read(session).await {
+            Ok(Some(snapshot)) if snapshot.turns >= turn.get() => Ok(()),
+            Ok(_) => Err(ApiError::RECEIPT_NOT_COMMITTED),
+            Err(_) => {
+                lock(&self.orphans).insert((session.clone(), turn));
+                Err(ApiError::RECEIPT_UNKNOWN)
+            }
+        }
+    }
+
+    /// The Store read that reconciles an uncertain receipt commit.
+    async fn reconcile_read(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<SessionSnapshot>, StoreError> {
+        #[cfg(test)]
+        if self.faults.reconcile_unreadable.load(Ordering::Acquire) {
+            return Err(StoreError::Unavailable);
+        }
+        self.store.session_snapshot(session).await
+    }
+
+    /// Registers a replayed turn whose original receipt outcome was unknown:
+    /// its keyed retry proved it committed, so it is handed off, exactly once.
+    fn adopt(&self, session: &SessionId, turn: TurnNumber) -> Option<(SessionId, TurnNumber)> {
+        if !lock(&self.orphans).remove(&(session.clone(), turn)) {
+            return None;
+        }
+        lock(&self.sessions)
+            .entry(session.clone())
+            .or_insert_with(|| Slot::new(Head::new(None), turn.get() - 1));
+        self.receipted(session, turn);
+        Some((session.clone(), turn))
+    }
+
+    /// A receipt commit's reply, lost by the test fault backend when armed.
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "the fault backend exists only in tests")
+    )]
+    fn receipt_reply<T>(&self, reply: Result<T, StoreError>) -> Result<T, StoreError> {
+        #[cfg(test)]
+        if reply.is_ok() && self.faults.receipt_reply_lost.swap(false, Ordering::AcqRel) {
+            return Err(StoreError::Uncertain("injected reply loss".to_owned()));
+        }
+        reply
     }
 
     /// The dispatch slot of a session this daemon admitted work for.
@@ -155,6 +239,8 @@ impl Engine {
 
     /// Records a receipted turn: tracked until durable, driven, and queued.
     fn receipted(&self, session: &SessionId, turn: TurnNumber) {
+        // A number reused after an uncommitted unknown receipt is this turn's.
+        lock(&self.orphans).remove(&(session.clone(), turn));
         self.unresolved.receipt(session, turn);
         self.active.fetch_add(1, Ordering::AcqRel);
         self.queued.fetch_add(1, Ordering::AcqRel);
@@ -187,9 +273,10 @@ impl Engine {
                     .map_err(|_| ApiError::STORE)?
                 {
                     return if stored.identity == identity {
+                        let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
                         Ok(Receipted {
                             receipt: stored.receipt,
-                            drive: None,
+                            drive: self.adopt(&stored.session_id, turn),
                         })
                     } else {
                         Err(ApiError::IDEMPOTENCY_CONFLICT)
@@ -246,19 +333,25 @@ impl Engine {
                 SpawnRecord {
                     session_id: session.clone(),
                     handle_hash: hash,
-                    receipt,
+                    receipt: receipt.clone(),
                     params: json!({"harness":"fake","model":"fake"}),
                     prompt: params.prompt,
                     initial_event,
                 },
                 key,
             )
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        lock(&self.sessions).insert(session.clone(), Slot::new(Head::new(Some(2)), 0, false));
+            .await;
+        let head = match self.receipt_reply(stored) {
+            Ok(_) => Head::new(Some(2)),
+            Err(error) => {
+                self.receipt_outcome(&error, &session, turn).await?;
+                Head::new(None)
+            }
+        };
+        lock(&self.sessions).insert(session.clone(), Slot::new(head, 0));
         self.receipted(&session, turn);
         Ok(Receipted {
-            receipt: stored.receipt,
+            receipt,
             drive: Some((session, turn)),
         })
     }
@@ -301,9 +394,14 @@ impl Engine {
                     .map_err(|_| ApiError::STORE)?;
                 if let Some(stored) = stored {
                     return if stored.identity == identity {
+                        let turn = stored.result["turn"]
+                            .as_str()
+                            .and_then(|address| parse_address(address).ok())
+                            .and_then(|(_, turn)| turn)
+                            .ok_or(ApiError::STORE)?;
                         Ok(Receipted {
+                            drive: self.adopt(&session, turn),
                             receipt: stored.result,
-                            drive: None,
                         })
                     } else {
                         Err(ApiError::IDEMPOTENCY_CONFLICT)
@@ -381,13 +479,19 @@ impl Engine {
                 }),
             })
             .await;
-        match committed {
+        match self.receipt_reply(committed) {
             Ok(()) => head.committed(1),
             Err(error) => {
                 if journal::may_have_committed(&error) {
                     head.lost();
                 }
-                return Err(ApiError::STORE);
+                if let Err(refused) = self.receipt_outcome(&error, &session, turn).await {
+                    // Possibly committed but not driven: later turns must not wait for it.
+                    if refused.commit_outcome == Some(crate::api::ReceiptOutcome::Unknown) {
+                        slot.finish(turn);
+                    }
+                    return Err(refused);
+                }
             }
         }
         self.receipted(&session, turn);
@@ -398,15 +502,13 @@ impl Engine {
     }
 
     /// The session's dispatch slot, created for a session no drive of this
-    /// daemon has touched. Such a session's unfinished turns belong to a
-    /// daemon that is gone, so nothing behind them may dispatch (C1 P6).
+    /// daemon has touched. Its earlier turns have no drive here; whether a new
+    /// turn may run behind them is decided from their durable state.
     fn slot_for(&self, session: &SessionId, snapshot: &SessionSnapshot) -> Arc<Slot> {
         Arc::clone(
             lock(&self.sessions)
                 .entry(session.clone())
-                .or_insert_with(|| {
-                    Slot::new(Head::new(None), snapshot.turns, snapshot.nonterminal > 0)
-                }),
+                .or_insert_with(|| Slot::new(Head::new(None), snapshot.turns)),
         )
     }
 
