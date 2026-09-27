@@ -1,8 +1,23 @@
 # Rust foundation — paused checkpoint
 
-> **Resumed by the owner, 2026-09-27, under a cloud/local split:** see
-> [cloud-and-local.md](cloud-and-local.md) for the decisions, roster and
-> models. The pause notice below is historical. W0 (cloud probe) comes first.
+## Current state (2026-09-27, resumed)
+
+The owner resumed work under a cloud/local split:
+[cloud-and-local.md](cloud-and-local.md) §5–§6 holds the decisions, roster,
+models, review rule and tmux control. Everything below "Status: PAUSED" is
+the historical checkpoint; its findings table is updated by this section.
+
+- W0 cloud probe: [cloud-probe-w0.md](cloud-probe-w0.md).
+- W1 ([w1/README.md](w1/README.md)): A (T1-I1, T1-I5 route side),
+  B (T1-I2, T1-I3), C (T1-I5 Core side, T1-I6) merged into
+  `rust-foundation` at `4f9d6e3`; gate green, 64 tests. Worker reports in
+  `w1/reports/`.
+- GPT-6 Sol medium reviewed each W1 merge: A unsound, B and C sound with
+  changes. Findings and their owners: [w2/README.md](w2/README.md).
+- Next: W1-D (shutdown seam, T1-I7, T1-I4, stop drain) and W2-E (T1-I5 end
+  to end, evidence gaps, failure classes), both Opus 5.5 high cloud
+  sessions in parallel. Then a Sol high review of Task 1 and close
+  `via-jm4.7.5`; then `.7.6`–`.7.8`, then `.7.9` (Fable 5.1 high / Astra).
 
 Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
 The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
