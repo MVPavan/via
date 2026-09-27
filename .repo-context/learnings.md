@@ -26,3 +26,9 @@ in the design record (`docs/`), not here.
   claude.ai → Connectors → GitHub Integration → "Check repository status" for
   the repo did, after which the CLI logged "GitHub app is installed" and the
   session cloned. `--cloud` also needs a TTY (run it in tmux).
+- Patch rounds on dispatch/failure-recovery code did not converge (T2-B,
+  2026-09-27, `docs/workstreams/rust-foundation/t2/sol-review-T2-B*.md`):
+  every round fixed the prior blockers, but each fix added an unowned state
+  (orphan set, then a 250 ms polling wait loop) that the next review found
+  broken. Design the state machine first and review the design; see
+  `docs/workstreams/rust-foundation/cloud-and-local.md` §6 "Convergence".

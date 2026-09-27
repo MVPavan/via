@@ -42,12 +42,20 @@ the historical checkpoint; its findings table is updated by this section.
 - W5-S split `via-core/src/engine.rs` into `engine.rs` (API entry points,
   shared types), `engine/drive.rs`, `engine/stop.rs`, `engine/terminal.rs`
   (Sol SOUND; merged `0f3650f`; 122 passed, 2 ignored).
-- Now: S1 Task 2 (`via-jm4.7.6`, [t2/README.md](t2/README.md)): T2-A
-  failpoint controller + F8/F10 (Opus 5.5 high) and T2-B multi-turn
-  sessions, resume, queues, retries + F13/F14/F17/F28 (Opus 5.5 medium), in
-  parallel cloud sessions. Then Task 3 (`.7.7`), Task 4 (`.7.8`), final
-  critique (`.7.9`). After a reboot, restore tmux session `via` (windows
-  `main`, and `watch` running `scratchpad/cloud/watch-branches.sh`).
+- Now: S1 Task 2 (`via-jm4.7.6`, [t2/README.md](t2/README.md)).
+  T2-A (failpoints + F8/F10, Opus 5.5 high, session
+  `session_014hFuihQE3oLoUQXqJqMu4P`, branch
+  `claude/task-t2a-report-x4b9yl`): Sol r3 SOUND WITH CHANGES; round 4
+  (deadline → uncertain, not fatal; paginated anchor inventory) in progress.
+  T2-B (multi-turn, resume, queues, retries + F13/F14/F17/F28, Opus 5.5
+  medium, branch `claude/t2-b-rust-foundation-juogko`): Sol r3 UNSOUND,
+  third round of fix-induced dispatch blockers, so it stopped patching and
+  moved to T2-B2 ([t2/b2.md](t2/b2.md), Opus 5.5 high, session
+  `session_011RDNGQPpgG3RwXuw349DaK`): a dispatch design note, Sol review of
+  the note, then implementation on T2-B's branch. Then Task 3 (`.7.7`),
+  Task 4 (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux
+  session `via` (windows `main`, and `watch` running
+  `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).

@@ -143,6 +143,16 @@ Coordination rules (proposed):
   model/effort, or an overlong context. After merging a wave, the
   orchestrator runs the gate; Sol high reviews each completed task or
   slice, which also covers interactions between parallel branches.
+- Convergence (orchestrator, 2026-09-27): T2-B went three UNSOUND rounds
+  whose blockers each came from the previous round's fix, and T2-A's round 3
+  blockers came from a round-2 "complete or fail explicitly" option. So:
+  work that adds dispatch, concurrency or failure-recovery states goes to
+  Opus 5.5 high and starts with a short design note that Sol reviews before
+  code; a re-review covers the round's change **and the states it adds**
+  (their interaction with stop, force, Store failure and bounds), not only
+  the changed lines; when relaying findings the orchestrator turns each
+  "X or Y" fix option into one decision checked against the contracts; a
+  branch still UNSOUND after two fix rounds moves to design-first.
 - Parallel workers get disjoint files. `via-core/src/engine.rs` is the
   recurring conflict point; split it by responsibility before the next
   parallel wave.
