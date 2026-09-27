@@ -181,10 +181,122 @@ feature. `Cargo.lock` is unchanged, and I added no dependencies.
 
 - The shape of `durable_state` is my choice: a C1 turn-state string. C1 does
   not fix its type.
-- After an uncertain `commit_submission`, the last *known* commit is
-  `turn.queued`, so the error reports `queued` even if `turn.submitted` did
-  persist. Settling uncertain submissions is still open, as in W3-G.
+- **Deferred (Sol W4-I review):** after an uncertain `commit_submission`, the
+  last *known* commit is `turn.queued`, so the error reports `queued` even if
+  `turn.submitted` did persist. The round-2 regression covers only a
+  submission that left nothing durable. The later task that settles
+  uncertain submissions should reconcile the durable submission head before
+  it reports the state.
+- Daemon-wide Store health, cleanup and Store reply bounds belong to Task 3
+  (`via-jm4.7.7`), as the W4 README says; the Sol review agrees.
 - There is no true end-to-end test through the `via` binary until failpoints
   can fail the daemon's Store.
 - The set is still in memory only. After a restart, nothing settles these
   turns; recovery is not in S1.
+
+## Round 2
+
+The review is [`../sol-review-W4-I.md`](../sol-review-W4-I.md). I merged
+`origin/rust-foundation` first; the merge changed docs only. This round fixes
+the three "Blocks merging" findings. Commit: `1618fbb`.
+
+### R2-1. The set was unbounded through in-flight turns
+
+**Failure mode.** `admits()` counted only `Failed` entries. Every accepted
+spawn added a `Pending` entry, so any number of turns could be in flight, and
+all of them could fail afterwards.
+
+**Regression.** `in_flight_turns_count_toward_the_bound` fills the set with
+`UNRESOLVED_LIMIT` pending receipts and expects `Engine::spawn` to refuse with
+`store_error`. It also checks that one resolution admits again (the next
+refusal is `harness_unavailable`, because the fake is unconfigured in unit
+tests). This test replaces `only_failed_turns_count_toward_the_bound`, which
+asserted the wrong rule.
+
+**Fix.** `Unresolved::admits()` bounds the total number of entries.
+`FAILED_TURNS_LIMIT` is renamed `UNRESOLVED_LIMIT` (256). `spawn` checks the
+bound and inserts the receipt under the same `admission` lock, so the set
+never exceeds the limit.
+
+**Consequence.** The limit also caps concurrent in-flight turns at 256.
+
+### R2-2. Durable-but-unread turns kept admission closed
+
+**Failure mode.** A `Failed` entry was forgotten only when `read_result`
+found its terminal. Terminals that became durable after a failed read-back,
+but that no caller read, could hold admission closed indefinitely.
+
+**Regression.** `durable_terminals_are_settled_before_admission_is_refused`:
+1. It fills the set with 255 failed turns that have no terminal.
+2. It adds one failed turn whose terminal it then commits straight to Store.
+   It uses `commit_turn_ended` on the real Store, never a read through Core.
+3. It expects `spawn` to be admitted, the durable turn to be forgotten and the
+   other 255 to be kept.
+
+**Fix.** `journal::admits` runs only when the set is full. It re-reads the
+durable result of each failed turn, forgets the ones that have a terminal,
+and then re-checks the bound. The whole sweep is bounded by `SETTLE_BOUND`
+(2 s, the F12 outcome-resolution bound). A read that fails or times out keeps
+its turn. `spawn` holds the `admission` lock for at most that bound.
+
+### R2-3. The submission regression had no receipt
+
+**Failure mode.** The round-1 test drove a session with no receipt, so
+submission failed only because `turn.queued` was absent.
+
+**Fix.** `submit` is now an associated function over the `TurnJournal` port,
+like `finish_turn`. It records `Failed(Queued)` on any error. The port gains
+`commit_submission`, and `StoreClient` implements it. `drive` calls
+`Self::submit(&self.store, &self.unresolved, …)`.
+
+**Regression.**
+`a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_state`:
+1. It commits a real receipt through Store and tracks it as `spawn` does.
+2. It injects a submission failure through the fault journal: an uncertain
+   error with nothing durable.
+3. It asserts the code, the message and the complete C1 data through
+   `Engine::result` and `Engine::wait`.
+
+This test replaces `a_turn_whose_submission_cannot_commit_reports_its_queued_state`.
+
+### Output before the fix
+
+I restored the round-1 behaviour at each fix site:
+- `admits` counts `Failed` entries only;
+- there is no settlement sweep;
+- there is no `fail(Queued)` on a submission error, which is also the
+  pre-W4 base behaviour.
+
+```
+FAIL durable_terminals_are_settled_before_admission_is_refused
+  left: "store_error"         right: "harness_unavailable"
+FAIL in_flight_turns_count_toward_the_bound
+  left: "harness_unavailable" right: "store_error"
+FAIL [30.170s] a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_state
+  left: (-32015, "turn has not finished")  right: (-32018, "durable storage failed")
+Summary 10 tests run: 7 passed, 3 failed
+```
+
+The 30 s runtime is `wait` spinning to `wait_timeout` on the old code, while
+`result` reports `turn_not_finished`.
+
+### Files changed
+
+- `crates/via-core/src/engine.rs` (shared): the admission call in `spawn`,
+  the `submit` call in `drive`, and `submit` split into `submit` and
+  `commit_submission` over the journal port.
+- `crates/via-core/src/engine/journal.rs`
+- `crates/via-core/src/engine/journal/tests.rs`
+
+### Gate
+
+Run with `XDG_RUNTIME_DIR` set to a private 0700 directory:
+
+| Check | Result |
+|---|---|
+| fmt | clean |
+| clippy | clean |
+| nextest | 107 passed, 1 skipped (the existing root-only `#[ignore]`) |
+| deny | ok |
+| check-layers | exit 0 |
+| Markdown links | 0 broken in this report |
