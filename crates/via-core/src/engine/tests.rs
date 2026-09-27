@@ -702,3 +702,161 @@ async fn futures_join_all<F: Future>(futures: impl IntoIterator<Item = F>) {
     })
     .await;
 }
+
+/// Round 1, decision 2: the latch takes `admission`, which a receipt holds
+/// through its commit, enqueue and start request. A spawn paused inside its
+/// receipt while another turn's failed submission latches either completes
+/// first, fully enqueued with a start, or is refused; it never succeeds
+/// after the latch.
+#[test]
+fn a_receipt_in_flight_when_another_turn_latches_completes_before_the_latch() {
+    let Some(root) =
+        child("a_receipt_in_flight_when_another_turn_latches_completes_before_the_latch")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let first = new_session(&engine).await;
+        assert_eq!(starts.try_recv().unwrap(), first);
+        engine
+            .faults
+            .submission_reply_lost
+            .store(true, Ordering::Release);
+        engine.faults.hold_receipt.store(true, Ordering::Release);
+        let (receipted, ()) = tokio::join!(
+            async {
+                let receipted = spawn(&engine, None).await;
+                (receipted, engine.store_failed())
+            },
+            async {
+                engine.faults.granted.notified().await;
+                let ((), ()) = tokio::join!(
+                    // The other turn's submission reply is lost: it latches.
+                    dispatch(&engine, &first),
+                    async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        engine.faults.release.notify_one();
+                    }
+                );
+            },
+        );
+        let (receipted, latched_at_return) = receipted;
+        assert!(engine.store_failed(), "the other turn latched");
+        match receipted {
+            Ok(receipted) => {
+                assert!(!latched_at_return, "a receipt succeeded after the latch");
+                let (session, _) = receipted.enqueued.unwrap();
+                assert_eq!(starts.try_recv().unwrap(), session, "its start was sent");
+                assert!(engine.unresolved.turns().contains(&(session, turn(1))));
+            }
+            Err(refused) => assert_eq!(refused.kind, "store_error"),
+        }
+    });
+}
+
+/// Round 1, decision 2: a closing cancellation decides `session.closed`
+/// under `admission`, after the latch check. Paused before that point while
+/// another turn latches, it writes nothing more and closes nothing.
+#[test]
+fn a_closing_cancellation_after_another_turn_latched_commits_no_close() {
+    let Some(root) = child("a_closing_cancellation_after_another_turn_latched_commits_no_close")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        engine
+            .faults
+            .hold_before_close
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            // Another turn's failed write.
+            engine.latch().await;
+            engine.faults.release.notify_one();
+        });
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.queued", "turn.ended"],
+            "turn 1 cancelled before the latch; nothing after it"
+        );
+        let report = shutdown(&engine).await;
+        assert!(!report.is_clean(), "{report:?}");
+    });
+}
+
+/// Round 1, decision 3: force accepted while the last queued turn's
+/// cancellation (behind an `unknown` predecessor) reads; that cancellation
+/// commits without `session.closed` and the dispatcher exits. Final
+/// shutdown's closure pass then closes the session durably, and the
+/// shutdown is clean.
+#[test]
+fn force_during_the_last_cancellation_is_closed_by_the_closure_pass() {
+    let Some(root) = child("force_during_the_last_cancellation_is_closed_by_the_closure_pass")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        end_turn_one(&engine, &session, Some("unknown")).await;
+        engine
+            .faults
+            .hold_cancel_read
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine.faults.release.notify_one();
+        });
+        assert!(
+            !event_types(&engine, &session)
+                .await
+                .contains(&"session.closed".to_owned()),
+            "the in-path cancellation did not close"
+        );
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+        let types = event_types(&engine, &session).await;
+        assert_eq!(types.last().map(String::as_str), Some("session.closed"));
+        let page = engine.events(session.as_str()).await.unwrap();
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.last().unwrap()["reason"], "daemon_stop_force");
+    });
+}
+
+/// Round 1, decision 4: under force a failed cancellation read retries with
+/// backoff; the queued turns are then cancelled and the session closed.
+#[test]
+fn a_failed_read_under_force_retries_then_cancels_and_closes() {
+    let Some(root) = child("a_failed_read_under_force_retries_then_cancels_and_closes") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        engine.faults.cancel_read_fails.store(1, Ordering::Release);
+        dispatch(&engine, &session).await;
+        assert_eq!(
+            event_types(&engine, &session).await,
+            [
+                "turn.queued",
+                "turn.queued",
+                "turn.ended",
+                "turn.ended",
+                "session.closed"
+            ]
+        );
+        assert!(!engine.store_failed(), "a read failure never latches");
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+    });
+}

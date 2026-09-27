@@ -7,9 +7,13 @@ use std::{
 
 use via_adapters::Cleanup;
 
-use super::{Engine, Terminal, TurnRecord, lock};
-use crate::api::{Cancel, EventBody, FailureClass, Warning, rfc3339};
-use crate::{ApiError, DaemonStopParams, Deadline};
+use std::sync::Arc;
+
+use super::drive::FORCE_CLOSE_REASON;
+use super::journal::{self, Head};
+use super::{Admission, Engine, Terminal, TurnRecord, lock};
+use crate::api::{Cancel, Event, EventBody, FailureClass, Warning, rfc3339};
+use crate::{ApiError, DaemonStopParams, Deadline, SessionId, TurnNumber};
 
 /// The C1 §3.14 stop mode Core accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +58,9 @@ pub struct EngineShutdown {
     pub store_failed: bool,
     /// Sessions whose dispatcher was requested but never ran.
     pub unstarted_dispatchers: usize,
+    /// Sessions a force stop found with dispatch state that could not be
+    /// closed durably (C1 §3.14).
+    pub unclosed_sessions: usize,
 }
 
 impl EngineShutdown {
@@ -67,6 +74,7 @@ impl EngineShutdown {
             && self.unresolved_turns == 0
             && !self.store_failed
             && self.unstarted_dispatchers == 0
+            && self.unclosed_sessions == 0
     }
 }
 
@@ -103,6 +111,9 @@ impl Engine {
         };
         // `stop` is released first: dispatchers and the reconciler wake on the watch.
         if mode == StopMode::Force {
+            // The sessions final shutdown's closure pass closes (C1 §3.14).
+            lock(&self.force_sessions)
+                .get_or_insert_with(|| lock(&self.sessions).keys().cloned().collect());
             self.force_requested_at
                 .get_or_init(|| rfc3339(SystemTime::now()));
             self.force.send_replace(true);
@@ -208,11 +219,14 @@ impl Engine {
                 // C1 §3.14: close only once every other turn of the session
                 // has a durable disposition, and never after a Store failure:
                 // an uncertain receipt may hold a turn Core never registered.
+                // `admission` orders this decision against the latch.
+                let admission = self.admission.lock().await;
                 let close = !self.store_failed()
                     && !self
                         .unresolved
                         .others(&turn.started.session, turn.started.turn);
-                self.finish(&turn.started, record, terminal, close).await
+                self.finish(&turn.started, record, terminal, close, Some(&admission))
+                    .await
             };
             if !matches!(
                 tokio::time::timeout_at(deadline.instant(), commit).await,
@@ -221,6 +235,10 @@ impl Engine {
                 uncommitted_turns += 1;
             }
         }
+        let unclosed_sessions =
+            tokio::time::timeout_at(deadline.instant(), self.close_forced_sessions())
+                .await
+                .unwrap_or_else(|_| lock(&self.force_sessions).as_ref().map_or(1, Vec::len));
         let unresolved_turns = self.unresolved_turns(deadline).await;
         let unstarted_dispatchers = lock(&self.sessions)
             .values()
@@ -237,6 +255,79 @@ impl Engine {
             unresolved_turns,
             store_failed: self.store_failed(),
             unstarted_dispatchers,
+            unclosed_sessions,
+        }
+    }
+
+    /// Final shutdown's force closure pass, after the dispatchers joined: under
+    /// `admission`, each session with dispatch state at force acceptance that
+    /// is still open in Store is closed with `session.closed`
+    /// (`daemon_stop_force`) once every turn has a durable disposition.
+    /// Returns how many could not be closed. Skipped after a Store failure,
+    /// whose exit is already incomplete; a session already closed in-path is
+    /// read as closed and never closed twice.
+    async fn close_forced_sessions(&self) -> usize {
+        let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
+        let mut unclosed = 0;
+        for session in sessions {
+            let admission = self.admission.lock().await;
+            if self.store_failed() {
+                return 0;
+            }
+            if !self.close_forced(&session, &admission).await {
+                unclosed += 1;
+            }
+        }
+        lock(&self.force_sessions).take();
+        unclosed
+    }
+
+    /// Closes one session for the closure pass; true when it is durably closed.
+    async fn close_forced(&self, session: &SessionId, admission: &Admission<'_>) -> bool {
+        let Ok(Some(snapshot)) = self.store.session_snapshot(session).await else {
+            return false;
+        };
+        if snapshot.closed {
+            return true;
+        }
+        let Ok(next) = TurnNumber::try_from(snapshot.turns + 1) else {
+            return false;
+        };
+        if !matches!(self.store.predecessors(session, next).await, Ok(p) if !p.unresolved) {
+            return false;
+        }
+        let head = self
+            .slot(session)
+            .map_or_else(|| Head::new(None), |slot| Arc::clone(&slot.head));
+        let Ok(guard) = head.lock(&self.store, session).await else {
+            return false;
+        };
+        let Ok(closed) = (Event {
+            seq: guard.next(),
+            session_id: session,
+            turn: None,
+            late: false,
+            at: &rfc3339(SystemTime::now()),
+            raw_ref: None,
+            body: EventBody::SessionClosed {
+                reason: FORCE_CLOSE_REASON,
+            },
+        })
+        .to_value() else {
+            return false;
+        };
+        match self.store.commit_session_closed(session, closed).await {
+            Ok(()) => {
+                guard.committed(1);
+                true
+            }
+            Err(error) => {
+                if journal::may_have_committed(&error) {
+                    guard.lost();
+                }
+                self.latch_held(admission);
+                false
+            }
         }
     }
 

@@ -243,6 +243,7 @@ async fn observe_then_finish(
         false,
     )
     .await
+    .map(drop)
 }
 
 fn event_types(events: &[StoredEvent]) -> Vec<(u64, String)> {

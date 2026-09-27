@@ -77,9 +77,16 @@ pub struct Engine {
     sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
     /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
-    /// Set by Core's first failed or uncertain state write (runtime §7):
-    /// admission and dispatch stop and final shutdown runs in force mode.
+    /// Set by Core's first failed or uncertain state write (runtime §7), under
+    /// `admission`: admission and dispatch stop and final shutdown runs in
+    /// force mode.
     store_failed: AtomicBool,
+    /// Sessions with dispatch state when force was accepted, for final
+    /// shutdown's closure pass.
+    force_sessions: StdMutex<Option<Vec<SessionId>>>,
+    /// Until when a force-path read may retry: final shutdown's deadline less
+    /// the part kept for Host cleanup and forced terminals.
+    read_retries_until: OnceLock<tokio::time::Instant>,
     /// Sessions whose dispatcher daemon main must start.
     starts: mpsc::Sender<SessionId>,
     /// Daemon main's end of `starts`, taken once.
@@ -105,6 +112,14 @@ struct Faults {
     submission_reply_lost: AtomicBool,
     /// This many `queued → cancelled` commits fail, writing nothing.
     cancel_fails: AtomicUsize,
+    /// The next cancellation waits for `release` before its first read.
+    hold_cancel_read: AtomicBool,
+    /// This many cancellation reads of the queued turn fail.
+    cancel_read_fails: AtomicUsize,
+    /// The next closing cancellation waits for `release` before `admission`.
+    hold_before_close: AtomicBool,
+    /// The next receipt commit waits for `release` first, holding `admission`.
+    hold_receipt: AtomicBool,
     /// A turn decided `Run` waits for `release` before its grant.
     hold_before_grant: AtomicBool,
     /// A granted turn waits for `release` before its submission commit.
@@ -145,6 +160,14 @@ struct Started {
     /// Submission time and clock; `None` for a turn cancelled while queued.
     submitted: Option<(String, Instant)>,
 }
+
+/// Part of final shutdown's deadline that force-path read retries leave for
+/// Host cleanup (its 3 s native stop) and forced terminals.
+const READ_RETRY_RESERVE: Duration = Duration::from_secs(4);
+
+/// A held `admission` guard: receipts, stop acceptance, the Store-failed
+/// latch and every `session.closed` decision are ordered by it.
+type Admission<'a> = tokio::sync::MutexGuard<'a, ()>;
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -201,6 +224,8 @@ impl Engine {
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
             store_failed: AtomicBool::new(false),
+            force_sessions: StdMutex::new(None),
+            read_retries_until: OnceLock::new(),
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
             pending_starts: StdMutex::new(HashSet::new()),
@@ -213,8 +238,8 @@ impl Engine {
     /// Store failure and is `store_error` with `commit_outcome`, `unknown`
     /// with `retry: same_key_only` when it may have committed. Restart
     /// recovery settles an unknown one.
-    fn receipt_failed(&self, error: &StoreError) -> ApiError {
-        self.latch();
+    fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
+        self.latch_held(admission);
         if journal::may_have_committed(error) {
             ApiError::RECEIPT_UNKNOWN
         } else {
@@ -223,10 +248,19 @@ impl Engine {
     }
 
     /// Latches Store failure after Core's first failed or uncertain state
-    /// write (runtime §7): new work and every grant are refused, and the stop
-    /// mode becomes `Force`, so running turns take the forced path and daemon
-    /// main starts final shutdown, which then reports an unclean exit.
-    pub(super) fn latch(&self) {
+    /// write (runtime §7), taking `admission` first: the latch is ordered
+    /// against every receipt and every `session.closed` decision, which run
+    /// under it. The caller holds no slot, session or head lock.
+    pub(super) async fn latch(&self) {
+        let admission = self.admission.lock().await;
+        self.latch_held(&admission);
+    }
+
+    /// [`Engine::latch`] for a caller already holding `admission`: new work
+    /// and every grant are refused, and the stop mode becomes `Force`, so
+    /// running turns take the forced path and daemon main starts final
+    /// shutdown, which then reports an unclean exit.
+    pub(super) fn latch_held(&self, _admission: &Admission<'_>) {
         if self.store_failed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -234,6 +268,30 @@ impl Engine {
         self.force_requested_at
             .get_or_init(|| rfc3339(SystemTime::now()));
         self.force.send_replace(true);
+    }
+
+    /// Final shutdown began with this absolute deadline: force-path reads
+    /// stop retrying in time for Host cleanup and forced terminals.
+    pub fn begin_final_shutdown(&self, deadline: tokio::time::Instant) {
+        let _ = self.read_retries_until.set(
+            deadline
+                .checked_sub(READ_RETRY_RESERVE)
+                .unwrap_or_else(tokio::time::Instant::now),
+        );
+    }
+
+    /// Until when a force-path read may retry, once final shutdown began.
+    fn read_retries_until(&self) -> Option<tokio::time::Instant> {
+        self.read_retries_until.get().copied()
+    }
+
+    /// Test hook: once `flag` is armed, signals `granted` and waits for `release`.
+    #[cfg(test)]
+    async fn hold(&self, flag: &AtomicBool) {
+        if flag.swap(false, Ordering::AcqRel) {
+            self.faults.granted.notify_one();
+            self.faults.release.notified().await;
+        }
     }
 
     /// Whether Store failure is latched.
@@ -335,7 +393,7 @@ impl Engine {
         params: SpawnParams,
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
         // Runtime §7: no new mutation, not even a keyed replay, after a failed write.
         if self.store_failed() {
             return Err(ApiError::STORE);
@@ -404,6 +462,8 @@ impl Engine {
             body: EventBody::TurnQueued { queue_position: 0 },
         }
         .to_value()?;
+        #[cfg(test)]
+        self.hold(&self.faults.hold_receipt).await;
         let stored = self
             .store
             .commit_keyed_spawn(
@@ -419,7 +479,7 @@ impl Engine {
             )
             .await;
         if let Err(error) = self.receipt_reply(stored) {
-            return Err(self.receipt_failed(&error));
+            return Err(self.receipt_failed(&error, &admission));
         }
         let slot = Slot::new(Head::new(Some(2)));
         lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
@@ -437,7 +497,7 @@ impl Engine {
         params: ResumeParams,
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
@@ -496,7 +556,7 @@ impl Engine {
         if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
             return Err(ApiError::QUEUED_AT_CAPACITY);
         }
-        self.queue_turn(session, &snapshot, params.prompt, operation)
+        self.queue_turn(session, &snapshot, params.prompt, operation, &admission)
             .await
     }
 
@@ -508,6 +568,7 @@ impl Engine {
         snapshot: &SessionSnapshot,
         prompt: String,
         operation: Option<(String, Vec<u8>)>,
+        admission: &Admission<'_>,
     ) -> Result<Receipted, ApiError> {
         let turn = TurnNumber::try_from(snapshot.turns + 1).map_err(|_| ApiError::STORE)?;
         let slot = self.slot_for(&session);
@@ -562,7 +623,7 @@ impl Engine {
                 // A slot this request created holds nothing: retire it.
                 drop(slot);
                 self.retire(&session);
-                return Err(self.receipt_failed(&error));
+                return Err(self.receipt_failed(&error, admission));
             }
         }
         self.receipted(&session, turn, &slot);

@@ -12,7 +12,7 @@ use via_adapters::{
 };
 use via_store::{AcceptanceRecord, QueuedTurn, SubmissionRecord, TerminalRecord};
 
-use super::journal::{self, Head, TurnJournal, UncertainEvent, Unresolved};
+use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
 use super::queue::{Backoff, Slot};
 use super::stop::{StopMode, stop_outcome};
 use super::terminal::{classify, terminal_envelope};
@@ -23,7 +23,7 @@ use crate::api::{
 use crate::{ApiError, ConnectionId, Deadline, RawRef, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
-const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
+pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 
 /// A committed submission: the queued turn's facts and the submission time.
 pub(super) struct Submission {
@@ -48,6 +48,16 @@ enum Decision {
     Cancel,
     /// Not yet: an earlier turn is unresolved or Store could not be read.
     Wait,
+}
+
+/// How a queued turn's cancellation ended.
+enum Cancelled {
+    /// Durably cancelled; the turn left the queue.
+    Committed,
+    /// A read failed before the commit: nothing was written.
+    Unread,
+    /// Store failure is latched: by this commit, or before it could run.
+    Latched,
 }
 
 /// What the dispatcher does after one step.
@@ -100,7 +110,10 @@ impl Engine {
             };
             let step = match self.decide(&session, turn).await {
                 Decision::Run => self.dispatch(&slot, &session, turn).await,
-                Decision::Cancel => self.cancel_queued(&slot, &session, turn, false).await,
+                Decision::Cancel => match self.cancel_queued(&slot, &session, turn, false).await {
+                    Cancelled::Committed | Cancelled::Latched => Step::Next,
+                    Cancelled::Unread => Step::Wait,
+                },
                 Decision::Wait => Step::Wait,
             };
             match step {
@@ -166,7 +179,7 @@ impl Engine {
             Ok(submission) => submission,
             Err(SubmitFailure::Unread) => return Step::Wait,
             Err(SubmitFailure::Failed) => {
-                self.latch();
+                self.latch().await;
                 return Step::Next;
             }
         };
@@ -179,28 +192,49 @@ impl Engine {
 
     /// Under force (design §2.3): commits every queued turn `queued →
     /// cancelled` without submission. `session.closed` rides on the last one
-    /// only when every other turn of the session is durably settled. After a
-    /// Store failure nothing is written: each queued turn stays `queued` and
-    /// unresolved, reading `store_error`.
+    /// only when every other turn of the session is durably settled, decided
+    /// under `admission`. A failed read retries with backoff until final
+    /// shutdown's read budget ends. After a Store failure nothing is written:
+    /// each queued turn stays `queued` and unresolved, reading `store_error`.
     async fn force_queue(&self, slot: &Slot, session: &SessionId) {
         let turns = slot.queued();
         let last = turns.last().copied();
         for turn in turns {
-            if self.store_failed() {
-                self.unresolved.fail(session, turn, TurnState::Queued);
-                continue;
-            }
-            let close = Some(turn) == last
-                && !self.store_failed()
-                && !self.unresolved.others(session, turn);
-            if matches!(
-                self.cancel_queued(slot, session, turn, close).await,
-                Step::Wait
-            ) {
-                // Only a read failed: nothing was written, but no retry under force.
-                self.unresolved.fail(session, turn, TurnState::Queued);
+            let mut backoff = Backoff::new();
+            loop {
+                if self.store_failed() {
+                    self.unresolved.fail(session, turn, TurnState::Queued);
+                    break;
+                }
+                match self
+                    .cancel_queued(slot, session, turn, Some(turn) == last)
+                    .await
+                {
+                    Cancelled::Committed | Cancelled::Latched => break,
+                    Cancelled::Unread => {
+                        if !self.retry_read(&mut backoff).await {
+                            self.unresolved.fail(session, turn, TurnState::Queued);
+                            break;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Waits out one read-retry delay under force; false once it would run
+    /// into the part of final shutdown's deadline kept for Host cleanup and
+    /// forced terminals.
+    async fn retry_read(&self, backoff: &mut Backoff) -> bool {
+        let delay = backoff.next();
+        if self
+            .read_retries_until()
+            .is_some_and(|by| tokio::time::Instant::now() + delay >= by)
+        {
+            return false;
+        }
+        tokio::time::sleep(delay).await;
+        true
     }
 
     /// C1 P6/§7.3 from durable state. While any earlier turn is unresolved
@@ -350,56 +384,63 @@ impl Engine {
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
         // A terminal that did not commit reads `store_error` and latches.
-        let _ = self.finish(&started, record, terminal, false).await;
+        let _ = self.finish(&started, record, terminal, false, None).await;
     }
 
     /// Commits a never-submitted turn `queued → cancelled` (C1 §7.2), behind
-    /// an `unknown` predecessor or under force; no vendor I/O happened. With
-    /// `close_session`, `session.closed` commits in the same transaction.
-    /// Once committed the turn leaves the queue. A failed or uncertain commit
-    /// latches Store failure; a failed read before it only waits.
+    /// an `unknown` predecessor or under force; no vendor I/O happened. Once
+    /// committed the turn leaves the queue. A failed or uncertain commit
+    /// latches Store failure; a failed read before it writes nothing. With
+    /// `closing` (the last queued turn under force), `admission` is held from
+    /// the latch and close check through the commit, and `session.closed`
+    /// rides on it when no other turn of the session is unresolved.
     async fn cancel_queued(
         &self,
         slot: &Slot,
         session: &SessionId,
         turn: TurnNumber,
-        close_session: bool,
-    ) -> Step {
-        let Ok(Some(queued)) = self.store.queued_turn(session, turn).await else {
-            return Step::Wait;
+        closing: bool,
+    ) -> Cancelled {
+        #[cfg(test)]
+        self.hold(&self.faults.hold_cancel_read).await;
+        #[cfg(test)]
+        let unread = self
+            .faults
+            .cancel_read_fails
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        #[cfg(not(test))]
+        let unread = false;
+        let queued = if unread {
+            None
+        } else {
+            self.store.queued_turn(session, turn).await.ok().flatten()
+        };
+        let Some(queued) = queued else {
+            return Cancelled::Unread;
         };
         // Settle an unknown head now, so the commit below reads nothing.
         if slot.head.lock(&self.store, session).await.is_err() {
-            return Step::Wait;
+            return Cancelled::Unread;
         }
-        let started = Started {
-            session: session.clone(),
-            turn,
-            queued_at: queued.queued_at,
-            first_seq: queued.queued_seq,
-            submitted: None,
+        let (started, record, terminal) = queued_cancellation(slot, session, turn, queued);
+        #[cfg(test)]
+        if closing {
+            self.hold(&self.faults.hold_before_close).await;
+        }
+        let admission = if closing {
+            Some(self.admission.lock().await)
+        } else {
+            None
         };
-        let record = TurnRecord {
-            session: session.clone(),
-            turn,
-            head: Arc::clone(&slot.head),
-            accepted: None,
-            spans: Vec::new(),
-            store_failed: false,
-            uncertain: None,
-        };
-        let terminal = Terminal {
-            state: "cancelled",
-            failure: None,
-            stop_reason: "interrupted",
-            vendor_stop_reason: None,
-            final_text: String::new(),
-            exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
-            warnings: Vec::new(),
-            cancel: None,
-        };
+        if admission.is_some() && self.store_failed() {
+            // Latched while this cancellation read: nothing more is written.
+            self.unresolved.fail(session, turn, TurnState::Queued);
+            return Cancelled::Latched;
+        }
+        let close = closing && !self.unresolved.others(session, turn);
         #[cfg(test)]
         let injected = self
             .faults
@@ -410,31 +451,47 @@ impl Engine {
             .is_ok();
         #[cfg(not(test))]
         let injected = false;
-        let committed = !injected
-            && Self::commit_turn_ended(&self.store, &started, record, terminal, close_session)
-                .await
-                .is_ok();
-        if committed {
-            slot.pop(turn);
-            self.unresolved.resolve(session, turn);
-            self.queued.fetch_sub(1, Ordering::AcqRel);
-            self.active.fetch_sub(1, Ordering::AcqRel);
+        let committed = if injected {
+            Err(ApiError::STORE)
         } else {
+            Self::commit_turn_ended(&self.store, &started, record, terminal, close).await
+        };
+        let Ok(durable) = committed else {
             self.unresolved.fail(session, turn, TurnState::Queued);
-            self.latch();
+            self.latch_with(admission.as_ref()).await;
+            return Cancelled::Latched;
+        };
+        slot.pop(turn);
+        self.unresolved.resolve(session, turn);
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        if durable.uncertain {
+            self.latch_with(admission.as_ref()).await;
         }
-        Step::Next
+        Cancelled::Committed
+    }
+
+    /// Latches Store failure, with `admission` if the caller holds it.
+    async fn latch_with(&self, admission: Option<&super::Admission<'_>>) {
+        match admission {
+            Some(admission) => self.latch_held(admission),
+            None => self.latch().await,
+        }
     }
 
     /// Commits the turn's terminal; one that cannot be made durable is recorded so
     /// that reads report `store_error` instead of a running turn. With
-    /// `close_session`, `session.closed` commits in the same transaction.
+    /// `close_session`, `session.closed` commits in the same transaction, and
+    /// the caller holds `admission` (`held`). A failed commit, or an uncertain
+    /// one whose read-back found the terminal, latches Store failure (runtime
+    /// §7); the committed result stays readable.
     pub(super) async fn finish(
         &self,
         started: &Started,
         record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
+        held: Option<&super::Admission<'_>>,
     ) -> Result<(), ApiError> {
         let finished = Self::finish_turn(
             &self.store,
@@ -445,10 +502,10 @@ impl Engine {
             close_session,
         )
         .await;
-        if finished.is_err() {
-            self.latch();
+        if !matches!(finished, Ok(Durable { uncertain: false })) {
+            self.latch_with(held).await;
         }
-        finished
+        finished.map(drop)
     }
 
     /// `finish` over any journal, so the Store/Core boundary is testable.
@@ -459,11 +516,11 @@ impl Engine {
         record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Durable, ApiError> {
         let committed =
             Self::commit_turn_ended(journal, started, record, terminal, close_session).await;
         match committed {
-            Ok(()) => unresolved.resolve(&started.session, started.turn),
+            Ok(_) => unresolved.resolve(&started.session, started.turn),
             Err(_) => unresolved.fail(&started.session, started.turn, TurnState::Running),
         }
         committed
@@ -479,7 +536,7 @@ impl Engine {
         mut record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Durable, ApiError> {
         journal::reconcile(journal, &mut record)
             .await
             .map_err(|_| ApiError::STORE)?;
@@ -562,9 +619,9 @@ impl Engine {
         )
         .await;
         match committed {
-            Ok(()) => head.committed(events),
-            // Durable or not, re-read the head before the session's next event.
-            Err(_) => head.lost(),
+            Ok(Durable { uncertain: false }) => head.committed(events),
+            // Uncertain or failed: re-read the head before the session's next event.
+            Ok(_) | Err(_) => head.lost(),
         }
         committed
     }
@@ -640,7 +697,7 @@ impl Engine {
                 let shared = Arc::clone(&record.head);
                 let Ok(head) = shared.lock(&self.store, &record.session).await else {
                     record.store_failed = true;
-                    self.latch();
+                    self.latch().await;
                     return;
                 };
                 let seq = head.next();
@@ -655,7 +712,6 @@ impl Engine {
                     }
                     Err(uncertain) => {
                         record.store_failed = true;
-                        self.latch();
                         if let Some(accepted) = uncertain {
                             head.lost();
                             record.uncertain = Some(UncertainEvent {
@@ -663,7 +719,11 @@ impl Engine {
                                 raw_ref: Some(accepted.raw_ref.clone()),
                                 accepted: Some(accepted),
                             });
+                        } else {
+                            drop(head);
                         }
+                        // The head lock is released before the latch takes admission.
+                        self.latch().await;
                     }
                 }
             }
@@ -684,9 +744,10 @@ impl Engine {
         body: EventBody,
         raw_ref: Option<RawRef>,
     ) {
+        let failed = record.store_failed;
         journal::commit_event(&self.store, record, body, raw_ref).await;
-        if record.store_failed {
-            self.latch();
+        if record.store_failed && !failed {
+            self.latch().await;
         }
     }
 
@@ -834,6 +895,44 @@ impl Engine {
             Err(error) => Err(journal::may_have_committed(&error).then_some(accepted)),
         }
     }
+}
+
+/// The facts, record and terminal of a never-submitted turn's cancellation.
+fn queued_cancellation(
+    slot: &Slot,
+    session: &SessionId,
+    turn: TurnNumber,
+    queued: QueuedTurn,
+) -> (Started, TurnRecord, Terminal) {
+    let started = Started {
+        session: session.clone(),
+        turn,
+        queued_at: queued.queued_at,
+        first_seq: queued.queued_seq,
+        submitted: None,
+    };
+    let record = TurnRecord {
+        session: session.clone(),
+        turn,
+        head: Arc::clone(&slot.head),
+        accepted: None,
+        spans: Vec::new(),
+        store_failed: false,
+        uncertain: None,
+    };
+    let terminal = Terminal {
+        state: "cancelled",
+        failure: None,
+        stop_reason: "interrupted",
+        vendor_stop_reason: None,
+        final_text: String::new(),
+        exit: None,
+        raw_ref: None,
+        raw_incomplete: false,
+        warnings: Vec::new(),
+        cancel: None,
+    };
+    (started, record, terminal)
 }
 
 /// Maps a normalized observation onto its C1 §6.1 event payload.

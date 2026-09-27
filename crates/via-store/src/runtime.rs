@@ -522,6 +522,7 @@ enum Command {
         Value,
         oneshot::Sender<Result<(), StoreError>>,
     ),
+    SessionClosed(SessionId, Value, oneshot::Sender<Result<(), StoreError>>),
     Result(
         SessionId,
         TurnNumber,
@@ -823,6 +824,18 @@ impl StoreClient {
     ) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::ClosingTerminal(record, closed, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Commits a session's `session.closed` event alone and marks it closed;
+    /// refused while the session is closed or holds queued or running work.
+    pub async fn commit_session_closed(
+        &self,
+        session_id: &SessionId,
+        closed: Value,
+    ) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SessionClosed(session_id.clone(), closed, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

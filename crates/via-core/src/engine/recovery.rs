@@ -202,11 +202,15 @@ impl Engine {
             None,
         )
         .await;
-        match committed {
-            Ok(()) => head.committed(1),
-            Err(_) => head.lost(),
+        // Recovery must be certain before admission: an uncertain commit, even
+        // one read back as durable, fails startup instead (runtime §7).
+        if matches!(committed, Ok(journal::Durable { uncertain: false })) {
+            head.committed(1);
+            Ok(())
+        } else {
+            head.lost();
+            Err(ApiError::STORE)
         }
-        committed
     }
 
     /// Records the recovery stop of the turn's orphaned execution (C1 §7.5):

@@ -1637,3 +1637,55 @@ fn check_pre_launch_force(paths: &Paths, session: &str, closed: bool) -> Result<
     let types = paths.event_types(session)?;
     check(types == expected, || format!("events {types:?}"))
 }
+
+/// Round 1, decision 1 (runtime §7): the terminal commit succeeds but its
+/// reply is lost. The read-back finds the terminal, so a waiter gets the
+/// committed envelope; the uncertain commit itself still latches Store
+/// failure, and the daemon exits 4.
+#[test]
+fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
+    scenario(
+        "s1_f12_lost_terminal_reply",
+        &accepting_fixture(),
+        |paths, evidence| {
+            // Spawn, submission and acceptance are the first three Core
+            // lifecycle commits; the terminal is the fourth.
+            let point = "store.commit.reply_lost";
+            paths.failpoints.arm(point, 4, "fail_io").map_err(infra)?;
+            let mut daemon = Daemon::start(paths, evidence, "latched")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            let receipt = json_line(&spawn.stdout)?;
+            let address = receipt["turn"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no turn"))?
+                .to_owned();
+            wait_file(&paths.sync.join("accepted.entered"))?;
+            let out = evidence.dir.join("wait.stdout");
+            let mut waiter = paths.command();
+            waiter
+                .args(["wait", &address, "--json"])
+                .stdin(Stdio::null())
+                .stdout(File::create(&out).map_err(infra)?)
+                .stderr(File::create(evidence.dir.join("wait.stderr")).map_err(infra)?);
+            let mut waiter = waiter.spawn().map_err(infra)?;
+            // The waiter is attached before the terminal commits.
+            thread::sleep(Duration::from_millis(300));
+            fs::write(paths.sync.join("accepted.release"), b"").map_err(infra)?;
+            paths
+                .failpoints
+                .wait_ack(point, 4, "fail_io", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            let exit = wait_child(&mut waiter, FINAL_SHUTDOWN)?
+                .ok_or_else(|| ScenarioError::Timeout("the waiter never returned".to_owned()))?;
+            let envelope = json_line(&fs::read(&out).map_err(infra)?)?;
+            check(exit.success() && envelope["state"] == "completed", || {
+                format!("waiter ended {exit} with {envelope}")
+            })?;
+            latched_exit(&mut daemon, evidence, "latched")?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            completes_normally(paths, evidence).map(drop)
+        },
+    )
+}

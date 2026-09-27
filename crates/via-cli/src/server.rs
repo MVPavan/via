@@ -246,6 +246,8 @@ struct Joins {
 async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i32 {
     let started = Instant::now();
     let deadline = started + FINAL_SHUTDOWN;
+    // Force-path reads stop retrying in time for Host cleanup and terminals.
+    engine.begin_final_shutdown(deadline);
     let Joins {
         mut clients,
         mut drives,
@@ -256,9 +258,12 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     closing.send_replace(true);
     // A force can land between a receipt and daemon main starting its
     // session's dispatcher: every requested dispatcher is started, so a force
-    // stop still settles its turns. No receipt commits once stop or a Store
-    // failure is latched, so starts and pending starts only drain; any slot
-    // still `Starting` at the deadline makes the shutdown incomplete.
+    // stop still settles its turns. Stop and the Store-failed latch are set
+    // under `admission`, which every receipt holds through its enqueue and
+    // start request, and daemon main gets here only after one of them: a
+    // receipt either put its start in the channel or pending set already, or
+    // was refused. Starts only drain now; any slot still `Starting` at the
+    // deadline makes the shutdown incomplete.
     let mut queued_drives = 0_usize;
     loop {
         while let Ok(session) = starts.try_recv() {
@@ -315,6 +320,7 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         "unresolved_turns":host.map(|host| host.unresolved_turns),
         "store_failed":host.map(|host| host.store_failed),
         "unstarted_dispatchers":host.map(|host| host.unstarted_dispatchers),
+        "unclosed_sessions":host.map(|host| host.unclosed_sessions),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});

@@ -636,15 +636,29 @@ fn s1_f28_two_callers_drive_two_sessions_without_crosstalk() -> TestResult {
                 return Err(failure("two spawns share one session"));
             }
             // Both first turns are running at once before either is released.
+            // The fake is at its gate once it emitted acceptance; VIA commits
+            // `turn.started` from that stdout frame a moment later, so poll
+            // (bounded) while both gates still hold.
             let running = |session: &str| -> Result<bool, ScenarioError> {
-                let history = events(
-                    &sandbox,
-                    evidence,
-                    &format!("events_running_{session}"),
-                    session,
-                )?;
-                Ok(history.iter().any(|event| event["type"] == "turn.started")
-                    && !history.iter().any(|event| event["type"] == "turn.ended"))
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let history = events(
+                        &sandbox,
+                        evidence,
+                        &format!("events_running_{session}"),
+                        session,
+                    )?;
+                    if history.iter().any(|event| event["type"] == "turn.ended") {
+                        return Ok(false);
+                    }
+                    if history.iter().any(|event| event["type"] == "turn.started") {
+                        return Ok(true);
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
             };
             if !running(&a)? || !running(&b)? {
                 return Err(failure("the two sessions did not run concurrently"));

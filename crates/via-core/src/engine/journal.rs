@@ -408,18 +408,27 @@ pub(super) async fn reconcile(
     }
 }
 
+/// A terminal record that is durable. `uncertain` when Store reported an
+/// unknown outcome and only the read-back found it: the commit itself was
+/// uncertain, which latches Store failure (runtime §7), while the committed
+/// result stays readable.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Durable {
+    pub(super) uncertain: bool,
+}
+
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
 /// uncertain failure is settled by reading back the durable result.
 pub(super) async fn commit_terminal(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
-) -> Result<(), ApiError> {
+) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
     match journal.commit_terminal(record, closed).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(Durable { uncertain: false }),
         Err(error) if may_have_committed(&error) => match journal.result(&session, turn).await {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => Ok(Durable { uncertain: true }),
             Ok(None) | Err(_) => Err(ApiError::STORE),
         },
         Err(_) => Err(ApiError::STORE),

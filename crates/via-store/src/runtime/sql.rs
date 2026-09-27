@@ -195,6 +195,7 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         | Command::Event(..)
         | Command::Terminal(..)
         | Command::ClosingTerminal(..)
+        | Command::SessionClosed(..)
         | Command::AnchorIntent(..)
         | Command::AnchorIdentified(..)
         | Command::ArmIntent(..)
@@ -225,6 +226,9 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         }
         Command::Terminal(record, reply) => {
             send_commit(reply, commit_terminal(conn, root, &record, None));
+        }
+        Command::SessionClosed(session, closed, reply) => {
+            send_commit(reply, commit_session_closed(conn, &session, &closed));
         }
         Command::ClosingTerminal(record, closed, reply) => {
             send_commit(reply, commit_terminal(conn, root, &record, Some(&closed)));
@@ -701,6 +705,38 @@ fn commit_event(
         &record.event,
         record.raw_ref.as_ref(),
     )?;
+    tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))
+}
+
+/// Commits `session.closed` alone once every turn of the session has a
+/// terminal, and marks the session closed.
+fn commit_session_closed(
+    conn: &mut Connection,
+    session: &SessionId,
+    closed: &Value,
+) -> Result<(), StoreError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let open: bool = tx
+        .query_row(
+            "SELECT state!='closed' AND NOT EXISTS(SELECT 1 FROM turns WHERE session_id=?1 AND state IN ('queued','running')) FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    if !open {
+        return Err(StoreError::Constraint(
+            "session is closed or holds unfinished turns",
+        ));
+    }
+    insert_event(&tx, session, closed, None)?;
+    tx.execute(
+        "UPDATE sessions SET state='closed' WHERE id=?1",
+        [session.as_str()],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
