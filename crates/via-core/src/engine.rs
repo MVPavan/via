@@ -3,7 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::{Value, json};
@@ -131,7 +131,7 @@ impl Engine {
         let _active = Active(&self.active);
         let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        let (queued_at, submitted) = self.submit(&session, turn).await?;
+        let (queued_at, submitted, submitted_clock) = self.submit(&session, turn).await?;
         let submitted_at = rfc3339(submitted);
         let mut seq = 2;
         let connection = ConnectionId::try_from(
@@ -172,8 +172,9 @@ impl Engine {
             }
         };
         seq += 1;
-        let ended = SystemTime::now();
-        let ended_at = rfc3339(ended);
+        let ended_at = rfc3339(SystemTime::now());
+        // Monotonic, so wall-clock steps cannot distort or drop the duration.
+        let elapsed = submitted_clock.elapsed();
         let terminal = classify(accepted.is_some(), outcome);
         let raw_ref = terminal.raw_ref.clone();
         let event = Event {
@@ -196,10 +197,7 @@ impl Engine {
             accepted_at: accepted.as_ref().map(|accepted| accepted.at.clone()),
             ended_at,
         };
-        let duration_ms = ended
-            .duration_since(submitted)
-            .ok()
-            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        let duration_ms = u64::try_from(elapsed.as_millis()).ok();
         let envelope = terminal_envelope(
             &session,
             turn,
@@ -229,7 +227,7 @@ impl Engine {
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<(String, SystemTime), ApiError> {
+    ) -> Result<(String, SystemTime, Instant), ApiError> {
         // S1 sessions hold one turn, so its events start at seq 1 (turn.queued).
         let queued = self
             .store
@@ -241,6 +239,7 @@ impl Engine {
             .and_then(|event| event.event.get("at")?.as_str().map(str::to_owned))
             .ok_or(ApiError::STORE)?;
         let submitted = SystemTime::now();
+        let submitted_clock = Instant::now();
         let event = Event {
             seq: 2,
             session_id: session,
@@ -259,7 +258,7 @@ impl Engine {
             })
             .await
             .map_err(|_| ApiError::STORE)?;
-        Ok((queued_at, submitted))
+        Ok((queued_at, submitted, submitted_clock))
     }
 
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.

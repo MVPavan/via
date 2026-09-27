@@ -41,7 +41,7 @@ fn submission() -> SubmissionRecord {
     SubmissionRecord {
         session_id: session(),
         turn: turn(),
-        event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z"}),
+        event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z","raw_ref":null}),
     }
 }
 
@@ -80,7 +80,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         session_id: session(),
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
-                        event: json!({"type":"turn.ended","seq":4}),
+                        event: json!({"type":"turn.ended","seq":4,"raw_ref":null}),
                         raw_ref: None,
                     })
                     .await
@@ -97,7 +97,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         session_id: session(),
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
-                        event: json!({"type":"turn.ended","seq":3}),
+                        event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
                         raw_ref: None,
                     })
                     .await
@@ -120,7 +120,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                     session_id: session(),
                     turn: turn(),
                     envelope: json!({"state":"completed","final_text":"reply"}),
-                    event: json!({"type":"turn.ended","seq":4}),
+                    event: json!({"type":"turn.ended","seq":4,"raw_ref":null}),
                     raw_ref: None,
                 })
                 .await
@@ -187,7 +187,7 @@ fn raw_reference_requires_synced_index_entry() {
                     session_id: session(),
                     turn: turn(),
                     envelope: json!({"state":"completed"}),
-                    event: json!({"type":"turn.ended","seq":4}),
+                    event: json!({"type":"turn.ended","seq":4,"raw_ref":forged}),
                     raw_ref: Some(forged),
                 })
                 .await,
@@ -207,7 +207,7 @@ fn raw_reference_requires_synced_index_entry() {
                 session_id: session(),
                 turn: turn(),
                 envelope: json!({"state":"completed"}),
-                event: json!({"type":"turn.ended","seq":4}),
+                event: json!({"type":"turn.ended","seq":4,"raw_ref":token.raw_ref()}),
                 raw_ref: Some(token.raw_ref().clone()),
             })
             .await
@@ -257,7 +257,7 @@ fn failure_before_vendor_acceptance_is_still_durable() {
                 session_id: session(),
                 turn: turn(),
                 envelope: json!({"state":"failed","failure":{"class":"process_exited"}}),
-                event: json!({"type":"turn.ended","seq":3}),
+                event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
                 raw_ref: None,
             })
             .await
@@ -427,6 +427,18 @@ fn events_keep_dense_seq_and_cited_raw_span() {
         miscited.event["raw_ref"] = serde_json::to_value(second.raw_ref()).unwrap();
         assert!(matches!(
             client.commit_acceptance(miscited).await,
+            Err(StoreError::Constraint(_))
+        ));
+        let mut uncited = acceptance(first.raw_ref());
+        uncited.event.as_object_mut().unwrap().remove("raw_ref");
+        assert!(matches!(
+            client.commit_acceptance(uncited).await,
+            Err(StoreError::Constraint(_))
+        ));
+        let mut nulled = acceptance(first.raw_ref());
+        nulled.event["raw_ref"] = serde_json::Value::Null;
+        assert!(matches!(
+            client.commit_acceptance(nulled).await,
             Err(StoreError::Constraint(_))
         ));
         client

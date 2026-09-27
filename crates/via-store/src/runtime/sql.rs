@@ -326,8 +326,9 @@ fn event_at(event: &Value) -> Result<&str, StoreError> {
 
 /// Appends one event at the session's dense next sequence inside `tx`.
 ///
-/// A `raw_ref` in the event document must equal the span stored in the
-/// columns, so `logs` reads exactly the bytes the event cites.
+/// The event document's `raw_ref` (explicit `null` when there is no span)
+/// must equal the span stored in the columns, so `logs` reads exactly the
+/// bytes the event cites and no stored span is hidden from the public event.
 fn insert_event(
     tx: &rusqlite::Transaction<'_>,
     session: &SessionId,
@@ -344,14 +345,15 @@ fn insert_event(
     if seq(event)? != u64::try_from(next).map_err(|_| StoreError::CorruptEvidence)? {
         return Err(StoreError::Constraint("event sequence is not the next one"));
     }
-    if let Some(cited) = event.get("raw_ref") {
-        let stored =
-            serde_json::to_value(raw_ref).map_err(|error| StoreError::Write(error.to_string()))?;
-        if *cited != stored {
-            return Err(StoreError::Constraint(
-                "event raw_ref differs from its span",
-            ));
-        }
+    let cited = event
+        .get("raw_ref")
+        .ok_or(StoreError::Constraint("event raw_ref missing"))?;
+    let stored =
+        serde_json::to_value(raw_ref).map_err(|error| StoreError::Write(error.to_string()))?;
+    if *cited != stored {
+        return Err(StoreError::Constraint(
+            "event raw_ref differs from its span",
+        ));
     }
     let (connection, offset, len) = match raw_ref {
         Some(reference) => (

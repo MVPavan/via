@@ -386,13 +386,14 @@ fn foreign_listener(
 }
 
 #[test]
+#[ignore = "requires root: run with `cargo nextest run --run-ignored all` as root"]
 fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
     const NOBODY: u32 = 65534;
-    // A foreign-uid listener needs CAP_SETUID (the cloud gate runs as root).
-    // Unprivileged runs rely on the isolated `verified_peer` test in
-    // `client.rs`, which covers the comparison but not this wiring.
+    // A foreign-uid listener needs CAP_SETUID, so the default gate skips this
+    // test and relies on the isolated `verified_peer` test in `client.rs`,
+    // which covers the comparison but not this wiring.
     if !rustix::process::geteuid().is_root() {
-        return Ok(());
+        return Err("requires root to listen as another uid; run as root".into());
     }
     let sandbox = Sandbox::new()?;
     fs::DirBuilder::new().mode(0o700).create(&sandbox.runtime)?;

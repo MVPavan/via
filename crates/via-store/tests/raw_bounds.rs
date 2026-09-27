@@ -53,7 +53,7 @@ fn oversized_raw_index_is_rejected_before_allocation() {
                 .commit_submission(SubmissionRecord {
                     session_id: session.clone(),
                     turn,
-                    event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z"}),
+                    event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z","raw_ref":null}),
                 })
                 .await
                 .unwrap();
@@ -71,7 +71,7 @@ fn oversized_raw_index_is_rejected_before_allocation() {
                     turn,
                     raw_ref: raw.raw_ref().clone(),
                     correlation: "fake-turn-1".to_owned(),
-                    event: json!({"type":"turn.started","seq":3,"at":"2026-01-01T00:00:01.000Z"}),
+                    event: json!({"type":"turn.started","seq":3,"at":"2026-01-01T00:00:01.000Z","raw_ref":raw.raw_ref()}),
                 })
                 .await
                 .unwrap();
