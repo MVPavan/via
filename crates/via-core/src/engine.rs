@@ -3,21 +3,28 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::api::{
+    Bound, Capabilities, Cost, Effective, Envelope, Event, EventBody, EventRange, Exit,
+    FAKE_WALL_MS, Failure, RawSpan, Receipt, Requested, RoutePlan, Timestamps, Usage, VendorFields,
+    rfc3339,
+};
 use crate::{
-    ApiError, ConnectionId, Deadline, FakeConfig, SessionId, SpawnParams, SteerParams, TurnNumber,
-    hash_handle, parse_address,
+    ApiError, ConnectionId, Deadline, FakeConfig, RawRef, SessionId, SpawnParams, SteerParams,
+    TurnNumber, hash_handle, parse_address,
 };
 use via_adapters::{
     AdapterRuntime, AdapterRuntimeConfig, Cleanup, FakeAcceptanceObservation, FakeTerminalEvidence,
     RuntimeConfig, VendorTerminalStatus,
 };
-use via_store::{SpawnRecord, Store, StoreClient, TerminalRecord};
+use via_store::{
+    AcceptanceRecord, SpawnRecord, Store, StoreClient, SubmissionRecord, TerminalRecord,
+};
 
 /// One daemon's durable state and opaque vendor runtime.
 pub struct Engine {
@@ -75,9 +82,28 @@ impl Engine {
         let hash = hash_handle(&params.handle)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
         let session = crate::api::new_session_id()?;
-        let address = format!("{}/1", session.as_str());
-        let receipt = json!({"api_version":1,"session_id":session,"turn":address,"turn_number":turn.get(),"address":address,"state":"queued","revision":0});
-        let initial_event = json!({"seq":1,"type":"turn.queued","session_id":session,"turn":turn.get(),"address":address});
+        let plan = RoutePlan::fake();
+        let receipt = Receipt {
+            session_id: session.clone(),
+            turn: format!("{}/{}", session.as_str(), turn.get()),
+            state: "queued",
+            warnings: plan.warnings(),
+            plan,
+            capabilities: Capabilities::fake(),
+            effective: Effective::fake(&params.model),
+        };
+        let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
+        let at = rfc3339(SystemTime::now());
+        let initial_event = Event {
+            seq: 1,
+            session_id: &session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &at,
+            raw_ref: None,
+            body: EventBody::TurnQueued { queue_position: 0 },
+        }
+        .to_value()?;
         let stored = self
             .store
             .commit_spawn(SpawnRecord {
@@ -105,16 +131,16 @@ impl Engine {
         let _active = Active(&self.active);
         let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        self.store
-            .commit_submission(&session, turn)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        let (queued_at, submitted) = self.submit(&session, turn).await?;
+        let submitted_at = rfc3339(submitted);
+        let mut seq = 2;
         let connection = ConnectionId::try_from(
             format!("c_{}", session.as_str().trim_start_matches("s_")).as_str(),
         )
         .map_err(|_| ApiError::STORE)?;
         let (accepted_tx, mut accepted_rx) = mpsc::channel::<FakeAcceptanceObservation>(1);
-        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(30));
+        let deadline =
+            Deadline::at(tokio::time::Instant::now() + Duration::from_millis(FAKE_WALL_MS));
         let execute = self.adapter.execute(
             session.clone(),
             turn,
@@ -124,29 +150,66 @@ impl Engine {
             deadline,
         );
         tokio::pin!(execute);
-        let mut accepted = false;
+        let mut accepted: Option<Accepted> = None;
         let mut acceptance_open = true;
         let outcome = loop {
             tokio::select! {
-                message = accepted_rx.recv(), if !accepted && acceptance_open => {
+                message = accepted_rx.recv(), if accepted.is_none() && acceptance_open => {
                     if let Some(observation) = message {
-                        self.store.commit_acceptance(&session, turn, &observation.raw_ref, observation.vendor_turn_id.as_str()).await.map_err(|_| ApiError::STORE)?;
-                        accepted = true;
+                        seq += 1;
+                        accepted = Some(self.accept(&session, turn, seq, observation).await?);
                     } else {
                         acceptance_open = false;
                     }
                 }
                 result = &mut execute => {
-                    if !accepted && let Ok(observation) = accepted_rx.try_recv() {
-                        self.store.commit_acceptance(&session, turn, &observation.raw_ref, observation.vendor_turn_id.as_str()).await.map_err(|_| ApiError::STORE)?;
-                        accepted = true;
+                    if accepted.is_none() && let Ok(observation) = accepted_rx.try_recv() {
+                        seq += 1;
+                        accepted = Some(self.accept(&session, turn, seq, observation).await?);
                     }
                     break result;
                 }
             }
         };
-        let (envelope, raw_ref) = terminal_envelope(&session, turn, accepted, outcome);
-        let event = json!({"seq":if accepted {4} else {3},"type":"turn.terminal","session_id":session,"turn":turn.get(),"state":envelope["state"]});
+        seq += 1;
+        let ended = SystemTime::now();
+        let ended_at = rfc3339(ended);
+        let terminal = classify(accepted.is_some(), outcome);
+        let raw_ref = terminal.raw_ref.clone();
+        let event = Event {
+            seq,
+            session_id: &session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &ended_at,
+            raw_ref: raw_ref.as_ref(),
+            body: EventBody::TurnEnded {
+                state: terminal.state,
+                failure: terminal.failure.clone(),
+                stop_reason: terminal.stop_reason,
+            },
+        }
+        .to_value()?;
+        let timestamps = Timestamps {
+            queued_at,
+            submitted_at: Some(submitted_at),
+            accepted_at: accepted.as_ref().map(|accepted| accepted.at.clone()),
+            ended_at,
+        };
+        let duration_ms = ended
+            .duration_since(submitted)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        let envelope = terminal_envelope(
+            &session,
+            turn,
+            terminal,
+            accepted,
+            timestamps,
+            duration_ms,
+            seq,
+        );
+        let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         self.store
             .commit_terminal(TerminalRecord {
                 session_id: session,
@@ -157,6 +220,85 @@ impl Engine {
             })
             .await
             .map_err(|_| ApiError::STORE)
+    }
+
+    /// Commits submission intent with `turn.submitted` (seq 2) before any agent I/O.
+    ///
+    /// Returns the durable `turn.queued` time and the submission time.
+    async fn submit(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<(String, SystemTime), ApiError> {
+        // S1 sessions hold one turn, so its events start at seq 1 (turn.queued).
+        let queued = self
+            .store
+            .events(session, 1, 1)
+            .await
+            .map_err(|_| ApiError::STORE)?;
+        let queued_at = queued
+            .first()
+            .and_then(|event| event.event.get("at")?.as_str().map(str::to_owned))
+            .ok_or(ApiError::STORE)?;
+        let submitted = SystemTime::now();
+        let event = Event {
+            seq: 2,
+            session_id: session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &rfc3339(submitted),
+            raw_ref: None,
+            body: EventBody::TurnSubmitted { attempt: 1 },
+        }
+        .to_value()?;
+        self.store
+            .commit_submission(SubmissionRecord {
+                session_id: session.clone(),
+                turn,
+                event,
+            })
+            .await
+            .map_err(|_| ApiError::STORE)?;
+        Ok((queued_at, submitted))
+    }
+
+    /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
+    async fn accept(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        seq: u64,
+        observation: FakeAcceptanceObservation,
+    ) -> Result<Accepted, ApiError> {
+        let at = rfc3339(SystemTime::now());
+        let event = Event {
+            seq,
+            session_id: session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &at,
+            raw_ref: Some(&observation.raw_ref),
+            body: EventBody::TurnStarted {
+                effective: Effective::fake("fake"),
+            },
+        }
+        .to_value()?;
+        let vendor_turn_id = observation.vendor_turn_id.as_str().to_owned();
+        self.store
+            .commit_acceptance(AcceptanceRecord {
+                session_id: session.clone(),
+                turn,
+                raw_ref: observation.raw_ref.clone(),
+                correlation: vendor_turn_id.clone(),
+                event,
+            })
+            .await
+            .map_err(|_| ApiError::STORE)?;
+        Ok(Accepted {
+            at,
+            raw_ref: observation.raw_ref,
+            vendor_turn_id,
+        })
     }
 
     /// Returns Host-verified cleanup facts for every committed anchor.
@@ -272,27 +414,170 @@ impl Engine {
     }
 }
 
+/// Assembles the C1 §5 envelope; `last_seq` is `turn.ended`, and S1 turns start at seq 1.
 fn terminal_envelope(
     session: &SessionId,
     turn: TurnNumber,
+    terminal: Terminal,
+    accepted: Option<Accepted>,
+    timestamps: Timestamps,
+    duration_ms: Option<u64>,
+    last_seq: u64,
+) -> Envelope {
+    let raw_spans = RawSpan::bounding(
+        accepted
+            .as_ref()
+            .map(|accepted| &accepted.raw_ref)
+            .into_iter()
+            .chain(terminal.raw_ref.as_ref()),
+    );
+    let plan = RoutePlan::fake();
+    Envelope {
+        api_version: 1,
+        session_id: session.clone(),
+        turn: turn.get(),
+        address: format!("{}/{}", session.as_str(), turn.get()),
+        revision: 0,
+        state: terminal.state,
+        failure: terminal.failure,
+        stop_reason: terminal.stop_reason,
+        vendor_stop_reason: terminal.vendor_stop_reason,
+        cancel: None,
+        harness: "fake",
+        model: Requested {
+            requested: "fake".to_owned(),
+            resolved: "fake".to_owned(),
+        },
+        effort: Requested {
+            requested: None,
+            resolved: None,
+        },
+        warnings: plan.warnings(),
+        plan,
+        vendor_session_id: None,
+        cwd: None,
+        bound: Bound::NONE,
+        final_text: terminal.final_text,
+        structured_output: None,
+        denied_actions: [],
+        auto_declined_requests: [],
+        steps: None,
+        usage: Usage::UNAVAILABLE,
+        cost: Cost::UNAVAILABLE,
+        timestamps,
+        duration_ms,
+        exit: terminal.exit,
+        events: EventRange {
+            first_seq: 1,
+            last_seq,
+            count: last_seq,
+        },
+        raw_spans,
+        vendor_options: json!({}),
+        vendor: VendorFields {
+            turn_id: accepted.map(|accepted| accepted.vendor_turn_id),
+        },
+    }
+}
+
+/// Committed acceptance facts the envelope reports.
+struct Accepted {
+    at: String,
+    raw_ref: RawRef,
+    vendor_turn_id: String,
+}
+
+/// Core's terminal decision from adapter evidence (C1 §5, §8.2).
+struct Terminal {
+    state: &'static str,
+    failure: Option<Failure>,
+    stop_reason: &'static str,
+    vendor_stop_reason: Option<String>,
+    final_text: String,
+    exit: Option<Exit>,
+    raw_ref: Option<RawRef>,
+}
+
+fn classify(
     accepted: bool,
     outcome: Result<FakeTerminalEvidence, via_adapters::AdapterError>,
-) -> (Value, Option<crate::RawRef>) {
-    let address = format!("{}/{}", session.as_str(), turn.get());
-    match outcome {
-        Ok(evidence) => {
-            let success = accepted
-                && evidence.status == VendorTerminalStatus::Completed
-                && evidence.exit.code == Some(0)
-                && evidence.cleanup == Cleanup::Quiescent;
-            let state = if success { "completed" } else { "failed" };
-            let raw_ref = evidence.terminal_raw;
-            let envelope = json!({"api_version":1,"session_id":session,"turn":turn.get(),"address":address,"revision":0,"state":state,"failure":if success {Value::Null} else {json!({"kind":"vendor_failed"})},"stop_reason":evidence.stop_reason,"vendor_stop_reason":evidence.stop_reason,"final_text":evidence.final_text,"harness":"fake","model":"fake","exit":{"code":evidence.exit.code,"signal":evidence.exit.signal},"raw_spans":[raw_ref]});
-            (envelope, Some(raw_ref))
-        }
+) -> Terminal {
+    let evidence = match outcome {
+        Ok(evidence) => evidence,
         Err(error) => {
-            let envelope = json!({"api_version":1,"session_id":session,"turn":turn.get(),"address":address,"revision":0,"state":"failed","failure":{"kind":"transport_lost","message":error.to_string()},"stop_reason":"error","final_text":"","harness":"fake","model":"fake","exit":null,"raw_spans":[]});
-            (envelope, None)
+            return Terminal {
+                state: "failed",
+                failure: Some(failure("protocol", error.to_string(), None)),
+                stop_reason: "error",
+                vendor_stop_reason: None,
+                final_text: String::new(),
+                exit: None,
+                raw_ref: None,
+            };
         }
+    };
+    let failed = |class, message: &str| Some(failure(class, message.to_owned(), None));
+    let failure = if accepted {
+        match evidence.status {
+            VendorTerminalStatus::Completed if evidence.exit.code != Some(0) => {
+                failed("process_exited", "the vendor exited unsuccessfully")
+            }
+            VendorTerminalStatus::Completed if evidence.cleanup != Cleanup::Quiescent => failed(
+                "process_exited",
+                "vendor process group cleanup is unconfirmed",
+            ),
+            VendorTerminalStatus::Completed => None,
+            VendorTerminalStatus::Interrupted | VendorTerminalStatus::Failed => Some(failure(
+                "vendor_error",
+                "the vendor reported a failed turn".to_owned(),
+                evidence.vendor_code.clone(),
+            )),
+        }
+    } else {
+        failed("submit_failed", "the vendor did not accept the submission")
+    };
+    let stop_reason = match (&failure, evidence.status) {
+        (None, _) => canonical_stop_reason(&evidence.stop_reason),
+        (Some(_), VendorTerminalStatus::Interrupted) => "interrupted",
+        (Some(_), VendorTerminalStatus::Completed | VendorTerminalStatus::Failed) => "error",
+    };
+    Terminal {
+        state: if failure.is_none() {
+            "completed"
+        } else {
+            "failed"
+        },
+        failure,
+        stop_reason,
+        vendor_stop_reason: Some(evidence.stop_reason),
+        final_text: evidence.final_text,
+        exit: Some(Exit {
+            code: evidence.exit.code,
+            signal: evidence.exit.signal,
+        }),
+        raw_ref: Some(evidence.terminal_raw),
+    }
+}
+
+fn failure(class: &'static str, message: String, vendor_code: Option<String>) -> Failure {
+    Failure {
+        class,
+        message,
+        vendor_code,
+        retryable: false,
+    }
+}
+
+/// Maps a vendor stop word onto C1's closed `stop_reason` set.
+fn canonical_stop_reason(vendor: &str) -> &'static str {
+    match vendor {
+        "end_turn" => "end_turn",
+        "max_steps" => "max_steps",
+        "budget" => "budget",
+        "refusal" => "refusal",
+        "interrupted" => "interrupted",
+        "deadline" => "deadline",
+        "error" => "error",
+        _ => "other",
     }
 }

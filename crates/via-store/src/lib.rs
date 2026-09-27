@@ -221,7 +221,8 @@ pub enum CommitOutcome<T> {
 mod runtime;
 
 pub use runtime::{
-    AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord, DurableRaw,
-    GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter, ReceiptRecord,
-    RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent, TerminalRecord,
+    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorPhase, AnchorRecord,
+    DurableRaw, GroupAbsenceRecord, ProcessJournal, RawFactory, RawStream, RawWriter,
+    ReceiptRecord, RuntimeResources, SpawnRecord, Store, StoreClient, StoreError, StoredEvent,
+    SubmissionRecord, TerminalRecord,
 };
