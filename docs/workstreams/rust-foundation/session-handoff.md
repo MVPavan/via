@@ -1,5 +1,9 @@
 # Rust foundation — paused checkpoint
 
+> **Resumed by the owner, 2026-09-27, under a cloud/local split:** see
+> [cloud-and-local.md](cloud-and-local.md) for the decisions, roster and
+> models. The pause notice below is historical. W0 (cloud probe) comes first.
+
 Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
 The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
 reviews or retries until the owner explicitly instructs resumption. The limits

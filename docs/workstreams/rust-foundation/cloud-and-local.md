@@ -100,3 +100,25 @@ Coordination rules (proposed):
 5. Run a short cloud probe first (Rust build and gate, `bwrap`, OpenCode
    free-model hosts, `claude` child auth, nested virtualization) before
    assigning work.
+
+## 6. Roster and models (owner, 2026-09-27)
+
+- The local Claude session is the **orchestrator**: it briefs, starts and
+  steers cloud sessions, reviews and merges their branches, runs the gate
+  and keeps Beads. Small edits are done directly by the orchestrator or a
+  local Opus 5.5 low/medium subagent, without a cloud round trip.
+- Cloud sessions (Claude only, no Sonnet):
+
+| Work | Model, effort |
+|---|---|
+| Quick edits and checks, the W0 probe, fixtures, docs, small fixes | Opus 5.5 low |
+| Normal implementation: S1 tasks `.7.6`–`.7.8`, ordinary S1 fixes, Claude and OpenCode adapters | Opus 5.5 medium |
+| Shutdown-design integration; hardest S1 findings (T1-I1, T1-I7, other ownership or timing findings) | Opus 5.5 high |
+| Final S1 critique (`via-jm4.7.9`) | Fable 5.1 high |
+
+- Local: GPT-6 Sol high implements the Codex adapter; GPT-6 Astra medium
+  reviews substantial merged work.
+- Default cloud environment: `Via-probe` (Full network, for the probe;
+  switch to Custom once OpenCode's hosts are known). Each cloud session
+  reports its model and effort first and pushes only its own branch; it
+  does not run `bd`, and the orchestrator records Beads changes locally.
