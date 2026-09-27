@@ -1,14 +1,14 @@
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::timeout_at};
 
 use crate::{
     AcceptanceToken, Cleanup, ConnectionId, Deadline, FakeAcceptanceObservation, FakeConfig,
-    FakeTerminalEvidence, ProcessOwner, RuntimeConfig, RuntimeResources, SessionId, TurnNumber,
+    FakeObservation, FakeTerminalEvidence, MAX_OBSERVATION_BYTES, Observation, ProcessOwner,
+    RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, TurnNumber,
     VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
-    FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteError, RouteMessage, TerminalStatus,
-    WireRecovery,
+    FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteMessage, TerminalStatus, WireRecovery,
 };
 
 /// Immutable fake deployment and Host paths supplied at daemon bootstrap.
@@ -22,9 +22,9 @@ pub struct AdapterRuntimeConfig {
 /// Adapter construction or fake-drive failure without handle or prompt text.
 #[derive(Debug, Error)]
 pub enum AdapterError {
-    /// Lower protocol or process boundary failed.
+    /// Lower protocol or process boundary failed, with its typed cause and evidence.
     #[error("fake route failed: {0}")]
-    Route(#[from] RouteError),
+    Route(#[from] RouteFailure),
     /// Lower runtime could not initialize.
     #[error("adapter runtime failed: {0}")]
     Open(#[from] via_routes::WireError),
@@ -34,9 +34,6 @@ pub enum AdapterError {
     /// A typed fake request or observation could not be represented.
     #[error("fake protocol identity is invalid")]
     Protocol,
-    /// The reserved acceptance observation slot was not drained.
-    #[error("fake acceptance observation overflow")]
-    ObservationOverflow,
 }
 
 /// Passive recovery facts for Core's later crash reconciliation.
@@ -77,14 +74,17 @@ impl AdapterRuntime {
         self.fake.is_available()
     }
 
-    /// Runs one submitted fake turn; acceptance travels on a reserved small control slot.
+    /// Runs one submitted fake turn and forwards every observation to Core in
+    /// decode order. When Core's channel is full this waits, bounded by `deadline`;
+    /// if Core cannot take an observation, the Route receiver is dropped so Route
+    /// fails the turn as overflow and still performs its cleanup and drain.
     pub async fn execute(
         &self,
         session_id: SessionId,
         turn: TurnNumber,
         connection_id: ConnectionId,
         prompt: String,
-        acceptance: mpsc::Sender<FakeAcceptanceObservation>,
+        observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
         let owner = ProcessOwner {
@@ -97,23 +97,43 @@ impl AdapterRuntime {
             .map_err(|_| AdapterError::Unavailable)?;
         let start = FakeStart::new(session_id.as_str().to_owned(), turn, prompt)
             .map_err(|_| AdapterError::Protocol)?;
-        // Full: Route waits for capacity under the turn deadline, so this loop keeps
-        // draining until the route finishes.
-        let (route_tx, mut route_rx) = mpsc::channel::<RouteMessage>(64);
+        // Full: Route waits for capacity under the turn deadline while this loop
+        // forwards to Core, which drains until the route finishes.
+        let (route_tx, route_rx) = mpsc::channel::<RouteMessage>(64);
         let route = self
             .route
             .execute(connection_id, process, start, route_tx, deadline);
         tokio::pin!(route);
+        let mut route_rx = Some(route_rx);
         loop {
             tokio::select! {
-                Some(message) = route_rx.recv() => {
-                    forward_observation(message, &acceptance)?;
+                Some(message) = recv(route_rx.as_mut()) => {
+                    if deliver(message, &observations, deadline).await.is_err() {
+                        // Route observes the closed channel as overflow.
+                        route_rx = None;
+                    }
                 }
                 result = &mut route => {
-                    while let Ok(message) = route_rx.try_recv() {
-                        forward_observation(message, &acceptance)?;
+                    let mut delivered = true;
+                    if let Some(receiver) = route_rx.as_mut() {
+                        while let Ok(message) = receiver.try_recv() {
+                            if deliver(message, &observations, deadline).await.is_err() {
+                                delivered = false;
+                                break;
+                            }
+                        }
                     }
-                    return result.map(normalize_terminal).map_err(AdapterError::Route);
+                    // A route failure is the first cause; undelivered data fails a success.
+                    return match result {
+                        Ok(result) if delivered => Ok(normalize_terminal(result)),
+                        Ok(result) => Err(AdapterError::Route(RouteFailure {
+                            cause: RouteError::Overflow { turn },
+                            evidence: None,
+                            exit: Some(result.exit),
+                            raw_incomplete: false,
+                        })),
+                        Err(failure) => Err(AdapterError::Route(failure)),
+                    };
                 }
             }
         }
@@ -144,27 +164,118 @@ impl AdapterRuntime {
     }
 }
 
-/// Forwards acceptance to Core. Core has no path for other observations yet, so they
-/// are dropped here after Route recorded their raw spans; the terminal arrives in the
-/// route result.
-fn forward_observation(
+async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<RouteMessage> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => None,
+    }
+}
+
+/// Normalizes one Route message and waits, bounded by `deadline`, for Core to
+/// take each resulting observation. The terminal travels in the route result.
+async fn deliver(
     message: RouteMessage,
-    sender: &mpsc::Sender<FakeAcceptanceObservation>,
-) -> Result<(), AdapterError> {
-    // Route admits exactly one acceptance per turn.
-    let FakeMessage::Accepted { vendor_turn_id } = message.payload else {
-        return Ok(());
+    observations: &mpsc::Sender<FakeObservation>,
+    deadline: Deadline,
+) -> Result<(), ()> {
+    for observation in normalize(message)? {
+        match timeout_at(deadline.instant(), observations.send(observation)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// Maps one decoded fake message to C2 observations; oversized text is split.
+fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, ()> {
+    let raw_ref = message.raw_ref;
+    let data = |observation| FakeObservation::Data {
+        observation,
+        raw_ref: raw_ref.clone(),
     };
-    let correlation = AcceptanceToken::try_from(1).map_err(|_| AdapterError::Protocol)?;
-    let vendor_turn_id =
-        VendorTurnId::try_from(vendor_turn_id).map_err(|_| AdapterError::Protocol)?;
-    sender
-        .try_send(FakeAcceptanceObservation {
-            correlation,
-            vendor_turn_id,
-            raw_ref: message.raw_ref,
-        })
-        .map_err(|_| AdapterError::ObservationOverflow)
+    Ok(match message.payload {
+        // Route admits exactly one acceptance per turn.
+        FakeMessage::Accepted { vendor_turn_id } => {
+            vec![FakeObservation::Accepted(FakeAcceptanceObservation {
+                correlation: AcceptanceToken::try_from(1).map_err(|_| ())?,
+                vendor_turn_id: VendorTurnId::try_from(vendor_turn_id).map_err(|_| ())?,
+                raw_ref: raw_ref.clone(),
+            })]
+        }
+        FakeMessage::Text { text, .. } => split_text(&text)
+            .into_iter()
+            .map(|text| data(Observation::AssistantText { text }))
+            .collect(),
+        FakeMessage::ToolStarted {
+            tool_id,
+            name,
+            input_summary,
+            ..
+        } => vec![data(Observation::ToolStarted {
+            tool_id,
+            name,
+            input_summary,
+        })],
+        FakeMessage::ToolEnded {
+            tool_id,
+            status,
+            output_summary,
+            exit_code,
+            ..
+        } => vec![data(Observation::ToolEnded {
+            tool_id,
+            status,
+            output_summary,
+            exit_code,
+        })],
+        FakeMessage::UnknownNotification {
+            vendor_type,
+            raw_payload,
+            truncated,
+        } => vec![data(Observation::VendorOther {
+            vendor_type,
+            payload: raw_payload,
+            truncated,
+        })],
+        // Route rejects interrupt acknowledgements; the terminal is the route result.
+        FakeMessage::Terminal { .. } | FakeMessage::InterruptAck { .. } => Vec::new(),
+    })
+}
+
+/// Encoded bytes of an `assistant.text` payload other than its text:
+/// `{"text":"","final":false}`.
+const TEXT_PAYLOAD_OVERHEAD: usize = 25;
+
+/// Splits text in order at UTF-8 boundaries so that each piece's encoded
+/// `assistant.text` payload stays within C2's 256 KiB bound.
+fn split_text(text: &str) -> Vec<String> {
+    let budget = MAX_OBSERVATION_BYTES - TEXT_PAYLOAD_OVERHEAD;
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut encoded = 0;
+    for (index, character) in text.char_indices() {
+        let width = escaped_len(character);
+        if encoded + width > budget {
+            pieces.push(text[start..index].to_owned());
+            start = index;
+            encoded = 0;
+        }
+        encoded += width;
+    }
+    if start < text.len() || pieces.is_empty() {
+        pieces.push(text[start..].to_owned());
+    }
+    pieces
+}
+
+/// Bytes `serde_json` writes for one character inside a JSON string.
+fn escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
+    }
 }
 
 fn normalize_terminal(result: FakeRouteResult) -> FakeTerminalEvidence {
@@ -210,4 +321,43 @@ pub struct FakeShutdown {
     pub failed_tasks: usize,
     /// Bounded description of the deadline, Store or recovery failure, if any.
     pub failure: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_OBSERVATION_BYTES, split_text};
+
+    /// Encoded bytes of the `assistant.text` payload Core commits for one piece.
+    fn encoded(text: &str) -> usize {
+        serde_json::to_vec(&serde_json::json!({"text":text,"final":false}))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn text_splits_in_order_within_the_encoded_payload_bound() {
+        let cases = [
+            String::new(),
+            "short".to_owned(),
+            "é".repeat(140_000),
+            "a".repeat(MAX_OBSERVATION_BYTES),
+            "\u{1}\"\n😀".repeat(40_000),
+        ];
+        for text in cases {
+            let pieces = split_text(&text);
+            assert_eq!(pieces.concat(), text);
+            assert!(!pieces.is_empty());
+            for piece in &pieces {
+                assert!(
+                    encoded(piece) <= MAX_OBSERVATION_BYTES,
+                    "{}",
+                    encoded(piece)
+                );
+            }
+            // Greedy: every piece but the last is filled to within one character.
+            for piece in &pieces[..pieces.len() - 1] {
+                assert!(encoded(piece) + 6 > MAX_OBSERVATION_BYTES);
+            }
+        }
+    }
 }

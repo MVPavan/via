@@ -4,10 +4,14 @@
 use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use thiserror::Error;
 
-pub use via_wire::{CloseRequest, Deadline, RawRef, SendOutcome, TurnNumber};
+pub use via_wire::{CloseRequest, Deadline, ExitReport, RawRef, SendOutcome, TurnNumber};
 
 /// Maximum bytes retained for an unknown fake notification's raw payload.
 pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;
+
+/// C2 A1 bound on one encoded observation payload. Text is split by Adapter;
+/// any other known payload above it fails the turn as a protocol error.
+pub const MAX_OBSERVATION_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum StartTag {
@@ -88,7 +92,7 @@ pub enum TerminalStatus {
 }
 
 /// Fake tool completion status.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     /// Tool completed.
@@ -204,6 +208,27 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
+    /// Core's absolute turn deadline elapsed before terminal evidence and exit.
+    #[error("fake turn deadline elapsed in turn {turn:?}")]
+    Deadline {
+        /// Affected turn.
+        turn: TurnNumber,
+    },
+}
+
+/// A failed route turn: the first typed cause plus the evidence Route still holds
+/// after its forced cleanup and bounded drain.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{cause}")]
+pub struct RouteFailure {
+    /// First cause; later cleanup failures never replace it.
+    pub cause: RouteError,
+    /// Synced frame that proved a protocol failure, when one exists.
+    pub evidence: Option<RawRef>,
+    /// Host-confirmed vendor exit when one was observed.
+    pub exit: Option<ExitReport>,
+    /// True when bytes read from or written to the vendor are missing from the raw log.
+    pub raw_incomplete: bool,
 }
 
 #[derive(Deserialize)]
@@ -240,7 +265,7 @@ struct TerminalFields {
     vendor_code: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolStartedFields {
     vendor_turn_id: String,
     tool_id: String,
@@ -248,7 +273,7 @@ struct ToolStartedFields {
     input_summary: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolEndedFields {
     vendor_turn_id: String,
     tool_id: String,
@@ -262,6 +287,17 @@ fn known<T: for<'de> Deserialize<'de>>(input: &[u8], turn: TurnNumber) -> Result
         turn,
         detail: "malformed known fake message",
     })
+}
+
+/// Refuses a known non-text payload whose encoded observation exceeds C2's bound.
+fn bounded_payload<T: Serialize>(fields: &T, turn: TurnNumber) -> Result<(), RouteError> {
+    match serde_json::to_vec(fields) {
+        Ok(encoded) if encoded.len() <= MAX_OBSERVATION_BYTES => Ok(()),
+        Ok(_) | Err(_) => Err(RouteError::Protocol {
+            turn,
+            detail: "fake observation payload exceeds 256 KiB",
+        }),
+    }
 }
 
 fn paired_vendor_turn(actual: &str, turn: TurnNumber) -> bool {
@@ -365,6 +401,7 @@ impl FakeMessage {
             turn,
             "tool start belongs to another turn",
         )?;
+        bounded_payload(&fields, turn)?;
         Ok(Self::ToolStarted {
             vendor_turn_id: fields.vendor_turn_id,
             tool_id: fields.tool_id,
@@ -380,6 +417,7 @@ impl FakeMessage {
             turn,
             "tool end belongs to another turn",
         )?;
+        bounded_payload(&fields, turn)?;
         Ok(Self::ToolEnded {
             vendor_turn_id: fields.vendor_turn_id,
             tool_id: fields.tool_id,
@@ -425,8 +463,8 @@ mod runtime;
 
 pub use runtime::{FakeRoute, FakeRouteResult};
 pub use via_wire::{
-    ConnectionId, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
-    RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
+    ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
+    SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
 };
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.

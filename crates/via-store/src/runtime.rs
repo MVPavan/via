@@ -107,6 +107,18 @@ pub struct AcceptanceRecord {
     pub event: Value,
 }
 
+/// One canonical event inside a running turn, such as an adapter observation.
+pub struct EventRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based running turn.
+    pub turn: TurnNumber,
+    /// Canonical event with the session's next sequence.
+    pub event: Value,
+    /// Already-synced source span, or `None` for a synthesized event.
+    pub raw_ref: Option<RawRef>,
+}
+
 /// Core's terminal state and final event, committed atomically.
 pub struct TerminalRecord {
     /// Owning session.
@@ -353,6 +365,7 @@ enum Command {
     ),
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
+    Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
     Terminal(TerminalRecord, oneshot::Sender<Result<(), StoreError>>),
     Result(
         SessionId,
@@ -525,6 +538,13 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::Acceptance(record, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Commits one event at the next sequence of a turn that is still running.
+    pub async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Event(record, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

@@ -3,10 +3,13 @@ use tokio::{sync::mpsc, time::timeout_at};
 
 use super::{
     ConnectionId, Deadline, FakeMessage, FakeStart, PrivateProcessSpec, RawRef, RouteError,
-    RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome, TerminalStatus, TurnNumber,
-    WireRecovery, WireShutdown,
+    RouteFailure, RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome, TerminalStatus,
+    TurnNumber, WireRecovery, WireShutdown,
 };
-use via_wire::{CloseMode, CloseRequest, ExitReport, WireConnection, WireError, WireRuntime};
+use via_wire::{
+    CloseMode, CloseRequest, ExitReport, RawEvidence, WireConnection, WireError, WireFailure,
+    WireRuntime,
+};
 
 /// Final fake protocol evidence, including independently confirmed process exit.
 pub struct FakeRouteResult {
@@ -42,7 +45,9 @@ impl FakeRoute {
     ///
     /// Every decoded message, including acceptance, the terminal and late observations
     /// after it, is sent on `observations` in decode order with its synced raw span.
-    /// When that channel is full the route waits, bounded by `deadline`.
+    /// When that channel is full the route waits, bounded by `deadline`; a dropped
+    /// receiver fails the turn as overflow. On any failure the private group is
+    /// force-closed and both pipes are drained under a separate cleanup bound.
     pub async fn execute(
         &self,
         connection_id: ConnectionId,
@@ -50,26 +55,39 @@ impl FakeRoute {
         start: FakeStart,
         observations: mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-    ) -> Result<FakeRouteResult, RouteError> {
+    ) -> Result<FakeRouteResult, RouteFailure> {
         let turn = start.turn();
         let mut wire = self
             .wire
             .open_connection(connection_id, process, deadline)
             .await
-            .map_err(|_| transport(turn))?;
-        let outcome = Box::pin(Self::drive(&mut wire, start, &observations, deadline)).await;
-        if outcome.is_err() {
-            let _report = wire
-                .close(CloseRequest {
-                    mode: CloseMode::Force,
-                    deadline,
-                })
-                .await;
-            // The group is stopping; keep both tails as raw evidence. The original
-            // failure stays authoritative even if this drain cannot finish.
-            let _drained = Box::pin(wire.drain_to_eof(deadline)).await;
-        }
-        outcome
+            .map_err(|error| RouteFailure {
+                cause: wire_cause(turn, &error),
+                evidence: None,
+                exit: None,
+                raw_incomplete: false,
+            })?;
+        let failed = match Box::pin(Self::drive(&mut wire, start, &observations, deadline)).await {
+            Ok(result) => return Ok(result),
+            Err(failed) => failed,
+        };
+        // The turn deadline may already have elapsed; cleanup gets its own bound.
+        let cleanup = cleanup_deadline();
+        let report = wire
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: cleanup,
+            })
+            .await;
+        // The group is stopping; keep both tails as raw evidence. The original
+        // failure stays authoritative; the drain only reports lost bytes.
+        let raw = Box::pin(wire.drain_to_eof(cleanup)).await;
+        Err(RouteFailure {
+            cause: failed.cause,
+            evidence: failed.evidence,
+            exit: failed.exit.or(report.vendor_exit),
+            raw_incomplete: raw == RawEvidence::Incomplete,
+        })
     }
 
     /// Drains Host controls and reapers before Core releases the Store owner.
@@ -87,27 +105,33 @@ impl FakeRoute {
         start: FakeStart,
         observations: &mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-    ) -> Result<FakeRouteResult, RouteError> {
+    ) -> Result<FakeRouteResult, Failed> {
         let turn = start.turn();
         let mut bytes = to_vec(&start).map_err(|_| protocol(turn, "cannot encode fake start"))?;
         bytes.push(b'\n');
-        if wire
+        let sent = wire
             .write_frame(&bytes, deadline)
             .await
-            .map_err(|_| transport(turn))?
-            != SendOutcome::Written
-        {
-            return Err(transport(turn));
+            .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
+        if sent != SendOutcome::Written {
+            return Err(transport(turn).into());
         }
         let mut phase = Phase::Submitted;
         let terminal = loop {
             let Some(message) = Box::pin(next_message(wire, turn, deadline)).await? else {
-                wire.wait_exit(deadline)
+                let exit = wire
+                    .wait_exit(deadline)
                     .await
-                    .map_err(|_| transport(turn))?;
-                return Err(RouteError::ProcessExited { turn });
+                    .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
+                return Err(Failed {
+                    cause: RouteError::ProcessExited { turn },
+                    evidence: None,
+                    exit: Some(exit),
+                });
             };
-            phase.advance(&message.payload, turn)?;
+            phase
+                .advance(&message.payload, turn)
+                .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
             let terminal = terminal_evidence(&message);
             forward(observations, message, turn, deadline).await?;
             if let Some(terminal) = terminal {
@@ -120,21 +144,21 @@ impl FakeRoute {
         // such as a second terminal, fails the turn.
         wire.close_input(deadline)
             .await
-            .map_err(|_| transport(turn))?;
+            .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
         while let Some(message) = Box::pin(next_message(wire, turn, deadline)).await? {
-            phase.advance(&message.payload, turn)?;
+            phase
+                .advance(&message.payload, turn)
+                .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
             forward(observations, message, turn, deadline).await?;
         }
         let exit = wire
             .wait_exit(deadline)
             .await
-            .map_err(|_| transport(turn))?;
-        let cleanup_deadline =
-            Deadline::at(tokio::time::Instant::now() + std::time::Duration::from_secs(3));
+            .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
         let close = wire
             .close(CloseRequest {
                 mode: CloseMode::Graceful,
-                deadline: cleanup_deadline,
+                deadline: cleanup_deadline(),
             })
             .await;
         Ok(FakeRouteResult {
@@ -147,6 +171,40 @@ impl FakeRoute {
             cleanup: close.cleanup,
         })
     }
+}
+
+/// First failure inside `drive`, before cleanup adds raw completeness.
+struct Failed {
+    cause: RouteError,
+    evidence: Option<RawRef>,
+    exit: Option<ExitReport>,
+}
+
+impl Failed {
+    /// A failure proved by one synced frame.
+    fn cited(cause: RouteError, evidence: &RawRef) -> Self {
+        Self {
+            cause,
+            evidence: Some(evidence.clone()),
+            exit: None,
+        }
+    }
+}
+
+impl From<RouteError> for Failed {
+    fn from(cause: RouteError) -> Self {
+        Self {
+            cause,
+            evidence: None,
+            exit: None,
+        }
+    }
+}
+
+/// Bounds Host cleanup and the raw drain separately from the turn deadline, which
+/// may already have elapsed when cleanup starts.
+fn cleanup_deadline() -> Deadline {
+    Deadline::at(tokio::time::Instant::now() + std::time::Duration::from_secs(3))
 }
 
 /// Connection-local protocol phase for the only turn on a fake connection.
@@ -235,16 +293,18 @@ async fn next_message(
     wire: &mut WireConnection,
     turn: TurnNumber,
     deadline: Deadline,
-) -> Result<Option<RouteMessage>, RouteError> {
+) -> Result<Option<RouteMessage>, Failed> {
     let Some(frame) = wire
         .next_frame(deadline)
         .await
-        .map_err(|_| transport(turn))?
+        .map_err(|error| Failed::from(wire_cause(turn, &error)))?
     else {
         return Ok(None);
     };
+    let payload = FakeMessage::decode(frame.bytes(), turn)
+        .map_err(|cause| Failed::cited(cause, frame.raw_ref()))?;
     Ok(Some(RouteMessage {
-        payload: FakeMessage::decode(frame.bytes(), turn)?,
+        payload,
         raw_ref: frame.raw_ref().clone(),
     }))
 }
@@ -256,10 +316,31 @@ async fn forward(
     message: RouteMessage,
     turn: TurnNumber,
     deadline: Deadline,
-) -> Result<(), RouteError> {
+) -> Result<(), Failed> {
     match timeout_at(deadline.instant(), observations.send(message)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(RouteError::Overflow { turn }),
+        Ok(Err(_)) | Err(_) => Err(RouteError::Overflow { turn }.into()),
+    }
+}
+
+/// Keeps a Wire failure's cause for Core's C1 class decision.
+fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
+    match error {
+        WireError::Raw(_) => RouteError::Store { turn },
+        WireError::Deadline => RouteError::Deadline { turn },
+        WireError::Frame(WireFailure::FrameTooLarge) => {
+            protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
+        }
+        WireError::Frame(WireFailure::UnterminatedFrame) => {
+            protocol(turn, "fake stdout ended inside a frame")
+        }
+        WireError::Frame(WireFailure::RawRangeMismatch | WireFailure::RawStore) => {
+            RouteError::Store { turn }
+        }
+        WireError::Frame(WireFailure::Overflow) => RouteError::Overflow { turn },
+        WireError::Frame(WireFailure::Transport) | WireError::Io(_) | WireError::Host(_) => {
+            transport(turn)
+        }
     }
 }
 

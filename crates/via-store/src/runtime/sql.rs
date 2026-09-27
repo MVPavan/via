@@ -1,9 +1,9 @@
 //! SQLite migration and single-writer transaction implementation.
 
 use super::{
-    AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, MetadataExt,
-    OptionalExtension, Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord, Receiver,
-    SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
+    AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, EventRecord,
+    MetadataExt, OptionalExtension, Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord,
+    Receiver, SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
     SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, Value,
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
     commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref, validate_raw_ref,
@@ -125,6 +125,10 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
             }
             Command::Acceptance(record, reply) => {
                 let _ = reply.send(commit_acceptance(&mut conn, root, &record));
+                true
+            }
+            Command::Event(record, reply) => {
+                let _ = reply.send(commit_event(&mut conn, root, &record));
                 true
             }
             Command::Terminal(record, reply) => {
@@ -377,6 +381,38 @@ fn insert_event(
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     Ok(())
+}
+
+fn commit_event(
+    conn: &mut Connection,
+    root: &Path,
+    record: &EventRecord,
+) -> Result<(), StoreError> {
+    if let Some(reference) = &record.raw_ref {
+        validate_raw_ref(root, reference)?;
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let state: Option<String> = tx
+        .query_row(
+            "SELECT state FROM turns WHERE session_id=?1 AND number=?2",
+            params![record.session_id.as_str(), record.turn.get()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    if state.as_deref() != Some("running") {
+        return Err(StoreError::Constraint("turn is not running"));
+    }
+    insert_event(
+        &tx,
+        &record.session_id,
+        &record.event,
+        record.raw_ref.as_ref(),
+    )?;
+    tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
 
 fn commit_terminal(

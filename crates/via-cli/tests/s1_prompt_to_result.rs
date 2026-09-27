@@ -817,7 +817,7 @@ fn envelope_violations(
     if envelope["cost"] != json!({"usd":null,"scope":"turn","provenance":"unavailable"}) {
         problems.push(format!("envelope.cost = {}", envelope["cost"]));
     }
-    if envelope["events"] != json!({"first_seq":1,"last_seq":4,"count":4}) {
+    if envelope["events"] != json!({"first_seq":1,"last_seq":5,"count":5}) {
         problems.push(format!("envelope.events = {}", envelope["events"]));
     }
     let spans = envelope["raw_spans"]
@@ -862,6 +862,7 @@ fn event_violations(
             "turn.queued",
             "turn.submitted",
             "turn.started",
+            "assistant.text",
             "turn.ended",
         ]
     {
@@ -881,7 +882,7 @@ fn event_violations(
             ));
         }
     }
-    if let [queued, submitted, started, ended] = events {
+    if let [queued, submitted, started, text, ended] = events {
         if !queued["queue_position"].is_u64() || submitted["attempt"] != 1 {
             problems.push("turn.queued/turn.submitted payload".to_owned());
         }
@@ -904,7 +905,10 @@ fn event_violations(
                         })
             })
         };
-        if !within(&started["raw_ref"]) || !within(&ended["raw_ref"]) {
+        if text["text"] != "reply" || text["final"] != false {
+            problems.push(format!("assistant.text payload: {text}"));
+        }
+        if !within(&started["raw_ref"]) || !within(&text["raw_ref"]) || !within(&ended["raw_ref"]) {
             problems.push("event raw_ref outside envelope raw_spans".to_owned());
         }
         if ended["state"] != "completed"
