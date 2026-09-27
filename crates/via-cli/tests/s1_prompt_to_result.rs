@@ -550,7 +550,7 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
                 let accepted_page: Value =
                     serde_json::from_slice(&accepted_events).map_err(infra)?;
                 if accepted_page["events"].as_array().is_some_and(|events| {
-                    events.iter().any(|event| event["type"] == "turn.accepted")
+                    events.iter().any(|event| event["type"] == "turn.started")
                 }) {
                     break;
                 }
@@ -700,6 +700,360 @@ fn s1_cli_auto_starts_daemon_and_keeps_result() -> TestResult {
             }
             Ok(())
         },
+    );
+    report.require_pass()
+}
+
+fn is_rfc3339_utc(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        let bytes = text.as_bytes();
+        text.len() >= 20
+            && text.ends_with('Z')
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'T'
+            && bytes[13] == b':'
+            && bytes[16] == b':'
+    })
+}
+
+fn support_violations(path: &str, entry: &Value, problems: &mut Vec<String>) {
+    match entry["support"].as_str() {
+        Some("native") => {}
+        Some("partial") if entry["semantics"].is_string() => {}
+        Some("unsupported") if entry["reason"].is_string() => {}
+        _ => problems.push(format!("{path} is not a C1 §4.1 support entry: {entry}")),
+    }
+}
+
+/// Lists every C1 §3.2/§5/§6.1 shape violation for one completed fake turn.
+fn c1_shape_violations(
+    session: &str,
+    receipt: &Value,
+    envelope: &Value,
+    events: &[Value],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    receipt_violations(session, receipt, &mut problems);
+    envelope_violations(session, receipt, envelope, &mut problems);
+    event_violations(session, receipt, envelope, events, &mut problems);
+    problems
+}
+
+fn receipt_violations(session: &str, receipt: &Value, problems: &mut Vec<String>) {
+    let address = format!("{session}/1");
+    for (key, expected) in [
+        ("session_id", json!(session)),
+        ("turn", json!(address)),
+        ("state", json!("queued")),
+    ] {
+        if receipt[key] != expected {
+            problems.push(format!("receipt.{key} = {}", receipt[key]));
+        }
+    }
+    for key in ["route", "adapter_version", "version_status"] {
+        if !receipt[key].is_string() {
+            problems.push(format!("receipt.{key} missing"));
+        }
+    }
+    if receipt.get("vendor_version").is_none() || !receipt["warnings"].is_array() {
+        problems.push("receipt.vendor_version or warnings missing".to_owned());
+    }
+    let capabilities = &receipt["capabilities"];
+    for verb in ["spawn", "resume", "steer", "cancel", "close"] {
+        support_violations(
+            &format!("capabilities.verbs.{verb}"),
+            &capabilities["verbs"][verb],
+            problems,
+        );
+    }
+    if capabilities["verbs"]["steer"]["support"] != "unsupported" {
+        problems.push("capabilities claim steer although fake refuses it".to_owned());
+    }
+    for param in ["instructions", "output_schema", "effort", "max_steps"] {
+        support_violations(
+            &format!("capabilities.params.{param}"),
+            &capabilities["params"][param],
+            problems,
+        );
+    }
+    support_violations("capabilities.recover", &capabilities["recover"], problems);
+    if !capabilities["bounds"].is_array()
+        || !capabilities["network_control"].is_boolean()
+        || !capabilities["usage"]["tokens"].is_string()
+        || !capabilities["usage"]["cost"].is_string()
+    {
+        problems.push(format!("capabilities incomplete: {capabilities}"));
+    }
+    let effective = &receipt["effective"];
+    if effective["model"] != "fake"
+        || effective.get("effort").is_none()
+        || effective.get("bound").is_none()
+        || !effective["deadlines"]["wall_ms"].is_u64()
+        || effective["deadlines"].get("idle_ms").is_none()
+        || effective.get("max_steps").is_none()
+    {
+        problems.push(format!("receipt.effective incomplete: {effective}"));
+    }
+}
+
+fn envelope_violations(
+    session: &str,
+    receipt: &Value,
+    envelope: &Value,
+    problems: &mut Vec<String>,
+) {
+    let address = format!("{session}/1");
+    if envelope["model"] != json!({"requested":"fake","resolved":"fake"}) {
+        problems.push(format!("envelope.model = {}", envelope["model"]));
+    }
+    if envelope["turn"] != 1 || envelope["address"] != json!(address) {
+        problems.push("envelope turn/address".to_owned());
+    }
+    if !envelope["failure"].is_null() || envelope["stop_reason"] != "end_turn" {
+        problems.push("envelope failure/stop_reason".to_owned());
+    }
+    for key in ["route", "adapter_version", "version_status"] {
+        if envelope[key] != receipt[key] {
+            problems.push(format!("envelope.{key} differs from receipt"));
+        }
+    }
+    for key in [
+        "effort",
+        "vendor_version",
+        "vendor_session_id",
+        "cwd",
+        "bound",
+        "structured_output",
+        "steps",
+        "cancel",
+        "vendor_options",
+        "vendor",
+    ] {
+        if envelope.get(key).is_none() {
+            problems.push(format!("envelope.{key} missing"));
+        }
+    }
+    for key in ["denied_actions", "auto_declined_requests", "warnings"] {
+        if !envelope[key].is_array() {
+            problems.push(format!("envelope.{key} is not a list"));
+        }
+    }
+    for key in ["queued_at", "submitted_at", "accepted_at", "ended_at"] {
+        if !is_rfc3339_utc(&envelope["timestamps"][key]) {
+            problems.push(format!("envelope.timestamps.{key} missing"));
+        }
+    }
+    if !envelope["duration_ms"].is_u64() {
+        problems.push("envelope.duration_ms missing".to_owned());
+    }
+    let usage = &envelope["usage"];
+    if usage["provenance"] != "unavailable"
+        || !usage["scope"].is_string()
+        || !usage["input_tokens"].is_null()
+        || usage.get("output_tokens").is_none()
+    {
+        problems.push(format!("envelope.usage not explicit unavailable: {usage}"));
+    }
+    if envelope["cost"] != json!({"usd":null,"scope":"turn","provenance":"unavailable"}) {
+        problems.push(format!("envelope.cost = {}", envelope["cost"]));
+    }
+    if envelope["events"] != json!({"first_seq":1,"last_seq":4,"count":4}) {
+        problems.push(format!("envelope.events = {}", envelope["events"]));
+    }
+    let spans = envelope["raw_spans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if spans.is_empty() {
+        problems.push("envelope.raw_spans empty".to_owned());
+    }
+    for span in &spans {
+        let valid = span["connection_id"]
+            .as_str()
+            .is_some_and(|connection| span["path"] == json!(format!("raw/{connection}.raw")))
+            && span["first_offset"]
+                .as_u64()
+                .zip(span["last_offset"].as_u64())
+                .is_some_and(|(first, last)| first < last)
+            && span.as_object().is_some_and(|fields| fields.len() == 4);
+        if !valid {
+            problems.push(format!("raw span shape: {span}"));
+        }
+    }
+}
+
+fn event_violations(
+    session: &str,
+    receipt: &Value,
+    envelope: &Value,
+    events: &[Value],
+    problems: &mut Vec<String>,
+) {
+    let spans = envelope["raw_spans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or("<none>"))
+        .collect();
+    if types
+        != [
+            "turn.queued",
+            "turn.submitted",
+            "turn.started",
+            "turn.ended",
+        ]
+    {
+        problems.push(format!("event types {types:?}"));
+    }
+    for (index, event) in events.iter().enumerate() {
+        let common = event["seq"] == json!(index + 1)
+            && event["session_id"] == json!(session)
+            && event["turn"] == 1
+            && event["late"] == false
+            && is_rfc3339_utc(&event["at"])
+            && event.get("raw_ref").is_some();
+        if !common {
+            problems.push(format!(
+                "event {} lacks C1 common fields: {event}",
+                index + 1
+            ));
+        }
+    }
+    if let [queued, submitted, started, ended] = events {
+        if !queued["queue_position"].is_u64() || submitted["attempt"] != 1 {
+            problems.push("turn.queued/turn.submitted payload".to_owned());
+        }
+        if started["effective"] != receipt["effective"] || !started["raw_ref"].is_object() {
+            problems.push(format!("turn.started payload: {started}"));
+        }
+        let within = |reference: &Value| {
+            spans.iter().any(|span| {
+                span["connection_id"] == reference["connection_id"]
+                    && reference["offset"]
+                        .as_u64()
+                        .zip(reference["len"].as_u64())
+                        .zip(
+                            span["first_offset"]
+                                .as_u64()
+                                .zip(span["last_offset"].as_u64()),
+                        )
+                        .is_some_and(|((offset, len), (first, last))| {
+                            first <= offset && offset + len <= last
+                        })
+            })
+        };
+        if !within(&started["raw_ref"]) || !within(&ended["raw_ref"]) {
+            problems.push("event raw_ref outside envelope raw_spans".to_owned());
+        }
+        if ended["state"] != "completed"
+            || ended["stop_reason"] != "end_turn"
+            || ended.get("failure").is_none()
+        {
+            problems.push(format!("turn.ended payload: {ended}"));
+        }
+        if ended["at"] != envelope["timestamps"]["ended_at"]
+            || queued["at"] != envelope["timestamps"]["queued_at"]
+        {
+            problems.push("event times differ from envelope timestamps".to_owned());
+        }
+    }
+}
+
+#[test]
+fn s1_c1_events_receipt_and_envelope_shapes() -> TestResult {
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let fake = fake_binary(via)?;
+    let sandbox = tempfile::tempdir()?;
+    let state = sandbox.path().join("state");
+    let runtime = sandbox.path().join("runtime");
+    let sync = sandbox.path().join("sync");
+    for path in [&state, &runtime, &sync] {
+        fs::DirBuilder::new().mode(0o700).create(path)?;
+    }
+    let fixture = sandbox.path().join("fixture.json");
+    write_reply_fixture(&fixture)?;
+    let evidence = Evidence::new("s1_c1_shapes", &fake, &fixture)?;
+    let cx = Context {
+        via,
+        state: &state,
+        runtime: &runtime,
+        fake: &fake,
+        fixture: &fixture,
+        sync: &sync,
+    };
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = start_daemon(
+                &cx,
+                &evidence.dir.join("daemon.trace"),
+                evidence.dir.join("cleanup.json"),
+            )?;
+            let output = cli(
+                &cx,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hello",
+                    "--json",
+                ],
+                Duration::from_secs(15),
+            )?;
+            evidence.write("envelopes.ndjson", &output).map_err(infra)?;
+            let lines: Vec<Value> = output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(serde_json::from_slice)
+                .collect::<Result<_, _>>()
+                .map_err(infra)?;
+            let [receipt, envelope] = lines.as_slice() else {
+                return Err(ScenarioError::Failure(
+                    "expected receipt and envelope".to_owned(),
+                ));
+            };
+            let session = receipt["session_id"]
+                .as_str()
+                .ok_or_else(|| ScenarioError::Failure("receipt has no session id".to_owned()))?;
+            let result = cli(
+                &cx,
+                evidence,
+                "result",
+                &["result", session, "--json"],
+                Duration::from_secs(5),
+            )?;
+            let stored: Value = serde_json::from_slice(&result).map_err(infra)?;
+            if &stored != envelope {
+                return Err(ScenarioError::Failure(
+                    "result differs from foreground envelope".to_owned(),
+                ));
+            }
+            let page = cli(
+                &cx,
+                evidence,
+                "events",
+                &["events", session, "--json"],
+                Duration::from_secs(5),
+            )?;
+            evidence.write("events.ndjson", &page).map_err(infra)?;
+            let page: Value = serde_json::from_slice(&page).map_err(infra)?;
+            let events = page["events"].as_array().cloned().unwrap_or_default();
+            let problems = c1_shape_violations(session, receipt, envelope, &events);
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                Err(ScenarioError::Failure(problems.join("\n")))
+            }
+        },
+        |evidence| collect_available(evidence, &state),
     );
     report.require_pass()
 }

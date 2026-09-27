@@ -83,6 +83,30 @@ pub struct ReceiptRecord {
     pub receipt: Value,
 }
 
+/// Core's submission intent and its canonical event, committed before agent I/O.
+pub struct SubmissionRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based turn number.
+    pub turn: TurnNumber,
+    /// Canonical event with the session's next sequence; its `at` becomes `submitted_at`.
+    pub event: Value,
+}
+
+/// Vendor acceptance evidence and Core's canonical event, committed atomically.
+pub struct AcceptanceRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based turn number.
+    pub turn: TurnNumber,
+    /// Synced raw span of the accepting frame.
+    pub raw_ref: RawRef,
+    /// Vendor correlation retained as durable C2 acceptance evidence.
+    pub correlation: String,
+    /// Canonical event with the session's next sequence; its `at` becomes `accepted_at`.
+    pub event: Value,
+}
+
 /// Core's terminal state and final event, committed atomically.
 pub struct TerminalRecord {
     /// Owning session.
@@ -327,18 +351,8 @@ enum Command {
         SpawnRecord,
         oneshot::Sender<Result<ReceiptRecord, StoreError>>,
     ),
-    Submission(
-        SessionId,
-        TurnNumber,
-        oneshot::Sender<Result<(), StoreError>>,
-    ),
-    Acceptance(
-        SessionId,
-        TurnNumber,
-        RawRef,
-        String,
-        oneshot::Sender<Result<(), StoreError>>,
-    ),
+    Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
+    Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Terminal(TerminalRecord, oneshot::Sender<Result<(), StoreError>>),
     Result(
         SessionId,
@@ -496,37 +510,21 @@ impl StoreClient {
     }
 
     /// Commits submission intent before any agent I/O is authorized.
-    pub async fn commit_submission(
-        &self,
-        session_id: &SessionId,
-        turn: TurnNumber,
-    ) -> Result<(), StoreError> {
+    pub async fn commit_submission(&self, record: SubmissionRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Submission(session_id.clone(), turn, reply))?;
+        self.send(Command::Submission(record, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
     /// Commits acceptance with a synced raw span and one vendor correlation.
-    pub async fn commit_acceptance(
-        &self,
-        session_id: &SessionId,
-        turn: TurnNumber,
-        raw_ref: &RawRef,
-        correlation: &str,
-    ) -> Result<(), StoreError> {
-        if correlation.is_empty() || correlation.len() > 128 {
+    pub async fn commit_acceptance(&self, record: AcceptanceRecord) -> Result<(), StoreError> {
+        if record.correlation.is_empty() || record.correlation.len() > 128 {
             return Err(StoreError::Constraint(
                 "acceptance correlation must contain 1 to 128 bytes",
             ));
         }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Acceptance(
-            session_id.clone(),
-            turn,
-            raw_ref.clone(),
-            correlation.to_owned(),
-            reply,
-        ))?;
+        self.send(Command::Acceptance(record, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

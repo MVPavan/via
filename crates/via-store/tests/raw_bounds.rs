@@ -8,7 +8,10 @@ use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use serde_json::json;
 use tempfile::TempDir;
-use via_store::{ConnectionId, RawStream, SessionId, SpawnRecord, Store, StoreError, TurnNumber};
+use via_store::{
+    AcceptanceRecord, ConnectionId, RawStream, SessionId, SpawnRecord, Store, StoreError,
+    SubmissionRecord, TurnNumber,
+};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -46,7 +49,14 @@ fn oversized_raw_index_is_rejected_before_allocation() {
                 })
                 .await
                 .unwrap();
-            client.commit_submission(&session, turn).await.unwrap();
+            client
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn,
+                    event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z"}),
+                })
+                .await
+                .unwrap();
             let raw = store
                 .runtime_resources()
                 .into_wire_parts()
@@ -56,7 +66,13 @@ fn oversized_raw_index_is_rejected_before_allocation() {
                 .await
                 .unwrap();
             client
-                .commit_acceptance(&session, turn, raw.raw_ref(), "fake-turn-1")
+                .commit_acceptance(AcceptanceRecord {
+                    session_id: session.clone(),
+                    turn,
+                    raw_ref: raw.raw_ref().clone(),
+                    correlation: "fake-turn-1".to_owned(),
+                    event: json!({"type":"turn.started","seq":3,"at":"2026-01-01T00:00:01.000Z"}),
+                })
                 .await
                 .unwrap();
         });

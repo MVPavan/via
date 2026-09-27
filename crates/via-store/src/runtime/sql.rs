@@ -1,12 +1,12 @@
 //! SQLite migration and single-writer transaction implementation.
 
 use super::{
-    Command, CommitOutcome, Connection, ConnectionId, Duration, MetadataExt, OptionalExtension,
-    Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord, Receiver, SCHEMA_VERSION, SessionId,
-    SpawnRecord, StoreError, StoreFailureKind, StoredEvent, TerminalRecord, TransactionBehavior,
-    TurnNumber, Value, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
-    commit_group_absence, commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref,
-    validate_raw_ref,
+    AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, MetadataExt,
+    OptionalExtension, Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord, Receiver,
+    SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
+    SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, Value,
+    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
+    commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref, validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -119,19 +119,12 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 let _ = reply.send(commit_spawn(&mut conn, record));
                 true
             }
-            Command::Submission(session, turn, reply) => {
-                let _ = reply.send(commit_submission(&mut conn, &session, turn));
+            Command::Submission(record, reply) => {
+                let _ = reply.send(commit_submission(&mut conn, &record));
                 true
             }
-            Command::Acceptance(session, turn, reference, correlation, reply) => {
-                let _ = reply.send(commit_acceptance(
-                    &mut conn,
-                    root,
-                    &session,
-                    turn,
-                    &reference,
-                    &correlation,
-                ));
+            Command::Acceptance(record, reply) => {
+                let _ = reply.send(commit_acceptance(&mut conn, root, &record));
                 true
             }
             Command::Terminal(record, reply) => {
@@ -260,41 +253,22 @@ fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRec
     })
 }
 
-fn commit_submission(
-    conn: &mut Connection,
-    session: &SessionId,
-    turn: TurnNumber,
-) -> Result<(), StoreError> {
+fn commit_submission(conn: &mut Connection, record: &SubmissionRecord) -> Result<(), StoreError> {
+    let session = &record.session_id;
+    let at = event_at(&record.event)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
     let changed = tx
         .execute(
-            "UPDATE turns SET state='running',submitted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE session_id=?1 AND number=?2 AND state='queued'",
-            params![session.as_str(), turn.get()],
+            "UPDATE turns SET state='running',submitted_at=?3 WHERE session_id=?1 AND number=?2 AND state='queued'",
+            params![session.as_str(), record.turn.get(), at],
         )
         .map_err(|error| StoreError::Write(error.to_string()))?;
     if changed != 1 {
         return Err(StoreError::Constraint("turn is not queued"));
     }
-    let next: i64 = tx
-        .query_row(
-            "SELECT next_seq FROM sessions WHERE id=?1",
-            [session.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    let event = serde_json::json!({"seq":next,"type":"turn.submitted","turn":format!("{}/{}",session.as_str(),turn.get())});
-    tx.execute(
-        "INSERT INTO events(session_id,seq,event) VALUES (?1,?2,?3)",
-        params![session.as_str(), next, json(&event)?],
-    )
-    .map_err(|error| StoreError::Write(error.to_string()))?;
-    tx.execute(
-        "UPDATE sessions SET next_seq=next_seq+1 WHERE id=?1",
-        [session.as_str()],
-    )
-    .map_err(|error| StoreError::Write(error.to_string()))?;
+    insert_event(&tx, session, &record.event, None)?;
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -302,12 +276,13 @@ fn commit_submission(
 fn commit_acceptance(
     conn: &mut Connection,
     root: &Path,
-    session: &SessionId,
-    turn: TurnNumber,
-    reference: &RawRef,
-    correlation: &str,
+    record: &AcceptanceRecord,
 ) -> Result<(), StoreError> {
-    validate_raw_ref(root, reference)?;
+    let session = &record.session_id;
+    let turn = record.turn;
+    let correlation = record.correlation.as_str();
+    validate_raw_ref(root, &record.raw_ref)?;
+    let at = event_at(&record.event)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
@@ -330,6 +305,35 @@ fn commit_acceptance(
             "acceptance phase or correlation mismatch",
         ));
     }
+    // The vendor correlation and accepted_at stay as internal C2 evidence; the
+    // public event is Core's canonical one.
+    tx.execute(
+        "UPDATE turns SET correlation=?3,accepted_at=?4 WHERE session_id=?1 AND number=?2",
+        params![session.as_str(), turn.get(), correlation, at],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
+    insert_event(&tx, session, &record.event, Some(&record.raw_ref))?;
+    tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))
+}
+
+fn event_at(event: &Value) -> Result<&str, StoreError> {
+    event
+        .get("at")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Constraint("event time missing"))
+}
+
+/// Appends one event at the session's dense next sequence inside `tx`.
+///
+/// A `raw_ref` in the event document must equal the span stored in the
+/// columns, so `logs` reads exactly the bytes the event cites.
+fn insert_event(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+    event: &Value,
+    raw_ref: Option<&RawRef>,
+) -> Result<(), StoreError> {
     let next: i64 = tx
         .query_row(
             "SELECT next_seq FROM sessions WHERE id=?1",
@@ -337,28 +341,40 @@ fn commit_acceptance(
             |row| row.get(0),
         )
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    let event = serde_json::json!({
-        "seq":next,"type":"turn.accepted",
-        "turn":format!("{}/{}",session.as_str(),turn.get()),
-        "raw_ref":reference,
-    });
-    let offset = i64::try_from(reference.offset())
-        .map_err(|_| StoreError::Constraint("raw offset too large"))?;
-    tx.execute(
-        "UPDATE turns SET correlation=?3,accepted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE session_id=?1 AND number=?2",
-        params![session.as_str(),turn.get(),correlation],
-    ).map_err(|error| StoreError::Write(error.to_string()))?;
+    if seq(event)? != u64::try_from(next).map_err(|_| StoreError::CorruptEvidence)? {
+        return Err(StoreError::Constraint("event sequence is not the next one"));
+    }
+    if let Some(cited) = event.get("raw_ref") {
+        let stored =
+            serde_json::to_value(raw_ref).map_err(|error| StoreError::Write(error.to_string()))?;
+        if *cited != stored {
+            return Err(StoreError::Constraint(
+                "event raw_ref differs from its span",
+            ));
+        }
+    }
+    let (connection, offset, len) = match raw_ref {
+        Some(reference) => (
+            Some(reference.connection_id().as_str()),
+            Some(
+                i64::try_from(reference.offset())
+                    .map_err(|_| StoreError::Constraint("raw offset too large"))?,
+            ),
+            Some(i64::from(reference.byte_len())),
+        ),
+        None => (None, None, None),
+    };
     tx.execute(
         "INSERT INTO events(session_id,seq,event,connection_id,raw_offset,raw_len) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![session.as_str(),next,json(&event)?,reference.connection_id().as_str(),offset,i64::from(reference.byte_len())],
-    ).map_err(|error| StoreError::Write(error.to_string()))?;
+        params![session.as_str(), next, json(event)?, connection, offset, len],
+    )
+    .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.execute(
         "UPDATE sessions SET next_seq=next_seq+1 WHERE id=?1",
         [session.as_str()],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    Ok(())
 }
 
 fn commit_terminal(
@@ -378,20 +394,9 @@ fn commit_terminal(
         validate_raw_ref(root, reference)?;
     }
     let envelope = json(&record.envelope)?;
-    let event = json(&record.event)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    let next: i64 = tx
-        .query_row(
-            "SELECT next_seq FROM sessions WHERE id=?1",
-            [record.session_id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    if seq(&record.event)? != u64::try_from(next).map_err(|_| StoreError::CorruptEvidence)? {
-        return Err(StoreError::Constraint("terminal event sequence mismatch"));
-    }
     let changed = tx
         .execute(
             "UPDATE turns SET state=?3,envelope=?4 WHERE session_id=?1 AND number=?2 AND state='running' AND (?3!='completed' OR correlation IS NOT NULL)",
@@ -401,24 +406,14 @@ fn commit_terminal(
     if changed != 1 {
         return Err(StoreError::Constraint("turn is not running"));
     }
-    let (connection, offset, len) = match &record.raw_ref {
-        Some(reference) => (
-            Some(reference.connection_id().as_str()),
-            Some(
-                i64::try_from(reference.offset())
-                    .map_err(|_| StoreError::Constraint("raw offset too large"))?,
-            ),
-            Some(i64::from(reference.byte_len())),
-        ),
-        None => (None, None, None),
-    };
+    insert_event(
+        &tx,
+        &record.session_id,
+        &record.event,
+        record.raw_ref.as_ref(),
+    )?;
     tx.execute(
-        "INSERT INTO events(session_id,seq,event,connection_id,raw_offset,raw_len) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![record.session_id.as_str(), next, event, connection, offset, len],
-    )
-    .map_err(|error| StoreError::Write(error.to_string()))?;
-    tx.execute(
-        "UPDATE sessions SET next_seq=next_seq+1,state='idle' WHERE id=?1",
+        "UPDATE sessions SET state='idle' WHERE id=?1",
         [record.session_id.as_str()],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
