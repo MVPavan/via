@@ -647,7 +647,7 @@ that does not prove its submitted work had no effect.
 | Vendor terminal `completed` | running | `completed`; `stop_reason` from vendor |
 | Vendor terminal `failed` | running | `failed`, class from vendor code (§8.2) |
 | Core deadline | running | Core cancels (§7.4); result `failed`, class `deadline_wall`/`deadline_idle`, `cancel` filled |
-| Force deadline, private process | running | `cancelled`, `forced` only with Host evidence; cleanup `quiescent` only after verified group absence (§7.5). If a turn event already failed to commit, the result is `failed(store)` instead, with `cancel` still filled |
+| Force deadline, private process | running | Host proved the live vendor stopped: `cancelled`, outcome `forced`, cleanup `quiescent` only after verified group absence, else `uncertain`. No vendor could have launched (start never sent): `cancelled`, outcome `requested`. A vendor may have launched but neither a stop nor a terminal is proved: `unknown`, outcome `requested`. Outcome and cleanup certainty are independent (§7.5). If a turn event already failed to commit, the result is `failed(store)` instead, with `cancel` still filled |
 | Force deadline, shared server | running | `unknown`, outcome `unknown` |
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |

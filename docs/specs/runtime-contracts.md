@@ -846,7 +846,13 @@ Without `drain` or `force`, a stop with active turns is refused
   for it, its cancel is `requested` with cleanup `quiescent` (C1 §7.4). Core
   commits the turn in final shutdown (C1 §7.6
   force row) once Host has reconciled its anchor; `forced` requires the
-  anchor's report that its cleanup began while the vendor was live.
+  anchor's report that its cleanup began while the vendor was live. A turn
+  whose vendor may have launched (ARM sent) without that report or a
+  terminal ends `unknown`. Host shutdown leaves 1 s of the final deadline
+  for these commits. After ARM, Host keeps the vendor pipes so Wire drains
+  them on every acquisition failure or abandonment; raw completeness is
+  then proven, or bytes the bounded drain could not record mark it
+  incomplete.
 - **Drain** keeps serving reads while accepted turns finish under their own
   existing work deadlines; the drain phase gets no invented 10 s deadline.
   When accepted and active work has settled, final shutdown begins.
