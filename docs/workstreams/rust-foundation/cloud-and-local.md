@@ -132,3 +132,18 @@ Coordination rules (proposed):
   `scratchpad/cloud/new-branches.log`. Both survive the orchestrator
   session closing; the cloud sessions themselves run on Anthropic's side
   regardless.
+- Review loop (owner, 2026-09-27): a worker branch stays unmerged until
+  its GPT-6 Sol medium review is SOUND or each remaining finding is
+  deferred to a named task. Findings go back to the **same cloud session**
+  (`scratchpad/cloud/followup.sh`), which first merges `rust-foundation`,
+  fixes, and appends a "Round N" section to its report; Sol re-reviews only
+  that round's change. Fresh sessions are for new tasks, a different
+  model/effort, or an overlong context. After merging a wave, the
+  orchestrator runs the gate; Sol high reviews each completed task or
+  slice, which also covers interactions between parallel branches.
+- Parallel workers get disjoint files. `via-core/src/engine.rs` is the
+  recurring conflict point; split it by responsibility before the next
+  parallel wave.
+- The owner delegates routine orchestration decisions (scoping, deferring
+  findings to planned tasks, fix guidance, escalation); the orchestrator
+  decides on evidence and reports what it decided.
