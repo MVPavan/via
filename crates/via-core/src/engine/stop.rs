@@ -206,10 +206,12 @@ impl Engine {
                     terminal.fail(FailureClass::Store, "a turn event could not be recorded");
                 }
                 // C1 §3.14: close only once every other turn of the session
-                // has a durable disposition.
-                let close = !self
-                    .unresolved
-                    .others(&turn.started.session, turn.started.turn);
+                // has a durable disposition, and never after a Store failure:
+                // an uncertain receipt may hold a turn Core never registered.
+                let close = !self.store_failed()
+                    && !self
+                        .unresolved
+                        .others(&turn.started.session, turn.started.turn);
                 self.finish(&turn.started, record, terminal, close).await
             };
             if !matches!(

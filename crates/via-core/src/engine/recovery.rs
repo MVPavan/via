@@ -11,9 +11,9 @@ use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, TerminalRecord, UnfinishedTurn};
 
+use super::journal::Head;
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
-use super::journal::Head;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
 use crate::api::{Cancel, Event, EventBody, FailureClass, RawSpan, Timestamps, rfc3339};
 use crate::{ApiError, Cleanup, Deadline, RawRef, SessionId, TurnNumber};

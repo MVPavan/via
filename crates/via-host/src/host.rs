@@ -103,6 +103,8 @@ pub enum HostError {
     Deadline,
     /// Anchor identity or private protocol failed validation.
     Protocol(&'static str),
+    /// The caller's stop signal was set at the pre-ARM gate: nothing launched.
+    Stopped,
 }
 
 impl std::fmt::Display for HostError {
@@ -116,6 +118,7 @@ impl std::fmt::Display for HostError {
                 write!(formatter, "process journal unavailable: {kind:?}")
             }
             Self::Deadline => formatter.write_str("Host deadline expired"),
+            Self::Stopped => formatter.write_str("stopped before ARM"),
         }
     }
 }
@@ -311,7 +314,8 @@ impl Host {
         spec: PrivateProcessSpec,
         deadline: Deadline,
     ) -> Result<AcquiredProcess, HostError> {
-        self.acquire_retaining(spec, deadline, &LaunchPipes::default())
+        let (_never, stop) = watch::channel(false);
+        self.acquire_retaining(spec, deadline, &LaunchPipes::default(), &stop)
             .await
     }
 
@@ -320,11 +324,17 @@ impl Host {
     /// outlive an acquisition that fails or is abandoned after ARM, and the
     /// caller can still record that output. A successful acquisition takes
     /// them back.
+    ///
+    /// `stop` is the caller's force or Store-failure signal, checked at the
+    /// last gate before ARM: set by then, no ARM is sent, the anchor control is
+    /// dropped so its group stops, and the result is [`HostError::Stopped`].
+    /// Set after the check, ARM won and the launch is in flight.
     pub async fn acquire_retaining(
         &self,
         spec: PrivateProcessSpec,
         deadline: Deadline,
         launch: &LaunchPipes,
+        stop: &watch::Receiver<bool>,
     ) -> Result<AcquiredProcess, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
@@ -342,7 +352,7 @@ impl Host {
         {
             return Err(HostError::Invalid("reserved vendor marker environment key"));
         }
-        timeout_at(deadline.instant(), self.acquire_inner(spec, launch))
+        timeout_at(deadline.instant(), self.acquire_inner(spec, launch, stop))
             .await
             .map_err(|_| HostError::Deadline)?
     }
@@ -472,6 +482,7 @@ impl Host {
         &self,
         spec: PrivateProcessSpec,
         launch: &LaunchPipes,
+        stop: &watch::Receiver<bool>,
     ) -> Result<AcquiredProcess, HostError> {
         let StartedAnchor {
             anchor_id,
@@ -496,6 +507,16 @@ impl Host {
         else {
             return Err(HostError::Store("ArmIntent lacks positive commit receipt"));
         };
+        #[cfg(feature = "test-failpoints")]
+        via_store::failpoint::hit_async("host.anchor.after_arm_intent_commit")
+            .await
+            .map_err(HostError::Io)?;
+        // The pre-ARM launch gate: a stop set by now wins and nothing launches;
+        // returning drops the anchor control, so the anchor exits on EOF and
+        // stops its group. Past this check ARM wins and the launch is in flight.
+        if *stop.borrow() {
+            return Err(HostError::Stopped);
+        }
         // This is the only ARM send for this generation; errors never cause retry.
         launch.put(pipes);
         let reply = protocol::transact(

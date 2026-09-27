@@ -35,6 +35,7 @@ POINTS = [
     "store.commit.reply_lost",
     "core.recovery.page_boundary",
     "host.recovery.absence_commit",
+    "host.anchor.after_arm_intent_commit",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 MARKERS = [*ACTIVATION, *POINTS, "failpoint controller"]

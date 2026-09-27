@@ -136,13 +136,10 @@ async fn shutdown(engine: &Engine) -> super::EngineShutdown {
 
 /// Runs the session's dispatcher until it returns.
 async fn dispatch(engine: &Engine, session: &SessionId) {
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        engine.dispatcher(session.clone()),
-    )
-    .await
-    .expect("the dispatcher returns")
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), engine.dispatcher(session.clone()))
+        .await
+        .expect("the dispatcher returns")
+        .unwrap();
 }
 
 /// The session's durable event types, checking that sequences are dense.
@@ -439,8 +436,7 @@ fn a_failed_submission_commit_latches_and_launches_nothing() {
 /// the last one; the shutdown is clean. T2-B submitted turn 1 after force.
 #[test]
 fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
-    let Some(root) = child("force_on_a_queued_only_session_cancels_its_turns_and_closes_it")
-    else {
+    let Some(root) = child("force_on_a_queued_only_session_cancels_its_turns_and_closes_it") else {
         return;
     };
     run(async {
@@ -486,8 +482,7 @@ fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
 /// the C1 §7.6 force row (`cancelled`, `requested`) and the session closes.
 #[test]
 fn a_turn_granted_before_force_submits_then_ends_forced_without_launch() {
-    let Some(root) =
-        child("a_turn_granted_before_force_submits_then_ends_forced_without_launch")
+    let Some(root) = child("a_turn_granted_before_force_submits_then_ends_forced_without_launch")
     else {
         return;
     };
@@ -642,7 +637,9 @@ fn waiting_turns_are_read_per_session_on_backoff_not_per_turn() {
             .predecessors_unreadable
             .store(usize::MAX, Ordering::Release);
         engine.faults.reads.store(0, Ordering::Release);
-        let dispatchers = sessions.iter().map(|session| engine.dispatcher(session.clone()));
+        let dispatchers = sessions
+            .iter()
+            .map(|session| engine.dispatcher(session.clone()));
         let all = futures_join_all(dispatchers);
         assert!(
             tokio::time::timeout(Duration::from_secs(3), all)
@@ -652,7 +649,10 @@ fn waiting_turns_are_read_per_session_on_backoff_not_per_turn() {
         );
         let reads = engine.faults.reads.load(Ordering::Acquire);
         // Reads at 0, 0.25, 0.75, 1.75 s per session, plus scheduling slack.
-        assert!(reads <= SESSIONS * 5, "{reads} reads for {SESSIONS} sessions");
+        assert!(
+            reads <= SESSIONS * 5,
+            "{reads} reads for {SESSIONS} sessions"
+        );
         assert!(reads >= SESSIONS, "each dispatcher read at least once");
         assert_eq!(engine.queued.load(Ordering::Acquire), SESSIONS * 8);
     });

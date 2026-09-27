@@ -527,21 +527,6 @@ fn hold_store_write_lock(paths: &Paths) -> Result<rusqlite::Connection, Scenario
     Ok(store)
 }
 
-/// Waits until the daemon reports no active turn, i.e. every drive returned.
-fn wait_no_active_turn(paths: &Paths, evidence: &Evidence) -> Result<(), ScenarioError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = paths.run(evidence, "status", &["daemon", "status", "--json"])?;
-        if status.status.success() && json_line(&status.stdout)?["sessions"]["active"] == 0 {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(ScenarioError::Timeout("turn never settled".to_owned()));
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn scenario(
     name: &str,
     fixture: &Value,
@@ -920,9 +905,11 @@ fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
     )
 }
 
-/// W1-D Sol finding 2: a receipted turn whose terminal commit failed leaves
-/// its drive failed and the turn unresolved; a later stop must not report a
-/// clean exit. An outside SQLite writer lock makes the commits fail for real.
+/// W1-D Sol finding 2 under runtime §7: a receipted turn whose terminal
+/// commit failed latches Store failure, so the daemon stops admission and
+/// dispatch and shuts itself down in force mode; the turn stays unresolved
+/// and the exit is 4, never clean. An outside SQLite writer lock makes the
+/// commit fail for real; it is released once final shutdown began.
 #[test]
 fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
     scenario(
@@ -934,17 +921,12 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
             wait_event(paths, &session, "assistant.text")?;
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
-            let settled = wait_no_active_turn(paths, evidence);
+            let latched = wait_socket_gone(paths);
             drop(lock);
-            settled?;
-            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--json"])?;
-            check(
-                stop.status.success() && json_line(&stop.stdout)? == json!({"stopping":true}),
-                || "idle stop receipt".to_owned(),
-            )?;
+            latched?;
             let status = daemon
                 .wait_exit(FINAL_SHUTDOWN)?
-                .ok_or_else(|| fail("stop did not exit"))?;
+                .ok_or_else(|| fail("the latched daemon did not exit"))?;
             let summary = daemon.summary()?;
             evidence
                 .write("daemon_shutdown.json", summary.to_string().as_bytes())
@@ -954,14 +936,29 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
             })?;
             check(
                 summary["disposition"] == "incomplete"
-                    && summary["unresolved_turns"] == 1
-                    && summary["failed_joins"]
-                        .as_u64()
-                        .is_some_and(|failed| failed >= 1),
+                    && summary["mode"] == "force"
+                    && summary["store_failed"] == true
+                    && summary["unresolved_turns"] == 1,
                 || format!("summary {summary}"),
             )
         },
     )
+}
+
+/// Waits until daemon main left serving: it removes its socket as final
+/// shutdown begins (a latched Store failure starts it without a request).
+fn wait_socket_gone(paths: &Paths) -> Result<(), ScenarioError> {
+    let socket = paths.runtime.join("via.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while socket.exists() {
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(
+                "daemon never began final shutdown".to_owned(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 /// W1-D Sol finding 4: final shutdown lets a foreground `via spawn` already
@@ -1063,10 +1060,13 @@ fn s1_daemon_stop_force_before_acceptance_is_forced() -> TestResult {
     )
 }
 
-/// W3-F 8: a turn whose Store commit already failed before a force ends
-/// `failed(store)`, not `cancelled`: C1 §8.2 `store` records that the durable
-/// stream lost an event, and hiding it behind a cancellation would claim a
-/// complete record. The cancel evidence is still reported.
+/// W3-F 8 under runtime §7: a turn whose event commit failed latches Store
+/// failure; the daemon force-stops itself and the turn ends `failed(store)`,
+/// not `cancelled`: C1 §8.2 `store` records that the durable stream lost an
+/// event, and hiding it behind a cancellation would claim a complete record.
+/// The cancel evidence is still reported. Store-failed mode commits no
+/// `session.closed` (an uncertain receipt could hold an unregistered turn)
+/// and the exit is 4.
 #[test]
 fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
     let fixture = json!({
@@ -1108,23 +1108,20 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
             wait_event(paths, &session, "turn.started")?;
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("text.release"), b"").map_err(infra)?;
-            let held = wait_file(&paths.sync.join("hold.entered"));
-            // Longer than the Store's 250 ms busy timeout: the text commit fails.
-            thread::sleep(Duration::from_millis(1500));
+            // Past the Store's 250 ms busy timeout the text commit fails and
+            // latches; the lock is released once final shutdown began, so
+            // the forced terminal can commit.
+            let latched = wait_socket_gone(paths);
             drop(lock);
-            held?;
-            let stop = paths.run(
-                evidence,
-                "stop_force",
-                &["daemon", "stop", "--force", "--json"],
-            )?;
-            check(stop.status.success(), || {
-                format!("force stop exited {}", stop.status)
-            })?;
+            latched?;
             let status = daemon
                 .wait_exit(FINAL_SHUTDOWN)?
-                .ok_or_else(|| fail("force stop did not exit"))?;
-            check(status.code() == Some(0), || format!("exit {status}"))?;
+                .ok_or_else(|| fail("the latched daemon did not exit"))?;
+            check(status.code() == Some(4), || format!("exit {status}"))?;
+            let summary = daemon.summary()?;
+            check(summary["store_failed"] == true, || {
+                format!("summary {summary}")
+            })?;
             let (envelope, events) = paths.committed(&session)?;
             evidence
                 .write("envelope.json", envelope.to_string().as_bytes())
@@ -1147,7 +1144,6 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
                         "turn.submitted",
                         "turn.started",
                         "turn.ended",
-                        "session.closed",
                     ],
                 || format!("event types {types:?}"),
             )?;
@@ -1271,11 +1267,28 @@ fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult 
     Ok(())
 }
 
-/// A receipted raced turn ends `cancelled` with the C1 force lifecycle. Host
+/// A receipted raced turn ends `cancelled`. One the force found still queued
+/// (T2-B2 design §4) was never submitted: `turn.queued`, `turn.ended`,
+/// `session.closed`, no cancel object. Otherwise it ends with the C1 force
+/// lifecycle. Host
 /// committed vendor facts only for a launched vendor, which holds at its gate,
 /// so its force must be `forced`; a turn forced before launch was `requested`.
 fn check_raced_turn(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
     let (envelope, events) = paths.committed(session)?;
+    if events.iter().all(|event| event["type"] != "turn.submitted") {
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect();
+        return check(
+            envelope["state"] == "cancelled"
+                && envelope["cancel"].is_null()
+                && envelope["timestamps"]["submitted_at"].is_null()
+                && types == ["turn.queued", "turn.ended", "session.closed"]
+                && events[2]["reason"] == "daemon_stop_force",
+            || format!("queued cancellation {envelope} {types:?}"),
+        );
+    }
     let outcome = match vendor_launched(paths, session)? {
         Some(true) => "forced",
         Some(false) => {

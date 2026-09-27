@@ -1,10 +1,7 @@
 //! Turn driving: submission, adapter execution, event commits and the terminal commit.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::Ordering,
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -188,7 +185,9 @@ impl Engine {
                 self.unresolved.fail(session, turn, TurnState::Queued);
                 continue;
             }
-            let close = Some(turn) == last && !self.unresolved.others(session, turn);
+            let close = Some(turn) == last
+                && !self.store_failed()
+                && !self.unresolved.others(session, turn);
             if matches!(
                 self.cancel_queued(slot, session, turn, close).await,
                 Step::Wait
