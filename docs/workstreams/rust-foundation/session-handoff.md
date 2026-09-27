@@ -53,10 +53,13 @@ the historical checkpoint; its findings table is updated by this section.
   refuses grants and admission at once, finalized under `admission`),
   force-stops and exits 4; there is no in-daemon orphan reconciler.
   Gate at `19c4c71`: 167 passed / 2 skipped; `test-failpoints` 185 / 2
-  (3 runs); F08–F12 line 17 passed; release check passes. Now T2-C
-  ([t2/c.md](t2/c.md), same session and branch): restart handoff of
-  surviving queued turns, cancellation behind `unknown`, keyed replay
-  after restart. Then Sol high review of Task 2 and close `.7.6`; then
+  (3 runs); F08–F12 line 17 passed; release check passes. T2-C (restart
+  handoff of surviving queued turns, cancellation behind `unknown`, keyed
+  replay after restart; [t2/c.md](t2/c.md)) merged at `81d5dd7` (Sol r2
+  SOUND); gate 170 / 2, failpoints 193 / 2. Now T2-D ([t2/d.md](t2/d.md),
+  same session and branch): runtime §8's 4-slot active-connection limit,
+  which T2-C found missing. Then Sol high review of Task 2 and close
+  `.7.6`; then
   Task 3 (`.7.7`, carries the F12 remainder and deferred items), Task 4
   (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
