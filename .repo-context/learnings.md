@@ -18,3 +18,11 @@ in the design record (`docs/`), not here.
   committed `.beads/issues.jsonl` / `interactions.jsonl`; sync Dolt locally.
 - `bd init` inside a checkout nested in another beads repo can bootstrap the
   outer repo's issue database. Initialize from a standalone clone.
+- `claude --cloud` (CLI 2.1.283, 2026-09-27) decides clone vs upload by asking
+  claude.ai whether the Claude GitHub App is installed on the repo. If the
+  answer is empty ("status is null" in `--debug-file` output) it uploads a
+  bundle: the session has no remote and the git proxy refuses pushes, so
+  `--teleport` cannot bring it back. `/web-setup` did not change this; opening
+  claude.ai → Connectors → GitHub Integration → "Check repository status" for
+  the repo did, after which the CLI logged "GitHub app is installed" and the
+  session cloned. `--cloud` also needs a TTY (run it in tmux).
