@@ -134,6 +134,16 @@ impl FakeRoute {
         self.wire.recover(deadline).await
     }
 
+    /// One page of `recover`: up to `limit` anchors after the `after` id.
+    pub async fn recover_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.wire.recover_page(after, limit, deadline).await
+    }
+
     async fn drive(
         wire: &mut WireConnection,
         start: FakeStart,

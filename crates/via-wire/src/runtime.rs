@@ -86,6 +86,34 @@ impl WireRuntime {
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(WireError::Host)
     }
+
+    /// One page of `recover`: up to `limit` anchors after the `after` id.
+    pub async fn recover_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.host
+            .recover_page(after, limit, deadline)
+            .await
+            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
+            .map_err(WireError::Host)
+    }
+}
+
+impl WireError {
+    /// Durable Store state could not be read or written, as opposed to a
+    /// deadline or process evidence that merely stays unproven.
+    pub fn is_store_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Raw(_)
+                | Self::Host(
+                    via_host::HostError::Store(_) | via_host::HostError::StoreUnavailable(_)
+                )
+        )
+    }
 }
 
 /// Passive recovery fact without process signalling authority.

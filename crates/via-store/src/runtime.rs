@@ -154,7 +154,12 @@ pub struct AnchorOwner {
     pub session_id: SessionId,
     /// Owning turn.
     pub turn: TurnNumber,
+    /// The owning turn is still `running`: recovery resolves it.
+    pub turn_running: bool,
 }
+
+/// Largest anchor page one read returns; callers page with a cursor.
+pub const ANCHOR_PAGE_LIMIT: u32 = 256;
 
 /// One durable event returned in sequence order.
 pub struct StoredEvent {
@@ -418,7 +423,11 @@ enum Command {
     ),
     Logs(SessionId, oneshot::Sender<Result<Value, StoreError>>),
     Unfinished(oneshot::Sender<Result<Vec<UnfinishedTurn>, StoreError>>),
-    AnchorOwners(oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>),
+    AnchorOwners(
+        Option<String>,
+        u32,
+        oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
+    ),
     Authenticate(
         SessionId,
         [u8; 32],
@@ -438,7 +447,11 @@ enum Command {
     ArmIntent(String, String, u64, oneshot::Sender<CommitOutcome<u64>>),
     VendorFacts(String, String, u32, oneshot::Sender<CommitOutcome<()>>),
     GroupAbsence(GroupAbsenceRecord, oneshot::Sender<CommitOutcome<()>>),
-    AnchorRecords(oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>),
+    AnchorRecords(
+        Option<String>,
+        u32,
+        oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>,
+    ),
     Shutdown,
 }
 
@@ -668,11 +681,19 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
-    /// Returns every committed anchor id with its owning turn (at most
-    /// 10000; more is an explicit error), for recovery's coverage check.
-    pub async fn anchor_owners(&self) -> Result<Vec<AnchorOwner>, StoreError> {
+    /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) committed anchors
+    /// after the `after` anchor id with their owning turns, for recovery's
+    /// coverage check; page with the last id until a short page.
+    pub async fn anchor_owners_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreError::Constraint("anchor page limit must be 1 to 256"));
+        }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorOwners(reply))?;
+        self.send(Command::AnchorOwners(after, limit, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
@@ -792,10 +813,36 @@ impl ProcessJournal {
         }
     }
 
-    /// Returns a consistent bounded snapshot of retained anchor records.
+    /// Returns every retained anchor record, read page by page.
     pub async fn list_anchor_records(&self) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        let mut records = Vec::new();
+        loop {
+            let after = records
+                .last()
+                .map(|record: &AnchorRecord| record.intent.anchor_id.clone());
+            let page = self
+                .list_anchor_records_page(after, ANCHOR_PAGE_LIMIT)
+                .await?;
+            let full = page.len() == ANCHOR_PAGE_LIMIT as usize;
+            records.extend(page);
+            if !full {
+                return Ok(records);
+            }
+        }
+    }
+
+    /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) anchor records
+    /// after the `after` anchor id, in id order, each read consistently.
+    pub async fn list_anchor_records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreFailureKind::Write);
+        }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorRecords(reply))
+        self.send(Command::AnchorRecords(after, limit, reply))
             .map_err(|error| error.kind())?;
         receive
             .await

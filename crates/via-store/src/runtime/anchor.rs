@@ -155,13 +155,19 @@ pub(super) fn commit_group_absence(
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
 
-pub(super) fn read_anchor_records(conn: &Connection) -> Result<Vec<AnchorRecord>, StoreError> {
+/// One page of anchor records in `anchor_id` order after `after`.
+pub(super) fn read_anchor_records(
+    conn: &Connection,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<AnchorRecord>, StoreError> {
     let mut query = conn.prepare(
         "SELECT anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,
-                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors ORDER BY anchor_id LIMIT 10001"
+                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors
+                WHERE ?1 IS NULL OR anchor_id>?1 ORDER BY anchor_id LIMIT ?2"
     ).map_err(|error| StoreError::Write(error.to_string()))?;
     let rows = query
-        .query_map([], |row| {
+        .query_map(params![after, limit], |row| {
             let owner: String = row.get(4)?;
             let owner_session =
                 SessionId::try_from(owner.as_str()).map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -217,28 +223,27 @@ pub(super) fn read_anchor_records(conn: &Connection) -> Result<Vec<AnchorRecord>
             })
         })
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    let records = rows
-        .map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
-    // A partial inventory would let recovery skip a live group: fail instead.
-    if records.len() > ANCHOR_INVENTORY_LIMIT {
-        return Err(StoreError::Constraint(
-            "anchor inventory exceeds 10000 records",
-        ));
-    }
-    Ok(records)
+    rows.map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
+        .collect()
 }
 
-/// Every committed anchor with its owning turn, for recovery's coverage
-/// check; no marker, identity or control path.
-pub(super) fn read_anchor_owners(conn: &Connection) -> Result<Vec<AnchorOwner>, StoreError> {
+/// One page of committed anchors, in `anchor_id` order after `after`, with
+/// their owning turns, for recovery's coverage check; no marker, identity or
+/// control path.
+pub(super) fn read_anchor_owners(
+    conn: &Connection,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<AnchorOwner>, StoreError> {
     let mut query = conn
         .prepare(
-            "SELECT anchor_id,owner_session,owner_turn FROM anchors ORDER BY anchor_id LIMIT 10001",
+            "SELECT a.anchor_id,a.owner_session,a.owner_turn,t.state='running' FROM anchors a
+             JOIN turns t ON t.session_id=a.owner_session AND t.number=a.owner_turn
+             WHERE ?1 IS NULL OR a.anchor_id>?1 ORDER BY a.anchor_id LIMIT ?2",
         )
         .map_err(|error| StoreError::Write(error.to_string()))?;
     let rows = query
-        .query_map([], |row| {
+        .query_map(params![after, limit], |row| {
             let owner: String = row.get(1)?;
             let session =
                 SessionId::try_from(owner.as_str()).map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -248,19 +253,10 @@ pub(super) fn read_anchor_owners(conn: &Connection) -> Result<Vec<AnchorOwner>, 
                 anchor_id: row.get(0)?,
                 session_id: session,
                 turn,
+                turn_running: row.get(3)?,
             })
         })
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    let owners = rows
-        .map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
-    if owners.len() > ANCHOR_INVENTORY_LIMIT {
-        return Err(StoreError::Constraint(
-            "anchor inventory exceeds 10000 records",
-        ));
-    }
-    Ok(owners)
+    rows.map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
+        .collect()
 }
-
-/// Bound of one complete anchor inventory; beyond it reads fail explicitly.
-const ANCHOR_INVENTORY_LIMIT: usize = 10_000;

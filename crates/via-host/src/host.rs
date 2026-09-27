@@ -644,13 +644,38 @@ impl Host {
 
     /// Reconciles committed anchor records without resending Configure or ARM.
     pub async fn recover(&self, deadline: Deadline) -> Result<Vec<RecoveryReport>, HostError> {
+        let mut reports: Vec<RecoveryReport> = Vec::new();
+        loop {
+            let after = reports.last().map(|report| report.anchor_id.clone());
+            let page = self
+                .recover_page(after, via_store::ANCHOR_PAGE_LIMIT, deadline)
+                .await?;
+            let full = page.len() == via_store::ANCHOR_PAGE_LIMIT as usize;
+            reports.extend(page);
+            if !full {
+                return Ok(reports);
+            }
+        }
+    }
+
+    /// Reconciles one page of up to `limit` committed anchor records after the
+    /// `after` anchor id, in id order, one report per record.
+    pub async fn recover_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        deadline: Deadline,
+    ) -> Result<Vec<RecoveryReport>, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
-        let records = timeout_at(deadline.instant(), self.journal.list_anchor_records())
-            .await
-            .map_err(|_| HostError::Deadline)?
-            .map_err(HostError::StoreUnavailable)?;
+        let records = timeout_at(
+            deadline.instant(),
+            self.journal.list_anchor_records_page(after, limit),
+        )
+        .await
+        .map_err(|_| HostError::Deadline)?
+        .map_err(HostError::StoreUnavailable)?;
         let mut results = Vec::with_capacity(records.len());
         for record in records {
             let anchor_id = record.intent.anchor_id.clone();

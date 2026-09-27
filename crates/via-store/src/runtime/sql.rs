@@ -167,8 +167,8 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 let _ = reply.send(read_unfinished(&conn));
                 false
             }
-            Command::AnchorOwners(reply) => {
-                let _ = reply.send(read_anchor_owners(&conn));
+            Command::AnchorOwners(after, limit, reply) => {
+                let _ = reply.send(read_anchor_owners(&conn, after.as_deref(), limit));
                 false
             }
             Command::Authenticate(session, hash, reply) => {
@@ -211,8 +211,11 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 let _ = reply.send(as_commit(commit_group_absence(&mut conn, &proof)));
                 true
             }
-            Command::AnchorRecords(reply) => {
-                let _ = reply.send(read_anchor_records(&conn).map_err(|error| error.kind()));
+            Command::AnchorRecords(after, limit, reply) => {
+                let _ = reply.send(
+                    read_anchor_records(&conn, after.as_deref(), limit)
+                        .map_err(|error| error.kind()),
+                );
                 false
             }
             Command::Shutdown => break,

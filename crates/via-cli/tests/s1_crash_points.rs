@@ -802,6 +802,17 @@ fn restarted_unknown(
     evidence: &Evidence,
     session: &str,
 ) -> Result<Value, ScenarioError> {
+    restarted_unknown_as(paths, evidence, session, true)
+}
+
+/// `restarted_unknown`, with cleanup expected `quiescent` or, when Host
+/// could not prove absence for every anchor of the turn, `uncertain`.
+fn restarted_unknown_as(
+    paths: &Paths,
+    evidence: &Evidence,
+    session: &str,
+    quiescent: bool,
+) -> Result<Value, ScenarioError> {
     let address = format!("{session}/1");
     let result = paths.run(
         evidence,
@@ -830,7 +841,7 @@ fn restarted_unknown(
             == 1,
         || format!("turn was submitted again: {types:?}"),
     )?;
-    restart_cleanup(paths, session, &envelope, &types)?;
+    restart_cleanup(paths, session, &envelope, &types, quiescent)?;
     let ended: String = paths
         .store()?
         .query_row(
@@ -890,6 +901,7 @@ fn restart_cleanup(
     session: &str,
     envelope: &Value,
     types: &[String],
+    quiescent: bool,
 ) -> Result<(), ScenarioError> {
     check(
         types.ends_with(&[
@@ -908,6 +920,16 @@ fn restart_cleanup(
         )
         .map_err(infra)?;
     let cancel = &envelope["cancel"];
+    if !quiescent {
+        let warned = envelope["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|w| w["code"] == "cancel_cleanup_uncertain")
+        });
+        return check(cancel["cleanup"] == "uncertain" && warned, || {
+            format!("unproven anchors did not leave cleanup uncertain: {cancel}")
+        });
+    }
     let outcome_ok = if anchors == 0 {
         cancel["outcome"] == "requested"
     } else {
@@ -1204,6 +1226,60 @@ fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
             let _daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
             completes_normally(paths, evidence).map(drop)
+        },
+    )
+}
+
+/// Runtime §7 availability: more than 10,000 committed anchors (here 10,001
+/// synthetic intent-only rows, which Host cannot verify) never strand the
+/// daemon. Recovery pages through the whole inventory, classifies the turn
+/// `uncertain` (never `quiescent`), commits, and admits requests.
+#[test]
+fn s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits() -> TestResult {
+    scenario(
+        "s1_f10_recovery_pages_anchors",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let point = "wire.prompt.after_write";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            wait_file(&paths.sync.join("prompted.entered"))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let mut store =
+                rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+            let tx = store.transaction().map_err(infra)?;
+            for index in 0..10_001 {
+                tx.execute(
+                    "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
+                     SELECT ?1,'g','m','/nonexistent',session_id,number,0,'b','n','intent',1 FROM turns WHERE session_id=?2 AND number=1",
+                    rusqlite::params![format!("synthetic{index:05}"), session],
+                )
+                .map_err(infra)?;
+            }
+            tx.commit().map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown_as(paths, evidence, &session, false)?;
+            completes_normally(paths, evidence)?;
+            // The synthetic rows name no process; drop them so teardown
+            // verifies only anchors that ever ran.
+            let store =
+                rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+            store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
+            store
+                .execute("DELETE FROM anchors WHERE anchor_id LIKE 'synthetic%'", [])
+                .map(drop)
+                .map_err(infra)
         },
     )
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use via_adapters::FakeRecovery;
-use via_store::{AnchorOwner, TerminalRecord, UnfinishedTurn};
+use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, TerminalRecord, UnfinishedTurn};
 
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
@@ -29,28 +29,7 @@ impl Engine {
     /// submission intent stays queued.
     pub async fn recover(&self) -> Result<usize, String> {
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
-        // Admission waits on a complete reconciliation: any failure is fatal.
-        let reports = self
-            .adapter
-            .recover(deadline)
-            .await
-            .map_err(|error| format!("host_reconciliation_failed: {error}"))?;
-        if tokio::time::Instant::now() >= deadline.instant() {
-            // Host may have reported later anchors without a stop attempt.
-            return Err("host_reconciliation_incomplete: its deadline passed".to_owned());
-        }
-        let owners = self
-            .store
-            .anchor_owners()
-            .await
-            .map_err(|error| format!("store_error: {error}"))?;
-        let reconciled = Reconciled::new(&owners, &reports);
-        if reconciled.missing > 0 {
-            return Err(format!(
-                "host_reconciliation_incomplete: {} committed anchors have no report",
-                reconciled.missing
-            ));
-        }
+        let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
         loop {
             let turns = self
@@ -69,6 +48,47 @@ impl Engine {
                     .map_err(|error| format!("store_error: {}", error.kind))?;
                 recovered += 1;
             }
+        }
+    }
+
+    /// Pages through every committed anchor with Host's reports for the same
+    /// id range, in bounded memory. An anchor Host did not report in time
+    /// stays uncertain; only a Store read or write failure is fatal
+    /// (runtime-contracts §7).
+    async fn reconcile(&self, deadline: Deadline) -> Result<Reconciled, String> {
+        let mut reconciled = Reconciled::default();
+        let mut after = None;
+        loop {
+            let owners = self
+                .store
+                .anchor_owners_page(after.clone(), ANCHOR_PAGE_LIMIT)
+                .await
+                .map_err(|error| format!("store_error: {error}"))?;
+            let Some(last) = owners.last() else {
+                return Ok(reconciled);
+            };
+            let next = last.anchor_id.clone();
+            let reports = if tokio::time::Instant::now() < deadline.instant() {
+                match self
+                    .adapter
+                    .recover_page(after, ANCHOR_PAGE_LIMIT, deadline)
+                    .await
+                {
+                    Ok(reports) => reports,
+                    Err(error) if error.is_store_failure() => {
+                        return Err(format!("host_reconciliation_failed: {error}"));
+                    }
+                    // Deadline or unproven evidence: this page stays unreported.
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            reconciled.add(&owners, &reports);
+            if owners.len() < ANCHOR_PAGE_LIMIT as usize {
+                return Ok(reconciled);
+            }
+            after = Some(next);
         }
     }
 
@@ -254,25 +274,33 @@ struct History {
     spans: Vec<RawSpan>,
 }
 
-/// Host's cleanup evidence per turn, checked against every committed anchor.
+/// Host's cleanup evidence for running turns, checked against every
+/// committed anchor; anchors of already-ended turns are only counted.
+#[derive(Default)]
 struct Reconciled {
-    /// `(quiescent, forced)` per owning turn of at least one committed anchor.
+    /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
-    /// Committed anchors Host returned no report for.
+    /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
 }
 
 impl Reconciled {
-    fn new(owners: &[AnchorOwner], reports: &[FakeRecovery]) -> Self {
-        let mut turns = HashMap::new();
-        let mut missing = 0;
+    /// Folds one inventory page and Host's reports for the same id range.
+    fn add(&mut self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
         for owner in owners {
             let report = reports.iter().find(|report| {
                 report.anchor_id == owner.anchor_id
                     && report.session_id == owner.session_id
                     && report.turn == owner.turn
             });
-            let entry = turns
+            if report.is_none() {
+                self.missing += 1;
+            }
+            if !owner.turn_running {
+                continue;
+            }
+            let entry = self
+                .turns
                 .entry((owner.session_id.clone(), owner.turn))
                 .or_insert((true, false));
             if let Some(report) = report {
@@ -281,10 +309,8 @@ impl Reconciled {
             } else {
                 // An unreported anchor is never proved absent.
                 entry.0 = false;
-                missing += 1;
             }
         }
-        Self { turns, missing }
     }
 
     /// `(quiescent, forced)` for a turn; with no committed anchor intent no
@@ -301,11 +327,12 @@ impl Reconciled {
 mod tests {
     use super::{AnchorOwner, Cleanup, FakeRecovery, Reconciled, SessionId, TurnNumber};
 
-    fn owner(anchor_id: &str, session: &SessionId) -> AnchorOwner {
+    fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
         AnchorOwner {
             anchor_id: anchor_id.to_owned(),
             session_id: session.clone(),
             turn: TurnNumber::try_from(1).expect("turn"),
+            turn_running,
         }
     }
 
@@ -324,26 +351,51 @@ mod tests {
     fn an_anchor_without_a_report_is_never_quiescent_and_is_counted_missing() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let owners = vec![owner("a1", &session), owner("a2", &session)];
-        let reports = vec![report("a1", &session, Cleanup::Quiescent)];
-        let reconciled = Reconciled::new(&owners, &reports);
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[owner("a1", &session, true), owner("a2", &session, true)],
+            &[report("a1", &session, Cleanup::Quiescent)],
+        );
         assert_eq!(reconciled.missing, 1);
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
     }
 
     #[test]
-    fn verified_uncertainty_stays_uncertain_and_full_proof_is_quiescent() {
+    fn a_page_without_reports_after_the_deadline_stays_uncertain() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let turn = TurnNumber::try_from(1).expect("turn");
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[owner("a1", &session, true)],
+            &[report("a1", &session, Cleanup::Quiescent)],
+        );
+        reconciled.add(&[owner("a2", &session, true)], &[]);
+        assert_eq!(reconciled.missing, 1);
+        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
+    }
+
+    #[test]
+    fn verified_uncertainty_stays_uncertain_and_ended_turns_are_not_retained() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let other = SessionId::try_from("s_000000000001").expect("session");
+        let ended = SessionId::try_from("s_000000000002").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let owners = vec![owner("a1", &session), owner("b1", &other)];
-        let reports = vec![
-            report("a1", &session, Cleanup::Uncertain),
-            report("b1", &other, Cleanup::Quiescent),
-        ];
-        let reconciled = Reconciled::new(&owners, &reports);
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[
+                owner("a1", &session, true),
+                owner("b1", &other, true),
+                owner("c1", &ended, false),
+            ],
+            &[
+                report("a1", &session, Cleanup::Uncertain),
+                report("b1", &other, Cleanup::Quiescent),
+                report("c1", &ended, Cleanup::Quiescent),
+            ],
+        );
         assert_eq!(reconciled.missing, 0);
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
         assert_eq!(reconciled.cleanup(&other, turn), (true, false));
+        assert_eq!(reconciled.turns.len(), 2);
     }
 }

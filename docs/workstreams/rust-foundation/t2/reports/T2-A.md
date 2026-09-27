@@ -428,3 +428,91 @@ deferred to the planned Host seam.
 - The release build and `check-release-features.py` pass.
 - The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
   (Task 4).
+
+## Round 4
+
+Response to [../sol-review-T2-A-r3.md](../sol-review-T2-A-r3.md) (SOUND WITH
+CHANGES; both blockers are about availability). I merged
+`origin/rust-foundation` (`e374e90`, docs only) first.
+
+**B1: the reconciliation deadline no longer fails startup.**
+`Engine::reconcile` walks the complete committed anchor inventory in
+`anchor_id` order, 256 anchors per page, from `StoreClient::anchor_owners_page`.
+For each page it asks Host for reports on the same id range, through the new
+`recover_page` path: Adapter → Route → Wire → `Host::recover_page`.
+
+- **Not fatal; the anchor stays uncertain:**
+  - no report because the deadline passed before the page;
+  - `HostError::Deadline`;
+  - other unproven evidence;
+  - an anchor missing from a report page.
+
+  Such an anchor is counted missing and its turn is `uncertain`, never
+  `quiescent`. Recovery still commits and the daemon admits requests.
+- **Fatal: a Store read or write failure.** This covers Host's journal read,
+  via `AdapterError::is_store_failure` → `WireError::is_store_failure` →
+  `HostError::Store`/`StoreUnavailable`/`WireError::Raw`, Core's own owners
+  read, and the recovery commits (runtime §7). The error is still named
+  `host_reconciliation_failed`, and the Round 3 regression still holds.
+- A verified `Uncertain` report stays uncertain; `daemon_restart` and the
+  coverage check are unchanged.
+
+**B2: no 10,000-anchor limit.** Both anchor reads now page with a cursor
+(`WHERE anchor_id > ? ORDER BY anchor_id LIMIT ?`, at most
+`ANCHOR_PAGE_LIMIT` = 256), and neither has a cap.
+
+- Core retains per-turn state only for anchors whose owning turn is
+  `running`. The owners read carries `turn_running` from a join with `turns`.
+  Memory is therefore bounded by one page plus the running turns, not by
+  table size.
+- `Host::recover`, used by final shutdown, and
+  `ProcessJournal::list_anchor_records` now loop over pages instead of
+  truncating. Their callers and tests are unchanged.
+
+**Regressions.**
+
+- `s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits`: after a
+  crash, the harness commits 10,001 synthetic intent-only anchors for the
+  crashed turn. Host cannot verify those. The restarted daemon pages through
+  all of them, admits requests, and recovers the turn:
+  - `unknown` with `daemon_restart`;
+  - `cancel.cleanup: uncertain` with the `cancel_cleanup_uncertain` warning;
+  - a later turn completes normally.
+
+  The harness then deletes the synthetic rows so that teardown verifies only
+  anchors that ran. On the Round 3 code, in a throwaway worktree:
+  `daemon exited before readiness: exit status: 4`.
+- `recovery::tests` (3): an unreported anchor is uncertain and counted; a
+  page with no reports (deadline passed) stays uncertain; a verified
+  `Uncertain` report stays uncertain, and ended turns are not retained.
+
+The deadline-passed path end to end, and Host's own uncertain and forced
+paths, remain without deterministic end-to-end tests (Host seam, deferred).
+
+**Files (Round 4):**
+
+- Store:
+  - `crates/via-store/src/runtime.rs`: `ANCHOR_PAGE_LIMIT`,
+    `AnchorOwner.turn_running`, `anchor_owners_page`,
+    `list_anchor_records_page`, and a paging `list_anchor_records`.
+  - `crates/via-store/src/runtime/anchor.rs` and `sql.rs`: cursor queries.
+  - `crates/via-store/src/lib.rs`.
+- Host, Wire, Route and Adapter (outside T2-A's owned paths; `recover_page`
+  pass-throughs plus store-failure classification):
+  - `crates/via-host/src/host.rs`: `recover_page`, and `recover` looping over
+    pages.
+  - `crates/via-wire/src/runtime.rs`.
+  - `crates/via-routes/src/runtime.rs`.
+  - `crates/via-adapters/src/runtime.rs`.
+- Core and tests: `crates/via-core/src/engine/recovery.rs`,
+  `crates/via-cli/tests/s1_crash_points.rs`.
+
+**Gate (Round 4):**
+
+- fmt, both clippy runs, `cargo deny` and the layer check pass.
+- Default nextest: 129 passed, 2 skipped.
+- nextest with the failpoint feature: 139 passed, 2 skipped.
+- The F08–F12 line: 9 passed; the F08/F10 selection passed in 3 more runs.
+- The release build and `check-release-features.py` pass.
+- The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
+  (Task 4).
