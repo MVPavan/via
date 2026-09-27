@@ -132,7 +132,10 @@ impl Engine {
             .instant()
             .checked_sub(FORCED_COMMIT_RESERVE)
             .unwrap_or_else(tokio::time::Instant::now);
-        let report = self.adapter.shutdown(Deadline::at(host_by)).await;
+        // Host keeps evidence only for receipted, unresolved turns (at most
+        // the unresolved cap), which include every force-stopped turn.
+        let turns = self.unresolved.turns();
+        let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
         let forced = std::mem::take(&mut *lock(&self.forced));
         let mut uncommitted_turns = 0;
         for turn in forced {
@@ -202,12 +205,8 @@ impl Engine {
         let unresolved_turns = self.unresolved_turns(deadline).await;
         self.finalized.store(true, Ordering::Release);
         EngineShutdown {
-            anchors: report.recovery.len(),
-            uncertain_owners: report
-                .recovery
-                .iter()
-                .filter(|record| record.cleanup != Cleanup::Quiescent)
-                .count(),
+            anchors: report.anchors,
+            uncertain_owners: report.uncertain_anchors,
             pending_tasks: report.pending_tasks,
             failed_tasks: report.failed_tasks,
             failure: report.failure,

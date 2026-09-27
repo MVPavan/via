@@ -99,6 +99,14 @@ impl Fixture {
     }
 }
 
+/// The fixture's one owning turn, the only turn shutdown reports on.
+fn owner_turns() -> [(SessionId, TurnNumber); 1] {
+    [(
+        SessionId::try_from("s_0123456789ab").unwrap(),
+        TurnNumber::try_from(1).unwrap(),
+    )]
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -170,7 +178,7 @@ fn vendor_pipes_detach_and_verified_anchor_stops_its_group() {
                     .runtime_resources()
                     .into_wire_parts()
                     .1
-                    .list_anchor_records()
+                    .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
                     .await
                     .unwrap();
                 panic!(
@@ -235,9 +243,11 @@ fn spawn_failure_never_returns_vendor_pipes_and_recovery_proves_absence() {
         let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3));
         assert!(host.acquire(spec, deadline).await.is_err());
         let recovered = host
-            .recover(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(3),
-            ))
+            .recover_page(
+                None,
+                via_store::ANCHOR_PAGE_LIMIT,
+                Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+            )
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);
@@ -265,7 +275,7 @@ fn unauthenticated_reconnect_cannot_steal_live_controller() {
             .runtime_resources()
             .into_wire_parts()
             .1
-            .list_anchor_records()
+            .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
             .await
             .unwrap()
             .remove(0);
@@ -334,7 +344,7 @@ fn controller_eof_triggers_autonomous_group_cleanup_and_recovery_proof() {
             .runtime_resources()
             .into_wire_parts()
             .1
-            .list_anchor_records()
+            .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
             .await
             .unwrap()[0]
             .vendor_pid
@@ -344,9 +354,11 @@ fn controller_eof_triggers_autonomous_group_cleanup_and_recovery_proof() {
     drop(first_runtime);
     drop(acquired);
     let recovered = runtime()
-        .block_on(host.recover(Deadline::at(
-            tokio::time::Instant::now() + Duration::from_secs(3),
-        )))
+        .block_on(host.recover_page(
+            None,
+            via_store::ANCHOR_PAGE_LIMIT,
+            Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+        ))
         .unwrap();
     assert_eq!(recovered.len(), 1);
     assert!(
@@ -422,7 +434,7 @@ fn dropping_last_control_handle_closes_socket_and_stops_vendor() {
             .runtime_resources()
             .into_wire_parts()
             .1
-            .list_anchor_records()
+            .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
             .await
             .unwrap()[0]
             .vendor_pid
@@ -457,15 +469,16 @@ fn shutdown_closes_live_control_joins_tasks_and_preserves_absence_evidence() {
             .runtime_resources()
             .into_wire_parts()
             .1
-            .list_anchor_records()
+            .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
             .await
             .unwrap()[0]
             .vendor_pid
             .unwrap();
         let shutdown = host
-            .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(3),
-            ))
+            .shutdown(
+                Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+                &owner_turns(),
+            )
             .await;
         assert!(shutdown.failure.is_none(), "{shutdown:?}");
         assert_eq!(shutdown.pending_tasks, 0, "{shutdown:?}");
@@ -485,12 +498,14 @@ fn shutdown_closes_live_control_joins_tasks_and_preserves_absence_evidence() {
         assert!(!PathBuf::from(format!("/proc/{vendor_pid}")).exists());
         // A later verifier must be able to use the committed proof without a live socket.
         let recovered = host
-            .recover(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            ))
+            .recover_page(
+                None,
+                via_store::ANCHOR_PAGE_LIMIT,
+                Deadline::at(tokio::time::Instant::now() + Duration::from_secs(1)),
+            )
             .await
             .unwrap();
-        assert_eq!(recovered[0].generation, shutdown.recovery[0].generation);
+        assert_eq!(shutdown.recovery[0].anchors, 1);
         assert!(matches!(
             recovered[0].cleanup,
             CleanupEvidence::GroupAbsent(_)
@@ -514,7 +529,7 @@ fn expired_shutdown_keeps_live_owner_for_later_verified_cleanup() {
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
-        let expired = host.shutdown(Deadline::at(started)).await;
+        let expired = host.shutdown(Deadline::at(started), &owner_turns()).await;
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(expired.failure.is_some(), "{expired:?}");
         assert!(
@@ -522,9 +537,10 @@ fn expired_shutdown_keeps_live_owner_for_later_verified_cleanup() {
             "live reaper stays owned: {expired:?}"
         );
         let later = host
-            .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(3),
-            ))
+            .shutdown(
+                Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+                &owner_turns(),
+            )
             .await;
         assert!(later.failure.is_none(), "{later:?}");
         assert_eq!(later.pending_tasks, 0, "{later:?}");
@@ -587,7 +603,7 @@ fn force_evidence_separates_host_stop_from_absence() {
         let mut spec = released.spec("/bin/sleep");
         spec.args.push(OsString::from("10"));
         drop(host.acquire(spec, deadline()).await.unwrap());
-        let report = host.shutdown(deadline()).await;
+        let report = host.shutdown(deadline(), &owner_turns()).await;
         assert_eq!(report.recovery.len(), 1, "{report:?}");
         assert!(
             matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),
@@ -614,7 +630,7 @@ fn force_evidence_separates_host_stop_from_absence() {
         assert!(close.vendor_exit.is_some(), "{close:?}");
         assert!(!close.forced, "the vendor exited on its own: {close:?}");
         drop(acquired);
-        let report = host.shutdown(deadline()).await;
+        let report = host.shutdown(deadline(), &owner_turns()).await;
         assert!(
             matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),
             "{report:?}"
@@ -652,7 +668,7 @@ async fn vendor_exited_unobserved(
         .runtime_resources()
         .into_wire_parts()
         .1
-        .list_anchor_records()
+        .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT)
         .await
         .unwrap()[0]
         .vendor_pid
@@ -700,9 +716,10 @@ fn force_close_after_unobserved_vendor_exit_is_not_forced() {
             );
             assert!(!close.forced, "the vendor had already exited: {close:?}");
             let report = host
-                .shutdown(Deadline::at(
-                    tokio::time::Instant::now() + Duration::from_secs(3),
-                ))
+                .shutdown(
+                    Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+                    &owner_turns(),
+                )
                 .await;
             assert!(!report.recovery[0].forced, "{report:?}");
             return;
@@ -724,9 +741,10 @@ fn released_control_after_unobserved_vendor_exit_is_not_forced() {
             };
             drop(released);
             let report = host
-                .shutdown(Deadline::at(
-                    tokio::time::Instant::now() + Duration::from_secs(3),
-                ))
+                .shutdown(
+                    Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+                    &owner_turns(),
+                )
                 .await;
             assert!(
                 matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),

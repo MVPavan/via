@@ -130,7 +130,7 @@ mod runtime;
 // and Host process control remain private to Wire.
 pub use runtime::{
     RawEvidence, RuntimeConfig, WireCloseReport, WireConnection, WireError, WireRecovery,
-    WireRuntime, WireShutdown,
+    WireRuntime, WireShutdown, WireTurnRecovery,
 };
 
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.

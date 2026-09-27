@@ -472,6 +472,8 @@ pub(crate) enum FailureClass {
     Protocol,
     Overflow,
     Store,
+    /// C1 §8.2: the daemon restarted before the turn ended (§7.5).
+    DaemonRestart,
 }
 
 /// C1 §5 `failure`.

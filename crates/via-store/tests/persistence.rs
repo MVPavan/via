@@ -369,7 +369,7 @@ fn anchor_arm_requires_committed_matching_identity_and_version() {
                 .runtime_resources()
                 .into_wire_parts()
                 .1
-                .list_anchor_records(),
+                .list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT),
         )
         .unwrap();
     assert_eq!(records.len(), 1);

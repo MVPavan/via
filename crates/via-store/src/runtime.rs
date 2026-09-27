@@ -133,6 +133,34 @@ pub struct TerminalRecord {
     pub raw_ref: Option<RawRef>,
 }
 
+/// A turn with durable submission intent and no terminal, as a crashed daemon
+/// left it; recovery resolves it before admission.
+pub struct UnfinishedTurn {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based turn number.
+    pub turn: TurnNumber,
+    /// Durable submission time.
+    pub submitted_at: String,
+    /// Recorded vendor acceptance correlation, if acceptance committed.
+    pub correlation: Option<String>,
+}
+
+/// A committed anchor and its owning turn; no marker, identity or control path.
+pub struct AnchorOwner {
+    /// Opaque committed anchor identifier.
+    pub anchor_id: String,
+    /// Owning session.
+    pub session_id: SessionId,
+    /// Owning turn.
+    pub turn: TurnNumber,
+    /// The owning turn is still `running`: recovery resolves it.
+    pub turn_running: bool,
+}
+
+/// Largest anchor page one read returns; callers page with a cursor.
+pub const ANCHOR_PAGE_LIMIT: u32 = 256;
+
 /// One durable event returned in sequence order.
 pub struct StoredEvent {
     /// Dense per-session sequence.
@@ -394,6 +422,12 @@ enum Command {
         oneshot::Sender<Result<Vec<StoredEvent>, StoreError>>,
     ),
     Logs(SessionId, oneshot::Sender<Result<Value, StoreError>>),
+    Unfinished(oneshot::Sender<Result<Vec<UnfinishedTurn>, StoreError>>),
+    AnchorOwners(
+        Option<String>,
+        u32,
+        oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
+    ),
     Authenticate(
         SessionId,
         [u8; 32],
@@ -413,7 +447,11 @@ enum Command {
     ArmIntent(String, String, u64, oneshot::Sender<CommitOutcome<u64>>),
     VendorFacts(String, String, u32, oneshot::Sender<CommitOutcome<()>>),
     GroupAbsence(GroupAbsenceRecord, oneshot::Sender<CommitOutcome<()>>),
-    AnchorRecords(oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>),
+    AnchorRecords(
+        Option<String>,
+        u32,
+        oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>,
+    ),
     Shutdown,
 }
 
@@ -636,6 +674,29 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
+    /// Returns at most 1000 turns that have submission intent but no terminal.
+    pub async fn unfinished_turns(&self) -> Result<Vec<UnfinishedTurn>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Unfinished(reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) committed anchors
+    /// after the `after` anchor id with their owning turns, for recovery's
+    /// coverage check; page with the last id until a short page.
+    pub async fn anchor_owners_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreError::Constraint("anchor page limit must be 1 to 256"));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AnchorOwners(after, limit, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
     /// Reads committed raw excerpts for one session in event order.
     pub async fn logs(&self, session_id: &SessionId) -> Result<Value, StoreError> {
         let (reply, receive) = oneshot::channel();
@@ -752,10 +813,18 @@ impl ProcessJournal {
         }
     }
 
-    /// Returns a consistent bounded snapshot of retained anchor records.
-    pub async fn list_anchor_records(&self) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+    /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) anchor records
+    /// after the `after` anchor id, in id order, each read consistently.
+    pub async fn list_anchor_records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreFailureKind::Write);
+        }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorRecords(reply))
+        self.send(Command::AnchorRecords(after, limit, reply))
             .map_err(|error| error.kind())?;
         receive
             .await
@@ -775,7 +844,7 @@ mod sql;
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, read_anchor_records,
+    commit_vendor_facts, read_anchor_owners, read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, validate_regular, validate_state, writer_loop};

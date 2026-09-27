@@ -148,7 +148,10 @@ mod fake_config;
 mod runtime;
 
 pub use fake_config::FakeConfig;
-pub use runtime::{AdapterError, AdapterRuntime, AdapterRuntimeConfig, FakeRecovery, FakeShutdown};
+pub use runtime::{
+    AdapterError, AdapterRuntime, AdapterRuntimeConfig, FakeRecovery, FakeShutdown,
+    FakeTurnRecovery,
+};
 pub use via_routes::{
     ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
     SessionId, WireCleanup,

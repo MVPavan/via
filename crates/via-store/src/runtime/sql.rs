@@ -4,9 +4,10 @@ use super::{
     AcceptanceRecord, Command, CommitOutcome, Connection, ConnectionId, Duration, EventRecord,
     MetadataExt, OptionalExtension, Path, RAW_UNIT_LIMIT, RawRef, RawStream, ReceiptRecord,
     Receiver, SCHEMA_VERSION, SessionId, SpawnRecord, StoreError, StoreFailureKind, StoredEvent,
-    SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, Value,
+    SubmissionRecord, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn, Value,
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, fs, params, read_anchor_records, read_raw_ref, validate_raw_ref,
+    commit_vendor_facts, fs, oneshot, params, read_anchor_owners, read_anchor_records,
+    read_raw_ref, validate_raw_ref,
 };
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
@@ -111,32 +112,39 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per variant of the closed Store command enum"
+)]
 pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver<Command>) {
     let mut commits = 0_u32;
     while let Ok(command) = receiver.recv() {
         let wrote = match command {
             Command::Spawn(record, reply) => {
-                let _ = reply.send(commit_spawn(&mut conn, record));
+                send_commit(reply, commit_spawn(&mut conn, record));
                 true
             }
             Command::Submission(record, reply) => {
-                let _ = reply.send(commit_submission(&mut conn, &record));
+                send_commit(reply, commit_submission(&mut conn, &record));
                 true
             }
             Command::Acceptance(record, reply) => {
-                let _ = reply.send(commit_acceptance(&mut conn, root, &record));
+                send_commit(reply, commit_acceptance(&mut conn, root, &record));
                 true
             }
             Command::Event(record, reply) => {
-                let _ = reply.send(commit_event(&mut conn, root, &record));
+                send_commit(reply, commit_event(&mut conn, root, &record));
                 true
             }
             Command::Terminal(record, reply) => {
-                let _ = reply.send(commit_terminal(&mut conn, root, &record, None));
+                send_commit(reply, commit_terminal(&mut conn, root, &record, None));
                 true
             }
             Command::ClosingTerminal(record, closed, reply) => {
-                let _ = reply.send(commit_terminal(&mut conn, root, &record, Some(&closed)));
+                send_commit(
+                    reply,
+                    commit_terminal(&mut conn, root, &record, Some(&closed)),
+                );
                 true
             }
             Command::Result(session, turn, reply) => {
@@ -153,6 +161,14 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
             }
             Command::Logs(session, reply) => {
                 let _ = reply.send(read_logs(&conn, root, &session));
+                false
+            }
+            Command::Unfinished(reply) => {
+                let _ = reply.send(read_unfinished(&conn));
+                false
+            }
+            Command::AnchorOwners(after, limit, reply) => {
+                let _ = reply.send(read_anchor_owners(&conn, after.as_deref(), limit));
                 false
             }
             Command::Authenticate(session, hash, reply) => {
@@ -195,8 +211,11 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 let _ = reply.send(as_commit(commit_group_absence(&mut conn, &proof)));
                 true
             }
-            Command::AnchorRecords(reply) => {
-                let _ = reply.send(read_anchor_records(&conn).map_err(|error| error.kind()));
+            Command::AnchorRecords(after, limit, reply) => {
+                let _ = reply.send(
+                    read_anchor_records(&conn, after.as_deref(), limit)
+                        .map_err(|error| error.kind()),
+                );
                 false
             }
             Command::Shutdown => break,
@@ -210,6 +229,17 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
         }
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+}
+
+/// Replies to a Core lifecycle mutation after its transaction ended. The
+/// test-only `store.commit.reply_lost` point can lose that reply: the caller
+/// then learns nothing about a mutation that may be durable.
+fn send_commit<T>(reply: oneshot::Sender<T>, result: T) {
+    #[cfg(feature = "test-failpoints")]
+    if crate::failpoint::hit("store.commit.reply_lost").is_err() {
+        return;
+    }
+    let _ = reply.send(result);
 }
 
 fn as_commit<T>(result: Result<T, StoreError>) -> CommitOutcome<T> {
@@ -258,7 +288,15 @@ fn commit_spawn(conn: &mut Connection, record: SpawnRecord) -> Result<ReceiptRec
         params![record.session_id.as_str(), event],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
+    // Every row is written but uncommitted: none may survive a crash here.
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("store.spawn.before_commit")
+        .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()
+        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    // Committed but unacknowledged: all rows survive together.
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("store.spawn.after_commit")
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     Ok(ReceiptRecord {
         receipt: record.receipt,
@@ -492,6 +530,38 @@ fn read_result(
         .flatten();
     raw.map(|value| serde_json::from_str(&value).map_err(|_| StoreError::CorruptEvidence))
         .transpose()
+}
+
+fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT session_id,number,submitted_at,correlation FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
+        )
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    let mut turns = Vec::new();
+    for row in rows {
+        let (session, number, submitted_at, correlation) =
+            row.map_err(|error| StoreError::Write(error.to_string()))?;
+        turns.push(UnfinishedTurn {
+            session_id: SessionId::try_from(session.as_str())
+                .map_err(|_| StoreError::CorruptEvidence)?,
+            turn: TurnNumber::try_from(number).map_err(|_| StoreError::CorruptEvidence)?,
+            // A running turn always has its submission time.
+            submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
+            correlation,
+        });
+    }
+    Ok(turns)
 }
 
 fn read_terminated(

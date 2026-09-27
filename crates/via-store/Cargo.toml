@@ -16,7 +16,7 @@ sha2 = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 
 [features]
-# Test-only fault hooks (runtime-contracts `test-failpoints`); default off.
+# Test-only fault hooks and the failpoint controller (runtime-contracts §11); default off.
 test-failpoints = []
 
 [dev-dependencies]

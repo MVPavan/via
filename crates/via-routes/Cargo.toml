@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only failpoint controller (runtime-contracts §11); default off.
+test-failpoints = ["via-wire/test-failpoints"]
+
 [dependencies]
 via-wire = { path = "../via-wire" }
 serde = { workspace = true }
