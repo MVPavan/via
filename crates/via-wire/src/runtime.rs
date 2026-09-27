@@ -8,7 +8,7 @@ use tokio::{
 use super::{
     BoundedBytes, ConnectionId, Deadline, Frame, PrivateProcessSpec, SendOutcome, WireFailure,
 };
-use via_host::{AcquiredProcess, ExitReceiver, Host, ProcessControl};
+use via_host::{AcquiredProcess, ExitReceiver, Host, LaunchPipes, OwnedPipes, ProcessControl};
 use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
 
 /// Raw unit size for a retained line recorded by the failure drain.
@@ -18,6 +18,9 @@ const DRAIN_UNIT_BYTES: usize = 64 * 1024;
 /// normal one does, so its group is force-closed and proved absent; a stalled
 /// one is abandoned well inside the 10 s final shutdown.
 const CANCELLED_ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bound on draining the vendor pipes of an acquisition that failed after ARM.
+const LAUNCH_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether every byte exchanged with the vendor reached the durable raw log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,13 +63,13 @@ impl WireRuntime {
         deadline: Deadline,
         cancel: watch::Receiver<bool>,
     ) -> Result<WireConnection, WireError> {
-        WireConnection::open(
+        Box::pin(WireConnection::open(
             &self.host,
             spec,
             self.raw.open(connection_id),
             deadline,
             cancel,
-        )
+        ))
         .await
     }
 
@@ -132,10 +135,15 @@ pub enum WireError {
     /// The caller's cancel signal ended a wait on the vendor.
     #[error("vendor wait cancelled")]
     Cancelled,
-    /// The caller's cancel signal abandoned an acquisition after ARM: the
-    /// vendor may have written output that no raw log recorded.
-    #[error("acquisition cancelled after vendor launch")]
-    CancelledAfterLaunch,
+    /// Acquisition failed or was cancelled after ARM, when the vendor may have
+    /// launched; `raw` says whether the drain recorded all of its output.
+    #[error("acquisition failed after vendor launch: {cause}")]
+    AfterLaunch {
+        /// The acquisition's own failure.
+        cause: Box<WireError>,
+        /// Whether every byte the vendor wrote reached the raw log.
+        raw: RawEvidence,
+    },
     /// Frame contract failure.
     #[error("vendor frame failure: {0:?}")]
     Frame(WireFailure),
@@ -168,32 +176,43 @@ impl WireConnection {
         deadline: Deadline,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<Self, WireError> {
-        let armed = std::sync::atomic::AtomicBool::new(false);
-        let acquire = host.acquire_marking_arm(spec, deadline, &armed);
-        tokio::pin!(acquire);
+        let launch = LaunchPipes::default();
+        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch));
         let acquired = tokio::select! {
-            acquired = &mut acquire => acquired,
+            // A force already set when the acquisition's own result is observed
+            // came first.
+            biased;
             () = cancelled(&mut cancel) => {
-                // An abandoned acquisition drops its anchor control: an anchor
-                // that connected exits on EOF, one that did not at its own
-                // bootstrap deadline; Host recovery reports what it can prove.
-                // After ARM the pipes carry vendor bytes nobody will record.
-                tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire)
-                    .await
-                    .map_err(|_| {
-                        if armed.load(std::sync::atomic::Ordering::Acquire) {
-                            WireError::CancelledAfterLaunch
-                        } else {
-                            WireError::Cancelled
-                        }
-                    })?
+                // After the force, a failure within the grace (including the
+                // acquisition deadline) is the force's, not its own cause.
+                match tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire).await {
+                    Ok(Ok(acquired)) => Ok(acquired),
+                    Ok(Err(_)) | Err(_) => Err(WireError::Cancelled),
+                }
             }
+            acquired = &mut acquire => acquired.map_err(WireError::Host),
         };
         let AcquiredProcess {
             pipes,
             control,
             exits,
-        } = acquired?;
+        } = match acquired {
+            Ok(acquired) => acquired,
+            Err(cause) => {
+                // Dropping the acquisition closes its anchor control: an anchor
+                // that connected exits on EOF and stops its group, one that did
+                // not at its own bootstrap deadline; Host recovery reports what
+                // it can prove. After ARM the vendor pipes are still ours.
+                drop(acquire);
+                return Err(match launch.take() {
+                    Some(pipes) => WireError::AfterLaunch {
+                        cause: Box::new(cause),
+                        raw: Box::pin(drain_pipes(pipes, &raw)).await,
+                    },
+                    None => cause,
+                });
+            }
+        };
         Ok(Self {
             stdin: Some(pipes.stdin),
             stdout: pipes.stdout,
@@ -428,6 +447,52 @@ impl WireConnection {
             forced: report.forced,
         }
     }
+}
+
+/// Records both vendor output pipes of a failed acquisition until EOF or a
+/// bounded cleanup deadline: `Complete` only if both reached EOF and every
+/// chunk was durably appended.
+async fn drain_pipes(pipes: OwnedPipes, raw: &RawWriter) -> RawEvidence {
+    let deadline = tokio::time::Instant::now() + LAUNCH_DRAIN;
+    let OwnedPipes {
+        stdin,
+        mut stdout,
+        mut stderr,
+    } = pipes;
+    drop(stdin);
+    let (mut stdout_eof, mut stderr_eof) = (false, false);
+    let mut evidence = RawEvidence::Complete;
+    let (mut out, mut err) = ([0; 8192], [0; 8192]);
+    while !(stdout_eof && stderr_eof) {
+        let read = timeout_at(deadline, async {
+            tokio::select! {
+                read = stdout.read(&mut out), if !stdout_eof => (RawStream::Stdout, read),
+                read = stderr.read(&mut err), if !stderr_eof => (RawStream::Stderr, read),
+            }
+        })
+        .await;
+        // A failed or late read may leave bytes unread in the pipes.
+        let Ok((stream, Ok(count))) = read else {
+            return RawEvidence::Incomplete;
+        };
+        let (bytes, eof) = if stream == RawStream::Stdout {
+            (&out[..count], &mut stdout_eof)
+        } else {
+            (&err[..count], &mut stderr_eof)
+        };
+        if count == 0 {
+            *eof = true;
+        } else if evidence == RawEvidence::Complete
+            && !matches!(
+                timeout_at(deadline, raw.append(stream, bytes.to_vec())).await,
+                Ok(Ok(_))
+            )
+        {
+            // Later bytes are still read to EOF, but the log has a gap.
+            evidence = RawEvidence::Incomplete;
+        }
+    }
+    evidence
 }
 
 /// Resolves once `cancel` is set; never when its sender is gone unset.

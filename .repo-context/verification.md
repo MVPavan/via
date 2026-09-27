@@ -16,6 +16,10 @@ cargo deny check
 python3 scripts/check-layers.py
 ```
 
+Root or CI runs (a foreign-uid listener needs CAP_SETUID) also run the
+ignored peer-UID end-to-end check:
+`cargo nextest run --locked --workspace --run-ignored only -E 'test(c1_client_refuses_daemon_socket_of_another_uid)'`.
+
 Testing policy: approved; `.repo-context/coding-style.md` §10 is authoritative.
 The default gate uses fake vendors, with failure-first isolated tests where
 they provide sharper evidence. Small live-vendor end-to-end sets are a separate

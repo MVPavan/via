@@ -11,8 +11,8 @@ mod protocol;
 pub use anchor::run_anchor_from_args;
 pub(crate) use host::monotonic_remaining;
 pub use host::{
-    AcquiredProcess, CloseReport, ExitReceiver, Host, HostError, OwnedPipes, ProcessControl,
-    RecoveryReport, ShutdownReport,
+    AcquiredProcess, CloseReport, ExitReceiver, Host, HostError, LaunchPipes, OwnedPipes,
+    ProcessControl, RecoveryReport, ShutdownReport,
 };
 
 pub use via_store::{Deadline, SessionId, TurnNumber};

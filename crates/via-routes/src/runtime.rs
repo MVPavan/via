@@ -10,8 +10,8 @@ use super::{
     TurnNumber, WireRecovery, WireShutdown,
 };
 use via_wire::{
-    CloseMode, CloseRequest, ExitReport, RawEvidence, WireConnection, WireError, WireFailure,
-    WireRuntime,
+    CloseMode, CloseRequest, ExitReport, HostError, RawEvidence, WireConnection, WireError,
+    WireFailure, WireRuntime,
 };
 
 /// Final fake protocol evidence, including independently confirmed process exit.
@@ -72,6 +72,7 @@ impl FakeRoute {
                 evidence: None,
                 exit: None,
                 raw_incomplete: false,
+                launched: false,
                 cleanup: None,
                 forced: false,
             });
@@ -84,8 +85,15 @@ impl FakeRoute {
                 cause: wire_cause(turn, &error),
                 evidence: None,
                 exit: None,
-                // A launched vendor's output never reached a raw writer.
-                raw_incomplete: matches!(error, WireError::CancelledAfterLaunch),
+                // After ARM, Wire drained the vendor pipes and says what it recorded.
+                raw_incomplete: matches!(
+                    error,
+                    WireError::AfterLaunch {
+                        raw: RawEvidence::Incomplete,
+                        ..
+                    }
+                ),
+                launched: matches!(error, WireError::AfterLaunch { .. }),
                 cleanup: None,
                 forced: false,
             })?;
@@ -110,6 +118,7 @@ impl FakeRoute {
             evidence: failed.evidence,
             exit: failed.exit.or(report.vendor_exit),
             raw_incomplete: raw == RawEvidence::Incomplete,
+            launched: true,
             cleanup: Some(report.cleanup),
             forced: report.forced,
         })
@@ -372,10 +381,14 @@ fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
     match error {
         WireError::Raw(_) => RouteError::Store { turn },
         // Every Wire call that reports a cause runs under the turn's work deadline,
-        // so an append it outlived is C1 `deadline_wall`. The failure drain runs
-        // under the cleanup deadline and reports lost bytes only, never a cause.
-        WireError::Deadline | WireError::RawDeadline => RouteError::Deadline { turn },
-        WireError::Cancelled | WireError::CancelledAfterLaunch => RouteError::ForceStopped { turn },
+        // so an append it outlived is C1 `deadline_wall`; so is an acquisition,
+        // which Host bounds by the same deadline. The failure drain runs under
+        // the cleanup deadline and reports lost bytes only, never a cause.
+        WireError::Deadline | WireError::RawDeadline | WireError::Host(HostError::Deadline) => {
+            RouteError::Deadline { turn }
+        }
+        WireError::Cancelled => RouteError::ForceStopped { turn },
+        WireError::AfterLaunch { cause, .. } => wire_cause(turn, cause),
         WireError::Frame(WireFailure::FrameTooLarge) => {
             protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
         }
