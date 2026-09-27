@@ -17,7 +17,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use via_core::{ApiError, Engine, FakeConfig, HelloParams, SpawnParams, SteerParams};
+use serde::de::DeserializeOwned;
+use via_core::{
+    ApiError, DaemonStatusParams, DaemonStopParams, Engine, FakeConfig, HelloParams, ReadParams,
+    SessionReadParams, SpawnParams, SteerParams,
+};
 
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
@@ -163,33 +167,35 @@ async fn handle_client(
         if count > MAX_LINE || line.last() != Some(&b'\n') {
             break;
         }
-        let request: Value = if let Ok(request) = serde_json::from_slice(&line) {
-            request
-        } else {
-            send(&mut write, &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid JSON","data":{"kind":"parse_error"}}})).await?;
-            continue;
+        let request = match serde_json::from_slice(&line) {
+            Ok(request) => parse_request(request),
+            Err(_) => Err((Value::Null, Refusal::from(PARSE_ERROR))),
         };
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request["method"].as_str().unwrap_or("");
-        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        let (id, method, params) = match request {
+            Ok(request) => request,
+            Err((id, refusal)) => {
+                send(&mut write, &error(&id, refusal)).await?;
+                continue;
+            }
+        };
+        let method = method.as_str();
         if !hello_done && method != "hello" {
             send(
                 &mut write,
                 &error(
                     &id,
-                    ApiError {
+                    Refusal::from(ApiError {
                         code: -32000,
                         kind: "handshake_required",
                         message: "hello must be first",
-                    },
+                    }),
                 ),
             )
             .await?;
             continue;
         }
         let response = if method == "hello" {
-            let hello: Result<HelloParams, _> = serde_json::from_value(params);
-            match hello {
+            match typed::<HelloParams>(params) {
                 Ok(hello)
                     if hello.validate().is_ok()
                         && hello.client_version == env!("CARGO_PKG_VERSION") =>
@@ -202,26 +208,26 @@ async fn handle_client(
                         &mut write,
                         &error(
                             &id,
-                            ApiError {
+                            Refusal::from(ApiError {
                                 code: -32001,
                                 kind: "version_mismatch",
                                 message: "client and daemon versions differ",
-                            },
+                            }),
                         ),
                     )
                     .await?;
                     continue;
                 }
-                Err(_) => {
-                    send(&mut write, &error(&id, ApiError::INVALID_PARAMS)).await?;
+                Err(refusal) => {
+                    send(&mut write, &error(&id, refusal)).await?;
                     continue;
                 }
             }
         } else {
             match dispatch(method, params, &engine, &drives, socket_path, store_path).await {
                 Ok(value) => value,
-                Err(error_kind) => {
-                    send(&mut write, &error(&id, error_kind)).await?;
+                Err(refusal) => {
+                    send(&mut write, &error(&id, refusal)).await?;
                     continue;
                 }
             }
@@ -248,62 +254,125 @@ async fn dispatch(
     drives: &mpsc::Sender<(String, String)>,
     socket_path: &Path,
     store_path: &Path,
-) -> Result<Value, ApiError> {
+) -> Result<Value, Refusal> {
     match method {
-        "daemon/status" => Ok(
-            json!({"daemon_version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),
-            "socket_path":socket_path,"store_path":store_path,"health":"healthy","sessions":{"idle":0,"active":engine.active(),"closing":0},"servers":[]}),
-        ),
+        "daemon/status" => {
+            typed::<DaemonStatusParams>(params)?;
+            Ok(
+                json!({"daemon_version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),
+                "socket_path":socket_path,"store_path":store_path,"health":"healthy","sessions":{"idle":0,"active":engine.active(),"closing":0},"servers":[]}),
+            )
+        }
         "daemon/stop" => {
-            if engine.active() > 0 && params["force"] != true {
-                return Err(ApiError {
+            let params: DaemonStopParams = typed(params)?;
+            if engine.active() > 0 && !params.force {
+                return Err(Refusal::from(ApiError {
                     code: -32012,
                     kind: "admission_refused",
                     message: "sessions are active",
-                });
+                }));
             }
             Ok(json!({"stopping":true}))
         }
         "spawn" => {
-            let params: SpawnParams =
-                serde_json::from_value(params).map_err(|_| ApiError::INVALID_PARAMS)?;
-            let (receipt, session, prompt) = engine.spawn(params).await?;
+            let (receipt, session, prompt) = engine.spawn(typed::<SpawnParams>(params)?).await?;
             drives
                 .send((session, prompt))
                 .await
                 .map_err(|_| ApiError::STORE)?;
             Ok(receipt)
         }
-        "steer" => {
-            let params: SteerParams =
-                serde_json::from_value(params).map_err(|_| ApiError::INVALID_PARAMS)?;
-            engine.steer(params).await
-        }
-        "result" => engine.result(&address(&params)?).await,
-        "wait" => engine.wait(&address(&params)?).await,
-        "events" => engine.events(session(&params)?).await,
-        "logs" => engine.logs(session(&params)?).await,
-        _ => Err(ApiError {
+        "steer" => Ok(engine.steer(typed::<SteerParams>(params)?).await?),
+        "result" => Ok(engine.result(&typed::<ReadParams>(params)?.address).await?),
+        "wait" => Ok(engine.wait(&typed::<ReadParams>(params)?.address).await?),
+        "events" => Ok(engine
+            .events(typed::<SessionReadParams>(params)?.session.as_str())
+            .await?),
+        "logs" => Ok(engine
+            .logs(typed::<SessionReadParams>(params)?.session.as_str())
+            .await?),
+        _ => Err(Refusal::from(ApiError {
             code: -32601,
             kind: "method_not_found",
             message: "method not found",
-        }),
+        })),
     }
 }
 
-fn address(params: &Value) -> Result<String, ApiError> {
-    params["address"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or(ApiError::INVALID_PARAMS)
+const PARSE_ERROR: ApiError = ApiError {
+    code: -32700,
+    kind: "parse_error",
+    message: "invalid JSON",
+};
+
+const INVALID_REQUEST: ApiError = ApiError {
+    code: -32600,
+    kind: "invalid_request",
+    message: "invalid JSON-RPC request",
+};
+
+/// A request error plus the optional C1 `data.kind2` refinement.
+#[derive(Clone, Copy)]
+struct Refusal {
+    error: ApiError,
+    kind2: Option<&'static str>,
 }
 
-fn session(params: &Value) -> Result<&str, ApiError> {
-    params["session"].as_str().ok_or(ApiError::INVALID_PARAMS)
+impl From<ApiError> for Refusal {
+    fn from(error: ApiError) -> Self {
+        Self { error, kind2: None }
+    }
 }
 
-fn error(id: &Value, error: ApiError) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code,"message":error.message,"data":{"kind":error.kind}}})
+/// Validates the C1 JSON-RPC 2.0 request envelope (§1): an object with exactly
+/// `jsonrpc: "2.0"`, a string or integer `id`, a string `method` and optional
+/// by-name `params`. A refused request echoes its `id` only when that is valid.
+fn parse_request(request: Value) -> Result<(Value, String, Value), (Value, Refusal)> {
+    let Value::Object(mut request) = request else {
+        return Err((Value::Null, INVALID_REQUEST.into()));
+    };
+    let id = match request.remove("id") {
+        Some(id @ Value::String(_)) => id,
+        Some(Value::Number(id)) if id.is_i64() || id.is_u64() => Value::Number(id),
+        _ => return Err((Value::Null, INVALID_REQUEST.into())),
+    };
+    if request.remove("jsonrpc").as_ref().and_then(Value::as_str) != Some("2.0") {
+        return Err((id, INVALID_REQUEST.into()));
+    }
+    let Some(Value::String(method)) = request.remove("method") else {
+        return Err((id, INVALID_REQUEST.into()));
+    };
+    let params = request.remove("params");
+    if !request.is_empty() {
+        return Err((id, INVALID_REQUEST.into()));
+    }
+    let params = match params {
+        None => Value::Object(serde_json::Map::new()),
+        Some(params @ Value::Object(_)) => params,
+        Some(_) => return Err((id, ApiError::INVALID_PARAMS.into())),
+    };
+    Ok((id, method, params))
+}
+
+/// Decodes by-name parameters into a strict DTO; unknown members are reported
+/// as `invalid_params` with `kind2: unknown_field` (C1 §8.1).
+fn typed<T: DeserializeOwned>(params: Value) -> Result<T, Refusal> {
+    serde_json::from_value(params).map_err(|error| Refusal {
+        error: ApiError::INVALID_PARAMS,
+        kind2: error
+            .to_string()
+            .starts_with("unknown field")
+            .then_some("unknown_field"),
+    })
+}
+
+fn error(id: &Value, refusal: Refusal) -> Value {
+    let Refusal { error, kind2 } = refusal;
+    let mut data = json!({"kind":error.kind});
+    if let Some(kind2) = kind2 {
+        data["kind2"] = json!(kind2);
+    }
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code,"message":error.message,"data":data}})
 }
 
 async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, value: &Value) -> io::Result<()> {

@@ -85,7 +85,10 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
     via_adapters::run_anchor_from_args(args)
 }
 
-pub use api::{ApiError, ReadParams, SpawnParams, SteerParams, hash_handle, parse_address};
+pub use api::{
+    ApiError, DaemonStatusParams, DaemonStopParams, ReadParams, SessionReadParams, SpawnParams,
+    SteerParams, hash_handle, parse_address,
+};
 
 impl Serialize for C1TurnState {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
