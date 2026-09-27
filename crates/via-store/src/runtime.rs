@@ -83,6 +83,71 @@ pub struct ReceiptRecord {
     pub receipt: Value,
 }
 
+/// A spawn's C1 `idempotency_key` and exact retry identity, kept for the
+/// session's lifetime.
+pub struct SpawnKey {
+    /// Caller key, unique per Store.
+    pub key: String,
+    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
+    pub identity: Vec<u8>,
+}
+
+/// A committed spawn key with the receipt it replays.
+pub struct StoredSpawnKey {
+    /// Session the key created.
+    pub session_id: SessionId,
+    /// Retry identity recorded with the key.
+    pub identity: Vec<u8>,
+    /// Original C1 receipt.
+    pub receipt: Value,
+}
+
+/// A keyed mutation's exact result, replayed for the same `op_key` (C1 §3).
+pub struct OperationRecord {
+    /// Caller key, unique per session.
+    pub op_key: String,
+    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
+    pub identity: Vec<u8>,
+    /// Original C1 result.
+    pub result: Value,
+}
+
+/// A queued turn Core proposes for an existing session, with its receipt.
+pub struct ResumeRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// The session's next turn number.
+    pub turn: TurnNumber,
+    /// Frozen prompt.
+    pub prompt: String,
+    /// Core's canonical `turn.queued` event at the session's next sequence.
+    pub event: Value,
+    /// The `op_key` result committed with the turn, when the caller gave a key.
+    pub operation: Option<OperationRecord>,
+}
+
+/// Session facts Core decides a new turn from.
+pub struct SessionSnapshot {
+    /// The session no longer admits turns.
+    pub closed: bool,
+    /// Highest turn number.
+    pub turns: u32,
+    /// Queued turns of the session, without submission intent.
+    pub queued: u32,
+    /// The session's queued and running turns.
+    pub nonterminal: u32,
+}
+
+/// Durable facts of a queued turn that its submission needs.
+pub struct QueuedTurn {
+    /// Frozen prompt.
+    pub prompt: String,
+    /// Time of `turn.queued`.
+    pub queued_at: String,
+    /// Sequence of `turn.queued`.
+    pub queued_seq: u64,
+}
+
 /// Core's submission intent and its canonical event, committed before agent I/O.
 pub struct SubmissionRecord {
     /// Owning session.
@@ -367,8 +432,29 @@ pub struct StoreClient {
 enum Command {
     Spawn(
         SpawnRecord,
+        Option<SpawnKey>,
         oneshot::Sender<Result<ReceiptRecord, StoreError>>,
     ),
+    SpawnKey(
+        String,
+        oneshot::Sender<Result<Option<StoredSpawnKey>, StoreError>>,
+    ),
+    Resume(ResumeRecord, oneshot::Sender<Result<(), StoreError>>),
+    Operation(
+        SessionId,
+        String,
+        oneshot::Sender<Result<Option<OperationRecord>, StoreError>>,
+    ),
+    Snapshot(
+        SessionId,
+        oneshot::Sender<Result<Option<SessionSnapshot>, StoreError>>,
+    ),
+    QueuedTurn(
+        SessionId,
+        TurnNumber,
+        oneshot::Sender<Result<Option<QueuedTurn>, StoreError>>,
+    ),
+    NextSeq(SessionId, oneshot::Sender<Result<Option<u64>, StoreError>>),
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
@@ -546,8 +632,75 @@ impl Drop for Store {
 impl StoreClient {
     /// Atomically persists the receipt, handle hash, session and queued first turn.
     pub async fn commit_spawn(&self, record: SpawnRecord) -> Result<ReceiptRecord, StoreError> {
+        self.commit_keyed_spawn(record, None).await
+    }
+
+    /// `commit_spawn` that also records the spawn's idempotency key, atomically.
+    pub async fn commit_keyed_spawn(
+        &self,
+        record: SpawnRecord,
+        key: Option<SpawnKey>,
+    ) -> Result<ReceiptRecord, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Spawn(record, reply))?;
+        self.send(Command::Spawn(record, key, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads a committed spawn key.
+    pub async fn spawn_key(&self, key: &str) -> Result<Option<StoredSpawnKey>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SpawnKey(key.to_owned(), reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Atomically commits a queued turn, its `turn.queued` event and any
+    /// `op_key` result. Refuses a closed session or a turn that is not the next.
+    pub async fn commit_resume(&self, record: ResumeRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Resume(record, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads a session's committed `op_key` result.
+    pub async fn operation(
+        &self,
+        session_id: &SessionId,
+        op_key: &str,
+    ) -> Result<Option<OperationRecord>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Operation(
+            session_id.clone(),
+            op_key.to_owned(),
+            reply,
+        ))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads the facts Core decides a new turn from; `None` for no such session.
+    pub async fn session_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSnapshot>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Snapshot(session_id.clone(), reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads a turn's prompt and `turn.queued` facts while it is still queued.
+    pub async fn queued_turn(
+        &self,
+        session_id: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<QueuedTurn>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::QueuedTurn(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Reads the session's durable next event sequence.
+    pub async fn next_seq(&self, session_id: &SessionId) -> Result<Option<u64>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::NextSeq(session_id.clone(), reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

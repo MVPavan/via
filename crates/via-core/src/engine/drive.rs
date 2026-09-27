@@ -1,7 +1,10 @@
 //! Turn driving: submission, adapter execution, event commits and the terminal commit.
 
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -10,9 +13,10 @@ use via_adapters::{
     AdapterError, FakeAcceptanceObservation, FakeObservation, FakeTerminalEvidence, Observation,
     RouteError, ToolStatus, WireCleanup,
 };
-use via_store::{AcceptanceRecord, SubmissionRecord, TerminalRecord};
+use via_store::{AcceptanceRecord, QueuedTurn, SubmissionRecord, TerminalRecord};
 
-use super::journal::{self, TurnJournal, UncertainEvent, Unresolved};
+use super::journal::{self, Head, TurnJournal, UncertainEvent, Unresolved};
+use super::queue::{Finish, Slot};
 use super::stop::stop_outcome;
 use super::terminal::{classify, terminal_envelope};
 use super::{Accepted, Engine, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock};
@@ -23,6 +27,15 @@ use crate::{ApiError, ConnectionId, Deadline, RawRef, SessionId, TurnNumber, Tur
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
+
+/// A committed submission: the queued turn's facts and the submission time.
+pub(super) struct Submission {
+    session: SessionId,
+    turn: TurnNumber,
+    queued: QueuedTurn,
+    submitted: SystemTime,
+    clock: Instant,
+}
 
 /// How a drive's execution ended.
 enum Driven {
@@ -40,9 +53,29 @@ enum Driven {
     },
 }
 
+/// Counts a turn out of the daemon's queue once, when it leaves it or its drive ends.
+struct Queued<'a>(Option<&'a AtomicUsize>);
+
+impl Queued<'_> {
+    fn leave(&mut self) {
+        if let Some(queued) = self.0.take() {
+            queued.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
 impl Engine {
-    /// Continues independently of the client connection after the committed receipt.
-    pub async fn drive(&self, session_text: &str, prompt: String) -> Result<(), ApiError> {
+    /// Continues independently of the client connection after the committed
+    /// receipt. The turn waits for every earlier turn of its session (C1 §7.3),
+    /// then submits; behind a predecessor that did not end cleanly it is
+    /// cancelled without submission instead.
+    pub async fn drive(&self, session: SessionId, turn: TurnNumber) -> Result<(), ApiError> {
         struct Active<'a>(&'a AtomicUsize);
         impl Drop for Active<'_> {
             fn drop(&mut self) {
@@ -50,25 +83,53 @@ impl Engine {
             }
         }
         let _active = Active(&self.active);
-        let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
-        let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        let (queued_at, submitted, submitted_clock) =
-            Self::submit(&self.store, &self.unresolved, &session, turn).await?;
+        let mut queued = Queued(Some(&self.queued));
+        let slot = self.slot(&session).ok_or(ApiError::STORE)?;
+        let cancel = slot.turn(turn).await;
+        let mut finish = Finish::new(&slot, turn);
+        if cancel {
+            let cancelled = self.cancel_queued(&slot, &session, turn).await;
+            queued.leave();
+            return cancelled;
+        }
+        let submission =
+            Self::submit(&self.store, &self.unresolved, &session, turn, &slot.head).await;
+        queued.leave();
+        let (clean, finished) = self.run(&slot, submission?).await;
+        finish.clean = clean;
+        finished
+    }
+
+    /// Executes a submitted turn to its terminal; returns whether it ended
+    /// cleanly enough for its successor to dispatch.
+    async fn run(&self, slot: &Slot, submission: Submission) -> (bool, Result<(), ApiError>) {
+        let Submission {
+            session,
+            turn,
+            queued,
+            submitted,
+            clock,
+        } = submission;
         let started = Started {
             session: session.clone(),
             turn,
-            queued_at,
-            submitted_at: rfc3339(submitted),
-            submitted_clock,
+            queued_at: queued.queued_at,
+            first_seq: queued.queued_seq,
+            submitted: Some((rfc3339(submitted), clock)),
         };
-        let connection = ConnectionId::try_from(
-            format!("c_{}", session.as_str().trim_start_matches("s_")).as_str(),
-        )
-        .map_err(|_| ApiError::STORE)?;
+        // One private connection per turn; turn 1 keeps the session's own name.
+        let suffix = session.as_str().trim_start_matches("s_");
+        let connection = match turn.get() {
+            1 => format!("c_{suffix}"),
+            n => format!("c_{suffix}t{n}"),
+        };
+        let Ok(connection) = ConnectionId::try_from(connection.as_str()) else {
+            return (false, Err(ApiError::STORE));
+        };
         let mut record = TurnRecord {
             session: session.clone(),
             turn,
-            seq: 2,
+            head: Arc::clone(&slot.head),
             accepted: None,
             spans: Vec::new(),
             store_failed: false,
@@ -78,7 +139,7 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + wall);
         let deadline_at = rfc3339(SystemTime::now() + wall);
         let outcome = match self
-            .execute(&mut record, connection.clone(), prompt, deadline)
+            .execute(&mut record, connection.clone(), queued.prompt, deadline)
             .await
         {
             Driven::Finished(outcome) => outcome,
@@ -105,7 +166,7 @@ impl Engine {
                     launched,
                     close,
                 });
-                return Ok(());
+                return (false, Ok(()));
             }
         };
         // C1 §7.6: Core's deadline cancels the turn; Route force-closed its group.
@@ -138,7 +199,59 @@ impl Engine {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
-        self.finish(&started, record, terminal, false).await
+        let settled = terminal.state != "unknown";
+        let finished = self.finish(&started, record, terminal, false).await;
+        (settled && finished.is_ok(), finished)
+    }
+
+    /// Cancels a turn that was never submitted because its predecessor did not
+    /// end cleanly (C1 §7.2 `queued` → `cancelled`): no vendor I/O happened.
+    async fn cancel_queued(
+        &self,
+        slot: &Slot,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<(), ApiError> {
+        let queued = self.store.queued_turn(session, turn).await.ok().flatten();
+        let Some(queued) = queued else {
+            self.unresolved.fail(session, turn, TurnState::Queued);
+            return Err(ApiError::STORE);
+        };
+        let started = Started {
+            session: session.clone(),
+            turn,
+            queued_at: queued.queued_at,
+            first_seq: queued.queued_seq,
+            submitted: None,
+        };
+        let record = TurnRecord {
+            session: session.clone(),
+            turn,
+            head: Arc::clone(&slot.head),
+            accepted: None,
+            spans: Vec::new(),
+            store_failed: false,
+            uncertain: None,
+        };
+        let terminal = Terminal {
+            state: "cancelled",
+            failure: None,
+            stop_reason: "interrupted",
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            cancel: None,
+        };
+        let committed =
+            Self::commit_turn_ended(&self.store, &started, record, terminal, false).await;
+        match committed {
+            Ok(()) => self.unresolved.resolve(session, turn),
+            Err(_) => self.unresolved.fail(session, turn, TurnState::Queued),
+        }
+        committed
     }
 
     /// Commits the turn's terminal; one that cannot be made durable is recorded so
@@ -197,10 +310,13 @@ impl Engine {
         if let Some(reference) = &terminal.raw_ref {
             RawSpan::include(&mut record.spans, reference);
         }
-        let seq = record.seq + 1;
+        let shared = Arc::clone(&record.head);
+        let head = shared
+            .lock(journal, &started.session)
+            .await
+            .map_err(|_| ApiError::STORE)?;
+        let seq = head.next();
         let ended_at = rfc3339(SystemTime::now());
-        // Monotonic, so wall-clock steps cannot distort or drop the duration.
-        let elapsed = started.submitted_clock.elapsed();
         let raw_ref = terminal.raw_ref.clone();
         let event = Event {
             seq,
@@ -219,11 +335,15 @@ impl Engine {
         .to_value()?;
         let timestamps = Timestamps {
             queued_at: started.queued_at.clone(),
-            submitted_at: Some(started.submitted_at.clone()),
+            submitted_at: started.submitted.as_ref().map(|(at, _)| at.clone()),
             accepted_at: record.accepted.as_ref().map(|accepted| accepted.at.clone()),
             ended_at,
         };
-        let duration_ms = u64::try_from(elapsed.as_millis()).ok();
+        // Monotonic, so wall-clock steps cannot distort or drop the duration.
+        let duration_ms = started
+            .submitted
+            .as_ref()
+            .and_then(|(_, clock)| u64::try_from(clock.elapsed().as_millis()).ok());
         let envelope = terminal_envelope(
             &started.session,
             started.turn,
@@ -232,7 +352,7 @@ impl Engine {
             record.spans,
             timestamps,
             duration_ms,
-            seq,
+            (started.first_seq, seq),
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let closed = if close_session {
@@ -252,7 +372,8 @@ impl Engine {
         } else {
             None
         };
-        journal::commit_terminal(
+        let events = if closed.is_some() { 2 } else { 1 };
+        let committed = journal::commit_terminal(
             journal,
             TerminalRecord {
                 session_id: started.session.clone(),
@@ -263,7 +384,13 @@ impl Engine {
             },
             closed,
         )
-        .await
+        .await;
+        match committed {
+            Ok(()) => head.committed(events),
+            // Durable or not, re-read the head before the session's next event.
+            Err(_) => head.lost(),
+        }
+        committed
     }
 
     /// Drives the adapter under the turn deadline, committing each observation it
@@ -334,22 +461,31 @@ impl Engine {
                 if record.store_failed || record.accepted.is_some() {
                     return;
                 }
+                let shared = Arc::clone(&record.head);
+                let Ok(head) = shared.lock(&self.store, &record.session).await else {
+                    record.store_failed = true;
+                    return;
+                };
+                let seq = head.next();
                 match self
-                    .accept(&record.session, record.turn, record.seq + 1, observation)
+                    .accept(&record.session, record.turn, seq, observation)
                     .await
                 {
                     Ok(accepted) => {
-                        record.seq += 1;
+                        head.committed(1);
                         RawSpan::include(&mut record.spans, &accepted.raw_ref);
                         record.accepted = Some(accepted);
                     }
                     Err(uncertain) => {
                         record.store_failed = true;
-                        record.uncertain = uncertain.map(|accepted| UncertainEvent {
-                            seq: record.seq + 1,
-                            raw_ref: Some(accepted.raw_ref.clone()),
-                            accepted: Some(accepted),
-                        });
+                        if let Some(accepted) = uncertain {
+                            head.lost();
+                            record.uncertain = Some(UncertainEvent {
+                                seq,
+                                raw_ref: Some(accepted.raw_ref.clone()),
+                                accepted: Some(accepted),
+                            });
+                        }
                     }
                 }
             }
@@ -373,43 +509,44 @@ impl Engine {
         journal::commit_event(&self.store, record, body, raw_ref).await;
     }
 
-    /// Commits submission intent with `turn.submitted` (seq 2) before any agent I/O.
+    /// Commits submission intent with `turn.submitted` before any agent I/O.
     /// A turn whose submission cannot be confirmed never reaches `finish`; it is
     /// recorded failed at its last committed state, `queued`.
-    ///
-    /// Returns the durable `turn.queued` time and the submission time.
     pub(super) async fn submit(
         journal: &impl TurnJournal,
         unresolved: &Unresolved,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<(String, SystemTime, Instant), ApiError> {
-        let submitted = Self::commit_submission(journal, session, turn).await;
+        head: &Head,
+    ) -> Result<Submission, ApiError> {
+        let submitted = Self::commit_submission(journal, session, turn, head).await;
         if submitted.is_err() {
             unresolved.fail(session, turn, TurnState::Queued);
         }
         submitted
     }
 
-    /// `submit`'s Store work: reads `turn.queued` and commits `turn.submitted`.
+    /// `submit`'s Store work: reads the queued turn and commits `turn.submitted`
+    /// at the session's next sequence.
     async fn commit_submission(
         journal: &impl TurnJournal,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<(String, SystemTime, Instant), ApiError> {
-        // S1 sessions hold one turn, so its events start at seq 1 (turn.queued).
+        head: &Head,
+    ) -> Result<Submission, ApiError> {
         let queued = journal
-            .events(session, 1, 1)
+            .queued_turn(session, turn)
+            .await
+            .map_err(|_| ApiError::STORE)?
+            .ok_or(ApiError::STORE)?;
+        let head = head
+            .lock(journal, session)
             .await
             .map_err(|_| ApiError::STORE)?;
-        let queued_at = queued
-            .first()
-            .and_then(|event| event.event.get("at")?.as_str().map(str::to_owned))
-            .ok_or(ApiError::STORE)?;
         let submitted = SystemTime::now();
-        let submitted_clock = Instant::now();
+        let clock = Instant::now();
         let event = Event {
-            seq: 2,
+            seq: head.next(),
             session_id: session,
             turn: Some(turn.get()),
             late: false,
@@ -418,15 +555,29 @@ impl Engine {
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()?;
-        journal
+        let committed = journal
             .commit_submission(SubmissionRecord {
                 session_id: session.clone(),
                 turn,
                 event,
             })
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        Ok((queued_at, submitted, submitted_clock))
+            .await;
+        match committed {
+            Ok(()) => head.committed(1),
+            Err(error) => {
+                if journal::may_have_committed(&error) {
+                    head.lost();
+                }
+                return Err(ApiError::STORE);
+            }
+        }
+        Ok(Submission {
+            session: session.clone(),
+            turn,
+            queued,
+            submitted,
+            clock,
+        })
     }
 
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.

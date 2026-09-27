@@ -10,7 +10,8 @@ use crate::api::{
 };
 use crate::{SessionId, TurnNumber};
 
-/// Assembles the C1 §5 envelope; `last_seq` is `turn.ended`, and S1 turns start at seq 1.
+/// Assembles the C1 §5 envelope; `events` runs from the turn's `turn.queued` to
+/// its `turn.ended`, other turns' events of the session included.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -23,7 +24,7 @@ pub(super) fn terminal_envelope(
     raw_spans: Vec<RawSpan>,
     timestamps: Timestamps,
     duration_ms: Option<u64>,
-    last_seq: u64,
+    (first_seq, last_seq): (u64, u64),
 ) -> Envelope {
     let plan = RoutePlan::fake();
     let mut warnings = plan.warnings();
@@ -71,9 +72,9 @@ pub(super) fn terminal_envelope(
         duration_ms,
         exit: terminal.exit,
         events: EventRange {
-            first_seq: 1,
+            first_seq,
             last_seq,
-            count: last_seq,
+            count: last_seq + 1 - first_seq,
         },
         raw_spans,
         vendor_options: json!({}),

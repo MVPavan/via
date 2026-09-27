@@ -1144,7 +1144,10 @@ The private S1 fixture invocation uses existing argument spelling
 first-release public harness or a new flag. No release-gated failpoint
 activation is implied by selecting that fake fixture route.
 
-Fixture shape is `{"expected_request":{...},"steps":[...]}`. The selected
+Fixture shape is `{"expected_request":{...},"steps":[...]}`, or
+`{"scripts":[...]}` of such scripts for multi-turn and multi-session
+deployments: each launch runs the first script whose `expected_request` its
+start request contains, and fails when none does. The selected
 `expected_request` fields may be a subset, but the fake must also validate
 the full typed start schema, positive turn, ID 1 and no second start.
 Positive scenarios emit all fields required by §3.1. Explicit negative

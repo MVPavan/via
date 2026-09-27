@@ -4,7 +4,7 @@
 mod client;
 mod server;
 
-use std::{io, path::PathBuf, process::ExitCode};
+use std::{io, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -19,9 +19,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Spawn(SpawnArgs),
+    Resume(ResumeArgs),
     Steer(SteerArgs),
     Result(ReadArgs),
-    Wait(ReadArgs),
+    Wait(WaitArgs),
     Events(ReadArgs),
     Logs(ReadArgs),
     Daemon {
@@ -45,7 +46,35 @@ struct SpawnArgs {
     #[arg(long)]
     handle_stdin: bool,
     #[arg(long)]
+    idempotency_key: Option<String>,
+    #[arg(long)]
     background: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ResumeArgs {
+    session: String,
+    #[arg(long)]
+    prompt: String,
+    #[arg(long)]
+    op_key: Option<String>,
+    #[arg(long)]
+    handle: Option<String>,
+    #[arg(long)]
+    handle_file: Option<PathBuf>,
+    #[arg(long)]
+    handle_stdin: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct WaitArgs {
+    address: String,
+    #[arg(long)]
+    timeout_ms: Option<u64>,
     #[arg(long)]
     json: bool,
 }
@@ -142,7 +171,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 args.handle.as_deref(),
                 true,
             )?;
-            let params = json!({"harness":args.harness,"model":args.model,"prompt":args.prompt,"handle":handle});
+            let mut params = json!({"harness":args.harness,"model":args.model,"prompt":args.prompt,"handle":handle});
+            if let Some(key) = args.idempotency_key {
+                params["idempotency_key"] = Value::String(key);
+            }
             let mut receipt = client::request("spawn", &params, true)?;
             if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
                 result.insert("handle".to_owned(), Value::String(handle));
@@ -166,6 +198,19 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 3
             })
         }
+        Command::Resume(args) => {
+            let handle = client::read_handle(
+                args.handle_file.as_deref(),
+                args.handle_stdin,
+                args.handle.as_deref(),
+                false,
+            )?;
+            let mut params = json!({"session":args.session,"prompt":args.prompt,"handle":handle});
+            if let Some(key) = args.op_key {
+                params["op_key"] = Value::String(key);
+            }
+            client::call("resume", &params, true, true)
+        }
         Command::Steer(args) => {
             let handle = client::read_handle(
                 args.handle_file.as_deref(),
@@ -183,7 +228,17 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Result(args) => {
             client::call("result", &json!({"address":args.address}), true, true)
         }
-        Command::Wait(args) => client::call("wait", &json!({"address":args.address}), true, true),
+        Command::Wait(args) => {
+            let mut params = json!({"address":args.address});
+            let mut read = Duration::from_millis(via_core::DEFAULT_WAIT_MS);
+            if let Some(timeout) = args.timeout_ms {
+                params["timeout_ms"] = Value::from(timeout);
+                read = Duration::from_millis(timeout);
+            }
+            // The daemon answers `wait_timeout` at the bound; allow for the reply.
+            let read = read.saturating_add(Duration::from_secs(5));
+            client::call_within("wait", &params, true, true, read)
+        }
         Command::Events(args) => {
             client::call("events", &json!({"session":args.address}), true, true)
         }

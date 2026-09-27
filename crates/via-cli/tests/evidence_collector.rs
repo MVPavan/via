@@ -106,3 +106,24 @@ fn failure_and_timeout_remain_distinct_evidence_outcomes() -> Result<(), Box<dyn
     }
     Ok(())
 }
+
+/// `via-jm4.7.6`: evidence can hold raw vendor bytes and Store backups, so the
+/// artifact directory and its `raw/` are private (0700) regardless of umask.
+#[test]
+fn evidence_and_raw_directories_are_private() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempfile::tempdir()?;
+    let fixture = sandbox.path().join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    let evidence = Evidence::new(
+        "collector_private_dirs",
+        std::path::Path::new(env!("CARGO_BIN_EXE_via")),
+        &fixture,
+    )?;
+    for dir in [evidence.dir.clone(), evidence.dir.join("raw")] {
+        let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{} has mode {mode:o}", dir.display());
+    }
+    Ok(())
+}
