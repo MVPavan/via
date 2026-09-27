@@ -132,6 +132,10 @@ pub enum WireError {
     /// The caller's cancel signal ended a wait on the vendor.
     #[error("vendor wait cancelled")]
     Cancelled,
+    /// The caller's cancel signal abandoned an acquisition after ARM: the
+    /// vendor may have written output that no raw log recorded.
+    #[error("acquisition cancelled after vendor launch")]
+    CancelledAfterLaunch,
     /// Frame contract failure.
     #[error("vendor frame failure: {0:?}")]
     Frame(WireFailure),
@@ -164,7 +168,8 @@ impl WireConnection {
         deadline: Deadline,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<Self, WireError> {
-        let acquire = host.acquire(spec, deadline);
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        let acquire = host.acquire_marking_arm(spec, deadline, &armed);
         tokio::pin!(acquire);
         let acquired = tokio::select! {
             acquired = &mut acquire => acquired,
@@ -172,9 +177,16 @@ impl WireConnection {
                 // An abandoned acquisition drops its anchor control: an anchor
                 // that connected exits on EOF, one that did not at its own
                 // bootstrap deadline; Host recovery reports what it can prove.
+                // After ARM the pipes carry vendor bytes nobody will record.
                 tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire)
                     .await
-                    .map_err(|_| WireError::Cancelled)?
+                    .map_err(|_| {
+                        if armed.load(std::sync::atomic::Ordering::Acquire) {
+                            WireError::CancelledAfterLaunch
+                        } else {
+                            WireError::Cancelled
+                        }
+                    })?
             }
         };
         let AcquiredProcess {

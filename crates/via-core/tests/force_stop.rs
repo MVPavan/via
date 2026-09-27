@@ -221,3 +221,104 @@ fn force_during_stalled_acquisition_settles_the_turn() {
         drop(engine);
     });
 }
+
+/// Stand-in anchor that passes Host's identity checks, accepts Configure and
+/// ARM, launches a vendor that writes to the inherited vendor pipes, and then
+/// never confirms the launch, so Host acquisition stalls after ARM. It stops
+/// its vendor and exits when Host closes the connection.
+const STALLED_AFTER_ARM_ANCHOR: &str = r"#!/usr/bin/env python3
+import json, os, socket, subprocess, sys
+bootstrap = json.load(open(sys.argv[2]))
+server = socket.socket(socket.AF_UNIX)
+server.bind(bootstrap['socket_path'])
+server.listen(1)
+connection, _ = server.accept()
+control = connection.makefile('rwb')
+fields = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()
+identity = {
+    'pid': os.getpid(), 'pgid': int(fields[2]), 'uid': os.getuid(),
+    'boot_id': open('/proc/sys/kernel/random/boot_id').read().strip(),
+    'pid_namespace': os.readlink('/proc/self/ns/pid'),
+    'start_ticks': int(fields[19]), 'marker': bootstrap['marker'],
+}
+def send(frame):
+    control.write(json.dumps(frame).encode() + b'\n')
+    control.flush()
+send({'kind': 'ready', 'identity': identity})
+control.readline()
+send({'kind': 'configured'})
+control.readline()
+vendor = subprocess.Popen(['/bin/sh', '-c', 'echo vendor output before launch reply; exec sleep 30'])
+control.readline()
+vendor.kill()
+vendor.wait()
+";
+
+/// W4-H Sol r2: a force that abandons an acquisition after ARM, when the
+/// vendor already wrote output no raw writer owned, must not report a
+/// complete raw log: the turn records `raw_log.incomplete` and warns.
+#[test]
+fn force_after_arm_abandonment_reports_raw_log_incomplete() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("force_after_arm_abandonment_reports_raw_log_incomplete");
+    };
+    let root = PathBuf::from(root);
+    let anchor = root.join("stalled-after-arm-anchor");
+    fs::write(&anchor, STALLED_AFTER_ARM_ANCHOR).unwrap();
+    fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let engine = Engine::open(
+            &root.join("state"),
+            &root.join("runtime"),
+            FakeConfig::from_environment().unwrap(),
+            anchor,
+        )
+        .unwrap();
+        let params: SpawnParams = serde_json::from_value(json!({
+            "harness":"fake","model":"fake","prompt":"hello",
+            "handle":format!("h_{}", "A".repeat(43)),
+        }))
+        .unwrap();
+        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
+        let (driven, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(8), engine.drive(&session, prompt)),
+            async {
+                // By then the vendor has launched and written its line.
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                engine.request_stop(&force).await.unwrap();
+            }
+        );
+        driven.expect("the forced drive must end").unwrap();
+        let report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ))
+            .await;
+        assert_eq!(report.unresolved_turns, 0, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert!(
+            envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "raw_log_incomplete"),
+            "lost vendor output must be reported: {envelope}"
+        );
+        let page = engine.events(&session).await.unwrap();
+        assert!(
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "raw_log.incomplete"),
+            "{page}"
+        );
+        drop(engine);
+    });
+}

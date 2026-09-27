@@ -258,6 +258,19 @@ impl Host {
         spec: PrivateProcessSpec,
         deadline: Deadline,
     ) -> Result<AcquiredProcess, HostError> {
+        self.acquire_marking_arm(spec, deadline, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Host::acquire`] that sets `armed` just before ARM is sent: from then
+    /// on the vendor may run and write to its pipes, so a caller that abandons
+    /// the acquisition knows vendor output may be lost.
+    pub async fn acquire_marking_arm(
+        &self,
+        spec: PrivateProcessSpec,
+        deadline: Deadline,
+        armed: &AtomicBool,
+    ) -> Result<AcquiredProcess, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
@@ -274,7 +287,7 @@ impl Host {
         {
             return Err(HostError::Invalid("reserved vendor marker environment key"));
         }
-        timeout_at(deadline.instant(), self.acquire_inner(spec))
+        timeout_at(deadline.instant(), self.acquire_inner(spec, armed))
             .await
             .map_err(|_| HostError::Deadline)?
     }
@@ -400,7 +413,11 @@ impl Host {
         Ok((pipes, anchor_process_id))
     }
 
-    async fn acquire_inner(&self, spec: PrivateProcessSpec) -> Result<AcquiredProcess, HostError> {
+    async fn acquire_inner(
+        &self,
+        spec: PrivateProcessSpec,
+        armed: &AtomicBool,
+    ) -> Result<AcquiredProcess, HostError> {
         let StartedAnchor {
             anchor_id,
             generation,
@@ -425,6 +442,7 @@ impl Host {
             return Err(HostError::Store("ArmIntent lacks positive commit receipt"));
         };
         // This is the only ARM send for this generation; errors never cause retry.
+        armed.store(true, Ordering::Release);
         let reply = protocol::transact(
             &mut stream,
             &Request::Arm {

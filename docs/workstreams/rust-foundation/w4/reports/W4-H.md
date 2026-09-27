@@ -336,3 +336,77 @@ fail: exit exit status: 4, summary {..,"queued_drives":1,..,"unresolved_turns":1
 - `cargo deny check`: ok.
 - `python3 scripts/check-layers.py`: ok.
 - The daemon-stop suite was rerun 3 more times with no failure.
+
+## Round 3
+
+Addresses the merge blocker in `../sol-review-W4-H-r2.md`. I merged
+`origin/rust-foundation` first (docs only).
+
+### Blocker: an abandoned post-ARM acquisition lost vendor output silently
+
+**Failure.** After Host sends ARM, the vendor runs and can write to its
+pipes while Host still awaits the spawn reply or vendor facts. If a force
+expires the 2 s grace, Wire drops the acquisition and, with it, the pipes
+Host still owned. Route reported `raw_incomplete: false`, so Core emitted
+neither `raw_log.incomplete` nor its warning.
+
+**Fix (smallest truthful one).** At that point Wire does not own the pipes
+yet, so the fix reports possible loss instead of draining. `Host` gains
+`acquire_marking_arm`, which sets a flag just before ARM is sent; `acquire`
+delegates to it. Wire abandons an acquisition with the flag set as
+`WireError::CancelledAfterLaunch`. Route maps it to `ForceStopped` with
+`raw_incomplete: true`. Core already turns that into `raw_log.incomplete`
+plus the `raw_log_incomplete` warning. An acquisition abandoned before ARM
+launched no vendor, so it stays `raw_incomplete: false`.
+
+**Regression.** `force_after_arm_abandonment_reports_raw_log_incomplete` in
+`crates/via-core/tests/force_stop.rs`, over the Engine with a real Store and
+Host. It uses a stand-in anchor that:
+
+1. passes Host's identity checks;
+2. answers Configure;
+3. on ARM, launches a vendor that writes a line to the inherited stdout
+   pipe;
+4. never sends the spawn reply.
+
+The test forces after 1 s, then requires a cancelled turn with the
+`raw_log_incomplete` warning and a `raw_log.incomplete` event. To show it
+fails without the fix, I set Route's flag back to `false`, as a mutation of
+the fixed tree. The test then failed:
+
+```
+lost vendor output must be reported: {..,"cancel":{"cleanup":"quiescent","outcome":"requested",..}
+```
+
+### Deferrable test note (addressed)
+
+`force_while_forwarding_is_blocked_drains_every_byte` now forces only after
+observing backpressure. It polls the turn until the observation channel
+reports zero capacity, waits 200 ms more, and asserts the channel is still
+full.
+
+### Files changed in round 3
+
+- `crates/via-host/src/host.rs`: `acquire_marking_arm`.
+- `crates/via-wire/src/runtime.rs` (shared): `CancelledAfterLaunch`.
+- `crates/via-routes/src/runtime.rs` (shared): maps it to `ForceStopped`
+  with `raw_incomplete`.
+- Tests: `crates/via-core/tests/{force_stop,route_stream}.rs`.
+
+### Gate
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: pass.
+- `cargo nextest run --locked --workspace`: 107 passed, 1 skipped.
+- `cargo deny check`: ok.
+- `python3 scripts/check-layers.py`: ok.
+- Core and Host suites were rerun twice more with no failure.
+
+### Open
+
+- **Unrecorded vendor bytes are not drained.** An abandoned post-ARM
+  acquisition reports possible loss; it does not recover the bytes, because
+  Wire never owned those pipes.
+- **Other post-ARM failures.** A non-force acquisition failure after ARM,
+  such as a failed vendor-facts commit, reports raw completeness as before.
+  That is outside this finding.

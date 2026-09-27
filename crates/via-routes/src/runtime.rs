@@ -84,7 +84,8 @@ impl FakeRoute {
                 cause: wire_cause(turn, &error),
                 evidence: None,
                 exit: None,
-                raw_incomplete: false,
+                // A launched vendor's output never reached a raw writer.
+                raw_incomplete: matches!(error, WireError::CancelledAfterLaunch),
                 cleanup: None,
                 forced: false,
             })?;
@@ -372,7 +373,7 @@ fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
         // A raw append the Store worker did not confirm in time is a Store failure.
         WireError::Raw(_) | WireError::RawDeadline => RouteError::Store { turn },
         WireError::Deadline => RouteError::Deadline { turn },
-        WireError::Cancelled => RouteError::ForceStopped { turn },
+        WireError::Cancelled | WireError::CancelledAfterLaunch => RouteError::ForceStopped { turn },
         WireError::Frame(WireFailure::FrameTooLarge) => {
             protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
         }
