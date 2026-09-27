@@ -116,8 +116,11 @@ Coordination rules (proposed):
 | Shutdown-design integration; hardest S1 findings (T1-I1, T1-I7, other ownership or timing findings) | Opus 5.5 high |
 | Final S1 critique (`via-jm4.7.9`) | Fable 5.1 high |
 
-- Local: GPT-6 Sol high implements the Codex adapter; GPT-6 Astra medium
-  reviews substantial merged work.
+- Local: GPT-6 Sol high implements the Codex adapter.
+- Reviews (owner, 2026-09-27): **GPT-6 Sol** reviews the Opus-built work,
+  medium for each worker branch, high for a whole slice. **GPT-6 Astra**
+  and **Claude Fable 5.1 high** are kept for large bodies of work and
+  critical reviews only (for example the final S1 critique and release).
 - Default cloud environment: `Via-probe` (Full network, for the probe;
   switch to Custom once OpenCode's hosts are known). Each cloud session
   reports its model and effort first and pushes only its own branch; it
