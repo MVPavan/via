@@ -575,8 +575,9 @@ fn blocked_absence_commit_cannot_extend_close_deadline() {
 
 /// W1-D Sol finding 3: `forced` comes from Host's own stop of a live vendor,
 /// not from group absence alone. Releasing an unclosed control while the vendor
-/// runs lets the anchor's EOF cleanup stop it (forced); a graceful close after
-/// the vendor exited on its own is absence without force.
+/// runs lets the anchor's EOF cleanup stop it, but that cleanup has no reply to
+/// carry the anchor's evidence, so it is not reported forced (W3-F Sol 2); a
+/// graceful close after the vendor exited on its own is absence without force.
 #[test]
 fn force_evidence_separates_host_stop_from_absence() {
     runtime().block_on(async {
@@ -593,8 +594,8 @@ fn force_evidence_separates_host_stop_from_absence() {
             "{report:?}"
         );
         assert!(
-            report.recovery[0].forced,
-            "released live vendor: {report:?}"
+            !report.recovery[0].forced,
+            "a release carries no anchor evidence: {report:?}"
         );
 
         let exited = Fixture::new().await;
@@ -619,5 +620,124 @@ fn force_evidence_separates_host_stop_from_absence() {
             "{report:?}"
         );
         assert!(!report.recovery[0].forced, "absence alone: {report:?}");
+    });
+}
+
+/// Whether `pid` names a live (non-zombie) process.
+fn process_live(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|text| {
+            let state = text.get(text.rfind(')')? + 2..)?.chars().next()?;
+            Some(state != 'Z' && state != 'X')
+        })
+        .unwrap_or(false)
+}
+
+/// Acquires `/bin/cat`, ends it by closing its stdin, and returns once the
+/// vendor has exited while Host's exit watch has not yet seen it: the vendor
+/// exits between Host's last status poll and a following stop. `None` when a
+/// poll saw the exit first; the caller retries with a fresh fixture.
+async fn vendor_exited_unobserved(
+    fixture: &Fixture,
+    host: &Host,
+) -> Option<(via_host::ProcessControl, via_host::ExitReceiver)> {
+    let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3));
+    let acquired = host
+        .acquire(fixture.spec("/bin/cat"), deadline)
+        .await
+        .unwrap();
+    let vendor_pid = fixture
+        .store
+        .runtime_resources()
+        .into_wire_parts()
+        .1
+        .list_anchor_records()
+        .await
+        .unwrap()[0]
+        .vendor_pid
+        .unwrap();
+    let via_host::AcquiredProcess {
+        pipes,
+        control,
+        exits,
+    } = acquired;
+    drop(pipes.stdin);
+    let started = std::time::Instant::now();
+    while process_live(vendor_pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cat did not exit"
+        );
+        std::thread::yield_now();
+    }
+    let unobserved = exits.borrow().is_none();
+    unobserved.then_some((control, exits))
+}
+
+/// W3-F Sol 2: `forced` needs the anchor's evidence that its cleanup stopped
+/// a live vendor. A vendor that exited between Host's last status poll and a
+/// force close was not stopped by Host, even though the anchor accepts the
+/// stop and Host's exit watch is still empty.
+#[test]
+fn force_close_after_unobserved_vendor_exit_is_not_forced() {
+    runtime().block_on(async {
+        for _ in 0..20 {
+            let fixture = Fixture::new().await;
+            let host = fixture.host();
+            let Some((control, _exits)) = vendor_exited_unobserved(&fixture, &host).await else {
+                continue;
+            };
+            let close = control
+                .close(CloseRequest {
+                    mode: CloseMode::Force,
+                    deadline: Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+                })
+                .await;
+            assert!(
+                matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+                "{close:?}"
+            );
+            assert!(!close.forced, "the vendor had already exited: {close:?}");
+            let report = host
+                .shutdown(Deadline::at(
+                    tokio::time::Instant::now() + Duration::from_secs(3),
+                ))
+                .await;
+            assert!(!report.recovery[0].forced, "{report:?}");
+            return;
+        }
+        panic!("Host's status poll saw every vendor exit first");
+    });
+}
+
+/// W3-F Sol 2, released-control path: releasing an unclosed control after the
+/// vendor exited, before Host's poll saw it, is not force evidence either.
+#[test]
+fn released_control_after_unobserved_vendor_exit_is_not_forced() {
+    runtime().block_on(async {
+        for _ in 0..20 {
+            let fixture = Fixture::new().await;
+            let host = fixture.host();
+            let Some(released) = vendor_exited_unobserved(&fixture, &host).await else {
+                continue;
+            };
+            drop(released);
+            let report = host
+                .shutdown(Deadline::at(
+                    tokio::time::Instant::now() + Duration::from_secs(3),
+                ))
+                .await;
+            assert!(
+                matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),
+                "{report:?}"
+            );
+            assert!(
+                !report.recovery[0].forced,
+                "the vendor had already exited: {report:?}"
+            );
+            return;
+        }
+        panic!("Host's status poll saw every vendor exit first");
     });
 }

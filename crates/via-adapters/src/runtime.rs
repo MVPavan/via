@@ -1,5 +1,8 @@
 use thiserror::Error;
-use tokio::{sync::mpsc, time::timeout_at};
+use tokio::{
+    sync::{mpsc, watch},
+    time::timeout_at,
+};
 
 use crate::{
     AcceptanceToken, Cleanup, ConnectionId, Deadline, FakeAcceptanceObservation, FakeConfig,
@@ -80,6 +83,11 @@ impl AdapterRuntime {
     /// decode order. When Core's channel is full this waits, bounded by `deadline`;
     /// if Core cannot take an observation, the Route receiver is dropped so Route
     /// fails the turn as overflow and still performs its cleanup and drain.
+    /// `force` set force-closes the turn through Route (C2 Close(Force)).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct input of the one turn"
+    )]
     pub async fn execute(
         &self,
         session_id: SessionId,
@@ -88,6 +96,7 @@ impl AdapterRuntime {
         prompt: String,
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
+        force: watch::Receiver<bool>,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
         let owner = ProcessOwner {
             session_id: session_id.clone(),
@@ -104,7 +113,7 @@ impl AdapterRuntime {
         let (route_tx, route_rx) = mpsc::channel::<RouteMessage>(64);
         let route = self
             .route
-            .execute(connection_id, process, start, route_tx, deadline);
+            .execute(connection_id, process, start, route_tx, deadline, force);
         tokio::pin!(route);
         let mut route_rx = Some(route_rx);
         loop {

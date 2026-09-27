@@ -1,5 +1,8 @@
 use serde_json::to_vec;
-use tokio::{sync::mpsc, time::timeout_at};
+use tokio::{
+    sync::{mpsc, watch},
+    time::timeout_at,
+};
 
 use super::{
     ConnectionId, Deadline, FakeMessage, FakeStart, PrivateProcessSpec, RawRef, RouteError,
@@ -48,6 +51,11 @@ impl FakeRoute {
     /// When that channel is full the route waits, bounded by `deadline`; a dropped
     /// receiver fails the turn as overflow. On any failure the private group is
     /// force-closed and both pipes are drained under a separate cleanup bound.
+    ///
+    /// `force` set fails the turn [`RouteError::ForceStopped`]: before launch
+    /// nothing starts; after it, frames already read are still forwarded, then
+    /// the same cleanup records every remaining vendor byte or reports the raw
+    /// log incomplete.
     pub async fn execute(
         &self,
         connection_id: ConnectionId,
@@ -55,11 +63,22 @@ impl FakeRoute {
         start: FakeStart,
         observations: mpsc::Sender<RouteMessage>,
         deadline: Deadline,
+        force: watch::Receiver<bool>,
     ) -> Result<FakeRouteResult, RouteFailure> {
         let turn = start.turn();
+        if *force.borrow() {
+            return Err(RouteFailure {
+                cause: RouteError::ForceStopped { turn },
+                evidence: None,
+                exit: None,
+                raw_incomplete: false,
+                cleanup: None,
+                forced: false,
+            });
+        }
         let mut wire = self
             .wire
-            .open_connection(connection_id, process, deadline)
+            .open_connection(connection_id, process, deadline, force)
             .await
             .map_err(|error| RouteFailure {
                 cause: wire_cause(turn, &error),
@@ -333,6 +352,7 @@ fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
         // A raw append the Store worker did not confirm in time is a Store failure.
         WireError::Raw(_) | WireError::RawDeadline => RouteError::Store { turn },
         WireError::Deadline => RouteError::Deadline { turn },
+        WireError::Cancelled => RouteError::ForceStopped { turn },
         WireError::Frame(WireFailure::FrameTooLarge) => {
             protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
         }

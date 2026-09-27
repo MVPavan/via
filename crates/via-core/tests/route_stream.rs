@@ -147,6 +147,8 @@ impl Child {
         let (sender, mut receiver) = mpsc::channel(4);
         let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
         let mut observed = Vec::new();
+        // Never set: these turns are not force-stopped.
+        let (_force, force) = tokio::sync::watch::channel(false);
         let result = runtime.block_on(async {
             let execute = adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
@@ -155,6 +157,7 @@ impl Child {
                 "hello".to_owned(),
                 sender,
                 deadline,
+                force,
             );
             tokio::pin!(execute);
             loop {

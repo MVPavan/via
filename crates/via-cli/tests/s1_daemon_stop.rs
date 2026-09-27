@@ -1165,3 +1165,216 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
         },
     )
 }
+
+/// W3-F Sol 1: a force accepted right after spawn receipts, while receipted
+/// turns may still be queued for daemon main and outside its drive set, still
+/// ends every receipted turn `cancelled` with truthful cancel fields and a
+/// clean exit. Several connections each pipeline a spawn and a force, so a
+/// force usually lands before daemon main takes some queued drive; the
+/// scenario repeats because that interleaving is not guaranteed. A first turn
+/// completes beforehand, so the scenario has raw evidence even when no raced
+/// turn launches.
+#[test]
+fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult {
+    for attempt in 0..4 {
+        scenario(
+            &format!("s1_daemon_stop_force_after_receipt_{attempt}"),
+            &drain_fixture(),
+            |paths, evidence| {
+                let mut daemon = Daemon::start(paths, evidence)?;
+                let (first, _, _) = start_held_turn(paths, evidence)?;
+                fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
+                wait_event(paths, &first, "turn.ended")?;
+                // Re-arm the gate: a launched raced turn holds until forced.
+                for name in ["hold.entered", "hold.release", "hold.released", "agent.pid"] {
+                    let _ = fs::remove_file(paths.sync.join(name));
+                }
+                let socket = paths.runtime.join("via.sock");
+                let racers: Vec<_> = (0..6)
+                    .map(|_| {
+                        let socket = socket.clone();
+                        thread::spawn(move || spawn_then_force(&socket))
+                    })
+                    .collect();
+                let mut sessions = Vec::new();
+                for racer in racers {
+                    let replies = racer
+                        .join()
+                        .map_err(|_| infra("racer panicked"))?
+                        .map_err(infra)?;
+                    evidence
+                        .write(
+                            &format!("replies_{}.json", sessions.len()),
+                            Value::from(replies.clone()).to_string().as_bytes(),
+                        )
+                        .map_err(infra)?;
+                    if let Some(session) = replies[0]["result"]["session_id"].as_str() {
+                        sessions.push(session.to_owned());
+                    }
+                }
+                let status = daemon
+                    .wait_exit(FINAL_SHUTDOWN)?
+                    .ok_or_else(|| fail("force stop did not exit"))?;
+                let summary = daemon.summary()?;
+                evidence
+                    .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                    .map_err(infra)?;
+                check(
+                    status.code() == Some(0) && summary["disposition"] == "clean",
+                    || format!("exit {status}, summary {summary}"),
+                )?;
+                for session in sessions {
+                    let (envelope, events) = paths.committed(&session)?;
+                    // `forced` only with Host evidence of a launched, stopped
+                    // vendor; a turn forced before launch was only `requested`.
+                    let outcome = if launched(paths, &session)? {
+                        "forced"
+                    } else {
+                        "requested"
+                    };
+                    check(
+                        envelope["state"] == "cancelled"
+                            && envelope["failure"].is_null()
+                            && envelope["stop_reason"] == "interrupted"
+                            && envelope["timestamps"]["accepted_at"].is_null()
+                            && envelope["cancel"]["outcome"] == outcome
+                            && envelope["cancel"]["cleanup"] == "quiescent",
+                        || format!("envelope {envelope}, summary {summary}"),
+                    )?;
+                    check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Pipelines `hello`, `spawn` and a forced `daemon/stop` on one connection and
+/// returns the spawn and stop replies.
+fn spawn_then_force(socket: &Path) -> Result<Vec<Value>, String> {
+    let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(FINAL_SHUTDOWN))
+        .map_err(|error| error.to_string())?;
+    let hello =
+        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"force-race"});
+    let spawn = json!({"harness":"fake","model":"fake","prompt":"hold","handle":format!("h_{}", "A".repeat(43))});
+    let mut requests = String::new();
+    for (id, method, params) in [
+        (1, "hello", hello),
+        (2, "spawn", spawn),
+        (3, "daemon/stop", json!({"force":true})),
+    ] {
+        requests.push_str(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+        );
+        requests.push('\n');
+    }
+    (&stream)
+        .write_all(requests.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut replies = BufReader::new(&stream);
+    let mut read = || -> Result<Value, String> {
+        let mut line = String::new();
+        replies
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&line).map_err(|error| format!("{error}: {line:?}"))
+    };
+    let _hello = read()?;
+    Ok(vec![read()?, read()?])
+}
+
+/// Whether Host committed an anchor intent for `session`, i.e. may have launched it.
+fn launched(paths: &Paths, session: &str) -> Result<bool, ScenarioError> {
+    let store = rusqlite::Connection::open_with_flags(
+        paths.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(infra)?;
+    store
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM anchors WHERE owner_session=?1)",
+            [session],
+            |row| row.get(0),
+        )
+        .map_err(infra)
+}
+
+/// W3-F merge follow-up: a force while vendor output is in flight never leaves
+/// the raw log silently short. The vendor writes an unterminated line, which
+/// Wire holds unframed, then waits; after the force, those bytes are in the
+/// connection's raw log, or the turn records `raw_log.incomplete` and the
+/// envelope warns `raw_log_incomplete`.
+#[test]
+fn s1_daemon_stop_force_keeps_in_flight_output_in_raw_log() -> TestResult {
+    const IN_FLIGHT: &str = r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":"in fli"#;
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"partial"}},
+            {"action":"emit_raw","text":IN_FLIGHT},
+            {"action":"report_pids"},
+            {"action":"gate","name":"hold"},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"late","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_force_in_flight_output",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let (session, agent, _) = start_held_turn(paths, evidence)?;
+            wait_event(paths, &session, "assistant.text")?;
+            let stop = paths.run(
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            wait_not_live(agent)?;
+            check(status.code() == Some(0), || format!("exit {status}"))?;
+            let (envelope, events) = paths.committed(&session)?;
+            evidence
+                .write("envelope.json", envelope.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                envelope["state"] == "cancelled"
+                    && envelope["cancel"]["outcome"] == "forced"
+                    && envelope["cancel"]["cleanup"] == "quiescent",
+                || format!("envelope {envelope}"),
+            )?;
+            let connection = format!("c_{}", session.trim_start_matches("s_"));
+            let raw = fs::read(paths.state.join("raw").join(format!("{connection}.raw")))
+                .map_err(infra)?;
+            let recorded = raw
+                .windows(IN_FLIGHT.len())
+                .any(|window| window == IN_FLIGHT.as_bytes());
+            let warned = envelope["warnings"].as_array().is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .any(|warning| warning["code"] == "raw_log_incomplete")
+            });
+            let mut prefix = vec![
+                "turn.queued",
+                "turn.submitted",
+                "turn.started",
+                "assistant.text",
+            ];
+            if !recorded {
+                prefix.push("raw_log.incomplete");
+            }
+            check(recorded != warned, || {
+                format!("raw log recorded in-flight bytes: {recorded}, warned: {warned}")
+            })?;
+            check_forced_lifecycle(&envelope, &events, &prefix)
+        },
+    )
+}

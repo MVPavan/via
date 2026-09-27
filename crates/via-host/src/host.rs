@@ -49,7 +49,8 @@ struct HostTasks {
     controls: Vec<TrackedControl>,
     /// Collected tasks that failed; a later shutdown still reports them.
     failed: usize,
-    /// Generations whose group Host stopped while the vendor was live.
+    /// Generations whose verified anchor reported that the stop Host requested
+    /// stopped a live vendor.
     forced: HashSet<String>,
 }
 
@@ -83,9 +84,7 @@ struct TrackedControl {
 /// How Host stopped one control's group, shared with its registration.
 #[derive(Default)]
 struct StopFacts {
-    /// A `close` ran, so the owner released the control only afterwards.
-    closed: AtomicBool,
-    /// The anchor accepted Host's stop while no vendor exit was observed.
+    /// The verified anchor reported that Host's stop stopped a live vendor.
     forced: AtomicBool,
 }
 
@@ -194,8 +193,8 @@ pub struct CloseReport {
     pub cleanup: CleanupEvidence,
     /// Last confirmed direct vendor exit, if known.
     pub vendor_exit: Option<ExitReport>,
-    /// The verified anchor accepted this stop while no vendor exit was
-    /// observed: Host force evidence, never proof of absence by itself.
+    /// The verified anchor reported that its cleanup for this stop began while
+    /// the vendor was live: Host force evidence, never proof of absence by itself.
     pub forced: bool,
 }
 
@@ -212,9 +211,10 @@ pub struct RecoveryReport {
     pub owner_turn: crate::TurnNumber,
     /// Positive absence or explicit uncertainty.
     pub cleanup: CleanupEvidence,
-    /// This Host stopped the group while its vendor was live: its verified
-    /// anchor accepted a stop, or the owner released the control unclosed and
-    /// the anchor's EOF cleanup stopped it. Kill evidence only with absence.
+    /// This Host's close stopped the group while its vendor was live, as the
+    /// verified anchor reported. A control released unclosed carries no such
+    /// evidence: the anchor's EOF cleanup has no reply. Kill evidence only
+    /// with absence.
     pub forced: bool,
 }
 
@@ -547,14 +547,6 @@ impl Host {
                 controls, forced, ..
             } = &mut *tasks;
             for control in controls.iter() {
-                // Released unclosed while the vendor was live: the anchor's EOF
-                // cleanup, triggered by Host's release, stopped the group.
-                if control.stream.strong_count() == 0
-                    && !control.stop.closed.load(Ordering::Acquire)
-                    && control.exit.borrow().is_none()
-                {
-                    control.stop.forced.store(true, Ordering::Release);
-                }
                 if control.stop.forced.load(Ordering::Acquire) {
                     forced.insert(control.generation.clone());
                 }
@@ -763,7 +755,6 @@ impl ProcessControl {
 
     /// Requests shutdown through the live anchor and proves group absence when possible.
     pub async fn close(&self, request: CloseRequest) -> CloseReport {
-        self.stop.closed.store(true, Ordering::Release);
         if request.mode == CloseMode::Graceful {
             let mut exit = self.exit.clone();
             let force_at = request
@@ -773,7 +764,6 @@ impl ProcessControl {
                 .unwrap_or_else(Instant::now);
             wait_graceful_exit(&mut exit, force_at).await;
         }
-        let vendor_live = self.exit.borrow().is_none();
         let stopping = timeout_at(request.deadline.instant(), async {
             let mut stream = self.stream.lock().await;
             stream
@@ -787,7 +777,9 @@ impl ProcessControl {
                 .await
         })
         .await;
-        let forced = vendor_live && matches!(stopping, Ok(Ok(Reply::Stopping)));
+        // Only the anchor knows whether the vendor was still live when its
+        // cleanup signalled the group; Host's polled exit watch may be stale.
+        let forced = matches!(stopping, Ok(Ok(Reply::Stopping { stopped_live: true })));
         if forced {
             self.stop.forced.store(true, Ordering::Release);
         }

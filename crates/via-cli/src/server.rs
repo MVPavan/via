@@ -147,8 +147,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 clients.spawn(handle_client(stream, client));
             }
             Some((session, prompt)) = drive_rx.recv() => {
-                let engine = Arc::clone(&engine);
-                drives.spawn(async move { engine.drive(&session, prompt).await });
+                spawn_drive(&mut drives, &engine, session, prompt);
             }
             () = stop.notified() => stopping = engine.stop_mode(),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
@@ -167,13 +166,26 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     drop(listener);
     // Best effort: a stale socket refuses connections and the next daemon replaces it.
     let _ = fs::remove_file(&socket);
+    drop(drive_tx);
     let joins = Joins {
         clients,
         drives,
+        queued: drive_rx,
         closing: closing_tx,
         failed: failed_joins,
     };
     Ok(final_shutdown(engine, joins, mode).await)
+}
+
+/// Drives one receipted turn independently of its client connection.
+fn spawn_drive(
+    drives: &mut JoinSet<Result<(), ApiError>>,
+    engine: &Arc<Engine>,
+    session: String,
+    prompt: String,
+) {
+    let engine = Arc::clone(engine);
+    drives.spawn(async move { engine.drive(&session, prompt).await });
 }
 
 /// Whether a joined drive ended without error; a failure is logged.
@@ -195,6 +207,9 @@ fn drive_joined(result: Result<Result<(), ApiError>, tokio::task::JoinError>) ->
 struct Joins {
     clients: JoinSet<anyhow::Result<()>>,
     drives: JoinSet<Result<(), ApiError>>,
+    /// Receipted turns handed off but not yet driven; a client holds a permit
+    /// from before its receipt commits until it hands the turn off.
+    queued: mpsc::Receiver<(String, String)>,
     closing: watch::Sender<bool>,
     failed: usize,
 }
@@ -213,11 +228,24 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     let Joins {
         mut clients,
         mut drives,
+        mut queued,
         closing,
         failed: mut failed_joins,
     } = joins;
     closing.send_replace(true);
-    // Force-stopped drives return at once; their terminals commit below.
+    // A force can land between a spawn receipt and daemon main taking its drive:
+    // every receipted turn is driven, so a force stop still settles it. `recv`
+    // ends once no client can hand off another turn; a spawn still committing
+    // past the deadline leaves its turn unresolved, which Core reports.
+    queued.close();
+    let _ = timeout_at(deadline, async {
+        while let Some((session, prompt)) = queued.recv().await {
+            spawn_drive(&mut drives, &engine, session, prompt);
+        }
+    })
+    .await;
+    // Force-stopped drives return after Route's bounded force cleanup; their
+    // terminals commit below.
     let joined = timeout_at(deadline, async {
         while let Some(result) = drives.join_next().await {
             if !drive_joined(result) {
@@ -234,20 +262,9 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     let report = timeout_at(deadline, engine.shutdown(Deadline::at(deadline))).await;
     // Every final record is committed: pending reads deliver, then clients close.
     let clients_by = deadline.checked_sub(STORE_RESERVE).unwrap_or(started);
-    let joined = timeout_at(clients_by, async {
-        while let Some(result) = clients.join_next().await {
-            if let Err(error) = result {
-                tracing::error!(%error, "client task failed");
-                failed_joins += 1;
-            }
-        }
-    })
-    .await;
-    if joined.is_err() {
-        pending_joins += clients.len();
-        clients.abort_all();
-        while clients.join_next().await.is_some() {}
-    }
+    let (pending, failed) = join_clients(&mut clients, clients_by, deadline).await;
+    pending_joins += pending;
+    failed_joins += failed;
     // Store Drop blocks on its writer and raw threads: keep it off Tokio workers
     // and bounded; a stalled join is left to process exit, never waited out.
     let store = match Arc::try_unwrap(engine) {
@@ -275,6 +292,37 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     // Best-effort bounded diagnostic; the exit status is the authoritative result.
     let _ = writeln!(io::stderr().lock(), "{summary}");
     if clean { 0 } else { 4 }
+}
+
+/// Joins client tasks until `clients_by`, then aborts the rest and awaits
+/// their exit only until the final `deadline`; one that has not reached an
+/// abort point by then is left to process exit. Returns `(pending, failed)`,
+/// where `pending` counts clients unjoined at `clients_by`.
+async fn join_clients(
+    clients: &mut JoinSet<anyhow::Result<()>>,
+    clients_by: Instant,
+    deadline: Instant,
+) -> (usize, usize) {
+    let mut failed = 0;
+    let joined = timeout_at(clients_by, async {
+        while let Some(result) = clients.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "client task failed");
+                failed += 1;
+            }
+        }
+    })
+    .await;
+    let mut pending = 0;
+    if joined.is_err() {
+        pending = clients.len();
+        clients.abort_all();
+        let _ = timeout_at(deadline, async {
+            while clients.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    (pending, failed)
 }
 
 /// Drops `value` on the blocking pool, waiting at most until `deadline`.
@@ -446,11 +494,15 @@ async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value,
             )
         }
         "spawn" => {
-            let (receipt, session, prompt) = engine.spawn(typed::<SpawnParams>(params)?).await?;
-            drives
-                .send((session, prompt))
+            let params = typed::<SpawnParams>(params)?;
+            // Reserved before the receipt commits, so final shutdown waits for
+            // this handoff; the queue closes only in final shutdown.
+            let handoff = drives
+                .reserve()
                 .await
-                .map_err(|_| ApiError::STORE)?;
+                .map_err(|_| ApiError::DAEMON_STOPPING)?;
+            let (receipt, session, prompt) = engine.spawn(params).await?;
+            handoff.send((session, prompt));
             Ok(receipt)
         }
         "steer" => Ok(engine.steer(typed::<SteerParams>(params)?).await?),
@@ -579,6 +631,32 @@ async fn read_line_limit<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W3-F Sol 4: a client task that does not reach an abort point promptly
+    /// cannot hold daemon main past the final deadline; it is counted pending
+    /// and left to process exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unabortable_client_join_stops_at_the_final_deadline() {
+        let mut clients = JoinSet::new();
+        clients.spawn(async {
+            // Blocks its worker: abort takes effect only once it returns.
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(())
+        });
+        let started = Instant::now();
+        let (pending, failed) = join_clients(
+            &mut clients,
+            started + Duration::from_millis(50),
+            started + Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!((pending, failed), (1, 0));
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "client join passed the final deadline: {:?}",
+            started.elapsed()
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn stalled_blocking_drop_is_abandoned_at_the_deadline() {

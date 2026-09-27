@@ -3,7 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Mutex as StdMutex, PoisonError,
+        Mutex as StdMutex, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -43,8 +43,10 @@ pub struct Engine {
     admission: tokio::sync::Mutex<()>,
     /// Accepted `daemon/stop` mode; set under `admission`, never cleared.
     stop: StdMutex<Option<StopMode>>,
-    /// Tells running drives to abandon their execution (C1 §3.14 `force`).
+    /// Tells running drives to force-close their execution (C1 §3.14 `force`).
     force: watch::Sender<bool>,
+    /// When the force stop was accepted: every forced turn's `requested_at`.
+    force_requested_at: OnceLock<String>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
     /// Receipted turns with no terminal known to have committed; a turn whose
@@ -112,6 +114,8 @@ struct ForcedTurn {
     started: Started,
     record: TurnRecord,
     requested_at: String,
+    /// Route's force cleanup could not record every vendor byte.
+    raw_incomplete: bool,
 }
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -121,8 +125,12 @@ const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 enum Driven {
     /// The adapter returned its outcome.
     Finished(Result<FakeTerminalEvidence, AdapterError>),
-    /// A force stop abandoned the execution.
-    Forced { requested_at: String },
+    /// A force stop closed the execution through Route.
+    Forced {
+        requested_at: String,
+        /// Route's cleanup drain could not record every vendor byte.
+        raw_incomplete: bool,
+    },
 }
 
 /// Durable facts established once a turn's submission committed.
@@ -167,6 +175,7 @@ impl Engine {
             admission: tokio::sync::Mutex::new(()),
             stop: StdMutex::new(None),
             force: watch::Sender::new(false),
+            force_requested_at: OnceLock::new(),
             forced: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
             finalized: AtomicBool::new(false),
@@ -199,6 +208,8 @@ impl Engine {
         };
         *stop = Some(mode);
         if mode == StopMode::Force {
+            self.force_requested_at
+                .get_or_init(|| rfc3339(SystemTime::now()));
             self.force.send_replace(true);
         }
         Ok(mode)
@@ -308,7 +319,16 @@ impl Engine {
             .await
         {
             Driven::Finished(outcome) => outcome,
-            Driven::Forced { requested_at } => {
+            Driven::Forced {
+                requested_at,
+                raw_incomplete,
+            } => {
+                if raw_incomplete {
+                    let body = EventBody::RawLogIncomplete {
+                        connection_id: connection,
+                    };
+                    self.commit_event(&mut record, body, None).await;
+                }
                 self.commit_event(&mut record, EventBody::CancelRequested {}, None)
                     .await;
                 // Final shutdown commits the cancelled terminal once Host has evidence.
@@ -316,6 +336,7 @@ impl Engine {
                     started,
                     record,
                     requested_at,
+                    raw_incomplete,
                 });
                 return Ok(());
             }
@@ -499,7 +520,8 @@ impl Engine {
 
     /// Drives the adapter under the turn deadline, committing each observation it
     /// reports in decode order before the adapter outcome is returned. A force stop
-    /// abandons the execution instead.
+    /// reaches Route, which force-closes the group and drains its output first:
+    /// frames it read still commit, and the raw log is complete or reported not.
     async fn execute(
         &self,
         record: &mut TurnRecord,
@@ -510,7 +532,6 @@ impl Engine {
         // Full: Adapter waits under the turn deadline; this loop keeps draining until
         // the adapter finishes.
         let (observed_tx, mut observed_rx) = mpsc::channel::<FakeObservation>(64);
-        let mut forced = self.force.subscribe();
         let mut execute = Box::pin(self.adapter.execute(
             record.session.clone(),
             record.turn,
@@ -518,24 +539,12 @@ impl Engine {
             prompt,
             observed_tx,
             deadline,
+            self.force.subscribe(),
         ));
         // No branch is cancelled mid-commit: an observation arm runs to completion
         // before the next poll, and the adapter's own sends wait for capacity.
         loop {
             tokio::select! {
-                biased;
-                // The watch guard is released before the handler's awaits.
-                true = async { forced.wait_for(|forced| *forced).await.is_ok() } => {
-                    let requested_at = rfc3339(SystemTime::now());
-                    // Force stop: dropping the execution releases its Host control, so
-                    // the anchor's reviewed EOF cleanup stops the whole group.
-                    drop(execute);
-                    // Observations already reported still commit, in decode order.
-                    while let Ok(observation) = observed_rx.try_recv() {
-                        self.observe(record, observation).await;
-                    }
-                    return Driven::Forced { requested_at };
-                }
                 Some(observation) = observed_rx.recv() => {
                     self.observe(record, observation).await;
                 }
@@ -543,7 +552,21 @@ impl Engine {
                     while let Ok(observation) = observed_rx.try_recv() {
                         self.observe(record, observation).await;
                     }
-                    return Driven::Finished(result);
+                    return match result {
+                        Err(AdapterError::Route(route))
+                            if matches!(route.cause, RouteError::ForceStopped { .. }) =>
+                        {
+                            Driven::Forced {
+                                requested_at: self
+                                    .force_requested_at
+                                    .get()
+                                    .cloned()
+                                    .unwrap_or_else(|| rfc3339(SystemTime::now())),
+                                raw_incomplete: route.raw_incomplete,
+                            }
+                        }
+                        result => Driven::Finished(result),
+                    };
                 }
             }
         }
@@ -721,6 +744,10 @@ impl Engine {
                     warnings: Vec::new(),
                     cancel: Some(cancel),
                 };
+                if turn.raw_incomplete {
+                    // `raw_log.incomplete` committed when the drive ended.
+                    terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
+                }
                 if record.store_failed {
                     // C1 §8.2: the durable stream already lost an event; a
                     // cancellation must not present it as a complete record.
@@ -1015,6 +1042,8 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         RouteError::Overflow { .. } => ("failed", Some(FailureClass::Overflow), "error"),
         RouteError::Store { .. } => ("failed", Some(FailureClass::Store), "error"),
         RouteError::Deadline { .. } => ("failed", Some(FailureClass::DeadlineWall), "deadline"),
+        // Core settles a force stop itself; this is only the C1 §7.6 force row.
+        RouteError::ForceStopped { .. } => ("cancelled", None, "interrupted"),
         // Input may have reached the vendor and no exit is confirmed (§7.6).
         RouteError::TransportLost { .. } => ("unknown", None, "error"),
     }
