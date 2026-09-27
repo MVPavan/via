@@ -227,6 +227,20 @@ pub(super) fn read_anchor_records(
         .collect()
 }
 
+/// Committed anchors after `after` in `anchor_id` order with no absence proof.
+pub(super) fn count_unproven_anchors(
+    conn: &Connection,
+    after: Option<&str>,
+) -> Result<u64, StoreError> {
+    conn.query_row(
+        "SELECT count(*) FROM anchors WHERE (?1 IS NULL OR anchor_id>?1) AND absence_time IS NULL",
+        params![after],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(i64::cast_unsigned)
+    .map_err(|error| StoreError::Write(error.to_string()))
+}
+
 /// One page of committed anchors, in `anchor_id` order after `after`, with
 /// their owning turns, for recovery's coverage check; no marker, identity or
 /// control path.

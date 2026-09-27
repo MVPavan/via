@@ -33,6 +33,10 @@ use crate::{
     protocol::{self, Bootstrap, Reply, Request, VendorConfig},
 };
 
+/// Absence verification after a failed acquisition: close's cleanup
+/// allowance (Route bounds every close by 3 s).
+const FAILED_ACQUIRE_CLEANUP: Duration = Duration::from_secs(3);
+
 /// One daemon-side Host instance tied to a validated private anchor directory.
 #[derive(Clone)]
 pub struct Host {
@@ -382,9 +386,31 @@ impl Host {
         {
             return Err(HostError::Invalid("reserved vendor marker environment key"));
         }
-        timeout_at(deadline.instant(), self.acquire_inner(spec, launch, stop))
-            .await
-            .map_err(|_| HostError::Deadline)?
+        let mut started = None;
+        let acquired = timeout_at(
+            deadline.instant(),
+            self.acquire_inner(spec, launch, stop, &mut started),
+        )
+        .await
+        .map_err(|_| HostError::Deadline)
+        .flatten();
+        if acquired.is_err()
+            && let Some((anchor_id, generation, identity)) = started
+        {
+            // Design §11: a failed acquisition whose anchor spawned proves the
+            // group absent before it returns, as close does and within close's
+            // cleanup allowance. The anchor control is dropped by now, so the
+            // anchor exits on EOF and stops its group. Only `GroupAbsent`
+            // releases the anchor's capacity; uncertainty keeps it.
+            let cleanup = Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP);
+            let evidence = wait_absence(&self.journal, &anchor_id, &generation, &identity, cleanup)
+                .await
+                .unwrap_or(CleanupEvidence::Uncertain(
+                    CleanupReason::EvidenceStoreFailure,
+                ));
+            self.capacity.settle(&anchor_id, &evidence);
+        }
+        acquired
     }
 
     /// Holds capacity for a group this Host did not launch, such as one an
@@ -529,6 +555,7 @@ impl Host {
         mut spec: PrivateProcessSpec,
         launch: &LaunchPipes,
         stop: &watch::Receiver<bool>,
+        started: &mut Option<(String, String, ProcessIdentity)>,
     ) -> Result<AcquiredProcess, HostError> {
         let StartedAnchor {
             anchor_id,
@@ -540,6 +567,7 @@ impl Host {
         } = self
             .start_anchor(spec.owner.clone(), spec.capacity.take())
             .await?;
+        *started = Some((anchor_id.clone(), generation.clone(), identity.clone()));
         let mut vendor_env = spec.env.entries().to_vec();
         vendor_env.push(("VIA_PROCESS_MARKER".into(), linux::random_hex()?.into()));
         let vendor = VendorConfig::from_parts(&spec.program, &spec.args, &spec.cwd, &vendor_env);

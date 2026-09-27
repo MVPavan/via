@@ -542,25 +542,41 @@ wait releases no admission capacity."
   1. no group was created: a refused grant, a failed submission commit, or
      a launch that fails before the anchor spawns drops it at once;
   2. Host has positively proved the group absent (`GroupAbsent`, from a
-     close or from reconciliation), which drops the ledger's token.
+     close, from a failed acquisition, or from reconciliation), which drops
+     the ledger's token.
 
-  None of these release it: a dispatcher future dropped after launch, a
-  `run` that returns with cleanup `uncertain`, a forced turn handed to
-  final shutdown, or a launch that fails after the anchor spawned (its anchor stops the
-  group on EOF, but nothing has proved that). Final shutdown's
-  reconciliation proves absence for its anchors and releases their permits
-  then.
+  None of these release it: a dispatcher future dropped after launch, or a
+  `run` that returns with cleanup `uncertain`, or a forced turn handed to
+  final shutdown. Final shutdown's reconciliation proves absence for its
+  anchors and releases their permits then.
+- **Failed acquisition (round 1).** Once the anchor has spawned and been
+  identified, a failed acquisition runs the same bounded absence
+  verification as close before the error returns. Such failures include a
+  Configure refusal, an ARM failure such as a missing vendor executable, a
+  protocol error, or the acquisition deadline. The verification runs within
+  close's 3 s cleanup allowance, with the anchor control already dropped so
+  the anchor exits on EOF. Only `GroupAbsent` settles the ledger entry;
+  uncertainty keeps the token. An anchor that spawned but failed before it
+  was identified cannot be probed, so it keeps its token.
 - **Recovered groups.** After startup recovery reconciles the anchor
   inventory, and before the restart handoff (§10) dispatches, every
   committed anchor whose absence recovery did not prove (an uncertain
   report, or none) holds a slot until a later Host absence proof. Past the
   pool, these groups share the permits they could reserve: a permit frees
   only once fewer such groups than held permits remain. With 4 or more, no
-  new child starts until cleanup proves room. Anchors that a
-  reconciliation deadline left unread hold nothing. This round adds no
-  re-probe loop for recovered groups; the orchestrator records that on
-  `via-jm4.7.7`, so such a slot is held until the daemon's next
-  reconciliation (shutdown or restart).
+  new child starts until cleanup proves room.
+- **Unread anchors (round 1).** When reconciliation stops paging at its
+  deadline, startup still proceeds (T2-A round 3; C1 §7.5 and runtime §7
+  allow uncertain cleanup). Core then makes one bounded Store query: the
+  committed anchors after the last reconciled cursor with no absence proof
+  (`absence_time IS NULL`). That count joins the recovered holdings as
+  unidentified groups, through the same accounting capped at the pool. They
+  have no Host ledger entry, and nothing releases them before the next full
+  reconciliation (final shutdown or restart). A failure of that query is a
+  Store failure and fails startup (runtime §7). This round adds no
+  re-probe loop for recovered or unidentified groups; the orchestrator
+  records both on `via-jm4.7.7`, so such a slot is held until the daemon's
+  next reconciliation (shutdown or restart).
 - **Wakes.** A waiting dispatcher wakes on a slot release (the semaphore
   hands the permit to the oldest waiter) and on the force signal. The force
   signal also carries force acceptance and phase one of the Store-failed

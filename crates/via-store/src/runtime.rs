@@ -545,6 +545,7 @@ enum Command {
         u32,
         oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
     ),
+    UnprovenAnchors(Option<String>, oneshot::Sender<Result<u64, StoreError>>),
     QueuedTurns(
         Option<(SessionId, TurnNumber)>,
         u32,
@@ -910,6 +911,15 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
+    /// Counts committed anchors after the `after` anchor id with no recorded
+    /// absence proof, in one query: the groups a recovery deadline left
+    /// unread (design §11).
+    pub async fn unproven_anchors_after(&self, after: Option<String>) -> Result<u64, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::UnprovenAnchors(after, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
     /// Reads one page of up to `limit` (1 to 256) durable `queued` turns in
     /// `(session, turn)` order after `after`, for the restart handoff.
     pub async fn queued_turns_page(
@@ -1072,7 +1082,7 @@ mod sql;
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, read_anchor_owners, read_anchor_records,
+    commit_vendor_facts, count_unproven_anchors, read_anchor_owners, read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, validate_regular, validate_state, writer_loop};

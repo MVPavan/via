@@ -337,20 +337,22 @@ impl<'a> Daemon<'a> {
     }
 
     /// `start` with the connection-slot pool lowered to `slots` (design §11).
+    /// `fake` replaces the fake vendor binary path when given.
     fn start_slots(
         paths: &'a Paths,
         evidence: &Evidence,
         run: &str,
         slots: usize,
+        fake: Option<&std::path::Path>,
     ) -> Result<Self, ScenarioError> {
-        let mut daemon = Self::spawn_with(paths, evidence, run, Some(slots))?;
+        let mut daemon = Self::spawn_with(paths, evidence, run, Some(slots), fake)?;
         daemon.wait_ready()?;
         Ok(daemon)
     }
 
     /// Starts a daemon without waiting for it to admit requests.
     fn spawn(paths: &'a Paths, evidence: &Evidence, run: &str) -> Result<Self, ScenarioError> {
-        Self::spawn_with(paths, evidence, run, None)
+        Self::spawn_with(paths, evidence, run, None, None)
     }
 
     fn spawn_with(
@@ -358,6 +360,7 @@ impl<'a> Daemon<'a> {
         evidence: &Evidence,
         run: &str,
         slots: Option<usize>,
+        fake: Option<&std::path::Path>,
     ) -> Result<Self, ScenarioError> {
         let trace = if run == "final" {
             evidence.dir.join("daemon.trace")
@@ -368,6 +371,9 @@ impl<'a> Daemon<'a> {
         paths.failpoints.activate(&mut command);
         if let Some(slots) = slots {
             command.env("VIA_TEST_CONNECTION_SLOTS", slots.to_string());
+        }
+        if let Some(fake) = fake {
+            command.env("VIA_FAKE_AGENT_BINARY", fake);
         }
         command
             .arg("daemon")
@@ -2412,7 +2418,7 @@ fn s1_t2d_uncertain_cleanup_keeps_its_connection_slot() -> TestResult {
         |paths, evidence| {
             let commit = "host.recovery.absence_commit";
             paths.failpoints.arm(commit, 1, "fail_io").map_err(infra)?;
-            let mut daemon = Daemon::start_slots(paths, evidence, "uncertain", 1)?;
+            let mut daemon = Daemon::start_slots(paths, evidence, "uncertain", 1, None)?;
             let first = spawn_session(paths, evidence, "spawn-a", "s0")?;
             let envelope = t2c_wait(paths, evidence, &format!("{first}/1"))?;
             let unproven = "SELECT count(*) FROM anchors WHERE absence_time IS NULL";
@@ -2456,13 +2462,101 @@ fn s1_t2d_unproven_recovered_group_reduces_capacity() -> TestResult {
             )
             .map_err(infra)?;
         check(changed == 1, || "no anchor to copy".to_owned())?;
-        let mut daemon = Daemon::start_slots(paths, evidence, "restarted", 1)?;
+        let mut daemon = Daemon::start_slots(paths, evidence, "restarted", 1, None)?;
         let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
         still_waiting(paths, &waiting)?;
         // The group is still unproven at shutdown: `incomplete`, exit 4.
         force_cancels_waiting(paths, evidence, &mut daemon, &waiting, 4)?;
         drop(daemon);
         delete_synthetic(paths, "unverified-")?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        completes_normally(paths, evidence).map(drop)
+    })
+}
+
+/// T2-D round 1, decision 1 (design §11): a failed acquisition proves its
+/// group absent before it returns. With one slot, turn A's vendor binary is
+/// missing, so the anchor refuses ARM (`VendorSpawnFailed`) and A ends
+/// `unknown` (or `failed`).
+/// Host then proves A's group absent and releases the slot, so turn B in
+/// another session launches and completes. Before, A's slot stayed held
+/// until shutdown and B never launched.
+#[test]
+fn s1_t2d_failed_acquisition_releases_its_proved_absent_slot() -> TestResult {
+    scenario(
+        "s1_t2d_failed_acquisition",
+        &two_quick(),
+        |paths, evidence| {
+            let vendor = paths.state.with_file_name("vendor");
+            let hidden = paths.state.with_file_name("vendor.hidden");
+            fs::copy(&paths.fake, &vendor).map_err(infra)?;
+            let _daemon = Daemon::start_slots(paths, evidence, "final", 1, Some(&vendor))?;
+            fs::rename(&vendor, &hidden).map_err(infra)?;
+            let failed = spawn_session(paths, evidence, "spawn-a", "s0")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{failed}/1"))?;
+            check(
+                envelope["state"] == "unknown" || envelope["state"] == "failed",
+                || format!("turn A with no vendor: {envelope}"),
+            )?;
+            fs::rename(&hidden, &vendor).map_err(infra)?;
+            let next = spawn_session(paths, evidence, "spawn-b", "s1")?;
+            let envelope = t2c_wait(paths, evidence, &format!("{next}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("turn B after A's failed launch: {envelope}")
+            })?;
+            let unproven = store_count(
+                paths,
+                "SELECT count(*) FROM anchors WHERE absence_time IS NULL",
+            )?;
+            check(unproven == 0, || {
+                format!("{unproven} anchors left unproven")
+            })
+        },
+    )
+}
+
+/// T2-D round 1, decision 2 (design §11): a recovery deadline counts the
+/// anchors it left unread. 300 proven-absent synthetic anchors sort first;
+/// one with no identity and no absence proof sorts after the first page.
+/// Reconciliation is held at the page boundary past its deadline, so paging
+/// stops before that anchor. Startup still admits, and with one slot a new
+/// turn stays `queued`, unsent, with no anchor. The force stop cancels it;
+/// exit 4, since the anchor is still unproven. Before, the unread anchor
+/// held nothing and the turn launched at once.
+#[test]
+fn s1_t2d_recovery_deadline_counts_unread_unproven_anchors() -> TestResult {
+    scenario("s1_t2d_unread_anchors", &two_quick(), |paths, evidence| {
+        let daemon = Daemon::start(paths, evidence, "first")?;
+        let ended = spawn_session(paths, evidence, "spawn-a", "s0")?;
+        let envelope = t2c_wait(paths, evidence, &format!("{ended}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        drop(daemon);
+        insert_proven_absent(paths, &ended, "0-synthetic", 300)?;
+        let changed = rusqlite::Connection::open(paths.state.join("store.sqlite3"))
+            .map_err(infra)?
+            .execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
+                 SELECT '1-unproven','g-1-unproven',a.marker,'/nonexistent',a.owner_session,1,a.uid,a.boot_id,a.pid_namespace,'intent',1
+                 FROM anchors a WHERE a.owner_session=?1 LIMIT 1",
+                [&ended],
+            )
+            .map_err(infra)?;
+        check(changed == 1, || "no anchor to copy".to_owned())?;
+        let boundary = "core.recovery.page_boundary";
+        arm(paths, boundary, "pause")?;
+        let mut daemon = Daemon::spawn_with(paths, evidence, "restarted", Some(1), None)?;
+        acknowledged(paths, evidence, boundary, "pause", &daemon)?;
+        // The deadline began before the acknowledgement: 5 s after it has passed.
+        thread::sleep(Duration::from_millis(5_200));
+        paths.failpoints.release(boundary, 1).map_err(infra)?;
+        daemon.wait_ready()?;
+        paths.failpoints.disarm(boundary).map_err(infra)?;
+        let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
+        still_waiting(paths, &waiting)?;
+        force_cancels_waiting(paths, evidence, &mut daemon, &waiting, 4)?;
+        drop(daemon);
+        delete_synthetic(paths, "0-synthetic")?;
+        delete_synthetic(paths, "1-unproven")?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
     })

@@ -118,3 +118,63 @@ the new code; the mutated file was restored after each run.
 4. **Test 6's exit 4 is existing behaviour.** Shutdown with an unproven
    anchor is `incomplete`. The test asserts it rather than working around
    it.
+
+## Round 1
+
+Sol high's review (`../sol-review-T2-D.md`) returned UNSOUND with two
+blockers. The permit lifecycle on the normal, forced and handoff paths was
+confirmed, with no double release. I merged `origin/rust-foundation`
+(docs only) and applied the orchestrator's decisions as given. Blocker 2
+uses the orchestrator's decision, not Sol's "fail startup on incomplete
+inventory". I found no contradiction with the contract text I re-read:
+runtime §5 (close's 3 s cleanup allowance; "a timed-out wait releases no
+admission capacity"), the §8 connection bound, and the C1 §7.5 row
+(unverified anchors give uncertain cleanup). For the deadline itself I
+relied on T2-A round 3 rather than re-reading runtime §7. Design §11 is
+updated with both decisions.
+
+Item 1 differs from close in one way: close sends the anchor `Stop`, while
+a failed acquisition has already dropped the anchor control. The anchor
+stops its own group on EOF; after a vendor spawn failure it replies with an
+error and exits. Host then runs the same `wait_absence` proof.
+
+| # | Item | Change | Regression; failure with the fix reverted |
+|---|---|---|---|
+| 1 | **Blocker 1:** a failed acquisition kept its slot until shutdown (open item 2 above) | `Host::acquire_retaining` records the anchor once it has spawned and been identified. If the acquisition then fails (Configure refusal, ARM failure, protocol error, or its deadline), the anchor control is already dropped, so the anchor exits on EOF. Before the error returns, Host runs close's `wait_absence` within close's 3 s cleanup allowance (`FAILED_ACQUIRE_CLEANUP`). It settles the ledger entry only on `GroupAbsent`; uncertainty keeps the token | `s1_t2d_failed_acquisition_releases_its_proved_absent_slot`: pool 1. The daemon's fake vendor is a private copy, hidden for turn A, so the anchor refuses ARM (`VendorSpawnFailed`) and A ends `unknown`. The copy is restored, and turn B in another session completes; no anchor is left without an absence proof. Reverted (no verification): `via wait` for B timed out after 15 s |
+| 2 | **Blocker 2:** anchors past a recovery deadline held no slot (open item 3 above) | When paging stops at the deadline, `reconcile` makes one Store query, `unproven_anchors_after(cursor)`: committed anchors after the last reconciled id with `absence_time IS NULL`. `RecoveredSlots::hold_unidentified` adds that count to the recovered groups, and they are never released before the next full reconciliation. A query failure fails startup as a Store error. Startup still proceeds on the deadline, as T2-A round 3 requires | `s1_t2d_recovery_deadline_counts_unread_unproven_anchors`: 300 proven-absent synthetic anchors sort first, and `1-unproven` (no identity, no absence proof) sorts after the first page. Reconciliation is held at `core.recovery.page_boundary` 5.2 s past its deadline. The daemon admits, and with pool 1 a new turn stays `queued` with no `submitted_at` and no anchor. The force stop cancels it unsent; exit 4. Reverted (no hold): "the waiting turn launched: completed …" |
+| 2a | Accounting for item 2 | Unidentified groups are all counted before permits are taken, so later drops of identified groups cannot free a slot while unread groups remain | `unidentified_groups_stay_counted_when_identified_ones_are_proved_absent` (Core unit): pool 4, 3 identified and 5 unidentified groups. Clearing the identified ones leaves 0 permits. With groups counted only while permits remain, it panics at "five unread groups still fill four" |
+
+T2-A's `s1_f10_reconciliation_deadline_settles_uncertain_and_admits` and
+the other F10 tests still pass unchanged.
+
+**Files (Round 1):**
+- `via-host/src/host.rs`: failed-acquisition verification.
+- `via-store`: `runtime.rs` (`unproven_anchors_after`), `runtime/sql.rs`,
+  `runtime/anchor.rs` (`count_unproven_anchors`).
+- `via-core/src/engine/recovery.rs`: the deadline count,
+  `hold_unidentified` and a unit test.
+- `via-cli/tests/s1_crash_points.rs`: two tests; `Daemon::spawn_with`
+  takes a fake-binary override.
+- `dispatch-design.md` §11.
+
+**Open or uncertain (Round 1):**
+- Items 2 and 3 above are resolved.
+- Item 1, no re-probe loop, stands for recovered, unidentified and
+  uncertain groups (`via-jm4.7.7`).
+- A failed acquisition whose anchor spawned but failed before it was
+  identified (ready frame, identity check or identity commit) cannot be
+  probed, so it keeps its slot until the next reconciliation.
+- A failed acquisition now returns up to 3 s later, while absence is
+  verified.
+- The unread-anchor count also includes anchors of ended turns that were
+  never proved absent. That is intended: any unproven group counts.
+
+**Gate (Round 1):**
+
+| Check | Result |
+|---|---|
+| fmt, `git diff --check`, both clippy configurations, deny, layers | pass |
+| `cargo nextest run --locked --workspace` | 172 passed, 2 skipped |
+| `… --features via-cli/test-failpoints`, 5 full runs | 5 of 5: 202 passed, 2 skipped |
+| `… -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 17 passed |
+| release build and `check-release-features.py` | pass: 11 points armed and ignored, none of 15 markers present |
