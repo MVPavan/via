@@ -132,7 +132,11 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
                 true
             }
             Command::Terminal(record, reply) => {
-                let _ = reply.send(commit_terminal(&mut conn, root, &record));
+                let _ = reply.send(commit_terminal(&mut conn, root, &record, None));
+                true
+            }
+            Command::ClosingTerminal(record, closed, reply) => {
+                let _ = reply.send(commit_terminal(&mut conn, root, &record, Some(&closed)));
                 true
             }
             Command::Result(session, turn, reply) => {
@@ -415,10 +419,13 @@ fn commit_event(
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
 
+/// Commits the terminal and, when `closed` is given, the session's
+/// `session.closed` event after it, in the same transaction.
 fn commit_terminal(
     conn: &mut Connection,
     root: &Path,
     record: &TerminalRecord,
+    closed: Option<&Value>,
 ) -> Result<(), StoreError> {
     let state = record
         .envelope
@@ -450,9 +457,15 @@ fn commit_terminal(
         &record.event,
         record.raw_ref.as_ref(),
     )?;
+    if let Some(closed) = closed {
+        insert_event(&tx, &record.session_id, closed, None)?;
+    }
     tx.execute(
-        "UPDATE sessions SET state='idle' WHERE id=?1",
-        [record.session_id.as_str()],
+        "UPDATE sessions SET state=?2 WHERE id=?1",
+        params![
+            record.session_id.as_str(),
+            if closed.is_some() { "closed" } else { "idle" }
+        ],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.commit()

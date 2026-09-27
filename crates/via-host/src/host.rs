@@ -1,6 +1,7 @@
 //! Daemon-side anchor launch, durable gate and verified cleanup.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
@@ -41,10 +42,15 @@ pub struct Host {
     tasks: Arc<StdMutex<HostTasks>>,
 }
 
+/// Owned tasks and live controls, plus facts kept until the daemon exits.
 #[derive(Default)]
 struct HostTasks {
     running: Vec<Arc<TrackedTask>>,
     controls: Vec<TrackedControl>,
+    /// Collected tasks that failed; a later shutdown still reports them.
+    failed: usize,
+    /// Generations whose group Host stopped while the vendor was live.
+    forced: HashSet<String>,
 }
 
 /// Owned task outcome: an `Err` is a failed task, such as a failed child wait.
@@ -71,6 +77,16 @@ struct TrackedControl {
     anchor_id: String,
     generation: String,
     exit: ExitReceiver,
+    stop: Arc<StopFacts>,
+}
+
+/// How Host stopped one control's group, shared with its registration.
+#[derive(Default)]
+struct StopFacts {
+    /// A `close` ran, so the owner released the control only afterwards.
+    closed: AtomicBool,
+    /// The anchor accepted Host's stop while no vendor exit was observed.
+    forced: AtomicBool,
 }
 
 /// Host launch, durable journal or private-control failure.
@@ -168,6 +184,7 @@ pub struct ProcessControl {
     generation: String,
     journal: ProcessJournal,
     exit: ExitReceiver,
+    stop: Arc<StopFacts>,
 }
 
 /// Process facts and cleanup evidence from a close request.
@@ -177,6 +194,9 @@ pub struct CloseReport {
     pub cleanup: CleanupEvidence,
     /// Last confirmed direct vendor exit, if known.
     pub vendor_exit: Option<ExitReport>,
+    /// The verified anchor accepted this stop while no vendor exit was
+    /// observed: Host force evidence, never proof of absence by itself.
+    pub forced: bool,
 }
 
 /// Recovery result for one committed anchor intent.
@@ -192,6 +212,10 @@ pub struct RecoveryReport {
     pub owner_turn: crate::TurnNumber,
     /// Positive absence or explicit uncertainty.
     pub cleanup: CleanupEvidence,
+    /// This Host stopped the group while its vendor was live: its verified
+    /// anchor accepted a stop, or the owner released the control unclosed and
+    /// the anchor's EOF cleanup stopped it. Kill evidence only with absence.
+    pub forced: bool,
 }
 
 /// Bounded shutdown result, returned on every path; unfinished tasks retain
@@ -202,7 +226,8 @@ pub struct ShutdownReport {
     pub recovery: Vec<RecoveryReport>,
     /// Retained reaper or status tasks whose result was not collected by the deadline.
     pub pending_tasks: usize,
-    /// Collected tasks that panicked, were cancelled or failed their child wait.
+    /// Tasks that panicked, were cancelled or failed their child wait, collected
+    /// by this or any earlier shutdown call.
     pub failed_tasks: usize,
     /// The named deadline, Store or recovery failure that precluded a complete report.
     pub failure: Option<HostError>,
@@ -432,6 +457,7 @@ impl Host {
             generation,
             journal: self.journal.clone(),
             exit: exits.clone(),
+            stop: Arc::default(),
         };
         self.track_control(&control, sender);
         Ok(AcquiredProcess {
@@ -494,6 +520,7 @@ impl Host {
             anchor_id: control.anchor_id.clone(),
             generation: control.generation.clone(),
             exit: control.exit.clone(),
+            stop: control.stop.clone(),
         });
     }
 
@@ -516,10 +543,24 @@ impl Host {
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tasks
-                .controls
-                .retain(|control| control.stream.strong_count() > 0);
-            tasks.controls.clone()
+            let HostTasks {
+                controls, forced, ..
+            } = &mut *tasks;
+            for control in controls.iter() {
+                // Released unclosed while the vendor was live: the anchor's EOF
+                // cleanup, triggered by Host's release, stopped the group.
+                if control.stream.strong_count() == 0
+                    && !control.stop.closed.load(Ordering::Acquire)
+                    && control.exit.borrow().is_none()
+                {
+                    control.stop.forced.store(true, Ordering::Release);
+                }
+                if control.stop.forced.load(Ordering::Acquire) {
+                    forced.insert(control.generation.clone());
+                }
+            }
+            controls.retain(|control| control.stream.strong_count() > 0);
+            controls.clone()
         };
         for tracked in controls {
             if Instant::now() >= deadline.instant() {
@@ -533,13 +574,21 @@ impl Host {
                     generation: tracked.generation,
                     journal: self.journal.clone(),
                     exit: tracked.exit,
+                    stop: tracked.stop,
                 };
-                let _ = control
+                let close = control
                     .close(CloseRequest {
                         mode: CloseMode::Force,
                         deadline,
                     })
                     .await;
+                if close.forced {
+                    self.tasks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .forced
+                        .insert(control.generation);
+                }
             }
         }
         let (recovery, failure) = match self.recover(deadline).await {
@@ -572,12 +621,19 @@ impl Host {
             let owner_session = record.intent.owner_session.clone();
             let owner_turn = record.intent.owner_turn;
             let cleanup = self.recover_one(record, deadline).await;
+            let forced = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forced
+                .contains(&generation);
             results.push(RecoveryReport {
                 anchor_id,
                 generation,
                 owner_session,
                 owner_turn,
                 cleanup,
+                forced,
             });
         }
         Ok(results)
@@ -645,17 +701,18 @@ impl Host {
     }
 }
 
-/// Collects owned task results until the deadline; returns `(pending, failed)`.
+/// Collects owned task results until the deadline; returns `(pending, failed)`,
+/// where `failed` counts every failure collected so far, by any call.
 ///
 /// A task leaves the registry only once its result was collected, so a
-/// cancelled caller or an expired deadline never detaches it.
+/// cancelled caller or an expired deadline never detaches it, and its failure
+/// is recorded in Host state before it leaves.
 async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) -> (usize, usize) {
     let running = tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .running
         .clone();
-    let mut failed = 0;
     for task in running {
         if task.joined.load(Ordering::Acquire) {
             continue;
@@ -680,9 +737,12 @@ async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) 
             timeout_at(deadline.instant(), &mut *handle).await
         };
         if let Ok(result) = outcome {
+            let mut owned = tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             task.joined.store(true, Ordering::Release);
             if !matches!(result, Ok(Ok(()))) {
-                failed += 1;
+                owned.failed += 1;
             }
         }
     }
@@ -692,7 +752,7 @@ async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) 
     owned
         .running
         .retain(|task| !task.joined.load(Ordering::Acquire));
-    (owned.running.len(), failed)
+    (owned.running.len(), owned.failed)
 }
 
 impl ProcessControl {
@@ -703,6 +763,7 @@ impl ProcessControl {
 
     /// Requests shutdown through the live anchor and proves group absence when possible.
     pub async fn close(&self, request: CloseRequest) -> CloseReport {
+        self.stop.closed.store(true, Ordering::Release);
         if request.mode == CloseMode::Graceful {
             let mut exit = self.exit.clone();
             let force_at = request
@@ -712,20 +773,23 @@ impl ProcessControl {
                 .unwrap_or_else(Instant::now);
             wait_graceful_exit(&mut exit, force_at).await;
         }
-        {
-            let _ = timeout_at(request.deadline.instant(), async {
-                let mut stream = self.stream.lock().await;
-                stream
-                    .transact(
-                        &Request::Stop {
-                            generation: self.generation.clone(),
-                            deadline_monotonic_ns: monotonic_deadline(request.deadline),
-                        },
-                        1024,
-                    )
-                    .await
-            })
-            .await;
+        let vendor_live = self.exit.borrow().is_none();
+        let stopping = timeout_at(request.deadline.instant(), async {
+            let mut stream = self.stream.lock().await;
+            stream
+                .transact(
+                    &Request::Stop {
+                        generation: self.generation.clone(),
+                        deadline_monotonic_ns: monotonic_deadline(request.deadline),
+                    },
+                    1024,
+                )
+                .await
+        })
+        .await;
+        let forced = vendor_live && matches!(stopping, Ok(Ok(Reply::Stopping)));
+        if forced {
+            self.stop.forced.store(true, Ordering::Release);
         }
         let cleanup = wait_absence(
             &self.journal,
@@ -738,6 +802,7 @@ impl ProcessControl {
         CloseReport {
             cleanup,
             vendor_exit: *self.exit.borrow(),
+            forced,
         }
     }
 }
@@ -1072,6 +1137,32 @@ mod tests {
             "{later:?}"
         );
         assert!(later.failure.is_none(), "{later:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// W1-D Sol finding 5: a failed join collected by one shutdown call stays
+    /// in Host state, so every later call still reports it.
+    #[tokio::test]
+    async fn failed_join_is_reported_by_every_later_shutdown() {
+        let (host, _store, root) = host_fixture(true);
+        host.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+            .push(TrackedTask::new(tokio::spawn(async { Err(()) })));
+        let deadline = || Deadline::at(Instant::now() + Duration::from_secs(1));
+        let first = host.shutdown(deadline()).await;
+        assert_eq!(
+            (first.pending_tasks, first.failed_tasks),
+            (0, 1),
+            "{first:?}"
+        );
+        let second = host.shutdown(deadline()).await;
+        assert_eq!(
+            (second.pending_tasks, second.failed_tasks),
+            (0, 1),
+            "a later shutdown forgot the failed join: {second:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

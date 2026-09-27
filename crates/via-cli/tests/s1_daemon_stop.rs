@@ -1,7 +1,9 @@
 //! `daemon/stop` through the real `via` binary and daemon (C1 §3.14, runtime
 //! §6 final shutdown): force enters final shutdown at once, drain finishes
 //! accepted work first, the `{"stopping":true}` receipt is acceptance only,
-//! and cleanup after daemon-first death is proved by the outer harness seam.
+//! final shutdown delivers committed results and never claims a false clean
+//! exit, and cleanup after daemon-first death is proved by the outer harness
+//! seam.
 
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
@@ -11,8 +13,9 @@ mod support;
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -348,13 +351,15 @@ fn json_line(bytes: &[u8]) -> Result<Value, ScenarioError> {
     serde_json::from_slice(bytes).map_err(infra)
 }
 
-/// A turn that is accepted, starts a grandchild in the owned group and then
-/// holds at gate `hold` until released; after release it completes.
+/// A turn that is accepted, reports partial text, starts a grandchild in the
+/// owned group and then holds at gate `hold` until released; after release it
+/// completes.
 fn held_fixture() -> Value {
     json!({
         "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
         "steps":[
             {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"partial"}},
             {"action":"spawn_grandchild","name":"gc"},
             {"action":"report_pids"},
             {"action":"gate","name":"hold"},
@@ -410,6 +415,131 @@ fn start_held_turn(
         None
     };
     Ok((session, agent, grandchild))
+}
+
+/// C1 §6 force lifecycle: the turn's `prefix` events, then `cancel.requested`,
+/// `cancel.settled`, `turn.ended` (the last event of the turn, ending its
+/// range) and the session-level `session.closed`, all densely sequenced.
+fn check_forced_lifecycle(
+    envelope: &Value,
+    events: &[Value],
+    prefix: &[&str],
+) -> Result<(), ScenarioError> {
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    let mut expected = prefix.to_vec();
+    expected.extend([
+        "cancel.requested",
+        "cancel.settled",
+        "turn.ended",
+        "session.closed",
+    ]);
+    check(types == expected, || format!("event types {types:?}"))?;
+    for (index, event) in events.iter().enumerate() {
+        check(event["seq"] == json!(index + 1), || {
+            format!("seq not dense at {index}: {event}")
+        })?;
+    }
+    let [settled, ended, closed] = [
+        &events[prefix.len() + 1],
+        &events[prefix.len() + 2],
+        &events[prefix.len() + 3],
+    ];
+    check(
+        settled["outcome"] == envelope["cancel"]["outcome"]
+            && settled["cleanup"] == envelope["cancel"]["cleanup"]
+            && settled["turn"] == 1,
+        || format!("cancel.settled {settled}"),
+    )?;
+    check(
+        ended["state"] == envelope["state"]
+            && ended["failure"] == envelope["failure"]
+            && ended["cancel"] == envelope["cancel"],
+        || format!("turn.ended {ended}"),
+    )?;
+    check(
+        closed["turn"].is_null() && closed["reason"] == "daemon_stop_force",
+        || format!("session.closed {closed}"),
+    )?;
+    let last = prefix.len() + 3;
+    check(
+        envelope["events"] == json!({"first_seq":1,"last_seq":last,"count":last}),
+        || format!("event range {}", envelope["events"]),
+    )
+}
+
+/// Whether the envelope's bounding span for `reference`'s connection covers it.
+fn span_covers(envelope: &Value, reference: &Value) -> bool {
+    let (Some(offset), Some(len)) = (reference["offset"].as_u64(), reference["len"].as_u64())
+    else {
+        return false;
+    };
+    envelope["raw_spans"].as_array().is_some_and(|spans| {
+        spans.iter().any(|span| {
+            span["connection_id"] == reference["connection_id"]
+                && span["first_offset"]
+                    .as_u64()
+                    .is_some_and(|first| first <= offset)
+                && span["last_offset"]
+                    .as_u64()
+                    .is_some_and(|last| offset + len <= last)
+        })
+    })
+}
+
+/// Waits until the Store has committed an event of `kind` for `session`.
+fn wait_event(paths: &Paths, session: &str, kind: &str) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = rusqlite::Connection::open_with_flags(
+            paths.state.join("store.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(infra)?;
+        let found: bool = store
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE session_id=?1 AND json_extract(event,'$.type')=?2)",
+                [session, kind],
+                |row| row.get(0),
+            )
+            .map_err(infra)?;
+        if found {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!("{kind} never committed")));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Holds the Store's SQLite write lock from outside the daemon, so its next
+/// commits fail after the busy timeout: a real Store write failure.
+fn hold_store_write_lock(paths: &Paths) -> Result<rusqlite::Connection, ScenarioError> {
+    let store = rusqlite::Connection::open_with_flags(
+        paths.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(infra)?;
+    store.execute_batch("BEGIN IMMEDIATE").map_err(infra)?;
+    Ok(store)
+}
+
+/// Waits until the daemon reports no active turn, i.e. every drive returned.
+fn wait_no_active_turn(paths: &Paths, evidence: &Evidence) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = paths.run(evidence, "status", &["daemon", "status", "--json"])?;
+        if status.status.success() && json_line(&status.stdout)?["sessions"]["active"] == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout("turn never settled".to_owned()));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn scenario(
@@ -485,15 +615,24 @@ fn s1_daemon_stop_force_ends_active_turn_immediately() -> TestResult {
                     && envelope["cancel"]["cleanup"] == "quiescent",
                 || format!("cancel {}", envelope["cancel"]),
             )?;
-            let ended = events.last().ok_or_else(|| fail("no events"))?;
-            check(
-                ended["type"] == "turn.ended"
-                    && ended["state"] == "cancelled"
-                    && ended["cancel"] == envelope["cancel"],
-                || format!("turn.ended {ended}"),
+            // Observations committed before the force stay in the turn (W3-F 8).
+            check_forced_lifecycle(
+                &envelope,
+                &events,
+                &[
+                    "turn.queued",
+                    "turn.submitted",
+                    "turn.started",
+                    "assistant.text",
+                ],
             )?;
-            check(envelope["events"]["last_seq"] == ended["seq"], || {
-                "event range".to_owned()
+            let text = &events[3];
+            check(text["text"] == "partial", || format!("text {text}"))?;
+            check(span_covers(&envelope, &text["raw_ref"]), || {
+                format!(
+                    "raw spans {} miss {}",
+                    envelope["raw_spans"], text["raw_ref"]
+                )
             })?;
             check(elapsed < FINAL_SHUTDOWN, || {
                 format!("force took {elapsed:?}")
@@ -670,6 +809,356 @@ fn s1_daemon_first_death_outer_cleanup_proves_absence() -> TestResult {
             )?;
             wait_not_live(agent)?;
             wait_not_live(grandchild.ok_or_else(|| fail("no grandchild"))?)
+        },
+    )
+}
+
+/// Spawns a foreground `via spawn` that waits for its result, with its output
+/// kept as evidence; the caller waits for it.
+fn spawn_foreground(paths: &Paths, evidence: &Evidence) -> Result<Child, ScenarioError> {
+    let mut command = paths.command();
+    command
+        .args([
+            "spawn",
+            "--harness",
+            "fake",
+            "--model",
+            "fake",
+            "--prompt",
+            "hold",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(File::create(evidence.dir.join("foreground.stdout")).map_err(infra)?)
+        .stderr(File::create(evidence.dir.join("foreground.stderr")).map_err(infra)?);
+    command.spawn().map_err(infra)
+}
+
+fn wait_child(child: &mut Child, within: Duration) -> Result<Option<ExitStatus>, ScenarioError> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().map_err(infra)? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// W1-D Sol finding 1: an accepted stop reaches daemon main before its reply
+/// is written. The caller never reads the reply, whose echoed 8 MiB id fills
+/// the socket buffer; the daemon must still run final shutdown and exit.
+#[test]
+fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hello"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"reply","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_unread_reply",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            // One completed turn first, so the run keeps raw evidence.
+            let spawn = paths.run(
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hello",
+                    "--json",
+                ],
+            )?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let mut stream = UnixStream::connect(paths.runtime.join("via.sock")).map_err(infra)?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(infra)?;
+            let hello = json!({"jsonrpc":"2.0","id":1,"method":"hello","params":{
+                "api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"s1-test"}});
+            writeln!(stream, "{hello}").map_err(infra)?;
+            let mut reply = String::new();
+            BufReader::new(stream.try_clone().map_err(infra)?)
+                .read_line(&mut reply)
+                .map_err(infra)?;
+            check(
+                json_line(reply.as_bytes())?["result"]["api_version"] == 1,
+                || format!("hello reply {reply}"),
+            )?;
+            let id = "x".repeat(8 * 1024 * 1024);
+            let stop = json!({"jsonrpc":"2.0","id":id,"method":"daemon/stop","params":{}});
+            writeln!(stream, "{stop}").map_err(infra)?;
+            // The reply is never read while the daemon stops.
+            let status = daemon.wait_exit(FINAL_SHUTDOWN + Duration::from_secs(5))?;
+            drop(stream);
+            let status = status
+                .ok_or_else(|| fail("an unread stop reply kept the daemon from final shutdown"))?;
+            check(status.code() == Some(0), || format!("exit {status}"))?;
+            let summary = daemon.summary()?;
+            check(
+                summary["mode"] == "idle" && summary["disposition"] == "clean",
+                || format!("summary {summary}"),
+            )
+        },
+    )
+}
+
+/// W1-D Sol finding 2: a receipted turn whose terminal commit failed leaves
+/// its drive failed and the turn unresolved; a later stop must not report a
+/// clean exit. An outside SQLite writer lock makes the commits fail for real.
+#[test]
+fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
+    scenario(
+        "s1_daemon_stop_unresolved",
+        &drain_fixture(),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let (session, _, _) = start_held_turn(paths, evidence)?;
+            wait_event(paths, &session, "assistant.text")?;
+            let lock = hold_store_write_lock(paths)?;
+            fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
+            let settled = wait_no_active_turn(paths, evidence);
+            drop(lock);
+            settled?;
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--json"])?;
+            check(
+                stop.status.success() && json_line(&stop.stdout)? == json!({"stopping":true}),
+                || "idle stop receipt".to_owned(),
+            )?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("stop did not exit"))?;
+            let summary = daemon.summary()?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            check(status.code() == Some(4), || {
+                format!("unresolved turn must exit 4, got {status}; summary {summary}")
+            })?;
+            check(
+                summary["disposition"] == "incomplete"
+                    && summary["unresolved_turns"] == 1
+                    && summary["failed_joins"]
+                        .as_u64()
+                        .is_some_and(|failed| failed >= 1),
+                || format!("summary {summary}"),
+            )
+        },
+    )
+}
+
+/// W1-D Sol finding 4: final shutdown lets a foreground `via spawn` already
+/// waiting on its turn receive the result committed during shutdown.
+#[test]
+fn s1_daemon_stop_force_delivers_waiting_foreground_result() -> TestResult {
+    scenario(
+        "s1_daemon_stop_force_foreground",
+        &held_fixture(),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let mut foreground = spawn_foreground(paths, evidence)?;
+            wait_file(&paths.sync.join("hold.entered"))?;
+            wait_file(&paths.sync.join("gc.entered"))?;
+            let stop = paths.run(
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let waited = wait_child(&mut foreground, FINAL_SHUTDOWN)?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            let waited = waited.ok_or_else(|| fail("foreground spawn never returned"))?;
+            let stdout = fs::read(evidence.dir.join("foreground.stdout")).map_err(infra)?;
+            let lines: Vec<&[u8]> = stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .collect();
+            check(waited.code() == Some(3) && lines.len() == 2, || {
+                format!(
+                    "foreground exit {waited}, stdout {}",
+                    String::from_utf8_lossy(&stdout)
+                )
+            })?;
+            let envelope = json_line(lines[1])?;
+            check(
+                envelope["state"] == "cancelled" && envelope["cancel"]["outcome"] == "forced",
+                || format!("envelope {envelope}"),
+            )?;
+            check(status.code() == Some(0), || format!("daemon exit {status}"))
+        },
+    )
+}
+
+/// W1-D Sol finding 3: a force while the vendor is launched but has not
+/// accepted is `forced` only from Host evidence that it stopped the live
+/// group, never `acknowledged`, and the lifecycle events commit.
+#[test]
+fn s1_daemon_stop_force_before_acceptance_is_forced() -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
+        "steps":[
+            {"action":"report_pids"},
+            {"action":"gate","name":"hold"},
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"late","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_force_before_acceptance",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let (session, agent, _) = start_held_turn(paths, evidence)?;
+            let stop = paths.run(
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            wait_not_live(agent)?;
+            let summary = daemon.summary()?;
+            check(
+                status.code() == Some(0) && summary["disposition"] == "clean",
+                || format!("exit {status}, summary {summary}"),
+            )?;
+            let (envelope, events) = paths.committed(&session)?;
+            evidence
+                .write("envelope.json", envelope.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                envelope["state"] == "cancelled"
+                    && envelope["timestamps"]["accepted_at"].is_null()
+                    && envelope["cancel"]["outcome"] == "forced"
+                    && envelope["cancel"]["cleanup"] == "quiescent",
+                || format!("envelope {envelope}"),
+            )?;
+            check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])
+        },
+    )
+}
+
+/// W3-F 8: a turn whose Store commit already failed before a force ends
+/// `failed(store)`, not `cancelled`: C1 §8.2 `store` records that the durable
+/// stream lost an event, and hiding it behind a cancellation would claim a
+/// complete record. The cancel evidence is still reported.
+#[test]
+fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"gate","name":"text"},
+            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"lost"}},
+            {"action":"report_pids"},
+            {"action":"gate","name":"hold"},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"late","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_force_after_store_failure",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let spawn = paths.run(
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hold",
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session id"))?
+                .to_owned();
+            wait_file(&paths.sync.join("text.entered"))?;
+            wait_event(paths, &session, "turn.started")?;
+            let lock = hold_store_write_lock(paths)?;
+            fs::write(paths.sync.join("text.release"), b"").map_err(infra)?;
+            let held = wait_file(&paths.sync.join("hold.entered"));
+            // Longer than the Store's 250 ms busy timeout: the text commit fails.
+            thread::sleep(Duration::from_millis(1500));
+            drop(lock);
+            held?;
+            let stop = paths.run(
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            check(status.code() == Some(0), || format!("exit {status}"))?;
+            let (envelope, events) = paths.committed(&session)?;
+            evidence
+                .write("envelope.json", envelope.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                envelope["state"] == "failed"
+                    && envelope["failure"]["class"] == "store"
+                    && envelope["stop_reason"] == "error"
+                    && envelope["cancel"]["outcome"] == "forced",
+                || format!("envelope {envelope}"),
+            )?;
+            let types: Vec<&str> = events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap_or_default())
+                .collect();
+            check(
+                types
+                    == [
+                        "turn.queued",
+                        "turn.submitted",
+                        "turn.started",
+                        "turn.ended",
+                        "session.closed",
+                    ],
+                || format!("event types {types:?}"),
+            )?;
+            check(
+                events
+                    .iter()
+                    .enumerate()
+                    .all(|(index, event)| event["seq"] == json!(index + 1)),
+                || "seq not dense".to_owned(),
+            )?;
+            check(
+                envelope["events"] == json!({"first_seq":1,"last_seq":4,"count":4}),
+                || format!("event range {}", envelope["events"]),
+            )
         },
     )
 }

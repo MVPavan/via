@@ -48,6 +48,8 @@ pub struct FakeRecovery {
     pub turn: TurnNumber,
     /// Cleanup certainty under Host's validated group.
     pub cleanup: Cleanup,
+    /// Host stopped the group while its vendor was live (Host force evidence).
+    pub forced: bool,
 }
 
 /// Fake Adapter with an opaque Route/Wire runtime and immutable fixture policy.
@@ -131,6 +133,8 @@ impl AdapterRuntime {
                             evidence: None,
                             exit: Some(result.exit),
                             raw_incomplete: false,
+                            cleanup: None,
+                            forced: false,
                         })),
                         Err(failure) => Err(AdapterError::Route(failure)),
                     };
@@ -308,6 +312,7 @@ fn normalize_recovery(report: WireRecovery) -> FakeRecovery {
             via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,
             via_routes::WireCleanup::Uncertain => Cleanup::Uncertain,
         },
+        forced: report.forced,
     }
 }
 

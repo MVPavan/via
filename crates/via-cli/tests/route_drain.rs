@@ -582,5 +582,17 @@ fn failure_class_deadline_wall_after_hang() {
     assert_eq!(envelope["state"], "failed", "{envelope}");
     assert_eq!(envelope["failure"]["class"], "deadline_wall", "{envelope}");
     assert_eq!(envelope["stop_reason"], "deadline", "{envelope}");
-    assert_dense(&sandbox.events(&session), &session, &envelope);
+    // C1 §7.6: Core's deadline cancels the turn, so `cancel` is filled with the
+    // evidenced outcome: Route force-closed the live group and Host proved it
+    // absent (W2-E Sol finding 2).
+    assert_eq!(envelope["cancel"]["outcome"], "forced", "{envelope}");
+    assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+    let events = sandbox.events(&session);
+    assert_dense(&events, &session, &envelope);
+    let tail: Vec<&Value> = events.iter().rev().take(3).rev().collect();
+    assert_eq!(tail[0]["type"], "cancel.requested", "{}", tail[0]);
+    assert_eq!(tail[1]["type"], "cancel.settled", "{}", tail[1]);
+    assert_eq!(tail[1]["outcome"], envelope["cancel"]["outcome"]);
+    assert_eq!(tail[1]["cleanup"], envelope["cancel"]["cleanup"]);
+    assert_eq!(tail[2]["cancel"], envelope["cancel"], "{}", tail[2]);
 }

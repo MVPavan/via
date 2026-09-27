@@ -81,6 +81,8 @@ pub struct WireRecovery {
     pub owner_turn: via_store::TurnNumber,
     /// Group cleanup certainty under Host's identity and absence checks.
     pub cleanup: super::WireCleanup,
+    /// Host stopped the group while its vendor was live (Host force evidence).
+    pub forced: bool,
 }
 
 /// Private-group close evidence without Host identity or signal authority.
@@ -89,6 +91,8 @@ pub struct WireCloseReport {
     pub cleanup: super::WireCleanup,
     /// Independently confirmed vendor exit if available.
     pub vendor_exit: Option<super::ExitReport>,
+    /// Host's verified anchor accepted the stop while the vendor was live.
+    pub forced: bool,
 }
 
 /// Failure of a private byte transport; an uncertain write never permits resend.
@@ -335,6 +339,7 @@ impl WireConnection {
                 via_host::CleanupEvidence::Uncertain(_) => super::WireCleanup::Uncertain,
             },
             vendor_exit: report.vendor_exit,
+            forced: report.forced,
         }
     }
 }
@@ -349,6 +354,7 @@ fn normalize_recovery(report: via_host::RecoveryReport) -> WireRecovery {
             via_host::CleanupEvidence::GroupAbsent(_) => super::WireCleanup::Quiescent,
             via_host::CleanupEvidence::Uncertain(_) => super::WireCleanup::Uncertain,
         },
+        forced: report.forced,
     }
 }
 

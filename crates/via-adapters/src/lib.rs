@@ -151,7 +151,7 @@ pub use fake_config::FakeConfig;
 pub use runtime::{AdapterError, AdapterRuntime, AdapterRuntimeConfig, FakeRecovery, FakeShutdown};
 pub use via_routes::{
     ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
-    SessionId,
+    SessionId, WireCleanup,
 };
 
 /// Fake terminal status as vendor evidence; Core chooses the C1 disposition.

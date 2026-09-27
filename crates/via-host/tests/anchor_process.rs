@@ -478,6 +478,10 @@ fn shutdown_closes_live_control_joins_tasks_and_preserves_absence_evidence() {
             ),
             "{shutdown:?}"
         );
+        assert!(
+            shutdown.recovery[0].forced,
+            "Host force-closed a live vendor: {shutdown:?}"
+        );
         assert!(!PathBuf::from(format!("/proc/{vendor_pid}")).exists());
         // A later verifier must be able to use the committed proof without a live socket.
         let recovered = host
@@ -566,5 +570,54 @@ fn blocked_absence_commit_cannot_extend_close_deadline() {
         assert!(started.elapsed() < Duration::from_millis(160), "close exceeded deadline while Store was locked");
         drop(blocker.stdin.take());
         blocker.wait().unwrap();
+    });
+}
+
+/// W1-D Sol finding 3: `forced` comes from Host's own stop of a live vendor,
+/// not from group absence alone. Releasing an unclosed control while the vendor
+/// runs lets the anchor's EOF cleanup stop it (forced); a graceful close after
+/// the vendor exited on its own is absence without force.
+#[test]
+fn force_evidence_separates_host_stop_from_absence() {
+    runtime().block_on(async {
+        let deadline = || Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3));
+        let released = Fixture::new().await;
+        let host = released.host();
+        let mut spec = released.spec("/bin/sleep");
+        spec.args.push(OsString::from("10"));
+        drop(host.acquire(spec, deadline()).await.unwrap());
+        let report = host.shutdown(deadline()).await;
+        assert_eq!(report.recovery.len(), 1, "{report:?}");
+        assert!(
+            matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{report:?}"
+        );
+        assert!(
+            report.recovery[0].forced,
+            "released live vendor: {report:?}"
+        );
+
+        let exited = Fixture::new().await;
+        let host = exited.host();
+        let acquired = host
+            .acquire(exited.spec("/bin/true"), deadline())
+            .await
+            .unwrap();
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Graceful,
+                deadline: deadline(),
+            })
+            .await;
+        assert!(close.vendor_exit.is_some(), "{close:?}");
+        assert!(!close.forced, "the vendor exited on its own: {close:?}");
+        drop(acquired);
+        let report = host.shutdown(deadline()).await;
+        assert!(
+            matches!(report.recovery[0].cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{report:?}"
+        );
+        assert!(!report.recovery[0].forced, "absence alone: {report:?}");
     });
 }

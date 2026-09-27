@@ -621,6 +621,15 @@ pub(crate) enum EventBody {
     },
     #[serde(rename = "raw_log.incomplete")]
     RawLogIncomplete { connection_id: ConnectionId },
+    #[serde(rename = "cancel.requested")]
+    CancelRequested {},
+    #[serde(rename = "cancel.settled")]
+    CancelSettled {
+        outcome: &'static str,
+        cleanup: &'static str,
+    },
+    #[serde(rename = "session.closed")]
+    SessionClosed { reason: &'static str },
 }
 
 /// C1 §6.1 event with every common field.

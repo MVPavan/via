@@ -66,6 +66,8 @@ impl FakeRoute {
                 evidence: None,
                 exit: None,
                 raw_incomplete: false,
+                cleanup: None,
+                forced: false,
             })?;
         let failed = match Box::pin(Self::drive(&mut wire, start, &observations, deadline)).await {
             Ok(result) => return Ok(result),
@@ -87,6 +89,8 @@ impl FakeRoute {
             evidence: failed.evidence,
             exit: failed.exit.or(report.vendor_exit),
             raw_incomplete: raw == RawEvidence::Incomplete,
+            cleanup: Some(report.cleanup),
+            forced: report.forced,
         })
     }
 

@@ -14,9 +14,9 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{Notify, mpsc, watch},
     task::JoinSet,
-    time::{Instant, timeout_at},
+    time::{Instant, timeout, timeout_at},
 };
 
 use serde::de::DeserializeOwned;
@@ -29,6 +29,12 @@ const MAX_LINE: usize = 16 * 1024 * 1024;
 
 /// One absolute budget for all of final shutdown (runtime §6, C1 §3.14).
 const FINAL_SHUTDOWN: Duration = Duration::from_secs(10);
+
+/// Part of the final deadline kept for the Store join after clients finish.
+const STORE_RESERVE: Duration = Duration::from_secs(2);
+
+/// Bound on writing a `daemon/stop` receipt to a caller that may not read it.
+const STOP_REPLY: Duration = Duration::from_secs(2);
 
 fn validate_dir(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -111,10 +117,14 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             .map_err(anyhow::Error::msg)?,
     );
     let (drive_tx, mut drive_rx) = mpsc::channel::<(String, String)>(16);
-    let (stop_tx, mut stop_rx) = mpsc::channel::<StopMode>(4);
+    // An accepted stop wakes main at once; Core holds the authoritative mode.
+    let stop = Arc::new(Notify::new());
+    let (closing_tx, closing) = watch::channel(false);
     let mut clients = JoinSet::new();
     let mut drives = JoinSet::new();
     let mut stopping = None;
+    // Owned joins that failed while serving, kept for the final disposition.
+    let mut failed_joins = 0_usize;
     // Drain keeps serving until accepted work settles; force and idle stop at once.
     let mode = loop {
         match stopping {
@@ -126,57 +136,91 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 if stream.peer_cred()?.uid() != rustix::process::geteuid().as_raw() { continue; }
-                let engine = Arc::clone(&engine);
-                let drive_tx = drive_tx.clone();
-                let stop_tx = stop_tx.clone();
-                let socket_path = socket.clone();
-                let store_path = paths.state.join("store.sqlite3");
-                clients.spawn(async move { handle_client(stream, engine, drive_tx, stop_tx, &socket_path, &store_path).await });
+                let client = Client {
+                    engine: Arc::clone(&engine),
+                    drives: drive_tx.clone(),
+                    stop: Arc::clone(&stop),
+                    closing: closing.clone(),
+                    socket_path: socket.clone(),
+                    store_path: paths.state.join("store.sqlite3"),
+                };
+                clients.spawn(handle_client(stream, client));
             }
             Some((session, prompt)) = drive_rx.recv() => {
                 let engine = Arc::clone(&engine);
                 drives.spawn(async move { engine.drive(&session, prompt).await });
             }
-            Some(mode) = stop_rx.recv() => stopping = Some(mode),
+            () = stop.notified() => stopping = engine.stop_mode(),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
-                if let Err(error) = result { tracing::error!(%error, "client task failed"); }
+                if let Err(error) = result {
+                    tracing::error!(%error, "client task failed");
+                    failed_joins += 1;
+                }
             }
             Some(result) = drives.join_next(), if !drives.is_empty() => {
-                if let Err(error) = result { tracing::error!(%error, "turn task failed"); }
+                if !drive_joined(result) {
+                    failed_joins += 1;
+                }
             }
         }
     };
     drop(listener);
     // Best effort: a stale socket refuses connections and the next daemon replaces it.
     let _ = fs::remove_file(&socket);
-    Ok(final_shutdown(engine, clients, drives, mode).await)
+    let joins = Joins {
+        clients,
+        drives,
+        closing: closing_tx,
+        failed: failed_joins,
+    };
+    Ok(final_shutdown(engine, joins, mode).await)
+}
+
+/// Whether a joined drive ended without error; a failure is logged.
+fn drive_joined(result: Result<Result<(), ApiError>, tokio::task::JoinError>) -> bool {
+    match result {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(kind = error.kind, "turn drive failed");
+            false
+        }
+        Err(error) => {
+            tracing::error!(%error, "turn task failed");
+            false
+        }
+    }
+}
+
+/// Daemon main's owned tasks, their close signal and failures seen so far.
+struct Joins {
+    clients: JoinSet<anyhow::Result<()>>,
+    drives: JoinSet<Result<(), ApiError>>,
+    closing: watch::Sender<bool>,
+    failed: usize,
 }
 
 /// Joins the daemon's owned work under one absolute deadline and decides the
 /// process exit: 0 only for a clean shutdown, otherwise 4 (incomplete).
 ///
-/// Only daemon main takes the incomplete exit. Unjoined tasks are aborted and
-/// reported, a blocked Store join is abandoned to process exit, and nothing is
-/// claimed from abort, handle drop or OS adoption.
-async fn final_shutdown(
-    engine: Arc<Engine>,
-    mut clients: JoinSet<anyhow::Result<()>>,
-    mut drives: JoinSet<Result<(), ApiError>>,
-    mode: StopMode,
-) -> i32 {
+/// Idle clients close at once; a client already serving a request (such as a
+/// `wait`) delivers it after the final records commit. Only daemon main takes
+/// the incomplete exit. Unjoined tasks are aborted and reported, a blocked
+/// Store join is abandoned to process exit, and nothing is claimed from abort,
+/// handle drop or OS adoption.
+async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i32 {
     let started = Instant::now();
     let deadline = started + FINAL_SHUTDOWN;
-    clients.abort_all();
-    let mut failed_joins = 0_usize;
+    let Joins {
+        mut clients,
+        mut drives,
+        closing,
+        failed: mut failed_joins,
+    } = joins;
+    closing.send_replace(true);
+    // Force-stopped drives return at once; their terminals commit below.
     let joined = timeout_at(deadline, async {
-        while let Some(result) = clients.join_next().await {
-            if result.is_err_and(|error| !error.is_cancelled()) {
-                failed_joins += 1;
-            }
-        }
-        // Force-stopped drives return at once; their terminals commit below.
         while let Some(result) = drives.join_next().await {
-            if !matches!(result, Ok(Ok(()))) {
+            if !drive_joined(result) {
                 failed_joins += 1;
             }
         }
@@ -184,11 +228,26 @@ async fn final_shutdown(
     .await;
     let mut pending_joins = 0;
     if joined.is_err() {
-        pending_joins = clients.len() + drives.len();
-        clients.abort_all();
+        pending_joins = drives.len();
         drives.abort_all();
     }
     let report = timeout_at(deadline, engine.shutdown(Deadline::at(deadline))).await;
+    // Every final record is committed: pending reads deliver, then clients close.
+    let clients_by = deadline.checked_sub(STORE_RESERVE).unwrap_or(started);
+    let joined = timeout_at(clients_by, async {
+        while let Some(result) = clients.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "client task failed");
+                failed_joins += 1;
+            }
+        }
+    })
+    .await;
+    if joined.is_err() {
+        pending_joins += clients.len();
+        clients.abort_all();
+        while clients.join_next().await.is_some() {}
+    }
     // Store Drop blocks on its writer and raw threads: keep it off Tokio workers
     // and bounded; a stalled join is left to process exit, never waited out.
     let store = match Arc::try_unwrap(engine) {
@@ -209,6 +268,7 @@ async fn final_shutdown(
         "uncertain_owners":host.map(|host| host.uncertain_owners),
         "host_failure":host.map_or(Some("final shutdown deadline expired"), |host| host.failure.as_deref()),
         "uncommitted_turns":host.map(|host| host.uncommitted_turns),
+        "unresolved_turns":host.map(|host| host.unresolved_turns),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
@@ -226,20 +286,28 @@ async fn drop_blocking<T: Send + 'static>(value: T, deadline: Instant) -> &'stat
     }
 }
 
-async fn handle_client(
-    stream: UnixStream,
+/// What one client connection shares with daemon main.
+struct Client {
     engine: Arc<Engine>,
     drives: mpsc::Sender<(String, String)>,
-    stop: mpsc::Sender<StopMode>,
-    socket_path: &Path,
-    store_path: &Path,
-) -> anyhow::Result<()> {
+    stop: Arc<Notify>,
+    /// Final shutdown began: stop reading new requests.
+    closing: watch::Receiver<bool>,
+    socket_path: std::path::PathBuf,
+    store_path: std::path::PathBuf,
+}
+
+async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let mut hello_done = false;
     loop {
         let mut line = Vec::new();
-        let count = read_line_limit(&mut read, &mut line).await?;
+        // A request already being served completes; an idle connection closes.
+        let count = tokio::select! {
+            count = read_line_limit(&mut read, &mut line) => count?,
+            _ = client.closing.wait_for(|closing| *closing) => break,
+        };
         if count == 0 {
             break;
         }
@@ -274,7 +342,7 @@ async fn handle_client(
             continue;
         }
         if hello_done && method == "daemon/stop" {
-            if stop_request(&engine, params, &mut write, &id, &stop).await? {
+            if stop_request(&client.engine, params, &mut write, &id, &client.stop).await? {
                 break;
             }
             continue;
@@ -309,7 +377,7 @@ async fn handle_client(
                 }
             }
         } else {
-            match dispatch(method, params, &engine, &drives, socket_path, store_path).await {
+            match dispatch(method, params, &client).await {
                 Ok(value) => value,
                 Err(refusal) => {
                     send(&mut write, &error(&id, refusal)).await?;
@@ -329,45 +397,46 @@ async fn handle_client(
 /// Handles C1 `daemon/stop`; returns whether the stop was accepted.
 ///
 /// The `{"stopping":true}` receipt is acceptance only, and a lost reply never
-/// cancels an accepted stop.
+/// cancels an accepted stop: daemon main is notified before the reply is
+/// written, and a caller that does not read it holds the connection only for
+/// a bounded time.
 async fn stop_request(
     engine: &Engine,
     params: Value,
     write: &mut tokio::net::unix::OwnedWriteHalf,
     id: &Value,
-    stop: &mpsc::Sender<StopMode>,
+    stop: &Notify,
 ) -> anyhow::Result<bool> {
     let mode = match typed::<DaemonStopParams>(params) {
         Ok(params) => engine.request_stop(&params).await.map_err(Refusal::from),
         Err(refusal) => Err(refusal),
     };
-    let mode = match mode {
-        Ok(mode) => mode,
-        Err(refusal) => {
-            send(write, &error(id, refusal)).await?;
-            return Ok(false);
-        }
-    };
-    // Safe to ignore: a caller disconnect never cancels the accepted stop.
-    let _ = send(
-        write,
-        &json!({"jsonrpc":"2.0","id":id,"result":{"stopping":true}}),
+    if let Err(refusal) = mode {
+        send(write, &error(id, refusal)).await?;
+        return Ok(false);
+    }
+    stop.notify_one();
+    // Safe to ignore: a caller disconnect or unread reply never cancels the
+    // accepted stop.
+    let _ = timeout(
+        STOP_REPLY,
+        send(
+            write,
+            &json!({"jsonrpc":"2.0","id":id,"result":{"stopping":true}}),
+        ),
     )
     .await;
-    stop.send(mode)
-        .await
-        .map_err(|_| anyhow::anyhow!("daemon stop receiver closed"))?;
     Ok(true)
 }
 
-async fn dispatch(
-    method: &str,
-    params: Value,
-    engine: &Arc<Engine>,
-    drives: &mpsc::Sender<(String, String)>,
-    socket_path: &Path,
-    store_path: &Path,
-) -> Result<Value, Refusal> {
+async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value, Refusal> {
+    let Client {
+        engine,
+        drives,
+        socket_path,
+        store_path,
+        ..
+    } = client;
     match method {
         "daemon/status" => {
             typed::<DaemonStatusParams>(params)?;
