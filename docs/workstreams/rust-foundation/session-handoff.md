@@ -19,11 +19,16 @@ the historical checkpoint; its findings table is updated by this section.
   stop drain) and W2-E (T1-I5 end to end, evidence gaps, failure classes)
   merged; gate green, 86 tests. Sol medium: W1-D unsound, W2-E sound with
   changes.
-- Next: W3 ([w3/README.md](w3/README.md)), W3-F (stop/shutdown/cancel) and
-  W3-G (raw waits, uncertain commits), Opus 5.5 high cloud sessions in
-  parallel. Then a Sol high review of Task 1 and close `via-jm4.7.5`; then
-  `.7.6`–`.7.8` (failpoint controller with `.7.6`/`.7.7`), then `.7.9`
-  (Fable 5.1 high / Astra).
+- W3 ([w3/README.md](w3/README.md)): W3-F (stop/shutdown/cancel) and W3-G
+  (raw waits, uncertain commits) merged; one unified unresolved-turn
+  tracker; force-stop e2e test now waits for a durable observation before
+  forcing (it raced locally). Gate green, 98 tests. Sol medium: W3-F
+  unsound, W3-G sound with changes (`w3/sol-review-*.md`).
+- Next: W4 ([w4/README.md](w4/README.md)), W4-H (force race, force
+  evidence, join bound, in-flight output; Opus high) and W4-I (store_error
+  data, bounded set, deadline class; Opus medium). Store-failure lifecycle
+  findings moved to `via-jm4.7.7`. Then a Sol high review of Task 1 and
+  close `via-jm4.7.5`; then `.7.6`–`.7.8`, then `.7.9`.
 
 Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
 The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
