@@ -842,7 +842,9 @@ Without `drain` or `force`, a stop with active turns is refused
   private group (C2 Close(Force)) and drains both pipes to the raw log under
   its cleanup bound. Frames already read still become events; bytes the
   drain cannot record mark the raw log incomplete. A receipted turn not yet
-  launched starts nothing. Core commits the turn in final shutdown (C1 §7.6
+  launched starts nothing; with a complete Host journal and no anchor intent
+  for it, its cancel is `requested` with cleanup `quiescent` (C1 §7.4). Core
+  commits the turn in final shutdown (C1 §7.6
   force row) once Host has reconciled its anchor; `forced` requires the
   anchor's report that its cleanup began while the vendor was live.
 - **Drain** keeps serving reads while accepted turns finish under their own
@@ -949,6 +951,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process and memory permits, not extra pools |
 | OpenCode vendor child-session metadata | 32 records per live server; one active top-level turn per owner | Refuse excess child metadata without routing it to another owner; idle namespaces retain durable identity but no listener or server memory |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
+| Unresolved turns (receipted, no terminal known durable: in flight or failed to persist) | 256 daemon-wide | When full, `spawn` first forgets failed turns whose terminal a Store read now finds durable; still full of in-flight turns is `admission_refused` ("too many unresolved turns"), while a retained failed turn keeps refusal and its reads `store_error` |
 | Client sockets / in-flight requests | 32 / 1 per socket | Extra connection refused; parser stops accepting the next request until current response admission |
 | C1 line | 16 MiB including LF | Oversize closes connection; bounded parse error attempt |
 | Global C1 input buffers | 32 MiB | Reserve bytes before read; 5 s partial-request deadline prevents monopolization |
