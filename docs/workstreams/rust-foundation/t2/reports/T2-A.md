@@ -253,3 +253,79 @@ reports 0 broken links, and the skill catalog reports 0 FAIL.
   a persistent form.
 - **The F24–F27/raw/bounds/store gate line** stays red (no tests) until
   Task 4.
+
+## Round 2
+
+Response to [../sol-review-T2-A.md](../sol-review-T2-A.md) (Sol medium,
+SOUND WITH CHANGES). I merged `origin/rust-foundation` (`6ff1e99`, docs
+only) first.
+
+| Finding | Fix | Evidence |
+|---|---|---|
+| **B1: an action could run without an ack** | `Controller::enter` now returns `io::Result`. The ack write error is propagated as the point's error, and no crash, pause or `fail_io` runs until the ack is published: write → fsync → rename → fsync of the directory, so the ack survives a crash. A lost `refused` marker stays ignored, because nothing acts on a refused command. | New unit test `an_unpublished_acknowledgement_is_an_error_and_never_acts`: a directory in the ack's place makes the rename fail; `enter` returns `Err` and nothing crashes. |
+| **B2: stale acks** | `Failpoints::arm` removes the point's earlier `.ack`, `.refused` and `.release` markers before it writes the command. `wait_ack` takes the daemon-under-test pid, and every scenario passes `daemon.child.id()`; an ack from another pid is rejected. | `failpoint_harness_rejects_stale_acknowledgements`: arming clears a planted ack and release, and a foreign-pid ack is refused. |
+| **B3: restart skipped Host reconciliation** | `Engine::recover` first runs Host's reconciliation through the existing `AdapterRuntime::recover` → Route → Wire → `Host::recover` path, with a 5 s deadline. That path verifies each committed anchor, stops a verified live one, or proves group absence. Each recovered turn then commits `cancel.requested` and `cancel.settled`, and its `unknown` envelope carries `cancel`. | See below. |
+| **Deferrable: unreaped client** | `PendingClient` now kills and waits in `Drop`, and on `finish`'s timeout and wait-error paths. | Covered by the scenarios' failure paths. |
+
+**B3 in detail.** The `cancel` object follows the existing force-stop rule,
+`stop_outcome`:
+
+- **Outcome:** `forced` only when Host's stop found the vendor live;
+  otherwise `requested`.
+- **Cleanup `quiescent`** only when every anchor the turn owns has proved
+  absence, or when no anchor intent committed. With no intent, no process
+  could exist.
+- **Cleanup `uncertain`** in every other case, including a failed Host
+  reconciliation. An uncertain cleanup adds the `cancel_cleanup_uncertain`
+  warning.
+- The state stays `unknown` (C1 §7.5), and nothing is resent.
+- Recovery still fails startup when its commits fail.
+
+**B3 regression.** All three F10 restart checks now call `restart_cleanup`,
+which requires:
+
+- the event tail is `cancel.requested`, `cancel.settled`, `turn.ended`;
+- every anchor of the session has committed `absence_time` by the time
+  `result` is served, so the proof comes from startup reconciliation and not
+  from the final shutdown;
+- `cancel.cleanup` is `quiescent`, with outcome `requested` when there is no
+  anchor, and `requested` or `forced` otherwise.
+
+Before the fix, with Round 1's `recovery.rs` and the new tests, three tests
+failed with:
+
+```
+fail: recovery recorded no cleanup settlement: ["turn.queued", "turn.submitted", "turn.ended"]
+```
+
+The released-pause test, which does not restart, still passed. After the fix
+all pass. A recovered envelope reads
+`cancel {outcome: requested, cleanup: quiescent}`. The `uncertain` branch
+(unverifiable anchor or Host failure) has no end-to-end regression; producing
+it deterministically needs a Host seam that belongs to a later task.
+
+**Files (Round 2):**
+
+- `crates/via-core/src/engine/recovery.rs`
+- `crates/via-store/src/failpoint.rs`
+- `crates/via-cli/tests/support/failpoints.rs`
+- `crates/via-cli/tests/s1_crash_points.rs`
+
+The shared-file hunks are unchanged since Round 1.
+
+**Gate (Round 2):**
+
+- fmt, both clippy runs, `cargo deny` and the layer check pass.
+- Default nextest: 126 passed, 2 skipped.
+- nextest with the failpoint feature: 134 passed, 2 skipped.
+- The F08–F12 line: 7 passed, and 3 more runs of the F08/F10 selection
+  passed 7/7 each.
+- The release build and `check-release-features.py` pass.
+- The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
+  (Task 4).
+
+**Still open, as the orchestrator assigned:**
+
+- keyed receipt replay and queued-successor cancellation (T2-B);
+- recovered raw-log incompleteness (`via-jm4.7.7`);
+- the recovered envelope's `failure: null` versus `daemon_restart`.

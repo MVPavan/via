@@ -46,8 +46,25 @@ impl Failpoints {
     }
 
     /// Arms `point` to act on its `occurrence`th hit in the next daemon hit
-    /// count; the command file appears atomically.
+    /// count; the command file appears atomically. Markers left by an earlier
+    /// arming of `point` are removed first, so no stale acknowledgement,
+    /// refusal or release can stand in for the new hit.
     pub(crate) fn arm(&self, point: &str, occurrence: u64, action: &str) -> Result<(), String> {
+        for entry in fs::read_dir(&self.dir).map_err(|error| error.to_string())? {
+            let name = entry.map_err(|error| error.to_string())?.file_name();
+            let name = name.to_string_lossy();
+            let marker = name
+                .strip_prefix(point)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    [".ack", ".refused", ".release"]
+                        .iter()
+                        .any(|kind| rest.ends_with(kind))
+                });
+            if marker {
+                fs::remove_file(self.dir.join(name.as_ref())).map_err(|error| error.to_string())?;
+            }
+        }
         let command = json!({"token":self.token,"occurrence":occurrence,"action":action});
         let temporary = self.dir.join(format!(".{point}.json.tmp"));
         let mut file = OpenOptions::new()
@@ -69,13 +86,14 @@ impl Failpoints {
     }
 
     /// Waits for the entry acknowledgement and checks it names exactly the
-    /// armed point, occurrence and action plus the daemon pid: no prompt,
-    /// handle, token or other payload.
+    /// armed point, occurrence and action plus the pid of `daemon`, the daemon
+    /// under test: no prompt, handle, token or other payload.
     pub(crate) fn wait_ack(
         &self,
         point: &str,
         occurrence: u64,
         action: &str,
+        daemon: u32,
         within: Duration,
     ) -> Result<Value, String> {
         let path = self.dir.join(format!("{point}.{occurrence}.ack"));
@@ -114,7 +132,7 @@ impl Failpoints {
             || ack["point"] != point
             || ack["occurrence"] != occurrence
             || ack["action"] != action
-            || !ack["pid"].is_u64()
+            || ack["pid"] != daemon
         {
             return Err(format!("unexpected acknowledgement {ack}"));
         }

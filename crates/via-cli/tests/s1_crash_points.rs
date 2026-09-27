@@ -132,7 +132,7 @@ impl Paths {
             .and_then(|out| Ok((out, File::create(&stderr)?)))
             .and_then(|(out, err)| command.stdout(out).stderr(err).spawn());
         PendingClient {
-            child,
+            child: Some(child),
             stdout,
             stderr,
         }
@@ -277,17 +277,21 @@ struct TurnRow {
 
 /// A client whose reply the scenario may deliberately lose.
 struct PendingClient {
-    child: std::io::Result<Child>,
+    child: Option<std::io::Result<Child>>,
     stdout: PathBuf,
     stderr: PathBuf,
 }
 
 impl PendingClient {
     /// Waits for the client and returns its status, stdout and stderr.
-    fn finish(self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), ScenarioError> {
-        let mut child = self.child.map_err(infra)?;
-        let status = wait_child(&mut child, Duration::from_secs(10))?;
-        let Some(status) = status else {
+    fn finish(mut self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), ScenarioError> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| infra("pending client already finished"))?
+            .map_err(infra)?;
+        let status = wait_child(&mut child, Duration::from_secs(10));
+        let Ok(Some(status)) = status else {
             let _ = child.kill();
             let _ = child.wait();
             return Err(ScenarioError::Timeout(
@@ -299,6 +303,16 @@ impl PendingClient {
             fs::read(&self.stdout).map_err(infra)?,
             fs::read(&self.stderr).map_err(infra)?,
         ))
+    }
+}
+
+/// A scenario that fails before `finish` never leaves its client unreaped.
+impl Drop for PendingClient {
+    fn drop(&mut self) {
+        if let Some(Ok(mut child)) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -524,10 +538,11 @@ fn acknowledged(
     evidence: &Evidence,
     point: &str,
     action: &str,
+    daemon: &Daemon<'_>,
 ) -> Result<(), ScenarioError> {
     paths
         .failpoints
-        .wait_ack(point, 1, action, ACK_WAIT)
+        .wait_ack(point, 1, action, daemon.child.id(), ACK_WAIT)
         .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
     let bytes = paths.failpoints.ack_bytes(point, 1).map_err(infra)?;
     evidence
@@ -635,7 +650,7 @@ fn s1_f08_crash_inside_spawn_write_leaves_nothing() -> TestResult {
             arm(paths, point, "pause")?;
             let mut daemon = Daemon::start(paths, evidence, "crashed")?;
             let client = paths.spawn_pending(evidence, "spawn-crashed", "f08");
-            acknowledged(paths, evidence, point, "pause")?;
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
             let paused = paths.counts()?;
             check(paused == [0; 4], || {
                 format!("uncommitted spawn visible while paused: {paused:?}")
@@ -674,7 +689,7 @@ fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
             arm(paths, point, "crash")?;
             let mut daemon = Daemon::start(paths, evidence, "crashed")?;
             let client = paths.spawn_pending(evidence, "spawn-crashed", "f08");
-            acknowledged(paths, evidence, point, "crash")?;
+            acknowledged(paths, evidence, point, "crash", &daemon)?;
             daemon.wait_crash()?;
             let (status, stdout, _) = client.finish()?;
             check(!status.success() && stdout.is_empty(), || {
@@ -754,9 +769,9 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
         |paths, evidence| {
             let point = "store.commit.reply_lost";
             arm(paths, point, "fail_io")?;
-            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let daemon = Daemon::start(paths, evidence, "final")?;
             let client = paths.spawn_pending(evidence, "spawn-lost", "f08");
-            acknowledged(paths, evidence, point, "fail_io")?;
+            acknowledged(paths, evidence, point, "fail_io", &daemon)?;
             let (status, stdout, stderr) = client.finish()?;
             check(
                 !status.success()
@@ -815,7 +830,51 @@ fn restarted_unknown(
             == 1,
         || format!("turn was submitted again: {types:?}"),
     )?;
+    restart_cleanup(paths, session, &envelope, &types)?;
     Ok(envelope)
+}
+
+/// C1 §7.5: before admission Host reconciled the crashed daemon's anchors and
+/// the recovered turn keeps that result. Every anchor of the session carries
+/// committed group-absence proof by the time `result` is served, so cleanup is
+/// `quiescent`; with no anchor nothing could launch and the stop was only
+/// `requested`.
+fn restart_cleanup(
+    paths: &Paths,
+    session: &str,
+    envelope: &Value,
+    types: &[String],
+) -> Result<(), ScenarioError> {
+    check(
+        types.ends_with(&[
+            "cancel.requested".to_owned(),
+            "cancel.settled".to_owned(),
+            "turn.ended".to_owned(),
+        ]),
+        || format!("recovery recorded no cleanup settlement: {types:?}"),
+    )?;
+    let (anchors, unproven): (i64, i64) = paths
+        .store()?
+        .query_row(
+            "SELECT count(*), count(*) - count(absence_time) FROM anchors WHERE owner_session=?1",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(infra)?;
+    let cancel = &envelope["cancel"];
+    let outcome_ok = if anchors == 0 {
+        cancel["outcome"] == "requested"
+    } else {
+        cancel["outcome"] == "requested" || cancel["outcome"] == "forced"
+    };
+    check(
+        unproven == 0 && cancel["cleanup"] == "quiescent" && outcome_ok,
+        || {
+            format!(
+                "restart cleanup not reconciled ({anchors} anchors, {unproven} unproven): {cancel}"
+            )
+        },
+    )
 }
 
 /// F10: the submission record commits before any agent I/O: paused right
@@ -838,7 +897,7 @@ fn s1_f10_submission_precedes_agent_io_and_restarts_unknown() -> TestResult {
                 .as_str()
                 .ok_or_else(|| fail("receipt has no session"))?
                 .to_owned();
-            acknowledged(paths, evidence, point, "pause")?;
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
             let turn = paths.turn(&session)?;
             let types = paths.event_types(&session)?;
             check(
@@ -885,7 +944,7 @@ fn s1_f10_crash_after_prompt_write_restarts_unknown_without_resend() -> TestResu
                 .as_str()
                 .ok_or_else(|| fail("receipt has no session"))?
                 .to_owned();
-            acknowledged(paths, evidence, point, "pause")?;
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
             wait_file(&paths.sync.join("prompted.entered"))?;
             let turn = paths.turn(&session)?;
             check(
@@ -931,7 +990,7 @@ fn s1_f10_crash_before_acceptance_commit_restarts_unknown() -> TestResult {
                 .as_str()
                 .ok_or_else(|| fail("receipt has no session"))?
                 .to_owned();
-            acknowledged(paths, evidence, point, "crash")?;
+            acknowledged(paths, evidence, point, "crash", &daemon)?;
             daemon.wait_crash()?;
             let turn = paths.turn(&session)?;
             check(
@@ -967,7 +1026,7 @@ fn s1_f10_released_intent_pause_launches_once_and_completes() -> TestResult {
         |paths, evidence| {
             let point = "core.intent.after_commit";
             arm(paths, point, "pause")?;
-            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let daemon = Daemon::start(paths, evidence, "final")?;
             let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
             check(spawn.status.success(), || {
                 format!("spawn exited {}", spawn.status)
@@ -977,7 +1036,7 @@ fn s1_f10_released_intent_pause_launches_once_and_completes() -> TestResult {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            acknowledged(paths, evidence, point, "pause")?;
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
             check(paths.anchors_for(&session)? == 0, || {
                 "agent I/O began before the submission record".to_owned()
             })?;
@@ -993,4 +1052,39 @@ fn s1_f10_released_intent_pause_launches_once_and_completes() -> TestResult {
             })
         },
     )
+}
+
+/// A marker left by an earlier arming or another daemon never satisfies a
+/// wait: arming clears it, and an acknowledgement from another pid is refused.
+#[test]
+fn failpoint_harness_rejects_stale_acknowledgements() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let failpoints = Failpoints::new(root.path())?;
+    let point = "store.spawn.before_commit";
+    let dir = root.path().join("failpoints");
+    let stale = json!({"action":"pause","occurrence":1,"pid":1,"point":point});
+    fs::write(dir.join(format!("{point}.1.ack")), stale.to_string())?;
+    fs::write(dir.join(format!("{point}.1.release")), b"")?;
+    failpoints.arm(point, 1, "pause")?;
+    if dir.join(format!("{point}.1.ack")).exists()
+        || dir.join(format!("{point}.1.release")).exists()
+    {
+        return Err("arming left a stale marker".into());
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(format!("{point}.1.ack")))?;
+    file.write_all(stale.to_string().as_bytes())?;
+    match failpoints.wait_ack(
+        point,
+        1,
+        "pause",
+        std::process::id(),
+        Duration::from_millis(50),
+    ) {
+        Err(error) if error.contains("unexpected acknowledgement") => Ok(()),
+        other => Err(format!("another daemon's acknowledgement was accepted: {other:?}").into()),
+    }
 }

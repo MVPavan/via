@@ -121,24 +121,30 @@ impl Controller {
     }
 
     /// Counts the hit and returns the matching command's action, if any.
-    fn enter(&self, point: &'static str) -> Option<(u64, Action)> {
+    ///
+    /// Acts only once the acknowledgement is published: a failed write is
+    /// returned instead, and no injected action runs.
+    fn enter(&self, point: &'static str) -> io::Result<Option<(u64, Action)>> {
         let occurrence = {
             let mut hits = self.hits.lock().unwrap_or_else(PoisonError::into_inner);
             let count = hits.entry(point).or_insert(0);
             *count += 1;
             *count
         };
-        let bytes = fs::read(self.dir.join(format!("{point}.json"))).ok()?;
+        let Ok(bytes) = fs::read(self.dir.join(format!("{point}.json"))) else {
+            return Ok(None);
+        };
         let command = match serde_json::from_slice::<Command>(&bytes) {
             Ok(command) if command.token == self.token => command,
             // Never echo the command or its token.
             _ => {
+                // Nothing acts on a refused command, so a lost marker is harmless.
                 let _ = self.write_marker(point, occurrence, "refused", b"{}");
-                return None;
+                return Ok(None);
             }
         };
         if command.occurrence != occurrence {
-            return None;
+            return Ok(None);
         }
         let ack = serde_json::json!({
             "point": point,
@@ -146,10 +152,10 @@ impl Controller {
             "action": command.action.as_str(),
             "pid": std::process::id(),
         });
-        // An unwritten acknowledgement would leave the harness unable to tell
-        // entry from absence; a crash or pause then acts anyway.
-        let _ = self.write_marker(point, occurrence, "ack", ack.to_string().as_bytes());
-        Some((occurrence, command.action))
+        // Without a published acknowledgement the harness could not tell entry
+        // from absence, so the action never runs unacknowledged.
+        self.write_marker(point, occurrence, "ack", ack.to_string().as_bytes())?;
+        Ok(Some((occurrence, command.action)))
     }
 
     fn write_marker(
@@ -169,8 +175,10 @@ impl Controller {
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        // The rename publishes a complete acknowledgement atomically.
-        fs::rename(&temporary, final_path)
+        // The rename publishes a complete marker atomically; syncing the
+        // directory keeps it across a crash that follows.
+        fs::rename(&temporary, final_path)?;
+        fs::File::open(&self.dir)?.sync_all()
     }
 
     fn release_path(&self, point: &str, occurrence: u64) -> PathBuf {
@@ -190,12 +198,13 @@ fn released(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-/// Enters `point` from a thread that may block, such as Store's writer.
+/// Enters `point` from a thread that may block, such as Store's writer. An
+/// acknowledgement that cannot be written is returned as the point's error.
 pub fn hit(point: &'static str) -> io::Result<()> {
     let Some(controller) = controller() else {
         return Ok(());
     };
-    match controller.enter(point) {
+    match controller.enter(point)? {
         None => Ok(()),
         Some((_, Action::Crash)) => std::process::abort(),
         Some((_, Action::FailIo)) => Err(injected(point)),
@@ -209,12 +218,13 @@ pub fn hit(point: &'static str) -> io::Result<()> {
     }
 }
 
-/// Enters `point` from an async task; a pause yields to the runtime.
+/// Enters `point` from an async task; a pause yields to the runtime. An
+/// acknowledgement that cannot be written is returned as the point's error.
 pub async fn hit_async(point: &'static str) -> io::Result<()> {
     let Some(controller) = controller() else {
         return Ok(());
     };
-    match controller.enter(point) {
+    match controller.enter(point)? {
         None => Ok(()),
         Some((_, Action::Crash)) => std::process::abort(),
         Some((_, Action::FailIo)) => Err(injected(point)),
@@ -260,12 +270,15 @@ mod tests {
         let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
         let command = format!(r#"{{"token":"{TOKEN}","occurrence":2,"action":"fail_io"}}"#);
         std::fs::write(dir.path().join("p.point.json"), command).expect("arm");
-        assert_eq!(controller.enter("p.point"), None);
+        assert_eq!(controller.enter("p.point").expect("enter"), None);
         assert!(!dir.path().join("p.point.1.ack").exists());
-        assert_eq!(controller.enter("p.point"), Some((2, Action::FailIo)));
+        assert_eq!(
+            controller.enter("p.point").expect("enter"),
+            Some((2, Action::FailIo))
+        );
         let ack = std::fs::read_to_string(dir.path().join("p.point.2.ack")).expect("ack");
         assert!(!ack.contains(TOKEN));
-        assert_eq!(controller.enter("p.point"), None);
+        assert_eq!(controller.enter("p.point").expect("enter"), None);
     }
 
     #[test]
@@ -274,8 +287,20 @@ mod tests {
         let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
         let command = r#"{"token":"ffffffffffffffffffff","occurrence":1,"action":"crash"}"#;
         std::fs::write(dir.path().join("p.point.json"), command).expect("arm");
-        assert_eq!(controller.enter("p.point"), None);
+        assert_eq!(controller.enter("p.point").expect("enter"), None);
         assert!(dir.path().join("p.point.1.refused").exists());
         assert!(!dir.path().join("p.point.1.ack").exists());
+    }
+
+    #[test]
+    fn an_unpublished_acknowledgement_is_an_error_and_never_acts() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let command = format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"crash"}}"#);
+        std::fs::write(dir.path().join("p.point.json"), command).expect("arm");
+        // A directory in the ack's place makes the publishing rename fail.
+        std::fs::create_dir(dir.path().join("p.point.1.ack")).expect("block");
+        std::fs::write(dir.path().join("p.point.1.ack").join("x"), b"").expect("nonempty");
+        assert!(controller.enter("p.point").is_err());
     }
 }
