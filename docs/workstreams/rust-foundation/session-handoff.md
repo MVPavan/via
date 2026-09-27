@@ -24,11 +24,26 @@ the historical checkpoint; its findings table is updated by this section.
   tracker; force-stop e2e test now waits for a durable observation before
   forcing (it raced locally). Gate green, 98 tests. Sol medium: W3-F
   unsound, W3-G sound with changes (`w3/sol-review-*.md`).
-- Next: W4 ([w4/README.md](w4/README.md)), W4-H (force race, force
-  evidence, join bound, in-flight output; Opus high) and W4-I (store_error
-  data, bounded set, deadline class; Opus medium). Store-failure lifecycle
-  findings moved to `via-jm4.7.7`. Then a Sol high review of Task 1 and
-  close `via-jm4.7.5`; then `.7.6`–`.7.8`, then `.7.9`.
+- W4 ([w4/README.md](w4/README.md)): W4-H (force race, force evidence,
+  join bound, in-flight output) and W4-I (store_error data, bounded set,
+  deadline class) went three review rounds in their own cloud sessions
+  (Sol reviews `w4/sol-review-*`). Round 3: **W4-I SOUND, W4-H SOUND WITH
+  CHANGES (no merge blocker)**. Both are **ready to merge, not yet merged**:
+  branches `claude/w4-h-rust-foundation-q1s7w7` (head `ca2eeee`) and
+  `claude/w4-i-rust-foundation-ce2rcm` (head `d128aed`).
+- Resume here (paused for an owner restart, 2026-09-27):
+  1. Merge W4-I, then W4-H, into `rust-foundation` (expect conflicts in
+     `via-core/src/engine.rs`); run the full gate; push; delete both
+     branches.
+  2. Record the round-3 deferrables (W4-H: deterministic post-ARM test,
+     C1 wording for "completeness uncertain"; W4-I: fault on the new
+     `terminated` query) on the right later Beads.
+  3. Sol high review of all of Task 1 (`via-jm4.7.5`); fix; close it.
+  4. Split `via-core/src/engine.rs` by responsibility before the next
+     parallel wave; then `.7.6`–`.7.8`, then `.7.9`.
+- Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
+  (review loop in the author's session; merge only after review; S3 Codex
+  adapter by a local Opus 5.5 medium session).
 
 Status: **PAUSED BY OWNER, 2026-09-26. Release and S1 acceptance are incomplete.**
 The goal tool is paused. Do not resume the goal, implementation, worker dispatch,
