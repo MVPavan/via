@@ -10,6 +10,10 @@ publish.workspace = true
 name = "via"
 path = "src/main.rs"
 
+[features]
+# Test-only failpoint controller (runtime-contracts §11); default off.
+test-failpoints = ["via-core/test-failpoints"]
+
 [dependencies]
 via-core = { path = "../via-core" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time"] }

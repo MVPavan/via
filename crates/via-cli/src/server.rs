@@ -116,6 +116,14 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             .await?
             .map_err(anyhow::Error::msg)?,
     );
+    // C1 §7.5: recovery commits before the first request is accepted.
+    let recovered = engine
+        .recover()
+        .await
+        .map_err(|error| anyhow::anyhow!("crash recovery failed: {}", error.kind))?;
+    if recovered > 0 {
+        tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
+    }
     let (drive_tx, mut drive_rx) = mpsc::channel::<(String, String)>(16);
     // An accepted stop wakes main at once; Core holds the authoritative mode.
     let stop = Arc::new(Notify::new());

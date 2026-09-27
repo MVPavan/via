@@ -273,6 +273,12 @@ impl WireConnection {
             .await?;
             written += next;
         }
+        // The whole frame (in S1 first the start carrying the prompt) is in the
+        // vendor's stdin; nothing it answered is recorded yet.
+        #[cfg(feature = "test-failpoints")]
+        via_store::failpoint::hit_async("wire.prompt.after_write")
+            .await
+            .map_err(WireError::Io)?;
         Ok(SendOutcome::Written)
     }
 

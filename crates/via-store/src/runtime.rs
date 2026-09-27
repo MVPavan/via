@@ -133,6 +133,19 @@ pub struct TerminalRecord {
     pub raw_ref: Option<RawRef>,
 }
 
+/// A turn with durable submission intent and no terminal, as a crashed daemon
+/// left it; recovery resolves it before admission.
+pub struct UnfinishedTurn {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based turn number.
+    pub turn: TurnNumber,
+    /// Durable submission time.
+    pub submitted_at: String,
+    /// Recorded vendor acceptance correlation, if acceptance committed.
+    pub correlation: Option<String>,
+}
+
 /// One durable event returned in sequence order.
 pub struct StoredEvent {
     /// Dense per-session sequence.
@@ -394,6 +407,7 @@ enum Command {
         oneshot::Sender<Result<Vec<StoredEvent>, StoreError>>,
     ),
     Logs(SessionId, oneshot::Sender<Result<Value, StoreError>>),
+    Unfinished(oneshot::Sender<Result<Vec<UnfinishedTurn>, StoreError>>),
     Authenticate(
         SessionId,
         [u8; 32],
@@ -633,6 +647,13 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::Events(session_id.clone(), from_seq, limit, reply))?;
+        receive.await.map_err(|_| StoreError::Unavailable)?
+    }
+
+    /// Returns at most 1000 turns that have submission intent but no terminal.
+    pub async fn unfinished_turns(&self) -> Result<Vec<UnfinishedTurn>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Unfinished(reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 
