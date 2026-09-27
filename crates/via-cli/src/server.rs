@@ -335,6 +335,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
                         code: -32000,
                         kind: "handshake_required",
                         message: "hello must be first",
+                        unpersisted: None,
                     }),
                 ),
             )
@@ -365,6 +366,7 @@ async fn handle_client(stream: UnixStream, mut client: Client) -> anyhow::Result
                                 code: -32001,
                                 kind: "version_mismatch",
                                 message: "client and daemon versions differ",
+                                unpersisted: None,
                             }),
                         ),
                     )
@@ -466,6 +468,7 @@ async fn dispatch(method: &str, params: Value, client: &Client) -> Result<Value,
             code: -32601,
             kind: "method_not_found",
             message: "method not found",
+            unpersisted: None,
         })),
     }
 }
@@ -474,16 +477,18 @@ const PARSE_ERROR: ApiError = ApiError {
     code: -32700,
     kind: "parse_error",
     message: "invalid JSON",
+    unpersisted: None,
 };
 
 const INVALID_REQUEST: ApiError = ApiError {
     code: -32600,
     kind: "invalid_request",
     message: "invalid JSON-RPC request",
+    unpersisted: None,
 };
 
 /// A request error plus the optional C1 `data.kind2` refinement.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Refusal {
     error: ApiError,
     kind2: Option<&'static str>,
@@ -539,7 +544,7 @@ fn typed<T: DeserializeOwned>(params: Value) -> Result<T, Refusal> {
 
 fn error(id: &Value, refusal: Refusal) -> Value {
     let Refusal { error, kind2 } = refusal;
-    let mut data = json!({"kind":error.kind});
+    let mut data = error.data();
     if let Some(kind2) = kind2 {
         data["kind2"] = json!(kind2);
     }
@@ -579,6 +584,21 @@ async fn read_line_limit<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1 §3.8/§9: a receipted turn whose terminal is not durable reads as
+    /// `store_error` carrying its session, turn and last committed state.
+    #[test]
+    fn unpersisted_turn_renders_the_complete_store_error_response() {
+        let session = via_core::SessionId::try_from("s_0123456789ab").unwrap();
+        let turn = via_core::TurnNumber::try_from(1).unwrap();
+        let unpersisted = ApiError::unpersisted(&session, turn, via_core::TurnState::Running);
+        assert_eq!(
+            error(&json!(7), Refusal::from(unpersisted)),
+            json!({"jsonrpc":"2.0","id":7,"error":{"code":-32018,"message":"durable storage failed",
+                "data":{"kind":"store_error","session":"s_0123456789ab","turn":1,
+                    "durable_state":"running","terminal_persisted":false}}})
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn stalled_blocking_drop_is_abandoned_at_the_deadline() {

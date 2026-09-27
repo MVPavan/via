@@ -6,10 +6,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{ConnectionId, RawRef, SessionId, TurnNumber};
+use crate::{ConnectionId, RawRef, SessionId, TurnNumber, TurnState};
 
 /// Strict C1 parameters for creating Task 1's fake session and first turn.
 #[derive(Deserialize)]
@@ -71,7 +71,7 @@ pub struct DaemonStopParams {
 }
 
 /// Named C1 request error without sensitive input in its message.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiError {
     /// JSON-RPC error code.
     pub code: i32,
@@ -79,6 +79,16 @@ pub struct ApiError {
     pub kind: &'static str,
     /// Bounded public explanation.
     pub message: &'static str,
+    /// C1 §3.8/§9 facts of a receipted turn whose terminal is not durable.
+    pub unpersisted: Option<Box<Unpersisted>>,
+}
+
+/// A receipted turn whose terminal could not be made durable (C1 `store_error`).
+#[derive(Clone, Debug)]
+pub struct Unpersisted {
+    session: SessionId,
+    turn: TurnNumber,
+    durable_state: TurnState,
 }
 
 impl fmt::Display for ApiError {
@@ -90,65 +100,107 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
+    /// C1 §3.8 `store_error` for a receipted turn whose terminal is not durable;
+    /// `durable_state` is the turn's last committed lifecycle state.
+    pub fn unpersisted(session: &SessionId, turn: TurnNumber, durable_state: TurnState) -> Self {
+        Self {
+            unpersisted: Some(Box::new(Unpersisted {
+                session: session.clone(),
+                turn,
+                durable_state,
+            })),
+            ..Self::STORE
+        }
+    }
+
+    /// The C1 §9 JSON-RPC `error.data` object: `kind` plus the kind's own fields.
+    pub fn data(&self) -> Value {
+        let mut data = json!({"kind":self.kind});
+        if let Some(turn) = &self.unpersisted {
+            data["session"] = json!(turn.session.as_str());
+            data["turn"] = json!(turn.turn.get());
+            data["durable_state"] = json!(turn.durable_state.as_str());
+            data["terminal_persisted"] = json!(false);
+        }
+        data
+    }
+
     /// Invalid request fields or identifier format.
     pub const INVALID_PARAMS: Self = Self {
         code: -32602,
         kind: "invalid_params",
         message: "invalid parameters",
+        unpersisted: None,
     };
     /// A caller handle did not authorize a mutation.
     pub const INVALID_HANDLE: Self = Self {
         code: -32002,
         kind: "invalid_handle",
         message: "invalid session handle",
+        unpersisted: None,
     };
     /// The selected route has no such control capability.
     pub const UNSUPPORTED_VERB: Self = Self {
         code: -32006,
         kind: "unsupported_verb",
         message: "verb is unsupported on this route",
+        unpersisted: None,
     };
     /// The fake route is not configured or selected.
     pub const HARNESS_UNAVAILABLE: Self = Self {
         code: -32009,
         kind: "harness_unavailable",
         message: "harness is unavailable",
+        unpersisted: None,
     };
     /// The daemon accepted a stop and admits no new work.
     pub const DAEMON_STOPPING: Self = Self {
         code: -32017,
         kind: "daemon_stopping",
         message: "the daemon is stopping",
+        unpersisted: None,
     };
     /// Active sessions refuse a plain stop (C1 §3.14).
     pub const SESSIONS_ACTIVE: Self = Self {
         code: -32012,
         kind: "admission_refused",
         message: "sessions are active",
+        unpersisted: None,
+    };
+    /// The daemon already retains its bound of turns without a durable terminal.
+    pub const TURNS_AT_CAPACITY: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "too many unresolved turns",
+        unpersisted: None,
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
         code: -32018,
         kind: "store_error",
         message: "durable storage failed",
+        unpersisted: None,
     };
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
         code: -32015,
         kind: "turn_not_finished",
         message: "turn has not finished",
+        unpersisted: None,
     };
     /// A wait deadline elapsed while the turn remains active.
     pub const WAIT_TIMEOUT: Self = Self {
         code: -32016,
         kind: "wait_timeout",
         message: "wait timed out",
+        unpersisted: None,
     };
     /// The requested session is absent.
     pub const SESSION_NOT_FOUND: Self = Self {
         code: -32003,
         kind: "session_not_found",
         message: "session does not exist",
+        unpersisted: None,
     };
 }
 

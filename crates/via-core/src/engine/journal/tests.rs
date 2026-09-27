@@ -1,7 +1,11 @@
 //! Uncertain commits at the Store/Core boundary, injected by a closed fault
 //! backend over a real Store.
 
-use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Value, json};
 use via_store::{
@@ -9,10 +13,12 @@ use via_store::{
     SubmissionRecord, TerminalRecord,
 };
 
-use super::{TurnJournal, Unresolved, commit_event, read_result};
+use super::{TurnJournal, UNRESOLVED_LIMIT, Unresolved, admission, commit_event, read_result};
 use crate::api::{Event, EventBody, FailureClass};
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
-use crate::{ConnectionId, RawRef, SessionId, TurnNumber};
+use crate::{
+    ApiError, ConnectionId, FakeConfig, RawRef, SessionId, SpawnParams, TurnNumber, TurnState,
+};
 
 const SESSION: &str = "s_0123456789ab";
 const CONNECTION: &str = "c_0123456789ab";
@@ -33,6 +39,10 @@ struct FaultJournal {
     event: EventFault,
     /// Reads of the durable event head fail, so nothing can be settled.
     head_unreadable: bool,
+    /// Submission commits report an uncertain outcome and leave nothing durable.
+    submission_fails: bool,
+    /// Result reads of every session but `SESSION` stall past the settle bound.
+    delayed_results: bool,
 }
 
 fn injected() -> StoreError {
@@ -40,6 +50,13 @@ fn injected() -> StoreError {
 }
 
 impl TurnJournal for FaultJournal {
+    async fn commit_submission(&self, record: SubmissionRecord) -> Result<(), StoreError> {
+        if self.submission_fails {
+            return Err(injected());
+        }
+        self.store.commit_submission(record).await
+    }
+
     async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
         if matches!(self.event, EventFault::CommittedThenUncertain) {
             self.store.commit_event(record).await?;
@@ -67,11 +84,21 @@ impl TurnJournal for FaultJournal {
         self.store.events(session, from_seq, limit).await
     }
 
+    async fn terminated(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> Result<Vec<(SessionId, TurnNumber)>, StoreError> {
+        self.store.terminated(turns).await
+    }
+
     async fn result(
         &self,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<Option<Value>, StoreError> {
+        if self.delayed_results && session.as_str() != SESSION {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
         self.store.result(session, turn).await
     }
 }
@@ -213,6 +240,8 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
         head_unreadable: false,
+        submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved, &raw_ref)
@@ -250,6 +279,8 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
         store: store.client(),
         event: EventFault::UncertainNotCommitted,
         head_unreadable: false,
+        submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved, &raw_ref)
@@ -271,6 +302,8 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
         head_unreadable: true,
+        submission_fails: false,
+        delayed_results: false,
     };
     let unresolved = Unresolved::default();
     let finished = observe_then_finish(&journal, &unresolved, &raw_ref).await;
@@ -285,5 +318,288 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
             .is_none()
     );
     let read = read_result(&store.client(), &unresolved, &session(), turn()).await;
-    assert_eq!(read.unwrap_err().kind, "store_error");
+    assert_eq!(
+        read.unwrap_err().data(),
+        unpersisted_data(SESSION, "running")
+    );
+}
+
+/// C1 §3.8/§9 `error.data` for a receipted turn whose terminal is not durable.
+fn unpersisted_data(session: &str, durable_state: &str) -> Value {
+    json!({"kind":"store_error","session":session,"turn":1,
+        "durable_state":durable_state,"terminal_persisted":false})
+}
+
+/// A daemon Engine over a fresh private state and runtime directory.
+fn engine(root: &tempfile::TempDir) -> Engine {
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let [state, runtime, _anchors] = ["state", "runtime", "runtime/anchors"].map(|part| {
+        let path = root.path().join(part);
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    });
+    let fake = FakeConfig::from_environment().unwrap();
+    Engine::open(&state, &runtime, fake, root.path().join("via")).unwrap()
+}
+
+/// Commits the receipt of `session` through `store`, with `turn.submitted` if `submitted`.
+async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
+    let event = |seq, body| {
+        Event {
+            seq,
+            session_id: session,
+            turn: Some(1),
+            late: false,
+            at: AT,
+            raw_ref: None,
+            body,
+        }
+        .to_value()
+        .unwrap()
+    };
+    store
+        .commit_spawn(SpawnRecord {
+            session_id: session.clone(),
+            handle_hash: [7; 32],
+            receipt: json!({"state":"queued"}),
+            params: json!({"harness":"fake"}),
+            prompt: "hello".to_owned(),
+            initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
+        })
+        .await
+        .unwrap();
+    if submitted {
+        store
+            .commit_submission(SubmissionRecord {
+                session_id: session.clone(),
+                turn: turn(),
+                event: event(2, EventBody::TurnSubmitted { attempt: 1 }),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+fn spawn_params() -> SpawnParams {
+    SpawnParams {
+        harness: "fake".to_owned(),
+        model: "fake".to_owned(),
+        prompt: "hello".to_owned(),
+        handle: format!("h_{}", "A".repeat(43)),
+    }
+}
+
+fn numbered(n: usize) -> SessionId {
+    SessionId::try_from(format!("s_{n:012}").as_str()).unwrap()
+}
+
+#[tokio::test]
+async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    receipt(&engine.store, &session(), true).await;
+    // The terminal commit fails and its read-back cannot settle it.
+    let journal = FaultJournal {
+        store: engine.store.clone(),
+        event: EventFault::CommittedThenUncertain,
+        head_unreadable: true,
+        submission_fails: false,
+        delayed_results: false,
+    };
+    let mut record = record();
+    commit_event(&journal, &mut record, EventBody::CancelRequested {}, None).await;
+    let finished = Engine::finish_turn(
+        &journal,
+        &engine.unresolved,
+        &started(),
+        record,
+        store_failure(),
+        false,
+    )
+    .await;
+    assert_eq!(finished.unwrap_err().kind, "store_error");
+    let address = format!("{SESSION}/1");
+    for read in [engine.result(&address).await, engine.wait(&address).await] {
+        let error = read.unwrap_err();
+        assert_eq!(
+            (error.code, error.message),
+            (-32018, "durable storage failed")
+        );
+        assert_eq!(error.data(), unpersisted_data(SESSION, "running"));
+    }
+}
+
+#[tokio::test]
+async fn a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_state() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    // A real receipt, tracked as `spawn` tracks it; its submission commit fails.
+    receipt(&engine.store, &session(), false).await;
+    engine.unresolved.receipt(&session(), turn());
+    let journal = FaultJournal {
+        store: engine.store.clone(),
+        event: EventFault::UncertainNotCommitted,
+        head_unreadable: false,
+        submission_fails: true,
+        delayed_results: false,
+    };
+    let submitted = Engine::submit(&journal, &engine.unresolved, &session(), turn()).await;
+    assert_eq!(submitted.unwrap_err().kind, "store_error");
+    let address = format!("{SESSION}/1");
+    for read in [engine.result(&address).await, engine.wait(&address).await] {
+        let error = read.unwrap_err();
+        assert_eq!(
+            (error.code, error.message),
+            (-32018, "durable storage failed")
+        );
+        assert_eq!(error.data(), unpersisted_data(SESSION, "queued"));
+    }
+}
+
+#[tokio::test]
+async fn failed_turns_are_bounded_and_each_keeps_store_error() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    let sessions: Vec<SessionId> = (0..UNRESOLVED_LIMIT).map(numbered).collect();
+    for session in &sessions {
+        engine.unresolved.receipt(session, turn());
+        engine.unresolved.fail(session, turn(), TurnState::Running);
+    }
+    // At the bound a new spawn is refused before any receipt, so the set stops growing.
+    let refused = engine.spawn(spawn_params()).await.unwrap_err();
+    assert_eq!(
+        (refused.kind, refused.unpersisted.is_none()),
+        ("store_error", true)
+    );
+    assert_eq!(engine.unresolved.turns().len(), UNRESOLVED_LIMIT);
+    for session in [&sessions[0], &sessions[UNRESOLVED_LIMIT - 1]] {
+        let read = engine.result(&format!("{}/1", session.as_str())).await;
+        assert_eq!(
+            read.unwrap_err().data(),
+            unpersisted_data(session.as_str(), "running")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_turn_whose_terminal_becomes_readable_is_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, _raw_ref) = running_turn(&root).await;
+    let unresolved = Unresolved::default();
+    unresolved.receipt(&session(), turn());
+    unresolved.fail(&session(), turn(), TurnState::Running);
+    assert!(
+        read_result(&store.client(), &unresolved, &session(), turn())
+            .await
+            .is_err()
+    );
+    // The terminal Core could not confirm turns out durable.
+    Engine::commit_turn_ended(
+        &store.client(),
+        &started(),
+        record(),
+        store_failure(),
+        false,
+    )
+    .await
+    .unwrap();
+    let read = read_result(&store.client(), &unresolved, &session(), turn()).await;
+    assert_eq!(read.unwrap().unwrap()["state"], "failed");
+    assert!(
+        unresolved.turns().is_empty(),
+        "the settled turn is forgotten"
+    );
+    assert!(unresolved.admits());
+}
+
+#[tokio::test]
+async fn in_flight_turns_count_toward_the_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    for n in 0..UNRESOLVED_LIMIT {
+        engine.unresolved.receipt(&numbered(n), turn());
+    }
+    // No turn has failed, yet the set is full: capacity, not a Store failure (C1 §8.1).
+    let refused = engine.spawn(spawn_params()).await.unwrap_err();
+    assert_eq!((refused.code, refused.kind), (-32012, "admission_refused"));
+    assert_eq!(engine.unresolved.turns().len(), UNRESOLVED_LIMIT);
+    engine.unresolved.resolve(&numbered(0), turn());
+    // Admitted past the bound; the fake harness is not configured in this test.
+    let admitted = engine.spawn(spawn_params()).await.unwrap_err();
+    assert_eq!(admitted.kind, "harness_unavailable");
+}
+
+#[tokio::test]
+async fn durable_terminals_are_settled_before_admission_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    for n in 1..UNRESOLVED_LIMIT {
+        engine.unresolved.receipt(&numbered(n), turn());
+        engine
+            .unresolved
+            .fail(&numbered(n), turn(), TurnState::Running);
+    }
+    // A failed turn whose terminal became durable, and that nobody read.
+    receipt(&engine.store, &session(), true).await;
+    engine.unresolved.receipt(&session(), turn());
+    engine
+        .unresolved
+        .fail(&session(), turn(), TurnState::Running);
+    Engine::commit_turn_ended(&engine.store, &started(), record(), store_failure(), false)
+        .await
+        .unwrap();
+    let admitted = engine.spawn(spawn_params()).await.unwrap_err();
+    assert_eq!(admitted.kind, "harness_unavailable");
+    let retained = engine.unresolved.turns();
+    assert_eq!(retained.len(), UNRESOLVED_LIMIT - 1);
+    assert!(
+        !retained.contains(&(session(), turn())),
+        "the durable turn is forgotten"
+    );
+}
+
+#[test]
+fn unpersisted_error_is_c1_store_error() {
+    let error = ApiError::unpersisted(&session(), turn(), TurnState::Running);
+    assert_eq!((error.code, error.kind), (-32018, "store_error"));
+    assert_eq!(ApiError::STORE.data(), json!({"kind":"store_error"}));
+}
+
+#[tokio::test]
+async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = engine(&root);
+    for n in 1..UNRESOLVED_LIMIT {
+        engine.unresolved.receipt(&numbered(n), turn());
+        engine
+            .unresolved
+            .fail(&numbered(n), turn(), TurnState::Running);
+    }
+    receipt(&engine.store, &session(), true).await;
+    engine.unresolved.receipt(&session(), turn());
+    engine
+        .unresolved
+        .fail(&session(), turn(), TurnState::Running);
+    Engine::commit_turn_ended(&engine.store, &started(), record(), store_failure(), false)
+        .await
+        .unwrap();
+    // Every other failed turn's read stalls past the bound.
+    let journal = FaultJournal {
+        store: engine.store.clone(),
+        event: EventFault::UncertainNotCommitted,
+        head_unreadable: false,
+        submission_fails: false,
+        delayed_results: true,
+    };
+    let started = Instant::now();
+    admission(&journal, &engine.unresolved).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let retained = engine.unresolved.turns();
+    assert_eq!(retained.len(), UNRESOLVED_LIMIT - 1);
+    assert!(!retained.contains(&(session(), turn())));
 }
