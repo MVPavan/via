@@ -24,27 +24,24 @@ the historical checkpoint; its findings table is updated by this section.
   tracker; force-stop e2e test now waits for a durable observation before
   forcing (it raced locally). Gate green, 98 tests. Sol medium: W3-F
   unsound, W3-G sound with changes (`w3/sol-review-*.md`).
-- W4 ([w4/README.md](w4/README.md)): W4-H (force race, force evidence,
-  join bound, in-flight output) and W4-I (store_error data, bounded set,
-  deadline class) went three review rounds in their own cloud sessions
-  (Sol reviews `w4/sol-review-*`). Round 3: **W4-I SOUND, W4-H SOUND WITH
-  CHANGES (no merge blocker)**. Both are **ready to merge, not yet merged**:
-  branches `claude/w4-h-rust-foundation-q1s7w7` (head `ca2eeee`) and
-  `claude/w4-i-rust-foundation-ce2rcm` (head `d128aed`).
-- Resume here (paused for an owner restart, 2026-09-27):
-  0. Restore tmux session `via` (lost on reboot): `tmux new-session -d -s
-     via -n main -c <repo>`, then window `watch` running
-     `scratchpad/cloud/watch-branches.sh`. Worker windows are recreated by
-     `launch.sh` / `followup.sh` as needed.
-  1. Merge W4-I, then W4-H, into `rust-foundation` (expect conflicts in
-     `via-core/src/engine.rs`); run the full gate; push; delete both
-     branches.
-  2. Record the round-3 deferrables (W4-H: deterministic post-ARM test,
-     C1 wording for "completeness uncertain"; W4-I: fault on the new
-     `terminated` query) on the right later Beads.
-  3. Sol high review of all of Task 1 (`via-jm4.7.5`); fix; close it.
-  4. Split `via-core/src/engine.rs` by responsibility before the next
-     parallel wave; then `.7.6`–`.7.8`, then `.7.9`.
+- W4 ([w4/README.md](w4/README.md)): W4-H and W4-I went three review
+  rounds in their own cloud sessions (Sol reviews `w4/sol-review-*`) and
+  merged after round 3 (W4-I SOUND; W4-H SOUND WITH CHANGES, no blocker).
+  Gate green: 116 passed, 2 skipped (root-only peer test; the
+  scheduling-dependent queued-handoff force test, ignored until
+  `test-failpoints` exists). Deferred test/Store items are on `via-jm4.7.7`.
+- Contract text still to record (implemented, not yet in specs): prelaunch
+  force is `requested`/`quiescent`; force after a Store failure is
+  `failed(store)` with `cancel` filled; a `wait` pending at final shutdown
+  ends `daemon_stopping`; `session.closed.reason` `daemon_stop_force`;
+  `vendor.other.truncated`; force abandoning a post-ARM acquisition marks
+  the raw log incomplete conservatively (bytes *may* be lost); the 256
+  unresolved-turn cap refuses with `admission_refused`.
+- Next: Sol high review of all of Task 1 (`via-jm4.7.5`) → fix → record the
+  contract text above → close Task 1. Then split `via-core/src/engine.rs`
+  by responsibility; then `.7.6`–`.7.8` (failpoint controller first), then
+  `.7.9`. After a reboot, restore tmux session `via` (windows `main`, and
+  `watch` running `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
