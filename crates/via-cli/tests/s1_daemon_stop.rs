@@ -1064,9 +1064,9 @@ fn s1_daemon_stop_force_before_acceptance_is_forced() -> TestResult {
 /// failure; the daemon force-stops itself and the turn ends `failed(store)`,
 /// not `cancelled`: C1 §8.2 `store` records that the durable stream lost an
 /// event, and hiding it behind a cancellation would claim a complete record.
-/// The cancel evidence is still reported. Store-failed mode commits no
-/// `session.closed` (an uncertain receipt could hold an unregistered turn)
-/// and the exit is 4.
+/// The cancel evidence is still reported. The failure was observed before
+/// the forced terminal's close check, so no close-bearing commit starts
+/// (T2-B2 design §3.2): no `session.closed`, and the exit is 4.
 #[test]
 fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
     let fixture = json!({

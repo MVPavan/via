@@ -7,14 +7,18 @@ Status: accepted with changes. This version folds in:
 - the orchestrator's correction after Sol's re-review. Runtime §7 latches
   Store failure on the first failed or uncertain state write, which
   replaces failed-write retries and the in-daemon orphan machinery;
-- Sol's round-3 check (`sol-review-T2-B2-design-r3.md`): no `session.closed`
-  in Store-failed mode, and a pre-ARM launch gate (§3.1);
+- Sol's round-3 check (`sol-review-T2-B2-design-r3.md`): a pre-ARM launch
+  gate (§3.1), and a rule against `session.closed` in Store-failed mode,
+  since replaced by the round-3 closure rule below;
 - the round-1 code review (`sol-review-T2-B2.md`) and its decisions: an
   uncertain terminal commit latches; `admission` is the latch barrier (§3.2);
   a force closure pass (§2.4); force-path reads retry (§2.3);
 - the round-2 code review (`sol-review-T2-B2-r2.md`) and its decisions: a
   two-phase latch (§3.2); Store refuses `session.closed` while another turn
-  is unfinished (§2.3); force-path reads are bounded by the cutoff (§2.3).
+  is unfinished (§2.3); force-path reads are bounded by the cutoff (§2.3);
+- the round-3 code review (`sol-review-T2-B2-r3.md`) and its decision: the
+  closure rule after a failure (§3.2), replacing "no `session.closed` in
+  Store-failed mode".
 
 This note is normative for Step 2.
 
@@ -162,8 +166,8 @@ N waiting turns in one session cost one timer, not N.
   read is issued for it.
 - `session.closed` (`reason: "daemon_stop_force"`) is committed only after
   every turn of the session has a durable force disposition, only when the
-  session has no other unresolved turn, and never once Store failure is
-  latched (§3). In a queued-only session it
+  session has no other unresolved turn. None starts once `failure_pending`
+  is observed (§3.2). In a queued-only session it
   rides on the last cancellation, in the same transaction. Store's closing
   terminal accepts `queued → cancelled`. Store itself refuses the close:
   every transaction that can write `session.closed` checks, in the same
@@ -195,7 +199,7 @@ recorded session that is still open in Store and, under `admission`:
 - otherwise counts the session in `unclosed_sessions`, which makes the exit
   4.
 
-The pass is skipped once Store failure is latched. It reads before it
+The pass starts no close once `failure_pending` is observed (§3.2). It reads before it
 writes, so a session already closed in-path is never closed twice. A failed
 close commit latches. This covers a session that went idle during force,
 for example when force was accepted while its last queued turn's
@@ -231,11 +235,16 @@ Once set:
   and starts final shutdown in force mode. `EngineShutdown.store_failed`
   makes the shutdown unclean, so the process exits 4.
 - An uncertain submission never leads to vendor I/O.
-- **No `session.closed` in Store-failed mode.** No path commits it once the
-  latch is set, including a forced running turn's terminal batch in final
-  shutdown. An uncertain resume receipt may have committed a queued turn
-  that Core never registered, so closure cannot be proved. Those sessions
-  stay open in Store, the exit is 4, and restart recovery settles them.
+- **Closure after a failure (round 3).** Once `failure_pending` is
+  observed, Core starts no new close-bearing commit: the closing
+  cancellation, the forced closing terminal and the closure pass. A
+  close-bearing commit that passed its check before that may complete. The
+  closure proof is Store's refusal in the same transaction: `session.closed`
+  is written only if no other turn of the session is queued or running
+  there (§2.3). That includes a turn that an uncertain receipt committed but
+  Core never registered, which was the reason for the earlier rule. Runtime
+  §7 allows best-effort writes after the first failure, and the daemon
+  still exits 4. No other write gate exists.
 
 A terminal commit whose outcome was uncertain latches even when the
 read-back finds the terminal. Waiters still get the committed envelope,
@@ -362,8 +371,8 @@ never lets a drain finish clean.
 |---|---|---|---|---|
 | Queued turn | refused `sessions_active` | runs in order under its own deadline | cancelled without submission (§2.3) | kept `queued`, unresolved |
 | Running turn | refused | runs to its terminal | existing forced-turn path | forced path, one best-effort terminal |
-| Queued-only session | refused | runs | turns cancelled, then `session.closed` | not closed |
-| Session of a forced running turn | refused | runs | closed with the forced terminal if every other turn is settled | not closed (§3) |
+| Queued-only session | refused | runs | turns cancelled, then `session.closed` | no new close starts (§3) |
+| Session of a forced running turn | refused | runs | closed with the forced terminal if every other turn is settled | no new close starts; one past its check completes under Store's refusal rule (§3) |
 | Waiting behind an unowned predecessor | refused | the drain waits (Task 3) | cancelled | kept `queued` |
 
 Final shutdown runs in this order:
@@ -429,5 +438,7 @@ has the path:
 8. **Pre-ARM gate:** paused at `host.anchor.after_arm_intent_commit`, force
    or the latch is set, then released; no ARM, no vendor launch recorded by
    the fake agent, and the pre-launch force outcome.
-9. **No close in Store-failed mode:** a forced running turn's terminal after
-   the latch commits without `session.closed`.
+9. **Closure after a failure:** no close starts once `failure_pending` is
+   observed. A closing cancellation already past its check completes; Store
+   writes `session.closed` only when no other turn is queued or running,
+   and the exit is 4.

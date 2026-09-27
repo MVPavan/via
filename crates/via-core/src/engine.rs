@@ -122,8 +122,13 @@ struct Faults {
     hold_before_close: AtomicBool,
     /// The next receipt commit waits for `release` first, holding `admission`.
     hold_receipt: AtomicBool,
-    /// A turn decided `Run` waits for `release` before its grant.
+    /// A turn decided `Run` waits for `grant_release` before its grant.
     hold_before_grant: AtomicBool,
+    grant_paused: tokio::sync::Notify,
+    grant_release: tokio::sync::Notify,
+    /// The next closing cancellation waits for `release` after its failure
+    /// and close checks, before its commit.
+    hold_after_close_check: AtomicBool,
     /// A granted turn waits for `release` before its submission commit.
     hold_after_grant: AtomicBool,
     granted: tokio::sync::Notify,

@@ -217,9 +217,11 @@ impl Engine {
                     terminal.fail(FailureClass::Store, "a turn event could not be recorded");
                 }
                 // C1 §3.14: close only once every other turn of the session
-                // has a durable disposition, and never after a Store failure:
-                // an uncertain receipt may hold a turn Core never registered.
-                // `admission` orders this decision against the latch.
+                // has a durable disposition. Design §3.2: once
+                // `failure_pending` is observed no new close-bearing commit
+                // starts; Store refuses `session.closed` in the same
+                // transaction while any other turn is queued or running, which
+                // covers a turn an uncertain receipt committed unregistered.
                 let admission = self.admission.lock().await;
                 let close = !self.store_failed()
                     && !self

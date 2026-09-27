@@ -494,9 +494,9 @@ fn a_force_between_the_decision_and_the_grant_refuses_the_grant() {
             .hold_before_grant
             .store(true, Ordering::Release);
         let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
-            engine.faults.granted.notified().await;
+            engine.faults.grant_paused.notified().await;
             engine.request_stop(&force()).await.unwrap();
-            engine.faults.release.notify_one();
+            engine.faults.grant_release.notify_one();
         });
         assert_eq!(
             event_types(&engine, &session).await,
@@ -864,13 +864,14 @@ fn a_failed_read_under_force_retries_then_cancels_and_closes() {
     });
 }
 
-/// Round 2, decision 1: the latch's first phase is synchronous. A holds
-/// `admission` inside its receipt; B's submission reply is lost, so B marks
-/// the failure pending and waits for `admission` to finalize; C's dispatcher
-/// reaches `Run` meanwhile and its grant is refused: no `turn.submitted`, no
-/// vendor launch. Released, A completes and is counted, the latch finalizes,
-/// and the shutdown is unclean. Round 1's latch waited for `admission` before
-/// publishing anything, so C was granted.
+/// Round 2, decision 1, with round 3's interleaving: the latch's first
+/// phase is synchronous. C's dispatcher decides `Run` and is paused before
+/// its grant. A is then paused inside its receipt, holding `admission`. B's
+/// submission reply is lost, so B marks the failure pending and waits for
+/// `admission` to finalize. Released, C's grant is refused: no
+/// `turn.submitted`, no anchor, no vendor launch. Released next, A completes
+/// and is counted with its start sent, the latch finalizes, and the shutdown
+/// is unclean.
 #[test]
 fn a_pending_failure_refuses_grants_while_a_receipt_holds_admission() {
     let Some(root) = child("a_pending_failure_refuses_grants_while_a_receipt_holds_admission")
@@ -885,29 +886,43 @@ fn a_pending_failure_refuses_grants_while_a_receipt_holds_admission() {
         while starts.try_recv().is_ok() {}
         engine
             .faults
-            .submission_reply_lost
+            .hold_before_grant
             .store(true, Ordering::Release);
-        engine.faults.hold_receipt.store(true, Ordering::Release);
-        let (a, ()) = tokio::join!(spawn(&engine, None), async {
-            engine.faults.granted.notified().await;
-            let ((), ()) = tokio::join!(
-                // B's lost submission reply marks the failure pending, then
-                // waits for `admission`, which A holds.
-                dispatch(&engine, &b),
-                async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    assert!(engine.store_failed(), "the failure is pending");
-                    assert!(!engine.latch_finalized(), "A still holds admission");
-                    dispatch(&engine, &c).await;
-                    assert_eq!(
-                        event_types(&engine, &c).await,
-                        ["turn.queued"],
-                        "C was not granted"
+        let ((), a) = tokio::join!(
+            // C decides `Run` and pauses before its grant.
+            dispatch(&engine, &c),
+            async {
+                engine.faults.grant_paused.notified().await;
+                engine.faults.hold_receipt.store(true, Ordering::Release);
+                let (a, ()) = tokio::join!(spawn(&engine, None), async {
+                    // A now holds `admission` inside its receipt.
+                    engine.faults.granted.notified().await;
+                    engine
+                        .faults
+                        .submission_reply_lost
+                        .store(true, Ordering::Release);
+                    let ((), ()) = tokio::join!(
+                        // B's lost submission reply marks the failure pending,
+                        // then waits for `admission`, which A holds.
+                        dispatch(&engine, &b),
+                        async {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            assert!(engine.store_failed(), "the failure is pending");
+                            assert!(!engine.latch_finalized(), "A still holds admission");
+                            engine.faults.grant_release.notify_one();
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            assert_eq!(
+                                event_types(&engine, &c).await,
+                                ["turn.queued"],
+                                "C's grant was refused"
+                            );
+                            engine.faults.release.notify_one();
+                        }
                     );
-                    engine.faults.release.notify_one();
-                }
-            );
-        });
+                });
+                a
+            },
+        );
         let (a, _) = a.unwrap().enqueued.unwrap();
         assert_eq!(starts.try_recv().unwrap(), a, "A's start was sent");
         assert!(
@@ -919,6 +934,75 @@ fn a_pending_failure_refuses_grants_while_a_receipt_holds_admission() {
         let report = shutdown(&engine).await;
         assert_eq!(report.anchors, 0, "C launched nothing: {report:?}");
         assert!(report.store_failed && !report.is_clean(), "{report:?}");
+    });
+}
+
+/// Round 3, decision 1: a closing cancellation paused after its failure and
+/// close checks may still complete once another session's write fails;
+/// Store's same-transaction refusal is the closure proof. With no other
+/// queued or running turn in Store the close commits; the exit is still 4.
+#[test]
+fn a_close_past_its_check_commits_when_store_proves_no_other_turn() {
+    let Some(root) = child("a_close_past_its_check_commits_when_store_proves_no_other_turn") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine.request_stop(&force()).await.unwrap();
+        close_racing_a_failure(&engine, &session).await;
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+        let report = shutdown(&engine).await;
+        assert!(report.store_failed && !report.is_clean(), "{report:?}");
+    });
+}
+
+/// Round 3, decision 1, variant: the session also holds a committed queued
+/// turn this daemon never registered (left by an earlier daemon here). The
+/// close passed its check before the failure, and Store refuses
+/// `session.closed` in the same transaction: no close, exit 4.
+#[test]
+fn a_close_past_its_check_is_refused_by_store_for_an_unregistered_turn() {
+    let Some(root) = child("a_close_past_its_check_is_refused_by_store_for_an_unregistered_turn")
+    else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            new_session(&earlier).await
+        };
+        let engine = open(&root);
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        close_racing_a_failure(&engine, &session).await;
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.queued", "turn.ended"]
+        );
+        let report = shutdown(&engine).await;
+        assert!(report.store_failed && !report.is_clean(), "{report:?}");
+    });
+}
+
+/// Pauses the session's closing cancellation after its checks, has another
+/// session's write fail (the latch's first phase runs at once; its second
+/// waits for the `admission` the closer holds), then releases the closer.
+async fn close_racing_a_failure(engine: &Engine, session: &SessionId) {
+    engine
+        .faults
+        .hold_after_close_check
+        .store(true, Ordering::Release);
+    let ((), ()) = tokio::join!(dispatch(engine, session), async {
+        engine.faults.granted.notified().await;
+        // Another session's failed write.
+        let finalize = engine.latch();
+        assert!(engine.store_failed(), "the failure is pending");
+        engine.faults.release.notify_one();
+        finalize.await;
     });
 }
 

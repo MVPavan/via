@@ -165,9 +165,9 @@ impl Engine {
     /// latches Store failure and the turn stays queued with no vendor I/O.
     async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
         #[cfg(test)]
-        if self.faults.hold_before_grant.load(Ordering::Acquire) {
-            self.faults.granted.notify_one();
-            self.faults.release.notified().await;
+        if self.faults.hold_before_grant.swap(false, Ordering::AcqRel) {
+            self.faults.grant_paused.notify_one();
+            self.faults.grant_release.notified().await;
         }
         if !self.grant() {
             return Step::Next;
@@ -453,12 +453,19 @@ impl Engine {
         } else {
             None
         };
+        // Design §3.2: once `failure_pending` is observed no new close-bearing
+        // commit starts. One that passed this check may complete; Store's
+        // same-transaction refusal is then the closure proof.
         if admission.is_some() && self.store_failed() {
-            // Latched while this cancellation read: nothing more is written.
+            // Failed while this cancellation read: nothing more is written.
             self.unresolved.fail(session, turn, TurnState::Queued);
             return Cancelled::Latched;
         }
         let close = closing && !self.unresolved.others(session, turn);
+        #[cfg(test)]
+        if closing {
+            self.hold(&self.faults.hold_after_close_check).await;
+        }
         #[cfg(test)]
         let injected = self
             .faults
