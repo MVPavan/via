@@ -107,7 +107,11 @@ pub(crate) enum Reply {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     },
-    Stopping,
+    Stopping {
+        /// The anchor's own-group cleanup began while its vendor had not
+        /// exited, so its signal stopped a live vendor (Host force evidence).
+        stopped_live: bool,
+    },
     Error {
         code: String,
     },

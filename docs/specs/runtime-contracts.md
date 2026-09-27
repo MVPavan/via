@@ -838,9 +838,13 @@ Without `drain` or `force`, a stop with active turns is refused
 
 - **Idle** (no active turn) and **force** enter final shutdown immediately
   after acceptance. Force closes every running turn with mode `force`: Core
-  abandons the execution, whose released Host control lets the anchor's
-  reviewed EOF cleanup stop the group, then commits the turn in final
-  shutdown (C1 §7.6 force row) once Host has reconciled its anchor.
+  signals the turn's route, which asks the verified anchor to stop its
+  private group (C2 Close(Force)) and drains both pipes to the raw log under
+  its cleanup bound. Frames already read still become events; bytes the
+  drain cannot record mark the raw log incomplete. A receipted turn not yet
+  launched starts nothing. Core commits the turn in final shutdown (C1 §7.6
+  force row) once Host has reconciled its anchor; `forced` requires the
+  anchor's report that its cleanup began while the vendor was live.
 - **Drain** keeps serving reads while accepted turns finish under their own
   existing work deadlines; the drain phase gets no invented 10 s deadline.
   When accepted and active work has settled, final shutdown begins.

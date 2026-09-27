@@ -1,5 +1,8 @@
 use thiserror::Error;
-use tokio::{sync::mpsc, time::timeout_at};
+use tokio::{
+    sync::{mpsc, watch},
+    time::timeout_at,
+};
 
 use crate::{
     AcceptanceToken, Cleanup, ConnectionId, Deadline, FakeAcceptanceObservation, FakeConfig,
@@ -80,6 +83,11 @@ impl AdapterRuntime {
     /// decode order. When Core's channel is full this waits, bounded by `deadline`;
     /// if Core cannot take an observation, the Route receiver is dropped so Route
     /// fails the turn as overflow and still performs its cleanup and drain.
+    /// `force` set force-closes the turn through Route (C2 Close(Force)).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct input of the one turn"
+    )]
     pub async fn execute(
         &self,
         session_id: SessionId,
@@ -88,6 +96,7 @@ impl AdapterRuntime {
         prompt: String,
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
+        force: watch::Receiver<bool>,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
         let owner = ProcessOwner {
             session_id: session_id.clone(),
@@ -102,16 +111,23 @@ impl AdapterRuntime {
         // Full: Route waits for capacity under the turn deadline while this loop
         // forwards to Core, which drains until the route finishes.
         let (route_tx, route_rx) = mpsc::channel::<RouteMessage>(64);
-        let route = self
-            .route
-            .execute(connection_id, process, start, route_tx, deadline);
+        let route = self.route.execute(
+            connection_id,
+            process,
+            start,
+            route_tx,
+            deadline,
+            force.clone(),
+        );
+        let mut force = force;
         tokio::pin!(route);
         let mut route_rx = Some(route_rx);
         loop {
             tokio::select! {
                 Some(message) = recv(route_rx.as_mut()) => {
-                    if deliver(message, &observations, deadline).await.is_err() {
-                        // Route observes the closed channel as overflow.
+                    if deliver(message, &observations, deadline, &mut force).await.is_err() {
+                        // Route observes the closed channel as overflow, or
+                        // after a force stops forwarding and force-closes.
                         route_rx = None;
                     }
                 }
@@ -119,7 +135,7 @@ impl AdapterRuntime {
                     let mut delivered = true;
                     if let Some(receiver) = route_rx.as_mut() {
                         while let Ok(message) = receiver.try_recv() {
-                            if deliver(message, &observations, deadline).await.is_err() {
+                            if deliver(message, &observations, deadline, &mut force).await.is_err() {
                                 delivered = false;
                                 break;
                             }
@@ -168,6 +184,13 @@ impl AdapterRuntime {
     }
 }
 
+/// Resolves once `force` is set; never when its sender is gone unset.
+async fn forced(force: &mut watch::Receiver<bool>) {
+    if force.wait_for(|force| *force).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<RouteMessage> {
     match receiver {
         Some(receiver) => receiver.recv().await,
@@ -177,13 +200,21 @@ async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<Rou
 
 /// Normalizes one Route message and waits, bounded by `deadline`, for Core to
 /// take each resulting observation. The terminal travels in the route result.
+/// A force ends the wait, so Route is polled into its force close and drain.
 async fn deliver(
     message: RouteMessage,
     observations: &mpsc::Sender<FakeObservation>,
     deadline: Deadline,
+    force: &mut watch::Receiver<bool>,
 ) -> Result<(), ()> {
     for observation in normalize(message)? {
-        match timeout_at(deadline.instant(), observations.send(observation)).await {
+        let sent = tokio::select! {
+            // Capacity first: a draining Core still commits frames already read.
+            biased;
+            sent = timeout_at(deadline.instant(), observations.send(observation)) => sent,
+            () = forced(force) => return Err(()),
+        };
+        match sent {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => return Err(()),
         }

@@ -167,6 +167,8 @@ async fn armed(
     let mut reader = protocol::FrameReader::new(1024);
     let mut verified_connection = true;
     let mut kill_at: Option<Instant> = None;
+    // Set once cleanup begins: whether the vendor was then still live.
+    let mut stopped_live: Option<bool> = None;
     loop {
         tokio::select! {
             incoming = async {
@@ -193,13 +195,14 @@ async fn armed(
                         }
                     }
                     Ok(Some(Request::Stop { generation, deadline_monotonic_ns })) if verified_connection && generation == bootstrap.generation => {
-                        let lost = match controller.as_mut() {
-                            Some(active) => protocol::write_frame(active, &Reply::Stopping, 1024).await.is_err(),
-                            None => true,
-                        };
+                        // Cleanup begins before the reply, which reports its evidence.
                         let grace = crate::monotonic_remaining(deadline_monotonic_ns).unwrap_or(Duration::ZERO);
-                        begin_cleanup(&mut kill_at, grace.min(Duration::from_millis(200)));
-                        lost
+                        begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, grace.min(Duration::from_millis(200)));
+                        let reply = Reply::Stopping { stopped_live: stopped_live == Some(true) };
+                        match controller.as_mut() {
+                            Some(active) => protocol::write_frame(active, &reply, 1024).await.is_err(),
+                            None => true,
+                        }
                     }
                     _ => true,
                 };
@@ -207,7 +210,7 @@ async fn armed(
                     controller = None;
                     reader.reset();
                     verified_connection = false;
-                    begin_cleanup(&mut kill_at, Duration::from_millis(200));
+                    begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, Duration::from_millis(200));
                 }
             }
             accepted = listener.accept(), if controller.is_none() => {
@@ -236,7 +239,7 @@ async fn armed(
                 }
             }
             _ = terminate.recv() => {
-                begin_cleanup(&mut kill_at, Duration::from_millis(200));
+                begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, Duration::from_millis(200));
             }
         }
     }
@@ -303,11 +306,21 @@ async fn spawn_vendor(
     Ok((child, vendor_pid))
 }
 
-fn begin_cleanup(kill_at: &mut Option<Instant>, grace: Duration) {
+/// Starts own-group cleanup once; a later call only shortens its grace.
+/// `stopped_live` records whether the vendor was still live when the anchor
+/// signalled its group: checked first, so a vendor that already exited, reaped
+/// or not, was not stopped by this cleanup.
+fn begin_cleanup(
+    kill_at: &mut Option<Instant>,
+    stopped_live: &mut Option<bool>,
+    child: &mut Child,
+    grace: Duration,
+) {
     let proposed = Instant::now() + grace;
     if let Some(existing) = kill_at {
         *existing = (*existing).min(proposed);
     } else {
+        *stopped_live = Some(matches!(child.try_wait(), Ok(None)));
         // Current membership pins this group while the anchor issues TERM.
         let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
         *kill_at = Some(proposed);

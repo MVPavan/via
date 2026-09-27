@@ -214,6 +214,13 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
+    /// The caller's force stop ended the turn; its private group was
+    /// force-closed and both pipes drained to the raw log when launched.
+    #[error("fake turn force-stopped in turn {turn:?}")]
+    ForceStopped {
+        /// Affected turn.
+        turn: TurnNumber,
+    },
 }
 
 /// A failed route turn: the first typed cause plus the evidence Route still holds

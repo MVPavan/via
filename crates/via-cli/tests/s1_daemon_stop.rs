@@ -1165,3 +1165,278 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
         },
     )
 }
+
+/// W3-F Sol 1: a force accepted right after spawn receipts, while receipted
+/// turns may still be queued for daemon main and outside its drive set, still
+/// ends every receipted turn `cancelled` with truthful cancel fields and a
+/// clean exit. Several connections each pipeline a spawn and a force; the
+/// daemon's summary counts turns final shutdown took from the queue, and the
+/// scenario repeats until that queued handoff was observed (W4-H Sol 4). A
+/// first turn completes beforehand, so each run has raw evidence.
+#[test]
+fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult {
+    let mut observed = 0;
+    // About one attempt in fifteen observes it here; 100 bound a miss near 0.1 %.
+    for attempt in 0..100 {
+        if observed > 0 && attempt >= 4 {
+            break;
+        }
+        scenario(
+            &format!("s1_daemon_stop_force_after_receipt_{attempt}"),
+            &drain_fixture(),
+            |paths, evidence| {
+                let mut daemon = Daemon::start(paths, evidence)?;
+                let (first, _, _) = start_held_turn(paths, evidence)?;
+                fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
+                wait_event(paths, &first, "turn.ended")?;
+                // Re-arm the gate: a launched raced turn holds until forced.
+                for name in ["hold.entered", "hold.release", "hold.released", "agent.pid"] {
+                    let _ = fs::remove_file(paths.sync.join(name));
+                }
+                let socket = paths.runtime.join("via.sock");
+                // Continuous spawn traffic; the force lands once one is receipted,
+                // usually while another spawn is committing its receipt.
+                let (replies_tx, replies) = std::sync::mpsc::channel();
+                let spawners: Vec<_> = (0..4)
+                    .map(|_| {
+                        let socket = socket.clone();
+                        let replies = replies_tx.clone();
+                        thread::spawn(move || pipeline(&socket, 8, false, &replies))
+                    })
+                    .collect();
+                drop(replies_tx);
+                let (force_tx, _) = std::sync::mpsc::channel();
+                let mut sessions = Vec::new();
+                let mut all = Vec::new();
+                let mut forced = None;
+                for reply in replies {
+                    if let Some(session) = reply["result"]["session_id"].as_str() {
+                        sessions.push(session.to_owned());
+                        if forced.is_none() {
+                            let socket = socket.clone();
+                            let force_tx = force_tx.clone();
+                            forced =
+                                Some(thread::spawn(move || pipeline(&socket, 0, true, &force_tx)));
+                        }
+                    }
+                    all.push(reply);
+                }
+                for spawner in spawners {
+                    spawner
+                        .join()
+                        .map_err(|_| infra("spawner panicked"))?
+                        .map_err(infra)?;
+                }
+                forced
+                    .ok_or_else(|| fail("no spawn was receipted"))?
+                    .join()
+                    .map_err(|_| infra("forcer panicked"))?
+                    .map_err(infra)?;
+                evidence
+                    .write("replies.json", Value::from(all).to_string().as_bytes())
+                    .map_err(infra)?;
+                let status = daemon
+                    .wait_exit(FINAL_SHUTDOWN)?
+                    .ok_or_else(|| fail("force stop did not exit"))?;
+                let summary = daemon.summary()?;
+                evidence
+                    .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                    .map_err(infra)?;
+                check(
+                    status.code() == Some(0) && summary["disposition"] == "clean",
+                    || format!("exit {status}, summary {summary}"),
+                )?;
+                if summary["queued_drives"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                {
+                    observed += 1;
+                }
+                for session in sessions {
+                    check_raced_turn(paths, &session)?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    if observed == 0 {
+        return Err("no attempt observed a receipted turn queued at final shutdown".into());
+    }
+    Ok(())
+}
+
+/// A receipted raced turn ends `cancelled` with the C1 force lifecycle. Host
+/// committed vendor facts only for a launched vendor, which holds at its gate,
+/// so its force must be `forced`; a turn forced before launch was `requested`.
+fn check_raced_turn(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
+    let (envelope, events) = paths.committed(session)?;
+    let outcome = match vendor_launched(paths, session)? {
+        Some(true) => "forced",
+        Some(false) => {
+            return Err(fail(&format!("{session}: anchor without vendor facts")));
+        }
+        None => "requested",
+    };
+    check(
+        envelope["state"] == "cancelled"
+            && envelope["failure"].is_null()
+            && envelope["stop_reason"] == "interrupted"
+            && envelope["timestamps"]["accepted_at"].is_null()
+            && envelope["cancel"]["outcome"] == outcome
+            && envelope["cancel"]["cleanup"] == "quiescent",
+        || format!("envelope {envelope}"),
+    )?;
+    check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])
+}
+
+/// Pipelines `hello`, `spawns` spawn requests and, with `force`, a forced
+/// `daemon/stop` on one connection, sending every reply after `hello` to
+/// `replies` as it arrives.
+fn pipeline(
+    socket: &Path,
+    spawns: usize,
+    force: bool,
+    replies: &std::sync::mpsc::Sender<Value>,
+) -> Result<(), String> {
+    let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(FINAL_SHUTDOWN))
+        .map_err(|error| error.to_string())?;
+    let hello =
+        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"force-race"});
+    let spawn = json!({"harness":"fake","model":"fake","prompt":"hold","handle":format!("h_{}", "A".repeat(43))});
+    let mut requests = vec![("hello", hello)];
+    requests.extend((0..spawns).map(|_| ("spawn", spawn.clone())));
+    if force {
+        requests.push(("daemon/stop", json!({"force":true})));
+    }
+    let mut lines = String::new();
+    for (id, (method, params)) in requests.iter().enumerate() {
+        lines.push_str(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+        );
+        lines.push('\n');
+    }
+    (&stream)
+        .write_all(lines.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(&stream);
+    for index in 0..requests.len() {
+        let mut line = String::new();
+        // Final shutdown closes the connection before unread requests.
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            break;
+        }
+        let reply: Value =
+            serde_json::from_str(&line).map_err(|error| format!("{error}: {line:?}"))?;
+        if index > 0 {
+            // The receiver may be gone once the test stopped collecting.
+            let _ = replies.send(reply);
+        }
+    }
+    Ok(())
+}
+
+/// Host's launch evidence for `session`: `None` without an anchor intent,
+/// otherwise whether Host committed the launched vendor's facts.
+fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, ScenarioError> {
+    let store = rusqlite::Connection::open_with_flags(
+        paths.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(infra)?;
+    let mut query = store
+        .prepare("SELECT vendor_pid IS NOT NULL FROM anchors WHERE owner_session=?1")
+        .map_err(infra)?;
+    let launched: Vec<bool> = query
+        .query_map([session], |row| row.get(0))
+        .map_err(infra)?
+        .collect::<Result<_, _>>()
+        .map_err(infra)?;
+    Ok(match launched.as_slice() {
+        [] => None,
+        [launched] => Some(*launched),
+        _ => return Err(fail(&format!("{session}: more than one anchor"))),
+    })
+}
+
+/// W3-F merge follow-up: a force while vendor output is in flight never leaves
+/// the raw log silently short. The vendor writes an unterminated line, which
+/// Wire holds unframed, then waits; after the force, those bytes are in the
+/// connection's raw log, or the turn records `raw_log.incomplete` and the
+/// envelope warns `raw_log_incomplete`.
+#[test]
+fn s1_daemon_stop_force_keeps_in_flight_output_in_raw_log() -> TestResult {
+    const IN_FLIGHT: &str = r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":"in fli"#;
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"partial"}},
+            {"action":"emit_raw","text":IN_FLIGHT},
+            {"action":"report_pids"},
+            {"action":"gate","name":"hold"},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"late","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_force_in_flight_output",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence)?;
+            let (session, agent, _) = start_held_turn(paths, evidence)?;
+            wait_event(paths, &session, "assistant.text")?;
+            let stop = paths.run(
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop.status.success(), || {
+                format!("force stop exited {}", stop.status)
+            })?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            wait_not_live(agent)?;
+            check(status.code() == Some(0), || format!("exit {status}"))?;
+            let (envelope, events) = paths.committed(&session)?;
+            evidence
+                .write("envelope.json", envelope.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                envelope["state"] == "cancelled"
+                    && envelope["cancel"]["outcome"] == "forced"
+                    && envelope["cancel"]["cleanup"] == "quiescent",
+                || format!("envelope {envelope}"),
+            )?;
+            let connection = format!("c_{}", session.trim_start_matches("s_"));
+            let raw = fs::read(paths.state.join("raw").join(format!("{connection}.raw")))
+                .map_err(infra)?;
+            let recorded = raw
+                .windows(IN_FLIGHT.len())
+                .any(|window| window == IN_FLIGHT.as_bytes());
+            let warned = envelope["warnings"].as_array().is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .any(|warning| warning["code"] == "raw_log_incomplete")
+            });
+            let mut prefix = vec![
+                "turn.queued",
+                "turn.submitted",
+                "turn.started",
+                "assistant.text",
+            ];
+            if !recorded {
+                prefix.push("raw_log.incomplete");
+            }
+            check(recorded != warned, || {
+                format!("raw log recorded in-flight bytes: {recorded}, warned: {warned}")
+            })?;
+            check_forced_lifecycle(&envelope, &events, &prefix)
+        },
+    )
+}

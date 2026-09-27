@@ -1,6 +1,7 @@
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    sync::watch,
     time::timeout_at,
 };
 
@@ -12,6 +13,11 @@ use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
 
 /// Raw unit size for a retained line recorded by the failure drain.
 const DRAIN_UNIT_BYTES: usize = 64 * 1024;
+
+/// How long an acquisition may still finish once its caller is cancelled: a
+/// normal one does, so its group is force-closed and proved absent; a stalled
+/// one is abandoned well inside the 10 s final shutdown.
+const CANCELLED_ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether every byte exchanged with the vendor reached the durable raw log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,13 +51,23 @@ impl WireRuntime {
     }
 
     /// Opens one private connection with a Store-owned synced raw writer.
+    /// Once `cancel` is set, waits for vendor input, output or exit end with
+    /// [`WireError::Cancelled`]; bytes already read still reach the raw log.
     pub async fn open_connection(
         &self,
         connection_id: ConnectionId,
         spec: PrivateProcessSpec,
         deadline: Deadline,
+        cancel: watch::Receiver<bool>,
     ) -> Result<WireConnection, WireError> {
-        WireConnection::open(&self.host, spec, self.raw.open(connection_id), deadline).await
+        WireConnection::open(
+            &self.host,
+            spec,
+            self.raw.open(connection_id),
+            deadline,
+            cancel,
+        )
+        .await
     }
 
     /// Drains Host controls and tasks before the Store owner is released.
@@ -113,6 +129,13 @@ pub enum WireError {
     /// A raw evidence append was not confirmed by its absolute deadline.
     #[error("raw evidence append deadline elapsed")]
     RawDeadline,
+    /// The caller's cancel signal ended a wait on the vendor.
+    #[error("vendor wait cancelled")]
+    Cancelled,
+    /// The caller's cancel signal abandoned an acquisition after ARM: the
+    /// vendor may have written output that no raw log recorded.
+    #[error("acquisition cancelled after vendor launch")]
+    CancelledAfterLaunch,
     /// Frame contract failure.
     #[error("vendor frame failure: {0:?}")]
     Frame(WireFailure),
@@ -132,6 +155,8 @@ pub struct WireConnection {
     evidence: RawEvidence,
     control: ProcessControl,
     exits: ExitReceiver,
+    /// Caller's cancel signal; checked only where waiting loses no bytes.
+    cancel: watch::Receiver<bool>,
 }
 
 impl WireConnection {
@@ -141,12 +166,34 @@ impl WireConnection {
         spec: PrivateProcessSpec,
         raw: RawWriter,
         deadline: Deadline,
+        mut cancel: watch::Receiver<bool>,
     ) -> Result<Self, WireError> {
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        let acquire = host.acquire_marking_arm(spec, deadline, &armed);
+        tokio::pin!(acquire);
+        let acquired = tokio::select! {
+            acquired = &mut acquire => acquired,
+            () = cancelled(&mut cancel) => {
+                // An abandoned acquisition drops its anchor control: an anchor
+                // that connected exits on EOF, one that did not at its own
+                // bootstrap deadline; Host recovery reports what it can prove.
+                // After ARM the pipes carry vendor bytes nobody will record.
+                tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire)
+                    .await
+                    .map_err(|_| {
+                        if armed.load(std::sync::atomic::Ordering::Acquire) {
+                            WireError::CancelledAfterLaunch
+                        } else {
+                            WireError::Cancelled
+                        }
+                    })?
+            }
+        };
         let AcquiredProcess {
             pipes,
             control,
             exits,
-        } = host.acquire(spec, deadline).await?;
+        } = acquired?;
         Ok(Self {
             stdin: Some(pipes.stdin),
             stdout: pipes.stdout,
@@ -159,6 +206,7 @@ impl WireConnection {
             evidence: RawEvidence::Complete,
             control,
             exits,
+            cancel,
         })
     }
 
@@ -173,7 +221,13 @@ impl WireConnection {
             let Some(stdin) = self.stdin.as_mut() else {
                 return Ok(SendOutcome::NotWritten);
             };
-            let next = match timeout_at(deadline.instant(), stdin.write(&frame[written..])).await {
+            // A pipe write is cancel-safe: a cancelled one wrote nothing.
+            let write = tokio::select! {
+                biased;
+                () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
+                write = timeout_at(deadline.instant(), stdin.write(&frame[written..])) => write,
+            };
+            let next = match write {
                 Ok(Ok(0)) => {
                     self.stdin.take();
                     return Ok(if written == 0 {
@@ -313,10 +367,12 @@ impl WireConnection {
     /// staged per call. Reads are cancel-safe, but dropping this future during a raw
     /// append loses that chunk; Route awaits it to completion or to the deadline.
     /// Once the raw log is incomplete, drain-mode chunks are read and discarded.
+    /// Outside drain mode, the cancel signal ends the wait before any byte is read.
     async fn read_either(&mut self, deadline: Deadline, stdout_raw: bool) -> Result<(), WireError> {
         let mut out = [0; 8192];
         let mut err = [0; 8192];
         tokio::select! {
+            () = cancelled(&mut self.cancel), if !stdout_raw => return Err(WireError::Cancelled),
             read = timeout_at(deadline.instant(), self.stdout.read(&mut out)), if !self.stdout_eof => {
                 let count = read.map_err(|_| WireError::Deadline)??;
                 if count == 0 {
@@ -349,8 +405,11 @@ impl WireConnection {
             if let Some(exit) = *self.exits.borrow() {
                 return Ok(exit);
             }
-            timeout_at(deadline.instant(), self.exits.changed())
-                .await
+            let changed = tokio::select! {
+                () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
+                changed = timeout_at(deadline.instant(), self.exits.changed()) => changed,
+            };
+            changed
                 .map_err(|_| WireError::Deadline)?
                 // Host dropped its exit supervision: transport loss, not a deadline.
                 .map_err(|_| WireError::Frame(WireFailure::Transport))?;
@@ -368,6 +427,13 @@ impl WireConnection {
             vendor_exit: report.vendor_exit,
             forced: report.forced,
         }
+    }
+}
+
+/// Resolves once `cancel` is set; never when its sender is gone unset.
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    if cancel.wait_for(|cancel| *cancel).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
