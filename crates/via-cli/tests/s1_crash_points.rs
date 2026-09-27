@@ -330,6 +330,13 @@ impl<'a> Daemon<'a> {
     /// Starts a daemon with the failpoint controller active; `run` names its
     /// trace and cleanup evidence.
     fn start(paths: &'a Paths, evidence: &Evidence, run: &str) -> Result<Self, ScenarioError> {
+        let mut daemon = Self::spawn(paths, evidence, run)?;
+        daemon.wait_ready()?;
+        Ok(daemon)
+    }
+
+    /// Starts a daemon without waiting for it to admit requests.
+    fn spawn(paths: &'a Paths, evidence: &Evidence, run: &str) -> Result<Self, ScenarioError> {
         let trace = if run == "final" {
             evidence.dir.join("daemon.trace")
         } else {
@@ -347,16 +354,21 @@ impl<'a> Daemon<'a> {
         } else {
             evidence.dir.join(format!("cleanup-{run}.json"))
         };
-        let mut daemon = Self {
+        Ok(Self {
             child: command.spawn().map_err(infra)?,
             paths,
             cleanup,
             evidence_dir: evidence.dir.clone(),
             crash_snapshot: None,
-        };
+        })
+    }
+
+    /// Waits until the daemon answers `daemon status`, i.e. admits requests.
+    fn wait_ready(&mut self) -> Result<(), ScenarioError> {
+        let paths = self.paths;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = daemon.child.try_wait().map_err(infra)? {
+            if let Some(status) = self.child.try_wait().map_err(infra)? {
                 return Err(fail(&format!("daemon exited before readiness: {status}")));
             }
             // Never let the readiness probe auto-start a second daemon.
@@ -365,7 +377,7 @@ impl<'a> Daemon<'a> {
                 status.args(["daemon", "status", "--json"]);
                 let capture = run_command(&mut status, Duration::from_secs(1)).map_err(infra)?;
                 if capture.status.success() {
-                    return Ok(daemon);
+                    return Ok(());
                 }
             }
             if Instant::now() >= deadline {
@@ -1206,7 +1218,7 @@ fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
             })?;
             let (status, trace) = refused_start(paths, evidence, "refused")?;
             check(
-                !status.success() && trace.contains("host_reconciliation_failed"),
+                !status.success() && trace.contains("store_error: host reconciliation"),
                 || format!("startup did not fail by name ({status}): {trace}"),
             )?;
             let turn = paths.turn(&session)?;
@@ -1230,10 +1242,51 @@ fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
     )
 }
 
-/// Runtime §7 availability: more than 10,000 committed anchors (here 10,001
-/// synthetic intent-only rows, which Host cannot verify) never strand the
-/// daemon. Recovery pages through the whole inventory, classifies the turn
-/// `uncertain` (never `quiescent`), commits, and admits requests.
+/// Commits `count` synthetic anchors owned by turn 1 of `owner`, each with a
+/// valid-looking identity copied from an existing real anchor and a committed
+/// absence proof, so Host accepts them without probing. Their groups
+/// (`pgid` beyond Linux's `pid_max`) cannot exist. Ids start with `prefix`.
+fn insert_proven_absent(
+    paths: &Paths,
+    owner: &str,
+    prefix: &str,
+    count: u32,
+) -> Result<(), ScenarioError> {
+    let mut store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+    let tx = store.transaction().map_err(infra)?;
+    for index in 0..count {
+        let changed = tx
+            .execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
+                 SELECT ?1,'g'||?1,a.marker,'/nonexistent',?2,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,?3,?3,1,'1'
+                 FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
+                rusqlite::params![format!("{prefix}{index:05}"), owner, 4_194_305 + index],
+            )
+            .map_err(infra)?;
+        check(changed == 1, || "no real anchor to copy".to_owned())?;
+    }
+    tx.commit().map_err(infra)
+}
+
+/// Removes synthetic anchors after the daemon exited, so teardown verifies
+/// only anchors that ever ran.
+fn delete_synthetic(paths: &Paths, prefix: &str) -> Result<(), ScenarioError> {
+    let store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+    store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
+    store
+        .execute(
+            "DELETE FROM anchors WHERE anchor_id LIKE ?1",
+            [format!("{prefix}%")],
+        )
+        .map(drop)
+        .map_err(infra)
+}
+
+/// Runtime §7 availability and bounded memory: more than 10,000 committed
+/// anchors (here 10,001 synthetic proven-absent rows) never strand the
+/// daemon. Startup recovery pages through the whole inventory, recovers the
+/// crashed turn, admits requests, and a normal `daemon stop` then shuts down
+/// cleanly (exit 0) with Host consuming the same inventory page by page.
 #[test]
 fn s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits() -> TestResult {
     scenario(
@@ -1256,30 +1309,126 @@ fn s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits() -> TestResult {
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
-            let mut store =
-                rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-            let tx = store.transaction().map_err(infra)?;
-            for index in 0..10_001 {
-                tx.execute(
-                    "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
-                     SELECT ?1,'g','m','/nonexistent',session_id,number,0,'b','n','intent',1 FROM turns WHERE session_id=?2 AND number=1",
-                    rusqlite::params![format!("synthetic{index:05}"), session],
-                )
-                .map_err(infra)?;
-            }
-            tx.commit().map_err(infra)?;
-            let _daemon = Daemon::start(paths, evidence, "final")?;
-            restarted_unknown_as(paths, evidence, &session, false)?;
+            insert_proven_absent(paths, &session, "synthetic", 10_001)?;
+            let mut daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
             completes_normally(paths, evidence)?;
-            // The synthetic rows name no process; drop them so teardown
-            // verifies only anchors that ever ran.
-            let store =
-                rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-            store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
-            store
-                .execute("DELETE FROM anchors WHERE anchor_id LIKE 'synthetic%'", [])
-                .map(drop)
-                .map_err(infra)
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--json"])?;
+            check(stop.status.success(), || {
+                format!("stop exited {}", stop.status)
+            })?;
+            let exit = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?;
+            check(exit.is_some_and(|status| status.success()), || {
+                format!("final shutdown after the load was not clean: {exit:?}")
+            })?;
+            delete_synthetic(paths, "synthetic")
+        },
+    )
+}
+
+/// Decision 1 (runtime §7, C1 §7.5): the 5 s reconciliation deadline bounds
+/// startup. Two pages of anchors belong to an ended turn; the crashed turn,
+/// which never launched, has none. Reconciliation is held at the page
+/// boundary past the deadline; on release Core stops paging, so it can no
+/// longer know the crashed turn has no anchor: it recovers `unknown` with
+/// cleanup `uncertain`, commits, and the daemon admits requests.
+#[test]
+fn s1_f10_reconciliation_deadline_settles_uncertain_and_admits() -> TestResult {
+    scenario(
+        "s1_f10_reconciliation_deadline",
+        &reply_steps("after"),
+        |paths, evidence| {
+            let intent = "core.intent.after_commit";
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let ended = completes_normally(paths, evidence)?;
+            // The completed turn was hit 1; the crashed turn is hit 2.
+            paths.failpoints.arm(intent, 2, "pause").map_err(infra)?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("after"))?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            paths
+                .failpoints
+                .wait_ack(intent, 2, "pause", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {intent}: {error}")))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(intent).map_err(infra)?;
+            drop(daemon);
+            check(paths.anchors_for(&session)? == 0, || {
+                "the crashed turn launched".to_owned()
+            })?;
+            // Ids sort before the real anchor's hex id: two full pages.
+            insert_proven_absent(paths, &ended, "0-synthetic", 300)?;
+            let boundary = "core.recovery.page_boundary";
+            arm(paths, boundary, "pause")?;
+            let mut daemon = Daemon::spawn(paths, evidence, "final")?;
+            acknowledged(paths, evidence, boundary, "pause", &daemon)?;
+            // The deadline began before the acknowledgement: 5 s after it has passed.
+            thread::sleep(Duration::from_millis(5_200));
+            paths.failpoints.release(boundary, 1).map_err(infra)?;
+            daemon.wait_ready()?;
+            let envelope = restarted_unknown_as(paths, evidence, &session, false)?;
+            check(envelope["cancel"]["outcome"] == "requested", || {
+                format!("unexpected outcome: {}", envelope["cancel"])
+            })?;
+            completes_normally(paths, evidence)?;
+            let stop = paths.run(evidence, "stop", &["daemon", "stop", "--json"])?;
+            check(stop.status.success(), || {
+                format!("stop exited {}", stop.status)
+            })?;
+            wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?;
+            delete_synthetic(paths, "0-synthetic")
+        },
+    )
+}
+
+/// Decision 2 (runtime §7): a failed absence-proof commit during startup
+/// recovery is a Store failure. The daemon exits with the Store startup
+/// failure before admission and commits no recovery; without the fault a
+/// restart recovers normally.
+#[test]
+fn s1_f10_failed_absence_commit_fails_startup() -> TestResult {
+    scenario(
+        "s1_f10_failed_absence_commit",
+        &prompted_fixture(),
+        |paths, evidence| {
+            let point = "wire.prompt.after_write";
+            arm(paths, point, "pause")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let spawn = paths.run(evidence, "spawn", &spawn_args("f10"))?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            acknowledged(paths, evidence, point, "pause", &daemon)?;
+            wait_file(&paths.sync.join("prompted.entered"))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            drop(daemon);
+            let commit = "host.recovery.absence_commit";
+            arm(paths, commit, "fail_io")?;
+            let (status, trace) = refused_start(paths, evidence, "refused")?;
+            check(
+                !status.success()
+                    && trace.contains("store_error: host reconciliation")
+                    && trace.contains("group absence commit failed"),
+                || format!("startup did not fail with the Store failure ({status}): {trace}"),
+            )?;
+            let turn = paths.turn(&session)?;
+            check(turn.state == "running" && turn.envelope.is_none(), || {
+                format!("recovery committed after a Store failure: {}", turn.state)
+            })?;
+            paths.failpoints.disarm(commit).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            restarted_unknown(paths, evidence, &session)?;
+            completes_normally(paths, evidence).map(drop)
         },
     )
 }

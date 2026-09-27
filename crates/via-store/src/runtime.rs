@@ -813,24 +813,6 @@ impl ProcessJournal {
         }
     }
 
-    /// Returns every retained anchor record, read page by page.
-    pub async fn list_anchor_records(&self) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
-        let mut records = Vec::new();
-        loop {
-            let after = records
-                .last()
-                .map(|record: &AnchorRecord| record.intent.anchor_id.clone());
-            let page = self
-                .list_anchor_records_page(after, ANCHOR_PAGE_LIMIT)
-                .await?;
-            let full = page.len() == ANCHOR_PAGE_LIMIT as usize;
-            records.extend(page);
-            if !full {
-                return Ok(records);
-            }
-        }
-    }
-
     /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) anchor records
     /// after the `after` anchor id, in id order, each read consistently.
     pub async fn list_anchor_records_page(

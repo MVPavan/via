@@ -59,6 +59,12 @@ impl Engine {
         let mut reconciled = Reconciled::default();
         let mut after = None;
         loop {
+            // At expiry paging stops: the unread rest of the inventory leaves
+            // every recovered turn uncertain, and startup continues.
+            if tokio::time::Instant::now() >= deadline.instant() {
+                reconciled.incomplete = true;
+                return Ok(reconciled);
+            }
             let owners = self
                 .store
                 .anchor_owners_page(after.clone(), ANCHOR_PAGE_LIMIT)
@@ -68,27 +74,27 @@ impl Engine {
                 return Ok(reconciled);
             };
             let next = last.anchor_id.clone();
-            let reports = if tokio::time::Instant::now() < deadline.instant() {
-                match self
-                    .adapter
-                    .recover_page(after, ANCHOR_PAGE_LIMIT, deadline)
-                    .await
-                {
-                    Ok(reports) => reports,
-                    Err(error) if error.is_store_failure() => {
-                        return Err(format!("host_reconciliation_failed: {error}"));
-                    }
-                    // Deadline or unproven evidence: this page stays unreported.
-                    Err(_) => Vec::new(),
+            let reports = match self
+                .adapter
+                .recover_page(after, ANCHOR_PAGE_LIMIT, deadline)
+                .await
+            {
+                Ok(reports) => reports,
+                Err(error) if error.is_store_failure() => {
+                    return Err(format!("store_error: host reconciliation: {error}"));
                 }
-            } else {
-                Vec::new()
+                // Unproven evidence: this page stays unreported.
+                Err(_) => Vec::new(),
             };
             reconciled.add(&owners, &reports);
             if owners.len() < ANCHOR_PAGE_LIMIT as usize {
                 return Ok(reconciled);
             }
             after = Some(next);
+            #[cfg(feature = "test-failpoints")]
+            via_store::failpoint::hit_async("core.recovery.page_boundary")
+                .await
+                .map_err(|error| format!("store_error: {error}"))?;
         }
     }
 
@@ -282,6 +288,8 @@ struct Reconciled {
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
+    /// The deadline stopped paging before the whole inventory was read.
+    incomplete: bool,
 }
 
 impl Reconciled {
@@ -313,13 +321,16 @@ impl Reconciled {
         }
     }
 
-    /// `(quiescent, forced)` for a turn; with no committed anchor intent no
-    /// process could exist, so nothing needs cleaning.
+    /// `(quiescent, forced)` for a turn. With a complete inventory and no
+    /// committed anchor intent no process could exist, so nothing needs
+    /// cleaning; an incomplete inventory proves nothing for any turn.
     fn cleanup(&self, session: &SessionId, turn: TurnNumber) -> (bool, bool) {
-        self.turns
+        let (quiescent, forced) = self
+            .turns
             .get(&(session.clone(), turn))
             .copied()
-            .unwrap_or((true, false))
+            .unwrap_or((true, false));
+        (quiescent && !self.incomplete, forced)
     }
 }
 
@@ -372,6 +383,21 @@ mod tests {
         reconciled.add(&[owner("a2", &session, true)], &[]);
         assert_eq!(reconciled.missing, 1);
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
+    }
+
+    #[test]
+    fn an_incomplete_inventory_leaves_every_turn_uncertain() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let unseen = SessionId::try_from("s_000000000001").expect("session");
+        let turn = TurnNumber::try_from(1).expect("turn");
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[owner("a1", &session, true)],
+            &[report("a1", &session, Cleanup::Quiescent)],
+        );
+        reconciled.incomplete = true;
+        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
+        assert_eq!(reconciled.cleanup(&unseen, turn), (false, false));
     }
 
     #[test]

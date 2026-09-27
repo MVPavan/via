@@ -169,30 +169,36 @@ impl AdapterRuntime {
     }
 
     /// Drains lower process owners before Store shutdown and returns passive facts.
-    pub async fn shutdown(&self, deadline: Deadline) -> FakeShutdown {
-        let report = self.route.shutdown(deadline).await;
+    pub async fn shutdown(
+        &self,
+        deadline: Deadline,
+        turns: &[(SessionId, TurnNumber)],
+    ) -> FakeShutdown {
+        let report = self.route.shutdown(deadline, turns).await;
         FakeShutdown {
             recovery: report
                 .recovery
                 .into_iter()
-                .map(normalize_recovery)
+                .map(|turn| FakeTurnRecovery {
+                    session_id: turn.owner_session,
+                    turn: turn.owner_turn,
+                    cleanup: match turn.cleanup {
+                        via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,
+                        via_routes::WireCleanup::Uncertain => Cleanup::Uncertain,
+                    },
+                    forced: turn.forced,
+                })
                 .collect(),
+            anchors: report.anchors,
+            uncertain_anchors: report.uncertain_anchors,
             pending_tasks: report.pending_tasks,
             failed_tasks: report.failed_tasks,
             failure: report.failure,
         }
     }
 
-    /// Recovers committed anchors without giving Core process signalling authority.
-    pub async fn recover(&self, deadline: Deadline) -> Result<Vec<FakeRecovery>, AdapterError> {
-        self.route
-            .recover(deadline)
-            .await
-            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
-            .map_err(AdapterError::Open)
-    }
-
-    /// One page of `recover`: up to `limit` anchors after the `after` id.
+    /// Recovers one page of committed anchors, up to `limit` after the
+    /// `after` id, without giving Core process signalling authority.
     pub async fn recover_page(
         &self,
         after: Option<String>,
@@ -370,10 +376,26 @@ fn normalize_recovery(report: WireRecovery) -> FakeRecovery {
     }
 }
 
+/// Passive per-turn shutdown recovery facts.
+pub struct FakeTurnRecovery {
+    /// Owning VIA session.
+    pub session_id: SessionId,
+    /// Owning turn.
+    pub turn: TurnNumber,
+    /// Quiescent only when every anchor of the turn was proved absent.
+    pub cleanup: Cleanup,
+    /// Host stopped a group of the turn while its vendor was live.
+    pub forced: bool,
+}
+
 /// Passive shutdown status; no Host operation or signal handle escapes Adapter.
 pub struct FakeShutdown {
-    /// Recovery facts for every committed anchor.
-    pub recovery: Vec<FakeRecovery>,
+    /// Per-turn recovery facts for the requested turns.
+    pub recovery: Vec<FakeTurnRecovery>,
+    /// Committed anchors reconciled.
+    pub anchors: usize,
+    /// Reconciled anchors without positive absence proof.
+    pub uncertain_anchors: usize,
     /// Host tasks still pending at the shutdown deadline.
     pub pending_tasks: usize,
     /// Host tasks that panicked, were cancelled or failed their child wait.

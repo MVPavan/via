@@ -240,12 +240,43 @@ pub struct RecoveryReport {
     pub forced: bool,
 }
 
+/// Shutdown recovery aggregate for one owning turn the caller asked about.
+#[derive(Debug)]
+pub struct TurnRecovery {
+    /// Owning session.
+    pub owner_session: crate::SessionId,
+    /// Owning turn.
+    pub owner_turn: crate::TurnNumber,
+    /// Committed anchors of this turn that Host reconciled.
+    pub anchors: usize,
+    /// The last absence proof when every anchor was proved absent, otherwise
+    /// the first uncertainty.
+    pub cleanup: CleanupEvidence,
+    /// Host force evidence for any of the turn's anchors.
+    pub forced: bool,
+}
+
+impl TurnRecovery {
+    fn fold(&mut self, report: RecoveryReport) {
+        self.anchors += 1;
+        self.forced |= report.forced;
+        if matches!(self.cleanup, CleanupEvidence::GroupAbsent(_)) {
+            self.cleanup = report.cleanup;
+        }
+    }
+}
+
 /// Bounded shutdown result, returned on every path; unfinished tasks retain
 /// their Host owner while the daemon lives.
 #[derive(Debug)]
 pub struct ShutdownReport {
-    /// Passive evidence for committed anchor intents established before any failure.
-    pub recovery: Vec<RecoveryReport>,
+    /// Per-turn evidence for the requested turns only, established before any
+    /// failure; the inventory is consumed page by page, never retained.
+    pub recovery: Vec<TurnRecovery>,
+    /// Committed anchors reconciled.
+    pub anchors: usize,
+    /// Reconciled anchors without positive absence proof.
+    pub uncertain_anchors: usize,
     /// Retained reaper or status tasks whose result was not collected by the deadline.
     pub pending_tasks: usize,
     /// Tasks that panicked, were cancelled or failed their child wait, collected
@@ -569,15 +600,22 @@ impl Host {
         });
     }
 
-    /// Closes known live controls, reconciles the journal, and joins owned tasks.
+    /// Closes known live controls, reconciles the journal page by page, and
+    /// joins owned tasks. Evidence is kept only for the `turns` asked about.
     ///
     /// The report survives every failure: an expired deadline or recovery error
     /// keeps pending and failed join counts, and unjoined tasks stay owned here.
-    pub async fn shutdown(&self, deadline: Deadline) -> ShutdownReport {
+    pub async fn shutdown(
+        &self,
+        deadline: Deadline,
+        turns: &[(crate::SessionId, crate::TurnNumber)],
+    ) -> ShutdownReport {
         if Instant::now() >= deadline.instant() {
             let (pending_tasks, failed_tasks) = join_owned_tasks(&self.tasks, deadline).await;
             return ShutdownReport {
                 recovery: Vec::new(),
+                anchors: 0,
+                uncertain_anchors: 0,
                 pending_tasks,
                 failed_tasks,
                 failure: Some(HostError::Deadline),
@@ -628,32 +666,65 @@ impl Host {
                 }
             }
         }
-        let (recovery, failure) = match self.recover(deadline).await {
-            Ok(recovery) => (recovery, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
+        let (recovery, anchors, uncertain_anchors, failure) =
+            match self.reconcile_turns(turns, deadline).await {
+                Ok((recovery, anchors, uncertain)) => (recovery, anchors, uncertain, None),
+                Err(error) => (Vec::new(), 0, 0, Some(error)),
+            };
         let (pending_tasks, failed_tasks) = join_owned_tasks(&self.tasks, deadline).await;
         let failure = failure.or((pending_tasks > 0).then_some(HostError::Deadline));
         ShutdownReport {
             recovery,
+            anchors,
+            uncertain_anchors,
             pending_tasks,
             failed_tasks,
             failure,
         }
     }
 
-    /// Reconciles committed anchor records without resending Configure or ARM.
-    pub async fn recover(&self, deadline: Deadline) -> Result<Vec<RecoveryReport>, HostError> {
-        let mut reports: Vec<RecoveryReport> = Vec::new();
+    /// Reconciles every committed anchor page by page, keeping per-turn
+    /// aggregates only for `turns` plus totals; returns `(turns, anchors,
+    /// uncertain anchors)`.
+    async fn reconcile_turns(
+        &self,
+        turns: &[(crate::SessionId, crate::TurnNumber)],
+        deadline: Deadline,
+    ) -> Result<(Vec<TurnRecovery>, usize, usize), HostError> {
+        let mut recovery: Vec<TurnRecovery> = Vec::new();
+        let (mut anchors, mut uncertain) = (0, 0);
+        let mut after = None;
         loop {
-            let after = reports.last().map(|report| report.anchor_id.clone());
             let page = self
                 .recover_page(after, via_store::ANCHOR_PAGE_LIMIT, deadline)
                 .await?;
             let full = page.len() == via_store::ANCHOR_PAGE_LIMIT as usize;
-            reports.extend(page);
+            after = page.last().map(|report| report.anchor_id.clone());
+            for report in page {
+                anchors += 1;
+                if !matches!(report.cleanup, CleanupEvidence::GroupAbsent(_)) {
+                    uncertain += 1;
+                }
+                let owner = (report.owner_session.clone(), report.owner_turn);
+                if !turns.contains(&owner) {
+                    continue;
+                }
+                match recovery
+                    .iter_mut()
+                    .find(|turn| (&turn.owner_session, turn.owner_turn) == (&owner.0, owner.1))
+                {
+                    Some(turn) => turn.fold(report),
+                    None => recovery.push(TurnRecovery {
+                        owner_session: owner.0,
+                        owner_turn: owner.1,
+                        anchors: 1,
+                        cleanup: report.cleanup,
+                        forced: report.forced,
+                    }),
+                }
+            }
             if !full {
-                return Ok(reports);
+                return Ok((recovery, anchors, uncertain));
             }
         }
     }
@@ -669,12 +740,13 @@ impl Host {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
+        // A read that never completed is a Store failure, not unproven cleanup.
         let records = timeout_at(
             deadline.instant(),
             self.journal.list_anchor_records_page(after, limit),
         )
         .await
-        .map_err(|_| HostError::Deadline)?
+        .map_err(|_| HostError::Store("anchor journal page read timed out"))?
         .map_err(HostError::StoreUnavailable)?;
         let mut results = Vec::with_capacity(records.len());
         for record in records {
@@ -682,7 +754,7 @@ impl Host {
             let generation = record.intent.generation.clone();
             let owner_session = record.intent.owner_session.clone();
             let owner_turn = record.intent.owner_turn;
-            let cleanup = self.recover_one(record, deadline).await;
+            let cleanup = self.recover_one(record, deadline).await?;
             let forced = self
                 .tasks
                 .lock()
@@ -701,12 +773,18 @@ impl Host {
         Ok(results)
     }
 
-    async fn recover_one(&self, record: AnchorRecord, deadline: Deadline) -> CleanupEvidence {
+    /// Process-proof outcomes are `CleanupEvidence`; a failed or uncertain
+    /// absence-proof commit is a Store failure.
+    async fn recover_one(
+        &self,
+        record: AnchorRecord,
+        deadline: Deadline,
+    ) -> Result<CleanupEvidence, HostError> {
         let Some(stored_identity) = record.identity else {
-            return CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor);
+            return Ok(CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor));
         };
         let Ok(identity) = identity_from_store(stored_identity) else {
-            return CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor);
+            return Ok(CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor));
         };
         if record.intent.generation.is_empty()
             || record.intent.marker != identity.marker.as_str()
@@ -714,7 +792,7 @@ impl Host {
             || record.intent.boot_id != identity.boot_id
             || record.intent.pid_namespace != identity.pid_namespace
         {
-            return CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor);
+            return Ok(CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor));
         }
         if let Some(absence) = record.absence {
             if absence.anchor_id != record.intent.anchor_id
@@ -726,13 +804,13 @@ impl Host {
                 || linux::boot_id().ok().as_deref() != Some(identity.boot_id.as_str())
                 || linux::pid_namespace().ok().as_deref() != Some(identity.pid_namespace.as_str())
             {
-                return CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor);
+                return Ok(CleanupEvidence::Uncertain(CleanupReason::UnverifiedAnchor));
             }
-            return CleanupEvidence::GroupAbsent(crate::GroupAbsenceProof {
+            return Ok(CleanupEvidence::GroupAbsent(crate::GroupAbsenceProof {
                 anchor: identity,
                 generation: absence.generation,
                 observed_at: absence.observed_at,
-            });
+            }));
         }
         let _ = timeout_at(deadline.instant(), async {
             if let Ok(mut stream) = UnixStream::connect(&record.intent.socket_path).await
@@ -853,6 +931,7 @@ impl ProcessControl {
         if forced {
             self.stop.forced.store(true, Ordering::Release);
         }
+        // A close has no error channel: a Store failure stays uncertain here.
         let cleanup = wait_absence(
             &self.journal,
             &self.anchor_id,
@@ -860,7 +939,10 @@ impl ProcessControl {
             &self.identity,
             request.deadline,
         )
-        .await;
+        .await
+        .unwrap_or(CleanupEvidence::Uncertain(
+            CleanupReason::EvidenceStoreFailure,
+        ));
         CloseReport {
             cleanup,
             vendor_exit: *self.exit.borrow(),
@@ -964,7 +1046,7 @@ async fn wait_absence(
     generation: &str,
     identity: &ProcessIdentity,
     deadline: Deadline,
-) -> CleanupEvidence {
+) -> Result<CleanupEvidence, HostError> {
     loop {
         let evidence = linux::probe_absence(identity, generation);
         match &evidence {
@@ -977,12 +1059,23 @@ async fn wait_absence(
                     pgid: identity.pgid,
                     observed_at: proof.observed_at().to_owned(),
                 };
+                // Proof observed too late to record is unproven, not a Store failure.
+                if Instant::now() >= deadline.instant() {
+                    return Ok(CleanupEvidence::Uncertain(CleanupReason::Deadline));
+                }
+                #[cfg(feature = "test-failpoints")]
+                via_store::failpoint::hit_async("host.recovery.absence_commit")
+                    .await
+                    .map_err(|_| HostError::Store("group absence commit failed"))?;
                 return match timeout_at(deadline.instant(), journal.commit_group_absence(record))
                     .await
                 {
-                    Ok(CommitOutcome::Committed(())) => evidence,
-                    Ok(CommitOutcome::NotCommitted(_) | CommitOutcome::Uncertain(_)) | Err(_) => {
-                        CleanupEvidence::Uncertain(CleanupReason::EvidenceStoreFailure)
+                    Ok(CommitOutcome::Committed(())) => Ok(evidence),
+                    Ok(CommitOutcome::NotCommitted(_)) => {
+                        Err(HostError::Store("group absence commit failed"))
+                    }
+                    Ok(CommitOutcome::Uncertain(_)) | Err(_) => {
+                        Err(HostError::Store("group absence commit outcome uncertain"))
                     }
                 };
             }
@@ -995,9 +1088,9 @@ async fn wait_absence(
                 .await;
             }
             CleanupEvidence::Uncertain(CleanupReason::GroupPresent) => {
-                return CleanupEvidence::Uncertain(CleanupReason::Deadline);
+                return Ok(CleanupEvidence::Uncertain(CleanupReason::Deadline));
             }
-            CleanupEvidence::Uncertain(_) => return evidence,
+            CleanupEvidence::Uncertain(_) => return Ok(evidence),
         }
     }
 }
@@ -1178,7 +1271,10 @@ mod tests {
         let (host, _store, root) = host_fixture(true);
         let release = hold(&host);
         let report = host
-            .shutdown(Deadline::at(Instant::now() + Duration::from_millis(50)))
+            .shutdown(
+                Deadline::at(Instant::now() + Duration::from_millis(50)),
+                &[],
+            )
             .await;
         assert_eq!((report.pending_tasks, report.failed_tasks), (1, 0));
         assert!(
@@ -1186,12 +1282,12 @@ mod tests {
             "{report:?}"
         );
         // An already expired deadline still returns the report, not only an error.
-        let expired = host.shutdown(Deadline::at(Instant::now())).await;
+        let expired = host.shutdown(Deadline::at(Instant::now()), &[]).await;
         assert_eq!(expired.pending_tasks, 1);
         assert!(matches!(expired.failure, Some(HostError::Deadline)));
         assert!(release.send(()).is_ok(), "task must still own its receiver");
         let later = host
-            .shutdown(Deadline::at(Instant::now() + Duration::from_secs(1)))
+            .shutdown(Deadline::at(Instant::now() + Duration::from_secs(1)), &[])
             .await;
         assert_eq!(
             (later.pending_tasks, later.failed_tasks),
@@ -1213,13 +1309,13 @@ mod tests {
             .running
             .push(TrackedTask::new(tokio::spawn(async { Err(()) })));
         let deadline = || Deadline::at(Instant::now() + Duration::from_secs(1));
-        let first = host.shutdown(deadline()).await;
+        let first = host.shutdown(deadline(), &[]).await;
         assert_eq!(
             (first.pending_tasks, first.failed_tasks),
             (0, 1),
             "{first:?}"
         );
-        let second = host.shutdown(deadline()).await;
+        let second = host.shutdown(deadline(), &[]).await;
         assert_eq!(
             (second.pending_tasks, second.failed_tasks),
             (0, 1),
@@ -1234,7 +1330,10 @@ mod tests {
         assert!(store.is_none());
         let release = hold(&host);
         let report = host
-            .shutdown(Deadline::at(Instant::now() + Duration::from_millis(100)))
+            .shutdown(
+                Deadline::at(Instant::now() + Duration::from_millis(100)),
+                &[],
+            )
             .await;
         assert!(
             matches!(report.failure, Some(HostError::StoreUnavailable(_))),

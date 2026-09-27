@@ -516,3 +516,133 @@ paths, remain without deterministic end-to-end tests (Host seam, deferred).
 - The release build and `check-release-features.py` pass.
 - The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
   (Task 4).
+
+## Round 5
+
+Response to [../sol-review-T2-A-r4.md](../sol-review-T2-A-r4.md) (UNSOUND),
+applying the orchestrator's three decisions. I merged `origin/rust-foundation`
+first (docs only). I found no contract contradiction in the decisions.
+Paging (Round 4 B2) is unchanged.
+
+**Decision 1: the deadline bounds startup.** `Engine::reconcile` checks the
+5 s deadline before each page. At expiry it stops paging both the Store owner
+pages and Host, and marks the reconciliation `incomplete`. With an incomplete
+inventory, `Reconciled::cleanup` proves nothing for any turn: a turn whose
+anchors were not all proven absent, including one with no anchor seen so far,
+is `(quiescent=false)`.
+
+Store's existing unfinished-turn selection then settles every running turn:
+
+- `unknown` with `daemon_restart`;
+- `cancel {outcome, cleanup: uncertain}`, with `forced` only from Host
+  reports;
+- then recovery commits, and the daemon admits requests.
+
+Only Store failures stay fatal.
+
+New test-only point `core.recovery.page_boundary`, hit in Core after each
+full page before the next.
+
+**Decision 2: Store failures are Store failures.** In Host:
+
+- `recover_one` and `wait_absence` now return `Result`.
+- A failed absence-proof commit becomes
+  `HostError::Store("group absence commit failed")`; an uncertain or
+  timed-out one becomes `"group absence commit outcome uncertain"`.
+- A journal page read that times out becomes
+  `HostError::Store("anchor journal page read timed out")`; a failed read is
+  `StoreUnavailable`, as before.
+- These propagate as errors through `recover_page` in Wire, Route and
+  Adapter. `is_store_failure` recognises them, and Core fails startup with
+  `store_error: host reconciliation: …` (runtime §7).
+- Process-proof outcomes stay `CleanupEvidence::Uncertain`: identity checks,
+  stop attempts, an absence wait that runs out of time, and an absence proof
+  observed only after the deadline, when no commit is attempted.
+- `ProcessControl::close` has no error channel, so it still reports a failed
+  commit as `Uncertain(EvidenceStoreFailure)`. That is the Route close path,
+  not startup recovery; I left it unchanged.
+
+New test-only point `host.recovery.absence_commit`, just before the commit.
+`via-host` gains a `test-failpoints` feature, forwarded from `via-wire`.
+
+**Decision 3: bounded memory.**
+
+- `Host::shutdown(deadline, turns)` walks the inventory page by page. It
+  keeps a `TurnRecovery` aggregate (anchor count, "all absent" or the first
+  uncertainty, and any `forced`) only for the requested turns, plus the
+  totals `anchors` and `uncertain_anchors`.
+- Core passes `Unresolved::turns()`, bounded by `UNRESOLVED_LIMIT` = 256. It
+  contains every force-stopped turn.
+- Wire (`WireTurnRecovery`), Route and Adapter (`FakeTurnRecovery`) carry the
+  aggregates. Core's shutdown reads its counts from the totals.
+- Removed with no production caller left:
+  - `Host::recover`, `WireRuntime::recover`, `FakeRoute::recover` and
+    `AdapterRuntime::recover`, the whole-table vectors;
+  - `ProcessJournal::list_anchor_records`.
+
+  Tests call `list_anchor_records_page` and `recover_page` instead, so no
+  whole-table helper remains, not even under `cfg(test)`.
+
+**Regressions (real daemon):**
+
+- `s1_f10_reconciliation_deadline_settles_uncertain_and_admits`:
+  - An ended turn owns 300 proven-absent synthetic anchors, two pages, plus
+    one real anchor. The crashed turn crashed at intent and has no anchor.
+  - Startup is held at `core.recovery.page_boundary` (pause) past the
+    deadline, 5.2 s after the ack. This is a timed wait, an OS-timing
+    tolerance that adds about 5 s to the suite.
+  - Once released, the daemon admits requests. The crashed turn is `unknown`,
+    `daemon_restart`, cleanup `uncertain`, outcome `requested`, with the
+    `cancel_cleanup_uncertain` warning. A later turn completes.
+  - With a complete inventory, the anchor-free turn would have been
+    `quiescent`.
+- `s1_f10_failed_absence_commit_fails_startup`: `fail_io` at
+  `host.recovery.absence_commit` during startup recovery.
+  - The daemon exits with
+    `store_error: host reconciliation: … group absence commit failed` before
+    admission, and nothing is committed: the turn is still `running` with no
+    envelope.
+  - Without the fault, a restart recovers normally.
+- `s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits`:
+  - The 10,001 synthetic anchors are now proven absent, so the crashed turn
+    recovers `quiescent`, and the daemon admits requests.
+  - A normal `daemon stop` then exits 0, a clean final shutdown after the
+    load, with Host paging the whole inventory.
+  - The synthetic rows are deleted only after exit.
+- `s1_f10_failed_host_reconciliation_refuses_admission` (Round 3) now checks
+  the `store_error: host reconciliation` name.
+- `recovery::tests`: new `an_incomplete_inventory_leaves_every_turn_uncertain`.
+
+**Before** (Round 4 code with the new tests, in a throwaway worktree;
+`scratchpad/t2a/r5-before.txt`):
+
+- Deadline test: `no acknowledgement of core.recovery.page_boundary #1` — the
+  seam is missing. Its discriminating assertion, the anchor-free turn being
+  `uncertain`, cannot be exercised there.
+- Absence-commit test: `daemon admitted requests after a failed
+  reconciliation`.
+- Round 3 test: failed only on the renamed error.
+- 10,001-anchor test: **passed on Round 4**. Whole-table memory use is not
+  observable from the outside, so decision 3 rests on code review plus the
+  removal of every whole-table API.
+
+**Outside T2-A's owned paths:**
+
+- Host: `recover_page` and `recover_one` error typing, `wait_absence`,
+  `shutdown` aggregation, `TurnRecovery`, the failpoint call site, and test
+  call sites.
+- Wire, Route and Adapter: shutdown and page seams, `WireTurnRecovery` and
+  `FakeTurnRecovery`, and the removed whole-table `recover`.
+- Store: `list_anchor_records` removed.
+- `scripts/check-release-features.py`: both new points added to `POINTS`.
+
+**Gate (Round 5):**
+
+- fmt, both clippy runs, `cargo deny` and the layer check pass.
+- Default nextest: 130 passed, 2 skipped.
+- nextest with the failpoint feature: 142 passed, 2 skipped.
+- The F08–F12 line: 11 passed; the F08/F10 selection passed in 3 more runs.
+- The release build and `check-release-features.py` pass (8 points armed and
+  ignored, 0 of 11 markers).
+- The `s1_(f2[4567]|raw|bounds|store)_` line still exits 4 with no tests
+  (Task 4).
