@@ -178,3 +178,40 @@ the other F10 tests still pass unchanged.
 | `… --features via-cli/test-failpoints`, 5 full runs | 5 of 5: 202 passed, 2 skipped |
 | `… -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 17 passed |
 | release build and `check-release-features.py` | pass: 11 points armed and ignored, none of 15 markers present |
+
+## Round 2
+
+Sol high's review (`../sol-review-T2-D-r2.md`) returned SOUND WITH CHANGES
+with one blocker. Blocker 1 and the orchestrator's alternative for blocker
+2 were accepted. The remaining blocker: the unread-anchor `COUNT(*)`
+scanned an unbounded historical suffix. I merged `origin/rust-foundation`
+(docs only) and applied the two decisions as given, with no other change.
+
+| # | Item | Change | Regression; failure with the fix reverted |
+|---|---|---|---|
+| 1 | **Blocker:** the unread-anchor count must be bounded | Store's `unproven_anchors_after` became `unproven_anchors_up_to(after, limit)`. It runs `SELECT count(*) FROM (SELECT 1 FROM anchors WHERE anchor_id>?1 AND absence_time IS NULL ORDER BY anchor_id LIMIT ?2)`, with `''` as the start cursor, since no anchor id is empty. Core passes the pool, `CONNECTION_SLOTS`. Unidentified holdings are never released during admission, so the saturated count holds the same permits as an exact one; the function and design §11 say so | `the_unread_anchor_count_seeks_the_partial_index_and_saturates` (Store unit, `runtime/anchor.rs`): a real v3 schema with 30 anchors, 20 of them unproven. `EXPLAIN QUERY PLAN` shows `SEARCH anchors USING INDEX anchors_unproven (anchor_id>?)`. Counts: 4 at limit 4, 20 at limit 100, 6 after `a00020`, and 0 past the end. Without the index the plan assertion fails |
+| 2 | Index in the schema, schema v3 | `CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL`; `user_version=3` and `SCHEMA_VERSION = 3`. Under runtime §6's pre-release rule, a v1 or v2 Store is refused with the named "recreate" error and never migrated. Runtime §6 now reads "Schema v3 (v1 was the unreleased single-turn format; v2 lacked the unproven-anchor index)", and a sentence lists the index | `unreleased_v1_and_v2_stores_are_refused_with_a_recreate_instruction` (was the v1-only test): both versions are refused with "schema v{n}" and "recreate", with their bytes untouched. With the version reverted to 2 (constant and DDL), the v2 case opens and the test fails |
+
+The plan is a range seek on the partial index, not a covering scan: each of
+the at most `limit` rows it visits costs one table lookup. The existing
+T2-D and F10 regressions pass unchanged.
+
+**Files (Round 2):**
+- `via-store`: `runtime.rs` (version, `unproven_anchors_up_to`),
+  `runtime/sql.rs` (index, v3), `runtime/anchor.rs` (bounded query, unit
+  test), `tests/persistence.rs` (v1 and v2 refusal).
+- `via-core/src/engine/recovery.rs`: passes the pool.
+- `docs/specs/runtime-contracts.md` §6; `dispatch-design.md` §11.
+
+**Open or uncertain (Round 2):** none new. A developer's existing v2 dev
+Store must be recreated, as runtime §6 intends.
+
+**Gate (Round 2):**
+
+| Check | Result |
+|---|---|
+| fmt, `git diff --check`, both clippy configurations, deny, layers | pass |
+| `cargo nextest run --locked --workspace` | 173 passed, 2 skipped |
+| `… --features via-cli/test-failpoints`, 5 full runs | 5 of 5: 203 passed, 2 skipped |
+| `… -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 17 passed |
+| release build and `check-release-features.py` | pass: 11 points armed and ignored, none of 15 markers present |

@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use crate::{CommitOutcome, ConnectionId, RawRef, SessionId, StoreFailureKind, TurnNumber};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Most queued turns one session holds, enforced inside the receipt
 /// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
@@ -545,7 +545,11 @@ enum Command {
         u32,
         oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
     ),
-    UnprovenAnchors(Option<String>, oneshot::Sender<Result<u64, StoreError>>),
+    UnprovenAnchors(
+        Option<String>,
+        u32,
+        oneshot::Sender<Result<u64, StoreError>>,
+    ),
     QueuedTurns(
         Option<(SessionId, TurnNumber)>,
         u32,
@@ -912,11 +916,18 @@ impl StoreClient {
     }
 
     /// Counts committed anchors after the `after` anchor id with no recorded
-    /// absence proof, in one query: the groups a recovery deadline left
-    /// unread (design §11).
-    pub async fn unproven_anchors_after(&self, after: Option<String>) -> Result<u64, StoreError> {
+    /// absence proof, saturating at `limit`: the groups a recovery deadline
+    /// left unread (design §11). One indexed query that reads at most
+    /// `limit` entries; Core passes the slot pool, and since those holdings
+    /// are never released during admission, a count saturated there holds
+    /// the same permits as an exact one.
+    pub async fn unproven_anchors_up_to(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<u64, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::UnprovenAnchors(after, reply))?;
+        self.send(Command::UnprovenAnchors(after, limit, reply))?;
         receive.await.map_err(|_| StoreError::Unavailable)?
     }
 

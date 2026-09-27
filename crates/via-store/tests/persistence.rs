@@ -463,30 +463,33 @@ fn events_keep_dense_seq_and_cited_raw_span() {
     assert_eq!(accepted, "2026-01-01T00:00:01.000Z");
 }
 
-/// Runtime §6: the unreleased schema-v1 dev format is not migrated. Opening it
+/// Runtime §6: the unreleased dev formats (schema v1, the single-turn format,
+/// and v2, before the unproven-anchor index) are not migrated. Opening one
 /// fails with a named, actionable error and leaves its bytes untouched.
 #[test]
-fn unreleased_v1_store_is_refused_with_a_recreate_instruction() {
-    let root = TempDir::new().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let db = root.path().join("store.sqlite3");
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+fn unreleased_v1_and_v2_stores_are_refused_with_a_recreate_instruction() {
+    for version in [1, 2] {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let db = root.path().join("store.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+                .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&db).unwrap();
+        let Err(error) = Store::open(root.path()) else {
+            panic!("a v{version} Store opened");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("schema v{version}")) && message.contains("recreate"),
+            "{message}"
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
     }
-    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
-    let before = fs::read(&db).unwrap();
-    let Err(error) = Store::open(root.path()) else {
-        panic!("a v1 Store opened");
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("schema v1") && message.contains("recreate"),
-        "{message}"
-    );
-    assert_eq!(fs::read(&db).unwrap(), before);
 }
 
 /// Runtime §6: at most eight queued turns per session, checked inside the

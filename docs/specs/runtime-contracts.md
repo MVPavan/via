@@ -682,7 +682,8 @@ the build's is an unreleased development format, is never migrated, and is
 refused at open with a named error telling the user to recreate the dev Store
 (remove `store.sqlite3` from the State directory); its bytes are left
 untouched. Migrations as described above start with the first released
-schema. Schema v2 (v1 was the unreleased single-turn format):
+schema. Schema v3 (v1 was the unreleased single-turn format; v2 lacked the
+unproven-anchor index):
 
 | Table | Key, constraints and stored content |
 |---|---|
@@ -698,7 +699,10 @@ schema. Schema v2 (v1 was the unreleased single-turn format):
 There is no separate queue table: ordered queued turns without submission
 intent are the queue. Only one in-flight turn per session, enforced by a
 partial unique index; at most eight queued turns checked inside admission's
-transaction. Terminal state requires envelope; nonterminal state forbids it.
+transaction. A partial index on anchor process IDs without absence evidence
+(`anchor_id` where `absence_time IS NULL`) lets recovery count unproven
+anchors past a cursor, saturating at the connection bound, without scanning
+history. Terminal state requires envelope; nonterminal state forbids it.
 Unknown is terminal but may be revised using C1's explicit revision batch.
 Append events, resulting state, envelope and next seq commit together.
 `turn.ended` is the final non-late event for that turn. Session events share

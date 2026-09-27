@@ -569,12 +569,15 @@ wait releases no admission capacity."
   deadline, startup still proceeds (T2-A round 3; C1 §7.5 and runtime §7
   allow uncertain cleanup). Core then makes one bounded Store query: the
   committed anchors after the last reconciled cursor with no absence proof
-  (`absence_time IS NULL`). That count joins the recovered holdings as
-  unidentified groups, through the same accounting capped at the pool. They
-  have no Host ledger entry, and nothing releases them before the next full
-  reconciliation (final shutdown or restart). A failure of that query is a
-  Store failure and fails startup (runtime §7). This round adds no
-  re-probe loop for recovered or unidentified groups; the orchestrator
+  (`absence_time IS NULL`), counted through the `anchors_unproven` partial
+  index (schema v3) and saturated at the pool size. These holdings are
+  never released during admission, so a saturated count holds the same
+  permits as an exact one (round 2). The count joins the recovered
+  holdings as unidentified groups, through the same accounting capped at
+  the pool. They have no Host ledger entry, and nothing releases them
+  before the next full reconciliation (final shutdown or restart). A
+  failure of that query is a Store failure and fails startup (runtime §7).
+  This round adds no re-probe loop for recovered or unidentified groups; the orchestrator
   records both on `via-jm4.7.7`, so such a slot is held until the daemon's
   next reconciliation (shutdown or restart).
 - **Wakes.** A waiting dispatcher wakes on a slot release (the semaphore

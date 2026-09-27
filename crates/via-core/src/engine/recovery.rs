@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use super::drive::Cancelled;
 use super::journal::Head;
+use super::queue::CONNECTION_SLOTS;
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
@@ -141,11 +142,14 @@ impl Engine {
             if tokio::time::Instant::now() >= deadline.instant() {
                 reconciled.incomplete = true;
                 // Design §11: the unread anchors without absence proof still
-                // count against the pool, as unidentified groups. One bounded
-                // query; its failure is a Store failure and fails startup.
+                // count against the pool, as unidentified groups. One indexed
+                // query saturating at the pool (never released during
+                // admission, so no more are needed); its failure is a Store
+                // failure and fails startup.
+                let pool = u32::try_from(CONNECTION_SLOTS).unwrap_or(u32::MAX);
                 let unread = self
                     .store
-                    .unproven_anchors_after(after)
+                    .unproven_anchors_up_to(after, pool)
                     .await
                     .map_err(|error| format!("store_error: {error}"))?;
                 self.recovered.hold_unidentified(&self.slots, unread);

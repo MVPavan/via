@@ -227,14 +227,22 @@ pub(super) fn read_anchor_records(
         .collect()
 }
 
+/// Counts committed anchors after `after` with no absence proof, up to ?2.
+pub(super) const UNPROVEN_ANCHORS_UP_TO: &str = "SELECT count(*) FROM (SELECT 1 FROM anchors
+     WHERE anchor_id>?1 AND absence_time IS NULL ORDER BY anchor_id LIMIT ?2)";
+
 /// Committed anchors after `after` in `anchor_id` order with no absence proof.
+/// Saturates at `limit`: a bounded range seek on the `anchors_unproven`
+/// partial index, visiting at most `limit` unproven rows, never the whole
+/// historical suffix. No anchor id is empty, so `''` starts at the first.
 pub(super) fn count_unproven_anchors(
     conn: &Connection,
     after: Option<&str>,
+    limit: u32,
 ) -> Result<u64, StoreError> {
     conn.query_row(
-        "SELECT count(*) FROM anchors WHERE (?1 IS NULL OR anchor_id>?1) AND absence_time IS NULL",
-        params![after],
+        UNPROVEN_ANCHORS_UP_TO,
+        params![after.unwrap_or(""), limit],
         |row| row.get::<_, i64>(0),
     )
     .map(i64::cast_unsigned)
@@ -273,4 +281,60 @@ pub(super) fn read_anchor_owners(
         .map_err(|error| StoreError::Write(error.to_string()))?;
     rows.map(|row| row.map_err(|error| StoreError::Write(error.to_string())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Connection, UNPROVEN_ANCHORS_UP_TO, count_unproven_anchors};
+
+    /// A schema-v3 Store with `total` anchors, every third one proved absent.
+    fn store_with_anchors(total: u32) -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut conn = Connection::open(dir.path().join("store.sqlite3")).expect("open");
+        super::super::configure(&mut conn).expect("schema");
+        // Only the anchor rows matter here; their owning turns do not.
+        conn.execute_batch("PRAGMA foreign_keys=OFF")
+            .expect("pragma");
+        for index in 0..total {
+            let absence = (index % 3 == 0).then_some("1");
+            conn.execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,absence_time)
+                 VALUES (?1,'g','m','/s','s_x',1,0,'b','n','intent',1,?2)",
+                super::params![format!("a{index:05}"), absence],
+            )
+            .expect("insert");
+        }
+        (dir, conn)
+    }
+
+    /// Design §11 (T2-D round 2): the unread-anchor count seeks the
+    /// `anchors_unproven` partial index and saturates at its limit.
+    #[test]
+    fn the_unread_anchor_count_seeks_the_partial_index_and_saturates() {
+        let (_dir, conn) = store_with_anchors(30);
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {UNPROVEN_ANCHORS_UP_TO}"))
+            .expect("plan");
+        let details: Vec<String> = plan
+            .query_map(super::params!["", 4], |row| row.get(3))
+            .expect("plan rows")
+            .collect::<Result<_, _>>()
+            .expect("plan details");
+        assert!(
+            details.iter().any(|detail| {
+                detail.starts_with("SEARCH anchors USING")
+                    && detail.ends_with("INDEX anchors_unproven (anchor_id>?)")
+            }),
+            "{details:?}"
+        );
+        // 20 unproven anchors: from the start, after a00020 (7 remain), past the end.
+        assert_eq!(count_unproven_anchors(&conn, None, 4).expect("count"), 4);
+        assert_eq!(count_unproven_anchors(&conn, None, 100).expect("count"), 20);
+        let tail = count_unproven_anchors(&conn, Some("a00020"), 100).expect("count");
+        assert_eq!(tail, 6);
+        assert_eq!(
+            count_unproven_anchors(&conn, Some("a00029"), 4).expect("count"),
+            0
+        );
+    }
 }
