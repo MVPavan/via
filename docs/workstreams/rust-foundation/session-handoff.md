@@ -30,17 +30,19 @@ the historical checkpoint; its findings table is updated by this section.
   Gate green: 116 passed, 2 skipped (root-only peer test; the
   scheduling-dependent queued-handoff force test, ignored until
   `test-failpoints` exists). Deferred test/Store items are on `via-jm4.7.7`.
-- Task 1 Sol high review ([task1-sol-high-review.md](task1-sol-high-review.md)):
-  ACCEPT AFTER CHANGES. Findings 1–3 (force disposition, post-ARM
-  acquisition errors and raw completeness, peer-UID acceptance evidence)
-  sent to the W4-H cloud session as "T1-close" (report
-  `w4/reports/T1-close.md`); finding 4 (close idle/drained sessions) is on
-  `via-jm4.7.7`. Approved contract text recorded in C1/runtime (`4b0b192`);
-  raw-completeness wording is left to T1-close.
-- Next: Sol medium review of T1-close → merge → gate → close Task 1
-  (`via-jm4.7.5`). Then split `via-core/src/engine.rs`
-  by responsibility; then `.7.6`–`.7.8` (failpoint controller first), then
-  `.7.9`. After a reboot, restore tmux session `via` (windows `main`, and
+- **S1 Task 1 closed** (`via-jm4.7.5`, with `.7.4` harness, `.7.12` Store,
+  `.7.13` Host) at `e24bb2c`: Sol high slice review
+  ([task1-sol-high-review.md](task1-sol-high-review.md)) → T1-close fixes →
+  Sol SOUND (`w4/sol-review-T1-close-r2.md`). Gate: 122 passed, 2 ignored
+  (root-only peer test, run as root in the cloud; scheduling-dependent
+  race). Approved contract text is in C1/runtime (`4b0b192`, `c00cb2b`).
+  Deferred items are on `via-jm4.7.6` (harness gaps) and `via-jm4.7.7`
+  (session closure on stop, shutdown phase budget, failpoint-deterministic
+  timing tests, Store-failure lifecycle).
+- Next: W5 ([w5/README.md](w5/README.md)) splits `via-core/src/engine.rs`
+  (Opus 5.5 medium, cloud); then Task 2 (`via-jm4.7.6`, failpoint
+  controller first), Task 3 (`.7.7`), Task 4 (`.7.8`), final critique
+  (`.7.9`). After a reboot, restore tmux session `via` (windows `main`, and
   `watch` running `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
