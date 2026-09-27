@@ -220,8 +220,8 @@ impl Engine {
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
-        // Bounds the failed turns retained for their `store_error` reads.
-        if !self.unresolved.admits() {
+        // Bounds the turns retained for their `store_error` reads.
+        if !journal::admits(&self.store, &self.unresolved).await {
             return Err(ApiError::STORE);
         }
         if params.harness != "fake" || !self.adapter.fake_available() {
@@ -283,14 +283,8 @@ impl Engine {
         let _active = Active(&self.active);
         let session = SessionId::try_from(session_text).map_err(|_| ApiError::INVALID_PARAMS)?;
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        let (queued_at, submitted, submitted_clock) = match self.submit(&session, turn).await {
-            Ok(submitted) => submitted,
-            Err(error) => {
-                // Only `turn.queued` is known durable; the turn never reaches `finish`.
-                self.unresolved.fail(&session, turn, TurnState::Queued);
-                return Err(error);
-            }
-        };
+        let (queued_at, submitted, submitted_clock) =
+            Self::submit(&self.store, &self.unresolved, &session, turn).await?;
         let started = Started {
             session: session.clone(),
             turn,
@@ -609,16 +603,31 @@ impl Engine {
     }
 
     /// Commits submission intent with `turn.submitted` (seq 2) before any agent I/O.
+    /// A turn whose submission cannot be confirmed never reaches `finish`; it is
+    /// recorded failed at its last committed state, `queued`.
     ///
     /// Returns the durable `turn.queued` time and the submission time.
     async fn submit(
-        &self,
+        journal: &impl TurnJournal,
+        unresolved: &Unresolved,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<(String, SystemTime, Instant), ApiError> {
+        let submitted = Self::commit_submission(journal, session, turn).await;
+        if submitted.is_err() {
+            unresolved.fail(session, turn, TurnState::Queued);
+        }
+        submitted
+    }
+
+    /// `submit`'s Store work: reads `turn.queued` and commits `turn.submitted`.
+    async fn commit_submission(
+        journal: &impl TurnJournal,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<(String, SystemTime, Instant), ApiError> {
         // S1 sessions hold one turn, so its events start at seq 1 (turn.queued).
-        let queued = self
-            .store
+        let queued = journal
             .events(session, 1, 1)
             .await
             .map_err(|_| ApiError::STORE)?;
@@ -638,7 +647,7 @@ impl Engine {
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()?;
-        self.store
+        journal
             .commit_submission(SubmissionRecord {
                 session_id: session.clone(),
                 turn,

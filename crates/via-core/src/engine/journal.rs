@@ -6,10 +6,17 @@
 //! takes the next sequence. A receipted turn whose terminal cannot be made
 //! durable reads as C1 `store_error`, never as a running turn.
 
-use std::{collections::HashMap, future::Future, sync::Mutex as StdMutex, time::SystemTime};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Mutex as StdMutex,
+    time::{Duration, SystemTime},
+};
 
 use serde_json::Value;
-use via_store::{EventRecord, StoreClient, StoreError, StoredEvent, TerminalRecord};
+use via_store::{
+    EventRecord, StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalRecord,
+};
 
 use super::{Accepted, TurnRecord, lock};
 use crate::api::{Event, EventBody, RawSpan, rfc3339};
@@ -18,6 +25,11 @@ use crate::{ApiError, RawRef, SessionId, TurnNumber, TurnState};
 /// Core's narrow Store port for one turn: `StoreClient` in production, a closed
 /// fault backend in unit tests.
 pub(super) trait TurnJournal: Sync {
+    /// Commits submission intent with `turn.submitted`.
+    fn commit_submission(
+        &self,
+        record: SubmissionRecord,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Commits one event of a running turn.
     fn commit_event(
         &self,
@@ -46,6 +58,10 @@ pub(super) trait TurnJournal: Sync {
 }
 
 impl TurnJournal for StoreClient {
+    async fn commit_submission(&self, record: SubmissionRecord) -> Result<(), StoreError> {
+        Self::commit_submission(self, record).await
+    }
+
     async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
         Self::commit_event(self, record).await
     }
@@ -93,10 +109,13 @@ pub(super) struct UncertainEvent {
     pub(super) accepted: Option<Accepted>,
 }
 
-/// Most receipted turns whose terminal could not be made durable that the daemon
-/// retains; while this many are retained, spawn refuses new work with
-/// `store_error`, so no affected turn loses its C1 `store_error` read.
-pub(super) const FAILED_TURNS_LIMIT: usize = 256;
+/// Most receipted turns without a terminal known durable, in flight or failed,
+/// that the daemon retains. While this many are retained, spawn refuses new work
+/// with `store_error`, so no accepted turn loses its C1 `store_error` read.
+pub(super) const UNRESOLVED_LIMIT: usize = 256;
+
+/// Bound on the Store reads that settle failed turns before admission is refused.
+const SETTLE_BOUND: Duration = Duration::from_secs(2);
 
 /// What Core knows of a receipted turn with no terminal known to be durable.
 #[derive(Clone, Copy)]
@@ -109,9 +128,8 @@ enum Entry {
 
 /// Receipted turns with no terminal known to have committed. An entry is
 /// removed once a terminal is known committed, including a failed turn whose
-/// terminal a later read finds durable. Failed entries are bounded by
-/// [`FAILED_TURNS_LIMIT`] plus the turns in flight when it was reached. Final
-/// shutdown is clean only when the set is empty.
+/// terminal a later read finds durable. Receipts stop at [`UNRESOLVED_LIMIT`]
+/// entries. Final shutdown is clean only when the set is empty.
 #[derive(Default)]
 pub(super) struct Unresolved(StdMutex<HashMap<(SessionId, TurnNumber), Entry>>);
 
@@ -132,13 +150,18 @@ impl Unresolved {
         lock(&self.0).remove(&(session.clone(), turn));
     }
 
-    /// Whether another receipt keeps failed turns within their bound.
-    pub(super) fn admits(&self) -> bool {
-        let failed = lock(&self.0)
-            .values()
-            .filter(|entry| matches!(entry, Entry::Failed(_)))
-            .count();
-        failed < FAILED_TURNS_LIMIT
+    /// Whether another receipt keeps the set within its bound.
+    fn admits(&self) -> bool {
+        lock(&self.0).len() < UNRESOLVED_LIMIT
+    }
+
+    /// Failed turns, whose terminals a later read may find durable.
+    fn failed_turns(&self) -> Vec<(SessionId, TurnNumber)> {
+        lock(&self.0)
+            .iter()
+            .filter(|(_, entry)| matches!(entry, Entry::Failed(_)))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Every turn not yet known to have a durable terminal.
@@ -162,6 +185,25 @@ impl Unresolved {
             entries.remove(&key);
         }
     }
+}
+
+/// Whether another receipt fits the bound. When the set is full, failed turns
+/// whose terminals have since become durable are forgotten first, with Store
+/// reads bounded by [`SETTLE_BOUND`]; a read that fails or times out keeps its turn.
+pub(super) async fn admits(journal: &impl TurnJournal, unresolved: &Unresolved) -> bool {
+    if unresolved.admits() {
+        return true;
+    }
+    let settle = async {
+        for (session, turn) in unresolved.failed_turns() {
+            if let Ok(Some(_)) = journal.result(&session, turn).await {
+                unresolved.settle(&session, turn);
+            }
+        }
+    };
+    // Safe to ignore: an expired bound only leaves unread turns retained.
+    let _ = tokio::time::timeout(SETTLE_BOUND, settle).await;
+    unresolved.admits()
 }
 
 /// Commits one non-lifecycle event of the running turn at the next sequence.
