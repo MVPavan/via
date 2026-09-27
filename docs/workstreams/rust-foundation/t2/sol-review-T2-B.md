@@ -1,0 +1,21 @@
+**Verdict: UNSOUND for merge.** The happy-path implementation and tests cover the requested verbs and FIFO behavior, but a committed receipt can become permanently stranded after an uncertain Store reply. That breaks the retry guarantee F13 and F14 are meant to establish.
+
+### Merge blockers
+
+1. **A keyed retry can replay a receipt for work that will never run.** In `crates/via-core/src/engine.rs:243-263` and `:370-397`, any error from the receipt transaction returns `store_error` before the turn is registered or handed to a drive. SQLite can have committed before reporting an uncertain outcome. A later keyed retry finds the stored receipt at `:183-195` or `:297-310`, but returns `drive: None`. Fix: reconcile an uncertain receipt commit against Store, register and hand off a committed queued turn exactly once, and return the C1 §8.1 commit-outcome and retry fields when the outcome remains unknown. Add fault tests for both spawn and resume where commit succeeds but its reply is lost.
+
+2. **An existing schema-v1 Store cannot open successfully with this branch.** `crates/via-store/src/runtime/sql.rs:74-123` adds the new tables, columns and index only when `user_version == 0`; an older database already marked v1 skips them. Subsequent spawn or resume operations then fail. Fix: give the changed schema a new version and migrate supported v1 databases atomically, or establish an explicit fresh-Store-only acceptance rule before merge. The report correctly identifies the compatibility failure; “not released” alone does not make an existing durable Store readable.
+
+3. **The per-session queue ceiling is checked outside the receipt transaction.** Core checks a Store snapshot at `crates/via-core/src/engine.rs:280-329`, while `crates/via-store/src/runtime/sql.rs:352-400` inserts the turn without checking the eight-queued-turn ceiling. The admission lock serializes this Engine’s callers, so the current end-to-end test passes, but Store does not enforce runtime §6’s stated transactional invariant. Fix: count queued turns and reject the insert within the same Store transaction; retain Core’s check for the C1 `queue_full` response.
+
+### Contract assessment
+
+F13, F14, F17, F28 and `wait.timeout_ms` have meaningful CLI/daemon regressions for their ordinary paths. Their reported pre-change failures are credible: keyed spawn was rejected, resume did not exist, and `--timeout-ms` was rejected. The F17 test checks eight queued turns, refusal of the ninth, and submission order; F28 checks simultaneous work and separate event histories. They do **not** cover the uncertain-commit failure above, so I cannot call F13/F14 end-to-end retry safety met.
+
+The shared event head serializes a session’s writers, and the Store worker does not acquire the Engine admission or head locks. I found no lock cycle. The head is held across Store awaits, including its uncertain-head re-read, which preserves event order but can delay admission for that session. Slots and heads are per session; F28 provides useful crosstalk evidence.
+
+The report’s **sticky cancellation** is accurate for the code: `crates/via-core/src/engine/queue.rs:56-61` never clears `cancel_queue`. It is broader than C1’s explicit instruction to cancel queued successors behind an `unknown` turn. In particular, the code also makes a non-clean drive poison future resumes even after a terminal predecessor. Fix before merge by deriving dispatch eligibility from the durable predecessor state and cleanup certainty, and test a later resume after a settled terminal; retain cancellation while the predecessor remains unknown or unresolved.
+
+The reported **1–64 character** `idempotency_key` bound is a proposal, not a C1 decision. `crates/via-core/src/api.rs:336-345` also measures UTF-8 bytes, so it does not implement a character bound. Set and document the intended bound consistently; this is deferrable if the owner accepts a temporary input limit. The queued-cancellation envelope shape and connection IDs are also deferrable. The missing §8.1 error fields are part of blocker 1; status listing and startup recovery need integration with their assigned work.
+
+I inspected the branch by ref and ran `git diff --check` successfully. I did not run the branch’s tests or alter the checkout; the worker’s gate results remain reported results, not independently verified results.
