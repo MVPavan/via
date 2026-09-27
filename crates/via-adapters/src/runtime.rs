@@ -149,6 +149,7 @@ impl AdapterRuntime {
                             evidence: None,
                             exit: Some(result.exit),
                             raw_incomplete: false,
+                            launched: true,
                             cleanup: None,
                             forced: false,
                         })),

@@ -116,6 +116,8 @@ struct ForcedTurn {
     requested_at: String,
     /// Route's force cleanup could not record every vendor byte.
     raw_incomplete: bool,
+    /// A vendor may have launched: Host sent ARM.
+    launched: bool,
 }
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -130,6 +132,8 @@ enum Driven {
         requested_at: String,
         /// Route's cleanup drain could not record every vendor byte.
         raw_incomplete: bool,
+        /// A vendor may have launched: Host sent ARM.
+        launched: bool,
     },
 }
 
@@ -325,6 +329,7 @@ impl Engine {
             Driven::Forced {
                 requested_at,
                 raw_incomplete,
+                launched,
             } => {
                 if raw_incomplete {
                     let body = EventBody::RawLogIncomplete {
@@ -340,6 +345,7 @@ impl Engine {
                     record,
                     requested_at,
                     raw_incomplete,
+                    launched,
                 });
                 return Ok(());
             }
@@ -566,6 +572,7 @@ impl Engine {
                                     .cloned()
                                     .unwrap_or_else(|| rfc3339(SystemTime::now())),
                                 raw_incomplete: route.raw_incomplete,
+                                launched: route.launched,
                             }
                         }
                         result => Driven::Finished(result),
@@ -729,31 +736,49 @@ impl Engine {
     /// evidence, and every receipted turn is checked for a durable terminal.
     /// Every step shares the caller's single absolute deadline.
     pub async fn shutdown(&self, deadline: Deadline) -> EngineShutdown {
-        let report = self.adapter.shutdown(deadline).await;
+        // Unprovable group absence must not consume the time to commit terminals.
+        let host_by = deadline
+            .instant()
+            .checked_sub(FORCED_COMMIT_RESERVE)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let report = self.adapter.shutdown(Deadline::at(host_by)).await;
         let forced = std::mem::take(&mut *lock(&self.forced));
         let mut uncommitted_turns = 0;
         for turn in forced {
             let evidence = report.recovery.iter().find(|record| {
                 record.session_id == turn.started.session && record.turn == turn.started.turn
             });
-            // C1 §7.6: `forced` only with Host force evidence and `quiescent` only
-            // after verified group absence. A complete journal without an anchor
-            // intent for the turn means nothing was launched: no vendor could
-            // acknowledge, so the cancel stays `requested`, with nothing to clean.
-            let (outcome, cleanup) = match evidence {
-                Some(record) => stop_outcome(record.cleanup == Cleanup::Quiescent, record.forced),
-                None if report.failure.is_none() => ("requested", "quiescent"),
-                None => ("requested", "uncertain"),
+            // C1 §7.6 force row, outcome and cleanup kept independent. Host's
+            // proof that its stop found the vendor live ends the turn `cancelled`
+            // with `forced`. Before ARM no vendor could launch: `cancelled` and
+            // `requested`, cleanup as proved (a complete journal without an
+            // anchor intent has nothing to clean). Otherwise a vendor may have
+            // run with neither stop nor terminal proved: the turn is `unknown`.
+            let quiescent = match evidence {
+                Some(record) => record.cleanup == Cleanup::Quiescent,
+                None => report.failure.is_none(),
             };
+            let forced = evidence.is_some_and(|record| record.forced);
+            let state = if forced || !turn.launched {
+                "cancelled"
+            } else {
+                "unknown"
+            };
+            let (outcome, cleanup) = stop_outcome(quiescent, forced);
             let commit = async {
                 let mut record = turn.record;
                 let cancel = self
                     .settle(&mut record, turn.requested_at, outcome, cleanup)
                     .await;
                 let mut terminal = Terminal {
-                    state: "cancelled",
+                    state,
                     failure: None,
-                    stop_reason: "interrupted",
+                    // C1 §7.6: an unconfirmed stop, like transport loss, is an error.
+                    stop_reason: if state == "cancelled" {
+                        "interrupted"
+                    } else {
+                        "error"
+                    },
                     vendor_stop_reason: None,
                     final_text: String::new(),
                     exit: None,
@@ -882,16 +907,19 @@ impl Engine {
     }
 }
 
-/// C1 §7.4 outcome and §3.5 cleanup of a stop Core ordered: `forced` needs
-/// Host force evidence and proved group absence; otherwise the cancel was only
-/// `requested`, and cleanup is `quiescent` only with proved absence.
+/// C1 §7.4 outcome and §3.5 cleanup of a stop Core ordered, as independent
+/// facts: `forced` needs Host's evidence that its stop found the vendor live,
+/// otherwise the cancel was only `requested`; cleanup is `quiescent` only with
+/// proved group absence.
 fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'static str) {
-    match (quiescent, forced) {
-        (true, true) => ("forced", "quiescent"),
-        (true, false) => ("requested", "quiescent"),
-        (false, _) => ("requested", "uncertain"),
-    }
+    (
+        if forced { "forced" } else { "requested" },
+        if quiescent { "quiescent" } else { "uncertain" },
+    )
 }
+
+/// Part of the final deadline Host shutdown leaves for forced turns' terminals.
+const FORCED_COMMIT_RESERVE: Duration = Duration::from_secs(1);
 
 /// Assembles the C1 §5 envelope; `last_seq` is `turn.ended`, and S1 turns start at seq 1.
 #[expect(
@@ -1191,6 +1219,7 @@ mod tests {
             evidence: None,
             exit: None,
             raw_incomplete,
+            launched: false,
             cleanup: None,
             forced: false,
         })

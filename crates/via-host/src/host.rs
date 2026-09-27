@@ -137,6 +137,28 @@ pub struct OwnedPipes {
     pub stderr: ChildStderr,
 }
 
+/// The vendor pipes of an acquisition from ARM on, owned by its caller.
+#[derive(Default)]
+pub struct LaunchPipes(StdMutex<Option<OwnedPipes>>);
+
+impl LaunchPipes {
+    fn put(&self, pipes: OwnedPipes) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pipes);
+    }
+
+    /// The pipes of an acquisition that sent ARM and did not succeed; `None`
+    /// if ARM was never sent (no vendor could have launched) or it succeeded.
+    pub fn take(&self) -> Option<OwnedPipes> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 /// Confirmed vendor exit updates from Host's separate control path.
 pub type ExitReceiver = watch::Receiver<Option<ExitReport>>;
 
@@ -258,18 +280,20 @@ impl Host {
         spec: PrivateProcessSpec,
         deadline: Deadline,
     ) -> Result<AcquiredProcess, HostError> {
-        self.acquire_marking_arm(spec, deadline, &AtomicBool::new(false))
+        self.acquire_retaining(spec, deadline, &LaunchPipes::default())
             .await
     }
 
-    /// [`Host::acquire`] that sets `armed` just before ARM is sent: from then
-    /// on the vendor may run and write to its pipes, so a caller that abandons
-    /// the acquisition knows vendor output may be lost.
-    pub async fn acquire_marking_arm(
+    /// [`Host::acquire`] that moves the vendor pipes into `launch` just before
+    /// ARM is sent: from then on the vendor may run and write to them, so they
+    /// outlive an acquisition that fails or is abandoned after ARM, and the
+    /// caller can still record that output. A successful acquisition takes
+    /// them back.
+    pub async fn acquire_retaining(
         &self,
         spec: PrivateProcessSpec,
         deadline: Deadline,
-        armed: &AtomicBool,
+        launch: &LaunchPipes,
     ) -> Result<AcquiredProcess, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
@@ -287,7 +311,7 @@ impl Host {
         {
             return Err(HostError::Invalid("reserved vendor marker environment key"));
         }
-        timeout_at(deadline.instant(), self.acquire_inner(spec, armed))
+        timeout_at(deadline.instant(), self.acquire_inner(spec, launch))
             .await
             .map_err(|_| HostError::Deadline)?
     }
@@ -416,7 +440,7 @@ impl Host {
     async fn acquire_inner(
         &self,
         spec: PrivateProcessSpec,
-        armed: &AtomicBool,
+        launch: &LaunchPipes,
     ) -> Result<AcquiredProcess, HostError> {
         let StartedAnchor {
             anchor_id,
@@ -442,7 +466,7 @@ impl Host {
             return Err(HostError::Store("ArmIntent lacks positive commit receipt"));
         };
         // This is the only ARM send for this generation; errors never cause retry.
-        armed.store(true, Ordering::Release);
+        launch.put(pipes);
         let reply = protocol::transact(
             &mut stream,
             &Request::Arm {
@@ -463,6 +487,9 @@ impl Host {
         else {
             return Err(HostError::Store("vendor facts not durably committed"));
         };
+        let pipes = launch
+            .take()
+            .ok_or(HostError::Protocol("launch pipes already taken"))?;
         let stream = Arc::new(Mutex::new(ControlConnection {
             stream,
             reader: protocol::FrameReader::new(1024),

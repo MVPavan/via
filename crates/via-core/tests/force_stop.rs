@@ -16,7 +16,11 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/stand_in_anchor.rs"]
+mod stand_in_anchor;
+
 use serde_json::{Value, json};
+use stand_in_anchor::{AfterArm, wait_flag};
 use via_core::{DaemonStopParams, Deadline, Engine, FakeConfig, SpawnParams, StopMode};
 
 const CHILD: &str = "VIA_FORCE_STOP_CHILD";
@@ -222,50 +226,44 @@ fn force_during_stalled_acquisition_settles_the_turn() {
     });
 }
 
-/// Stand-in anchor that passes Host's identity checks, accepts Configure and
-/// ARM, launches a vendor that writes to the inherited vendor pipes, and then
-/// never confirms the launch, so Host acquisition stalls after ARM. It stops
-/// its vendor and exits when Host closes the connection.
-const STALLED_AFTER_ARM_ANCHOR: &str = r"#!/usr/bin/env python3
-import json, os, socket, subprocess, sys
-bootstrap = json.load(open(sys.argv[2]))
-server = socket.socket(socket.AF_UNIX)
-server.bind(bootstrap['socket_path'])
-server.listen(1)
-connection, _ = server.accept()
-control = connection.makefile('rwb')
-fields = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()
-identity = {
-    'pid': os.getpid(), 'pgid': int(fields[2]), 'uid': os.getuid(),
-    'boot_id': open('/proc/sys/kernel/random/boot_id').read().strip(),
-    'pid_namespace': os.readlink('/proc/self/ns/pid'),
-    'start_ticks': int(fields[19]), 'marker': bootstrap['marker'],
-}
-def send(frame):
-    control.write(json.dumps(frame).encode() + b'\n')
-    control.flush()
-send({'kind': 'ready', 'identity': identity})
-control.readline()
-send({'kind': 'configured'})
-control.readline()
-vendor = subprocess.Popen(['/bin/sh', '-c', 'echo vendor output before launch reply; exec sleep 30'])
-control.readline()
-vendor.kill()
-vendor.wait()
-";
-
-/// W4-H Sol r2: a force that abandons an acquisition after ARM, when the
-/// vendor already wrote output no raw writer owned, must not report a
-/// complete raw log: the turn records `raw_log.incomplete` and warns.
+/// Task 1 Sol high 2 (supersedes W4-H round 3): a force that abandons an
+/// acquisition after ARM, once the vendor wrote output, drains the vendor
+/// pipes Host handed over before ARM: the raw log holds that output and is not
+/// reported incomplete. A vendor launched with neither stop nor terminal
+/// proved leaves the turn `unknown`.
 #[test]
-fn force_after_arm_abandonment_reports_raw_log_incomplete() {
+fn force_after_arm_abandonment_drains_vendor_output() {
+    const LINE: &str = "vendor output before launch reply";
     let Some(root) = env::var_os(CHILD) else {
-        return run_child("force_after_arm_abandonment_reports_raw_log_incomplete");
+        return run_child("force_after_arm_abandonment_drains_vendor_output");
     };
     let root = PathBuf::from(root);
-    let anchor = root.join("stalled-after-arm-anchor");
-    fs::write(&anchor, STALLED_AFTER_ARM_ANCHOR).unwrap();
-    fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+    let (envelope, events) = force_over_stand_in(&root, &AfterArm::Stall { line: LINE }, "wrote");
+    assert_eq!(envelope["state"], "unknown", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+    assert!(!warns(&envelope, "raw_log_incomplete"), "{envelope}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "raw_log.incomplete"),
+        "{events:?}"
+    );
+    let session = envelope["session_id"].as_str().unwrap();
+    let connection = format!("c_{}", session.trim_start_matches("s_"));
+    let raw = fs::read(root.join(format!("state/raw/{connection}.raw"))).unwrap();
+    assert!(
+        raw.windows(LINE.len())
+            .any(|window| window == LINE.as_bytes()),
+        "the vendor's output must be in the raw log"
+    );
+}
+
+/// Runs one turn over a stand-in anchor, forces it once the stand-in set
+/// `barrier`, completes final shutdown and returns the durable envelope and
+/// events.
+fn force_over_stand_in(root: &Path, after_arm: &AfterArm, barrier: &str) -> (Value, Vec<Value>) {
+    let anchor = root.join("stand-in-anchor");
+    after_arm.install(&anchor);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -286,39 +284,76 @@ fn force_after_arm_abandonment_reports_raw_log_incomplete() {
         let (_, session, prompt) = engine.spawn(params).await.unwrap();
         let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
         let (driven, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(8), engine.drive(&session, prompt)),
+            tokio::time::timeout(Duration::from_secs(10), engine.drive(&session, prompt)),
             async {
-                // By then the vendor has launched and written its line.
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                wait_flag(&root.join("runtime"), barrier).await;
                 engine.request_stop(&force).await.unwrap();
             }
         );
-        driven.expect("the forced drive must end").unwrap();
+        assert!(driven.is_ok(), "the forced drive must end");
+        driven.unwrap().unwrap();
         let report = engine
             .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(3),
             ))
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
-        assert_eq!(envelope["state"], "cancelled", "{envelope}");
-        assert!(
-            envelope["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|warning| warning["code"] == "raw_log_incomplete"),
-            "lost vendor output must be reported: {envelope}"
-        );
-        let page = engine.events(&session).await.unwrap();
-        assert!(
-            page["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|event| event["type"] == "raw_log.incomplete"),
-            "{page}"
-        );
-        drop(engine);
-    });
+        let events = engine.events(&session).await.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        (envelope, events)
+    })
+}
+
+fn warns(envelope: &Value, code: &str) -> bool {
+    envelope["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["code"] == code)
+}
+
+/// Task 1 Sol high 1: the anchor proved it stopped a live vendor, but group
+/// absence stays unproved. Outcome and cleanup are independent facts: the
+/// durable result is `cancelled` with `forced` and `uncertain` cleanup.
+#[test]
+fn proved_stop_without_proved_absence_is_forced_uncertain() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("proved_stop_without_proved_absence_is_forced_uncertain");
+    };
+    let after_arm = AfterArm::Serve {
+        stopped_live: true,
+        linger: true,
+    };
+    let (envelope, events) = force_over_stand_in(Path::new(&root), &after_arm, "spawned");
+    assert_eq!(envelope["state"], "cancelled", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "forced", "{envelope}");
+    assert_eq!(envelope["cancel"]["cleanup"], "uncertain", "{envelope}");
+    assert!(warns(&envelope, "cancel_cleanup_uncertain"), "{envelope}");
+    let settled = events
+        .iter()
+        .find(|event| event["type"] == "cancel.settled")
+        .unwrap();
+    assert_eq!(settled["outcome"], "forced", "{settled}");
+}
+
+/// Task 1 Sol high 1: a vendor was launched, but Host proved neither that its
+/// stop found the vendor live nor a vendor terminal. The durable result is
+/// `unknown`, not `cancelled`; the force was only `requested`.
+#[test]
+fn launched_turn_without_proved_stop_is_unknown() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("launched_turn_without_proved_stop_is_unknown");
+    };
+    let after_arm = AfterArm::Serve {
+        stopped_live: false,
+        linger: false,
+    };
+    let (envelope, _) = force_over_stand_in(Path::new(&root), &after_arm, "spawned");
+    assert_eq!(envelope["state"], "unknown", "{envelope}");
+    assert!(envelope["failure"].is_null(), "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+    assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
 }
