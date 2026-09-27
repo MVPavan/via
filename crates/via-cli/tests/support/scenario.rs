@@ -35,6 +35,12 @@ impl ScenarioError {
     }
 }
 
+impl std::fmt::Display for ScenarioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.outcome(), self.detail())
+    }
+}
+
 pub(crate) struct Captured {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,

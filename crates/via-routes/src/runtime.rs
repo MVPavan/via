@@ -138,13 +138,10 @@ impl FakeRoute {
                         .map_err(|_| transport(turn))?;
                     // Terminal is semantic completion, not transport EOF. Drain both pipes
                     // and reject any later stdout frame before accepting the exit.
-                    loop {
-                        let trailing = Box::pin(wire.next_frame(deadline))
-                            .await
-                            .map_err(|_| transport(turn))?;
-                        let Some(trailing) = trailing else {
-                            break;
-                        };
+                    let trailing = Box::pin(wire.next_frame(deadline))
+                        .await
+                        .map_err(|_| transport(turn))?;
+                    if let Some(trailing) = trailing {
                         let _message = FakeMessage::decode(trailing.bytes(), turn)?;
                         return Err(protocol(turn, "fake observation after terminal"));
                     }
