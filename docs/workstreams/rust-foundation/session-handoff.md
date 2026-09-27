@@ -32,6 +32,10 @@ the historical checkpoint; its findings table is updated by this section.
   branches `claude/w4-h-rust-foundation-q1s7w7` (head `ca2eeee`) and
   `claude/w4-i-rust-foundation-ce2rcm` (head `d128aed`).
 - Resume here (paused for an owner restart, 2026-09-27):
+  0. Restore tmux session `via` (lost on reboot): `tmux new-session -d -s
+     via -n main -c <repo>`, then window `watch` running
+     `scratchpad/cloud/watch-branches.sh`. Worker windows are recreated by
+     `launch.sh` / `followup.sh` as needed.
   1. Merge W4-I, then W4-H, into `rust-foundation` (expect conflicts in
      `via-core/src/engine.rs`); run the full gate; push; delete both
      branches.
