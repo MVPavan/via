@@ -7,7 +7,7 @@ use crate::{
     VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
-    FakeRoute, FakeRouteResult, FakeStart, RouteAcceptance, RouteError, TerminalStatus,
+    FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteError, RouteMessage, TerminalStatus,
     WireRecovery,
 };
 
@@ -97,23 +97,21 @@ impl AdapterRuntime {
             .map_err(|_| AdapterError::Unavailable)?;
         let start = FakeStart::new(session_id.as_str().to_owned(), turn, prompt)
             .map_err(|_| AdapterError::Protocol)?;
-        let (route_tx, mut route_rx) = mpsc::channel::<RouteAcceptance>(1);
+        // Full: Route waits for capacity under the turn deadline, so this loop keeps
+        // draining until the route finishes.
+        let (route_tx, mut route_rx) = mpsc::channel::<RouteMessage>(64);
         let route = self
             .route
             .execute(connection_id, process, start, route_tx, deadline);
         tokio::pin!(route);
-        let mut observed = false;
         loop {
             tokio::select! {
-                message = route_rx.recv(), if !observed => {
-                    if let Some(message) = message {
-                        observed = true;
-                        forward_acceptance(message, &acceptance)?;
-                    }
+                Some(message) = route_rx.recv() => {
+                    forward_observation(message, &acceptance)?;
                 }
                 result = &mut route => {
-                    if !observed && let Ok(message) = route_rx.try_recv() {
-                        forward_acceptance(message, &acceptance)?;
+                    while let Ok(message) = route_rx.try_recv() {
+                        forward_observation(message, &acceptance)?;
                     }
                     return result.map(normalize_terminal).map_err(AdapterError::Route);
                 }
@@ -144,13 +142,20 @@ impl AdapterRuntime {
     }
 }
 
-fn forward_acceptance(
-    message: RouteAcceptance,
+/// Forwards acceptance to Core. Core has no path for other observations yet, so they
+/// are dropped here after Route recorded their raw spans; the terminal arrives in the
+/// route result.
+fn forward_observation(
+    message: RouteMessage,
     sender: &mpsc::Sender<FakeAcceptanceObservation>,
 ) -> Result<(), AdapterError> {
+    // Route admits exactly one acceptance per turn.
+    let FakeMessage::Accepted { vendor_turn_id } = message.payload else {
+        return Ok(());
+    };
     let correlation = AcceptanceToken::try_from(1).map_err(|_| AdapterError::Protocol)?;
     let vendor_turn_id =
-        VendorTurnId::try_from(message.vendor_turn_id).map_err(|_| AdapterError::Protocol)?;
+        VendorTurnId::try_from(vendor_turn_id).map_err(|_| AdapterError::Protocol)?;
     sender
         .try_send(FakeAcceptanceObservation {
             correlation,

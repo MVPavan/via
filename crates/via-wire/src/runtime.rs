@@ -228,21 +228,52 @@ impl WireConnection {
                     Ok(None)
                 };
             }
-            let mut out = [0; 8192];
-            let mut err = [0; 8192];
-            tokio::select! {
-                read = timeout_at(deadline.instant(), self.stdout.read(&mut out)), if !self.stdout_eof => {
-                    let count = read.map_err(|_| WireError::Deadline)??;
-                    if count == 0 { self.stdout_eof = true; } else { self.buffered.extend_from_slice(&out[..count]); }
+            Box::pin(self.read_either(deadline, false)).await?;
+        }
+    }
+
+    /// Records every remaining byte of both pipes, unframed, until both reach EOF.
+    /// Used after a failure, when framing no longer decides protocol meaning.
+    pub async fn drain_to_eof(&mut self, deadline: Deadline) -> Result<(), WireError> {
+        self.stdin.take();
+        // An oversized partial frame may exceed the raw unit cap; store it in read-sized units.
+        for chunk in std::mem::take(&mut self.buffered).chunks(8192) {
+            self.raw.append(RawStream::Stdout, chunk.to_vec()).await?;
+        }
+        while !(self.stdout_eof && self.stderr_eof) {
+            Box::pin(self.read_either(deadline, true)).await?;
+        }
+        Ok(())
+    }
+
+    /// Reads one chunk from whichever open pipe is ready; stderr is always raw-logged
+    /// at once, so neither stream waits for the other. At most one 8 KiB chunk is
+    /// staged per call. Reads are cancel-safe, but dropping this future during a raw
+    /// append loses that chunk; Route awaits it to completion or to the deadline.
+    async fn read_either(&mut self, deadline: Deadline, stdout_raw: bool) -> Result<(), WireError> {
+        let mut out = [0; 8192];
+        let mut err = [0; 8192];
+        tokio::select! {
+            read = timeout_at(deadline.instant(), self.stdout.read(&mut out)), if !self.stdout_eof => {
+                let count = read.map_err(|_| WireError::Deadline)??;
+                if count == 0 {
+                    self.stdout_eof = true;
+                } else if stdout_raw {
+                    self.raw.append(RawStream::Stdout, out[..count].to_vec()).await?;
+                } else {
+                    self.buffered.extend_from_slice(&out[..count]);
                 }
-                read = timeout_at(deadline.instant(), self.stderr.read(&mut err)), if !self.stderr_eof => {
-                    let count = read.map_err(|_| WireError::Deadline)??;
-                    if count == 0 { self.stderr_eof = true; } else {
-                        self.raw.append(RawStream::Stderr, err[..count].to_vec()).await?;
-                    }
+            }
+            read = timeout_at(deadline.instant(), self.stderr.read(&mut err)), if !self.stderr_eof => {
+                let count = read.map_err(|_| WireError::Deadline)??;
+                if count == 0 {
+                    self.stderr_eof = true;
+                } else {
+                    self.raw.append(RawStream::Stderr, err[..count].to_vec()).await?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Observes Host-confirmed vendor exit without treating a terminal frame as exit proof.
