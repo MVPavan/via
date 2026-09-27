@@ -512,3 +512,47 @@ the handoff completes.
    enqueues it like any other queued turn, so it runs exactly once. A keyed
    retry after the restart replays the stored receipt and enqueues nothing
    (`enqueued: None`).
+
+## 11. Connection slots (T2-D, runtime §8)
+
+Normative. Runtime §8 sets this bound: "Active private connections: 4
+daemon-wide (one vendor + one anchor each). Queue eligible work; do not
+create a child until a slot is reserved."
+
+- **Pool.** Engine owns one pool of 4 slots, a `tokio::sync::Semaphore`.
+  Unit tests may lower it; raising it is out of scope.
+- **Reservation order.** A dispatcher whose decision is `Run` (§2.2 step 6)
+  reserves a slot before its grant and its submission commit. If the grant
+  is then refused, the slot is released at once. A turn waiting for a slot
+  therefore has no `submitted_at`, launches nothing, stays `queued`, and
+  stays counted in `queued`, `active` and `Unresolved`.
+- **Release.** The slot is an RAII permit held across the grant, the
+  submission commit and `run`. It is released when `run` returns: the
+  turn's connection is closed, including Route's force close for a forced
+  turn, and its terminal outcome is handled (committed, failed and latched,
+  or handed to final shutdown's forced list). It is released on every path,
+  including an early return and a dropped future.
+- **Wakes.** A waiting dispatcher wakes on a slot release (the semaphore
+  hands the permit to the oldest waiter) and on the force signal. The force
+  signal also carries force acceptance and phase one of the Store-failed
+  latch (§3.2). On force or the latch while waiting, the dispatcher gives
+  up the wait and takes the existing queued path: cancelled without
+  submission under force (§2.3), or left `queued` and unresolved under the
+  latch (§3).
+- **Fairness.** Waiters are served FIFO daemon-wide, because the tokio
+  semaphore queues acquirers in order.
+- **Wall deadline.** Waiting for a slot does not count against the turn's
+  wall deadline. The deadline starts at submission (C1 §7.4 and the
+  deadlines in §4 apply to a submitted turn), and a waiting turn has not
+  been submitted.
+- **Drain.** Waiting turns are accepted queued work. A drain waits for them
+  to get a slot and run to their terminal, like any other queued turn
+  (§6).
+- **Lock order.** The slot is acquired with no other lock held: no
+  `admission`, `sessions`, slot-state or head lock. The grant's `stop`
+  mutex is taken after it. No code holds `admission` while waiting for a
+  slot; receipts, the latch finalization and closes never reserve slots.
+  A dispatcher that holds a slot and latches (it then awaits `admission`)
+  therefore cannot deadlock.
+- **Scope.** Two items are recorded on `via-jm4.7.8` (Task 4 bounds): raw
+  staging overflow classification, and Store request-side refusal.
