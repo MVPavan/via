@@ -40,14 +40,15 @@ use journal::{Head, UncertainEvent, Unresolved};
 use queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
 pub use stop::{EngineShutdown, StopMode};
 
-/// A committed receipt and, when this request created the turn, the turn
-/// daemon main must drive. A replayed retry creates nothing to drive.
+/// A committed receipt and, when this request created or adopted the turn,
+/// that turn, now queued with its session's dispatcher. A replayed retry
+/// enqueues nothing.
 #[derive(Debug)]
 pub struct Receipted {
     /// The exact C1 receipt, original or replayed.
     pub receipt: Value,
-    /// The new turn to hand to its drive.
-    pub drive: Option<(SessionId, TurnNumber)>,
+    /// The turn this request enqueued.
+    pub enqueued: Option<(SessionId, TurnNumber)>,
 }
 
 /// One daemon's durable state and opaque vendor runtime.
@@ -70,32 +71,43 @@ pub struct Engine {
     unresolved: Unresolved,
     /// Set once final shutdown committed its last record; nothing commits after.
     finalized: AtomicBool,
-    /// Every session this daemon admitted work for: dispatch gate and event head.
+    /// Sessions with dispatch state: queue, dispatcher and event head. A slot
+    /// is retired when its dispatcher exits with nothing left (design §2).
     sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
-    /// Receipted turns of this daemon not yet out of the queue.
+    /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
-    /// Turns whose receipt commit outcome stayed unknown: possibly committed,
-    /// never registered or driven. A keyed retry that finds one adopts it.
-    orphans: StdMutex<HashSet<(SessionId, TurnNumber)>>,
-    /// Orphans the daemon itself found committed, for daemon main to drive.
-    adopted: mpsc::Sender<(SessionId, TurnNumber)>,
-    /// Daemon main's end of `adopted`, taken once.
-    adoptions: StdMutex<Option<mpsc::Receiver<(SessionId, TurnNumber)>>>,
+    /// Set by Core's first failed or uncertain state write (runtime §7):
+    /// admission and dispatch stop and final shutdown runs in force mode.
+    store_failed: AtomicBool,
+    /// Sessions whose dispatcher daemon main must start.
+    starts: mpsc::Sender<SessionId>,
+    /// Daemon main's end of `starts`, taken once.
+    start_receiver: StdMutex<Option<mpsc::Receiver<SessionId>>>,
+    /// Starts that found `starts` full; daemon main retries them.
+    pending_starts: StdMutex<HashSet<SessionId>>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
 }
 
-/// Receipt-commit faults injected in unit tests.
+/// Store faults and dispatch hooks injected in unit tests.
 #[cfg(test)]
 #[derive(Default)]
 struct Faults {
     /// The next receipt commit succeeds, but its reply reports an unknown outcome.
     receipt_reply_lost: AtomicBool,
-    /// Reads that reconcile an uncertain receipt commit fail.
-    reconcile_unreadable: AtomicBool,
     /// This many dispatch reads of a turn's predecessors fail.
     predecessors_unreadable: AtomicUsize,
+    /// Dispatch reads of predecessors made.
+    reads: AtomicUsize,
+    /// The next submission commit succeeds, but its reply reports an unknown outcome.
+    submission_reply_lost: AtomicBool,
+    /// This many `queued → cancelled` commits fail, writing nothing.
+    cancel_fails: AtomicUsize,
+    /// A granted turn waits for `release` before its submission commit.
+    hold_after_grant: AtomicBool,
+    granted: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -143,6 +155,17 @@ impl Engine {
         fake: FakeConfig,
         binary: PathBuf,
     ) -> Result<Self, String> {
+        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT)
+    }
+
+    /// `open` with the dispatcher-start channel's capacity; unit tests lower it.
+    fn open_with(
+        state: &Path,
+        runtime: &Path,
+        fake: FakeConfig,
+        binary: PathBuf,
+        start_capacity: usize,
+    ) -> Result<Self, String> {
         let owner = Store::open(state).map_err(|error| error.to_string())?;
         let store = owner.client();
         let adapter = AdapterRuntime::new(
@@ -156,7 +179,7 @@ impl Engine {
             owner.runtime_resources(),
         )
         .map_err(|error| error.to_string())?;
-        let (adopted, adoptions) = mpsc::channel(DAEMON_QUEUE_LIMIT);
+        let (starts, start_receiver) = mpsc::channel(start_capacity);
         Ok(Self {
             _store_owner: owner,
             store,
@@ -171,100 +194,51 @@ impl Engine {
             finalized: AtomicBool::new(false),
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
-            orphans: StdMutex::new(HashSet::new()),
-            adopted,
-            adoptions: StdMutex::new(Some(adoptions)),
+            store_failed: AtomicBool::new(false),
+            starts,
+            start_receiver: StdMutex::new(Some(start_receiver)),
+            pending_starts: StdMutex::new(HashSet::new()),
             #[cfg(test)]
             faults: Faults::default(),
         })
     }
 
-    /// Settles a receipt commit that reported failure (C1 §8.1): Ok when Store
-    /// shows the turn committed, so the caller registers and hands it off;
-    /// otherwise `store_error` with `commit_outcome`. An unknown outcome leaves
-    /// the turn an orphan, which its keyed retry or the daemon's own
-    /// reconciliation adopts once Store reads succeed.
-    async fn receipt_outcome(
-        &self,
-        error: &StoreError,
-        session: &SessionId,
-        turn: TurnNumber,
-    ) -> Result<(), ApiError> {
-        if !journal::may_have_committed(error) {
-            return Err(ApiError::RECEIPT_NOT_COMMITTED);
-        }
-        // Admission is held: only this request could have created `turn`.
-        match self.reconcile_read(session).await {
-            Ok(Some(snapshot)) if snapshot.turns >= turn.get() => Ok(()),
-            Ok(_) => Err(ApiError::RECEIPT_NOT_COMMITTED),
-            Err(_) => {
-                lock(&self.orphans).insert((session.clone(), turn));
-                Err(ApiError::RECEIPT_UNKNOWN)
-            }
+    /// A receipt commit that reported failure (C1 §8.1, runtime §7): latches
+    /// Store failure and is `store_error` with `commit_outcome`, `unknown`
+    /// with `retry: same_key_only` when it may have committed. Restart
+    /// recovery settles an unknown one.
+    fn receipt_failed(&self, error: &StoreError) -> ApiError {
+        self.latch();
+        if journal::may_have_committed(error) {
+            ApiError::RECEIPT_UNKNOWN
+        } else {
+            ApiError::RECEIPT_NOT_COMMITTED
         }
     }
 
-    /// The Store read that reconciles an uncertain receipt commit.
-    async fn reconcile_read(
-        &self,
-        session: &SessionId,
-    ) -> Result<Option<SessionSnapshot>, StoreError> {
-        #[cfg(test)]
-        if self.faults.reconcile_unreadable.load(Ordering::Acquire) {
-            return Err(StoreError::Unavailable);
-        }
-        self.store.session_snapshot(session).await
-    }
-
-    /// Reconciles orphans once Store reads succeed, taking admission so no
-    /// receipt of the same number is in flight.
-    pub(super) async fn reconcile_orphans(&self) {
-        if lock(&self.orphans).is_empty() {
+    /// Latches Store failure after Core's first failed or uncertain state
+    /// write (runtime §7): new work and every grant are refused, and the stop
+    /// mode becomes `Force`, so running turns take the forced path and daemon
+    /// main starts final shutdown, which then reports an unclean exit.
+    pub(super) fn latch(&self) {
+        if self.store_failed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _admission = self.admission.lock().await;
-        self.reconcile_orphans_held().await;
+        *lock(&self.stop) = Some(StopMode::Force);
+        self.force_requested_at
+            .get_or_init(|| rfc3339(SystemTime::now()));
+        self.force.send_replace(true);
     }
 
-    /// Reconciles every orphan, keyed or not, against Store while admission is
-    /// held: a committed one is registered and sent to daemon main exactly
-    /// once, one Store shows never committed is forgotten, and one it cannot
-    /// read yet stays. After a stop is accepted nothing more is adopted.
-    async fn reconcile_orphans_held(&self) {
-        if lock(&self.stop).is_some() {
-            return;
-        }
-        let orphans: Vec<_> = lock(&self.orphans).iter().cloned().collect();
-        for (session, turn) in orphans {
-            match self.reconcile_read(&session).await {
-                Ok(Some(snapshot)) if snapshot.turns >= turn.get() => {
-                    // Capacity first: a full channel leaves the orphan for a later pass.
-                    let Ok(permit) = self.adopted.try_reserve() else {
-                        continue;
-                    };
-                    if let Some(drive) = self.adopt(&session, turn) {
-                        permit.send(drive);
-                    }
-                }
-                Ok(_) => {
-                    lock(&self.orphans).remove(&(session, turn));
-                }
-                Err(_) => {}
-            }
-        }
+    /// Whether Store failure is latched.
+    pub fn store_failed(&self) -> bool {
+        self.store_failed.load(Ordering::Acquire)
     }
 
-    /// Registers an orphan found committed, by its keyed retry or the
-    /// daemon's reconciliation, so that it is handed off exactly once.
-    fn adopt(&self, session: &SessionId, turn: TurnNumber) -> Option<(SessionId, TurnNumber)> {
-        if !lock(&self.orphans).remove(&(session.clone(), turn)) {
-            return None;
-        }
-        lock(&self.sessions)
-            .entry(session.clone())
-            .or_insert_with(|| Slot::new(Head::new(None), turn.get() - 1));
-        self.receipted(session, turn);
-        Some((session.clone(), turn))
+    /// Wakes when a force stop is accepted or Store failure latches; daemon
+    /// main then starts final shutdown in the mode `stop_mode` reports.
+    pub fn force_signal(&self) -> watch::Receiver<bool> {
+        self.force.subscribe()
     }
 
     /// A receipt commit's reply, lost by the test fault backend when armed.
@@ -280,27 +254,67 @@ impl Engine {
         reply
     }
 
-    /// The dispatch slot of a session this daemon admitted work for.
+    /// The dispatch slot of a session with dispatch state.
     fn slot(&self, session: &SessionId) -> Option<Arc<Slot>> {
         lock(&self.sessions).get(session).cloned()
     }
 
-    /// Records a receipted turn: tracked until durable, driven, and queued.
-    fn receipted(&self, session: &SessionId, turn: TurnNumber) {
-        // A number reused after an uncommitted unknown receipt is this turn's.
-        lock(&self.orphans).remove(&(session.clone(), turn));
+    /// Records a receipted turn under admission: tracked until durable,
+    /// counted active and queued, and enqueued with its dispatcher.
+    fn receipted(&self, session: &SessionId, turn: TurnNumber, slot: &Slot) {
         self.unresolved.receipt(session, turn);
         self.active.fetch_add(1, Ordering::AcqRel);
         self.queued.fetch_add(1, Ordering::AcqRel);
+        if slot.enqueue(turn) {
+            self.request_start(session.clone());
+        }
     }
 
-    /// Daemon main's receiver of turns the daemon adopted itself after an
-    /// unknown receipt outcome; each must be driven like a handed-off turn.
-    pub fn take_adoptions(&self) -> Option<mpsc::Receiver<(SessionId, TurnNumber)>> {
-        lock(&self.adoptions).take()
+    /// Asks daemon main to start the session's dispatcher; a full channel
+    /// leaves the start pending for daemon main's retry (design §5).
+    fn request_start(&self, session: SessionId) {
+        let mut pending = lock(&self.pending_starts);
+        if let Err(mpsc::error::TrySendError::Full(session)) = self.starts.try_send(session) {
+            pending.insert(session);
+        }
     }
 
-    /// Returns the number of receipted turns still being driven.
+    /// Moves pending starts into the channel while it has capacity. Daemon
+    /// main calls it after each start it takes and in final shutdown.
+    pub fn retry_starts(&self) {
+        let mut pending = lock(&self.pending_starts);
+        let waiting: Vec<SessionId> = pending.iter().cloned().collect();
+        for session in waiting {
+            if self.starts.try_send(session.clone()).is_err() {
+                break;
+            }
+            pending.remove(&session);
+        }
+    }
+
+    /// Whether a start still waits for channel capacity.
+    pub fn starts_pending(&self) -> bool {
+        !lock(&self.pending_starts).is_empty()
+    }
+
+    /// Daemon main's receiver of sessions whose dispatcher it must start.
+    pub fn take_starts(&self) -> Option<mpsc::Receiver<SessionId>> {
+        lock(&self.start_receiver).take()
+    }
+
+    /// Removes an idle, unleased slot; the caller holds admission, so no
+    /// receipt commit is using it.
+    fn retire(&self, session: &SessionId) {
+        let mut sessions = lock(&self.sessions);
+        if sessions
+            .get(session)
+            .is_some_and(|slot| slot.idle() && slot.unleased())
+        {
+            sessions.remove(session);
+        }
+    }
+
+    /// Returns the number of receipted turns not yet settled.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -316,6 +330,10 @@ impl Engine {
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
         let _admission = self.admission.lock().await;
+        // Runtime §7: no new mutation, not even a keyed replay, after a failed write.
+        if self.store_failed() {
+            return Err(ApiError::STORE);
+        }
         let hash = hash_handle(&params.handle)?;
         let key = match retry_key(params.idempotency_key.as_deref())? {
             Some(key) => {
@@ -327,10 +345,9 @@ impl Engine {
                     .map_err(|_| ApiError::STORE)?
                 {
                     return if stored.identity == identity {
-                        let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
                         Ok(Receipted {
                             receipt: stored.receipt,
-                            drive: self.adopt(&stored.session_id, turn),
+                            enqueued: None,
                         })
                     } else {
                         Err(ApiError::IDEMPOTENCY_CONFLICT)
@@ -343,7 +360,6 @@ impl Engine {
             }
             None => None,
         };
-        self.reconcile_orphans_held().await;
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -396,18 +412,15 @@ impl Engine {
                 key,
             )
             .await;
-        let head = match self.receipt_reply(stored) {
-            Ok(_) => Head::new(Some(2)),
-            Err(error) => {
-                self.receipt_outcome(&error, &session, turn).await?;
-                Head::new(None)
-            }
-        };
-        lock(&self.sessions).insert(session.clone(), Slot::new(head, 0));
-        self.receipted(&session, turn);
+        if let Err(error) = self.receipt_reply(stored) {
+            return Err(self.receipt_failed(&error));
+        }
+        let slot = Slot::new(Head::new(Some(2)));
+        lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
+        self.receipted(&session, turn, &slot);
         Ok(Receipted {
             receipt,
-            drive: Some((session, turn)),
+            enqueued: Some((session, turn)),
         })
     }
 
@@ -419,6 +432,9 @@ impl Engine {
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
         let _admission = self.admission.lock().await;
+        if self.store_failed() {
+            return Err(ApiError::STORE);
+        }
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.op_key.as_deref())?;
         if params.prompt.is_empty() {
@@ -449,13 +465,8 @@ impl Engine {
                     .map_err(|_| ApiError::STORE)?;
                 if let Some(stored) = stored {
                     return if stored.identity == identity {
-                        let turn = stored.result["turn"]
-                            .as_str()
-                            .and_then(|address| parse_address(address).ok())
-                            .and_then(|(_, turn)| turn)
-                            .ok_or(ApiError::STORE)?;
                         Ok(Receipted {
-                            drive: self.adopt(&session, turn),
+                            enqueued: None,
                             receipt: stored.result,
                         })
                     } else {
@@ -469,7 +480,6 @@ impl Engine {
         if snapshot.closed {
             return Err(ApiError::SESSION_CLOSED);
         }
-        self.reconcile_orphans_held().await;
         if lock(&self.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -494,7 +504,7 @@ impl Engine {
         operation: Option<(String, Vec<u8>)>,
     ) -> Result<Receipted, ApiError> {
         let turn = TurnNumber::try_from(snapshot.turns + 1).map_err(|_| ApiError::STORE)?;
-        let slot = self.slot_for(&session, snapshot);
+        let slot = self.slot_for(&session);
         let receipt = TurnReceipt {
             turn: format!("{}/{}", session.as_str(), turn.get()),
             state: "queued",
@@ -540,36 +550,37 @@ impl Engine {
             Err(error) => {
                 if journal::may_have_committed(&error) {
                     head.lost();
+                } else {
+                    drop(head);
                 }
-                if let Err(refused) = self.receipt_outcome(&error, &session, turn).await {
-                    // Possibly committed but not driven: later turns must not wait for it.
-                    if refused.commit_outcome == Some(crate::api::ReceiptOutcome::Unknown) {
-                        slot.finish(turn);
-                    }
-                    return Err(refused);
-                }
+                // A slot this request created holds nothing: retire it.
+                drop(slot);
+                self.retire(&session);
+                return Err(self.receipt_failed(&error));
             }
         }
-        self.receipted(&session, turn);
+        self.receipted(&session, turn, &slot);
         Ok(Receipted {
             receipt,
-            drive: Some((session, turn)),
+            enqueued: Some((session, turn)),
         })
     }
 
-    /// The session's dispatch slot, created for a session no drive of this
-    /// daemon has touched. Its earlier turns have no drive here; whether a new
-    /// turn may run behind them is decided from their durable state.
-    fn slot_for(&self, session: &SessionId, snapshot: &SessionSnapshot) -> Arc<Slot> {
+    /// The session's dispatch slot, created when it has none. Whether a new
+    /// turn may run behind earlier ones is decided from their durable state.
+    fn slot_for(&self, session: &SessionId) -> Arc<Slot> {
         Arc::clone(
             lock(&self.sessions)
                 .entry(session.clone())
-                .or_insert_with(|| Slot::new(Head::new(None), snapshot.turns)),
+                .or_insert_with(|| Slot::new(Head::new(None))),
         )
     }
 
     /// Authenticates before reporting fake's unsupported mutation capability.
     pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
+        if self.store_failed() {
+            return Err(ApiError::STORE);
+        }
         let hash = hash_handle(&params.handle)?;
         if !self
             .store

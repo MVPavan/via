@@ -50,6 +50,10 @@ pub struct EngineShutdown {
     pub uncommitted_turns: usize,
     /// Receipted turns with no durable terminal record at final shutdown.
     pub unresolved_turns: usize,
+    /// A state write failed or was uncertain (runtime §7).
+    pub store_failed: bool,
+    /// Sessions whose dispatcher was requested but never ran.
+    pub unstarted_dispatchers: usize,
 }
 
 impl EngineShutdown {
@@ -61,6 +65,8 @@ impl EngineShutdown {
             && self.failure.is_none()
             && self.uncommitted_turns == 0
             && self.unresolved_turns == 0
+            && !self.store_failed
+            && self.unstarted_dispatchers == 0
     }
 }
 
@@ -74,7 +80,6 @@ impl Engine {
             return Err(ApiError::INVALID_PARAMS);
         }
         let _admission = self.admission.lock().await;
-        let mut stop = lock(&self.stop);
         let requested = if params.force {
             StopMode::Force
         } else if params.drain {
@@ -82,14 +87,21 @@ impl Engine {
         } else {
             StopMode::Idle
         };
-        let mode = match *stop {
-            Some(current) if requested != StopMode::Force => current,
-            None if requested == StopMode::Idle && self.active() > 0 => {
-                return Err(ApiError::SESSIONS_ACTIVE);
-            }
-            _ => requested,
+        let mode = {
+            let mut stop = lock(&self.stop);
+            // `active` counts orphans and turns whose commits failed, so an
+            // idle stop cannot skip them.
+            let mode = match *stop {
+                Some(current) if requested != StopMode::Force => current,
+                None if requested == StopMode::Idle && self.active() > 0 => {
+                    return Err(ApiError::SESSIONS_ACTIVE);
+                }
+                _ => requested,
+            };
+            *stop = Some(mode);
+            mode
         };
-        *stop = Some(mode);
+        // `stop` is released first: dispatchers and the reconciler wake on the watch.
         if mode == StopMode::Force {
             self.force_requested_at
                 .get_or_init(|| rfc3339(SystemTime::now()));
@@ -190,7 +202,12 @@ impl Engine {
                     // cancellation must not present it as a complete record.
                     terminal.fail(FailureClass::Store, "a turn event could not be recorded");
                 }
-                self.finish(&turn.started, record, terminal, true).await
+                // C1 §3.14: close only once every other turn of the session
+                // has a durable disposition.
+                let close = !self
+                    .unresolved
+                    .others(&turn.started.session, turn.started.turn);
+                self.finish(&turn.started, record, terminal, close).await
             };
             if !matches!(
                 tokio::time::timeout_at(deadline.instant(), commit).await,
@@ -200,6 +217,10 @@ impl Engine {
             }
         }
         let unresolved_turns = self.unresolved_turns(deadline).await;
+        let unstarted_dispatchers = lock(&self.sessions)
+            .values()
+            .filter(|slot| slot.starting())
+            .count();
         self.finalized.store(true, Ordering::Release);
         EngineShutdown {
             anchors: report.recovery.len(),
@@ -213,6 +234,8 @@ impl Engine {
             failure: report.failure,
             uncommitted_turns,
             unresolved_turns,
+            store_failed: self.store_failed(),
+            unstarted_dispatchers,
         }
     }
 

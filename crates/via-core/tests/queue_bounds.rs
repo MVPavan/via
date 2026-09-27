@@ -91,14 +91,14 @@ fn daemon_wide_queued_turns_are_bounded_as_admission_refused() {
         let mut sessions = Vec::new();
         for _ in 0..127 {
             let receipted = engine.spawn(spawn_params(), "{}").await.unwrap();
-            sessions.push(receipted.drive.unwrap().0);
+            sessions.push(receipted.enqueued.unwrap().0);
         }
         let keyed =
             json!({"session":sessions[0].as_str(),"handle":HANDLE,"prompt":"q","op_key":"k"});
         let (params, raw) = resume(&keyed);
         let accepted = engine.resume(params, &raw).await.unwrap();
         assert!(
-            accepted.drive.is_some(),
+            accepted.enqueued.is_some(),
             "the 128th queued turn is admitted"
         );
         let refused = engine.spawn(spawn_params(), "{}").await.unwrap_err();
@@ -113,7 +113,7 @@ fn daemon_wide_queued_turns_are_bounded_as_admission_refused() {
         // Replay precedes admission: the keyed retry returns the original receipt.
         let (params, raw) = resume(&keyed);
         let replayed = engine.resume(params, &raw).await.unwrap();
-        assert!(replayed.drive.is_none(), "a replay creates no turn");
+        assert!(replayed.enqueued.is_none(), "a replay creates no turn");
         assert_eq!(replayed.receipt, accepted.receipt);
     });
 }

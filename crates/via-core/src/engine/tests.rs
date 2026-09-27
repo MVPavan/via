@@ -1,6 +1,7 @@
-//! Receipt reconciliation and dispatch eligibility through the Engine over a
-//! real Store, with the in-process fault backend. Each case re-executes this
-//! binary with fake settings, since Core reads them once from the environment.
+//! Per-session dispatch, the Store-failed latch and force stop through the
+//! Engine over a real Store, with the in-process fault backend. Each case
+//! re-executes this binary with fake settings, since Core reads them once
+//! from the environment.
 
 use std::{
     env, fs,
@@ -16,7 +17,10 @@ use via_store::{SubmissionRecord, TerminalRecord};
 
 use super::{Engine, Receipted};
 use crate::api::{Event, EventBody, rfc3339};
-use crate::{ApiError, FakeConfig, ResumeParams, SessionId, SpawnParams, TurnNumber};
+use crate::{
+    ApiError, DaemonStopParams, Deadline, FakeConfig, ResumeParams, SessionId, SpawnParams,
+    TurnNumber,
+};
 
 const CHILD: &str = "VIA_ENGINE_TEST_CHILD";
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -64,11 +68,16 @@ fn run(body: impl Future<Output = ()>) {
 }
 
 fn open(root: &Path) -> Engine {
-    Engine::open(
+    open_with(root, super::DAEMON_QUEUE_LIMIT)
+}
+
+fn open_with(root: &Path, start_capacity: usize) -> Engine {
+    Engine::open_with(
         &root.join("state"),
         &root.join("runtime"),
         FakeConfig::from_environment().unwrap(),
         root.join("absent-anchor"),
+        start_capacity,
     )
     .unwrap()
 }
@@ -105,137 +114,127 @@ async fn resume(engine: &Engine, session: &SessionId, key: Option<&str>) -> Rece
     engine.resume(params, &raw).await.unwrap()
 }
 
+async fn new_session(engine: &Engine) -> SessionId {
+    spawn(engine, None).await.unwrap().enqueued.unwrap().0
+}
+
 fn unknown_outcome() -> Value {
     json!({"kind":"store_error","commit_outcome":"unknown","retry":"same_key_only"})
+}
+
+fn force() -> DaemonStopParams {
+    serde_json::from_value(json!({"force":true})).unwrap()
+}
+
+async fn shutdown(engine: &Engine) -> super::EngineShutdown {
+    engine
+        .shutdown(Deadline::at(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ))
+        .await
+}
+
+/// Runs the session's dispatcher until it returns.
+async fn dispatch(engine: &Engine, session: &SessionId) {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.dispatcher(session.clone()),
+    )
+    .await
+    .expect("the dispatcher returns")
+    .unwrap();
+}
+
+/// The session's durable event types, checking that sequences are dense.
+async fn event_types(engine: &Engine, session: &SessionId) -> Vec<String> {
+    let page = engine.events(session.as_str()).await.unwrap();
+    let events = page["events"].as_array().unwrap();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["seq"], json!(index + 1), "dense seq: {page}");
+    }
+    events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn turn(n: u32) -> TurnNumber {
     TurnNumber::try_from(n).unwrap()
 }
 
-/// Blocker 1: SQLite committed the spawn but its reply was lost. Core
-/// reconciles against Store, registers the turn and hands it off once; a keyed
-/// retry replays the receipt and creates nothing more to drive.
+/// Runtime §7, C1 §8.1: a receipt commit whose outcome is unknown is
+/// `store_error` with `commit_outcome: unknown` and `retry: same_key_only`
+/// and latches Store failure: no new spawn, keyed retry or resume is
+/// admitted, and final shutdown is unclean (exit 4). T2-B instead read the
+/// Store back and returned the receipt.
 #[test]
-fn a_committed_spawn_whose_reply_is_lost_is_handed_off_once() {
-    let Some(root) = child("a_committed_spawn_whose_reply_is_lost_is_handed_off_once") else {
+fn an_uncertain_receipt_commit_latches_store_failure() {
+    let Some(root) = child("an_uncertain_receipt_commit_latches_store_failure") else {
         return;
     };
     run(async {
         let engine = open(&root);
+        let session = new_session(&engine).await;
         engine
             .faults
             .receipt_reply_lost
-            .store(true, Ordering::Release);
-        let first = spawn(&engine, Some("k-1")).await.unwrap();
-        let (session, number) = first.drive.clone().expect("the committed turn is driven");
-        assert_eq!(number, turn(1));
-        assert_eq!(engine.active(), 1, "registered exactly once");
-        let retry = spawn(&engine, Some("k-1")).await.unwrap();
-        assert!(retry.drive.is_none(), "a replay creates no second drive");
-        assert_eq!(retry.receipt, first.receipt);
-        assert_eq!(engine.active(), 1);
-        assert_eq!(first.receipt["session_id"], session.as_str());
-    });
-}
-
-/// Blocker 1 for `resume`: the committed turn is registered and handed off
-/// once, and the session's event head stays dense for the next writer.
-#[test]
-fn a_committed_resume_whose_reply_is_lost_is_handed_off_once() {
-    let Some(root) = child("a_committed_resume_whose_reply_is_lost_is_handed_off_once") else {
-        return;
-    };
-    run(async {
-        let engine = open(&root);
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
-        engine
-            .faults
-            .receipt_reply_lost
-            .store(true, Ordering::Release);
-        let first = resume(&engine, &session, Some("r-1")).await;
-        assert_eq!(first.drive, Some((session.clone(), turn(2))));
-        assert_eq!(engine.active(), 2);
-        let retry = resume(&engine, &session, Some("r-1")).await;
-        assert!(retry.drive.is_none());
-        assert_eq!(retry.receipt, first.receipt);
-        let third = resume(&engine, &session, None).await;
-        assert_eq!(third.drive, Some((session.clone(), turn(3))));
-        let events = engine.events(session.as_str()).await.unwrap();
-        let seqs: Vec<_> = events["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|event| event["seq"].as_u64().unwrap())
-            .collect();
-        assert_eq!(seqs, [1, 2, 3]);
-    });
-}
-
-/// Blocker 1, outcome unknown: the reply was lost and Store cannot be read.
-/// The request is C1 §8.1 `store_error` with `commit_outcome: unknown` and
-/// `retry: same_key_only`; the keyed retry then adopts the committed turn and
-/// hands it off exactly once.
-#[test]
-fn an_unknown_receipt_outcome_is_store_error_and_its_keyed_retry_adopts_it_once() {
-    let Some(root) =
-        child("an_unknown_receipt_outcome_is_store_error_and_its_keyed_retry_adopts_it_once")
-    else {
-        return;
-    };
-    run(async {
-        let engine = open(&root);
-        engine
-            .faults
-            .receipt_reply_lost
-            .store(true, Ordering::Release);
-        engine
-            .faults
-            .reconcile_unreadable
             .store(true, Ordering::Release);
         let error = spawn(&engine, Some("k-1")).await.unwrap_err();
         assert_eq!((error.code, error.data()), (-32018, unknown_outcome()));
-        engine
-            .faults
-            .reconcile_unreadable
-            .store(false, Ordering::Release);
-        let adopted = spawn(&engine, Some("k-1")).await.unwrap();
-        let (session, _) = adopted
-            .drive
-            .expect("the retry hands off the committed turn");
-        assert!(spawn(&engine, Some("k-1")).await.unwrap().drive.is_none());
+        assert!(engine.store_failed(), "the uncertain commit latched");
+        for refused in [
+            spawn(&engine, None).await.unwrap_err(),
+            spawn(&engine, Some("k-1")).await.unwrap_err(),
+            {
+                let (params, raw) = resume_raw(&session, None);
+                engine.resume(params, &raw).await.unwrap_err()
+            },
+        ] {
+            assert_eq!(refused.kind, "store_error");
+            assert_eq!(refused.data(), json!({"kind":"store_error"}));
+        }
+        // Nothing is written after a failed write: turn 1 stays queued and
+        // unresolved rather than being cancelled.
+        dispatch(&engine, &session).await;
+        assert_eq!(event_types(&engine, &session).await, ["turn.queued"]);
+        let report = shutdown(&engine).await;
+        assert!(report.store_failed && !report.is_clean(), "{report:?}");
+        assert!(report.unresolved_turns >= 1, "{report:?}");
+    });
+}
 
+/// Runtime §7 for `resume`: a lost reply is `store_error` with
+/// `commit_outcome: unknown` and latches; T2-B read it back and succeeded.
+#[test]
+fn an_uncertain_resume_commit_latches_store_failure() {
+    let Some(root) = child("an_uncertain_resume_commit_latches_store_failure") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
         engine
             .faults
             .receipt_reply_lost
-            .store(true, Ordering::Release);
-        engine
-            .faults
-            .reconcile_unreadable
             .store(true, Ordering::Release);
         let (params, raw) = resume_raw(&session, Some("r-1"));
         let error = engine.resume(params, &raw).await.unwrap_err();
         assert_eq!(error.data(), unknown_outcome());
-        engine
-            .faults
-            .reconcile_unreadable
-            .store(false, Ordering::Release);
-        let adopted = resume(&engine, &session, Some("r-1")).await;
-        assert_eq!(adopted.drive, Some((session.clone(), turn(2))));
-        assert!(resume(&engine, &session, Some("r-1")).await.drive.is_none());
-        assert_eq!(engine.active(), 2, "each committed turn is registered once");
+        assert!(engine.store_failed());
+        let (params, raw) = resume_raw(&session, Some("r-1"));
+        assert_eq!(
+            engine.resume(params, &raw).await.unwrap_err().kind,
+            "store_error",
+            "a keyed retry in the same daemon gets store_error"
+        );
+        assert!(!shutdown(&engine).await.is_clean());
     });
 }
 
-/// Commits turn 1's submission and `state` terminal directly, then ends its
-/// drive without a clean disposition, as a drive whose terminal commit could
-/// not be confirmed does.
-async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>) {
-    end_turn(engine, session, 1, state).await;
-}
-
-/// `end_turn_one` for turn `n`; `pending` is a cancelled terminal whose
-/// cleanup is still pending.
+/// Commits turn `n`'s submission and, with `state`, its terminal directly,
+/// and takes it out of the dispatcher's queue as a finished drive would;
+/// `pending` is a cancelled terminal whose cleanup is still pending. Without
+/// `state` the turn stays running in Store with no owner in this daemon.
 async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&str>) {
     let at = rfc3339(std::time::SystemTime::now());
     let slot = engine.slot(session).unwrap();
@@ -292,21 +291,21 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
             .await
             .unwrap();
         count = 2;
+        engine.unresolved.resolve(session, turn(n));
     }
     head.committed(count);
+    slot.pop(turn(n));
     engine.queued.fetch_sub(1, Ordering::AcqRel);
     engine.active.fetch_sub(1, Ordering::AcqRel);
-    drop(super::queue::Finish::new(&slot, turn(n)));
 }
 
+async fn end_turn_one(engine: &Engine, session: &SessionId, state: Option<&str>) {
+    end_turn(engine, session, 1, state).await;
+}
+
+/// Runs the dispatcher and reports whether turn `n` was submitted.
 async fn submitted(engine: &Engine, session: &SessionId, n: u32) -> bool {
-    let envelope = tokio::time::timeout(
-        Duration::from_secs(20),
-        engine.drive(session.clone(), turn(n)),
-    )
-    .await
-    .expect("a drive ends");
-    let _ = envelope;
+    dispatch(engine, session).await;
     let result = engine
         .result(&format!("{}/{n}", session.as_str()))
         .await
@@ -314,7 +313,7 @@ async fn submitted(engine: &Engine, session: &SessionId, n: u32) -> bool {
     !result["timestamps"]["submitted_at"].is_null()
 }
 
-/// Item 4: dispatch follows the durable predecessor, not how its drive ended.
+/// Dispatch follows the durable predecessor, not how its drive ended.
 /// Behind a durable, settled terminal whose drive ended uncleanly, both a turn
 /// queued before it ended and a later resume run. (A dispatched turn here
 /// ends `unknown`, since no anchor exists, so each case uses turn 2.)
@@ -326,7 +325,7 @@ fn a_turn_behind_a_settled_terminal_runs_however_its_drive_ended() {
     run(async {
         let engine = open(&root);
         // Turn 2 queued while turn 1 ran.
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        let session = new_session(&engine).await;
         resume(&engine, &session, None).await;
         end_turn_one(&engine, &session, Some("failed")).await;
         assert!(
@@ -334,10 +333,11 @@ fn a_turn_behind_a_settled_terminal_runs_however_its_drive_ended() {
             "the queued turn runs"
         );
         // A later resume, accepted after turn 1's unclean drive ended.
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        let session = new_session(&engine).await;
         end_turn_one(&engine, &session, Some("failed")).await;
         resume(&engine, &session, None).await;
         assert!(submitted(&engine, &session, 2).await, "a later resume runs");
+        assert!(!engine.store_failed());
     });
 }
 
@@ -353,61 +353,19 @@ fn successors_are_cancelled_behind_an_unknown_or_cleanup_pending_predecessor() {
     run(async {
         let engine = open(&root);
         for state in [Some("unknown"), Some("pending")] {
-            let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+            let session = new_session(&engine).await;
             resume(&engine, &session, None).await;
             end_turn_one(&engine, &session, state).await;
             assert!(!submitted(&engine, &session, 2).await, "{state:?}");
             resume(&engine, &session, None).await;
             assert!(!submitted(&engine, &session, 3).await, "{state:?}");
         }
-    });
-}
-
-/// Round 3 blocker 1: a successor that starts while its predecessor is an
-/// orphan (committed, reply lost, outcome unknown) waits rather than cancel;
-/// once the keyed retry adopts and runs the predecessor, the successor runs.
-#[test]
-fn a_successor_waits_for_an_orphan_predecessor_to_be_adopted_then_runs() {
-    let Some(root) = child("a_successor_waits_for_an_orphan_predecessor_to_be_adopted_then_runs")
-    else {
-        return;
-    };
-    run(async {
-        let engine = open(&root);
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
-        end_turn_one(&engine, &session, Some("failed")).await;
-        engine
-            .faults
-            .receipt_reply_lost
-            .store(true, Ordering::Release);
-        engine
-            .faults
-            .reconcile_unreadable
-            .store(true, Ordering::Release);
-        let (params, raw) = resume_raw(&session, Some("r-2"));
-        assert_eq!(
-            engine.resume(params, &raw).await.unwrap_err().data(),
-            unknown_outcome()
-        );
-        let third = resume(&engine, &session, None).await;
-        assert_eq!(third.drive, Some((session.clone(), turn(3))));
-        let address = format!("{}/3", session.as_str());
-        let (ran, ()) = tokio::join!(submitted(&engine, &session, 3), async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let pending = engine.result(&address).await.unwrap_err();
-            assert_eq!(pending.kind, "turn_not_finished", "turn 3 stays queued");
-            // Reconciliation still fails, so only this keyed retry can adopt
-            // turn 2, which then runs and settles.
-            let adopted = resume(&engine, &session, Some("r-2")).await;
-            assert_eq!(adopted.drive, Some((session.clone(), turn(2))));
-            end_turn(&engine, &session, 2, Some("failed")).await;
-        });
-        assert!(ran, "turn 3 submits after its adopted predecessor");
+        assert_eq!(engine.active(), 0);
     });
 }
 
 /// Round 3 blocker 2: a failed predecessor read leaves the turn queued; the
-/// decision is retried and the turn later runs.
+/// decision is retried on the read timer and the turn later runs.
 #[test]
 fn a_failed_predecessor_read_waits_and_the_turn_later_runs() {
     let Some(root) = child("a_failed_predecessor_read_waits_and_the_turn_later_runs") else {
@@ -415,7 +373,7 @@ fn a_failed_predecessor_read_waits_and_the_turn_later_runs() {
     };
     run(async {
         let engine = open(&root);
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        let session = new_session(&engine).await;
         resume(&engine, &session, None).await;
         end_turn_one(&engine, &session, Some("failed")).await;
         engine
@@ -433,46 +391,283 @@ fn a_failed_predecessor_read_waits_and_the_turn_later_runs() {
                 .load(Ordering::Acquire),
             0
         );
+        assert!(!engine.store_failed(), "a read failure never latches");
     });
 }
 
-/// Round 3 blocker 3: an unkeyed receipt that committed but whose reply was
-/// lost, with reconciliation reads failing for a while, is still reconciled by
-/// the daemon itself and handed off exactly once.
+/// Runtime §7: a submission commit whose outcome is unknown after the grant
+/// latches Store failure; the turn is never retried and no vendor launches.
+/// T2-B recorded the turn failed and kept admitting new work.
 #[test]
-fn an_unkeyed_committed_receipt_is_reconciled_and_handed_off_once() {
-    let Some(root) = child("an_unkeyed_committed_receipt_is_reconciled_and_handed_off_once") else {
+fn a_failed_submission_commit_latches_and_launches_nothing() {
+    let Some(root) = child("a_failed_submission_commit_latches_and_launches_nothing") else {
         return;
     };
     run(async {
         let engine = open(&root);
-        let mut adoptions = engine.take_adoptions().unwrap();
-        let (session, _) = spawn(&engine, None).await.unwrap().drive.unwrap();
+        let session = new_session(&engine).await;
         engine
             .faults
-            .receipt_reply_lost
+            .submission_reply_lost
             .store(true, Ordering::Release);
-        engine
-            .faults
-            .reconcile_unreadable
-            .store(true, Ordering::Release);
-        let (params, raw) = resume_raw(&session, None);
+        dispatch(&engine, &session).await;
+        assert!(engine.store_failed(), "the uncertain submission latched");
+        assert_eq!(engine.stop_mode(), Some(super::StopMode::Force));
         assert_eq!(
-            engine.resume(params, &raw).await.unwrap_err().data(),
-            unknown_outcome()
+            spawn(&engine, None).await.unwrap_err().kind,
+            "store_error",
+            "admission stopped"
         );
-        // Still unreadable: the next admission reconciles nothing.
-        spawn(&engine, None).await.unwrap();
-        assert!(adoptions.try_recv().is_err());
+        // The commit did land, but nothing followed it.
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.submitted"]
+        );
+        let read = engine
+            .result(&format!("{}/1", session.as_str()))
+            .await
+            .unwrap_err();
+        assert_eq!(read.kind, "store_error");
+        let report = shutdown(&engine).await;
+        assert_eq!(report.anchors, 0, "no vendor launched: {report:?}");
+        assert!(report.store_failed && !report.is_clean(), "{report:?}");
+    });
+}
+
+/// C1 §3.14 force before the grant, on a queued-only session: every queued
+/// turn is cancelled without submission and `session.closed` commits with
+/// the last one; the shutdown is clean. T2-B submitted turn 1 after force.
+#[test]
+fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
+    let Some(root) = child("force_on_a_queued_only_session_cancels_its_turns_and_closes_it")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        resume(&engine, &session, None).await;
+        assert_eq!(
+            engine.request_stop(&force()).await.unwrap(),
+            super::StopMode::Force
+        );
+        dispatch(&engine, &session).await;
+        assert_eq!(
+            event_types(&engine, &session).await,
+            [
+                "turn.queued",
+                "turn.queued",
+                "turn.queued",
+                "turn.ended",
+                "turn.ended",
+                "turn.ended",
+                "session.closed",
+            ]
+        );
+        let page = engine.events(session.as_str()).await.unwrap();
+        assert_eq!(page["events"][6]["reason"], "daemon_stop_force");
+        for n in 1..=3 {
+            let envelope = engine
+                .result(&format!("{}/{n}", session.as_str()))
+                .await
+                .unwrap();
+            assert_eq!(envelope["state"], "cancelled", "{envelope}");
+            assert!(envelope["timestamps"]["submitted_at"].is_null());
+        }
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.anchors, 0);
+    });
+}
+
+/// Design §4, grant before force: the granted turn is submitted, then the
+/// already-latched force reaches Route before any launch; the turn ends under
+/// the C1 §7.6 force row (`cancelled`, `requested`) and the session closes.
+#[test]
+fn a_turn_granted_before_force_submits_then_ends_forced_without_launch() {
+    let Some(root) =
+        child("a_turn_granted_before_force_submits_then_ends_forced_without_launch")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
         engine
             .faults
-            .reconcile_unreadable
-            .store(false, Ordering::Release);
-        spawn(&engine, None).await.unwrap();
-        assert_eq!(adoptions.try_recv().unwrap(), (session.clone(), turn(2)));
-        spawn(&engine, None).await.unwrap();
-        assert!(adoptions.try_recv().is_err(), "handed off exactly once");
-        // Four sessions' first turns plus the adopted turn 2.
-        assert_eq!(engine.active(), 5);
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine.faults.release.notify_one();
+        });
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.anchors, 0, "nothing launched: {report:?}");
+        let envelope = engine
+            .result(&format!("{}/1", session.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+        assert!(envelope["timestamps"]["accepted_at"].is_null());
+        assert_eq!(
+            event_types(&engine, &session).await,
+            [
+                "turn.queued",
+                "turn.submitted",
+                "cancel.requested",
+                "cancel.settled",
+                "turn.ended",
+                "session.closed",
+            ]
+        );
     });
+}
+
+/// Design §2.3: a `queued → cancelled` commit that fails under force latches;
+/// nothing more is written, the session is not closed, and the shutdown is
+/// unclean (exit 4).
+#[test]
+fn a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open() {
+    let Some(root) =
+        child("a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        engine.faults.cancel_fails.store(1, Ordering::Release);
+        dispatch(&engine, &session).await;
+        assert!(engine.store_failed());
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.queued"],
+            "no cancellation after the failed one, and no session.closed"
+        );
+        let report = shutdown(&engine).await;
+        assert!(!report.is_clean(), "{report:?}");
+        assert_eq!(report.unresolved_turns, 2, "{report:?}");
+    });
+}
+
+/// Design §5: a start that finds the channel full waits in the pending set
+/// and enters the channel once daemon main takes a start.
+#[test]
+fn a_start_that_finds_the_channel_full_is_retried_when_capacity_returns() {
+    let Some(root) = child("a_start_that_finds_the_channel_full_is_retried_when_capacity_returns")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open_with(&root, 1);
+        let mut starts = engine.take_starts().unwrap();
+        let first = new_session(&engine).await;
+        let second = new_session(&engine).await;
+        assert!(engine.starts_pending(), "the second start found it full");
+        assert_eq!(starts.try_recv().unwrap(), first);
+        engine.retry_starts();
+        assert!(!engine.starts_pending());
+        assert_eq!(starts.try_recv().unwrap(), second);
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unstarted_dispatchers, 2, "{report:?}");
+    });
+}
+
+/// Design §2: dispatcher exits, which retire their slot, race receipt commits
+/// on the same session. Retirement runs under admission and only unleased, so
+/// the session keeps one event head: every event is dense and every turn ends.
+#[test]
+fn slot_retirement_racing_receipts_keeps_one_event_head() {
+    let Some(root) = child("slot_retirement_racing_receipts_keeps_one_event_head") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        end_turn_one(&engine, &session, Some("failed")).await;
+        for _ in 0..12 {
+            // Daemon main starts a dispatcher only for a slot that exists.
+            let run = async {
+                if engine.slot(&session).is_some() {
+                    dispatch(&engine, &session).await;
+                }
+            };
+            let ((), receipted) = tokio::join!(run, async {
+                tokio::task::yield_now().await;
+                resume(&engine, &session, None).await
+            });
+            assert!(receipted.enqueued.is_some());
+        }
+        if engine.slot(&session).is_some() {
+            dispatch(&engine, &session).await;
+        }
+        assert!(!engine.store_failed(), "no event collided");
+        let types = event_types(&engine, &session).await;
+        let ended = types.iter().filter(|kind| *kind == "turn.ended").count();
+        assert_eq!(ended, 13, "{types:?}");
+        assert!(engine.slot(&session).is_none(), "the idle slot retired");
+        assert_eq!(engine.active(), 0);
+    });
+}
+
+/// Design §7: waiting turns cost no reads of their own. Eight sessions each
+/// hold eight queued turns behind a predecessor whose reads keep failing;
+/// over three seconds each dispatcher reads only on its backoff timer
+/// (250 ms doubling), never once per waiting turn per 250 ms as T2-B did.
+#[test]
+fn waiting_turns_are_read_per_session_on_backoff_not_per_turn() {
+    const SESSIONS: usize = 8;
+    let Some(root) = child("waiting_turns_are_read_per_session_on_backoff_not_per_turn") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut sessions = Vec::new();
+        for _ in 0..SESSIONS {
+            let session = new_session(&engine).await;
+            for _ in 0..7 {
+                resume(&engine, &session, None).await;
+            }
+            sessions.push(session);
+        }
+        engine
+            .faults
+            .predecessors_unreadable
+            .store(usize::MAX, Ordering::Release);
+        engine.faults.reads.store(0, Ordering::Release);
+        let dispatchers = sessions.iter().map(|session| engine.dispatcher(session.clone()));
+        let all = futures_join_all(dispatchers);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), all)
+                .await
+                .is_err(),
+            "the turns keep waiting"
+        );
+        let reads = engine.faults.reads.load(Ordering::Acquire);
+        // Reads at 0, 0.25, 0.75, 1.75 s per session, plus scheduling slack.
+        assert!(reads <= SESSIONS * 5, "{reads} reads for {SESSIONS} sessions");
+        assert!(reads >= SESSIONS, "each dispatcher read at least once");
+        assert_eq!(engine.queued.load(Ordering::Acquire), SESSIONS * 8);
+    });
+}
+
+/// Polls every future to completion together on the current task.
+async fn futures_join_all<F: Future>(futures: impl IntoIterator<Item = F>) {
+    let mut set: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    std::future::poll_fn(|context| {
+        set.retain_mut(|future| future.as_mut().poll(context).is_pending());
+        if set.is_empty() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }

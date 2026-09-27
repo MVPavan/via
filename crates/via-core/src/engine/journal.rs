@@ -241,6 +241,13 @@ impl Unresolved {
         lock(&self.0).remove(&(session.clone(), turn));
     }
 
+    /// Whether another turn of `session` than `turn` is still unresolved.
+    pub(super) fn others(&self, session: &SessionId, turn: TurnNumber) -> bool {
+        lock(&self.0)
+            .keys()
+            .any(|(unresolved, number)| unresolved == session && *number != turn)
+    }
+
     /// Whether another receipt keeps the set within its bound.
     fn admits(&self) -> bool {
         lock(&self.0).len() < UNRESOLVED_LIMIT

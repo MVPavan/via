@@ -24,11 +24,8 @@ use serde_json::value::RawValue;
 use via_core::{
     ApiError, DaemonStatusParams, DaemonStopParams, Deadline, Engine, FakeConfig, HelloParams,
     ReadParams, Receipted, ResumeParams, SessionId, SessionReadParams, SpawnParams, SteerParams,
-    StopMode, TurnNumber, WaitParams,
+    StopMode, WaitParams,
 };
-
-/// A receipted turn handed from its client to daemon main for driving.
-type Handoff = (SessionId, TurnNumber);
 
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
@@ -121,11 +118,12 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
             .await?
             .map_err(anyhow::Error::msg)?,
     );
-    let (drive_tx, mut drive_rx) = mpsc::channel::<Handoff>(16);
-    // Orphans the daemon found committed itself; the Engine gives this out once.
-    let mut adopted = engine
-        .take_adoptions()
-        .context("Engine adoption channel already taken")?;
+    // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
+    let mut starts = engine
+        .take_starts()
+        .context("Engine start channel already taken")?;
+    // A force stop or a latched Store failure (runtime §7) ends serving at once.
+    let mut forced = engine.force_signal();
     // An accepted stop wakes main at once; Core holds the authoritative mode.
     let stop = Arc::new(Notify::new());
     let (closing_tx, closing) = watch::channel(false);
@@ -147,7 +145,6 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 if stream.peer_cred()?.uid() != rustix::process::geteuid().as_raw() { continue; }
                 let client = Client {
                     engine: Arc::clone(&engine),
-                    drives: drive_tx.clone(),
                     stop: Arc::clone(&stop),
                     closing: closing.clone(),
                     socket_path: socket.clone(),
@@ -155,13 +152,13 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
                 };
                 clients.spawn(handle_client(stream, client));
             }
-            Some((session, turn)) = drive_rx.recv() => {
-                spawn_drive(&mut drives, &engine, session, turn);
-            }
-            Some((session, turn)) = adopted.recv() => {
-                spawn_drive(&mut drives, &engine, session, turn);
+            Some(session) = starts.recv() => {
+                spawn_dispatcher(&mut drives, &engine, session);
+                // Capacity just returned: a start that found the channel full goes in.
+                engine.retry_starts();
             }
             () = stop.notified() => stopping = engine.stop_mode(),
+            _ = forced.wait_for(|forced| *forced) => stopping = engine.stop_mode(),
             Some(result) = clients.join_next(), if !clients.is_empty() => {
                 if let Err(error) = result {
                     tracing::error!(%error, "client task failed");
@@ -178,27 +175,25 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     drop(listener);
     // Best effort: a stale socket refuses connections and the next daemon replaces it.
     let _ = fs::remove_file(&socket);
-    drop(drive_tx);
     let joins = Joins {
         clients,
         drives,
-        queued: drive_rx,
-        adopted,
+        starts,
         closing: closing_tx,
         failed: failed_joins,
     };
     Ok(final_shutdown(engine, joins, mode).await)
 }
 
-/// Drives one receipted turn independently of its client connection.
-fn spawn_drive(
+/// Runs one session's dispatcher, which drives its turns independently of
+/// any client connection.
+fn spawn_dispatcher(
     drives: &mut JoinSet<Result<(), ApiError>>,
     engine: &Arc<Engine>,
     session: SessionId,
-    turn: TurnNumber,
 ) {
     let engine = Arc::clone(engine);
-    drives.spawn(async move { engine.drive(session, turn).await });
+    drives.spawn(async move { engine.dispatcher(session).await });
 }
 
 /// Whether a joined drive ended without error; a failure is logged.
@@ -220,11 +215,8 @@ fn drive_joined(result: Result<Result<(), ApiError>, tokio::task::JoinError>) ->
 struct Joins {
     clients: JoinSet<anyhow::Result<()>>,
     drives: JoinSet<Result<(), ApiError>>,
-    /// Receipted turns handed off but not yet driven; a client holds a permit
-    /// from before its receipt commits until it hands the turn off.
-    queued: mpsc::Receiver<Handoff>,
-    /// Turns the Engine adopted itself; none are added once a stop is accepted.
-    adopted: mpsc::Receiver<Handoff>,
+    /// Sessions whose dispatcher was requested but not yet started.
+    starts: mpsc::Receiver<SessionId>,
     closing: watch::Sender<bool>,
     failed: usize,
 }
@@ -243,28 +235,26 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     let Joins {
         mut clients,
         mut drives,
-        mut queued,
-        mut adopted,
+        mut starts,
         closing,
         failed: mut failed_joins,
     } = joins;
     closing.send_replace(true);
-    // A force can land between a spawn receipt and daemon main taking its drive:
-    // every receipted turn is driven, so a force stop still settles it. `recv`
-    // ends once no client can hand off another turn; a spawn still committing
-    // past the deadline leaves its turn unresolved, which Core reports.
-    queued.close();
+    // A force can land between a receipt and daemon main starting its
+    // session's dispatcher: every requested dispatcher is started, so a force
+    // stop still settles its turns. No receipt commits once stop or a Store
+    // failure is latched, so starts and pending starts only drain; any slot
+    // still `Starting` at the deadline makes the shutdown incomplete.
     let mut queued_drives = 0_usize;
-    let _ = timeout_at(deadline, async {
-        while let Some((session, turn)) = queued.recv().await {
-            spawn_drive(&mut drives, &engine, session, turn);
+    loop {
+        while let Ok(session) = starts.try_recv() {
+            spawn_dispatcher(&mut drives, &engine, session);
             queued_drives += 1;
         }
-    })
-    .await;
-    while let Ok((session, turn)) = adopted.try_recv() {
-        spawn_drive(&mut drives, &engine, session, turn);
-        queued_drives += 1;
+        if !engine.starts_pending() || Instant::now() >= deadline {
+            break;
+        }
+        engine.retry_starts();
     }
     // Force-stopped drives return after Route's bounded force cleanup; their
     // terminals commit below.
@@ -309,6 +299,8 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         "host_failure":host.map_or(Some("final shutdown deadline expired"), |host| host.failure.as_deref()),
         "uncommitted_turns":host.map(|host| host.uncommitted_turns),
         "unresolved_turns":host.map(|host| host.unresolved_turns),
+        "store_failed":host.map(|host| host.store_failed),
+        "unstarted_dispatchers":host.map(|host| host.unstarted_dispatchers),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
@@ -358,7 +350,6 @@ async fn drop_blocking<T: Send + 'static>(value: T, deadline: Instant) -> &'stat
 /// What one client connection shares with daemon main.
 struct Client {
     engine: Arc<Engine>,
-    drives: mpsc::Sender<Handoff>,
     stop: Arc<Notify>,
     /// Final shutdown began: stop reading new requests.
     closing: watch::Receiver<bool>,
@@ -484,7 +475,6 @@ async fn dispatch(
 ) -> Result<Value, Refusal> {
     let Client {
         engine,
-        drives,
         socket_path,
         store_path,
         ..
@@ -498,22 +488,14 @@ async fn dispatch(
             )
         }
         "spawn" | "resume" => {
-            // Reserved before the receipt commits, so final shutdown waits for
-            // this handoff; the queue closes only in final shutdown.
-            let handoff = drives
-                .reserve()
-                .await
-                .map_err(|_| ApiError::DAEMON_STOPPING)?;
+            // Core enqueues the new turn with its session's dispatcher under
+            // admission; a replayed retry enqueues nothing.
             let raw = raw_params(line)?;
-            let Receipted { receipt, drive } = if method == "spawn" {
+            let Receipted { receipt, .. } = if method == "spawn" {
                 engine.spawn(typed::<SpawnParams>(params)?, raw).await?
             } else {
                 engine.resume(typed::<ResumeParams>(params)?, raw).await?
             };
-            // A replayed retry created no turn to drive.
-            if let Some(turn) = drive {
-                handoff.send(turn);
-            }
             Ok(receipt)
         }
         "steer" => Ok(engine.steer(typed::<SteerParams>(params)?).await?),

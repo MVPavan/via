@@ -17,6 +17,7 @@ use super::{
     Head, TurnJournal, UNRESOLVED_LIMIT, Unresolved, admission, commit_event, read_result,
 };
 use crate::api::{Event, EventBody, FailureClass};
+use crate::engine::drive::SubmitFailure;
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
 use crate::{
     ApiError, ConnectionId, FakeConfig, RawRef, SessionId, SpawnParams, TurnNumber, TurnState,
@@ -541,13 +542,13 @@ async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
     }
 }
 
+/// A submission commit whose outcome is unknown is `Failed`, which latches
+/// Store failure in the dispatcher (runtime §7), and leaves the head unknown.
 #[tokio::test]
-async fn a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_state() {
+async fn a_submission_commit_with_an_unknown_outcome_fails_and_unsettles_the_head() {
     let root = tempfile::tempdir().unwrap();
     let engine = engine(&root);
-    // A real receipt, tracked as `spawn` tracks it; its submission commit fails.
     receipt(&engine.store, &session(), false).await;
-    engine.unresolved.receipt(&session(), turn());
     let journal = FaultJournal {
         store: engine.store.clone(),
         event: EventFault::UncertainNotCommitted,
@@ -556,20 +557,10 @@ async fn a_receipted_turn_whose_submission_cannot_commit_reports_its_queued_stat
         delayed_results: false,
     };
     let head = Head::new(Some(2));
-    let submitted = Engine::submit(&journal, &engine.unresolved, &session(), turn(), &head).await;
-    assert_eq!(submitted.err().map(|error| error.kind), Some("store_error"));
-    let address = format!("{SESSION}/1");
-    for read in [
-        engine.result(&address).await,
-        engine.wait(wait(&address)).await,
-    ] {
-        let error = read.unwrap_err();
-        assert_eq!(
-            (error.code, error.message),
-            (-32018, "durable storage failed")
-        );
-        assert_eq!(error.data(), unpersisted_data(SESSION, "queued"));
-    }
+    let submitted = Engine::commit_submission(&journal, &session(), turn(), &head).await;
+    assert!(matches!(submitted, Err(SubmitFailure::Failed)));
+    let reread = head.lock(&engine.store, &session()).await.unwrap();
+    assert_eq!(reread.next(), 2, "the head was re-read from Store");
 }
 
 #[tokio::test]
