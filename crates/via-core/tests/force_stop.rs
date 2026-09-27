@@ -262,6 +262,16 @@ fn force_after_arm_abandonment_drains_vendor_output() {
 /// `barrier`, completes final shutdown and returns the durable envelope and
 /// events.
 fn force_over_stand_in(root: &Path, after_arm: &AfterArm, barrier: &str) -> (Value, Vec<Value>) {
+    force_over_stand_in_within(root, after_arm, barrier, Duration::from_secs(3))
+}
+
+/// [`force_over_stand_in`] with final shutdown bounded by `shutdown`.
+fn force_over_stand_in_within(
+    root: &Path,
+    after_arm: &AfterArm,
+    barrier: &str,
+    shutdown: Duration,
+) -> (Value, Vec<Value>) {
     let anchor = root.join("stand-in-anchor");
     after_arm.install(&anchor);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -293,9 +303,7 @@ fn force_over_stand_in(root: &Path, after_arm: &AfterArm, barrier: &str) -> (Val
         assert!(driven.is_ok(), "the forced drive must end");
         driven.unwrap().unwrap();
         let report = engine
-            .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(3),
-            ))
+            .shutdown(Deadline::at(tokio::time::Instant::now() + shutdown))
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
@@ -355,5 +363,30 @@ fn launched_turn_without_proved_stop_is_unknown() {
     assert_eq!(envelope["state"], "unknown", "{envelope}");
     assert!(envelope["failure"].is_null(), "{envelope}");
     assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+    assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+}
+
+/// Task 1 closeout round 2: Route's verified Host close proved a live stop and
+/// group absence, then shutdown recovery failed (its share of the final
+/// deadline was already spent). The proved stop still settles the turn
+/// `cancelled`, `forced`, `quiescent`.
+#[test]
+fn proved_stop_survives_recovery_failure() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("proved_stop_survives_recovery_failure");
+    };
+    let after_arm = AfterArm::Serve {
+        stopped_live: true,
+        linger: false,
+    };
+    // Host gets the final deadline minus Core's 1 s commit reserve: nothing.
+    let (envelope, _) = force_over_stand_in_within(
+        Path::new(&root),
+        &after_arm,
+        "spawned",
+        Duration::from_secs(1),
+    );
+    assert_eq!(envelope["state"], "cancelled", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "forced", "{envelope}");
     assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
 }

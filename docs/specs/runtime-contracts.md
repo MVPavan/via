@@ -848,8 +848,12 @@ Without `drain` or `force`, a stop with active turns is refused
   force row) once Host has reconciled its anchor; `forced` requires the
   anchor's report that its cleanup began while the vendor was live. A turn
   whose vendor may have launched (ARM sent) without that report or a
-  terminal ends `unknown`. Host shutdown leaves 1 s of the final deadline
-  for these commits. After ARM, Host keeps the vendor pipes so Wire drains
+  terminal ends `unknown`. That report and proved group absence each count
+  whether Route's own close or final-shutdown recovery obtained them; a
+  failed recovery never discards what the close proved. A force Wire
+  observed before an acquisition failure (including its deadline) owns that
+  failure; an acquisition deadline observed first stays `deadline_wall`.
+  Host shutdown leaves 1 s of the final deadline for these commits. After ARM, Host keeps the vendor pipes so Wire drains
   them on every acquisition failure or abandonment; raw completeness is
   then proven, or bytes the bounded drain could not record mark it
   incomplete.

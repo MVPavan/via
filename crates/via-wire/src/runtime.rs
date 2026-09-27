@@ -179,13 +179,18 @@ impl WireConnection {
         let launch = LaunchPipes::default();
         let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch));
         let acquired = tokio::select! {
-            acquired = &mut acquire => acquired.map_err(WireError::Host),
+            // A force already set when the acquisition's own result is observed
+            // came first.
+            biased;
             () = cancelled(&mut cancel) => {
+                // After the force, a failure within the grace (including the
+                // acquisition deadline) is the force's, not its own cause.
                 match tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire).await {
-                    Ok(acquired) => acquired.map_err(WireError::Host),
-                    Err(_) => Err(WireError::Cancelled),
+                    Ok(Ok(acquired)) => Ok(acquired),
+                    Ok(Err(_)) | Err(_) => Err(WireError::Cancelled),
                 }
             }
+            acquired = &mut acquire => acquired.map_err(WireError::Host),
         };
         let AcquiredProcess {
             pipes,

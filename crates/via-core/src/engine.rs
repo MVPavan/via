@@ -118,6 +118,16 @@ struct ForcedTurn {
     raw_incomplete: bool,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
+    /// Route's own Host close: its stop found the vendor live, and whether it
+    /// proved group absence; recovery can add to these, never retract them.
+    close: RouteClose,
+}
+
+/// Evidence from Route's verified Host close of a forced turn.
+#[derive(Clone, Copy, Default)]
+struct RouteClose {
+    forced: bool,
+    quiescent: bool,
 }
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -134,6 +144,8 @@ enum Driven {
         raw_incomplete: bool,
         /// A vendor may have launched: Host sent ARM.
         launched: bool,
+        /// Route's own Host close evidence.
+        close: RouteClose,
     },
 }
 
@@ -330,6 +342,7 @@ impl Engine {
                 requested_at,
                 raw_incomplete,
                 launched,
+                close,
             } => {
                 if raw_incomplete {
                     let body = EventBody::RawLogIncomplete {
@@ -346,6 +359,7 @@ impl Engine {
                     requested_at,
                     raw_incomplete,
                     launched,
+                    close,
                 });
                 return Ok(());
             }
@@ -573,6 +587,10 @@ impl Engine {
                                     .unwrap_or_else(|| rfc3339(SystemTime::now())),
                                 raw_incomplete: route.raw_incomplete,
                                 launched: route.launched,
+                                close: RouteClose {
+                                    forced: route.forced,
+                                    quiescent: route.cleanup == Some(WireCleanup::Quiescent),
+                                },
                             }
                         }
                         result => Driven::Finished(result),
@@ -754,11 +772,14 @@ impl Engine {
             // `requested`, cleanup as proved (a complete journal without an
             // anchor intent has nothing to clean). Otherwise a vendor may have
             // run with neither stop nor terminal proved: the turn is `unknown`.
-            let quiescent = match evidence {
-                Some(record) => record.cleanup == Cleanup::Quiescent,
-                None => report.failure.is_none(),
-            };
-            let forced = evidence.is_some_and(|record| record.forced);
+            // Each fact holds if Route's close or recovery proved it, so a failed
+            // or late recovery never discards what Route's close proved.
+            let quiescent = turn.close.quiescent
+                || match evidence {
+                    Some(record) => record.cleanup == Cleanup::Quiescent,
+                    None => report.failure.is_none(),
+                };
+            let forced = turn.close.forced || evidence.is_some_and(|record| record.forced);
             let state = if forced || !turn.launched {
                 "cancelled"
             } else {

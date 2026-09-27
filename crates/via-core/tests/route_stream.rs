@@ -551,3 +551,91 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
         "raw log misses the vendor output: {failure:?}"
     );
 }
+
+/// Runs a turn over the stalling stand-in with an acquisition deadline of
+/// `deadline` and sets force once `force_at` resolves; returns the failure.
+fn stalled_acquisition_with_force(
+    name: &str,
+    deadline: Duration,
+    force_at: impl FnOnce(&Path, tokio::time::Instant) -> std::pin::Pin<Box<dyn Future<Output = ()>>>,
+) -> Option<via_adapters::RouteFailure> {
+    let Some(root) = child_root() else {
+        run_child(name, "exit 0\n", &[]);
+        return None;
+    };
+    let anchor = root.join("stand-in-anchor");
+    stand_in_anchor::AfterArm::Stall {
+        line: "vendor line",
+    }
+    .install(&anchor);
+    let child = Child::open_with_anchor(&root, anchor);
+    let (sender, _receiver) = mpsc::channel(4);
+    let (force_tx, force) = tokio::sync::watch::channel(false);
+    let result = child.runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + deadline;
+        let execute = child.adapter.execute(
+            SessionId::try_from(SESSION).unwrap(),
+            TurnNumber::try_from(1).unwrap(),
+            ConnectionId::try_from(CONNECTION).unwrap(),
+            "hello".to_owned(),
+            sender,
+            Deadline::at(deadline),
+            force,
+        );
+        let (result, ()) = tokio::join!(execute, async {
+            force_at(&root, deadline).await;
+            force_tx.send_replace(true);
+        });
+        result
+    });
+    let failure = match result {
+        Err(AdapterError::Route(failure)) => Some(failure),
+        _ => None,
+    };
+    assert!(failure.is_some(), "expected a route failure");
+    failure
+}
+
+/// Task 1 closeout round 2: a force requested after ARM and before the
+/// acquisition deadline wins, even when that deadline expires inside the
+/// force's grace: the turn is force-stopped, not `deadline_wall`.
+#[test]
+fn force_before_acquisition_deadline_is_force_stopped() {
+    let failure = stalled_acquisition_with_force(
+        "force_before_acquisition_deadline_is_force_stopped",
+        Duration::from_millis(1500),
+        |root, _| {
+            let flags = root.to_path_buf();
+            // ARM happened and the vendor wrote; the deadline is still ahead.
+            Box::pin(async move { stand_in_anchor::wait_flag(&flags, "wrote").await })
+        },
+    );
+    let Some(failure) = failure else { return };
+    assert!(
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.launched && !failure.raw_incomplete, "{failure:?}");
+}
+
+/// Task 1 closeout round 2: an acquisition deadline that expired before the
+/// force keeps its cause.
+#[test]
+fn acquisition_deadline_before_force_keeps_deadline() {
+    let failure = stalled_acquisition_with_force(
+        "acquisition_deadline_before_force_keeps_deadline",
+        Duration::from_millis(1500),
+        // Strictly after the deadline Host's acquisition timer enforces.
+        |_, deadline| {
+            Box::pin(tokio::time::sleep_until(
+                deadline + Duration::from_millis(50),
+            ))
+        },
+    );
+    let Some(failure) = failure else { return };
+    assert!(
+        matches!(failure.cause, RouteError::Deadline { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.launched, "{failure:?}");
+}

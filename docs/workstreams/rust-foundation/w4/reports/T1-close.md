@@ -169,3 +169,93 @@ as root.
 - **Earlier deferred item.** The drained-pipe path cannot prove bytes still
   held by a stalled writer past its 3 s bound; it reports them
   `raw_log_incomplete`, as Route's failure drain does.
+
+## Round 2
+
+Addresses the merge blockers in `../sol-review-T1-close.md`. I merged
+`origin/rust-foundation` first (docs only, including `c00cb2b`). The
+deferrable phase-budget item is on `via-jm4.7.7` and is not done here.
+
+### Blocker 1: a proved stop was lost when recovery failed
+
+**Failure.** Forced settlement used only shutdown recovery evidence. Route's
+own verified Host close could report `forced: true` and proved absence, but
+if recovery then failed or missed its deadline, the turn became
+`unknown`/`requested`.
+
+**Regression.** `proved_stop_survives_recovery_failure` in
+`crates/via-core/tests/force_stop.rs`. The stand-in anchor reports
+`stopped_live: true` and exits, so Route's close proves both the stop and
+absence. The 1 s final deadline leaves Host no time after Core's commit
+reserve, so recovery fails with a deadline error. The test expects
+`cancelled`/`forced`/`quiescent`. Before the fix:
+
+```
+left: String("unknown")  right: "cancelled"   (cancel: requested/uncertain)
+```
+
+**Fix.** `crates/via-core/src/engine.rs`: `Driven::Forced` and `ForcedTurn`
+carry `RouteClose { forced, quiescent }` from Route's failure. At
+settlement, `forced` and `quiescent` each hold if Route's close *or*
+recovery proved them. The two facts stay independent, and recovery can add
+to them but never retract them.
+
+### Blocker 2: force versus acquisition-deadline ordering
+
+**Failure.** After a force, Wire let the acquisition finish within its
+grace. If the acquisition then failed with `HostError::Deadline`, Route kept
+`Deadline`, so a force requested first was settled as `failed(deadline_wall)`.
+
+**Fix.** `crates/via-wire/src/runtime.rs`:
+
+- The acquisition `select!` is `biased` toward the cancel signal, so a force
+  already set when Wire observes the acquisition's result counts as first.
+- Once Wire has observed the force, any acquisition failure within the
+  grace, the deadline included, is `WireError::Cancelled`. With pipes held
+  after ARM this becomes `AfterLaunch`, so the turn gets forced settlement
+  with drained raw evidence.
+- A deadline Wire observes before any force still yields
+  `Host(Deadline)` → `deadline_wall`.
+
+**Regressions.** In `crates/via-core/tests/route_stream.rs`, over the
+stalling stand-in with a 1.5 s acquisition deadline and controlled barriers:
+
+- `force_before_acquisition_deadline_is_force_stopped`: force at the
+  stand-in's `wrote` barrier, which is after ARM and before the deadline.
+  Expects `ForceStopped`, `launched`, raw complete. Before the fix:
+
+  ```
+  RouteFailure { cause: Deadline { .. }, .., launched: true, cleanup: None, forced: false }
+  ```
+
+- `acquisition_deadline_before_force_keeps_deadline`: force 50 ms after the
+  deadline instant that Host's acquisition timer enforces. Expects
+  `Deadline`. This is a guard: it passed before and after the fix.
+
+### Contract text
+
+I added one sentence to the force bullet in `docs/specs/runtime-contracts.md`
+§6, next to `c00cb2b`'s text:
+- the live-stop report and group absence count whether Route's close or
+  recovery obtained them;
+- a force observed before an acquisition failure owns it;
+- an acquisition deadline observed first stays `deadline_wall`.
+
+The C1 §7.6 force row from `c00cb2b` is unchanged and consistent.
+
+### Gate
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: pass.
+- `cargo nextest run --locked --workspace`: 122 passed, 2 skipped.
+- `cargo deny check`: ok.
+- `python3 scripts/check-layers.py`: ok.
+- Core suite rerun twice more (30/30). After the final test-only lint fix,
+  route_stream was rerun (8/8).
+
+### Open
+
+- **Ordering is by observation.** Force-versus-deadline ordering is decided
+  by what Wire observes first. A force set in the instant between Host's
+  deadline firing and Wire polling counts as first.
+- **Phase-budget reserve.** Deferred to `via-jm4.7.7`.
