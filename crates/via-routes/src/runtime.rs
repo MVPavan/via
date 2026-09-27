@@ -78,7 +78,7 @@ impl FakeRoute {
         }
         let mut wire = self
             .wire
-            .open_connection(connection_id, process, deadline, force)
+            .open_connection(connection_id, process, deadline, force.clone())
             .await
             .map_err(|error| RouteFailure {
                 cause: wire_cause(turn, &error),
@@ -88,7 +88,8 @@ impl FakeRoute {
                 cleanup: None,
                 forced: false,
             })?;
-        let failed = match Box::pin(Self::drive(&mut wire, start, &observations, deadline)).await {
+        let drive = Self::drive(&mut wire, start, &observations, deadline, force);
+        let failed = match Box::pin(drive).await {
             Ok(result) => return Ok(result),
             Err(failed) => failed,
         };
@@ -128,6 +129,7 @@ impl FakeRoute {
         start: FakeStart,
         observations: &mpsc::Sender<RouteMessage>,
         deadline: Deadline,
+        mut force: watch::Receiver<bool>,
     ) -> Result<FakeRouteResult, Failed> {
         let turn = start.turn();
         let mut bytes = to_vec(&start).map_err(|_| protocol(turn, "cannot encode fake start"))?;
@@ -156,7 +158,7 @@ impl FakeRoute {
                 .advance(&message.payload, turn)
                 .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
             let terminal = terminal_evidence(&message);
-            forward(observations, message, turn, deadline).await?;
+            forward(observations, message, turn, deadline, &mut force).await?;
             if let Some(terminal) = terminal {
                 break terminal;
             }
@@ -172,7 +174,7 @@ impl FakeRoute {
             phase
                 .advance(&message.payload, turn)
                 .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
-            forward(observations, message, turn, deadline).await?;
+            forward(observations, message, turn, deadline, &mut force).await?;
         }
         let exit = wire
             .wait_exit(deadline)
@@ -333,16 +335,34 @@ async fn next_message(
 }
 
 /// Waits for observation capacity until the turn deadline; a consumer that neither
-/// drains nor stays attached is an overflow, never a silent drop.
+/// drains nor stays attached is an overflow, never a silent drop. A force ends
+/// the wait: the unsent message's bytes are already in the raw log, and Route's
+/// force close and drain follow.
 async fn forward(
     observations: &mpsc::Sender<RouteMessage>,
     message: RouteMessage,
     turn: TurnNumber,
     deadline: Deadline,
+    force: &mut watch::Receiver<bool>,
 ) -> Result<(), Failed> {
-    match timeout_at(deadline.instant(), observations.send(message)).await {
+    let sent = tokio::select! {
+        // Capacity first: a draining consumer still receives frames already read.
+        biased;
+        sent = timeout_at(deadline.instant(), observations.send(message)) => sent,
+        () = forced(force) => return Err(RouteError::ForceStopped { turn }.into()),
+    };
+    match sent {
         Ok(Ok(())) => Ok(()),
+        // A forced Adapter stops taking messages; that is the force, not overflow.
+        Ok(Err(_)) if *force.borrow() => Err(RouteError::ForceStopped { turn }.into()),
         Ok(Err(_)) | Err(_) => Err(RouteError::Overflow { turn }.into()),
+    }
+}
+
+/// Resolves once `force` is set; never when its sender is gone unset.
+async fn forced(force: &mut watch::Receiver<bool>) {
+    if force.wait_for(|force| *force).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 

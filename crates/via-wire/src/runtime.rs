@@ -14,6 +14,11 @@ use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
 /// Raw unit size for a retained line recorded by the failure drain.
 const DRAIN_UNIT_BYTES: usize = 64 * 1024;
 
+/// How long an acquisition may still finish once its caller is cancelled: a
+/// normal one does, so its group is force-closed and proved absent; a stalled
+/// one is abandoned well inside the 10 s final shutdown.
+const CANCELLED_ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Whether every byte exchanged with the vendor reached the durable raw log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RawEvidence {
@@ -157,13 +162,26 @@ impl WireConnection {
         spec: PrivateProcessSpec,
         raw: RawWriter,
         deadline: Deadline,
-        cancel: watch::Receiver<bool>,
+        mut cancel: watch::Receiver<bool>,
     ) -> Result<Self, WireError> {
+        let acquire = host.acquire(spec, deadline);
+        tokio::pin!(acquire);
+        let acquired = tokio::select! {
+            acquired = &mut acquire => acquired,
+            () = cancelled(&mut cancel) => {
+                // An abandoned acquisition drops its anchor control: an anchor
+                // that connected exits on EOF, one that did not at its own
+                // bootstrap deadline; Host recovery reports what it can prove.
+                tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire)
+                    .await
+                    .map_err(|_| WireError::Cancelled)?
+            }
+        };
         let AcquiredProcess {
             pipes,
             control,
             exits,
-        } = host.acquire(spec, deadline).await?;
+        } = acquired?;
         Ok(Self {
             stdin: Some(pipes.stdin),
             stdout: pipes.stdout,

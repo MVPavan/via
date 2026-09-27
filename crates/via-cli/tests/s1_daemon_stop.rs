@@ -1169,14 +1169,18 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
 /// W3-F Sol 1: a force accepted right after spawn receipts, while receipted
 /// turns may still be queued for daemon main and outside its drive set, still
 /// ends every receipted turn `cancelled` with truthful cancel fields and a
-/// clean exit. Several connections each pipeline a spawn and a force, so a
-/// force usually lands before daemon main takes some queued drive; the
-/// scenario repeats because that interleaving is not guaranteed. A first turn
-/// completes beforehand, so the scenario has raw evidence even when no raced
-/// turn launches.
+/// clean exit. Several connections each pipeline a spawn and a force; the
+/// daemon's summary counts turns final shutdown took from the queue, and the
+/// scenario repeats until that queued handoff was observed (W4-H Sol 4). A
+/// first turn completes beforehand, so each run has raw evidence.
 #[test]
 fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult {
-    for attempt in 0..4 {
+    let mut observed = 0;
+    // About one attempt in fifteen observes it here; 100 bound a miss near 0.1 %.
+    for attempt in 0..100 {
+        if observed > 0 && attempt >= 4 {
+            break;
+        }
         scenario(
             &format!("s1_daemon_stop_force_after_receipt_{attempt}"),
             &drain_fixture(),
@@ -1190,28 +1194,47 @@ fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult 
                     let _ = fs::remove_file(paths.sync.join(name));
                 }
                 let socket = paths.runtime.join("via.sock");
-                let racers: Vec<_> = (0..6)
+                // Continuous spawn traffic; the force lands once one is receipted,
+                // usually while another spawn is committing its receipt.
+                let (replies_tx, replies) = std::sync::mpsc::channel();
+                let spawners: Vec<_> = (0..4)
                     .map(|_| {
                         let socket = socket.clone();
-                        thread::spawn(move || spawn_then_force(&socket))
+                        let replies = replies_tx.clone();
+                        thread::spawn(move || pipeline(&socket, 8, false, &replies))
                     })
                     .collect();
+                drop(replies_tx);
+                let (force_tx, _) = std::sync::mpsc::channel();
                 let mut sessions = Vec::new();
-                for racer in racers {
-                    let replies = racer
-                        .join()
-                        .map_err(|_| infra("racer panicked"))?
-                        .map_err(infra)?;
-                    evidence
-                        .write(
-                            &format!("replies_{}.json", sessions.len()),
-                            Value::from(replies.clone()).to_string().as_bytes(),
-                        )
-                        .map_err(infra)?;
-                    if let Some(session) = replies[0]["result"]["session_id"].as_str() {
+                let mut all = Vec::new();
+                let mut forced = None;
+                for reply in replies {
+                    if let Some(session) = reply["result"]["session_id"].as_str() {
                         sessions.push(session.to_owned());
+                        if forced.is_none() {
+                            let socket = socket.clone();
+                            let force_tx = force_tx.clone();
+                            forced =
+                                Some(thread::spawn(move || pipeline(&socket, 0, true, &force_tx)));
+                        }
                     }
+                    all.push(reply);
                 }
+                for spawner in spawners {
+                    spawner
+                        .join()
+                        .map_err(|_| infra("spawner panicked"))?
+                        .map_err(infra)?;
+                }
+                forced
+                    .ok_or_else(|| fail("no spawn was receipted"))?
+                    .join()
+                    .map_err(|_| infra("forcer panicked"))?
+                    .map_err(infra)?;
+                evidence
+                    .write("replies.json", Value::from(all).to_string().as_bytes())
+                    .map_err(infra)?;
                 let status = daemon
                     .wait_exit(FINAL_SHUTDOWN)?
                     .ok_or_else(|| fail("force stop did not exit"))?;
@@ -1223,36 +1246,58 @@ fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult 
                     status.code() == Some(0) && summary["disposition"] == "clean",
                     || format!("exit {status}, summary {summary}"),
                 )?;
+                if summary["queued_drives"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                {
+                    observed += 1;
+                }
                 for session in sessions {
-                    let (envelope, events) = paths.committed(&session)?;
-                    // `forced` only with Host evidence of a launched, stopped
-                    // vendor; a turn forced before launch was only `requested`.
-                    let outcome = if launched(paths, &session)? {
-                        "forced"
-                    } else {
-                        "requested"
-                    };
-                    check(
-                        envelope["state"] == "cancelled"
-                            && envelope["failure"].is_null()
-                            && envelope["stop_reason"] == "interrupted"
-                            && envelope["timestamps"]["accepted_at"].is_null()
-                            && envelope["cancel"]["outcome"] == outcome
-                            && envelope["cancel"]["cleanup"] == "quiescent",
-                        || format!("envelope {envelope}, summary {summary}"),
-                    )?;
-                    check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])?;
+                    check_raced_turn(paths, &session)?;
                 }
                 Ok(())
             },
         )?;
     }
+    if observed == 0 {
+        return Err("no attempt observed a receipted turn queued at final shutdown".into());
+    }
     Ok(())
 }
 
-/// Pipelines `hello`, `spawn` and a forced `daemon/stop` on one connection and
-/// returns the spawn and stop replies.
-fn spawn_then_force(socket: &Path) -> Result<Vec<Value>, String> {
+/// A receipted raced turn ends `cancelled` with the C1 force lifecycle. Host
+/// committed vendor facts only for a launched vendor, which holds at its gate,
+/// so its force must be `forced`; a turn forced before launch was `requested`.
+fn check_raced_turn(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
+    let (envelope, events) = paths.committed(session)?;
+    let outcome = match vendor_launched(paths, session)? {
+        Some(true) => "forced",
+        Some(false) => {
+            return Err(fail(&format!("{session}: anchor without vendor facts")));
+        }
+        None => "requested",
+    };
+    check(
+        envelope["state"] == "cancelled"
+            && envelope["failure"].is_null()
+            && envelope["stop_reason"] == "interrupted"
+            && envelope["timestamps"]["accepted_at"].is_null()
+            && envelope["cancel"]["outcome"] == outcome
+            && envelope["cancel"]["cleanup"] == "quiescent",
+        || format!("envelope {envelope}"),
+    )?;
+    check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])
+}
+
+/// Pipelines `hello`, `spawns` spawn requests and, with `force`, a forced
+/// `daemon/stop` on one connection, sending every reply after `hello` to
+/// `replies` as it arrives.
+fn pipeline(
+    socket: &Path,
+    spawns: usize,
+    force: bool,
+    replies: &std::sync::mpsc::Sender<Value>,
+) -> Result<(), String> {
     let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(FINAL_SHUTDOWN))
@@ -1260,46 +1305,63 @@ fn spawn_then_force(socket: &Path) -> Result<Vec<Value>, String> {
     let hello =
         json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"force-race"});
     let spawn = json!({"harness":"fake","model":"fake","prompt":"hold","handle":format!("h_{}", "A".repeat(43))});
-    let mut requests = String::new();
-    for (id, method, params) in [
-        (1, "hello", hello),
-        (2, "spawn", spawn),
-        (3, "daemon/stop", json!({"force":true})),
-    ] {
-        requests.push_str(
+    let mut requests = vec![("hello", hello)];
+    requests.extend((0..spawns).map(|_| ("spawn", spawn.clone())));
+    if force {
+        requests.push(("daemon/stop", json!({"force":true})));
+    }
+    let mut lines = String::new();
+    for (id, (method, params)) in requests.iter().enumerate() {
+        lines.push_str(
             &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
         );
-        requests.push('\n');
+        lines.push('\n');
     }
     (&stream)
-        .write_all(requests.as_bytes())
+        .write_all(lines.as_bytes())
         .map_err(|error| error.to_string())?;
-    let mut replies = BufReader::new(&stream);
-    let mut read = || -> Result<Value, String> {
+    let mut reader = BufReader::new(&stream);
+    for index in 0..requests.len() {
         let mut line = String::new();
-        replies
+        // Final shutdown closes the connection before unread requests.
+        if reader
             .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        serde_json::from_str(&line).map_err(|error| format!("{error}: {line:?}"))
-    };
-    let _hello = read()?;
-    Ok(vec![read()?, read()?])
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            break;
+        }
+        let reply: Value =
+            serde_json::from_str(&line).map_err(|error| format!("{error}: {line:?}"))?;
+        if index > 0 {
+            // The receiver may be gone once the test stopped collecting.
+            let _ = replies.send(reply);
+        }
+    }
+    Ok(())
 }
 
-/// Whether Host committed an anchor intent for `session`, i.e. may have launched it.
-fn launched(paths: &Paths, session: &str) -> Result<bool, ScenarioError> {
+/// Host's launch evidence for `session`: `None` without an anchor intent,
+/// otherwise whether Host committed the launched vendor's facts.
+fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, ScenarioError> {
     let store = rusqlite::Connection::open_with_flags(
         paths.state.join("store.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(infra)?;
-    store
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM anchors WHERE owner_session=?1)",
-            [session],
-            |row| row.get(0),
-        )
-        .map_err(infra)
+    let mut query = store
+        .prepare("SELECT vendor_pid IS NOT NULL FROM anchors WHERE owner_session=?1")
+        .map_err(infra)?;
+    let launched: Vec<bool> = query
+        .query_map([session], |row| row.get(0))
+        .map_err(infra)?
+        .collect::<Result<_, _>>()
+        .map_err(infra)?;
+    Ok(match launched.as_slice() {
+        [] => None,
+        [launched] => Some(*launched),
+        _ => return Err(fail(&format!("{session}: more than one anchor"))),
+    })
 }
 
 /// W3-F merge follow-up: a force while vendor output is in flight never leaves

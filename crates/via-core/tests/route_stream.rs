@@ -359,3 +359,68 @@ fn stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline() {
     // Route's cleanup bound is 3 s; the 20 s turn deadline must not be reached.
     assert!(elapsed < Duration::from_secs(8), "cleanup took {elapsed:?}");
 }
+
+/// W4-H Sol 2: a force while Route waits for observation capacity (the
+/// consumer is not draining) still reaches Route's bounded force close and
+/// drain: every vendor byte, including an unterminated tail, is in the raw
+/// log, and the turn ends `ForceStopped` well before its deadline.
+#[test]
+fn force_while_forwarding_is_blocked_drains_every_byte() {
+    let mut lines = vec![json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
+    lines.extend(
+        (0..300).map(
+            |n| json!({"type":"text","vendor_turn_id":"fake-turn-1","text":format!("line {n}")}),
+        ),
+    );
+    let Some(root) = child_root() else {
+        return run_child(
+            "force_while_forwarding_is_blocked_drains_every_byte",
+            "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO\"\nprintf 'unterminated tail'\nexec sleep 30\n",
+            &lines,
+        );
+    };
+    let child = Child::open(&root);
+    // Never read: the adapter and then Route block on observation capacity.
+    let (sender, _receiver) = mpsc::channel(1);
+    let (force_tx, force) = tokio::sync::watch::channel(false);
+    let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
+    let (result, elapsed) = child.runtime.block_on(async {
+        let execute = child.adapter.execute(
+            SessionId::try_from(SESSION).unwrap(),
+            TurnNumber::try_from(1).unwrap(),
+            ConnectionId::try_from(CONNECTION).unwrap(),
+            "hello".to_owned(),
+            sender,
+            deadline,
+            force,
+        );
+        tokio::pin!(execute);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut execute)
+                .await
+                .is_err(),
+            "the blocked turn must still be running"
+        );
+        let forced_at = tokio::time::Instant::now();
+        force_tx.send_replace(true);
+        let result = execute.await;
+        (result, forced_at.elapsed())
+    });
+    assert!(elapsed < Duration::from_secs(5), "force took {elapsed:?}");
+    let Err(AdapterError::Route(failure)) = result else {
+        panic!("expected a route failure: {:?}", result.map(|_| ()));
+    };
+    assert!(
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
+        "{failure:?}"
+    );
+    assert!(!failure.raw_incomplete, "{failure:?}");
+    let raw = fs::read(root.join(format!("state/raw/{CONNECTION}.raw"))).unwrap();
+    for needle in [&b"line 299"[..], b"unterminated tail"] {
+        assert!(
+            raw.windows(needle.len()).any(|window| window == needle),
+            "raw log misses {}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+}

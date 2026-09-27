@@ -238,9 +238,11 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
     // ends once no client can hand off another turn; a spawn still committing
     // past the deadline leaves its turn unresolved, which Core reports.
     queued.close();
+    let mut queued_drives = 0_usize;
     let _ = timeout_at(deadline, async {
         while let Some((session, prompt)) = queued.recv().await {
             spawn_drive(&mut drives, &engine, session, prompt);
+            queued_drives += 1;
         }
     })
     .await;
@@ -278,6 +280,7 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
         && host.is_some_and(via_core::EngineShutdown::is_clean);
     let summary = json!({"daemon_shutdown":{
         "mode":mode.as_str(),
+        "queued_drives":queued_drives,
         "elapsed_ms":u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "pending_joins":pending_joins + host.map_or(0, |host| host.pending_tasks),
         "failed_joins":failed_joins + host.map_or(0, |host| host.failed_tasks),
@@ -296,33 +299,31 @@ async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: StopMode) -> i3
 
 /// Joins client tasks until `clients_by`, then aborts the rest and awaits
 /// their exit only until the final `deadline`; one that has not reached an
-/// abort point by then is left to process exit. Returns `(pending, failed)`,
-/// where `pending` counts clients unjoined at `clients_by`.
+/// abort point by then is left to process exit. Returns `(pending, failed)`:
+/// `pending` counts clients still unjoined at `deadline`, and `failed` those
+/// that panicked (an abort's own cancellation is not a failure).
 async fn join_clients(
     clients: &mut JoinSet<anyhow::Result<()>>,
     clients_by: Instant,
     deadline: Instant,
 ) -> (usize, usize) {
     let mut failed = 0;
-    let joined = timeout_at(clients_by, async {
+    let mut join = async |clients: &mut JoinSet<anyhow::Result<()>>| {
         while let Some(result) = clients.join_next().await {
-            if let Err(error) = result {
+            // A client's own I/O error is its connection's end, not a failed join.
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
                 tracing::error!(%error, "client task failed");
                 failed += 1;
             }
         }
-    })
-    .await;
-    let mut pending = 0;
-    if joined.is_err() {
-        pending = clients.len();
+    };
+    if timeout_at(clients_by, join(clients)).await.is_err() {
         clients.abort_all();
-        let _ = timeout_at(deadline, async {
-            while clients.join_next().await.is_some() {}
-        })
-        .await;
+        let _ = timeout_at(deadline, join(clients)).await;
     }
-    (pending, failed)
+    (clients.len(), failed)
 }
 
 /// Drops `value` on the blocking pool, waiting at most until `deadline`.
@@ -656,6 +657,25 @@ mod tests {
             "client join passed the final deadline: {:?}",
             started.elapsed()
         );
+    }
+
+    /// W4-H Sol 3: a client aborted at `clients_by` that then joins before the
+    /// final deadline is not pending; only tasks still unjoined count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_client_that_joins_is_not_pending() {
+        let mut clients = JoinSet::new();
+        clients.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        });
+        let started = Instant::now();
+        let joined = join_clients(
+            &mut clients,
+            started + Duration::from_millis(50),
+            started + Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(joined, (0, 0), "an aborted, joined client is not pending");
     }
 
     #[tokio::test(flavor = "multi_thread")]

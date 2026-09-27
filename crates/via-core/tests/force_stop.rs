@@ -147,3 +147,77 @@ fn force_before_launch_claims_no_acknowledgement() {
         drop(engine);
     });
 }
+
+/// Stand-in anchor that accepts Host's control connection and never reports
+/// ready, so Host acquisition stalls until the turn deadline; it exits when
+/// Host closes the connection.
+const STALLED_ANCHOR: &str = "#!/usr/bin/env python3
+import json, socket, sys
+path = json.load(open(sys.argv[2]))['socket_path']
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+server.listen(1)
+connection, _ = server.accept()
+connection.recv(1)
+";
+
+/// W4-H Sol 1: a force during a stalled Host acquisition still ends the drive
+/// well inside the final shutdown bound, so the receipted turn gets its
+/// cancelled terminal. Nothing proves the unidentified anchor's group absent,
+/// so the cancel is only `requested` with `uncertain` cleanup.
+#[test]
+fn force_during_stalled_acquisition_settles_the_turn() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("force_during_stalled_acquisition_settles_the_turn");
+    };
+    let root = PathBuf::from(root);
+    let anchor = root.join("stalled-anchor");
+    fs::write(&anchor, STALLED_ANCHOR).unwrap();
+    fs::set_permissions(&anchor, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let engine = Engine::open(
+            &root.join("state"),
+            &root.join("runtime"),
+            FakeConfig::from_environment().unwrap(),
+            anchor,
+        )
+        .unwrap();
+        let params: SpawnParams = serde_json::from_value(json!({
+            "harness":"fake","model":"fake","prompt":"hello",
+            "handle":format!("h_{}", "A".repeat(43)),
+        }))
+        .unwrap();
+        let (_, session, prompt) = engine.spawn(params).await.unwrap();
+        let force: DaemonStopParams = serde_json::from_value(json!({"force":true})).unwrap();
+        let forced_at = std::cell::Cell::new(None);
+        let (driven, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(8), engine.drive(&session, prompt)),
+            async {
+                // Acquisition is then waiting for the anchor's ready frame.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                forced_at.set(Some(tokio::time::Instant::now()));
+                engine.request_stop(&force).await.unwrap();
+            }
+        );
+        driven
+            .expect("a force must end a stalled acquisition's drive")
+            .unwrap();
+        let elapsed = forced_at.get().unwrap().elapsed();
+        assert!(elapsed < Duration::from_secs(4), "drive took {elapsed:?}");
+        let report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ))
+            .await;
+        assert_eq!(report.unresolved_turns, 0, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "uncertain", "{envelope}");
+        drop(engine);
+    });
+}

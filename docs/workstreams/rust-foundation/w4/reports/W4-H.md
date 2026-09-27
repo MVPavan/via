@@ -189,20 +189,150 @@ release build.
   whose drain *could not* record every byte is not exercised: the fake route
   has no raw-append failpoint. The in-flight regression accepts either
   outcome but hit the "recorded" branch.
-- **Race coverage is probabilistic.** The item 1 regression depends on
-  scheduling. On the old code it failed 3 of 3 runs, mostly through the
-  mid-acquire variant; the pure queued-drive variant was seen once in about
-  40 single-connection attempts.
-- **Pre-existing gap: anchor intent without identity.** A drive aborted at
-  the final deadline while acquiring can still leave an anchor intent with no
-  committed identity. Host reports it `uncertain`. The force path no longer
-  causes this.
-- **Definition of "live".** `stopped_live` means the vendor's own process
-  had not exited when cleanup began. A vendor that exited while its
-  grandchildren lived is not reported forced. If cleanup began because of an
+- **Race coverage is probabilistic (updated in round 2).** The item 1
+  regression now requires a receipted turn and loops until the daemon's
+  summary shows a queued handoff: about 1 attempt in 15, capped at 100
+  attempts, so a miss is near 0.1%.
+- **Host exit-window tests are probabilistic (deferred, W4-H Sol).** The two
+  Host tests for item 2 need an unobserved-exit window within 20 tries. On a
+  slow machine they can fail without a product defect. A controlled
+  status-poll seam would make them deterministic.
+- **Pre-existing gap: anchor intent without identity.** An anchor intent
+  with no committed identity is reported `uncertain`. Since round 2, a force
+  during an acquisition that stalls past the 2 s grace abandons it this way,
+  and so does a drive aborted at the final deadline.
+- **What `stopped_live` shows (W4-H Sol, deferred).** `stopped_live`, and so
+  `forced`, is `child.try_wait()` on the direct vendor child when cleanup
+  begins. It is not evidence about the whole group. It does not prove that
+  the cleanup stopped any group member, and a vendor that exited while its
+  descendants lived is not reported forced. If cleanup began because of an
   external SIGTERM to the anchor, a later Host stop reports that first
   cleanup's evidence.
 - **Events for bytes after the force.** Frames still in the pipes at the
   force are recorded raw-only, not as events, which matches the decision
   above. The existing force e2e test still waits for a durable
   `assistant.text` before forcing, because it asserts on that event.
+
+## Round 2
+
+Addresses `../sol-review-W4-H.md` "Blocks merging" 1–4. I merged
+`origin/rust-foundation` first (docs only). Each regression failed on the
+round-1 code before the fix.
+
+### Sol 1: a force during a stalled acquisition left the turn unresolved
+
+**Failure.** Wire awaited `Host::acquire` under the 30 s turn deadline and did
+not watch for force. Final shutdown aborted the drive at 10 s, so there was
+no `ForcedTurn`.
+
+**Regression.** `force_during_stalled_acquisition_settles_the_turn` in
+`crates/via-core/tests/force_stop.rs`. It uses the Engine over a real Store
+and Host. The anchor is a stand-in that accepts Host's connection and never
+sends `Ready`. The test forces 500 ms into the drive; the drive must end
+within 4 s, and the turn must end `cancelled`/`requested`/`uncertain` with no
+unresolved turn. Before the fix:
+
+```
+a force must end a stalled acquisition's drive: Elapsed(())
+```
+
+The drive was still stuck 8 s after the force.
+
+**Fix.** In `WireConnection::open`, once cancelled, the acquisition gets
+`CANCELLED_ACQUIRE_GRACE` (2 s):
+
+- A normal acquisition finishes, and its group is force-closed and proved
+  absent as before.
+- A stalled one is dropped with `WireError::Cancelled`, which Route maps to
+  `ForceStopped`. Dropping it closes the anchor control: an anchor that had
+  connected exits on EOF, and one that had not exits at its own 5 s bootstrap
+  deadline.
+
+Host recovery then proves absence when the identity was committed and
+otherwise reports `uncertain`. Final shutdown's exit status stays truthful:
+exit 4 when cleanup is uncertain.
+
+### Sol 2: a force during a blocked observation send lost bytes silently
+
+**Failure.** Route's `forward` and the Adapter's `deliver` waited for
+observation capacity until the turn deadline, and neither watched for force.
+Route never reached its close-and-drain path before the drive was aborted.
+
+**Regression.** `force_while_forwarding_is_blocked_drains_every_byte` in
+`crates/via-core/tests/route_stream.rs`. The consumer never drains; the
+vendor writes 300 lines plus an unterminated tail, then sleeps. The test
+forces after 1 s. The route must end `ForceStopped` within 5 s,
+`raw_incomplete` must be false, and the raw log must contain `line 299` and
+the tail. Before the fix:
+
+```
+force took 19.267352511s
+```
+
+**Fix.** `forward` (Route) and `deliver` (Adapter) wait for capacity first,
+so a draining consumer still gets frames already read. They end on force
+otherwise. A closed channel while forced is `ForceStopped`, not `Overflow`.
+The unsent message's bytes were already durable in the raw log, and Route's
+drain records everything else or marks the raw log incomplete.
+
+### Sol 3: the client-join summary miscounted pending joins
+
+**Failure.** `join_clients` returned the count taken *before* the abort, so
+clients that joined after the abort still forced exit 4.
+
+**Regression.** Unit test `aborted_client_that_joins_is_not_pending`, with
+an abortable 5 s sleep. Before the fix:
+
+```
+left: (1, 0)
+right: (0, 0)
+```
+
+**Fix.** The abort-then-join loop now collects post-abort results, and
+`pending` counts only tasks still unjoined at the final deadline. Cancellation
+by the abort is not a failure. As before, a client's own I/O error is not a
+failed join. The blocked-client test still reports `(1, 0)` within the
+deadline.
+
+### Sol 4: the queued-drive regression did not establish the race
+
+**Changes.**
+
+- The daemon summary gains `queued_drives`: receipted turns that final
+  shutdown took from the handoff queue.
+- The scenario now keeps spawn traffic continuous: four connections each
+  pipeline eight spawns, and a separate connection forces after the first
+  receipt.
+- It requires at least one receipt.
+- It asserts each turn's outcome from Host's vendor facts (`vendor_pid`),
+  not from the anchor intent: `forced` if a vendor launched, `requested` if
+  there is no anchor, and failure for an anchor without vendor facts.
+- It repeats until `queued_drives > 0` has been seen (at least 4 attempts,
+  at most 100).
+
+**Check.** I temporarily made the drain skip driving the turns it takes from
+the queue, as before round 1. The test then failed for the intended reason:
+
+```
+fail: exit exit status: 4, summary {..,"queued_drives":1,..,"unresolved_turns":1}
+```
+
+### Files changed in round 2
+
+- `crates/via-cli/src/server.rs`: `join_clients` and the `queued_drives`
+  summary field.
+- `crates/via-wire/src/runtime.rs` (shared): the cancelled-acquisition
+  grace.
+- `crates/via-routes/src/runtime.rs` (shared): `forward` ends on force.
+- `crates/via-adapters/src/runtime.rs` (shared): `deliver` ends on force.
+- Tests: `crates/via-core/tests/{force_stop,route_stream}.rs` and
+  `crates/via-cli/tests/s1_daemon_stop.rs`.
+
+### Gate
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: pass.
+- `cargo nextest run --locked --workspace`: 106 passed, 1 skipped.
+- `cargo deny check`: ok.
+- `python3 scripts/check-layers.py`: ok.
+- The daemon-stop suite was rerun 3 more times with no failure.
