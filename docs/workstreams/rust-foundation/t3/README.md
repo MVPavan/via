@@ -50,3 +50,8 @@ high. Round 1 on `42993bc`: `astra-review-design.md` (UNSOUND) and
 `design-r1-decisions.md`. Owner decisions on the Store failure policy
 (runtime §7), drain closing sessions and force's session scope:
 `owner-decisions.md`.
+
+Round 2 on `f145ff2`: `astra-review-design-r2.md` (UNSOUND) and
+`fable-review-design-r2.md` (SOUND WITH CHANGES); decisions in
+`design-r3-decisions.md`. S0 (moves only, `s0.md`) starts in parallel with
+design round 3.
