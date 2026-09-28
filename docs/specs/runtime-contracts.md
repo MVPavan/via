@@ -952,7 +952,14 @@ that transaction is resolved by the writer. No transaction outcome resolution
 within 2 s means skip the failure write, keep health failed, and clean up.
 
 Host independently stops private groups using §5 within 3 s of failure
-notification; this does not wait for Store. Drain reads until EOF/deadline.
+notification; this does not wait for Store. The 3 s bound runs from the
+instant the failure is raised, not from when a Host task first runs. It
+bounds the `Stop` attempt and the wait for its reply: every armed group is
+sent one `Stop`, even when the bound has already passed. A reply received
+after the bound never counts as force evidence; cleanup that is not proved
+stays uncertain until reconciliation proves absence. The runtime cannot
+promise a completed write to an anchor socket the kernel will not accept
+bytes on, and reports that group's cleanup as uncertain. Drain reads until EOF/deadline.
 The daemon remains available for diagnostic/read requests for at most 5 s
 after first failure, attempts raw/Store flush and task joins within a total
 10 s shutdown bound measured from first failure (§6.2), then exits 4. No successful graceful-stop result
