@@ -407,6 +407,7 @@ impl Engine {
             started,
             spans,
             requested_at,
+            settled,
             raw_logged,
         } = self.history(&session, turn).await?;
         let accepted = recovered_acceptance(correlation, started);
@@ -425,7 +426,7 @@ impl Engine {
             .record_raw_incomplete(&mut record, reconciled, raw_logged)
             .await?;
         let cancel = self
-            .settle_recovered(&mut record, reconciled, requested_at)
+            .settle_recovered(&mut record, reconciled, requested_at, settled)
             .await?;
         let head = head
             .lock(&self.store, &session)
@@ -515,13 +516,30 @@ impl Engine {
     /// `quiescent` only when Host proved every owned group absent, or when no
     /// anchor intent committed, so no process could exist. A durable
     /// `cancel.requested` (`requested`, its `at`) is the turn's one request
-    /// (design §9); otherwise recovery commits it.
+    /// (design §9); otherwise recovery commits it. A durable `cancel.settled`
+    /// (`settled`, from a live settlement or an earlier recovery whose
+    /// terminal did not commit) is likewise the turn's one settlement: the
+    /// terminal cites it and nothing new is committed.
     async fn settle_recovered(
         &self,
         record: &mut TurnRecord,
         reconciled: &Reconciled,
         requested: Option<String>,
+        settled: Option<DurableSettlement>,
     ) -> Result<Cancel, ApiError> {
+        if let Some(settled) = settled {
+            if record.first_failure.is_some() {
+                return Err(ApiError::STORE);
+            }
+            // A settlement is only ever committed after its request.
+            let requested_at = requested.ok_or(ApiError::STORE)?;
+            return Ok(Cancel {
+                outcome: settled.outcome,
+                cleanup: settled.cleanup,
+                requested_at,
+                settled_at: settled.at,
+            });
+        }
         let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn);
         let (outcome, cleanup) = stop_outcome(quiescent, forced);
         let requested_at = if let Some(at) = requested {
@@ -549,6 +567,7 @@ impl Engine {
         let mut started = None;
         let mut spans = Vec::new();
         let mut requested_at = None;
+        let mut settled = None;
         let mut raw_logged = false;
         loop {
             let page = self
@@ -577,6 +596,9 @@ impl Engine {
                     Some("cancel.requested") if requested_at.is_none() => {
                         requested_at = at.map(str::to_owned);
                     }
+                    Some("cancel.settled") if settled.is_none() => {
+                        settled = Some(DurableSettlement::read(&stored.event)?);
+                    }
                     Some("raw_log.incomplete") => raw_logged = true,
                     _ => {}
                 }
@@ -592,6 +614,7 @@ impl Engine {
             started,
             spans,
             requested_at,
+            settled,
             raw_logged,
         })
     }
@@ -669,8 +692,40 @@ struct History {
     spans: Vec<RawSpan>,
     /// `at` of the turn's first durable `cancel.requested`.
     requested_at: Option<String>,
+    /// The turn's first durable `cancel.settled`.
+    settled: Option<DurableSettlement>,
     /// The turn already has a durable `raw_log.incomplete`.
     raw_logged: bool,
+}
+
+/// A durable `cancel.settled`: what the recovered terminal's `cancel` cites.
+#[derive(Debug, PartialEq, Eq)]
+struct DurableSettlement {
+    at: String,
+    outcome: &'static str,
+    cleanup: &'static str,
+}
+
+impl DurableSettlement {
+    /// Reads a committed `cancel.settled`; a value outside C1 §3.5's sets
+    /// is corrupt evidence.
+    fn read(event: &Value) -> Result<Self, ApiError> {
+        let field = |name: &str| event.get(name).and_then(Value::as_str);
+        let outcome = ["requested", "acknowledged", "forced", "unknown"]
+            .into_iter()
+            .find(|known| field("outcome") == Some(*known));
+        let cleanup = ["quiescent", "uncertain", "pending"]
+            .into_iter()
+            .find(|known| field("cleanup") == Some(*known));
+        match (field("at"), outcome, cleanup) {
+            (Some(at), Some(outcome), Some(cleanup)) => Ok(Self {
+                at: at.to_owned(),
+                outcome,
+                cleanup,
+            }),
+            _ => Err(ApiError::STORE),
+        }
+    }
 }
 
 /// Host's cleanup evidence for running turns, checked against every
@@ -749,8 +804,8 @@ impl Reconciled {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorOwner, AnchorPhase, Cleanup, FakeRecovery, Reconciled, SessionId, TurnNumber,
-        recovered_connection,
+        AnchorOwner, AnchorPhase, Cleanup, DurableSettlement, FakeRecovery, Reconciled, SessionId,
+        TurnNumber, recovered_connection,
     };
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
@@ -909,5 +964,26 @@ mod tests {
         };
         assert_eq!(name(1), "c_0123456789ab");
         assert_eq!(name(12), "c_0123456789abt12");
+    }
+
+    /// A durable `cancel.settled` is read back as committed; a value outside
+    /// C1 §3.5's sets, or a missing `at`, is corrupt evidence.
+    #[test]
+    fn a_durable_settlement_reads_only_c1_values() {
+        let event = |outcome: &str, cleanup: &str| serde_json::json!({"type":"cancel.settled","at":"t","outcome":outcome,"cleanup":cleanup});
+        assert_eq!(
+            DurableSettlement::read(&event("acknowledged", "pending")).ok(),
+            Some(DurableSettlement {
+                at: "t".to_owned(),
+                outcome: "acknowledged",
+                cleanup: "pending",
+            })
+        );
+        assert!(DurableSettlement::read(&event("stopped", "quiescent")).is_err());
+        assert!(DurableSettlement::read(&event("forced", "gone")).is_err());
+        assert!(
+            DurableSettlement::read(&serde_json::json!({"outcome":"forced","cleanup":"quiescent"}))
+                .is_err()
+        );
     }
 }

@@ -983,6 +983,74 @@ fn s1_recovery_keeps_the_durable_cancel_requested() -> TestResult {
     )
 }
 
+/// Design §9: a recovery that commits `cancel.settled` but not its terminal
+/// (`store.commit.terminal` fails the write, so startup fails with the same
+/// durable state a crash there leaves) is completed by the next recovery
+/// with exactly one `cancel.requested` and one `cancel.settled`; the
+/// terminal's `cancel` is the durable one: `requested_at` and `settled_at`
+/// are those events' `at`, and `outcome` and `cleanup` those settled.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
+    scenario(
+        "s1_recovery_durable_cancel_settled",
+        &hanging("settled"),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let session = session_of(&spawn(paths, evidence, "spawn", "settled", &[])?)?;
+            paths.await_event(&session, 1, "turn.started")?;
+            daemon.kill()?;
+            let point = "store.commit.terminal";
+            paths.failpoints.arm(point, 1, "fail_io").map_err(infra)?;
+            let mut refused = Daemon::spawn(paths, evidence, "refused", &[])?;
+            let status = wait_child(&mut refused.child, Duration::from_secs(15))?
+                .ok_or_else(|| fail("the daemon admitted after a failed recovery terminal"))?;
+            let trace =
+                fs::read_to_string(evidence.dir.join("daemon-refused.trace")).map_err(infra)?;
+            check(!status.success() && trace.contains("store_error"), || {
+                format!("startup did not fail on the terminal write ({status}): {trace}")
+            })?;
+            drop(refused);
+            let (state, _) = paths.turn(&session, 1)?;
+            let types = paths.turn_types(&session, 1)?;
+            check(
+                state == "running" && types.last().map(String::as_str) == Some("cancel.settled"),
+                || format!("before the second recovery: {state} {types:?}"),
+            )?;
+            let events = paths.events(&session)?;
+            let durable = |kind: &str| {
+                events
+                    .iter()
+                    .map(|(event, _)| event)
+                    .find(|event| event["turn"] == 1 && event["type"] == kind)
+                    .cloned()
+                    .ok_or_else(|| fail(&format!("no durable {kind}")))
+            };
+            let requested = durable("cancel.requested")?;
+            let settled = durable("cancel.settled")?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let envelope = recovered_unknown(paths, &session)?;
+            let types = paths.turn_types(&session, 1)?;
+            let settlements = types
+                .iter()
+                .filter(|kind| *kind == "cancel.settled")
+                .count();
+            check(settlements == 1, || {
+                format!("{settlements} cancel.settled events: {types:?}")
+            })?;
+            let cancel = &envelope["cancel"];
+            check(
+                cancel["requested_at"] == requested["at"]
+                    && cancel["settled_at"] == settled["at"]
+                    && cancel["outcome"] == settled["outcome"]
+                    && cancel["cleanup"] == settled["cleanup"],
+                || format!("the durable cancel was not kept: {cancel} vs {requested} {settled}"),
+            )
+        },
+    )
+}
+
 // ------------------------------------------------- raw incompleteness negatives
 
 /// Design §9, the negative half: a recovered turn whose anchor never reached
