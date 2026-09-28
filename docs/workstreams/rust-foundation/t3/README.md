@@ -15,7 +15,7 @@ orchestrator dispatches implementation slices on disjoint files.
 | T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); three local fix rounds; merged `4a1c11c` (Sol medium SOUND, `sol-review-S1-r3.md`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); rounds 1–3: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
 | T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2); two local fix rounds; merged `dd2a81d` (Sol medium SOUND, `sol-review-S2-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md`, `s2-r1-decisions.md` |
 | T3-S3 | Daemon lifecycle: stop, drain, force, idle exit, final-shutdown pipeline, status, re-probe loop, early-stop wiring (design §13 S3) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s3` | `s3.md` |
-| T3-S4 | Recovery evidence: raw incompleteness, recovered `cancel.requested`, corrupt-row handoff, F9, F22, F23 (design §13 S4); parallel with S3 | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s4` | `s4.md` |
+| T3-S4 | Recovery evidence: raw incompleteness, durable cancel events, corrupt-row handoff, F9, F22, F23 (design §13 S4); parallel with S3; two local fix rounds; merged `3ca53e4` (Sol medium SOUND, `sol-review-S4-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s4` | `s4.md`, `s4-r1-decisions.md` |
 
 ## Carried into Task 3
 
@@ -110,3 +110,14 @@ merged at `dd2a81d`. The gate on the merged tree: 231 / 2, failpoints
 295 / 2 three times, F08–F12 17, release check clean. The design edits S2
 needed are tagged `[s2.N]` and `[S2]`, with amendments A21 and A22. S3 and
 S4 then start in parallel on disjoint files (design §13).
+
+S4 delivered at `e8a9631` blocked on one occurrence count in S3's
+`s1_crash_points.rs`, which it was granted. Round 1 (`2d3a477`) also fixed a
+duplicate `cancel.settled` on re-recovery. Sol medium
+(`sol-review-S4.md`) found two gaps: a corrupt row broke the `unknown`
+barrier, and a durable `raw_log.incomplete` could lose its warning. Round 2
+(`5916bd2`) cancels Store-unreadable rows on the P6 and close paths instead
+of failing them, and carries the warning. Sol round-2 check SOUND
+(`sol-review-S4-r2.md`). S4 merged at `3ca53e4` (gate: 243 / 2, failpoints 316 / 2 three times,
+F08–F12 19, release check clean); decisions 1–8 are in
+`s4-r1-decisions.md`, and the items carried into S5 are in design §13.

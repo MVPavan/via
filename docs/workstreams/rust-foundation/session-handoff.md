@@ -94,13 +94,15 @@ the historical checkpoint; its findings table is updated by this section.
   subagent with two fix rounds ([t3/s2-r1-decisions.md](t3/s2-r1-decisions.md)
   1–5); Sol medium reviews `t3/sol-review-S2-{core,close,r1,r2}.md`, the
   last SOUND. S2 merged at `dd2a81d`. Gate: 231 / 2, failpoints 295 / 2
-  three times, F08–F12 17, release check clean. **Now S3 and S4 in
-  parallel** ([t3/s3.md](t3/s3.md), [t3/s4.md](t3/s4.md)): local
-  `implementer-high` subagents in worktrees `../via-wt/t3-s3` and
-  `../via-wt/t3-s4`, on branches `wt/t3-s3` and `wt/t3-s4`, which are not
-  pushed. If the session died, inspect those branches and their reports,
-  then re-dispatch what is missing. Each gets a Sol medium review, then
-  merge, gate and push; S5 follows S3; then Sol high on the whole task. **From 2026-09-28 no new cloud work: Claude workers are local
+  three times, F08–F12 17, release check clean. S4 (recovery
+  evidence, [t3/s4.md](t3/s4.md)) merged at `3ca53e4` after two local fix
+  rounds ([t3/s4-r1-decisions.md](t3/s4-r1-decisions.md) 1–8; Sol
+  `t3/sol-review-S4{,-r2}.md`, the last SOUND). **Now S3** (daemon
+  lifecycle, [t3/s3.md](t3/s3.md)): a local `implementer-high` subagent in
+  worktree `../via-wt/t3-s3` on branch `wt/t3-s3`, not pushed. If the
+  session died, inspect that branch and its report, then re-dispatch what
+  is missing. Then Sol medium, merge, gate and push; then S5 (its §13
+  entry carries S4's leftovers); then Sol high on the whole task. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session

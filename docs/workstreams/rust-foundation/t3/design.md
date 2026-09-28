@@ -8,7 +8,8 @@ the final `design-r6-decisions.md` (`[r6.1]`). The design is final after
 round 6; later findings are handled in the slices' code reviews. S1's
 review decisions are in `s1-r1-decisions.md` (`[s1.4]`), and choices S1
 made where the design was open are in `reports/T3-S1.md` (`[S1]`). S2's
-are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`).
+are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`), and S4's
+in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -1170,6 +1171,15 @@ the resolution write's `turn.ended` and envelope.
   with `commit_submit_failed`.
   - This applies live, in the dispatcher, and in the restart handoff, which
     parses the frozen values of every turn it would enqueue.
+  - In the handoff this applies at the session head only (no unresolved
+    predecessor): failing a later row first would submit it ahead of an
+    earlier queued turn. A corrupt row behind an unresolved predecessor, or
+    behind an `unknown` turn whose cleanup is `pending`, is enqueued and
+    meets the live rule at the head [s4.3, s4.8].
+  - A row the handoff cancels (P6, or a closing session) is cancelled even
+    when Store cannot read it, from its committed `turn.queued`. It is never
+    submitted, so the `unknown` barrier holds for the handoff and for the
+    live dispatcher [s4.8].
   - It is not a startup refusal. In the handoff, a failure of that write
     fails startup (row 13).
 - **SQLite-level corruption** latches (§7.1). At startup it is F11's
@@ -1397,9 +1407,20 @@ Interactions:
     `raw_log_incomplete` warning to its `unknown` envelope.
   - A turn with no such anchor adds neither.
   - `AnchorOwner` gains the anchor phase for this.
-- **A durable `cancel.requested`.** If recovery finds one for the turn, it
-  keeps that event's `at` as `requested_at` and commits no second
-  `cancel.requested`.
+  - Recovery cannot always show that a raw log is complete, and then it
+    records the event. An owner with no readable phase, or an incomplete
+    Host inventory (a deadline or a failed page), counts as armed. The event
+    therefore means the raw evidence cannot be shown complete; it may name
+    a connection that never armed [s4.7, S4].
+  - The event is its own commit, before recovery's `cancel.requested`, and
+    names the connection id the dispatcher derives. An event already
+    durable from an interrupted recovery is not repeated, and it always
+    carries the warning, whatever the later inventory shows [s4.6, S4].
+- **A durable `cancel.requested` or `cancel.settled`.** If recovery finds
+  one for the turn, it keeps it and commits no second one: `requested_at`
+  is the request's `at`; the terminal cites the settlement's outcome,
+  cleanup and `at` (as `settled_at`), which take precedence over the second
+  recovery's own Host evidence [s4.2].
 - **F22.** The existing Host recovery stays the authority (runtime
   §5.1–§5.2). Task 3 adds the missing proofs (§11):
   - (b): a barrier-held anchor survives the crash, restart verifies it and
@@ -1535,7 +1556,11 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 - Each test must first fail on the current code for its stated reason.
 - **Characterization tests** pass on current code and guard existing
   behaviour: `s1_f02_`, `s1_f09_` without its warning assertion, and
-  `s1_f22_autonomous_eof_` [r1.23].
+  `s1_f22_autonomous_eof_` [r1.23]. S4 found that
+  `s1_f22_surviving_anchor_verified_and_stopped_on_restart`,
+  `s1_f23_agent_sees_only_allow_listed_env`, the isolated F22 Host
+  negatives and `s1_restart_keeps_nondefault_frozen_values` also pass on
+  the base; they are proofs of existing behaviour [S4].
 
 | Test | Proves |
 |---|---|
@@ -1897,7 +1922,9 @@ behaviour change.
     uses S1's `commit_submit_failed`. A failure of that write fails startup
     (§7.2 row 13);
   - `via-host/tests/anchor_process.rs`;
-  - new `via-cli/tests/s1_recovery.rs`.
+  - new `via-cli/tests/s1_recovery.rs`;
+  - by grant, the occurrence count in `s1_crash_points.rs` that its
+    `raw_log.incomplete` commit shifts [s4.1].
 - Closes: F9, F22 (a, b and the isolated negatives), F23, raw-log
   incompleteness after recovery, restart with a nondefault frozen value,
   and the restart half of O1.D8.
@@ -1919,6 +1946,16 @@ behaviour change.
   - new `via-cli/tests/s1_store_failure.rs`, the F12 unit tests in
     `engine/tests.rs`, and the re-pointed latch tests in
     `s1_crash_points.rs` and `s1_daemon_stop.rs`.
+- Carried from S4 [s4.4, s4.8]:
+  - the live corrupt-row rule must make progress for a corrupt row queued
+    behind an `unknown` turn once its cleanup settles (today
+    `cancel_queued` cannot read the row and retries); test it, and a
+    Store-unreadable row in a closing session at restart;
+  - count the handoff's extra `queued_turn` reads in occurrence-armed
+    `store.read.*` tests;
+  - make `drive.rs`'s `connection_id` and `queued_cancellation`
+    `pub(super)` and remove `recovery.rs`'s copies; move the synthetic-anchor
+    helpers duplicated in `s1_recovery.rs` into `tests/support`.
 - Closes: O1 (D1–D6, D8 live, D9–D13), the report's contradictions 7, 11
   and 12, and the F12 carried items.
 

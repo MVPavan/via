@@ -1,0 +1,15 @@
+GPT-6 Sol medium check of T3-S4 fix round 2 (`2d3a477..5916bd2` on local `wt/t3-s4`): decisions 5-8.
+
+**Verdict: SOUND (merge S4).** I found no new merge-blocking defect in the round-2 diff.
+
+1. **Finding 1 — addressed.** At `wt/t3-s4:crates/via-core/src/engine/recovery.rs:129-170`, the handoff cancels a Store-unreadable row on the P6 or close path without submitting it. Store’s predecessor query selects the latest row with `submitted_at`, so the earlier `unknown` remains the barrier in the same handoff, after a crash between rows, and for a later live `decide` on resume. The cancellation built at `recovery.rs:223-269` matches `drive.rs`’s `queued_cancellation`: a P6 cancellation has no cause or `cancel_cause`; a close cancellation records the close cause, acknowledged/quiescent cleanup and its request time. Both have no `submitted_at` or duration, and carry a cancelled `turn.ended` and envelope.
+
+   A corrupt row queued behind an `unknown` predecessor with **pending** cleanup cannot be dispatched while pending: current `decide` waits. If that predecessor becomes settled, `decide` chooses cancellation, but the current `cancel_queued` cannot read the corrupt row and retries. **S5’s live corrupt-row cancellation is needed for progress in that case.** This is the declared S5 boundary, not a reason to change S4’s handoff.
+
+2. **Finding 2 — addressed.** At `recovery.rs:582-595`, the warning condition includes a previously durable `raw_log.incomplete`. That value reaches `recovered_terminal` at `recovery.rs:519,727-748`. If recording the event fails, recovery does not write the terminal. I found no recovery path that writes a terminal after seeing the durable event without its warning.
+
+3. **Crash and event order.** The unreadable-row cancellation and `turn.ended` commit together; a crash leaves either the queued row for the next handoff or a terminal row. The row gains no `submitted_at`, and I found no new duplicate-event or sequence-order window.
+
+4. **Tests.** The report’s RED results describe both barrier tests failing on `2d3a477` and the warning test failing without the warning; I did not independently run them. The restart barrier test pauses at the next queued-row read and checks both rows’ durable states before restarting. The warning test uses an acknowledgement and pause to establish its recovery boundary; its 5.2-second sleep advances the reconciliation deadline, not event order. A closing-session corrupt-row test would directly cover the new close-cause branch and is worthwhile, but I do not consider it required before merging S4 because that branch uses the same cancellation commit. Test the pending-cleanup case with **S5’s live rule**, where its progress behavior is implemented.
+
+**Checks and limits:** I inspected the supplied diff, decisions, C1, Store’s predecessor and terminal writes, and the dispatcher source. I did not run bd, cargo, tests, or the worker’s gate, edit files, or change checkout. The RED/GREEN and gate counts above remain worker-reported.
