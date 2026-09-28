@@ -556,6 +556,9 @@ impl ControlConnection {
     /// Like [`Self::transact`], but only the wait for the reply ends at
     /// `deadline`: the request is written first, whether or not the
     /// deadline has passed, so a caller past its deadline still delivers it.
+    /// A reply in hand only at or after `deadline` is late and is refused:
+    /// Tokio polls the read before its timer, so a task that runs late would
+    /// otherwise be handed a ready reply as if it were in time.
     async fn transact_by(
         &mut self,
         request: &Request,
@@ -563,10 +566,14 @@ impl ControlConnection {
         deadline: Instant,
     ) -> io::Result<Reply> {
         protocol::write_frame(&mut self.stream, request, max).await?;
-        timeout_at(deadline, self.reader.read(&self.stream))
+        let late = || io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline");
+        let reply = timeout_at(deadline, self.reader.read(&self.stream))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline"))??
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
+            .map_err(|_| late())??;
+        if Instant::now() >= deadline {
+            return Err(late());
+        }
+        reply.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
     }
 }
 
@@ -2016,7 +2023,8 @@ async fn force_raised(signal: &mut watch::Receiver<Option<Instant>>) {
 /// still gets its `Stop`, which the anchor honours at once, since it caps its
 /// grace at the time left. Only the wait for the reply is bounded by
 /// `deadline`, with no fresh allowance, so a late `Stop` whose reply is not
-/// in hand by then records no forced evidence. The lock and the write are
+/// in hand before then records no forced evidence, including a reply that was
+/// already waiting when the late task first polled it. The lock and the write are
 /// not bounded by it: the control's other holders each run under their own
 /// deadline, and a `Stop` frame is far smaller than the socket buffer.
 /// `Stop` is idempotent and only shortens the anchor's deadline, so a second
@@ -2410,6 +2418,36 @@ mod tests {
         assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
         assert!(!stopping.await.expect("stop task"));
         assert!(!stop.forced.load(Ordering::Acquire));
+    }
+
+    /// Sol review of Task 3 round 3: a reply that is already in hand when the
+    /// deadline has passed is late. Tokio polls the read before the timer, so
+    /// the wait alone would return it; the evidence is refused on the clock.
+    /// The reply is written before `stop_through` runs and the socket is
+    /// awaited readable, so its readiness is recorded and the reply is ready
+    /// on the first poll, as when a blocked runtime lets both the reply and
+    /// the deadline pass before the task runs. There is no race and no clock.
+    #[tokio::test]
+    async fn a_ready_reply_after_the_deadline_records_no_forced_evidence() {
+        let (control, mut peer) = control_pair();
+        protocol::write_frame(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
+            .await
+            .expect("reply");
+        control
+            .lock()
+            .await
+            .stream
+            .readable()
+            .await
+            .expect("the reply is readable");
+        let stop = StopFacts::default();
+        let forced = stop_through(&control, "g1", &stop, already_past()).await;
+        assert!(
+            !forced,
+            "a reply past the deadline recorded forced evidence"
+        );
+        assert!(!stop.forced.load(Ordering::Acquire));
+        assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
     }
 
     /// A reply inside the deadline still records the forced evidence.
