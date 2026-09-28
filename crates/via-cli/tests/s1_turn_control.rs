@@ -774,6 +774,9 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     );
     let sandbox = Sandbox::new(&scripts(vec![responsive, silent]))?;
     let daemon = sandbox.start()?;
+    // The durable timestamps are wall-clock; a clock step during the window
+    // shows as a gap between these two elapsed times.
+    let (wall_start, monotonic_start) = (SystemTime::now(), Instant::now());
     let (session, _) = sandbox.spawn("idle", &["--idle-ms", "2000", "--wall-ms", "20000"])?;
     sandbox.await_file("noise1.entered")?;
     // Elapsed time only: noise lands inside the idle window.
@@ -783,6 +786,10 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     thread::sleep(Duration::from_millis(600));
     sandbox.release("noise2")?;
     let envelope = sandbox.wait(&format!("{session}/1"))?;
+    let monotonic = monotonic_start.elapsed();
+    let wall = SystemTime::now()
+        .duration_since(wall_start)
+        .unwrap_or_default();
     check(
         envelope["state"] == "failed"
             && envelope["failure"]["class"] == "deadline_idle"
@@ -800,8 +807,20 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
             .ok_or_else(|| format!("no {kind} event"))
     };
     let idle_after = epoch_ms(&at("cancel.requested")?)? - epoch_ms(&at("turn.started")?)?;
-    check((1950..2800).contains(&idle_after), || {
-        format!("the idle stop came {idle_after} ms after acceptance")
+    // A wall-clock step (seen under WSL2 load) moves the durable timestamps
+    // but not the monotonic clock: the interval is then bounded from the
+    // harness's monotonic spawn-to-terminal time instead.
+    let stepped = wall.abs_diff(monotonic) > Duration::from_millis(250);
+    let timely = if stepped {
+        (Duration::from_millis(1950)..Duration::from_millis(4000)).contains(&monotonic)
+    } else {
+        (1950..2800).contains(&idle_after)
+    };
+    check(timely, || {
+        format!(
+            "the idle stop came {idle_after} ms after acceptance (harness elapsed: \
+             wall {wall:?}, monotonic {monotonic:?}; events {events:?})"
+        )
     })?;
     check(
         events.iter().any(|event| event["type"] == "vendor.other"),
