@@ -234,8 +234,10 @@ impl Engine {
     ///
     /// Design §9: a turn with a committed anchor at `arm_intent` had a
     /// connection the crashed daemon never sealed, so `raw_log.incomplete`
-    /// commits first and the envelope carries `raw_log_incomplete`. An
-    /// earlier recovery attempt's `raw_log.incomplete` is kept.
+    /// commits first and the envelope carries `raw_log_incomplete`. A
+    /// durable `cancel.requested` (the crashed daemon's order, or an
+    /// earlier recovery attempt's) is kept, with its `at` as
+    /// `requested_at`; so is an earlier attempt's `raw_log.incomplete`.
     async fn recover_turn(
         &self,
         unfinished: UnfinishedTurn,
@@ -253,6 +255,7 @@ impl Engine {
             queued_seq,
             started,
             spans,
+            requested_at,
             raw_logged,
         } = self.history(&session, turn).await?;
         let accepted = recovered_acceptance(correlation, started);
@@ -270,7 +273,9 @@ impl Engine {
         let raw_incomplete = self
             .record_raw_incomplete(&mut record, reconciled, raw_logged)
             .await?;
-        let cancel = self.settle_recovered(&mut record, reconciled).await?;
+        let cancel = self
+            .settle_recovered(&mut record, reconciled, requested_at)
+            .await?;
         let head = head
             .lock(&self.store, &session)
             .await
@@ -357,17 +362,25 @@ impl Engine {
     /// Records the recovery stop of the turn's orphaned execution (C1 §7.5):
     /// `forced` only when Host's stop found its vendor live; cleanup
     /// `quiescent` only when Host proved every owned group absent, or when no
-    /// anchor intent committed, so no process could exist.
+    /// anchor intent committed, so no process could exist. A durable
+    /// `cancel.requested` (`requested`, its `at`) is the turn's one request
+    /// (design §9); otherwise recovery commits it.
     async fn settle_recovered(
         &self,
         record: &mut TurnRecord,
         reconciled: &Reconciled,
+        requested: Option<String>,
     ) -> Result<Cancel, ApiError> {
-        let requested_at = rfc3339(SystemTime::now());
         let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn);
         let (outcome, cleanup) = stop_outcome(quiescent, forced);
-        self.commit_event(record, EventBody::CancelRequested {}, None)
-            .await;
+        let requested_at = if let Some(at) = requested {
+            at
+        } else {
+            let at = rfc3339(SystemTime::now());
+            self.commit_event(record, EventBody::CancelRequested {}, None)
+                .await;
+            at
+        };
         let cancel = self.settle(record, requested_at, outcome, cleanup).await;
         if record.first_failure.is_some() {
             // Recovery must be durable before admission; startup fails instead.
@@ -384,6 +397,7 @@ impl Engine {
         let mut queued_seq = None;
         let mut started = None;
         let mut spans = Vec::new();
+        let mut requested_at = None;
         let mut raw_logged = false;
         loop {
             let page = self
@@ -409,6 +423,9 @@ impl Engine {
                     Some("turn.started") => {
                         started = at.map(str::to_owned).zip(stored.raw_ref.clone());
                     }
+                    Some("cancel.requested") if requested_at.is_none() => {
+                        requested_at = at.map(str::to_owned);
+                    }
                     Some("raw_log.incomplete") => raw_logged = true,
                     _ => {}
                 }
@@ -423,6 +440,7 @@ impl Engine {
             queued_seq: queued_seq.ok_or(ApiError::STORE)?,
             started,
             spans,
+            requested_at,
             raw_logged,
         })
     }
@@ -498,6 +516,8 @@ struct History {
     /// `turn.started` time and raw span, when acceptance's event committed.
     started: Option<(String, RawRef)>,
     spans: Vec<RawSpan>,
+    /// `at` of the turn's first durable `cancel.requested`.
+    requested_at: Option<String>,
     /// The turn already has a durable `raw_log.incomplete`.
     raw_logged: bool,
 }

@@ -929,6 +929,58 @@ fn s1_f23_agent_sees_only_allow_listed_env() -> TestResult {
     })
 }
 
+// ------------------------------------------------- recovered cancel.requested
+
+/// Design §9: a caller's `cancel.requested` committed before the crash is
+/// kept: recovery commits no second one, and the recovered envelope's
+/// `requested_at` is that event's `at`.
+#[test]
+fn s1_recovery_keeps_the_durable_cancel_requested() -> TestResult {
+    scenario(
+        "s1_recovery_durable_cancel_requested",
+        &hanging("ordered"),
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let session = session_of(&spawn(paths, evidence, "spawn", "ordered", &[])?)?;
+            paths.await_event(&session, 1, "turn.started")?;
+            paths.ok(
+                evidence,
+                "cancel",
+                &[
+                    "cancel",
+                    &session,
+                    "--force-after",
+                    "60000",
+                    "--handle",
+                    HANDLE,
+                    "--json",
+                ],
+            )?;
+            let requested = paths.await_event(&session, 1, "cancel.requested")?;
+            daemon.kill()?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let envelope = recovered_unknown(paths, &session)?;
+            let types = paths.turn_types(&session, 1)?;
+            let orders = types
+                .iter()
+                .filter(|kind| *kind == "cancel.requested")
+                .count();
+            check(orders == 1, || {
+                format!("{orders} cancel.requested events: {types:?}")
+            })?;
+            check(
+                envelope["cancel"]["requested_at"] == requested["at"],
+                || {
+                    format!(
+                        "requested_at not kept: {} vs {requested}",
+                        envelope["cancel"]
+                    )
+                },
+            )
+        },
+    )
+}
+
 // ------------------------------------------------- raw incompleteness negatives
 
 /// Design §9, the negative half: a recovered turn whose anchor never reached
