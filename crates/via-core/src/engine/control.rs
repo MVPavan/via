@@ -51,6 +51,10 @@ impl Engine {
         if *lock(&self.stop) == Some(StopMode::Force) {
             return Err(ApiError::DAEMON_STOPPING);
         }
+        // Past step 3: a force accepted from here finds this cancel admitted
+        // (a pause seam for the settling handoff).
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.cancel.admitted").await;
         let force_after = params.force_after_ms.unwrap_or(DEFAULT_FORCE_AFTER_MS);
         let spec = StopSpec::Cancel {
             force_after: Duration::from_millis(force_after),

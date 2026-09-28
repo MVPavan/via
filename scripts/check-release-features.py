@@ -91,6 +91,7 @@ POINTS = [
     "core.retry.before",
     "core.head.contended",
     "core.commit.before_send",
+    "core.cancel.admitted",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

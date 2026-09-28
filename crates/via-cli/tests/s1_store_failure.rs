@@ -2153,6 +2153,113 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
     Ok(())
 }
 
+/// Design §6.8 steps 3–6, §7.4 [r3.3, r4.2, r4.9], carried from S2:
+/// an uncertain event on turn A (its reply is lost,
+/// `store.commit.reply_lost`) latches while turn B runs, and both run loops
+/// are forced. B's run loop is held at `core.run.before_handoff`. (A's
+/// handoff commits nothing after its failure, so B is first held at its
+/// own handoff commit, `core.commit.before_send`, while A passes the
+/// handoff seam's first occurrence; the seam's second occurrence is then
+/// B's.) Meanwhile the window serves `daemon/status`, Host's early stop
+/// has stopped the groups (`host.early_stop.sent`, and B's vendor is
+/// gone), and final shutdown has not entered Host reconciliation
+/// (`core.shutdown.reconcile_entry`) with B's handoff outstanding. After
+/// release, reconciliation is entered once, B's forced terminal commits
+/// with its evidence (`forced`, cleanup `quiescent`), and A's batch commits
+/// (`failed(store)`), all before the exit (4).
+#[test]
+fn s1_f12_latch_pipeline_orders_handoffs() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[
+        reported("b"),
+        script(
+            "a",
+            1,
+            vec![
+                accepted(1),
+                gate("accepted"),
+                text("lost"),
+                gate("a"),
+                terminal(1),
+            ],
+        ),
+    ]))?;
+    let handoff = "core.run.before_handoff";
+    let send = "core.commit.before_send";
+    let reconcile = "core.shutdown.reconcile_entry";
+    let early = "host.early_stop.sent";
+    let lost = "store.commit.reply_lost";
+    for point in [send, reconcile, early, lost] {
+        sandbox.count(point)?;
+    }
+    let daemon = sandbox.start()?;
+    let (b, _) = sandbox.spawn("b")?;
+    sandbox.await_file("b.entered")?;
+    sandbox.await_accepted(&b, 1)?;
+    let vendor = vendor_pid(&sandbox)?;
+    let (a, _) = sandbox.spawn("a")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&a, 1)?;
+    // The Store's one worker serves this read after both acceptances, whose
+    // hits precede it: the counts below are settled.
+    sandbox.events(&a)?;
+    let next = sandbox.next_hit(lost)?;
+    // A's event is the next send; B's first commit after the latch, the one
+    // after it.
+    let b_send = sandbox.next_hit(send)? + 1;
+    sandbox.arm(lost, next, "fail_io")?;
+    sandbox.arm(send, b_send, "pause")?;
+    sandbox.arm(handoff, 1, "pause")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, lost, next, "fail_io")?;
+    sandbox.ack(&daemon, send, b_send, "pause")?;
+    sandbox.ack(&daemon, handoff, 1, "pause")?;
+    // A is held at its handoff: arming the next occurrence keeps it held
+    // until its release below.
+    sandbox.arm(handoff, 2, "pause")?;
+    sandbox.resume_point(handoff, 1)?;
+    sandbox.resume_point(send, b_send)?;
+    sandbox.ack(&daemon, handoff, 2, "pause")?;
+    let status = sandbox.status()?;
+    check(status["health"] == "store_failed", || {
+        format!("the window's status: {status}")
+    })?;
+    wait_until("B's group is gone", Duration::from_secs(3), || {
+        !process_live(vendor)
+    })?;
+    check(sandbox.next_hit(early)? > 1, || {
+        "no early stop was sent".to_owned()
+    })?;
+    check(sandbox.next_hit(reconcile)? == 1, || {
+        "reconciliation entered with B's handoff outstanding".to_owned()
+    })?;
+    sandbox.resume_point(handoff, 2)?;
+    let summary = daemon.latched_exit()?;
+    check(sandbox.next_hit(reconcile)? == 2, || {
+        "reconciliation was not entered once".to_owned()
+    })?;
+    check(
+        summary["failure_batches"] == json!({"committed": 1, "skipped": 0}),
+        || format!("summary: {summary}"),
+    )?;
+    let envelope = |session: &str| -> TestResult<Value> {
+        let raw: String = sandbox.query(&format!(
+            "SELECT envelope FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        Ok(serde_json::from_str(&raw)?)
+    };
+    let (a, b) = (envelope(&a)?, envelope(&b)?);
+    check(
+        a["state"] == "failed" && a["failure"]["class"] == "store",
+        || format!("turn A: {a}"),
+    )?;
+    check(
+        b["cancel"]["outcome"] == "forced" && b["cancel"]["cleanup"] == "quiescent",
+        || format!("turn B: {b}"),
+    )?;
+    sandbox.disarm(handoff)?;
+    sandbox.disarm(send)
+}
+
 /// Design §6.8, §7.4 [r4.3, r5.7]: Host's early stop is independent of
 /// Core, the dispatchers and Store. Turn B's dispatcher is parked at
 /// `core.commit.before_send` before sending its observation commit, so the
