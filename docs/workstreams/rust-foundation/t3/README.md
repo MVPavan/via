@@ -12,7 +12,7 @@ orchestrator dispatches implementation slices on disjoint files.
 |---|---|---|---|
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
-| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`) | Opus 5.5 high | `s1.md` |
+| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`) | `s1.md` |
 
 ## Carried into Task 3
 
@@ -61,3 +61,8 @@ design round 3.
 Round 3 on `4531dd0`: `astra-review-design-r3.md` (UNSOUND, no blocker)
 and `fable-review-design-r3.md` (SOUND WITH CHANGES); decisions in
 `design-r4-decisions.md`.
+
+Round 4 on `1a814d6`: `astra-review-design-r4.md` (UNSOUND, no blocker)
+and `fable-review-design-r4.md` (SOUND WITH CHANGES, one blocker in S1's
+early-stop lifetime); decisions in `design-r5-decisions.md`, with 1–7 sent
+to S1 directly.
