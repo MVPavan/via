@@ -1,8 +1,11 @@
 # T2-E: frozen per-turn parameters and Task 2 acceptance fixes
 
-Model: Opus 5.5 high, continuing the T2-B2…T2-D cloud session on its
-branch (`claude/t2-b2-step-1-3pslux`; merge `origin/rust-foundation`
-first). Follow `../w1/common.md`; report to `reports/T2-E.md`.
+Model: Opus 5.5 high, fresh cloud session (the T2-B2…T2-D session went
+idle without starting this task). Start your branch from
+`origin/rust-foundation`. Follow `../w1/common.md`; report to
+`reports/T2-E.md`. Context: `dispatch-design.md` (the reviewed dispatcher,
+latch, restart handoff and slot design) and the T2-B2, T2-C and T2-D
+reports in `reports/`.
 
 The Sol high slice review of Task 2 (`task2-sol-high-review.md`) returned
 ACCEPT AFTER CHANGES with three blockers. This task clears them. The
