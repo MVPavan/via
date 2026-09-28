@@ -122,7 +122,116 @@ pub(crate) fn read_handle(
     Ok(value)
 }
 
-fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
+/// One startup budget for an auto-started daemon (design §6.1): longer
+/// than an old daemon's 10 s final shutdown, so a daemon still shutting
+/// down is outlasted.
+const STARTUP_BUDGET: Duration = Duration::from_secs(15);
+
+/// After a lost `daemon.lock` race (exit 75), the next spawn waits this long.
+const RESPAWN_AFTER: Duration = Duration::from_millis(100);
+
+/// How much of a starting daemon's stderr the CLI keeps to report.
+const STARTUP_STDERR: usize = 4096;
+
+/// Exit status of a daemon that found `daemon.lock` held (runtime §6.1).
+const LOCK_CONTENDED: i32 = 75;
+
+/// A daemon this CLI started that has not yet answered `hello`.
+struct Starting {
+    child: std::process::Child,
+    stderr: Option<std::process::ChildStderr>,
+    captured: Vec<u8>,
+}
+
+/// Auto-start state within one startup budget (design §6.1).
+struct Starter {
+    deadline: Instant,
+    starting: Option<Starting>,
+    respawn_at: Instant,
+}
+
+impl Starter {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            deadline: now + STARTUP_BUDGET,
+            starting: None,
+            respawn_at: now,
+        }
+    }
+
+    /// Spawns `via daemon` when none of ours is starting and the respawn
+    /// delay passed; reaps an exited one: 75 schedules a respawn, any other
+    /// exit fails with the captured stderr (exit 4).
+    fn advance(&mut self, paths: &Paths) -> anyhow::Result<()> {
+        if let Some(starting) = self.starting.as_mut() {
+            starting.capture();
+            if let Some(status) = starting.child.try_wait()? {
+                starting.capture();
+                let captured = std::mem::take(&mut starting.captured);
+                self.starting = None;
+                if status.code() == Some(LOCK_CONTENDED) {
+                    self.respawn_at = Instant::now() + RESPAWN_AFTER;
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&captured);
+                bail!(
+                    "daemon exited during startup: {status}: {}",
+                    stderr.trim_end()
+                );
+            }
+        } else if Instant::now() >= self.respawn_at {
+            self.starting = Some(spawn_daemon(paths)?);
+        }
+        Ok(())
+    }
+
+    /// Fails once the startup budget is spent.
+    fn check(&self) -> anyhow::Result<()> {
+        if Instant::now() >= self.deadline {
+            bail!("daemon startup timed out");
+        }
+        Ok(())
+    }
+}
+
+impl Starting {
+    /// Reads what the daemon wrote to stderr so far, without blocking, up
+    /// to `STARTUP_STDERR`; the pipe is dropped at the limit or at EOF.
+    fn capture(&mut self) {
+        let Some(stderr) = self.stderr.as_mut() else {
+            return;
+        };
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let room = STARTUP_STDERR.saturating_sub(self.captured.len());
+            if room == 0 {
+                self.stderr = None;
+                return;
+            }
+            let limit = room.min(buffer.len());
+            match stderr.read(&mut buffer[..limit]) {
+                Ok(0) => {
+                    self.stderr = None;
+                    return;
+                }
+                Ok(count) => self.captured.extend_from_slice(&buffer[..count]),
+                // `WouldBlock`: nothing more now. Any other error ends capture.
+                Err(error) => {
+                    if error.kind() != io::ErrorKind::WouldBlock {
+                        self.stderr = None;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Spawns `via daemon` in its own process group, so a terminal's SIGINT
+/// never reaches it (design §6.5), with stderr on a nonblocking pipe.
+fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
+    use std::os::unix::process::CommandExt as _;
     let binary = env::current_exe()?;
     let mut command = Command::new(binary);
     command
@@ -132,7 +241,8 @@ fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
         .env("VIA_RUNTIME_DIR", &paths.runtime)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .process_group(0);
     for name in [
         "VIA_FAKE_AGENT_BINARY",
         "VIA_FAKE_SCENARIO",
@@ -142,25 +252,134 @@ fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
             command.env(name, value);
         }
     }
-    let mut child = command.spawn()?;
-    let socket = paths.runtime.join("via.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if socket.exists() && UnixStream::connect(&socket).is_ok() {
-            return Ok(());
+    // Test builds only: the daemon a test's CLI starts keeps the test's
+    // failpoints, lowered limits and binary version.
+    #[cfg(feature = "test-failpoints")]
+    for name in [
+        "VIA_FAILPOINT_DIR",
+        "VIA_FAILPOINT_TOKEN",
+        "VIA_TEST_CONNECTION_SLOTS",
+        "VIA_TEST_IDLE_EXIT_MS",
+        "VIA_TEST_CLIENT_VERSION",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
         }
-        if let Some(status) = child.try_wait()? {
-            bail!("daemon exited during startup: {status}");
-        }
-        thread::sleep(Duration::from_millis(10));
     }
-    bail!("daemon startup timed out")
+    let mut child = command.spawn()?;
+    let stderr = child.stderr.take();
+    if let Some(stderr) = &stderr {
+        let flags = rustix::fs::fcntl_getfl(stderr)?;
+        rustix::fs::fcntl_setfl(stderr, flags | rustix::fs::OFlags::NONBLOCK)?;
+    }
+    Ok(Starting {
+        child,
+        stderr,
+        captured: Vec::new(),
+    })
 }
+
+/// This binary's version as a C1 client: in test builds only,
+/// `VIA_TEST_CLIENT_VERSION` overrides it (F4); the daemon this CLI starts
+/// inherits the override, as a binary of that version would.
+pub(crate) fn binary_version() -> String {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(version) =
+        env::var_os("VIA_TEST_CLIENT_VERSION").and_then(|value| value.into_string().ok())
+    {
+        return version;
+    }
+    env!("CARGO_PKG_VERSION").to_owned()
+}
+
+/// A connection whose `hello` was answered, with that answer.
+struct Connection {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+    hello: Value,
+}
+
+/// Connects and says `hello` (design §6.1): with `auto_start`, a missing
+/// or refused socket starts a daemon, and a reset or EOF before `hello`
+/// completes is retried within the startup budget. Nothing is retried
+/// after a request other than `hello` was written.
+fn connect(
+    paths: &Paths,
+    auto_start: bool,
+    read: Duration,
+    starter: &mut Starter,
+) -> anyhow::Result<Connection> {
+    let socket = paths.runtime.join("via.sock");
+    loop {
+        let stream = match UnixStream::connect(&socket) {
+            Ok(stream) => stream,
+            Err(error)
+                if auto_start
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                starter.check()?;
+                starter.advance(paths)?;
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
+        stream.set_read_timeout(Some(read))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = stream;
+        let params = json!({
+            "api_version":1,"client_version":binary_version(),"client":"via-cli"
+        });
+        match transact(&mut writer, &mut reader, 1, "hello", &params) {
+            Ok(hello) => {
+                // Ready: the pipe is dropped and later daemon writes fail silently.
+                starter.starting = None;
+                return Ok(Connection {
+                    writer,
+                    reader,
+                    hello,
+                });
+            }
+            Err(error) if auto_start && before_hello(&error) => {
+                starter.check()?;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether `hello` failed because the daemon went away (reset, EOF or a
+/// broken pipe), which a starting or stopping daemon causes.
+fn before_hello(error: &anyhow::Error) -> bool {
+    if error.to_string() == CLOSED {
+        return true;
+    }
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::BrokenPipe
+        )
+    })
+}
+
+/// The connection closed before a whole response line.
+const CLOSED: &str = "daemon closed the connection";
 
 fn read_response(reader: &mut BufReader<UnixStream>) -> anyhow::Result<Value> {
     let mut bytes = Vec::new();
     let count = reader.take(MAX_LINE + 1).read_until(b'\n', &mut bytes)?;
-    if count == 0 || u64::try_from(count)? > MAX_LINE || bytes.last() != Some(&b'\n') {
+    if count == 0 {
+        bail!(CLOSED);
+    }
+    if u64::try_from(count)? > MAX_LINE || bytes.last() != Some(&b'\n') {
         bail!("invalid or oversized daemon response");
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -221,49 +440,59 @@ pub(crate) fn request_within(
     read: Duration,
 ) -> anyhow::Result<Value> {
     let paths = paths()?;
-    let socket = paths.runtime.join("via.sock");
-    let stream = match UnixStream::connect(&socket) {
-        Ok(stream) => stream,
-        Err(error)
-            if auto_start
-                && matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-        {
-            start_daemon(&paths)?;
-            UnixStream::connect(&socket)?
+    // The daemon's own check, before any connect or spawn (F3).
+    if paths.runtime.exists() {
+        super::server::validate_dir(&paths.runtime)?;
+    }
+    let mut starter = Starter::new();
+    let mut restarted = false;
+    loop {
+        let Connection {
+            mut writer,
+            mut reader,
+            hello,
+        } = connect(&paths, auto_start, read, &mut starter)?;
+        if let Some(error) = hello.get("error") {
+            if !auto_start || restarted || error["data"]["kind"] != "version_mismatch" {
+                return Ok(hello);
+            }
+            // Design §6.2: a Store-matched mismatched daemon is stopped only
+            // while idle, then this binary's daemon is started once.
+            let store_path = error["data"]["store_path"].as_str().unwrap_or_default();
+            if !same_store(&paths.state.join("store.sqlite3"), store_path).unwrap_or(false) {
+                bail!("connected daemon of another version uses a different Store path");
+            }
+            let stop = transact(
+                &mut writer,
+                &mut reader,
+                2,
+                "daemon/stop",
+                &json!({"drain":false,"force":false}),
+            )?;
+            if stop["result"]["stopping"] != true {
+                return Ok(stop);
+            }
+            drop((writer, reader));
+            let socket = paths.runtime.join("via.sock");
+            while socket.exists() {
+                starter.check()?;
+                thread::sleep(Duration::from_millis(10));
+            }
+            restarted = true;
+            continue;
         }
-        Err(error) => return Err(error.into()),
-    };
-    let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
-    stream.set_read_timeout(Some(read))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-    let hello = transact(
-        &mut writer,
-        &mut reader,
-        1,
-        "hello",
-        &json!({
-            "api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"via-cli"
-        }),
-    )?;
-    if hello.get("error").is_some() {
-        return Ok(hello);
+        let status = transact(&mut writer, &mut reader, 2, "daemon/status", &json!({}))?;
+        let store_path = status["result"]["store_path"]
+            .as_str()
+            .context("daemon status has no store path")?;
+        if !same_store(&paths.state.join("store.sqlite3"), store_path)? {
+            bail!("connected daemon uses a different Store path");
+        }
+        if method == "daemon/status" {
+            return Ok(status);
+        }
+        return transact(&mut writer, &mut reader, 3, method, params);
     }
-    let status = transact(&mut writer, &mut reader, 2, "daemon/status", &json!({}))?;
-    let store_path = status["result"]["store_path"]
-        .as_str()
-        .context("daemon status has no store path")?;
-    if !same_store(&paths.state.join("store.sqlite3"), store_path)? {
-        bail!("connected daemon uses a different Store path");
-    }
-    if method == "daemon/status" {
-        return Ok(status);
-    }
-    transact(&mut writer, &mut reader, 3, method, params)
 }
 
 pub(crate) fn emit_response(response: &Value, _json_output: bool) -> anyhow::Result<Option<Value>> {

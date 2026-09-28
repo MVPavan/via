@@ -37,18 +37,35 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
     let Joins {
         mut clients,
         mut drives,
+        mut reprobe,
         mut starts,
         closing,
         failed: mut failed_joins,
     } = joins;
     closing.send_replace(true);
-    // A force can land between a receipt and daemon main starting its
-    // session's dispatcher: every requested dispatcher is started, so a force
-    // stop still settles its turns. Stop and the Store-failed latch are set
-    // under `admission`, which every receipt holds through its enqueue and
-    // start request, and daemon main gets here only after one of them: a
-    // receipt either put its start in the channel or pending set already, or
-    // was refused. Starts only drain now; any slot still `Starting` at the
+    // Test builds: idle expiry reached final shutdown with the listener gone.
+    #[cfg(feature = "test-failpoints")]
+    if mode == StopMode::Idle {
+        let _ = via_core::failpoint::hit_async("daemon.shutdown.idle_final").await;
+    }
+    // Pipeline step 1 (design §6.8): the re-probe task returns at entry; a
+    // pass in progress finishes under its own bound.
+    let mut pending_joins = 0;
+    if timeout_at(deadline, join_reprobe(&mut reprobe, &mut failed_joins))
+        .await
+        .is_err()
+    {
+        pending_joins += reprobe.len();
+        reprobe.abort_all();
+    }
+    // Step 2. A force can land between a receipt and daemon main starting
+    // its session's dispatcher: every requested dispatcher is started, so a
+    // force stop still settles its turns. Stop, the Store-failed latch and
+    // the final-shutdown fence are set under `admission`, which every
+    // receipt and every `Closing` commit holds through its start request,
+    // and daemon main gets here only after entry set the fence: each one
+    // either put its start in the channel or pending set already, or was
+    // refused. Starts only drain now; any slot still `Starting` at the
     // deadline makes the shutdown incomplete.
     let mut queued_drives = 0_usize;
     loop {
@@ -61,9 +78,10 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
         }
         engine.retry_starts();
     }
-    // Force-stopped drives return after Route's bounded force cleanup; their
-    // terminals commit below.
-    let joined = timeout_at(deadline, async {
+    // Step 3: force-stopped drives return after Route's bounded force
+    // cleanup and hand their turns to Host reconciliation (step 4), which
+    // keeps its time; their terminals commit there.
+    let joined = timeout_at(Engine::dispatchers_by(deadline), async {
         while let Some(result) = drives.join_next().await {
             if !drive_joined(result) {
                 failed_joins += 1;
@@ -71,7 +89,6 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
         }
     })
     .await;
-    let mut pending_joins = 0;
     if joined.is_err() {
         pending_joins = drives.len();
         drives.abort_all();
@@ -142,6 +159,16 @@ async fn join_clients(
         let _ = timeout_at(deadline, join(clients)).await;
     }
     (clients.len(), failed)
+}
+
+/// Joins the re-probe task; a panic counts as a failed join.
+async fn join_reprobe(reprobe: &mut JoinSet<()>, failed: &mut usize) {
+    while let Some(result) = reprobe.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "re-probe task failed");
+            *failed += 1;
+        }
+    }
 }
 
 /// Drops `value` on the blocking pool, waiting at most until `deadline`.

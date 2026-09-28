@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    sync::Notify,
+    sync::{Notify, oneshot},
     time::timeout,
 };
 use via_core::{
@@ -17,6 +17,7 @@ use via_core::{
 };
 
 use super::Client;
+use super::serving::{IdleStop, NOT_IDLE};
 
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
@@ -27,6 +28,10 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let mut hello_done = false;
+    // A `hello` got `version_mismatch`: only a plain `daemon/stop` is
+    // accepted from here on (design §6.2).
+    let mut mismatched = false;
+    let version = crate::client::binary_version();
     loop {
         let mut line = Vec::new();
         // A request already being served completes; an idle connection closes.
@@ -52,7 +57,13 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
             }
         };
         let method = method.as_str();
-        if !hello_done && method != "hello" {
+        if mismatched && method == "daemon/stop" {
+            if idle_stop_request(&client, params, &mut write, &id).await? {
+                break;
+            }
+            continue;
+        }
+        if (!hello_done && method != "hello") || mismatched {
             send(&mut write, &error(&id, Refusal::from(HANDSHAKE_REQUIRED))).await?;
             continue;
         }
@@ -64,12 +75,18 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
         }
         let response = if method == "hello" {
             match typed::<HelloParams>(params) {
-                Ok(hello)
-                    if hello.validate().is_ok()
-                        && hello.client_version == env!("CARGO_PKG_VERSION") =>
-                {
+                Ok(hello) if hello.validate().is_ok() && hello.client_version == version => {
                     hello_done = true;
-                    json!({"api_version":1,"daemon_version":env!("CARGO_PKG_VERSION"),"daemon_pid":std::process::id(),"deprecations":[]})
+                    json!({"api_version":1,"daemon_version":version,"daemon_pid":std::process::id(),"deprecations":[]})
+                }
+                Ok(hello) if hello.validate().is_ok() => {
+                    // Stops nothing; the connection stays open (design §6.2).
+                    mismatched = true;
+                    let mut refusal = error(&id, Refusal::from(VERSION_MISMATCH));
+                    refusal["error"]["data"]["daemon_version"] = json!(version);
+                    refusal["error"]["data"]["store_path"] = json!(client.store_path);
+                    send(&mut write, &refusal).await?;
+                    continue;
                 }
                 Ok(_) => {
                     send(&mut write, &error(&id, Refusal::from(VERSION_MISMATCH))).await?;
@@ -133,6 +150,46 @@ async fn stop_request(
     Ok(true)
 }
 
+/// A version-mismatched client's `daemon/stop` (design §6.2): only a
+/// plain stop, which daemon main accepts only while idle apart from this
+/// connection. Returns whether the stop was accepted.
+async fn idle_stop_request(
+    client: &Client,
+    params: Value,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    id: &Value,
+) -> anyhow::Result<bool> {
+    let decided = match typed::<DaemonStopParams>(params) {
+        Ok(params) if params.drain || params.force => Err(Refusal::from(ApiError::INVALID_PARAMS)),
+        Ok(_) => {
+            let (reply, decision) = oneshot::channel();
+            // A full queue means other mismatched clients are connected.
+            match client.idle_stops.try_send(IdleStop { reply }) {
+                Ok(()) => decision
+                    .await
+                    .unwrap_or(Err(NOT_IDLE))
+                    .map_err(Refusal::from),
+                Err(_) => Err(Refusal::from(NOT_IDLE)),
+            }
+        }
+        Err(refusal) => Err(refusal),
+    };
+    if let Err(refusal) = decided {
+        send(write, &error(id, refusal)).await?;
+        return Ok(false);
+    }
+    // Safe to ignore: the stop is accepted whether or not the reply arrives.
+    let _ = timeout(
+        STOP_REPLY,
+        send(
+            write,
+            &json!({"jsonrpc":"2.0","id":id,"result":{"stopping":true}}),
+        ),
+    )
+    .await;
+    Ok(true)
+}
+
 async fn dispatch(
     method: &str,
     params: Value,
@@ -148,9 +205,16 @@ async fn dispatch(
     match method {
         "daemon/status" => {
             typed::<DaemonStatusParams>(params)?;
+            // Memory only: no Store read (design §6.6).
+            let counts = engine.counts();
+            let connections = counts.connections;
             Ok(
-                json!({"daemon_version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),
-                "socket_path":socket_path,"store_path":store_path,"health":"healthy","sessions":{"idle":0,"active":engine.active(),"closing":0},"servers":[]}),
+                json!({"daemon_version":crate::client::binary_version(),"pid":std::process::id(),
+                "socket_path":socket_path,"store_path":store_path,"health":"healthy",
+                "sessions":{"idle":0,"active":counts.active,"closing":counts.closing},
+                "connections":{"limit":connections.limit,"in_use":connections.in_use,
+                    "held_unproven":connections.held_unproven},
+                "servers":[]}),
             )
         }
         "spawn" | "resume" => {
