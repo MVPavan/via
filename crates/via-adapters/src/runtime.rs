@@ -235,6 +235,12 @@ impl AdapterRuntime {
         self.route.held_unproven()
     }
 
+    /// Advances on every added holding: the re-probe loop resets its
+    /// backoff when it changes (design §8).
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.route.holdings_changed()
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns, which
     /// block idle exit (design §6.4).
     pub fn pending_cleanup(&self) -> usize {

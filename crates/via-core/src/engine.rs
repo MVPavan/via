@@ -163,6 +163,8 @@ struct Faults {
     hold_before_closed: AtomicBool,
     granted: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    /// Re-probe passes begun.
+    reprobe_passes: AtomicUsize,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.

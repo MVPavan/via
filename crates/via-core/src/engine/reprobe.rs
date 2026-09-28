@@ -31,39 +31,46 @@ struct Fence(#[expect(dead_code, reason = "held only for its drop")] Option<Owne
 
 impl Engine {
     /// Runs re-probe passes while holdings exist (design §8): at 1 s,
-    /// doubling to 10 s, and back to 1 s when a holding is added. It
-    /// continues through a drain, so capacity can return while drained
-    /// turns wait, and returns at final-shutdown entry, on force and on the
-    /// latch; final shutdown's reconciliation then takes over. A pass in
-    /// progress finishes under its own bound, so no proof commit or
-    /// reconciliation step is cut in the middle. It holds no Core lock
-    /// across an `.await`; `RecoveredSlots` and the Host ledger are short
-    /// `std` mutexes taken alone. Wakes: the force watch and the
-    /// final-shutdown fence's watch.
+    /// doubling to 10 s, and back to 1 s whenever Host signals an added
+    /// holding, during a wait or a pass. It continues through a drain, so
+    /// capacity can return while drained turns wait, and returns at
+    /// final-shutdown entry, on force and on the latch; final shutdown's
+    /// reconciliation then takes over. A pass in progress finishes under its
+    /// own bound, so no proof commit or reconciliation step is cut in the
+    /// middle. It holds no Core lock across an `.await`; `RecoveredSlots`
+    /// and the Host ledger are short `std` mutexes taken alone. Wakes: the
+    /// force watch, the final-shutdown fence's watch and Host's holdings
+    /// generation.
     pub async fn reprobe(&self) {
         let mut force = self.force.subscribe();
         let mut entered = self.final_shutdown.subscribe();
+        let mut added = self.adapter.holdings_changed();
         let mut interval = FIRST_PASS;
-        let mut known = 0;
+        let mut next = tokio::time::Instant::now() + FIRST_PASS;
         loop {
-            let holdings = self.holdings();
-            if holdings > known {
-                interval = FIRST_PASS;
-            }
-            known = holdings;
-            let wait = if holdings == 0 { IDLE_CHECK } else { interval };
             tokio::select! {
                 biased;
                 _ = force.wait_for(|forced| *forced) => return,
                 _ = entered.wait_for(|entered| *entered) => return,
-                () = tokio::time::sleep(wait) => {}
+                // A closed generation disables this arm; the timer goes on.
+                Ok(()) = added.changed() => {
+                    interval = FIRST_PASS;
+                    next = next.min(tokio::time::Instant::now() + FIRST_PASS);
+                    continue;
+                }
+                () = tokio::time::sleep_until(next) => {}
             }
-            if holdings == 0 || self.holdings() == 0 {
+            if self.holdings() == 0 {
+                // Nothing to read: only the in-memory counts, each second.
+                interval = FIRST_PASS;
+                next = tokio::time::Instant::now() + IDLE_CHECK;
                 continue;
             }
             self.reprobe_pass().await;
+            // A holding added during the pass has marked `added` changed:
+            // the next select resets the interval.
             interval = interval.saturating_mul(2).min(LAST_PASS);
-            known = self.holdings();
+            next = tokio::time::Instant::now() + interval;
         }
     }
 
@@ -71,6 +78,10 @@ impl Engine {
     /// held group with no live control, then one page of the interrupted
     /// startup reconciliation, if groups remain unread.
     async fn reprobe_pass(&self) {
+        #[cfg(test)]
+        self.faults
+            .reprobe_passes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let deadline = Deadline::at(tokio::time::Instant::now() + PASS_BOUND);
         // Safe to ignore: a failed pass keeps every token, and the next pass
         // retries; a not-committed proof keeps its token too (§7.2 row 12).

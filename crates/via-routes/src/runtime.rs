@@ -244,6 +244,11 @@ impl FakeRoute {
         self.wire.held_unproven()
     }
 
+    /// Advances on every added holding (design §8).
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.wire.holdings_changed()
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns
     /// (design §6.4).
     pub fn pending_cleanup(&self) -> usize {

@@ -1633,3 +1633,44 @@ fn the_reprobe_loop_returns_at_entry_and_on_force() {
         );
     });
 }
+
+/// T3-S3 round 1, decision 6 (design §8): the re-probe backoff resets to
+/// 1 s on every added holding, including one added while the loop waits.
+/// A held group with no identity keeps its token at every pass: after the
+/// passes at 1, 3 and 7 s the loop waits 8 s. A holding added once the
+/// third pass began is re-probed within 1 s (2.5 s allowed), not 8 s later.
+#[test]
+fn an_added_holding_resets_the_reprobe_backoff() {
+    let Some(root) = child("an_added_holding_resets_the_reprobe_backoff") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let passes = || engine.faults.reprobe_passes.load(Ordering::Acquire);
+        engine
+            .adapter
+            .hold_capacity("0-held".to_owned(), session.clone(), Box::new(()));
+        let stop = force();
+        let ((), ()) = tokio::join!(engine.reprobe(), async {
+            // During the third pass or the 8 s wait after it.
+            until(|| passes() == 3).await;
+            engine
+                .adapter
+                .hold_capacity("1-held".to_owned(), session.clone(), Box::new(()));
+            let added = tokio::time::Instant::now();
+            let reset = tokio::time::timeout(Duration::from_millis(2_500), async {
+                while passes() < 4 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                reset.is_ok(),
+                "no pass within 2.5 s of the addition ({:?})",
+                added.elapsed()
+            );
+            engine.request_stop(&stop).await.unwrap();
+        });
+    });
+}

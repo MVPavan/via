@@ -72,6 +72,10 @@ struct Ledger {
     live: HashMap<String, LiveControl>,
     /// Sticky: the early stop's deadline, once the force signal came.
     stopping: Option<Instant>,
+    /// Advanced on every added holding: a held entry, or an uncertain
+    /// settlement that leaves one for re-probe (design §8). Core's re-probe
+    /// loop resets its backoff on it.
+    holdings: watch::Sender<u64>,
 }
 
 /// A verified control and its launch phase.
@@ -107,6 +111,11 @@ impl Ledger {
         owner: crate::SessionId,
         token: crate::CapacityToken,
     ) -> Option<Held> {
+        // A group an acquisition still owns is not a holding yet: its
+        // uncertain settlement signals it.
+        if !self.busy(&anchor_id) {
+            self.holdings.send_modify(|generation| *generation += 1);
+        }
         self.held.insert(
             anchor_id,
             Held {
@@ -222,6 +231,12 @@ impl Capacity {
         if matches!(cleanup, CleanupEvidence::GroupAbsent(_)) {
             let held = self.lock().held.remove(anchor_id);
             drop(held);
+        } else {
+            // The group stays held: now a holding only a re-probe can release.
+            let ledger = self.lock();
+            if ledger.held.contains_key(anchor_id) {
+                ledger.holdings.send_modify(|generation| *generation += 1);
+            }
         }
     }
 }
@@ -761,6 +776,12 @@ impl Host {
         token: crate::CapacityToken,
     ) {
         self.capacity.hold(anchor_id, owner, token);
+    }
+
+    /// Advances on every added holding (design §8): Core's re-probe loop
+    /// resets its backoff to 1 s when it changes.
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.capacity.lock().holdings.subscribe()
     }
 
     /// Held groups with no live control: the ledger entries only a proof
