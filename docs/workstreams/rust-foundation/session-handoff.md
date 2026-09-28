@@ -95,19 +95,17 @@ the historical checkpoint; its findings table is updated by this section.
   `t3/reports/T3-S1.md` "Round 1"; gate 213 / 2, failpoints 261 / 2 ×3,
   F08–F12 17). Decision 8 (post-`stopping` acquisitions keep the early
   stop's deadline) and dispositions 9–10 are in the same decisions file.
-  A Sol medium re-review of `4352602..020ac95` is running in tmux window
-  `sol-s1-r1`. Its output goes to the gitignored
-  `scratchpad/reviews/t3/review-s1-r1.md`, and its brief is
-  `brief-s1-r1.md` alongside. **Resume here:**
-  1. Read the review, copy it to `t3/sol-review-S1-r1.md`, and decide its
-     findings.
-  2. Dispatch a fresh `implementer-high` in that worktree for decision 8 and
-     any findings.
-  3. Get a narrow Sol check of that round.
-  4. Merge `wt/t3-s1` into `rust-foundation`, run the gate, push. Delete the
+  The Sol medium re-review of `4352602..020ac95` is SOUND: merge after
+  decision 8, with no findings (`t3/sol-review-S1-r1.md`). Round 2
+  (decision 8 only) is with the round-1 worker in the same worktree; it
+  appends "Round 2" to the report. **Resume here:**
+  1. If the worker died, check `wt/t3-s1` past `020ac95` and dispatch a
+     fresh `implementer-high` for whatever of decision 8 is missing.
+  2. Get a narrow Sol check of round 2.
+  3. Merge `wt/t3-s1` into `rust-foundation`, run the gate, push. Delete the
      remote `claude/t3-s1-task-execution-60rojp` and the worktree.
-  5. Make the design and contract edits both S1 report sections list.
-  6. S2. **From 2026-09-28 no new cloud work: Claude workers are local
+  4. Make the design and contract edits all the S1 report sections list.
+  5. S2. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). Then S2
   (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique

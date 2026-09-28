@@ -78,3 +78,7 @@ S1 review on `8d2a7b6` (GPT-6 Sol medium, in two parts):
 (UNSOUND: the interrupt write discards a raw Store failure). The local
 gate at `8d2a7b6` was clean: default tests 207/2 three times, failpoint
 tests 253/2 five times, F08–F12 17. Decisions are in `s1-r1-decisions.md`.
+Round 1 (local `wt/t3-s1`, `4352602..020ac95`) fixed decisions 1–7. Gate:
+213 / 2, failpoints 261 / 2 three times, F08–F12 17. The Sol medium
+re-review (`sol-review-S1-r1.md`) is SOUND: merge after decision 8, with no
+findings. Round 2 is decision 8 alone.
