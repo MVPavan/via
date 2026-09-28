@@ -79,9 +79,19 @@ POINTS = [
     "core.cancel.settling",
     "core.run.idle_expired",
     "core.cancel.ordered",
+    # Task 3 S3 (design §6, §10): daemon lifecycle seams.
+    "daemon.startup.after_lock",
+    "daemon.dispatcher.before_start",
+    "daemon.shutdown.idle_final",
+    "daemon.shutdown.before_fence",
+    "daemon.shutdown.after_fence",
+    "core.shutdown.reconcile_entry",
+    "core.shutdown.before_forced_terminal",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
-MARKERS = [*ACTIVATION, *POINTS, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
+# Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
+OVERRIDES = {"VIA_TEST_CLIENT_VERSION": "0.0.0-release-check", "VIA_TEST_IDLE_EXIT_MS": "1"}
+MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {
     "expected_request": {"type": "start", "id": 1, "turn": 1, "prompt": "release"},
     "steps": [
@@ -189,7 +199,13 @@ def ignored_activation(via, fake, root):
         path.chmod(0o600)
     fixture = root / "fixture.json"
     fixture.write_text(json.dumps(FIXTURE))
-    activation = {"VIA_FAILPOINT_DIR": str(paths["failpoints"]), "VIA_FAILPOINT_TOKEN": token}
+    activation = {
+        "VIA_FAILPOINT_DIR": str(paths["failpoints"]),
+        "VIA_FAILPOINT_TOKEN": token,
+        # Supplied like the activation inputs; the marker scan below is the
+        # direct check that release carries neither name.
+        **OVERRIDES,
+    }
     env = environment(paths, fake, fixture, activation)
     with open(root / "daemon.trace", "wb") as trace:
         daemon, error = start_daemon(via, env, trace)

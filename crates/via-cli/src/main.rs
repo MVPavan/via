@@ -287,6 +287,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 params["idempotency_key"] = Value::String(key);
             }
             args.turn.apply(&mut params)?;
+            // Foreground: Ctrl-C leaves the turn running (design §6.5).
+            let _interrupt = (!args.background).then(exit_on_interrupt).transpose()?;
             let mut receipt = client::request("spawn", &params, true)?;
             if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
                 result.insert("handle".to_owned(), Value::String(handle));
@@ -352,6 +354,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             // The daemon answers `wait_timeout` at the bound; allow for the reply.
             let read = read.saturating_add(Duration::from_secs(5));
+            let _interrupt = exit_on_interrupt()?;
             client::call_within("wait", &params, true, true, read)
         }
         Command::Events(args) => {
@@ -411,6 +414,36 @@ fn close(args: CloseArgs) -> anyhow::Result<i32> {
     // time a running turn's terminal takes.
     let read = read.saturating_add(Duration::from_secs(30));
     client::call_within("close", &params, true, true, read)
+}
+
+/// Exit status of a foreground `spawn` or `wait` the user interrupted.
+const INTERRUPTED: i32 = 130;
+
+/// While a foreground `spawn` or `wait` waits (design §6.5): SIGINT writes
+/// nothing and cancels nothing; the CLI exits 130 once stdout is flushed.
+/// The daemon runs in its own process group, so the terminal's SIGINT never
+/// reaches it. The handler is registered before this returns; dropping the
+/// guard stops the task.
+fn exit_on_interrupt() -> io::Result<Interrupt> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let task = tokio::spawn(async move {
+        if interrupt.recv().await.is_some() {
+            // Waits for a line being written to finish, so none is cut.
+            let mut stdout = io::stdout().lock();
+            let _ = io::Write::flush(&mut stdout);
+            std::process::exit(INTERRUPTED);
+        }
+    });
+    Ok(Interrupt(task))
+}
+
+/// Owns the interrupt task for as long as the CLI waits.
+struct Interrupt(tokio::task::JoinHandle<()>);
+
+impl Drop for Interrupt {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Read bound of `cancel --wait`, whose reply waits for the turn's terminal.
