@@ -1969,8 +1969,9 @@ fn corrupt_head_read(verb: &str) -> TestResult {
 /// session-head read of final shutdown's failure-resolution batch is
 /// reported as corruption. A lost event reply (`store.commit.reply_lost`)
 /// latches and leaves the head unknown, so the batch reads it
-/// (`store.sqlite.corrupt_head`): the batch is skipped, and the latest
-/// `store_failure`, served in the diagnostic window, is `corrupt_store`.
+/// (`store.sqlite.corrupt_head`): the batch is skipped, nothing more is
+/// written, and the latest `store_failure`, served in the diagnostic
+/// window, is `corrupt_store`.
 #[test]
 fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
     let point = "store.sqlite.corrupt_head";
@@ -1988,9 +1989,12 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
     sandbox.count("store.commit.reply_lost")?;
     sandbox.count(point)?;
     let daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("first")?;
+    let (session, handle) = sandbox.spawn("first")?;
     sandbox.await_file("accepted.entered")?;
     sandbox.await_accepted(&session, 1)?;
+    // The acceptance's reply hit is counted after its row is durable; a
+    // receipt's reply returns after its own hit, so the count is settled.
+    sandbox.resume(&session, &handle, "second")?;
     let lost = sandbox.next_hit("store.commit.reply_lost")?;
     sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
     let next = sandbox.next_hit(point)?;
@@ -2011,7 +2015,12 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
     check(
         summary["failure_batches"] == json!({"committed": 0, "skipped": 1}),
         || format!("unexpected summary: {summary}"),
-    )
+    )?;
+    let states: String = sandbox.query(&format!(
+        "SELECT group_concat(state, ',') FROM
+         (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
+    ))?;
+    check(states == "running,queued", || format!("turns: {states}"))
 }
 
 // -------------------------------------------------------- latch path (§7.4)
