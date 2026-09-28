@@ -1044,7 +1044,7 @@ fn s1_recovery_without_armed_anchor_records_no_raw_incompleteness() -> TestResul
     )
 }
 
-// ------------------------------------------------- restart handoff: queued turns
+// ------------------------------------------------- restart handoff: queued turns, corrupt rows (O1.D8)
 
 /// Crashes a daemon with turn 1 completed and turns 2.. of `prompts` durably
 /// `queued`: the dispatcher is held at `core.dispatch.before_grant` for
@@ -1094,6 +1094,115 @@ fn crash_with_queued_turns(
     paths.failpoints.disarm(point).map_err(infra)?;
     drop(daemon);
     Ok((session, receipts))
+}
+
+/// Writes `effective` into a queued turn's frozen row while no daemon runs.
+#[cfg(feature = "test-failpoints")]
+fn corrupt_effective(
+    paths: &Paths,
+    session: &str,
+    n: u32,
+    effective: &str,
+) -> Result<(), ScenarioError> {
+    let changed = rusqlite::Connection::open(paths.state.join("store.sqlite3"))
+        .map_err(infra)?
+        .execute(
+            "UPDATE turns SET effective=?3 WHERE session_id=?1 AND number=?2 AND state='queued'",
+            rusqlite::params![session, n, effective],
+        )
+        .map_err(infra)?;
+    check(changed == 1, || format!("turn {n} was not queued"))
+}
+
+/// Design §7.2 row 2 shape for a handoff turn failed on a corrupt row: no
+/// launch, `failed(store)` with `submitted_at` and `cancel: null`, and only
+/// `turn.queued`, `turn.submitted` and `turn.ended` in its history.
+#[cfg(feature = "test-failpoints")]
+fn failed_on_corrupt_row(paths: &Paths, session: &str, n: u32) -> Result<(), ScenarioError> {
+    let (state, envelope) = paths.turn(session, n)?;
+    check(
+        state == "failed"
+            && envelope["state"] == "failed"
+            && envelope["failure"]["class"] == "store"
+            && envelope["cancel"].is_null()
+            && envelope["timestamps"]["submitted_at"].is_string(),
+        || format!("turn {n} after restart: {state} {envelope}"),
+    )?;
+    let types = paths.turn_types(session, n)?;
+    check(
+        types == ["turn.queued", "turn.submitted", "turn.ended"],
+        || format!("turn {n} history: {types:?}"),
+    )?;
+    check(paths.anchors_of_turn(session, n)? == 0, || {
+        format!("turn {n} launched")
+    })
+}
+
+/// O1.D8, restart half (design §7.3): in the restart handoff a frozen value
+/// that is present but unparseable fails that turn `failed(store)` through
+/// `commit_submit_failed`, without agent I/O. Turn 2's `effective` is not
+/// JSON (Store cannot read the row); turn 3's is JSON Core cannot parse.
+/// The restarted daemon admits, and turn 4 runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f12_corrupt_frozen_row_fails_turn_on_restart() -> TestResult {
+    let fixture = json!({"scripts":[completes("r1", 1), completes("r4", 4)]});
+    scenario("s1_f12_corrupt_frozen_row", &fixture, |paths, evidence| {
+        let (session, _) =
+            crash_with_queued_turns(paths, evidence, &["r1", "r2", "r3", "r4"], &[], &[])?;
+        corrupt_effective(paths, &session, 2, "not json {")?;
+        corrupt_effective(paths, &session, 3, r#"{"deadlines":"unparseable"}"#)?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        failed_on_corrupt_row(paths, &session, 2)?;
+        failed_on_corrupt_row(paths, &session, 3)?;
+        let fourth = wait(paths, evidence, &format!("{session}/4"))?;
+        check(fourth["state"] == "completed", || {
+            format!("turn 4 after the corrupt rows: {fourth}")
+        })?;
+        check(paths.anchors_of_turn(&session, 4)? == 1, || {
+            "turn 4 did not launch exactly once".to_owned()
+        })
+    })
+}
+
+/// Design §7.2 row 13: when the handoff's `commit_submit_failed` for a
+/// corrupt row does not commit (`store.commit.terminal`), startup fails and
+/// nothing is admitted; the turn stays `queued`. A later start commits it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_write_failure_fails_startup() -> TestResult {
+    let fixture = json!({"scripts":[completes("w1", 1), completes("w3", 3)]});
+    scenario(
+        "s1_recovery_corrupt_row_write",
+        &fixture,
+        |paths, evidence| {
+            let (session, _) =
+                crash_with_queued_turns(paths, evidence, &["w1", "w2", "w3"], &[], &[])?;
+            corrupt_effective(paths, &session, 2, "not json {")?;
+            let point = "store.commit.terminal";
+            paths.failpoints.arm(point, 1, "fail_io").map_err(infra)?;
+            let mut refused = Daemon::spawn(paths, evidence, "refused", &[])?;
+            let status = wait_child(&mut refused.child, Duration::from_secs(15))?
+                .ok_or_else(|| fail("the daemon admitted after a failed handoff write"))?;
+            let trace =
+                fs::read_to_string(evidence.dir.join("daemon-refused.trace")).map_err(infra)?;
+            check(!status.success() && trace.contains("store_error"), || {
+                format!("startup did not fail on the Store failure ({status}): {trace}")
+            })?;
+            drop(refused);
+            let (state, _) = paths.turn(&session, 2)?;
+            check(state == "queued", || {
+                format!("turn 2 after the failed write: {state}")
+            })?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            failed_on_corrupt_row(paths, &session, 2)?;
+            let third = wait(paths, evidence, &format!("{session}/3"))?;
+            check(third["state"] == "completed", || {
+                format!("turn 3 after restart: {third}")
+            })
+        },
+    )
 }
 
 // ------------------------------------------------- nondefault frozen values

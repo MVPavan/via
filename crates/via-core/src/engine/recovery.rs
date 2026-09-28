@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{
-    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, SubmitFailedRecord,
+    TerminalRecord, UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
@@ -21,7 +22,9 @@ use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339};
+use crate::api::{
+    Cancel, Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
+};
 use crate::{ApiError, Cleanup, ConnectionId, Deadline, RawRef, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
@@ -39,9 +42,14 @@ pub struct Handoff {
     pub cancelled: usize,
     /// Durably `closing` sessions the restart closed (design §4).
     pub closed: usize,
+    /// Failed `failed(store)` without agent I/O because a frozen value in
+    /// the queued row is unparseable (design §7.3, O1.D8).
+    pub failed: usize,
 }
 /// Startup budget for Host's anchor reconciliation (its native stop is 3 s).
 const HOST_RECOVERY: Duration = Duration::from_secs(5);
+/// The failure message of a turn whose frozen row cannot be parsed.
+const CORRUPT_ROW: &str = "a frozen value of the queued turn could not be read";
 
 impl Engine {
     /// Reconciles committed anchors through Host, then resolves every durable
@@ -86,6 +94,13 @@ impl Engine {
     /// A durably `closing` session is finished before admission (design §4
     /// "Restart"): its queued turns are cancelled with cause `close`, then
     /// `Closed` commits after one bounded absence check.
+    ///
+    /// Design §7.3 (O1.D8): a turn at its session's head whose frozen row is
+    /// present but unparseable fails `failed(store)` without agent I/O
+    /// through `commit_submit_failed`, and its successors are handed off as
+    /// usual. That write failing fails startup (§7.2 row 13). A corrupt turn
+    /// behind an unresolved predecessor is enqueued: the dispatcher's live
+    /// rule meets it at the head, so turns still dispatch in order.
     pub async fn hand_off_queued(&self) -> Result<Handoff, String> {
         let mut handoff = Handoff::default();
         let closing = self.closing_on_disk().await?;
@@ -110,11 +125,20 @@ impl Engine {
                     && predecessors.last_submitted.is_some_and(|envelope| {
                         envelope["state"] == "unknown" && envelope["cancel"]["cleanup"] != "pending"
                     });
+                let close = closing.contains(&session);
+                if !predecessors.unresolved
+                    && self
+                        .frozen_row_corrupt(&session, turn, !(cancel || close))
+                        .await?
+                {
+                    self.fail_corrupt_turn(&session, turn).await?;
+                    handoff.failed += 1;
+                    continue;
+                }
                 let slot = self.slot_for(&session);
                 self.unresolved.receipt(&session, turn);
                 self.active.fetch_add(1, Ordering::AcqRel);
                 self.queued.fetch_add(1, Ordering::AcqRel);
-                let close = closing.contains(&session);
                 if cancel || close {
                     let cause = close.then(|| (CancelCause::Close, rfc3339(SystemTime::now())));
                     if !matches!(
@@ -145,6 +169,133 @@ impl Engine {
             handoff.closed += 1;
         }
         Ok(handoff)
+    }
+
+    /// Whether `turn`'s queued row holds a frozen value that is present but
+    /// unparseable (design §7.3): Store cannot read the row, or, for a turn
+    /// the handoff would enqueue (`parse`), Core cannot read its `effective`.
+    /// Any other read failure fails startup.
+    async fn frozen_row_corrupt(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        parse: bool,
+    ) -> Result<bool, String> {
+        match self.store.queued_turn(session, turn).await {
+            Ok(Some(queued)) => {
+                Ok(parse && serde_json::from_value::<Effective>(queued.effective).is_err())
+            }
+            // Store's own parse of the row's values failed.
+            Err(StoreError::CorruptEvidence) => Ok(true),
+            Ok(None) => Err(format!(
+                "store_error: queued turn {session}/{} is gone",
+                turn.get()
+            )),
+            Err(error) => Err(format!("store_error: {error}")),
+        }
+    }
+
+    /// Fails a queued turn whose frozen row is corrupt (design §7.2 row 2,
+    /// §7.3): `turn.submitted` and `turn.ended` `failed(store)`, with
+    /// `cancel: null`, in one `commit_submit_failed` transaction and without
+    /// agent I/O. Any failure of the write fails startup (§7.2 row 13).
+    async fn fail_corrupt_turn(&self, session: &SessionId, turn: TurnNumber) -> Result<(), String> {
+        let store_error = |error: ApiError| format!("store_error: {}", error.kind);
+        // The row itself may be unreadable: its queueing comes from the
+        // committed history instead.
+        let History {
+            queued_at,
+            queued_seq,
+            ..
+        } = self.history(session, turn).await.map_err(store_error)?;
+        let slot = self.slot_for(session);
+        let head = slot
+            .head
+            .lock(&self.store, session)
+            .await
+            .map_err(|error| format!("store_error: {error}"))?;
+        let submitted_seq = head.next();
+        let ended_seq = submitted_seq
+            .checked_add(1)
+            .ok_or("store_error: the session's sequence is exhausted")?;
+        let at = rfc3339(SystemTime::now());
+        let terminal = Terminal {
+            state: "failed",
+            failure: Some(failure(FailureClass::Store, CORRUPT_ROW.to_owned(), None)),
+            stop_reason: "error",
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            cancel: None,
+        };
+        let submitted = Event {
+            seq: submitted_seq,
+            session_id: session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &at,
+            raw_ref: None,
+            body: EventBody::TurnSubmitted { attempt: 1 },
+        }
+        .to_value()
+        .map_err(store_error)?;
+        let ended = Event {
+            seq: ended_seq,
+            session_id: session,
+            turn: Some(turn.get()),
+            late: false,
+            at: &at,
+            raw_ref: None,
+            body: EventBody::TurnEnded {
+                state: terminal.state,
+                failure: terminal.failure.clone(),
+                stop_reason: terminal.stop_reason,
+                cancel: None,
+            },
+        }
+        .to_value()
+        .map_err(store_error)?;
+        let timestamps = Timestamps {
+            queued_at,
+            submitted_at: Some(at.clone()),
+            accepted_at: None,
+            ended_at: at.clone(),
+        };
+        // No vendor I/O happened, so no duration is claimed.
+        let envelope = terminal_envelope(
+            session,
+            turn,
+            terminal,
+            None,
+            Vec::new(),
+            timestamps,
+            None,
+            (queued_seq, ended_seq),
+        );
+        let envelope = serde_json::to_value(&envelope).map_err(|_| store_error(ApiError::STORE))?;
+        let committed = self
+            .store
+            .commit_submit_failed(SubmitFailedRecord {
+                session_id: session.clone(),
+                turn,
+                submitted,
+                ended,
+                envelope,
+            })
+            .await;
+        match committed {
+            Ok(()) => {
+                head.committed(2);
+                Ok(())
+            }
+            Err(error) => {
+                head.lost();
+                Err(format!("store_error: {error}"))
+            }
+        }
     }
 
     /// Pages through every committed anchor with Host's reports for the same
