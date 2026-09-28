@@ -1,13 +1,17 @@
-//! The resolution write of a queued turn that fails without agent I/O
-//! (design §7.2 row 2, §7.3): `commit_submit_failed` commits `turn.submitted`
+//! Turns whose own Store writes failed outside Core's event commits
+//! (design §7.2). The resolution write of a queued turn that fails without
+//! agent I/O (row 2, §7.3): `commit_submit_failed` commits `turn.submitted`
 //! and `turn.ended` `failed(store)`, `cancel: null`, in one transaction
-//! (`queued → running → failed`, C1 §7.2). The live dispatcher and the
-//! restart handoff share it.
+//! (`queued → running → failed`, C1 §7.2); the live dispatcher and the
+//! restart handoff share it. And a running turn whose Route reports a
+//! Store failure: a Host journal write (rows 3 and 4) or raw evidence
+//! (row 6).
 
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
+use via_adapters::{RouteError, StoreFailure};
 use via_store::{StoreClient, StoreError, SubmitFailedRecord};
 
 use super::drive::Step;
@@ -15,7 +19,7 @@ use super::journal::Head;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::Slot;
 use super::terminal::terminal_envelope;
-use super::{Engine, Terminal, failure};
+use super::{Engine, FailureNote, Terminal, TurnRecord, failure};
 use crate::api::{Event, EventBody, FailureClass, Timestamps, rfc3339};
 use crate::{SessionId, TurnNumber};
 
@@ -65,6 +69,56 @@ impl fmt::Display for SubmitFailed {
 }
 
 impl Engine {
+    /// Design §7.2 rows 3, 4 and 6 [O1.D10, D11]: a Store write the turn's
+    /// Route depended on failed (`cause`), or a Host journal write of it
+    /// had an uncertain outcome (`journal_uncertain`, §7.1). Route's Store
+    /// failure is the turn's first failure, reported to the failure hook.
+    /// One that did not commit stops the turn with cause `store`: the order
+    /// is attached before the turn settles, so its disposition is `failed
+    /// (store)` with the `cancel` evidence, and its terminal is the
+    /// resolution write. One that may have committed latches. Returns
+    /// whether the raw log lost bytes (row 6), which the resolution write
+    /// records as `raw_log.incomplete`. The caller holds no lock.
+    pub(super) async fn route_failed(
+        &self,
+        slot: &Slot,
+        record: &mut TurnRecord,
+        cause: Option<&RouteError>,
+        journal_uncertain: bool,
+    ) -> bool {
+        if journal_uncertain {
+            let scope = FailureScope::Turn(&record.session, record.turn);
+            self.store_failure(FailureSite::Journal, WriteOutcome::Uncertain, scope)
+                .finish()
+                .await;
+        }
+        let Some(RouteError::Store { kind, .. }) = cause else {
+            return false;
+        };
+        if record.first_failure.is_some() {
+            // An earlier write already failed; Route's failure follows it.
+            return false;
+        }
+        let site = match kind {
+            StoreFailure::NotCommitted => FailureSite::Journal,
+            StoreFailure::Raw
+            | StoreFailure::NotEnqueued
+            | StoreFailure::WriterLost
+            | StoreFailure::Uncertain => FailureSite::Raw,
+        };
+        let outcome = if kind.latches() {
+            WriteOutcome::Uncertain
+        } else {
+            WriteOutcome::NotCommitted
+        };
+        record.first_failure = Some(FailureNote { site, outcome });
+        self.report_first_failure(record, false).await;
+        if outcome == WriteOutcome::NotCommitted {
+            slot.store_order(record.turn, tokio::time::Instant::now());
+        }
+        site == FailureSite::Raw && outcome == WriteOutcome::NotCommitted
+    }
+
     /// Fails the claimed queue head `turn` with row 2's resolution write
     /// (design §7.2, §7.3), without agent I/O; the caller dropped its
     /// connection slot. On a commit the turn leaves the queue (its stop

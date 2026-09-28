@@ -45,6 +45,12 @@ impl AdapterError {
     pub fn is_store_failure(&self) -> bool {
         matches!(self, Self::Open(error) if error.is_store_failure())
     }
+
+    /// A Host journal write had an uncertain outcome: the daemon latches
+    /// (design §7.2 row 12).
+    pub fn journal_uncertain(&self) -> bool {
+        matches!(self, Self::Open(error) if error.journal_uncertain())
+    }
 }
 
 /// Passive recovery facts for Core's later crash reconciliation.

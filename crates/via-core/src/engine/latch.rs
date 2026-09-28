@@ -81,6 +81,12 @@ pub(super) enum FailureSite {
     /// Final shutdown's failure-resolution batch (§7.4); only reached after
     /// the latch.
     Batch,
+    /// A raw append or sync Route depends on (row 6).
+    Raw,
+    /// A Host journal write of a turn's acquisition (rows 3 and 4).
+    Journal,
+    /// A group-absence proof's commit (row 12).
+    Absence,
 }
 
 impl FailureSite {
@@ -97,7 +103,10 @@ impl FailureSite {
             | Self::Submission
             | Self::Event
             | Self::Terminal
-            | Self::QueuedCancel => true,
+            | Self::QueuedCancel
+            | Self::Raw
+            | Self::Journal
+            | Self::Absence => true,
             // The escalation: a turn's one resolution write failed.
             Self::Resolution | Self::Batch => false,
         }
@@ -109,14 +118,16 @@ impl FailureSite {
     fn scope(self) -> &'static str {
         match self {
             Self::Receipt | Self::RequestCancel | Self::Closing => "request",
-            Self::Closed | Self::SessionClosed => "session",
+            Self::Closed | Self::SessionClosed | Self::Absence => "session",
             Self::Submission
             | Self::Event
             | Self::Terminal
             | Self::Resolution
             | Self::QueuedCancel
             | Self::ForcedTerminal
-            | Self::Batch => "turn",
+            | Self::Batch
+            | Self::Raw
+            | Self::Journal => "turn",
         }
     }
 }
@@ -226,6 +237,8 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             | FailureSite::Closed
             | FailureSite::ForcedTerminal
             | FailureSite::Batch => "commit_failed",
+            FailureSite::Raw => "raw_failed",
+            FailureSite::Journal | FailureSite::Absence => "journal_failed",
         },
     }
 }

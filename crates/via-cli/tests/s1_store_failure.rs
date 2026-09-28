@@ -1464,3 +1464,288 @@ fn s1_f12_force_rider_rollback_retries() -> TestResult {
     }
     Ok(())
 }
+
+// ------------------------------------- Host journal and raw evidence (3, 4, 6)
+
+/// `pid` is live: neither gone nor a zombie awaiting its reaper.
+fn process_live(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|text| {
+            let state = text.get(text.rfind(')')? + 2..)?.chars().next()?;
+            Some(state != 'Z' && state != 'X')
+        })
+        .unwrap_or(false)
+}
+
+/// Design §7.2 row 3 [O1.D10]: an anchor intent that is not committed
+/// starts no process; the turn ends `failed(store)` with `requested` and
+/// `quiescent` evidence, and the session's next turn launches.
+#[test]
+fn s1_f12_anchor_intent_not_committed() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[
+        held("other", 1),
+        script("first", 1, vec![gate("first"), accepted(1), terminal(1)]),
+        completes("second", 2),
+    ]))?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    // The second session's anchor intent was the first.
+    sandbox.arm("store.journal.anchor_intent", 2, "fail_io")?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, "store.journal.anchor_intent", 2, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["stop_reason"] == "error"
+            && first["cancel"]["outcome"] == "requested"
+            && first["cancel"]["cleanup"] == "quiescent",
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    check(
+        sandbox.anchors(&session, 1)? == 0 && !sandbox.sync.join("first.entered").exists(),
+        || "turn 1 launched".to_owned(),
+    )?;
+    sandbox.resume(&session, &handle, "second")?;
+    let second = sandbox.wait(&format!("{session}/2"))?;
+    check(second["state"] == "completed", || {
+        format!("the next turn did not launch: {second}")
+    })?;
+    dense(&sandbox.events(&session)?)?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "journal_failed" && failure["scope"] == "turn",
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    scoped_end(daemon, &other)
+}
+
+/// Design §7.2 row 4 [O1.D10, r3.12]: an anchor identified, ARM intent or
+/// vendor facts write that is not committed stops the group through the
+/// live control, from the identity Host recorded before the commit, and
+/// proves it absent: the turn ends `failed(store)` with `cancel` evidence
+/// and cleanup `quiescent`, and the session's next turn launches. The
+/// outer harness proves every anchor's group absent at the end.
+#[test]
+fn s1_f12_host_journal_failure_stops_group() -> TestResult {
+    for point in [
+        "store.journal.identified",
+        "store.journal.arm_intent",
+        "store.journal.vendor_facts",
+    ] {
+        host_journal_failure_stops_group(point).map_err(|error| format!("{point}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn host_journal_failure_stops_group(point: &str) -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[
+        held("other", 1),
+        script(
+            "first",
+            1,
+            vec![
+                json!({"action":"report_pids"}),
+                accepted(1),
+                gate("first"),
+                terminal(1),
+            ],
+        ),
+        completes("second", 2),
+    ]))?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    // The second session's write at `point` was the first.
+    sandbox.arm(point, 2, "fail_io")?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, point, 2, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["cancel"]["requested_at"].is_string()
+            && first["cancel"]["cleanup"] == "quiescent",
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    // The vendor, if it ran, is gone.
+    let agent = sandbox.sync.join("agent.pid");
+    if agent.exists() {
+        let pid: u32 = fs::read_to_string(&agent)?.trim().parse()?;
+        check(!process_live(pid), || "the vendor survived".to_owned())?;
+    }
+    sandbox.resume(&session, &handle, "second")?;
+    let second = sandbox.wait(&format!("{session}/2"))?;
+    check(second["state"] == "completed", || {
+        format!("the next turn did not launch: {second}")
+    })?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "journal_failed" && failure["scope"] == "turn",
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    scoped_end(daemon, &other)
+}
+
+/// Design §7.2 row 6 [O1.D11, r3.10]: a raw append that fails fails the
+/// connection; the group is force-closed and proved absent, and the
+/// terminal is `failed(store)` with `raw_log.incomplete` sequenced just
+/// before `turn.ended` in the same transaction, the `raw_log_incomplete`
+/// warning and the cleanup evidence.
+#[test]
+fn s1_f12_raw_failure_records_incomplete() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[
+        held("other", 1),
+        script(
+            "first",
+            1,
+            vec![
+                accepted(1),
+                gate("accepted"),
+                text("lost"),
+                gate("first"),
+                terminal(1),
+            ],
+        ),
+    ]))?;
+    sandbox.count("raw.append.fail")?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    let next = sandbox.next_hit("raw.append.fail")?;
+    sandbox.arm("raw.append.fail", next, "fail_io")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, "raw.append.fail", next, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    let warned = first["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|w| w["code"] == "raw_log_incomplete"));
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["cancel"]["cleanup"] == "quiescent"
+            && warned,
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 1)
+            == [
+                "turn.queued",
+                "turn.submitted",
+                "turn.started",
+                "raw_log.incomplete",
+                "turn.ended",
+            ],
+        || format!("turn 1 events: {events:?}"),
+    )?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "raw_failed" && failure["scope"] == "turn",
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    scoped_end(daemon, &other)
+}
+
+// ------------------------------------------------ re-probe proofs (rows 4, 12)
+
+/// Design §7.2 rows 4 and 12 [s1.6]: an anchor identified write that is
+/// not committed, with the anchor held at `host.anchor.before_eof_cleanup`,
+/// leaves absence unproven: the slot stays held
+/// (`connections.held_unproven`). After release, re-probe commits the
+/// proof with the identity Host kept in memory and frees the slot. The
+/// proof's own commit: not committed once, it is retried on the next pass
+/// and nothing latches; uncertain (the commit outlives the pass), the
+/// daemon latches.
+#[test]
+fn s1_f12_host_journal_failure_unproven_slot_reprobed() -> TestResult {
+    for proof in ["commits", "not_committed", "uncertain"] {
+        unproven_slot_reprobed(proof).map_err(|error| format!("{proof}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn unproven_slot_reprobed(proof: &str) -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![accepted(1), gate("first"), terminal(1)],
+    ))?;
+    let daemon = sandbox.start()?;
+    let eof_cleanup = "host.anchor.before_eof_cleanup";
+    sandbox.arm(eof_cleanup, 1, "pause")?;
+    sandbox.arm("store.journal.identified", 1, "fail_io")?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, "store.journal.identified", 1, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["cancel"]["cleanup"] == "uncertain",
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    let held = sandbox.status()?;
+    check(held["connections"]["held_unproven"] == 1, || {
+        format!("the slot is not held: {held}")
+    })?;
+    match proof {
+        "not_committed" => sandbox.arm("store.journal.absence", 1, "fail_io")?,
+        "uncertain" => sandbox.arm("store.journal.absence", 1, "pause")?,
+        _ => {}
+    }
+    sandbox.process_ack(eof_cleanup, 1, "pause")?;
+    sandbox.resume_point(eof_cleanup, 1)?;
+    sandbox.disarm(eof_cleanup)?;
+    if proof == "uncertain" {
+        sandbox.ack(&daemon, "store.journal.absence", 1, "pause")?;
+        // The proof's commit outlives the pass's bound: uncertain. The
+        // latch shows in `daemon/status` while the window serves, and the
+        // socket is gone after it.
+        wait_until("the daemon latches", Duration::from_secs(20), || {
+            !sandbox.runtime.join("via.sock").exists()
+                || sandbox
+                    .status()
+                    .is_ok_and(|status| status["health"] == "store_failed")
+        })?;
+        sandbox.resume_point("store.journal.absence", 1)?;
+        daemon.latched_exit()?;
+        return Ok(());
+    }
+    if proof == "not_committed" {
+        sandbox.ack(&daemon, "store.journal.absence", 1, "fail_io")?;
+    }
+    wait_until(
+        "the re-probe frees the slot",
+        Duration::from_secs(30),
+        || {
+            sandbox
+                .status()
+                .is_ok_and(|status| status["connections"]["held_unproven"] == 0)
+        },
+    )?;
+    let proved: i64 = sandbox.query(&format!(
+        "SELECT count(*) FROM anchors WHERE owner_session='{session}'
+         AND pgid IS NOT NULL AND absence_time IS NOT NULL"
+    ))?;
+    check(proved == 1, || {
+        "the proof was not committed with the identity".to_owned()
+    })?;
+    let status = sandbox.status()?;
+    check(status["health"] == "healthy", || {
+        format!("a scoped failure latched: {status}")
+    })?;
+    if proof == "not_committed" {
+        // The identified write's failure, then the proof's.
+        let failure = store_failure(&sandbox)?;
+        check(
+            failure["kind"] == "journal_failed"
+                && failure["scope"] == "session"
+                && failure["count"] == 2,
+            || format!("unexpected store_failure: {failure}"),
+        )?;
+    }
+    daemon.stop_clean()
+}

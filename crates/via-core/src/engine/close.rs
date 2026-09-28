@@ -327,9 +327,13 @@ impl Engine {
                     .reprobe_held(Deadline::at(bound), Some(session.clone())),
             )
             .await;
+            if let Ok(pass) = &pass {
+                self.proof_failures(pass, FailureScope::Session(session))
+                    .await;
+            }
             match pass {
                 Ok(Ok(report)) if report.held == report.proved => return,
-                // An uncertain proof commit is design §7.2 row 12 (S5).
+                // An uncertain proof commit latched (design §7.2 row 12).
                 Ok(Err(_)) | Err(_) => return,
                 Ok(Ok(_)) => {}
             }

@@ -16,7 +16,7 @@ use via_store::{
 
 use std::sync::atomic::Ordering;
 
-use super::drive::Cancelled;
+use super::drive::{Cancelled, Commit};
 use super::journal::Head;
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
@@ -278,7 +278,7 @@ impl Engine {
             terminal,
             false,
             extras,
-            false,
+            Commit::default(),
         )
         .await
         {

@@ -79,6 +79,16 @@ enum Decision {
     Wait,
 }
 
+/// How a terminal commits (design §7.2): retried once at the same sequence
+/// (rows 7 and 9), and with the `raw_log.incomplete` the turn's first
+/// failure dropped, sequenced just before `turn.ended` in the same
+/// transaction (row 6).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Commit {
+    pub(super) retry: bool,
+    pub(super) raw_owed: bool,
+}
+
 /// How a queued turn's cancellation ended.
 pub(super) enum Cancelled {
     /// Durably cancelled; the turn left the queue. Carries the envelope's
@@ -142,6 +152,22 @@ enum Driven {
     Forced(Forced),
 }
 
+impl Driven {
+    /// Route's Store failure, if its outcome carries one, and whether a
+    /// Host journal write of the turn had an uncertain outcome (design
+    /// §7.1, §7.2 rows 3, 4 and 6).
+    fn store_facts(&self) -> (Option<&RouteError>, bool) {
+        match self {
+            Self::Finished(Ok(evidence)) => (None, evidence.journal_uncertain),
+            Self::Finished(Err(AdapterError::Route(route))) => {
+                (Some(&route.cause), route.journal_uncertain)
+            }
+            Self::Finished(Err(_)) => (None, false),
+            Self::Forced(forced) => (None, forced.journal_uncertain),
+        }
+    }
+}
+
 /// Evidence of an execution a force stop closed through Route.
 struct Forced {
     requested_at: String,
@@ -151,6 +177,8 @@ struct Forced {
     launched: bool,
     /// Route's own Host close evidence.
     close: RouteClose,
+    /// A Host journal write of the turn had an uncertain outcome (§7.1).
+    journal_uncertain: bool,
 }
 
 impl Engine {
@@ -615,6 +643,10 @@ impl Engine {
                 &mut control,
             )
             .await;
+        let (cause, journal_uncertain) = driven.store_facts();
+        let raw_lost = self
+            .route_failed(slot, &mut record, cause, journal_uncertain)
+            .await;
         // Design §2 [r1.4]: from here cancel and close send no order.
         let order = slot.settle(turn);
         if let Some(order) = &order
@@ -641,17 +673,11 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
-        // After the turn's first failure its `raw_log.incomplete` is dropped
-        // and owed to a batch, should the terminal fail too.
-        let mut raw_owed = false;
-        if terminal.raw_incomplete {
-            let body = EventBody::RawLogIncomplete {
-                connection_id: connection,
-            };
-            self.commit_event(&mut record, body, None).await;
-            raw_owed = record.first_failure.is_some();
-            terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
-        }
+        // Row 6: a failed raw append lost the connection's bytes.
+        terminal.raw_incomplete |= raw_lost;
+        let raw_owed = self
+            .raw_incomplete(&mut record, &mut terminal, connection)
+            .await;
         if let Some((outcome, cleanup)) = disposed.stop {
             let requested_at = if let Some(order) = &order {
                 order.requested_at.clone()
@@ -678,6 +704,27 @@ impl Engine {
             .finish_with(started, (record, terminal), cause, raw_owed)
             .await;
         slot.finish_running(turn);
+    }
+
+    /// Commits the terminal's `raw_log.incomplete` when the raw log lost
+    /// bytes, with the warning. After the turn's first failure the event is
+    /// dropped and owed to its resolution write (design §7.2 row 6):
+    /// returns whether it is owed.
+    async fn raw_incomplete(
+        &self,
+        record: &mut TurnRecord,
+        terminal: &mut Terminal,
+        connection: ConnectionId,
+    ) -> bool {
+        if !terminal.raw_incomplete {
+            return false;
+        }
+        let body = EventBody::RawLogIncomplete {
+            connection_id: connection,
+        };
+        self.commit_event(record, body, None).await;
+        terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
+        record.first_failure.is_some()
     }
 
     /// Hands a forced turn to final shutdown, which commits its terminal once
@@ -899,8 +946,11 @@ impl Engine {
         if faulted && (!retry || self.cancel_fault()) {
             return Err(ApiError::STORE);
         }
-        let retry = retry && !faulted;
-        Self::commit_turn_ended_with(&self.store, started, record, terminal, close, extras, retry)
+        let mode = Commit {
+            retry: retry && !faulted,
+            raw_owed: false,
+        };
+        Self::commit_turn_ended_with(&self.store, started, record, terminal, close, extras, mode)
             .await
             .map(|durable| Durable {
                 retried: durable.retried || faulted,
@@ -947,7 +997,7 @@ impl Engine {
             (record, terminal),
             close_session,
             TerminalExtras::default(),
-            false,
+            Commit::default(),
         )
         .await;
         // Design §7.2 row 15: a forced terminal is final shutdown's single
@@ -978,7 +1028,10 @@ impl Engine {
             cancel_cause,
             raw_incomplete: None,
         };
-        let retry = record.first_failure.is_none();
+        let mode = Commit {
+            retry: record.first_failure.is_none(),
+            raw_owed,
+        };
         let kept = (record.clone(), terminal.clone());
         let finished = Self::finish_turn_with(
             &self.store,
@@ -987,7 +1040,7 @@ impl Engine {
             (record, terminal),
             false,
             extras,
-            retry,
+            mode,
         )
         .await;
         if finished.is_err() {
@@ -996,7 +1049,7 @@ impl Engine {
                 started: started.clone(),
                 record,
                 terminal,
-                raw_incomplete: raw_owed,
+                raw_incomplete: mode.raw_owed,
             });
         }
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
@@ -1046,13 +1099,13 @@ impl Engine {
             (record, terminal),
             close_session,
             TerminalExtras::default(),
-            false,
+            Commit::default(),
         )
         .await
     }
 
-    /// [`Self::finish_turn`] with the terminal's `extras`, retried once with
-    /// `retry` ([`Self::commit_turn_ended_with`]).
+    /// [`Self::finish_turn`] with the terminal's `extras`, committed as
+    /// `mode` says ([`Self::commit_turn_ended_with`]).
     async fn finish_turn_with(
         journal: &impl TurnJournal,
         unresolved: &Unresolved,
@@ -1060,7 +1113,7 @@ impl Engine {
         (record, terminal): (TurnRecord, Terminal),
         close_session: bool,
         extras: TerminalExtras,
-        retry: bool,
+        mode: Commit,
     ) -> Result<Durable, ApiError> {
         let committed = Self::commit_turn_ended_with(
             journal,
@@ -1069,7 +1122,7 @@ impl Engine {
             terminal,
             close_session,
             extras,
-            retry,
+            mode,
         )
         .await;
         match committed {
@@ -1095,7 +1148,7 @@ impl Engine {
             terminal,
             close_session,
             TerminalExtras::default(),
-            false,
+            Commit::default(),
         )
         .await
     }
@@ -1104,19 +1157,21 @@ impl Engine {
     /// with the terminal envelope whose raw spans bound every committed reference.
     /// An uncertain event commit is settled against the durable head first. With
     /// `close_session`, `session.closed` follows in the same transaction;
-    /// otherwise `extras` commit with the terminal. With `retry`, a commit
-    /// known not committed is retried once at the same sequence, holding the
-    /// session head across both attempts (design §7.2 rows 7 and 9 [r3.7]).
-    /// The head advances only on a confirmed commit: a write that did not
-    /// commit leaves it as it was, and an uncertain one leaves it unknown.
+    /// otherwise `extras` commit with the terminal, and an owed
+    /// `raw_log.incomplete` just before it (`mode.raw_owed`, design §7.2
+    /// row 6). With `mode.retry`, a commit known not committed is retried
+    /// once at the same sequence, holding the session head across both
+    /// attempts (design §7.2 rows 7 and 9 [r3.7]). The head advances only on
+    /// a confirmed commit: a write that did not commit leaves it as it was,
+    /// and an uncertain one leaves it unknown.
     pub(super) async fn commit_turn_ended_with(
         journal: &impl TurnJournal,
         started: &Started,
         mut record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-        extras: TerminalExtras,
-        retry: bool,
+        mut extras: TerminalExtras,
+        mode: Commit,
     ) -> Result<Durable, ApiError> {
         journal::reconcile(journal, &mut record)
             .await
@@ -1126,7 +1181,24 @@ impl Engine {
             .lock(journal, &started.session)
             .await
             .map_err(|_| ApiError::STORE)?;
-        let seq = head.next();
+        let first = head.next();
+        let mut seq = first;
+        if mode.raw_owed {
+            let connection_id =
+                connection_id(&started.session, started.turn).map_err(|_| ApiError::STORE)?;
+            let incomplete = Event {
+                seq,
+                session_id: &started.session,
+                turn: Some(started.turn.get()),
+                late: false,
+                at: &rfc3339(SystemTime::now()),
+                raw_ref: None,
+                body: EventBody::RawLogIncomplete { connection_id },
+            }
+            .to_value()?;
+            extras.raw_incomplete = Some(incomplete);
+            seq += 1;
+        }
         let ended = ended_record(started, record, terminal, seq)?;
         let closed = if close_session {
             let closed = Event {
@@ -1145,13 +1217,14 @@ impl Engine {
         } else {
             None
         };
-        let committed = journal::commit_terminal_with(journal, ended, closed, extras, retry).await;
+        let committed =
+            journal::commit_terminal_with(journal, ended, closed, extras, mode.retry).await;
         match &committed {
             Ok(Durable {
                 uncertain: false,
                 closed,
                 ..
-            }) => head.committed(1 + u64::from(*closed)),
+            }) => head.committed(seq + 1 - first + u64::from(*closed)),
             // Nothing was written: the sequence stays the session's next.
             Err(error) if journal::outcome_of(error) == WriteOutcome::NotCommitted => drop(head),
             // Uncertain: re-read the head before the session's next event.
@@ -1242,6 +1315,7 @@ impl Engine {
                                     forced: route.forced,
                                     quiescent: route.cleanup == Some(WireCleanup::Quiescent),
                                 },
+                                journal_uncertain: route.journal_uncertain,
                             })
                         }
                         result => Driven::Finished(result),
