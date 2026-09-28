@@ -12,6 +12,7 @@ orchestrator dispatches implementation slices on disjoint files.
 |---|---|---|---|
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
+| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`) | Opus 5.5 high | `s1.md` |
 
 ## Carried into Task 3
 
