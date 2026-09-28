@@ -23,3 +23,21 @@ GPT-6 Sol (high) on `5f3c9f7..9be7c72`, verbatim, local links converted to repo 
 Row 10 and Wire `read_either` remain with `via-jm4.7.8`; intermittent bugs `via-jm4.15` and `via-jm4.16` retain their named owners. None blocks Task 3 closure once the contract wording is resolved.
 
 I inspected the merged source, diff, tests, design, and spec. I did **not** run cargo, bd, or tests, so passing behavior and timing under load were not independently verified.
+## Confirmation round 2
+
+**Remaining wording issues — do not close Task 3 yet.**
+
+- `docs/specs/runtime-contracts.md:958` and `docs/workstreams/rust-foundation/t3/design.md:1873` say a launch past the ARM gate is stopped “as soon as it spawns.” The owner sends `Stop` after **receiving `Spawned`** (`crates/via-host/src/host.rs:1261`); a lost reply takes the failed-acquisition EOF cleanup path. Qualify both statements.
+- `docs/workstreams/rust-foundation/t3/design.md:1873` says the 3 s bound covers the `Stop` attempt, but the control lock and write are unbounded; only the reply wait has that deadline (`crates/via-host/src/host.rs:2034`). The design also retains absolute “stops every group within 3 s” claims at `docs/workstreams/rust-foundation/t3/design.md:918` and `docs/workstreams/rust-foundation/t3/design.md:1307`.
+- `docs/specs/runtime-contracts.md:889` and `docs/specs/runtime-contracts.md:969` still measure shutdown from “first Store failure” or “first failure”; both should identify the **latching failure (`failed_at`)**, as `docs/workstreams/rust-foundation/t3/design.md:1865` specifies.
+## Confirmation round 3
+
+Remaining issue — **do not close Task 3 yet.** `docs/workstreams/rust-foundation/t3/design.md:931` still says each `Stop` is bounded at force `+ 3 s`; `docs/workstreams/rust-foundation/t3/design.md:1308` still implies the sends finish by then. In `crates/via-host/src/host.rs:2034`, the control lock and write are unbounded; only the reply wait has that deadline.
+
+The `Spawned` and `failed_at` wording fixes match the code and stated timing. Runtime §7 has no remaining absolute 3 s cleanup claim.
+## Confirmation round 4
+
+Remaining issue: `docs/workstreams/rust-foundation/t3/design.md:1780` still says the running group is gone within 3 seconds of the latch. That contradicts A23 and runtime §7, which bound only the `Stop` reply wait; the control lock, write, and group disappearance have no such bound. Task 3 is not ready to close.
+## Confirmation round 5
+
+ACCEPT (close Task 3). The cited sections and `host.rs` agree: the three-second deadline bounds only the `Stop` reply wait. The §11 disappearance check is expressly a cooperative-fixture expectation.

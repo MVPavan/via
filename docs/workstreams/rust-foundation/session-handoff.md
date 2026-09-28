@@ -113,8 +113,10 @@ the historical checkpoint; its findings table is updated by this section.
   `t3/sol-review-T3-force-row.md`). Runtime §7 clarified for the Host stop
   bound (`08b8fab`, `1174004`). Gate at `3a6f173`: 304 / 1, failpoints
   445 / 1 three times, F08–F12 58, release check clean. Intermittent tests
-  tracked as `via-jm4.15` and `via-jm4.16`. **Now: a Sol high re-check of the
-  fix delta**, then close `via-jm4.7.7`. From
+  tracked as `via-jm4.15` and `via-jm4.16`. A Sol high re-check of the fix
+  delta accepted Task 3 after the runtime §7 Host bound was recorded as
+  amendment A23 (`t3/sol-review-T3-recheck.md`, five rounds). **Task 3
+  (`via-jm4.7.7`) is closed.** Next: Task 4 (`.7.8`) on Sonnet workers. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
   owner decision), compared with Opus in

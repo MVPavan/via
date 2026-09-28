@@ -155,5 +155,6 @@ whose outcome section lists the merges. Sonnet 5.5 workers fixed rows 1–9 and
 the force-row race: X (`554a18b`, 2 rounds), Y (`3636b7a`, 3 rounds), force row
 and decision 5 (`e56efcc`, 1 + 3 rounds), each Sol medium with no open code
 finding. Gate at `3a6f173`: 304 / 1, failpoints 445 / 1 three times, F08–F12
-58, release check clean. Next: a Sol high re-check of the fix delta, then
-close `via-jm4.7.7`.
+58, release check clean. The Sol high re-check (`sol-review-T3-recheck.md`)
+accepted after the runtime §7 Host bound became amendment A23. **Task 3 is
+closed.**

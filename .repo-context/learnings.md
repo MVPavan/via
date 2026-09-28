@@ -47,3 +47,9 @@ in the design record (`docs/`), not here.
   and `claude -p` transcripts log final usage. Estimate subagent output
   from content size, calibrated on main-session messages, and label it an
   estimate (a local script is in the gitignored `scratchpad/usage/`).
+- When a contract bound changes (for example, T3's runtime §7 "stops within
+  3 s" becoming "the reply wait ends at force + 3 s"), grep the spec, the
+  design (including its test tables and amendments) and the code comments
+  for every restatement of the old bound, and fix them in one pass. Record
+  the change as a numbered amendment, not as a "clarification". T3 took
+  four extra Sol confirmation rounds, each finding one more stale line.
