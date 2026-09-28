@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use crate::{CommitOutcome, ConnectionId, RawRef, SessionId, StoreFailureKind, TurnNumber};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Most queued turns one session holds, enforced inside the receipt
 /// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
@@ -26,11 +26,12 @@ pub const SESSION_QUEUE_LIMIT: u32 = 8;
 
 /// Refuses a Store whose schema this build neither creates nor reads. Older
 /// versions are unreleased dev formats with no migration (runtime §6).
-fn check_schema_version(version: i64) -> Result<(), StoreError> {
+/// Version 0 is a new Store only in a file VIA itself `created`.
+fn check_schema_version(version: i64, created: bool) -> Result<(), StoreError> {
     if version > SCHEMA_VERSION {
         return Err(StoreError::Open("newer Store schema".to_owned()));
     }
-    if version != 0 && version < SCHEMA_VERSION {
+    if version < SCHEMA_VERSION && !(version == 0 && created) {
         return Err(StoreError::Open(format!(
             "Store schema v{version} is an unreleased development format with no migration; \
              stop the daemon and recreate the Store by removing store.sqlite3 from the State directory"
@@ -92,6 +93,8 @@ pub struct SpawnRecord {
     pub params: Value,
     /// Frozen first-turn prompt.
     pub prompt: String,
+    /// Turn 1's frozen effective per-turn values (C1 §3.2 `effective`).
+    pub effective: Value,
     /// Core's initial canonical queued event, with sequence one.
     pub initial_event: Value,
 }
@@ -139,6 +142,9 @@ pub struct ResumeRecord {
     pub turn: TurnNumber,
     /// Frozen prompt.
     pub prompt: String,
+    /// Frozen effective per-turn values, resolved by Core under admission
+    /// against [`SessionSnapshot::latest_effective`] (C1 P5).
+    pub effective: Value,
     /// Core's canonical `turn.queued` event at the session's next sequence.
     pub event: Value,
     /// The `op_key` result committed with the turn, when the caller gave a key.
@@ -153,6 +159,9 @@ pub struct SessionSnapshot {
     pub turns: u32,
     /// Queued turns of the session, without submission intent.
     pub queued: u32,
+    /// Frozen effective values of the latest accepted turn, whatever its
+    /// state: what an omitted per-turn parameter inherits (C1 P5).
+    pub latest_effective: Option<Value>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -167,6 +176,8 @@ pub struct Predecessors {
 pub struct QueuedTurn {
     /// Frozen prompt.
     pub prompt: String,
+    /// Frozen effective per-turn values the turn is driven from.
+    pub effective: Value,
     /// Time of `turn.queued`.
     pub queued_at: String,
     /// Sequence of `turn.queued`.
@@ -596,11 +607,13 @@ enum RawCommand {
 }
 
 impl Store {
-    /// Opens `<state>/store.sqlite3`, refusing an unsafe or newer Store before mutation.
+    /// Opens `<state>/store.sqlite3`, refusing an unsafe, older or newer
+    /// Store before mutation. Only a file this call creates is initialized.
     pub fn open(state: &Path) -> Result<Self, StoreError> {
         validate_state(state)?;
         let db = state.join("store.sqlite3");
-        if db.exists() {
+        let created = !db.exists();
+        if !created {
             validate_regular(&db)?;
             let readonly = Connection::open_with_flags(
                 &db,
@@ -610,7 +623,7 @@ impl Store {
             let version: i64 = readonly
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|error| StoreError::Open(error.to_string()))?;
-            check_schema_version(version)?;
+            check_schema_version(version, false)?;
             readonly
                 .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
                 .map_err(|error| StoreError::Open(error.to_string()))
@@ -634,16 +647,24 @@ impl Store {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| StoreError::Open(error.to_string()))?;
         }
+        if created {
+            // Exclusive (and never through a symlink): a file that appeared
+            // since the check is not one VIA created.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&db)
+                .map_err(|error| StoreError::Open(error.to_string()))?;
+        }
         let mut conn = Connection::open_with_flags(
             &db,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
         fs::set_permissions(&db, fs::Permissions::from_mode(0o600))
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        configure(&mut conn)?;
+        configure(&mut conn, created)?;
         let (sender, receiver) = mpsc::sync_channel(128);
         let (raw_sender, raw_receiver) = mpsc::sync_channel(64);
         let writer_root = state.to_path_buf();

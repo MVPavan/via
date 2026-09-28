@@ -681,20 +681,35 @@ supported across schema versions: a Store whose `user_version` is older than
 the build's is an unreleased development format, is never migrated, and is
 refused at open with a named error telling the user to recreate the dev Store
 (remove `store.sqlite3` from the State directory); its bytes are left
-untouched. Migrations as described above start with the first released
-schema. Schema v3 (v1 was the unreleased single-turn format; v2 lacked the
-unproven-anchor index):
+untouched. `user_version = 0` is initialized only in a database file that
+open itself creates (exclusively); an existing file at version 0, empty or
+not, gets the same refusal before any writable open. Migrations as described
+above start with the first released schema. Schema v4 (v1 was the unreleased
+single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
+per-turn values) is exactly:
 
-| Table | Key, constraints and stored content |
+| Table | Implemented columns and constraints |
 |---|---|
-| `sessions` | PK id; 32-byte handle hash; frozen route/adapter/version/capability/session spec; state/admission, vendor ID, next turn/seq, record version, timestamps |
-| `turns` | PK (session, number), FK session; frozen effective params and prompt; state/phase, submission and acceptance timestamps, vendor correlation, cancel/cleanup, revision, terminal envelope, event bounds |
-| `spawn_keys` | PK key; FK session; handle hash, exact retry-identity bytes and original receipt; retained for session lifetime |
-| `operations` | PK (session, op_key); verb, identity bytes, phase intent/done, target turn, exact result; queued resume insert and receipt atomic |
-| `events` | PK (session, seq), FK session and nullable FK turn; type, late, time, bounded canonical JSON, nullable connection/offset/len; seq allocated by Core and checked transactionally |
-| `connections` | PK id; process owner, relative raw/index paths, durable high-water offsets, open/sealed/incomplete state and reason |
-| `processes` | PK internal process ID; role anchor/vendor, nullable parent-anchor FK, owner session/turn, unique marker; anchor generation and launch phase (`intent`, `identified`, `arm_intent`); nullable full identity including boot/PID namespace; vendor child facts, exit/cleanup evidence |
-| `metadata` | schema-format metadata and retention low-water marks; schema version itself in `user_version` |
+| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2 |
+| `turns` | PK (`session_id`, `number`), FK session; `prompt`; `effective` (the turn's frozen per-turn values, the receipt's `effective`, written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence); `envelope` (terminal). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
+| `spawn_keys` | PK `key`; FK `session_id`; `identity` (exact retry-identity bytes); `receipt`; kept for the session's lifetime |
+| `operations` | PK (`session_id`, `op_key`); `verb` (only `resume` so far); `identity`; `turn` with FK (`session_id`, `turn`); `result`; committed in the same transaction as the queued turn |
+| `events` | PK (`session_id`, `seq`), FK session; `event` (canonical JSON; type, turn, late and time live inside it); nullable `connection_id`, `raw_offset`, `raw_len`; `seq` allocated by Core and checked transactionally |
+| `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner (`owner_session`, `owner_turn`) FK turn; `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
+
+Target columns and tables not implemented yet, with their owners:
+
+| Target | Owner |
+|---|---|
+| `sessions`: `closing` admission state, record version and timestamps, frozen instructions/cwd/`allow_untested` | `via-jm4.7.7` (cancel/close, Task 3) |
+| `sessions`: vendor session ID | the first vendor adapter slice, after `via-jm4.7.9` |
+| `turns`: separate phase, cancel/cleanup columns (today inside `envelope`), revision of an `unknown` result by late evidence | `via-jm4.7.7` |
+| `turns`: event-bound columns (today the envelope's `events` range) | `via-jm4.7.8` |
+| `operations`: phase intent/done and other keyed verbs (`steer`, `close`) | `via-jm4.7.7` |
+| `events`: separate FK turn, type, late and time columns | `via-jm4.7.8` |
+| `connections` table: raw paths, high-water offsets, open/sealed/incomplete state (today the `raw/` payload and index files alone) | `via-jm4.7.8` |
+| `processes` as a general table: vendor rows, exit and cleanup evidence beyond `anchors.vendor_pid` and `absence_time` | `via-jm4.7.7` |
+| `metadata` table: retention low-water marks (the schema version is `user_version`) | none in S1, which prunes nothing |
 
 There is no separate queue table: ordered queued turns without submission
 intent are the queue. Only one in-flight turn per session, enforced by a

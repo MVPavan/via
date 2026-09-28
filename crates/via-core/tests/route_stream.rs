@@ -120,6 +120,7 @@ impl Child {
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
                 prompt: "hello".to_owned(),
+                effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: json!({"seq":1,"type":"turn.queued"}),
             }))
             .unwrap();

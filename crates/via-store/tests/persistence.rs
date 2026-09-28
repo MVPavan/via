@@ -33,6 +33,7 @@ fn spawn(hash: [u8; 32]) -> SpawnRecord {
         receipt: json!({"session_id":"s_7f3k9q2mzr4c","turn":"s_7f3k9q2mzr4c/1","state":"queued"}),
         params: json!({"harness":"fake"}),
         prompt: "test prompt".to_owned(),
+        effective: json!({"deadlines":{"wall_ms":1}}),
         initial_event: json!({"type":"turn.queued","seq":1}),
     }
 }
@@ -463,12 +464,13 @@ fn events_keep_dense_seq_and_cited_raw_span() {
     assert_eq!(accepted, "2026-01-01T00:00:01.000Z");
 }
 
-/// Runtime §6: the unreleased dev formats (schema v1, the single-turn format,
-/// and v2, before the unproven-anchor index) are not migrated. Opening one
-/// fails with a named, actionable error and leaves its bytes untouched.
+/// Runtime §6: the unreleased dev formats (schema v1, the single-turn format;
+/// v2, before the unproven-anchor index; v3, before frozen per-turn values)
+/// are not migrated. Opening one fails with a named, actionable error and
+/// leaves its bytes untouched.
 #[test]
-fn unreleased_v1_and_v2_stores_are_refused_with_a_recreate_instruction() {
-    for version in [1, 2] {
+fn unreleased_v1_to_v3_stores_are_refused_with_a_recreate_instruction() {
+    for version in [1, 2, 3] {
         let root = TempDir::new().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let db = root.path().join("store.sqlite3");
@@ -492,6 +494,38 @@ fn unreleased_v1_and_v2_stores_are_refused_with_a_recreate_instruction() {
     }
 }
 
+/// Runtime §6: `user_version = 0` is initialized only in a database VIA
+/// creates. An existing file at version 0, empty or holding foreign tables,
+/// gets the same named recreate refusal before any writable open, and its
+/// bytes stay untouched (no journal-mode change, no schema, no WAL).
+#[test]
+fn an_existing_version_zero_store_is_refused_without_mutation() {
+    for foreign in [false, true] {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let db = root.path().join("store.sqlite3");
+        if foreign {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE notes (body TEXT)")
+                .unwrap();
+        } else {
+            fs::write(&db, b"").unwrap();
+        }
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&db).unwrap();
+        let Err(error) = Store::open(root.path()) else {
+            panic!("an existing version-0 Store opened (foreign tables: {foreign})");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("schema v0") && message.contains("recreate"),
+            "{message}"
+        );
+        assert_eq!(fs::read(&db).unwrap(), before, "foreign tables: {foreign}");
+        assert!(!root.path().join("store.sqlite3-wal").exists());
+    }
+}
+
 /// Runtime §6: at most eight queued turns per session, checked inside the
 /// receipt transaction itself, not only by Core before it.
 #[test]
@@ -509,6 +543,7 @@ fn a_ninth_queued_turn_is_refused_inside_the_receipt_transaction() {
         session_id: session(),
         turn: TurnNumber::try_from(turn).unwrap(),
         prompt: "p".to_owned(),
+        effective: json!({"deadlines":{"wall_ms":turn}}),
         event: json!({"type":"turn.queued","seq":turn,"at":at,"raw_ref":null}),
         operation: None,
     };
@@ -526,4 +561,50 @@ fn a_ninth_queued_turn_is_refused_inside_the_receipt_transaction() {
         .unwrap()
         .unwrap();
     assert_eq!((snapshot.turns, snapshot.queued), (8, 8));
+}
+
+/// C1 P5: each turn's frozen values are stored with it, and a new turn
+/// inherits from the latest accepted turn whatever its later state: a
+/// queued turn cancelled afterwards still supplies them.
+#[test]
+fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
+    let root = TempDir::new().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    let rt = runtime();
+    let at = "2026-01-01T00:00:00.000Z";
+    let mut first = spawn([1; 32]);
+    first.initial_event = json!({"type":"turn.queued","seq":1,"at":at});
+    rt.block_on(client.commit_spawn(first)).unwrap();
+    let second = via_store::ResumeRecord {
+        session_id: session(),
+        turn: TurnNumber::try_from(2).unwrap(),
+        prompt: "p".to_owned(),
+        effective: json!({"deadlines":{"wall_ms":2}}),
+        event: json!({"type":"turn.queued","seq":2,"at":at,"raw_ref":null}),
+        operation: None,
+    };
+    rt.block_on(client.commit_resume(second)).unwrap();
+    let queued = rt
+        .block_on(client.queued_turn(&session(), TurnNumber::try_from(2).unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.effective, json!({"deadlines":{"wall_ms":2}}));
+    rt.block_on(client.commit_terminal(TerminalRecord {
+        session_id: session(),
+        turn: TurnNumber::try_from(2).unwrap(),
+        envelope: json!({"state":"cancelled"}),
+        event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
+        raw_ref: None,
+    }))
+    .unwrap();
+    let snapshot = rt
+        .block_on(client.session_snapshot(&session()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.latest_effective,
+        Some(json!({"deadlines":{"wall_ms":2}}))
+    );
 }

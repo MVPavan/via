@@ -47,6 +47,8 @@ struct SpawnArgs {
     handle_stdin: bool,
     #[arg(long)]
     idempotency_key: Option<String>,
+    #[command(flatten)]
+    turn: TurnArgs,
     #[arg(long)]
     background: bool,
     #[arg(long)]
@@ -60,6 +62,8 @@ struct ResumeArgs {
     prompt: String,
     #[arg(long)]
     op_key: Option<String>,
+    #[command(flatten)]
+    turn: TurnArgs,
     #[arg(long)]
     handle: Option<String>,
     #[arg(long)]
@@ -68,6 +72,73 @@ struct ResumeArgs {
     handle_stdin: bool,
     #[arg(long)]
     json: bool,
+}
+
+/// C1 §3.2/§3.3 per-turn flags; the daemon validates them against the route.
+#[derive(Args)]
+struct TurnArgs {
+    #[arg(long)]
+    bound: Option<String>,
+    #[arg(long = "allow-dir", requires = "bound")]
+    allow_dirs: Vec<String>,
+    #[arg(long, requires = "bound")]
+    network: bool,
+    #[arg(long)]
+    effort: Option<String>,
+    /// A file holding the JSON Schema object, or `null` to clear.
+    #[arg(long)]
+    output_schema: Option<PathBuf>,
+    #[arg(long)]
+    wall_ms: Option<u64>,
+    #[arg(long)]
+    idle_ms: Option<u64>,
+    #[arg(long)]
+    max_steps: Option<u64>,
+    /// `harness.key=value`, repeatable.
+    #[arg(long = "vendor")]
+    vendor: Vec<String>,
+}
+
+impl TurnArgs {
+    /// Adds the given per-turn parameters to `params`; omitted ones inherit.
+    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+        if let Some(mode) = self.bound {
+            params["bound"] =
+                json!({"mode":mode,"extra_write_dirs":self.allow_dirs,"network":self.network});
+        }
+        if let Some(effort) = self.effort {
+            params["effort"] = Value::String(effort);
+        }
+        if let Some(path) = self.output_schema {
+            let schema = std::fs::read(&path)?;
+            params["output_schema"] = serde_json::from_slice(&schema)?;
+        }
+        if self.wall_ms.is_some() || self.idle_ms.is_some() {
+            let mut deadlines = json!({});
+            if let Some(wall) = self.wall_ms {
+                deadlines["wall_ms"] = Value::from(wall);
+            }
+            if let Some(idle) = self.idle_ms {
+                deadlines["idle_ms"] = Value::from(idle);
+            }
+            params["deadlines"] = deadlines;
+        }
+        if let Some(steps) = self.max_steps {
+            params["max_steps"] = Value::from(steps);
+        }
+        if !self.vendor.is_empty() {
+            let mut vendor = json!({});
+            for option in self.vendor {
+                let (name, value) = option
+                    .split_once('=')
+                    .and_then(|(key, value)| Some((key.split_once('.')?, value)))
+                    .ok_or_else(|| anyhow::anyhow!("--vendor takes harness.key=value"))?;
+                vendor[name.0][name.1] = Value::String(value.to_owned());
+            }
+            params["vendor"] = vendor;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args)]
@@ -175,6 +246,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             if let Some(key) = args.idempotency_key {
                 params["idempotency_key"] = Value::String(key);
             }
+            args.turn.apply(&mut params)?;
             let mut receipt = client::request("spawn", &params, true)?;
             if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
                 result.insert("handle".to_owned(), Value::String(handle));
@@ -209,6 +281,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             if let Some(key) = args.op_key {
                 params["op_key"] = Value::String(key);
             }
+            args.turn.apply(&mut params)?;
             client::call("resume", &params, true, true)
         }
         Command::Steer(args) => {

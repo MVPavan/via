@@ -45,6 +45,7 @@ fn oversized_raw_index_is_rejected_before_allocation() {
                     receipt: json!({"state":"queued"}),
                     params: json!({"harness":"fake"}),
                     prompt: "x".to_owned(),
+                    effective: json!({"deadlines":{"wall_ms":1}}),
                     initial_event: json!({"type":"turn.queued","seq":1}),
                 })
                 .await

@@ -287,11 +287,11 @@ pub(super) fn read_anchor_owners(
 mod tests {
     use super::{Connection, UNPROVEN_ANCHORS_UP_TO, count_unproven_anchors};
 
-    /// A schema-v3 Store with `total` anchors, every third one proved absent.
+    /// A current-schema Store with `total` anchors, every third one proved absent.
     fn store_with_anchors(total: u32) -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().expect("temporary directory");
         let mut conn = Connection::open(dir.path().join("store.sqlite3")).expect("open");
-        super::super::configure(&mut conn).expect("schema");
+        super::super::configure(&mut conn, true).expect("schema");
         // Only the anchor rows matter here; their owning turns do not.
         conn.execute_batch("PRAGMA foreign_keys=OFF")
             .expect("pragma");

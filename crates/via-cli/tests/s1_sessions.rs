@@ -52,13 +52,34 @@ fn session_of(receipt: &Value) -> Result<String, ScenarioError> {
 }
 
 /// Proves one session's durable history: dense `seq` from 1, every event its
-/// own, and per turn exactly one queued, submitted and ended event in order.
-/// Returns each turn's `(submitted_seq, ended_seq)`.
+/// own, and per turn exactly one queued, submitted and ended event in order
+/// and exactly one agent launch (one committed Host anchor per turn, none
+/// for any other). Returns each turn's `(submitted_seq, ended_seq)`.
 fn check_history(
+    sandbox: &Sandbox,
     session: &str,
     events: &[Value],
     turns: u32,
 ) -> Result<Vec<(u64, u64)>, ScenarioError> {
+    // Session ids are `s_` plus base32 digits: safe to inline in SQL.
+    let launches = sandbox.count(&format!(
+        "SELECT count(*) FROM anchors WHERE owner_session='{session}'"
+    ))?;
+    if launches != i64::from(turns) {
+        return Err(failure(format!(
+            "{session}: {launches} agent launches for {turns} turns"
+        )));
+    }
+    for turn in 1..=turns {
+        let per_turn = sandbox.count(&format!(
+            "SELECT count(*) FROM anchors WHERE owner_session='{session}' AND owner_turn={turn}"
+        ))?;
+        if per_turn != 1 {
+            return Err(failure(format!(
+                "{session}/{turn}: {per_turn} agent launches"
+            )));
+        }
+    }
     for (index, event) in events.iter().enumerate() {
         if event["seq"] != json!(index + 1) || event["session_id"] != session {
             return Err(failure(format!(
@@ -221,7 +242,7 @@ fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
                     serde_json::to_vec(&history).map_err(infra)?.as_slice(),
                 )
                 .map_err(infra)?;
-            check_history(&session, &history, 1)?;
+            check_history(&sandbox, &session, &history, 1)?;
             if sandbox.count("SELECT count(*) FROM sessions")? != 1
                 || sandbox.count("SELECT count(*) FROM turns")? != 1
             {
@@ -402,7 +423,7 @@ fn s1_f14_resume_retry_with_op_key_adds_one_turn() -> TestResult {
                     serde_json::to_vec(&history).map_err(infra)?.as_slice(),
                 )
                 .map_err(infra)?;
-            check_history(&session, &history, 4)?;
+            check_history(&sandbox, &session, &history, 4)?;
             if sandbox.count("SELECT count(*) FROM turns")? != 4 {
                 return Err(failure("a keyed retry created a duplicate turn"));
             }
@@ -548,7 +569,7 @@ fn s1_f17_ninth_queued_turn_is_queue_full_and_order_kept() -> TestResult {
                     serde_json::to_vec(&history).map_err(infra)?.as_slice(),
                 )
                 .map_err(infra)?;
-            let spans = check_history(&session, &history, 10)?;
+            let spans = check_history(&sandbox, &session, &history, 10)?;
             // One at a time, in order: each turn submits after its predecessor ended.
             for pair in spans.windows(2) {
                 if pair[1].0 < pair[0].1 {
@@ -720,8 +741,25 @@ fn s1_f28_two_callers_drive_two_sessions_without_crosstalk() -> TestResult {
             let mut all = Vec::new();
             for session in [&a, &b] {
                 let history = events(&sandbox, evidence, &format!("events_{session}"), session)?;
-                check_history(session, &history, 2)?;
-                let foreign = if *session == a { "b" } else { "a" };
+                check_history(&sandbox, session, &history, 2)?;
+                let (own, foreign) = if *session == a {
+                    ("a", "b")
+                } else {
+                    ("b", "a")
+                };
+                // Each turn's own reply text is present, attributed to that turn.
+                for turn in 1..=2_u32 {
+                    let expected = format!("{own}{turn} reply");
+                    if !history.iter().any(|event| {
+                        event["type"] == "assistant.text"
+                            && event["turn"] == json!(turn)
+                            && event["text"] == expected.as_str()
+                    }) {
+                        return Err(failure(format!(
+                            "{session}/{turn} has no assistant.text {expected:?}"
+                        )));
+                    }
+                }
                 if history.iter().any(|event| {
                     event["text"]
                         .as_str()
@@ -814,6 +852,615 @@ fn c1_wait_timeout_ms_bounds_the_wait() -> TestResult {
                     serde_json::to_vec(&history).map_err(infra)?.as_slice(),
                 )
                 .map_err(infra)?;
+            Ok(())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}
+
+/// The `result` of a raw C1 reply that must have succeeded.
+fn succeeded(name: &str, reply: &Value) -> Result<Value, ScenarioError> {
+    if reply["result"].is_object() {
+        Ok(reply["result"].clone())
+    } else {
+        Err(failure(format!("{name}: expected a result: {reply}")))
+    }
+}
+
+/// Checks a raw C1 refusal's canonical `kind`, its `kind2` and the named field.
+fn refused_raw(
+    name: &str,
+    reply: &Value,
+    kind: &str,
+    kind2: Option<&str>,
+    field: &str,
+) -> Result<(), ScenarioError> {
+    let data = &reply["error"]["data"];
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    if data["kind"] != kind
+        || data["kind2"] != json!(kind2)
+        || data["field"] != field
+        || !message.contains(field)
+    {
+        return Err(failure(format!(
+            "{name}: expected {kind}/{kind2:?} naming {field}: {reply}"
+        )));
+    }
+    // A route refusal also names the route; a session-scope one does not.
+    if kind2.is_none() && data["route"] != "fake" {
+        return Err(failure(format!("{name}: refusal names no route: {reply}")));
+    }
+    Ok(())
+}
+
+/// Every turn's frozen per-turn values as its Store row holds them, in order.
+fn stored_effective(sandbox: &Sandbox, session: &str) -> Result<Vec<Value>, ScenarioError> {
+    let store = rusqlite::Connection::open_with_flags(
+        sandbox.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(infra)?;
+    let mut query = store
+        .prepare("SELECT effective FROM turns WHERE session_id=?1 ORDER BY number")
+        .map_err(|error| failure(format!("turns have no frozen values: {error}")))?;
+    let rows = query
+        .query_map([session], |row| row.get::<_, String>(0))
+        .map_err(infra)?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(serde_json::from_str(&row.map_err(infra)?).map_err(infra)?);
+    }
+    Ok(values)
+}
+
+/// Each turn's `turn.started` effective values, in turn order.
+fn started_effective(history: &[Value], turns: u32) -> Vec<Value> {
+    (1..=turns)
+        .map(|turn| {
+            history
+                .iter()
+                .find(|event| event["type"] == "turn.started" && event["turn"] == json!(turn))
+                .map_or(Value::Null, |event| event["effective"].clone())
+        })
+        .collect()
+}
+
+/// The fake route's frozen values with `wall_ms`: nothing else is settable.
+fn fake_effective(wall_ms: u64) -> Value {
+    json!({"model":"fake","effort":null,"bound":null,
+        "deadlines":{"wall_ms":wall_ms,"idle_ms":null},"max_steps":null})
+}
+
+/// C1 §3.3/§4 P5: per-turn values freeze at receipt. Turn 1 sets `wall_ms`
+/// A; turn 2, queued behind it, sets B through the CLI flag; turn 3, queued,
+/// sets nothing and inherits B from the latest accepted turn. Receipts,
+/// Store rows and each turn's `turn.started` carry the frozen values.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end inheritance scenario keeps its steps and checks together"
+)]
+fn s1_params_queued_turns_inherit_frozen_per_turn_values() -> TestResult {
+    const A: u64 = 20_000;
+    const B: u64 = 25_000;
+    let sandbox = Sandbox::new(&fixture(&[
+        turn_script(1, "i1", Some("hold_i")),
+        turn_script(2, "i2", None),
+        turn_script(3, "i3", None),
+    ]))?;
+    let evidence = Evidence::new("s1_params_inheritance", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let mut raw = Raw::open(&sandbox)?;
+            let spawn = succeeded(
+                "spawn",
+                &raw.exchange(&request(
+                    7,
+                    "spawn",
+                    &json!({"harness":"fake","model":"fake","prompt":"i1","handle":HANDLE,
+                        "deadlines":{"wall_ms":A}}),
+                ))?,
+            )?;
+            let session = session_of(&spawn)?;
+            sandbox.await_gate("hold_i")?;
+            let second = cli(
+                &sandbox,
+                evidence,
+                "resume_2",
+                &[
+                    "resume",
+                    &session,
+                    "--prompt",
+                    "i2",
+                    "--wall-ms",
+                    &B.to_string(),
+                    "--handle",
+                    HANDLE,
+                    "--json",
+                ],
+            )?;
+            let third = succeeded(
+                "resume_3",
+                &raw.exchange(&request(
+                    8,
+                    "resume",
+                    &json!({"session":session,"handle":HANDLE,"prompt":"i3"}),
+                ))?,
+            )?;
+            let receipts = [&spawn, &second, &third];
+            let expected = [fake_effective(A), fake_effective(B), fake_effective(B)];
+            for (index, receipt) in receipts.iter().enumerate() {
+                if receipt["state"] != "queued" || receipt["effective"] != expected[index] {
+                    return Err(failure(format!(
+                        "turn {} receipt is not frozen at {}: {receipt}",
+                        index + 1,
+                        expected[index]
+                    )));
+                }
+            }
+            // Frozen at receipt: durable before any of turns 2 and 3 ran.
+            let stored = stored_effective(&sandbox, &session)?;
+            if stored != expected {
+                return Err(failure(format!("Store rows hold {stored:?}")));
+            }
+            sandbox.release_gate("hold_i")?;
+            let mut envelopes = Vec::new();
+            for turn in 1..=3_u32 {
+                envelopes.push(wait_completed(
+                    &sandbox,
+                    evidence,
+                    &format!("wait_{turn}"),
+                    &format!("{session}/{turn}"),
+                    &format!("i{turn} reply"),
+                )?);
+            }
+            let mut lines = String::new();
+            for value in receipts.into_iter().chain(&envelopes) {
+                lines.push_str(&value.to_string());
+                lines.push('\n');
+            }
+            evidence
+                .write("envelopes.ndjson", lines.as_bytes())
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 3)?;
+            let started = started_effective(&history, 3);
+            if started != expected {
+                return Err(failure(format!("turn.started effective: {started:?}")));
+            }
+            // C1 §5 has no deadlines field; its frozen effort and bound show.
+            for envelope in &envelopes {
+                if envelope["effort"] != json!({"requested":null,"resolved":null})
+                    || envelope["bound"]["effective"] != Value::Null
+                {
+                    return Err(failure(format!("envelope differs from frozen: {envelope}")));
+                }
+            }
+            if stored_effective(&sandbox, &session)? != expected {
+                return Err(failure("frozen Store rows changed after the turns ran"));
+            }
+            Ok(())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}
+
+/// C1 §4 / §8.2: Core drives each turn from its own frozen `wall_ms`. Turn 1
+/// hangs under a short one and ends `deadline_wall` well before the fake's
+/// default; turn 2 sets a longer one, is still live (`wait_timeout`) past
+/// turn 1's budget, and completes once released.
+#[test]
+fn s1_params_frozen_wall_deadline_applies_to_its_turn_only() -> TestResult {
+    let hang = json!({"expected_request":{"type":"start","id":1,"turn":1,"prompt":"d1"},
+        "steps":[{"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"hang"}]});
+    let sandbox = Sandbox::new(&fixture(&[hang, turn_script(2, "d2", Some("hold_d2"))]))?;
+    let evidence = Evidence::new("s1_params_wall_deadline", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let mut raw = Raw::open(&sandbox)?;
+            let spawn = succeeded(
+                "spawn",
+                &raw.exchange(&request(
+                    7,
+                    "spawn",
+                    &json!({"harness":"fake","model":"fake","prompt":"d1","handle":HANDLE,
+                        "deadlines":{"wall_ms":1500}}),
+                ))?,
+            )?;
+            let session = session_of(&spawn)?;
+            let second = cli(
+                &sandbox,
+                evidence,
+                "resume_2",
+                &[
+                    "resume",
+                    &session,
+                    "--prompt",
+                    "d2",
+                    "--wall-ms",
+                    "60000",
+                    "--handle",
+                    HANDLE,
+                    "--json",
+                ],
+            )?;
+            let first = cli(
+                &sandbox,
+                evidence,
+                "wait_1",
+                &["wait", &format!("{session}/1"), "--json"],
+            )?;
+            if first["state"] != "failed"
+                || first["failure"]["class"] != "deadline_wall"
+                || first["duration_ms"].as_u64().is_none_or(|ms| ms >= 10_000)
+            {
+                return Err(failure(format!(
+                    "turn 1 did not end at its own 1500 ms deadline: {first}"
+                )));
+            }
+            // Turn 2 is still live 2 s after reaching its gate, past turn 1's
+            // whole 1500 ms budget: its own 60 s deadline applies.
+            sandbox.await_gate("hold_d2")?;
+            refused(
+                &sandbox,
+                evidence,
+                "wait_2_held",
+                &[
+                    "wait",
+                    &format!("{session}/2"),
+                    "--timeout-ms",
+                    "2000",
+                    "--json",
+                ],
+                "wait_timeout",
+            )?;
+            sandbox.release_gate("hold_d2")?;
+            let last = wait_completed(
+                &sandbox,
+                evidence,
+                "wait_2",
+                &format!("{session}/2"),
+                "d2 reply",
+            )?;
+            evidence
+                .write(
+                    "envelopes.ndjson",
+                    format!("{spawn}\n{second}\n{first}\n{last}\n").as_bytes(),
+                )
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 2)?;
+            let started = started_effective(&history, 2);
+            if started != [fake_effective(1500), fake_effective(60_000)] {
+                return Err(failure(format!("turn.started effective: {started:?}")));
+            }
+            Ok(())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}
+
+/// C1 §4/§4.2/§8.1 against the fake route's capabilities: each unsupported
+/// per-turn value is refused with its canonical kind, naming field and
+/// route; session-scope parameters on `resume` are `session_scope_on_resume`.
+/// Nullable and empty values are accepted and follow inheritance. A refusal
+/// commits nothing.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end refusal table keeps every case together"
+)]
+fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
+    let sandbox = Sandbox::new(&fixture(&[
+        turn_script(1, "r1", None),
+        turn_script(1, "n1", None),
+        turn_script(2, "n2", None),
+    ]))?;
+    let evidence = Evidence::new("s1_params_refusals", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let mut raw = Raw::open(&sandbox)?;
+            let spawn = succeeded(
+                "spawn",
+                &raw.exchange(&request(
+                    7,
+                    "spawn",
+                    &json!({"harness":"fake","model":"fake","prompt":"r1","handle":HANDLE}),
+                ))?,
+            )?;
+            let session = session_of(&spawn)?;
+            let first = wait_completed(
+                &sandbox,
+                evidence,
+                "wait_r1",
+                &format!("{session}/1"),
+                "r1 reply",
+            )?;
+            let per_turn = [
+                ("effort", json!("high"), "invalid_params", "effort"),
+                (
+                    "output_schema",
+                    json!({"type":"object"}),
+                    "invalid_params",
+                    "output_schema",
+                ),
+                ("max_steps", json!(5), "invalid_params", "max_steps"),
+                (
+                    "bound",
+                    json!({"mode":"full","extra_write_dirs":[],"network":true}),
+                    "bound_unsupported",
+                    "bound",
+                ),
+                (
+                    "vendor",
+                    json!({"fake":{"k":"v"}}),
+                    "invalid_params",
+                    "vendor",
+                ),
+                (
+                    "deadlines",
+                    json!({"idle_ms":60_000}),
+                    "invalid_params",
+                    "deadlines.idle_ms",
+                ),
+            ];
+            let spawn_base = json!({"harness":"fake","model":"fake","prompt":"x","handle":HANDLE});
+            let resume_base = json!({"session":session,"handle":HANDLE,"prompt":"x"});
+            let mut id = 10;
+            let mut replies = String::new();
+            for (method, base) in [("spawn", &spawn_base), ("resume", &resume_base)] {
+                for (member, value, kind, field) in &per_turn {
+                    let mut params = base.clone();
+                    params[*member] = value.clone();
+                    id += 1;
+                    let reply = raw.exchange(&request(id, method, &params))?;
+                    replies.push_str(&reply.to_string());
+                    replies.push('\n');
+                    refused_raw(&format!("{method} {member}"), &reply, kind, None, field)?;
+                }
+            }
+            for (member, value) in [
+                ("harness", json!("fake")),
+                ("model", json!("fake")),
+                ("allow_untested", json!(false)),
+                ("instructions", json!({"text":"x"})),
+                ("cwd", json!("/")),
+                ("require", json!([])),
+                ("label", json!("l")),
+            ] {
+                let mut params = resume_base.clone();
+                params[member] = value;
+                id += 1;
+                let reply = raw.exchange(&request(id, "resume", &params))?;
+                replies.push_str(&reply.to_string());
+                replies.push('\n');
+                refused_raw(
+                    &format!("resume {member}"),
+                    &reply,
+                    "invalid_params",
+                    Some("session_scope_on_resume"),
+                    member,
+                )?;
+            }
+            evidence
+                .write("refusals.ndjson", replies.as_bytes())
+                .map_err(infra)?;
+            if sandbox.count("SELECT count(*) FROM turns")? != 1 {
+                return Err(failure("a refused request committed a turn"));
+            }
+            // Nullable members accept null (`output_schema: null` clears);
+            // empty values pass.
+            let nulls = json!({"output_schema":null,"max_steps":null,
+                "vendor":{},"deadlines":{"wall_ms":null,"idle_ms":null}});
+            let mut params = spawn_base.clone();
+            params["prompt"] = json!("n1");
+            let mut resumed = resume_base.clone();
+            resumed["prompt"] = json!("n2");
+            for (target, extra) in [(&mut params, &nulls), (&mut resumed, &nulls)] {
+                for (member, value) in extra.as_object().into_iter().flatten() {
+                    target[member] = value.clone();
+                }
+            }
+            let null_spawn = succeeded(
+                "spawn_nulls",
+                &raw.exchange(&request(90, "spawn", &params))?,
+            )?;
+            let null_resume = succeeded(
+                "resume_nulls",
+                &raw.exchange(&request(91, "resume", &resumed))?,
+            )?;
+            // Nothing given or inherited: the fake route's default wall deadline.
+            for receipt in [&null_spawn, &null_resume] {
+                if receipt["effective"] != fake_effective(30_000) {
+                    return Err(failure(format!("null values changed effective: {receipt}")));
+                }
+            }
+            let other = session_of(&null_spawn)?;
+            let other_first = wait_completed(
+                &sandbox,
+                evidence,
+                "wait_n1",
+                &format!("{other}/1"),
+                "n1 reply",
+            )?;
+            let second = wait_completed(
+                &sandbox,
+                evidence,
+                "wait_n2",
+                &format!("{session}/2"),
+                "n2 reply",
+            )?;
+            let mut lines = String::new();
+            for value in [
+                &spawn,
+                &first,
+                &null_spawn,
+                &null_resume,
+                &other_first,
+                &second,
+            ] {
+                lines.push_str(&value.to_string());
+                lines.push('\n');
+            }
+            evidence
+                .write("envelopes.ndjson", lines.as_bytes())
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 2)?;
+            Ok(())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}
+
+/// C1 P4 and §3 `op_key` with per-turn values: a keyed retry replays the
+/// identical receipt, `effective` included; changed per-turn values under
+/// the key are `idempotency_conflict`. An unkeyed turn after them inherits
+/// the keyed turn's frozen value.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end retry scenario keeps its steps and checks together"
+)]
+fn s1_params_keyed_retry_replays_identical_effective() -> TestResult {
+    let sandbox = Sandbox::new(&fixture(&[
+        turn_script(1, "k1", None),
+        turn_script(2, "k2", None),
+        turn_script(3, "k3", None),
+    ]))?;
+    let evidence = Evidence::new("s1_params_keyed_retry", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let mut raw = Raw::open(&sandbox)?;
+            let spawn = json!({"harness":"fake","model":"fake","prompt":"k1","handle":HANDLE,
+                "idempotency_key":"k-e","deadlines":{"wall_ms":21_000}});
+            let original = succeeded("spawn", &raw.exchange(&request(7, "spawn", &spawn))?)?;
+            let session = session_of(&original)?;
+            let repeated = succeeded("spawn_retry", &raw.exchange(&request(8, "spawn", &spawn))?)?;
+            if repeated != original || original["effective"] != fake_effective(21_000) {
+                return Err(failure(format!(
+                    "spawn replay differs: {repeated} vs {original}"
+                )));
+            }
+            let mut changed = spawn.clone();
+            changed["deadlines"]["wall_ms"] = json!(22_000);
+            let reply = raw.exchange(&request(9, "spawn", &changed))?;
+            if reply["error"]["data"]["kind2"] != "idempotency_conflict" {
+                return Err(failure(format!("changed spawn wall_ms: {reply}")));
+            }
+            wait_completed(
+                &sandbox,
+                evidence,
+                "wait_1",
+                &format!("{session}/1"),
+                "k1 reply",
+            )?;
+            let resume = json!({"session":session,"handle":HANDLE,"prompt":"k2","op_key":"o-e",
+                "deadlines":{"wall_ms":23_000}});
+            let turn = succeeded("resume", &raw.exchange(&request(10, "resume", &resume))?)?;
+            let again = succeeded(
+                "resume_retry",
+                &raw.exchange(&request(11, "resume", &resume))?,
+            )?;
+            if again != turn || turn["effective"] != fake_effective(23_000) {
+                return Err(failure(format!("resume replay differs: {again} vs {turn}")));
+            }
+            for (id, name, value) in [
+                (12, "wall_ms", json!({"wall_ms":24_000})),
+                (13, "omitted", json!({})),
+            ] {
+                let mut changed = resume.clone();
+                changed["deadlines"] = value;
+                let reply = raw.exchange(&request(id, "resume", &changed))?;
+                if reply["error"]["data"]["kind2"] != "idempotency_conflict" {
+                    return Err(failure(format!("changed resume {name}: {reply}")));
+                }
+            }
+            wait_completed(
+                &sandbox,
+                evidence,
+                "wait_2",
+                &format!("{session}/2"),
+                "k2 reply",
+            )?;
+            // A replay after the turn ended is still the original receipt.
+            let late = succeeded(
+                "resume_late_retry",
+                &raw.exchange(&request(14, "resume", &resume))?,
+            )?;
+            let third = succeeded(
+                "resume_3",
+                &raw.exchange(&request(
+                    15,
+                    "resume",
+                    &json!({"session":session,"handle":HANDLE,"prompt":"k3"}),
+                ))?,
+            )?;
+            if late != turn || third["effective"] != fake_effective(23_000) {
+                return Err(failure(format!("late replay {late}; turn 3 {third}")));
+            }
+            let last = wait_completed(
+                &sandbox,
+                evidence,
+                "wait_3",
+                &format!("{session}/3"),
+                "k3 reply",
+            )?;
+            evidence
+                .write(
+                    "envelopes.ndjson",
+                    format!("{original}\n{turn}\n{third}\n{last}\n").as_bytes(),
+                )
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 3)?;
+            let expected = [
+                fake_effective(21_000),
+                fake_effective(23_000),
+                fake_effective(23_000),
+            ];
+            if stored_effective(&sandbox, &session)? != expected
+                || started_effective(&history, 3) != expected
+            {
+                return Err(failure("frozen values differ from the receipts"));
+            }
             Ok(())
         },
         |evidence| collect_available(evidence, &sandbox.state),
