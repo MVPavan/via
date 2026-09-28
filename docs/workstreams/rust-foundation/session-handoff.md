@@ -82,9 +82,14 @@ the historical checkpoint; its findings table is updated by this section.
   §7); drain keeps sessions resumable; force closes only sessions with
   unfinished work. Design rounds 2–4 reviewed by Astra medium and Fable
   high, decisions in `t3/design-r{3,4}-decisions.md`; design at `1a814d6`
-  (round 4), narrow round-4 re-review running. S0 (file split) merged at
-  `08fffce`. S1 (Store/Host/Wire/Route primitives, [t3/s1.md](t3/s1.md))
-  running in Opus 5.5 high `session_01YVUZbU8b2HpcRwvyHqKvSB`. Then S2
+  final after round 6 and merged at `68aa7b6` ([t3/design.md](t3/design.md)).
+  S0 (file split) merged at `08fffce`. S1 (Store/Host/Wire/Route
+  primitives, [t3/s1.md](t3/s1.md), last cloud worker) delivered on
+  `claude/t3-s1-task-execution-60rojp` at `8d2a7b6`; two Sol medium reviews
+  (Store; Host/Wire/Route) and a local gate with repeated failpoint runs are
+  running. **From 2026-09-28 no new cloud work: Claude workers are local
+  subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
+  reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). Then S2
   (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique
   (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
