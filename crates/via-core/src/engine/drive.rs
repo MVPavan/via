@@ -1317,9 +1317,7 @@ impl Engine {
                     control.slot.idle_order(control.turn, tokio::time::Instant::now());
                 }
                 result = &mut execute => {
-                    while let Ok(observation) = observed_rx.try_recv() {
-                        self.observe(record, effective, observation).await;
-                    }
+                    self.drain(record, effective, control, &mut observed_rx).await;
                     return match result {
                         Err(AdapterError::Route(route))
                             if matches!(route.cause, RouteError::ForceStopped { .. }) =>
@@ -1344,6 +1342,51 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Commits the observations still queued when `execute` completed, in
+    /// decode order. A failed write sends or upgrades the turn's order to
+    /// cause `store`, as in the observation branch (design §7.2 row 5).
+    async fn drain(
+        &self,
+        record: &mut TurnRecord,
+        effective: &Effective,
+        control: &mut Control<'_>,
+        observed: &mut mpsc::Receiver<FakeObservation>,
+    ) {
+        while let Ok(observation) = observed.try_recv() {
+            self.observe(record, effective, observation).await;
+            stop_for_store(record, control);
+        }
+    }
+
+    /// Test builds: drains `queued` for the running `turn` of `slot` as
+    /// `execute`'s completion does, with the run loop's own order receiver.
+    #[cfg(test)]
+    pub(super) async fn drain_queued(
+        &self,
+        slot: &Slot,
+        record: &mut TurnRecord,
+        effective: &Effective,
+        orders: watch::Receiver<Option<StopOrder>>,
+        queued: Vec<FakeObservation>,
+    ) {
+        let (sender, mut observed) = mpsc::channel(queued.len().max(1));
+        for observation in queued {
+            let _ = sender.try_send(observation);
+        }
+        drop(sender);
+        let mut control = Control {
+            slot,
+            turn: record.turn,
+            orders,
+            observed: false,
+            stored: false,
+            idle_at: None,
+            idle: Duration::ZERO,
+        };
+        self.drain(record, effective, &mut control, &mut observed)
+            .await;
     }
 
     /// Commits one adapter observation at the next sequence, in decode order.

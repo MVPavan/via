@@ -1785,3 +1785,61 @@ fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
         assert_eq!(status["kind"], "commit_uncertain");
     });
 }
+
+/// T3-S5 round 1, decision 3 (design §7.2 row 5): an observation still
+/// queued when `execute` completes is committed by the completion's drain.
+/// When that write is not committed (the record's head read fails and
+/// writes nothing), the turn's stop order with cause `store` attaches, as
+/// in the observation branch, so the disposition carries row 5's `cancel`
+/// evidence.
+#[test]
+fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
+    let Some(root) = child("a_drained_observation_whose_write_fails_attaches_the_store_order")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let (_route, orders) = slot.start_running(turn(1), wall);
+        let watched = orders.clone();
+        // A session Store does not hold: the head read writes nothing.
+        let mut record = super::TurnRecord {
+            session: SessionId::try_from("s_000000000000").unwrap(),
+            turn: turn(1),
+            head: super::journal::Head::new(None),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: None,
+            uncertain: None,
+        };
+        let effective: crate::api::Effective = serde_json::from_value(json!({
+            "model":"fake","effort":null,"bound":null,
+            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+        }))
+        .unwrap();
+        let raw_ref = crate::RawRef::new(
+            crate::ConnectionId::try_from("c_000000000000").unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
+        let queued = via_adapters::FakeObservation::Data {
+            observation: via_adapters::Observation::AssistantText {
+                text: "lost".to_owned(),
+            },
+            raw_ref,
+        };
+        engine
+            .drain_queued(&slot, &mut record, &effective, orders, vec![queued])
+            .await;
+        let note = record.first_failure.expect("the drained write failed");
+        assert_eq!(note.outcome, super::latch::WriteOutcome::NotCommitted);
+        let order = watched.borrow().clone();
+        let order = order.expect("row 5's stop order attached");
+        assert!(matches!(order.cause, via_adapters::StopCause::Store));
+        assert!(!engine.store_failed(), "the failure is scoped");
+    });
+}
