@@ -104,6 +104,8 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + PASS_BOUND);
         // A failed pass keeps every token, and the next pass retries.
         let pass = self.adapter.reprobe_held(deadline, None).await;
+        // An uncertain pass latches (scope `daemon`); a not-committed proof
+        // is recorded against its owner session.
         self.proof_failures(&pass, FailureScope::Request).await;
         if let Some(unread) = self.recovered.unread()
             && let Some(cohort) = unread.cohort
@@ -116,7 +118,9 @@ impl Engine {
     /// commit failed to the failure hook. One that did not commit is scoped:
     /// its token stays held and the next pass retries it. One whose commit
     /// may have committed latches. A pass that failed otherwise keeps every
-    /// token and reports nothing. The caller holds no lock.
+    /// token and reports nothing. A not-committed proof is recorded against
+    /// its owner session; `scope` covers an uncertain pass, which has no
+    /// owner. The caller holds no lock.
     pub(super) async fn proof_failures(
         &self,
         pass: &Result<ReprobeReport, AdapterError>,
@@ -124,8 +128,9 @@ impl Engine {
     ) {
         match pass {
             Ok(report) => {
-                for _ in 0..report.not_committed {
-                    self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, scope)
+                for owner in &report.not_committed {
+                    let owner = FailureScope::Session(owner);
+                    self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, owner)
                         .finish()
                         .await;
                 }

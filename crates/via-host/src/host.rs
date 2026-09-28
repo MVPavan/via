@@ -427,16 +427,17 @@ impl std::fmt::Display for AcquireFailure {
 impl std::error::Error for AcquireFailure {}
 
 /// One re-probe pass over held groups (design §8).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReprobeReport {
     /// Held groups without a live control, as the pass found them; with a
     /// session filter, only that session's (see [`Host::reprobe_held`]).
     pub held: usize,
     /// Groups proved absent and released by this pass.
     pub proved: usize,
-    /// Proofs observed whose commit was not committed; their tokens stay
-    /// held and the next pass retries (design §7.2 row 12).
-    pub not_committed: usize,
+    /// Owner sessions of proofs observed whose commit was not committed;
+    /// their tokens stay held and the next pass retries (design §7.2 row
+    /// 12). Core records each failure against its session.
+    pub not_committed: Vec<crate::SessionId>,
 }
 
 /// Successfully launched process after durable vendor facts and pipe detachment.
@@ -863,7 +864,7 @@ impl Host {
         deadline: Deadline,
         owner: Option<crate::SessionId>,
     ) -> Result<ReprobeReport, HostError> {
-        let mut remaining: HashMap<String, Option<(ProcessIdentity, String)>> = {
+        let mut remaining: HashMap<String, (Option<(ProcessIdentity, String)>, crate::SessionId)> = {
             let ledger = self.capacity.lock();
             ledger
                 .held
@@ -872,7 +873,12 @@ impl Host {
                     !ledger.busy(anchor_id)
                         && owner.as_ref().is_none_or(|owner| *owner == held.owner)
                 })
-                .map(|(anchor_id, held)| (anchor_id.clone(), held.identity.clone()))
+                .map(|(anchor_id, held)| {
+                    (
+                        anchor_id.clone(),
+                        (held.identity.clone(), held.owner.clone()),
+                    )
+                })
                 .collect()
         };
         let mut report = ReprobeReport {
@@ -895,12 +901,12 @@ impl Host {
             let full = page.len() == via_store::ANCHOR_PAGE_LIMIT as usize;
             after = page.last().map(|record| record.intent.anchor_id.clone());
             for record in page {
-                let Some(memory) = remaining.remove(&record.intent.anchor_id) else {
+                let Some((memory, owner)) = remaining.remove(&record.intent.anchor_id) else {
                     continue;
                 };
                 match self.reprobe_one(record, memory, deadline).await? {
                     Reprobed::Proved => report.proved += 1,
-                    Reprobed::NotCommitted => report.not_committed += 1,
+                    Reprobed::NotCommitted => report.not_committed.push(owner),
                     Reprobed::Held => {}
                 }
             }

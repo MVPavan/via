@@ -1752,12 +1752,14 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
         format!("a scoped failure latched: {status}")
     })?;
     if proof == "not_committed" {
-        // The identified write's failure, then the proof's.
+        // The identified write's failure, then the proof's, which carries
+        // the owner session (T3-S5 round 1, decision 6).
         let failure = store_failure(&sandbox)?;
         check(
             failure["kind"] == "journal_failed"
                 && failure["scope"] == "session"
-                && failure["count"] == 2,
+                && failure["count"] == 2
+                && failure["affected"]["addresses"] == json!([session]),
             || format!("unexpected store_failure: {failure}"),
         )?;
     }
