@@ -431,12 +431,27 @@ struct Acquisition {
     started: Option<(String, String, ProcessIdentity)>,
     /// Host's row-4 `Stop` stopped a live vendor.
     forced: bool,
-    /// Row 4's one cleanup deadline, set before its `Stop`: the absence
-    /// check that follows uses what remains of it (design §7.2 row 4).
+    /// The one cleanup deadline, set before the cleanup starts: row 4's
+    /// `Stop` (design §7.2 row 4), or the early stop's deadline once the
+    /// acquisition observed `stopping` (§6.8). The absence check that
+    /// follows uses what remains of it.
     cleanup_by: Option<Deadline>,
     /// The acquisition observed Host's early stop: any failure is then
     /// [`HostError::Stopped`] (design §6.8 [r6.1]).
     stopping: bool,
+}
+
+impl Acquisition {
+    /// The acquisition observed Host's early stop (design §6.8): its
+    /// failure is `Stopped`, and its cleanup (the EOF drop or the owner's
+    /// `Stop`, then the absence check) runs under the early stop's own
+    /// deadline, never a fresh allowance. Returns that deadline.
+    fn stop_early(&mut self, deadline: Instant) -> Deadline {
+        let deadline = Deadline::at(deadline);
+        self.stopping = true;
+        self.cleanup_by = Some(deadline);
+        deadline
+    }
 }
 
 /// One held group's re-probe result.
@@ -972,8 +987,8 @@ impl Host {
                 phase: LaunchPhase::Verified,
             },
         );
-        if registered.is_some() {
-            state.stopping = true;
+        if let Some(deadline) = registered {
+            state.stop_early(deadline);
             return Err(HostError::Stopped);
         }
         let version = committed(
@@ -1081,8 +1096,8 @@ impl Host {
         if stopped() {
             return Err(HostError::Stopped);
         }
-        if self.capacity.begin_arming(&anchor_id).is_err() {
-            state.stopping = true;
+        if let Err(deadline) = self.capacity.begin_arming(&anchor_id) {
+            state.stop_early(deadline);
             return Err(HostError::Stopped);
         }
         // This is the only ARM send for this generation; errors never cause retry.
@@ -1106,8 +1121,8 @@ impl Host {
         // that already took its snapshot missed this group, so the owner
         // stops it under the original deadline.
         if let Some(deadline) = self.capacity.armed(&anchor_id) {
-            state.stopping = true;
-            state.forced = stop_through(&control, &generation, &stop, Deadline::at(deadline)).await;
+            let deadline = state.stop_early(deadline);
+            state.forced = stop_through(&control, &generation, &stop, deadline).await;
             #[cfg(feature = "test-failpoints")]
             let _ = via_store::failpoint::hit_async("host.early_stop.sent").await;
             return Err(HostError::Stopped);

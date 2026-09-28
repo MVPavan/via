@@ -653,6 +653,145 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
     });
 }
 
+/// How long the tests below let pass between the force signal and the
+/// held acquisition's next step, so that a fresh 3 s cleanup would outlast
+/// the early stop's deadline. It only creates elapsed time; every ordering
+/// is witnessed by an acknowledgement.
+const LATE_STEP: Duration = Duration::from_millis(1_500);
+
+/// The early stop's deadline is the force signal plus 3 s (design §6.8).
+/// This margin covers scheduling only; a fresh 3 s would exceed it by
+/// `LATE_STEP`.
+const EARLY_STOP_BOUND: Duration = Duration::from_millis(3_500);
+
+/// S1 round-2 decision 8: a control registered after the early stop's
+/// snapshot is dropped (EOF), and its cleanup runs under the early stop's
+/// deadline, not a fresh 3 s. The anchor holds its EOF exit at
+/// `host.anchor.before_eof_cleanup`, so absence stays unproven: the failure
+/// returns by that deadline with `Uncertain` cleanup, and the group stays
+/// held.
+#[test]
+fn a_late_registered_control_is_cleaned_up_under_the_early_stop_deadline() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        host.watch_force(signal);
+        fixture.arm("store.journal.anchor_intent", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let released = Arc::new(AtomicBool::new(false));
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let mut spec = fixture.spec("/bin/cat", &[]);
+            spec.capacity = Some(Box::new(Token(released.clone())));
+            async move {
+                host.acquire_retaining(spec, within(10), &LaunchPipes::default(), &never())
+                    .await
+                    .err()
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("store.journal.anchor_intent"))
+            .await
+        );
+        let forced_at = tokio::time::Instant::now();
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        tokio::time::sleep_until(forced_at + LATE_STEP).await;
+        fixture.release("store.journal.anchor_intent");
+        let failure = acquiring.await.unwrap().unwrap();
+        let elapsed = forced_at.elapsed();
+        assert!(fixture.acked("host.anchor.before_eof_cleanup"));
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < EARLY_STOP_BOUND,
+            "cleanup returned {elapsed:?} after the force signal"
+        );
+        assert!(!released.load(Ordering::Acquire));
+        assert_eq!(host.held_unproven(), 1);
+    });
+}
+
+/// S1 round-2 decision 8, the `Spawned` path: ARM completes after the early
+/// stop's snapshot, so the owner sends `Stop` itself. The anchor defers
+/// that cleanup (`host.anchor.defer_cleanup`), so absence stays unproven,
+/// and the absence check after the owner's `Stop` ends at the early stop's
+/// deadline, not a fresh 3 s.
+#[test]
+fn an_owner_stop_after_the_snapshot_keeps_the_early_stop_deadline() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        host.watch_force(signal);
+        fixture.arm("host.anchor.arm_received", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm_with("host.anchor.defer_cleanup", "fail_io", true);
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(10), &launch, &never())
+                    .await
+                    .err();
+                (failure, launch.take())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.arm_received"))
+            .await
+        );
+        let forced_at = tokio::time::Instant::now();
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        tokio::time::sleep_until(forced_at + LATE_STEP).await;
+        fixture.release("host.anchor.arm_received");
+        let (failure, pipes) = acquiring.await.unwrap();
+        let elapsed = forced_at.elapsed();
+        let failure = failure.unwrap();
+        assert!(fixture.acked("host.anchor.defer_cleanup"));
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(pipes.is_some(), "ARM was sent: the pipes are ours");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < EARLY_STOP_BOUND,
+            "cleanup returned {elapsed:?} after the force signal"
+        );
+        // Final reconciliation supplies the proof once cleanup may run.
+        fixture.disarm("host.anchor.defer_cleanup");
+        let recovered = host
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(3))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recovered[0].cleanup,
+            CleanupEvidence::GroupAbsent(_)
+        ));
+        drop(pipes);
+    });
+}
+
 /// Design §6.8: an untriggered early-stop task never holds up shutdown.
 #[test]
 fn an_untriggered_early_stop_task_is_joined_by_shutdown() {
