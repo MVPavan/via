@@ -281,7 +281,15 @@ impl Engine {
             return false;
         };
         if record.first_failure.is_some() {
-            // An earlier write already failed; Route's failure follows it.
+            // An earlier write already failed and keeps the turn's note for
+            // its resolution write; Route's failure follows it. An uncertain
+            // one still latches (design §7.1: every uncertain outcome).
+            if kind.latches() {
+                let scope = FailureScope::Turn(&record.session, record.turn);
+                self.store_failure(FailureSite::Raw, WriteOutcome::Uncertain, scope)
+                    .finish()
+                    .await;
+            }
             return false;
         }
         let site = match kind {

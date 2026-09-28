@@ -1740,3 +1740,48 @@ fn an_added_holding_resets_the_reprobe_backoff() {
         });
     });
 }
+
+/// T3-S5 round 1, decision 1 (design §7.1, §7.2 rows 5 and 6 [O1.D2]): a
+/// turn whose event already failed cleanly (its first failure, scoped)
+/// then reports an uncertain Route Store failure, such as a raw write
+/// during cleanup. The uncertain outcome still latches, and the first note
+/// stays the turn's, for its resolution write.
+#[test]
+fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
+    let Some(root) = child("a_later_uncertain_route_failure_latches_after_a_clean_first_failure")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = super::queue::Slot::new(super::journal::Head::new(Some(2)));
+        let mut record = super::TurnRecord {
+            session: session.clone(),
+            turn: turn(1),
+            head: super::journal::Head::new(Some(2)),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: Some(super::FailureNote {
+                site: super::latch::FailureSite::Event,
+                outcome: super::latch::WriteOutcome::NotCommitted,
+            }),
+            uncertain: None,
+        };
+        assert!(!engine.store_failed(), "the clean failure is scoped");
+        let cause = via_adapters::RouteError::Store {
+            turn: turn(1),
+            kind: via_adapters::StoreFailure::Uncertain,
+        };
+        engine
+            .route_failed(&slot, &mut record, Some(&cause), false)
+            .await;
+        assert!(engine.store_failed(), "the uncertain failure latched");
+        let first = record.first_failure.expect("the first note is kept");
+        assert_eq!(first.site, super::latch::FailureSite::Event);
+        assert_eq!(first.outcome, super::latch::WriteOutcome::NotCommitted);
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "daemon");
+        assert_eq!(status["kind"], "commit_uncertain");
+    });
+}
