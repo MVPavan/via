@@ -112,7 +112,12 @@ impl Fixture {
     }
 
     fn arm(&self, point: &str, action: &str) {
-        let command = serde_json::json!({"token":TOKEN,"occurrence":1,"action":action});
+        self.arm_with(point, action, false);
+    }
+
+    fn arm_with(&self, point: &str, action: &str, persist: bool) {
+        let command =
+            serde_json::json!({"token":TOKEN,"occurrence":1,"action":action,"persist":persist});
         fs::write(
             self.points.join(format!("{point}.json")),
             command.to_string(),
@@ -120,8 +125,18 @@ impl Fixture {
         .unwrap();
     }
 
+    fn disarm(&self, point: &str) {
+        fs::remove_file(self.points.join(format!("{point}.json"))).unwrap();
+    }
+
     fn acked(&self, point: &str) -> bool {
-        self.points.join(format!("{point}.1.ack")).exists()
+        self.acked_at(point, 1)
+    }
+
+    fn acked_at(&self, point: &str, occurrence: u64) -> bool {
+        self.points
+            .join(format!("{point}.{occurrence}.ack"))
+            .exists()
     }
 
     fn release(&self, point: &str) {
@@ -509,6 +524,8 @@ fn an_untriggered_early_stop_task_is_joined_by_shutdown() {
         let host = fixture.host();
         let (_force, signal) = tokio::sync::watch::channel(false);
         host.watch_force(signal);
+        // Design §6.8 [r6.2]: the task itself is not pending cleanup.
+        assert_eq!(host.pending_cleanup(), 0);
         let report = host.shutdown(within(2), &[]).await;
         assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
         assert!(report.failure.is_none(), "{report:?}");
@@ -543,5 +560,211 @@ fn a_vendor_ignoring_sigterm_is_killed_within_the_allowance() {
         assert!(close.forced, "{close:?}");
         assert!(matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)));
         assert!(group_gone(pgid));
+    });
+}
+
+/// Design §6.8 [r6.1]: ARM is in flight (the anchor holds it at
+/// `host.anchor.arm_received`) when the early stop takes its snapshot, so the
+/// snapshot, which holds only armed controls, misses the group. Marking it
+/// armed after `Spawned`, the owner sees `stopping` and sends `Stop` itself
+/// under the original deadline: acknowledged, and the group is gone.
+#[test]
+fn arm_completing_after_the_snapshot_is_stopped_by_its_owner() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        host.watch_force(signal);
+        fixture.arm("host.anchor.arm_received", "pause");
+        fixture.arm("host.early_stop.snapshot", "pause");
+        fixture.arm("host.early_stop.sent", "fail_io");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(6), &launch, &|| false)
+                    .await
+                    .err();
+                (failure, launch.take().is_some())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.arm_received"))
+            .await
+        );
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        fixture.release("host.anchor.arm_received");
+        let (failure, launched) = acquiring.await.unwrap();
+        let failure = failure.unwrap();
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(launched && failure.forced, "{failure:?}");
+        assert!(fixture.acked("host.early_stop.sent"));
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{failure:?}"
+        );
+        fixture.release("host.early_stop.snapshot");
+    });
+}
+
+/// Design §6.8 [r6.1]: before ARM the early stop sends nothing (the pre-ARM
+/// anchor treats `Stop` as invalid); the ARM gate reads `stopping` and
+/// refuses: `Stopped`, not launched, no `Stop` frame, absence proved.
+#[test]
+fn a_pre_arm_acquisition_is_refused_at_the_gate_without_a_stop_frame() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        host.watch_force(signal);
+        fixture.arm("host.anchor.after_arm_intent_commit", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("host.early_stop.sent", "fail_io");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(6), &launch, &|| false)
+                    .await
+                    .err();
+                (failure, launch.take().is_some())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.after_arm_intent_commit"))
+            .await
+        );
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        fixture.release("host.anchor.after_arm_intent_commit");
+        let (failure, launched) = acquiring.await.unwrap();
+        let failure = failure.unwrap();
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(!launched && !failure.forced, "{failure:?}");
+        assert!(!fixture.acked("host.early_stop.sent"));
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{failure:?}"
+        );
+    });
+}
+
+/// Design §6.8 [r4.2, r6.3]: with `host.anchor.defer_cleanup` armed, the
+/// anchor keeps its group alive through Route's force close (no force
+/// evidence, cleanup uncertain) and through the control's EOF; the first
+/// `Stop` after the harness disarms it is reconciliation's, which starts
+/// the cleanup, supplies `stopped_live` and proves absence.
+#[test]
+fn reconciliation_supplies_the_evidence_a_deferred_close_lacked() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm_with("host.anchor.defer_cleanup", "fail_io", true);
+        let acquired = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let pgid = acquired.control.identity().pgid;
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(1),
+            })
+            .await;
+        assert!(!close.forced, "{close:?}");
+        assert!(matches!(close.cleanup, CleanupEvidence::Uncertain(_)));
+        // The vendor keeps its stdin; only the control is released.
+        let via_host::AcquiredProcess { pipes, control, .. } = acquired;
+        drop(control);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked_at("host.anchor.defer_cleanup", 2))
+            .await,
+            "the control's EOF was not deferred"
+        );
+        assert!(!group_gone(pgid));
+        fixture.disarm("host.anchor.defer_cleanup");
+        let recovered = host
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(3))
+            .await
+            .unwrap();
+        assert!(recovered[0].forced, "{recovered:?}");
+        assert!(matches!(
+            recovered[0].cleanup,
+            CleanupEvidence::GroupAbsent(_)
+        ));
+        assert!(group_gone(pgid));
+        drop(pipes);
+    });
+}
+
+/// Design §6.8 [r5.3, r6.5]: the early stop's Stops run concurrently. One
+/// anchor holds its `Stop` at `host.anchor.stop_received` (a close already
+/// owns that control); the other group's `host.early_stop.sent` arrives
+/// while the pause is still held.
+#[test]
+fn early_stops_are_concurrent() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        host.watch_force(signal);
+        let busy = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let other = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        fixture.arm("host.anchor.stop_received", "pause");
+        fixture.arm("host.early_stop.sent", "fail_io");
+        let closing = tokio::spawn(async move {
+            busy.control
+                .close(CloseRequest {
+                    mode: CloseMode::Force,
+                    deadline: within(8),
+                })
+                .await
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.stop_received"))
+            .await
+        );
+        // Only the held anchor pauses; the other one's Stop proceeds.
+        fixture.disarm("host.anchor.stop_received");
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.sent"))
+            .await,
+            "the free group's stop waited behind the busy one"
+        );
+        assert!(
+            eventually(Duration::from_secs(3), || group_gone(
+                other.control.identity().pgid
+            ))
+            .await
+        );
+        fixture.release("host.anchor.stop_received");
+        let close = closing.await.unwrap();
+        assert!(matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)));
     });
 }

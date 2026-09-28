@@ -32,22 +32,22 @@ pub(super) fn sql_error(error: rusqlite::Error) -> StoreError {
 /// a `fail_io` at `point` or at `store.commit.fail_persistent` rolls the
 /// transaction back, so the write is not committed; a pause holds the writer.
 #[cfg(feature = "test-failpoints")]
-pub(super) fn before_commit(point: &'static str) -> Result<(), StoreError> {
+pub(super) fn commit_seam(point: &'static str) -> Result<(), StoreError> {
     for point in [point, "store.commit.fail_persistent"] {
         crate::failpoint::hit(point).map_err(|error| StoreError::Write(error.to_string()))?;
     }
     Ok(())
 }
 
-/// Release builds have no seam before `COMMIT`.
-#[cfg(not(feature = "test-failpoints"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "test builds can fail at the seam; callers stay identical"
-)]
-pub(super) fn before_commit(_point: &'static str) -> Result<(), StoreError> {
-    Ok(())
+/// [`commit_seam`] at a named point; nothing at all, not even the point's
+/// name, in a release build.
+macro_rules! before_commit {
+    ($point:expr) => {
+        #[cfg(feature = "test-failpoints")]
+        crate::runtime::sql::commit_seam($point)?;
+    };
 }
+pub(super) use before_commit;
 
 pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
     let metadata =
@@ -556,7 +556,7 @@ fn commit_spawn(
     #[cfg(feature = "test-failpoints")]
     crate::failpoint::hit("store.spawn.before_commit")
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    before_commit("store.commit.receipt")?;
+    before_commit!("store.commit.receipt");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     // Committed but unacknowledged: all rows survive together.
@@ -655,7 +655,7 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
         [session.as_str()],
     )
     .map_err(sql_error)?;
-    before_commit("store.commit.receipt")?;
+    before_commit!("store.commit.receipt");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -859,7 +859,7 @@ fn commit_submission(conn: &mut Connection, record: &SubmissionRecord) -> Result
         return Err(StoreError::Constraint("turn is not queued"));
     }
     insert_event(&tx, session, &record.event, None)?;
-    before_commit("store.commit.submission")?;
+    before_commit!("store.commit.submission");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -904,7 +904,7 @@ fn commit_acceptance(
     )
     .map_err(sql_error)?;
     insert_event(&tx, session, &record.event, Some(&record.raw_ref))?;
-    before_commit("store.commit.event")?;
+    before_commit!("store.commit.event");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -999,7 +999,7 @@ fn commit_event(
         &record.event,
         record.raw_ref.as_ref(),
     )?;
-    before_commit("store.commit.event")?;
+    before_commit!("store.commit.event");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -1032,7 +1032,7 @@ fn commit_session_closed(
         [session.as_str()],
     )
     .map_err(sql_error)?;
-    before_commit("store.commit.session_closed")?;
+    before_commit!("store.commit.session_closed");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     Ok(true)
@@ -1056,13 +1056,14 @@ fn commit_terminal(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
     // A queued turn can only be cancelled: that is `store.commit.cancel`.
+    #[cfg(feature = "test-failpoints")]
     let queued = turn_state(&tx, &record.session_id, record.turn)?.as_deref() == Some("queued");
     let closed = insert_terminal(&tx, record, extras, closed)?;
-    before_commit(if queued {
+    before_commit!(if queued {
         "store.commit.cancel"
     } else {
         "store.commit.terminal"
-    })?;
+    });
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     Ok(closed)
@@ -1136,7 +1137,7 @@ fn insert_terminal(
         Some(closed) => {
             // Design §10 [r3.6]: the rider seam fails the combined
             // transaction after the terminal insert.
-            before_commit("store.commit.rider")?;
+            before_commit!("store.commit.rider");
             if unfinished_turns(tx, &record.session_id)? {
                 false
             } else {
@@ -1199,7 +1200,7 @@ fn commit_closing(conn: &mut Connection, record: &ClosingRecord) -> Result<(), S
         )
         .map_err(sql_error)?;
     }
-    before_commit("store.commit.closing")?;
+    before_commit!("store.commit.closing");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -1257,7 +1258,7 @@ fn commit_closed(
             .map_err(sql_error)?;
         }
     }
-    before_commit("store.commit.closed")?;
+    before_commit!("store.commit.closed");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     Ok(ClosedOutcome::Closed(result))
@@ -1364,7 +1365,7 @@ fn commit_submit_failed(
     insert_event(&tx, session, &record.submitted, None)?;
     insert_event(&tx, session, &record.ended, None)?;
     update_session_state(&tx, session, false)?;
-    before_commit("store.commit.terminal")?;
+    before_commit!("store.commit.terminal");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -1404,7 +1405,7 @@ fn commit_failure_resolution(
         }
         insert_terminal(&tx, cancellation, &TerminalExtras::default(), None)?;
     }
-    before_commit("store.commit.terminal")?;
+    before_commit!("store.commit.terminal");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }

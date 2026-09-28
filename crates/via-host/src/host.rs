@@ -66,19 +66,33 @@ struct Ledger {
     held: HashMap<String, Held>,
     /// Spawned anchors whose acquisition has not returned yet.
     acquiring: HashSet<String>,
-    /// Verified controls, registered before ARM (design §6.8 [r5.2]); an
-    /// entry whose control was dropped is pruned lazily.
+    /// Verified controls, registered before ARM (design §6.8 [r5.2]), with
+    /// their launch phase [r6.1]; an entry whose control was dropped is
+    /// pruned lazily.
     live: HashMap<String, LiveControl>,
     /// Sticky: the early stop's deadline, once the force signal came.
     stopping: Option<Instant>,
 }
 
-/// A verified control the early stop can reach.
+/// A verified control and its launch phase.
 #[derive(Clone)]
 struct LiveControl {
     stream: Weak<Mutex<ControlConnection>>,
     generation: String,
     stop: Arc<StopFacts>,
+    phase: LaunchPhase,
+}
+
+/// Where a verified control's launch is (design §6.8 [r6.1]). Only an
+/// `Armed` anchor accepts `Stop`; before ARM it treats `Stop` as invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchPhase {
+    /// Verified; ARM not yet authorized.
+    Verified,
+    /// Past the gate: ARM is being sent.
+    Arming,
+    /// The anchor confirmed the vendor spawn.
+    Armed,
 }
 
 impl Ledger {
@@ -136,8 +150,9 @@ impl Capacity {
         ledger.stopping
     }
 
-    /// Sets the sticky `stopping` flag and snapshots the live controls,
-    /// atomically with registration (design §6.8 [r5.2]).
+    /// Sets the sticky `stopping` flag and snapshots the armed live
+    /// controls, atomically with registration, the ARM gate and the armed
+    /// mark (design §6.8 [r5.2, r6.1]).
     fn begin_stopping(&self) -> (Instant, Vec<LiveControl>) {
         let mut ledger = self.lock();
         let deadline = *ledger
@@ -146,10 +161,36 @@ impl Capacity {
         let controls = ledger
             .live
             .values()
-            .filter(|control| control.stream.strong_count() > 0)
+            .filter(|control| {
+                control.phase == LaunchPhase::Armed && control.stream.strong_count() > 0
+            })
             .cloned()
             .collect();
         (deadline, controls)
+    }
+
+    /// The ARM gate's ledger half: refused with the early stop's deadline
+    /// once `stopping` is set, else the entry is `Arming`.
+    fn begin_arming(&self, anchor_id: &str) -> Result<(), Instant> {
+        let mut ledger = self.lock();
+        if let Some(deadline) = ledger.stopping {
+            return Err(deadline);
+        }
+        if let Some(control) = ledger.live.get_mut(anchor_id) {
+            control.phase = LaunchPhase::Arming;
+        }
+        Ok(())
+    }
+
+    /// Marks the entry `Armed` once the vendor spawned; returns the early
+    /// stop's deadline when it already took its snapshot, so the owner
+    /// sends `Stop` itself.
+    fn armed(&self, anchor_id: &str) -> Option<Instant> {
+        let mut ledger = self.lock();
+        if let Some(control) = ledger.live.get_mut(anchor_id) {
+            control.phase = LaunchPhase::Armed;
+        }
+        ledger.stopping
     }
 
     /// Releases the anchor's capacity once its group is proved absent.
@@ -390,6 +431,9 @@ struct Acquisition {
     started: Option<(String, String, ProcessIdentity)>,
     /// Host's row-4 `Stop` stopped a live vendor.
     forced: bool,
+    /// The acquisition observed Host's early stop: any failure is then
+    /// [`HostError::Stopped`] (design §6.8 [r6.1]).
+    stopping: bool,
 }
 
 /// One held group's re-probe result.
@@ -614,6 +658,11 @@ impl Host {
     /// releases the anchor's capacity; uncertainty keeps it with its
     /// in-memory identity for re-probe (§8).
     async fn failed_acquisition(&self, error: HostError, state: &Acquisition) -> AcquireFailure {
+        let error = if state.stopping {
+            HostError::Stopped
+        } else {
+            error
+        };
         let mut journal_uncertain = matches!(
             error,
             HostError::Journal {
@@ -708,6 +757,9 @@ impl Host {
                 () = raised(&mut retire) => return Ok(()),
             }
             let (deadline, controls) = ledger.begin_stopping();
+            // Test builds: the snapshot is taken and no Stop sent yet.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("host.early_stop.snapshot").await;
             let mut stops = tokio::task::JoinSet::new();
             for control in controls {
                 stops.spawn(early_stop(control, deadline));
@@ -912,9 +964,11 @@ impl Host {
                 stream: Arc::downgrade(&control),
                 generation: generation.clone(),
                 stop: stop.clone(),
+                phase: LaunchPhase::Verified,
             },
         );
         if registered.is_some() {
+            state.stopping = true;
             return Err(HostError::Stopped);
         }
         let version = committed(
@@ -1004,17 +1058,8 @@ impl Host {
         } = self
             .start_anchor(spec.owner.clone(), spec.capacity.take(), state)
             .await?;
-        let mut vendor_env = spec.env.entries().to_vec();
-        vendor_env.push(("VIA_PROCESS_MARKER".into(), linux::random_hex()?.into()));
-        let vendor = VendorConfig::from_parts(&spec.program, &spec.args, &spec.cwd, &vendor_env);
-        let Reply::Configured = control
-            .lock()
-            .await
-            .transact(&Request::Configure { vendor }, 65_536)
-            .await?
-        else {
-            return Err(HostError::Protocol("anchor configuration refused"));
-        };
+        let vendor = vendor_config(&spec)?;
+        configure(&control, vendor).await?;
         committed(
             self.journal
                 .commit_arm_intent(&anchor_id, &generation, version)
@@ -1028,7 +1073,11 @@ impl Host {
         // The pre-ARM launch gate: a stop set by now wins and nothing launches;
         // returning drops the anchor control, so the anchor exits on EOF and
         // stops its group. Past this check ARM wins and the launch is in flight.
-        if stopped() || self.capacity.lock().stopping.is_some() {
+        if stopped() {
+            return Err(HostError::Stopped);
+        }
+        if self.capacity.begin_arming(&anchor_id).is_err() {
+            state.stopping = true;
             return Err(HostError::Stopped);
         }
         // This is the only ARM send for this generation; errors never cause retry.
@@ -1048,6 +1097,16 @@ impl Host {
                 "anchor did not confirm descriptor detachment",
             ));
         };
+        // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
+        // that already took its snapshot missed this group, so the owner
+        // stops it under the original deadline.
+        if let Some(deadline) = self.capacity.armed(&anchor_id) {
+            state.stopping = true;
+            state.forced = stop_through(&control, &generation, &stop, Deadline::at(deadline)).await;
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("host.early_stop.sent").await;
+            return Err(HostError::Stopped);
+        }
         if let Err(error) = committed(
             self.journal
                 .commit_vendor_facts(&anchor_id, &generation, vendor_pid)
@@ -1363,13 +1422,13 @@ impl Host {
                 observed_at: absence.observed_at,
             }));
         }
-        let _ = timeout_at(deadline.instant(), async {
+        let stopped = timeout_at(deadline.instant(), async {
             if let Ok(mut stream) = UnixStream::connect(&record.intent.socket_path).await
                 && verify_peer_and_challenge(&mut stream, &identity)
                     .await
                     .is_ok()
             {
-                let _ = protocol::transact(
+                return protocol::transact(
                     &mut stream,
                     &Request::Stop {
                         generation: record.intent.generation.clone(),
@@ -1377,10 +1436,21 @@ impl Host {
                     },
                     1024,
                 )
-                .await;
+                .await
+                .ok();
             }
+            None
         })
         .await;
+        // Reconciliation's own Stop evidence counts (runtime §6.2, design
+        // §6.8 [r4.2, r6.3]).
+        if matches!(stopped, Ok(Some(Reply::Stopping { stopped_live: true }))) {
+            self.tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forced
+                .insert(record.intent.generation.clone());
+        }
         wait_absence(
             &self.journal,
             &record.intent.anchor_id,
@@ -1523,6 +1593,35 @@ async fn wait_graceful_exit(exit: &mut ExitReceiver, force_at: Instant) {
             break;
         }
     }
+}
+
+/// The vendor launch configuration, with Host's own random
+/// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9).
+fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
+    let mut vendor_env = spec.env.entries().to_vec();
+    vendor_env.push(("VIA_PROCESS_MARKER".into(), linux::random_hex()?.into()));
+    Ok(VendorConfig::from_parts(
+        &spec.program,
+        &spec.args,
+        &spec.cwd,
+        &vendor_env,
+    ))
+}
+
+/// Sends the vendor launch configuration through the verified control.
+async fn configure(
+    control: &Mutex<ControlConnection>,
+    vendor: VendorConfig,
+) -> Result<(), HostError> {
+    let Reply::Configured = control
+        .lock()
+        .await
+        .transact(&Request::Configure { vendor }, 65_536)
+        .await?
+    else {
+        return Err(HostError::Protocol("anchor configuration refused"));
+    };
+    Ok(())
 }
 
 /// Writes the anchor's private bootstrap file, synced, never over another.

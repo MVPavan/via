@@ -33,7 +33,7 @@ pub(super) fn commit_anchor_intent(
         params![intent.anchor_id,intent.generation,intent.marker,socket_path,
             intent.owner_session.as_str(),intent.owner_turn.get(),intent.uid,intent.boot_id,intent.pid_namespace],
     ).map_err(sql_error)?;
-    before_commit("store.journal.anchor_intent")?;
+    before_commit!("store.journal.anchor_intent");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     Ok(AnchorIntentReceipt { record_version: 1 })
@@ -62,7 +62,7 @@ pub(super) fn commit_anchor_identified(
     if changed != 1 {
         return Err(StoreError::Constraint("anchor identity/version mismatch"));
     }
-    before_commit("store.journal.identified")?;
+    before_commit!("store.journal.identified");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     version
@@ -97,7 +97,7 @@ pub(super) fn commit_arm_intent(
             "ARM intent requires committed identity/version",
         ));
     }
-    before_commit("store.journal.arm_intent")?;
+    before_commit!("store.journal.arm_intent");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))?;
     version
@@ -124,7 +124,7 @@ pub(super) fn commit_vendor_facts(
     if changed != 1 {
         return Err(StoreError::Constraint("vendor facts require ARM intent"));
     }
-    before_commit("store.journal.vendor_facts")?;
+    before_commit!("store.journal.vendor_facts");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
@@ -195,7 +195,7 @@ pub(super) fn commit_group_absence(
     if changed != 1 {
         return Err(StoreError::Constraint("group absence identity mismatch"));
     }
-    before_commit("store.journal.absence")?;
+    before_commit!("store.journal.absence");
     tx.commit()
         .map_err(|error| StoreError::Uncertain(error.to_string()))
 }
