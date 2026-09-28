@@ -1186,7 +1186,7 @@ pub(crate) struct Timestamps {
     pub(crate) ended_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Exit {
     pub(crate) code: Option<i32>,
     pub(crate) signal: Option<i32>,
@@ -1200,7 +1200,7 @@ pub(crate) struct EventRange {
 }
 
 /// C1 §5 bounding span of one connection's raw log for a turn; `last_offset` is exclusive.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct RawSpan {
     connection_id: ConnectionId,
     path: String,

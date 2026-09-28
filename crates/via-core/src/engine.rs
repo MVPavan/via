@@ -19,6 +19,7 @@ use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
 use via_store::{Store, StoreClient, StoreLock};
 
+mod batch;
 mod close;
 mod control;
 mod drive;
@@ -29,6 +30,7 @@ mod read;
 mod receipt;
 mod recovery;
 mod reprobe;
+mod resolve;
 mod slots;
 mod status;
 mod stop;
@@ -36,6 +38,7 @@ mod terminal;
 #[cfg(test)]
 mod tests;
 
+pub use batch::FailureBatches;
 use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
@@ -69,6 +72,9 @@ pub struct Engine {
     force_requested_at: OnceLock<String>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
+    /// Running turns whose terminal write failed after the run loop ended,
+    /// kept for final shutdown's failure-resolution batch (design §7.4).
+    affected: StdMutex<Vec<batch::AffectedTurn>>,
     /// Receipted turns with no terminal known to have committed; a turn whose
     /// terminal could not be made durable reads as `store_error`.
     unresolved: Unresolved,
@@ -178,6 +184,9 @@ struct ForcedTurn {
     requested_at: String,
     /// Route's force cleanup could not record every vendor byte.
     raw_incomplete: bool,
+    /// Its `raw_log.incomplete` was dropped after the turn's first failure
+    /// and is owed to the failure-resolution batch (design §7.4).
+    raw_owed: bool,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
     /// Route's own Host close: its stop found the vendor live, and whether it
@@ -197,6 +206,7 @@ struct RouteClose {
 
 /// Durable facts of a turn about to take its terminal: its queue entry and,
 /// once committed, its submission.
+#[derive(Clone)]
 struct Started {
     session: SessionId,
     turn: TurnNumber,
@@ -295,6 +305,7 @@ impl Engine {
             force: watch::Sender::new(false),
             force_requested_at: OnceLock::new(),
             forced: StdMutex::new(Vec::new()),
+            affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
             finalized: AtomicBool::new(false),
             sessions: StdMutex::new(HashMap::new()),
@@ -417,6 +428,7 @@ impl Engine {
 }
 
 /// Committed acceptance facts the envelope reports.
+#[derive(Clone)]
 struct Accepted {
     at: String,
     raw_ref: RawRef,
@@ -424,7 +436,10 @@ struct Accepted {
 }
 
 /// Durable progress of a running turn: the session's shared event head and the
-/// bounding raw spans of every event committed so far.
+/// bounding raw spans of every event committed so far. A clone is kept
+/// for the failure-resolution batch of a turn whose terminal failed
+/// (design §7.4).
+#[derive(Clone)]
 struct TurnRecord {
     session: SessionId,
     turn: TurnNumber,
@@ -447,6 +462,7 @@ struct FailureNote {
 }
 
 /// Core's terminal decision from adapter evidence (C1 §5, §8.2).
+#[derive(Clone)]
 struct Terminal {
     state: &'static str,
     failure: Option<Failure>,

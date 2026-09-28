@@ -78,6 +78,9 @@ pub(super) enum FailureSite {
     Closed,
     /// A forced turn's terminal in final shutdown (row 15).
     ForcedTerminal,
+    /// Final shutdown's failure-resolution batch (§7.4); only reached after
+    /// the latch.
+    Batch,
 }
 
 impl FailureSite {
@@ -90,13 +93,13 @@ impl FailureSite {
             | Self::SessionClosed
             | Self::Closing
             | Self::Closed
-            | Self::ForcedTerminal => true,
-            // Until their resolution writes exist, these latch as before.
-            Self::Submission
+            | Self::ForcedTerminal
+            | Self::Submission
             | Self::Event
             | Self::Terminal
-            | Self::QueuedCancel
-            | Self::Resolution => false,
+            | Self::QueuedCancel => true,
+            // The escalation: a turn's one resolution write failed.
+            Self::Resolution | Self::Batch => false,
         }
     }
 
@@ -112,7 +115,8 @@ impl FailureSite {
             | Self::Terminal
             | Self::Resolution
             | Self::QueuedCancel
-            | Self::ForcedTerminal => "turn",
+            | Self::ForcedTerminal
+            | Self::Batch => "turn",
         }
     }
 }
@@ -220,7 +224,8 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             | FailureSite::SessionClosed
             | FailureSite::Closing
             | FailureSite::Closed
-            | FailureSite::ForcedTerminal => "commit_failed",
+            | FailureSite::ForcedTerminal
+            | FailureSite::Batch => "commit_failed",
         },
     }
 }

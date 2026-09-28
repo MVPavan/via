@@ -14,9 +14,11 @@ use via_store::{
     AcceptanceRecord, CancelCause, QueuedTurn, SubmissionRecord, TerminalExtras, TerminalRecord,
 };
 
+use super::batch::AffectedTurn;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
+use super::resolve::{CORRUPT_ROW, Queueing, SUBMISSION_FAILED};
 use super::stop::StopMode;
 use super::terminal::{dispose, terminal_envelope};
 use super::{
@@ -42,7 +44,7 @@ pub(super) struct Submission {
 }
 
 /// One private connection per turn; turn 1 keeps the session's own name.
-fn connection_id(
+pub(super) fn connection_id(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<ConnectionId, <ConnectionId as TryFrom<&str>>::Error> {
@@ -58,8 +60,15 @@ fn connection_id(
 pub(super) enum SubmitFailure {
     /// A read before the commit failed; nothing was written.
     Unread,
-    /// The commit failed or its outcome is unknown: Store failure latches.
+    /// The commit's outcome is unknown or the database is corrupt: Store
+    /// failure latches.
     Failed(WriteOutcome),
+    /// Nothing was written: the turn fails with row 2's resolution write
+    /// (design §7.2).
+    NotCommitted(Queueing),
+    /// A frozen value of the queued row is unparseable: the turn fails with
+    /// the same write, and no Store write failed (design §7.3).
+    Corrupt(Queueing),
 }
 
 /// A queued turn's dispatch decision from its predecessors' durable state.
@@ -108,6 +117,9 @@ struct Control<'a> {
     orders: watch::Receiver<Option<StopOrder>>,
     /// The order was observed: `cancel.requested` was attempted once.
     observed: bool,
+    /// The turn's first failed write sent or upgraded its order to cause
+    /// `store` (design §7.2 row 5).
+    stored: bool,
     /// When the idle deadline strikes; disarmed once any order exists.
     idle_at: Option<tokio::time::Instant>,
     /// The turn's frozen idle budget.
@@ -278,10 +290,12 @@ impl Engine {
     }
 
     /// Claims, grants, submits and runs the queue head (design §3.1). It
-    /// keeps its queued count until Store confirms the submission. A failed
-    /// or uncertain submission latches Store failure and the turn stays
-    /// queued with no vendor I/O. Every path that does not submit rolls the
-    /// claim back.
+    /// keeps its queued count until Store confirms the submission. A
+    /// submission that did not commit, or a corrupt frozen row, fails the
+    /// turn with no vendor I/O through row 2's resolution write (design
+    /// §7.2, §7.3); an uncertain one latches Store failure and the turn
+    /// stays queued. Every other path that does not submit rolls the claim
+    /// back.
     async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
         // Design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
@@ -335,6 +349,26 @@ impl Engine {
                 .finish()
                 .await;
                 return Step::Next;
+            }
+            Err(SubmitFailure::NotCommitted(queueing)) => {
+                // No agent I/O: the connection slot is released first.
+                drop(connection);
+                self.store_failure(
+                    FailureSite::Submission,
+                    WriteOutcome::NotCommitted,
+                    FailureScope::Turn(session, turn),
+                )
+                .finish()
+                .await;
+                return self
+                    .submit_failed(slot, session, turn, queueing, SUBMISSION_FAILED)
+                    .await;
+            }
+            Err(SubmitFailure::Corrupt(queueing)) => {
+                drop(connection);
+                return self
+                    .submit_failed(slot, session, turn, queueing, CORRUPT_ROW)
+                    .await;
             }
         };
         self.queued.fetch_sub(1, Ordering::AcqRel);
@@ -567,6 +601,7 @@ impl Engine {
             turn,
             orders,
             observed: false,
+            stored: false,
             idle_at: Some(origin + effective.idle()),
             idle: effective.idle(),
         };
@@ -606,11 +641,15 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
+        // After the turn's first failure its `raw_log.incomplete` is dropped
+        // and owed to a batch, should the terminal fail too.
+        let mut raw_owed = false;
         if terminal.raw_incomplete {
             let body = EventBody::RawLogIncomplete {
                 connection_id: connection,
             };
             self.commit_event(&mut record, body, None).await;
+            raw_owed = record.first_failure.is_some();
             terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
         }
         if let Some((outcome, cleanup)) = disposed.stop {
@@ -636,7 +675,7 @@ impl Engine {
             .filter(|_| terminal.state == "cancelled");
         // A terminal that did not commit reads `store_error` and latches.
         let _ = self
-            .finish_with(&started, record, terminal, None, cause)
+            .finish_with(started, (record, terminal), cause, raw_owed)
             .await;
         slot.finish_running(turn);
     }
@@ -654,11 +693,13 @@ impl Engine {
         order: Option<StopOrder>,
     ) {
         let turn = started.turn;
+        let mut raw_owed = false;
         if forced.raw_incomplete {
             let body = EventBody::RawLogIncomplete {
                 connection_id: connection,
             };
             self.commit_event(&mut record, body, None).await;
+            raw_owed = record.first_failure.is_some();
         }
         // One `cancel.requested` per turn [r1.12]: an order's stays.
         let requested_at = if let Some(order) = &order {
@@ -675,6 +716,7 @@ impl Engine {
             record,
             requested_at,
             raw_incomplete: forced.raw_incomplete,
+            raw_owed,
             launched: forced.launched,
             close: forced.close,
             cause: order.map(|order| order.cause),
@@ -790,20 +832,19 @@ impl Engine {
         if closing {
             self.hold(&self.faults.hold_after_close_check).await;
         }
-        let committed = if self.cancel_fault() {
-            Err(ApiError::STORE)
-        } else {
-            Self::commit_turn_ended_with(&self.store, &started, record, terminal, close, extras)
-                .await
-        };
+        // Design §7.2 row 9: the dispatcher keeps its claim and retries once
+        // at the same sequence; a request rolls back instead (row 8).
+        let retry = owner == Owner::Dispatcher;
+        let committed = self
+            .commit_cancellation(&started, (record, terminal), (close, extras), retry)
+            .await;
         let durable = match committed {
             Ok(durable) => durable,
             Err(error) => {
                 let outcome = journal::outcome_of(&error);
                 let site = match owner {
                     Owner::Request => FailureSite::RequestCancel,
-                    // Until the same-sequence retry (row 9), a dispatcher's
-                    // failed cancellation escalates at once.
+                    // The retry failed, or the first write was uncertain.
                     Owner::Dispatcher => FailureSite::Resolution,
                 };
                 let latching = self.store_failure(site, outcome, FailureScope::Turn(session, turn));
@@ -830,7 +871,41 @@ impl Engine {
             .await;
             return Cancelled::Latched;
         }
+        if durable.retried {
+            // The retry committed: the first attempt's failure is scoped to
+            // the turn, which stays `cancelled` [r3.13].
+            self.store_failure(
+                FailureSite::QueuedCancel,
+                WriteOutcome::NotCommitted,
+                FailureScope::Turn(session, turn),
+            )
+            .finish_with(admission.as_ref())
+            .await;
+        }
         Cancelled::Committed(cancel)
+    }
+
+    /// Commits a queued turn's cancellation, retried once with `retry`
+    /// ([`Self::commit_turn_ended_with`]). The test fault backend fails an
+    /// attempt before it writes.
+    async fn commit_cancellation(
+        &self,
+        started: &Started,
+        (record, terminal): (TurnRecord, Terminal),
+        (close, extras): (bool, TerminalExtras),
+        retry: bool,
+    ) -> Result<Durable, ApiError> {
+        let faulted = self.cancel_fault();
+        if faulted && (!retry || self.cancel_fault()) {
+            return Err(ApiError::STORE);
+        }
+        let retry = retry && !faulted;
+        Self::commit_turn_ended_with(&self.store, started, record, terminal, close, extras, retry)
+            .await
+            .map(|durable| Durable {
+                retried: durable.retried || faulted,
+                ..durable
+            })
     }
 
     /// Whether the test fault backend fails this `queued → cancelled` commit.
@@ -872,57 +947,81 @@ impl Engine {
             (record, terminal),
             close_session,
             TerminalExtras::default(),
+            false,
         )
         .await;
-        // Design §7.2 row 15: a forced terminal is final shutdown's.
-        self.finished(started, &finished, held, FailureSite::ForcedTerminal)
-            .await;
+        // Design §7.2 row 15: a forced terminal is final shutdown's single
+        // best-effort write; it is never retried.
+        let sites = (FailureSite::ForcedTerminal, FailureSite::ForcedTerminal);
+        self.finished(started, &finished, held, sites).await;
         finished.map(drop)
     }
 
     /// `finish` for a running turn's own terminal, with the `cancel_cause`
-    /// of a cancellation a `cancel` or `close` made (design §4).
+    /// of a cancellation a `cancel` or `close` made (design §4). A natural
+    /// terminal is retried once at the same sequence (design §7.2 row 7);
+    /// after the turn's first failure the terminal is its one resolution
+    /// write and is not retried. Either way the write that ends the attempt
+    /// latches when it fails (escalation).
+    ///
+    /// A terminal that did not become durable leaves the turn affected: it
+    /// is kept, with the `raw_log.incomplete` it owes, for final shutdown's
+    /// failure-resolution batch (design §7.4) before the latch is finished.
     async fn finish_with(
         &self,
-        started: &Started,
-        record: TurnRecord,
-        terminal: Terminal,
-        held: Option<&super::Admission<'_>>,
+        started: Started,
+        (record, terminal): (TurnRecord, Terminal),
         cancel_cause: Option<CancelCause>,
+        raw_owed: bool,
     ) -> Result<(), ApiError> {
         let extras = TerminalExtras {
             cancel_cause,
             raw_incomplete: None,
         };
+        let retry = record.first_failure.is_none();
+        let kept = (record.clone(), terminal.clone());
         let finished = Self::finish_turn_with(
             &self.store,
             &self.unresolved,
-            started,
+            &started,
             (record, terminal),
             false,
             extras,
+            retry,
         )
         .await;
-        self.finished(started, &finished, held, FailureSite::Terminal)
-            .await;
+        if finished.is_err() {
+            let (record, terminal) = kept;
+            self.keep_affected(AffectedTurn {
+                started: started.clone(),
+                record,
+                terminal,
+                raw_incomplete: raw_owed,
+            });
+        }
+        let sites = (FailureSite::Terminal, FailureSite::Resolution);
+        self.finished(&started, &finished, None, sites).await;
         finished.map(drop)
     }
 
-    /// Reports a terminal commit at `site` that failed or was uncertain to
-    /// the failure hook.
+    /// Reports a terminal commit to the failure hook: a first attempt that
+    /// did not commit before its retry committed at `first`, and a failed
+    /// or uncertain final write at `last` (an uncertain one latches at any
+    /// site).
     async fn finished(
         &self,
         started: &Started,
         finished: &Result<Durable, ApiError>,
         held: Option<&super::Admission<'_>>,
-        site: FailureSite,
+        (first, last): (FailureSite, FailureSite),
     ) {
         let failed = match finished {
-            Ok(durable) if !durable.uncertain => None,
-            Ok(_) => Some(WriteOutcome::Uncertain),
-            Err(error) => Some(journal::outcome_of(error)),
+            Ok(durable) if durable.uncertain => Some((first, WriteOutcome::Uncertain)),
+            Ok(durable) if durable.retried => Some((first, WriteOutcome::NotCommitted)),
+            Ok(_) => None,
+            Err(error) => Some((last, journal::outcome_of(error))),
         };
-        if let Some(outcome) = failed {
+        if let Some((site, outcome)) = failed {
             let scope = FailureScope::Turn(&started.session, started.turn);
             self.store_failure(site, outcome, scope)
                 .finish_with(held)
@@ -947,11 +1046,13 @@ impl Engine {
             (record, terminal),
             close_session,
             TerminalExtras::default(),
+            false,
         )
         .await
     }
 
-    /// [`Self::finish_turn`] with the terminal's `extras`.
+    /// [`Self::finish_turn`] with the terminal's `extras`, retried once with
+    /// `retry` ([`Self::commit_turn_ended_with`]).
     async fn finish_turn_with(
         journal: &impl TurnJournal,
         unresolved: &Unresolved,
@@ -959,10 +1060,18 @@ impl Engine {
         (record, terminal): (TurnRecord, Terminal),
         close_session: bool,
         extras: TerminalExtras,
+        retry: bool,
     ) -> Result<Durable, ApiError> {
-        let committed =
-            Self::commit_turn_ended_with(journal, started, record, terminal, close_session, extras)
-                .await;
+        let committed = Self::commit_turn_ended_with(
+            journal,
+            started,
+            record,
+            terminal,
+            close_session,
+            extras,
+            retry,
+        )
+        .await;
         match committed {
             Ok(_) => unresolved.resolve(&started.session, started.turn),
             Err(_) => unresolved.fail(&started.session, started.turn, TurnState::Running),
@@ -986,6 +1095,7 @@ impl Engine {
             terminal,
             close_session,
             TerminalExtras::default(),
+            false,
         )
         .await
     }
@@ -994,7 +1104,11 @@ impl Engine {
     /// with the terminal envelope whose raw spans bound every committed reference.
     /// An uncertain event commit is settled against the durable head first. With
     /// `close_session`, `session.closed` follows in the same transaction;
-    /// otherwise `extras` commit with the terminal.
+    /// otherwise `extras` commit with the terminal. With `retry`, a commit
+    /// known not committed is retried once at the same sequence, holding the
+    /// session head across both attempts (design §7.2 rows 7 and 9 [r3.7]).
+    /// The head advances only on a confirmed commit: a write that did not
+    /// commit leaves it as it was, and an uncertain one leaves it unknown.
     pub(super) async fn commit_turn_ended_with(
         journal: &impl TurnJournal,
         started: &Started,
@@ -1002,58 +1116,18 @@ impl Engine {
         terminal: Terminal,
         close_session: bool,
         extras: TerminalExtras,
+        retry: bool,
     ) -> Result<Durable, ApiError> {
         journal::reconcile(journal, &mut record)
             .await
             .map_err(|_| ApiError::STORE)?;
-        if let Some(reference) = &terminal.raw_ref {
-            RawSpan::include(&mut record.spans, reference);
-        }
         let shared = Arc::clone(&record.head);
         let head = shared
             .lock(journal, &started.session)
             .await
             .map_err(|_| ApiError::STORE)?;
         let seq = head.next();
-        let ended_at = rfc3339(SystemTime::now());
-        let raw_ref = terminal.raw_ref.clone();
-        let event = Event {
-            seq,
-            session_id: &started.session,
-            turn: Some(started.turn.get()),
-            late: false,
-            at: &ended_at,
-            raw_ref: raw_ref.as_ref(),
-            body: EventBody::TurnEnded {
-                state: terminal.state,
-                failure: terminal.failure.clone(),
-                stop_reason: terminal.stop_reason,
-                cancel: terminal.cancel.clone(),
-            },
-        }
-        .to_value()?;
-        let timestamps = Timestamps {
-            queued_at: started.queued_at.clone(),
-            submitted_at: started.submitted.as_ref().map(|(at, _)| at.clone()),
-            accepted_at: record.accepted.as_ref().map(|accepted| accepted.at.clone()),
-            ended_at,
-        };
-        // Monotonic, so wall-clock steps cannot distort or drop the duration.
-        let duration_ms = started
-            .submitted
-            .as_ref()
-            .and_then(|(_, clock)| u64::try_from(clock.elapsed().as_millis()).ok());
-        let envelope = terminal_envelope(
-            &started.session,
-            started.turn,
-            terminal,
-            record.accepted,
-            record.spans,
-            timestamps,
-            duration_ms,
-            (started.first_seq, seq),
-        );
-        let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
+        let ended = ended_record(started, record, terminal, seq)?;
         let closed = if close_session {
             let closed = Event {
                 seq: seq + 1,
@@ -1071,25 +1145,16 @@ impl Engine {
         } else {
             None
         };
-        let committed = journal::commit_terminal_with(
-            journal,
-            TerminalRecord {
-                session_id: started.session.clone(),
-                turn: started.turn,
-                envelope,
-                event,
-                raw_ref,
-            },
-            closed,
-            extras,
-        )
-        .await;
-        match committed {
+        let committed = journal::commit_terminal_with(journal, ended, closed, extras, retry).await;
+        match &committed {
             Ok(Durable {
                 uncertain: false,
                 closed,
-            }) => head.committed(1 + u64::from(closed)),
-            // Uncertain or failed: re-read the head before the session's next event.
+                ..
+            }) => head.committed(1 + u64::from(*closed)),
+            // Nothing was written: the sequence stays the session's next.
+            Err(error) if journal::outcome_of(error) == WriteOutcome::NotCommitted => drop(head),
+            // Uncertain: re-read the head before the session's next event.
             Ok(_) | Err(_) => head.lost(),
         }
         committed
@@ -1138,6 +1203,7 @@ impl Engine {
                         *idle_at = tokio::time::Instant::now() + control.idle;
                     }
                     self.observe(record, effective, observation).await;
+                    stop_for_store(record, control);
                 }
                 changed = control.orders.changed(), if !control.observed => {
                     let order = changed
@@ -1145,6 +1211,7 @@ impl Engine {
                         .and_then(|()| control.orders.borrow_and_update().clone());
                     if let Some(order) = order {
                         self.observe_order(record, control, &order).await;
+                        stop_for_store(record, control);
                     }
                 }
                 () = sleep_until_some(idle_at), if idle_at.is_some() => {
@@ -1332,9 +1399,13 @@ impl Engine {
         let Ok(Some(queued)) = journal.queued_turn(session, turn).await else {
             return Err(SubmitFailure::Unread);
         };
-        // A frozen row Core cannot read is a Store failure: nothing is sent.
+        let queueing = || Queueing {
+            queued_at: queued.queued_at.clone(),
+            queued_seq: queued.queued_seq,
+        };
+        // A frozen row Core cannot read fails the turn: nothing is sent.
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
-            return Err(SubmitFailure::Failed(WriteOutcome::NotCommitted));
+            return Err(SubmitFailure::Corrupt(queueing()));
         };
         // Design §2 [r1.11]: the submission clock is taken immediately
         // before the commit; both deadlines run from it.
@@ -1360,7 +1431,7 @@ impl Engine {
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()
-        .map_err(|_| SubmitFailure::Failed(WriteOutcome::NotCommitted))?;
+        .map_err(|_| SubmitFailure::NotCommitted(queueing()))?;
         let committed = journal
             .commit_submission(SubmissionRecord {
                 session_id: session.clone(),
@@ -1374,8 +1445,11 @@ impl Engine {
                 let outcome = WriteOutcome::of(&error);
                 if outcome.head_unknown() {
                     head.lost();
+                    return Err(SubmitFailure::Failed(outcome));
                 }
-                return Err(SubmitFailure::Failed(outcome));
+                // Nothing was written: the sequence stays the session's next.
+                drop(head);
+                return Err(SubmitFailure::NotCommitted(queueing()));
             }
         }
         Ok(Submission {
@@ -1443,6 +1517,83 @@ impl Engine {
     }
 }
 
+/// `turn.ended` at `seq` with the terminal envelope, whose raw spans bound
+/// every reference `record` committed and the terminal's own; `record` is
+/// already reconciled (design §7.4's batch builds it the same way).
+pub(super) fn ended_record(
+    started: &Started,
+    mut record: TurnRecord,
+    terminal: Terminal,
+    seq: u64,
+) -> Result<TerminalRecord, ApiError> {
+    if let Some(reference) = &terminal.raw_ref {
+        RawSpan::include(&mut record.spans, reference);
+    }
+    let ended_at = rfc3339(SystemTime::now());
+    let raw_ref = terminal.raw_ref.clone();
+    let event = Event {
+        seq,
+        session_id: &started.session,
+        turn: Some(started.turn.get()),
+        late: false,
+        at: &ended_at,
+        raw_ref: raw_ref.as_ref(),
+        body: EventBody::TurnEnded {
+            state: terminal.state,
+            failure: terminal.failure.clone(),
+            stop_reason: terminal.stop_reason,
+            cancel: terminal.cancel.clone(),
+        },
+    }
+    .to_value()?;
+    let timestamps = Timestamps {
+        queued_at: started.queued_at.clone(),
+        submitted_at: started.submitted.as_ref().map(|(at, _)| at.clone()),
+        accepted_at: record.accepted.as_ref().map(|accepted| accepted.at.clone()),
+        ended_at,
+    };
+    // Monotonic, so wall-clock steps cannot distort or drop the duration.
+    let duration_ms = started
+        .submitted
+        .as_ref()
+        .and_then(|(_, clock)| u64::try_from(clock.elapsed().as_millis()).ok());
+    let envelope = terminal_envelope(
+        &started.session,
+        started.turn,
+        terminal,
+        record.accepted,
+        record.spans,
+        timestamps,
+        duration_ms,
+        (started.first_seq, seq),
+    );
+    let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
+    Ok(TerminalRecord {
+        session_id: started.session.clone(),
+        turn: started.turn,
+        envelope,
+        event,
+        raw_ref,
+    })
+}
+
+/// Design §7.2 row 5: the turn's first write that did not commit stops it
+/// with cause `store`, once; later events are dropped and its terminal is
+/// the resolution write. An uncertain one latches instead, and the latch's
+/// force stops the turn.
+fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
+    if !control.stored
+        && record
+            .first_failure
+            .is_some_and(|note| note.outcome == WriteOutcome::NotCommitted)
+    {
+        control.stored = true;
+        control
+            .slot
+            .store_order(control.turn, tokio::time::Instant::now());
+    }
+}
+
 /// The turn's absolute Core deadline from its own frozen wall budget (C1 §4)
 /// and that deadline's wall time, both from the submission clock (design §2
 /// [r1.11]). A budget too far off to represent never expires in practice.
@@ -1502,7 +1653,7 @@ fn new_record(slot: &Slot, session: &SessionId, turn: TurnNumber) -> TurnRecord 
 /// cancellation. Design §3.2: a queued turn has no anchor intent, so a
 /// caused cancellation's cleanup is `quiescent`; the envelope and
 /// `turn.ended` carry the same `cancel`, and the cause is recorded.
-fn queued_cancellation(
+pub(super) fn queued_cancellation(
     slot: &Slot,
     session: &SessionId,
     turn: TurnNumber,

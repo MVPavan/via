@@ -87,6 +87,9 @@ POINTS = [
     "daemon.shutdown.after_fence",
     "core.shutdown.reconcile_entry",
     "core.shutdown.before_forced_terminal",
+    # Task 3 S5 (design §7.2, §10): same-sequence retry seams.
+    "core.retry.before",
+    "core.head.contended",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

@@ -922,10 +922,13 @@ fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
 }
 
 /// W1-D Sol finding 2 under runtime §7: a receipted turn whose terminal
-/// commit failed latches Store failure, so the daemon stops admission and
-/// dispatch and shuts itself down in force mode; the turn stays unresolved
-/// and the exit is 4, never clean. An outside SQLite writer lock makes the
-/// commit fail for real; it is released once final shutdown began.
+/// commit failed, and whose one same-sequence retry failed too, latches
+/// Store failure (design §7.2 row 7, escalation), so the daemon stops
+/// admission and dispatch and shuts itself down in force mode; the exit is
+/// 4, never clean. An outside SQLite writer lock makes both attempts fail
+/// for real; it is released once final shutdown began, so the turn's
+/// failure-resolution batch commits it `failed(store)` (§7.4). Re-pointed
+/// in S5: the turn no longer stays unresolved.
 #[test]
 fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
     scenario(
@@ -954,8 +957,14 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
                 summary["disposition"] == "incomplete"
                     && summary["mode"] == "force"
                     && summary["store_failed"] == true
-                    && summary["unresolved_turns"] == 1,
+                    && summary["unresolved_turns"] == 0
+                    && summary["failure_batches"] == json!({"committed":1,"skipped":0}),
                 || format!("summary {summary}"),
+            )?;
+            let (envelope, _) = paths.committed(&session)?;
+            check(
+                envelope["state"] == "failed" && envelope["failure"]["class"] == "store",
+                || format!("the batch did not resolve the turn: {envelope}"),
             )
         },
     )

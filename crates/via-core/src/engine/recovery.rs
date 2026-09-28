@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{
-    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, SubmitFailedRecord,
-    TerminalExtras, TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, TerminalExtras,
+    TerminalRecord, UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use super::drive::Cancelled;
 use super::journal::Head;
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
+use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Started, Terminal, TurnRecord, failure, journal};
@@ -48,8 +49,6 @@ pub struct Handoff {
 }
 /// Startup budget for Host's anchor reconciliation (its native stop is 3 s).
 const HOST_RECOVERY: Duration = Duration::from_secs(5);
-/// The failure message of a turn whose frozen row cannot be parsed.
-const CORRUPT_ROW: &str = "a frozen value of the queued turn could not be read";
 
 impl Engine {
     /// Reconciles committed anchors through Host, then resolves every durable
@@ -272,8 +271,16 @@ impl Engine {
             cancel_cause: cause.map(|(cause, _)| cause),
             raw_incomplete: None,
         };
-        match Self::commit_turn_ended_with(&self.store, &started, record, terminal, false, extras)
-            .await
+        match Self::commit_turn_ended_with(
+            &self.store,
+            &started,
+            record,
+            terminal,
+            false,
+            extras,
+            false,
+        )
+        .await
         {
             Ok(durable) if !durable.uncertain => Ok(()),
             Ok(_) | Err(_) => Err(format!(
@@ -297,93 +304,19 @@ impl Engine {
             ..
         } = self.history(session, turn).await.map_err(store_error)?;
         let slot = self.slot_for(session);
-        let head = slot
-            .head
-            .lock(&self.store, session)
-            .await
-            .map_err(|error| format!("store_error: {error}"))?;
-        let submitted_seq = head.next();
-        let ended_seq = submitted_seq
-            .checked_add(1)
-            .ok_or("store_error: the session's sequence is exhausted")?;
-        let at = rfc3339(SystemTime::now());
-        let terminal = Terminal {
-            state: "failed",
-            failure: Some(failure(FailureClass::Store, CORRUPT_ROW.to_owned(), None)),
-            stop_reason: "error",
-            vendor_stop_reason: None,
-            final_text: String::new(),
-            exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
-            warnings: Vec::new(),
-            cancel: None,
-        };
-        let submitted = Event {
-            seq: submitted_seq,
-            session_id: session,
-            turn: Some(turn.get()),
-            late: false,
-            at: &at,
-            raw_ref: None,
-            body: EventBody::TurnSubmitted { attempt: 1 },
-        }
-        .to_value()
-        .map_err(store_error)?;
-        let ended = Event {
-            seq: ended_seq,
-            session_id: session,
-            turn: Some(turn.get()),
-            late: false,
-            at: &at,
-            raw_ref: None,
-            body: EventBody::TurnEnded {
-                state: terminal.state,
-                failure: terminal.failure.clone(),
-                stop_reason: terminal.stop_reason,
-                cancel: None,
-            },
-        }
-        .to_value()
-        .map_err(store_error)?;
-        let timestamps = Timestamps {
+        let queueing = Queueing {
             queued_at,
-            submitted_at: Some(at.clone()),
-            accepted_at: None,
-            ended_at: at.clone(),
+            queued_seq,
         };
-        // No vendor I/O happened, so no duration is claimed.
-        let envelope = terminal_envelope(
-            session,
-            turn,
-            terminal,
-            None,
-            Vec::new(),
-            timestamps,
-            None,
-            (queued_seq, ended_seq),
-        );
-        let envelope = serde_json::to_value(&envelope).map_err(|_| store_error(ApiError::STORE))?;
-        let committed = self
-            .store
-            .commit_submit_failed(SubmitFailedRecord {
-                session_id: session.clone(),
-                turn,
-                submitted,
-                ended,
-                envelope,
-            })
-            .await;
-        match committed {
-            Ok(()) => {
-                head.committed(2);
-                Ok(())
-            }
-            Err(error) => {
-                head.lost();
-                Err(format!("store_error: {error}"))
-            }
-        }
+        resolve::commit_submit_failed(
+            &self.store,
+            &slot.head,
+            (session, turn),
+            queueing,
+            CORRUPT_ROW,
+        )
+        .await
+        .map_err(|error| format!("store_error: {error}"))
     }
 
     /// Pages through every committed anchor with Host's reports for the same

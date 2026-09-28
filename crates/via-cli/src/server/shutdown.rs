@@ -121,6 +121,10 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
         "unstarted_dispatchers":host.map(|host| host.unstarted_dispatchers),
         "unclosed_sessions":host.map(|host| host.unclosed_sessions),
         "unjoined_dispatchers":host.map(|host| host.unjoined_dispatchers),
+        "failure_batches":host.map(|host| json!({
+            "committed":host.failure_batches.committed,
+            "skipped":host.failure_batches.skipped,
+        })),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});

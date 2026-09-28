@@ -1584,9 +1584,11 @@ fn s1_close_partial_restarts_keep_one_result() -> TestResult {
 /// Design §4 "Force" [r4.6, r5.8, r6.6], latch variant: a keyed replay of
 /// a close in progress reaches the close watch and is paused at
 /// `core.close.before_subscribe`, holding `admission`. Another session's
-/// terminal commit fails (`store.commit.terminal`), and the latch's first
-/// phase (which needs no `admission`) forces the closing session's running
-/// turn; the dispatcher's latch exit publishes `store_error` in that window.
+/// terminal commit and its one same-sequence retry fail (persistent
+/// `store.commit.terminal`, an escalation; re-pointed in S5, since one
+/// failure is now retried and scoped), and the latch's first phase (which
+/// needs no `admission`) forces the closing session's running turn; the
+/// dispatcher's latch exit publishes `store_error` in that window.
 /// The first caller receives it, and the paused replay, released after the
 /// publication, still receives it from the retained outcome. (The design's
 /// force variant needs a caller entering after force is accepted; the S2
@@ -1638,10 +1640,11 @@ fn s1_close_outcome_retained_for_late_subscriber() -> TestResult {
                 .map_err(|error| error.to_string())
         });
         sandbox.ack(&daemon, "core.close.before_subscribe", 2, "pause")?;
-        // No terminal committed yet: the other session's is the first.
-        sandbox.arm("store.commit.terminal", 1, "fail_io")?;
+        // No terminal committed yet: the other session's is the first, and
+        // its retry the second.
+        sandbox.arm("store.commit.terminal", 1, "fail_io_persist")?;
         sandbox.release("other")?;
-        sandbox.ack(&daemon, "store.commit.terminal", 1, "fail_io")?;
+        sandbox.ack(&daemon, "store.commit.terminal", 2, "fail_io")?;
         // The latch exit published: the first caller has its outcome.
         first.join().map_err(|_| "first close panicked")??;
         check(!replay.is_finished(), || {

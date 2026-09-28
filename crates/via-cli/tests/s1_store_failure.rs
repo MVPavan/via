@@ -287,6 +287,34 @@ impl Sandbox {
         Ok(store.query_row(sql, [], |row| row.get(0))?)
     }
 
+    /// Anchors committed for `session`'s turn `turn`: zero when nothing
+    /// launched.
+    fn anchors(&self, session: &str, turn: u32) -> TestResult<i64> {
+        self.query(&format!(
+            "SELECT count(*) FROM anchors WHERE owner_session='{session}' AND owner_turn={turn}"
+        ))
+    }
+
+    /// Waits until the turn's acceptance is durable.
+    fn await_accepted(&self, session: &str, turn: u32) -> TestResult {
+        let sql = format!(
+            "SELECT count(*) FROM turns WHERE session_id='{session}' AND number={turn}
+             AND accepted_at IS NOT NULL"
+        );
+        wait_until("the acceptance is durable", Duration::from_secs(20), || {
+            self.query::<i64>(&sql).is_ok_and(|count| count == 1)
+        })
+    }
+
+    /// Runs one CLI call on its own thread, for a call that blocks.
+    fn background(&self, args: &[&str]) -> thread::JoinHandle<Result<Captured, String>> {
+        let mut command = self.command();
+        command.args(args);
+        thread::spawn(move || {
+            run_command(&mut command, Duration::from_secs(60)).map_err(|error| error.to_string())
+        })
+    }
+
     /// Proves every committed anchor's group absent, as the runtime §11.2
     /// outer harness does.
     fn verify_anchors(&self) -> TestResult {
@@ -510,6 +538,10 @@ fn accepted(turn: u32) -> Value {
     json!({"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":format!("fake-turn-{turn}")}})
 }
 
+fn text(content: &str) -> Value {
+    json!({"action":"emit","message":{"type":"assistant_text","text":content}})
+}
+
 fn terminal(turn: u32) -> Value {
     json!({"action":"emit","message":{"type":"terminal","vendor_turn_id":format!("fake-turn-{turn}"),
         "status":"completed","final_text":"done","stop_reason":"end_turn"}})
@@ -541,6 +573,20 @@ fn held(prompt: &str, turn: u32) -> Value {
         turn,
         vec![accepted(turn), gate(prompt), terminal(turn)],
     )
+}
+
+/// A background call's JSON result.
+fn joined(call: thread::JoinHandle<Result<Captured, String>>) -> TestResult<Value> {
+    let captured = call.join().map_err(|_| "the background call panicked")??;
+    if !captured.status.success() {
+        return Err(format!(
+            "a background call exited {}: {}",
+            captured.status,
+            String::from_utf8_lossy(&captured.stderr)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&captured.stdout)?)
 }
 
 /// The event types of `turn`, in sequence order.
@@ -938,5 +984,483 @@ fn s1_f12_queued_cancel_not_committed() -> TestResult {
         event_types(&events, 2) == ["turn.queued", "turn.ended"],
         || format!("turn 2 events: {events:?}"),
     )?;
+    scoped_end(daemon, &other)?;
+    close_pass_cancel_retried(false)?;
+    close_pass_cancel_retried(true)
+}
+
+/// Design §7.2 row 9: the close pass's `queued → cancelled` of turn 2 is
+/// not committed. Retried once, holding the session head, it commits and
+/// the close completes with nothing latched; failing `persistent`ly, the
+/// retry fails too, so the daemon latches (the escalation) and the close
+/// replies `store_error`.
+fn close_pass_cancel_retried(persistent: bool) -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("first", 1)]))?;
+    let daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.resume(&session, &handle, "second")?;
+    let action = if persistent {
+        "fail_io_persist"
+    } else {
+        "fail_io"
+    };
+    // Turn 1 is running: its terminal is `store.commit.terminal`, so turn 2's
+    // cancellation is the first `store.commit.cancel`.
+    sandbox.arm("store.commit.cancel", 1, action)?;
+    let close = [
+        "close", &session, "--mode", "force", "--handle", &handle, "--json",
+    ];
+    if persistent {
+        sandbox.refused(&close, "store_error")?;
+        sandbox.ack(&daemon, "store.commit.cancel", 2, "fail_io")?;
+        daemon.latched_exit()?;
+        return Ok(());
+    }
+    let closed = sandbox.ok(&close)?;
+    sandbox.ack(&daemon, "store.commit.cancel", 1, "fail_io")?;
+    check(
+        closed["state"] == "closed"
+            && closed["cancelled_turns"] == json!([format!("{session}/1"), format!("{session}/2")]),
+        || format!("the close did not complete: {closed}"),
+    )?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 2) == ["turn.queued", "turn.ended"],
+        || format!("turn 2 events: {events:?}"),
+    )?;
+    let status = sandbox.status()?;
+    check(
+        status["health"] == "healthy"
+            && status["store_failure"]["scope"] == "turn"
+            && status["store_failure"]["affected"]["addresses"] == json!([format!("{session}/2")]),
+        || format!("the retried cancellation latched: {status}"),
+    )?;
+    daemon.stop_clean()
+}
+
+// ------------------------------------------- submission and events (rows 2, 5)
+
+/// Design §7.2 row 2: a submission that is not committed fails the turn
+/// `failed(store)` through `commit_submit_failed`, with `submitted_at` and
+/// `cancel: null`. Nothing launched, the connection permit is free again,
+/// and the successor runs.
+#[test]
+fn s1_f12_submission_not_committed_fails_turn_without_launch() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("other", 1), completes("second", 2)]))?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    // The second session's submission was the first of each point.
+    sandbox.arm("core.submit.before_commit", 2, "pause")?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, "core.submit.before_commit", 2, "pause")?;
+    sandbox.resume(&session, &handle, "second")?;
+    sandbox.arm("store.commit.submission", 2, "fail_io")?;
+    sandbox.resume_point("core.submit.before_commit", 2)?;
+    sandbox.ack(&daemon, "store.commit.submission", 2, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["timestamps"]["submitted_at"].is_string()
+            && first["cancel"].is_null(),
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    check(sandbox.anchors(&session, 1)? == 0, || {
+        "turn 1 launched".to_owned()
+    })?;
+    let second = sandbox.wait(&format!("{session}/2"))?;
+    check(second["state"] == "completed", || {
+        format!("the successor did not run: {second}")
+    })?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 1) == ["turn.queued", "turn.submitted", "turn.ended"],
+        || format!("turn 1 events: {events:?}"),
+    )?;
+    // Only the second session's group holds a permit.
+    wait_until("the permit is free", Duration::from_secs(20), || {
+        sandbox
+            .status()
+            .is_ok_and(|status| status["connections"]["in_use"] == 1)
+    })?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["scope"] == "turn"
+            && failure["affected"]["addresses"] == json!([format!("{session}/1")]),
+        || format!("unexpected store_failure: {failure}"),
+    )?;
     scoped_end(daemon, &other)
+}
+
+/// Design §7.2 row 5, §7.1: an `assistant.text` commit that is not
+/// committed sets a stop order with cause `store`; the turn ends
+/// `failed(store)` with `cancel` evidence and no later events, its group is
+/// stopped, and `turn.ended` reuses the failed event's sequence number, so
+/// the session's events stay dense.
+#[test]
+fn s1_f12_event_not_committed_stops_turn_and_reuses_seq() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[
+        held("other", 1),
+        script(
+            "first",
+            1,
+            vec![
+                accepted(1),
+                gate("accepted"),
+                text("lost"),
+                gate("first"),
+                terminal(1),
+            ],
+        ),
+    ]))?;
+    sandbox.count("store.commit.event")?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    let next = sandbox.next_hit("store.commit.event")?;
+    sandbox.arm("store.commit.event", next, "fail_io")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, "store.commit.event", next, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["stop_reason"] == "error"
+            && first["cancel"]["requested_at"].is_string()
+            && first["cancel"]["cleanup"] == "quiescent",
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 1)
+            == [
+                "turn.queued",
+                "turn.submitted",
+                "turn.started",
+                "turn.ended",
+            ],
+        || format!("turn 1 events: {events:?}"),
+    )?;
+    let failure = store_failure(&sandbox)?;
+    check(failure["scope"] == "turn", || {
+        format!("unexpected store_failure: {failure}")
+    })?;
+    scoped_end(daemon, &other)
+}
+
+/// Design §7.2 row 5, §2 durability: a caller's cancel whose
+/// `cancel.requested` commit is not committed gets `store_error`; the order
+/// is upgraded to cause `store`, and the turn ends `failed(store)` with the
+/// order's `cancel` object.
+#[test]
+fn s1_f12_cancel_requested_not_committed() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("other", 1), held("first", 1)]))?;
+    sandbox.count("store.commit.event")?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    let next = sandbox.next_hit("store.commit.event")?;
+    sandbox.arm("store.commit.event", next, "fail_io")?;
+    let error = sandbox.refused(
+        &["cancel", &session, "--handle", &handle, "--json"],
+        "store_error",
+    )?;
+    sandbox.ack(&daemon, "store.commit.event", next, "fail_io")?;
+    check(error["data"] == json!({"kind":"store_error"}), || {
+        format!("unexpected cancel refusal: {error}")
+    })?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["cancel"]["requested_at"].is_string(),
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 1)
+            == [
+                "turn.queued",
+                "turn.submitted",
+                "turn.started",
+                "turn.ended",
+            ],
+        || format!("turn 1 events: {events:?}"),
+    )?;
+    scoped_end(daemon, &other)
+}
+
+// ------------------------------------------ terminals and retries (rows 7, 9)
+
+/// Design §7.2 row 7 [r3.7, r3.13]: a natural terminal that is not
+/// committed is retried once with the same content and sequence number;
+/// the retry commits the vendor's result, and nothing latches.
+#[test]
+fn s1_f12_terminal_retry_once() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("other", 1), completes("first", 1)]))?;
+    let daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    sandbox.arm("store.commit.terminal", 1, "fail_io")?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, "store.commit.terminal", 1, "fail_io")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "completed" && first["final_text"] == "done",
+        || format!("the retry lost the vendor's result: {first}"),
+    )?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    let ended = events
+        .iter()
+        .find(|event| event["type"] == "turn.ended")
+        .ok_or("no turn.ended")?;
+    check(first["events"]["last_seq"] == ended["seq"], || {
+        format!("the envelope's range ends elsewhere: {first}")
+    })?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "commit_failed" && failure["scope"] == "turn" && failure["count"] == 1,
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    scoped_end(daemon, &other)
+}
+
+/// Design §7.2 escalation: with `store.commit.fail_persistent` armed at a
+/// turn event, the event is not committed and the resolution write fails
+/// too, so the daemon latches and exits 4. The same for a natural terminal
+/// whose one retry fails.
+#[test]
+fn s1_f12_escalation_latches() -> TestResult {
+    for at_terminal in [false, true] {
+        let sandbox = Sandbox::new(&script(
+            "first",
+            1,
+            vec![
+                accepted(1),
+                gate("accepted"),
+                text("lost"),
+                gate("first"),
+                terminal(1),
+            ],
+        ))?;
+        sandbox.count("store.commit.fail_persistent")?;
+        let daemon = sandbox.start()?;
+        if at_terminal {
+            sandbox.arm("core.run.settling", 1, "pause")?;
+        }
+        let (session, _) = sandbox.spawn("first")?;
+        sandbox.await_file("accepted.entered")?;
+        sandbox.await_accepted(&session, 1)?;
+        if at_terminal {
+            sandbox.release("accepted")?;
+            sandbox.release("first")?;
+            sandbox.ack(&daemon, "core.run.settling", 1, "pause")?;
+        }
+        let next = sandbox.next_hit("store.commit.fail_persistent")?;
+        sandbox.arm("store.commit.fail_persistent", next, "fail_io_persist")?;
+        if at_terminal {
+            sandbox.resume_point("core.run.settling", 1)?;
+        } else {
+            sandbox.release("accepted")?;
+        }
+        sandbox.ack(&daemon, "store.commit.fail_persistent", next + 1, "fail_io")?;
+        daemon.latched_exit()?;
+        let state: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        check(state == "running", || {
+            format!("at_terminal {at_terminal}: nothing committed, yet turn 1 is {state}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Design §7.2 same-sequence retries [r3.7, r4.9]: while a natural
+/// terminal's retry is paused at `core.retry.before`, holding the session
+/// head, a `resume` receipt of the same session blocks on the head
+/// (`core.head.contended`). On release the terminal commits at the failed
+/// sequence number, then the receipt takes the next one. The same for the
+/// close pass's cancellation (row 9) against a caller's cancel.
+#[test]
+fn s1_f12_retry_holds_head_against_competing_writer() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("first", 1), completes("second", 2)]))?;
+    sandbox.count("core.head.contended")?;
+    let daemon = sandbox.start()?;
+    sandbox.arm("store.commit.terminal", 1, "fail_io")?;
+    sandbox.arm("core.retry.before", 1, "pause")?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, "core.retry.before", 1, "pause")?;
+    let contended = sandbox.next_hit("core.head.contended")?;
+    sandbox.arm("core.head.contended", contended, "fail_io")?;
+    let resume = sandbox.background(&[
+        "resume", &session, "--prompt", "second", "--handle", &handle, "--json",
+    ]);
+    sandbox.ack(&daemon, "core.head.contended", contended, "fail_io")?;
+    sandbox.resume_point("core.retry.before", 1)?;
+    joined(resume)?;
+    let second = sandbox.wait(&format!("{session}/2"))?;
+    check(second["state"] == "completed", || {
+        format!("turn 2 did not run: {second}")
+    })?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    let order: Vec<(u64, String)> = events
+        .iter()
+        .filter_map(|event| Some((event["turn"].as_u64()?, event["type"].as_str()?.to_owned())))
+        .collect();
+    let ended = order
+        .iter()
+        .position(|entry| *entry == (1, "turn.ended".to_owned()));
+    let queued = order
+        .iter()
+        .position(|entry| *entry == (2, "turn.queued".to_owned()));
+    check(
+        ended.is_some() && queued.is_some() && ended < queued,
+        || format!("the receipt did not wait for the retry: {order:?}"),
+    )?;
+    check(sandbox.status()?["health"] == "healthy", || {
+        "the retry latched".to_owned()
+    })?;
+    daemon.stop_clean()?;
+    cancel_retry_holds_head()
+}
+
+/// [`s1_f12_retry_holds_head_against_competing_writer`]'s row 9 half: the
+/// close pass's cancellation of turn 2 is retried holding the head while a
+/// caller's cancel of turn 3 waits for it.
+fn cancel_retry_holds_head() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("first", 1)]))?;
+    sandbox.count("core.head.contended")?;
+    let daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.resume(&session, &handle, "second")?;
+    sandbox.resume(&session, &handle, "third")?;
+    sandbox.arm("store.commit.cancel", 1, "fail_io")?;
+    sandbox.arm("core.retry.before", 1, "pause")?;
+    let close = sandbox.background(&[
+        "close", &session, "--mode", "force", "--handle", &handle, "--json",
+    ]);
+    sandbox.ack(&daemon, "core.retry.before", 1, "pause")?;
+    let contended = sandbox.next_hit("core.head.contended")?;
+    sandbox.arm("core.head.contended", contended, "fail_io")?;
+    let cancel = sandbox.background(&[
+        "cancel", &session, "--turn", "3", "--handle", &handle, "--json",
+    ]);
+    sandbox.ack(&daemon, "core.head.contended", contended, "fail_io")?;
+    sandbox.resume_point("core.retry.before", 1)?;
+    let cancelled = joined(cancel)?;
+    check(cancelled["state"] == "cancelled", || {
+        format!("the caller's cancel failed: {cancelled}")
+    })?;
+    let closed = joined(close)?;
+    check(closed["state"] == "closed", || {
+        format!("the close failed: {closed}")
+    })?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    let ends: Vec<u64> = events
+        .iter()
+        .filter(|event| event["type"] == "turn.ended")
+        .filter_map(|event| event["turn"].as_u64())
+        .collect();
+    check(ends == [1, 2, 3], || {
+        format!("turn 3's cancel did not wait for the retry: {ends:?}")
+    })?;
+    check(sandbox.status()?["health"] == "healthy", || {
+        "the retry latched".to_owned()
+    })?;
+    daemon.stop_clean()
+}
+
+/// Design §7.2 row 9 [r3.6]: under force, the last queued turn's
+/// cancellation carries `session.closed` in the same transaction. With
+/// `store.commit.rider` once, that transaction rolls back; the retry, holding
+/// the head, commits both and nothing latches. Failing persistently, the
+/// retry fails and the daemon latches. With another turn of the session
+/// unfinished at the retry, the cancellation commits alone and the session
+/// counts in `unclosed_sessions`.
+#[test]
+fn s1_f12_force_rider_rollback_retries() -> TestResult {
+    for variant in ["once", "persistent", "unfinished"] {
+        let mut sandbox = Sandbox::new(&scripts(&[held("holder", 1)]))?;
+        // One permit: the second session's turn waits for it, queued.
+        sandbox
+            .env
+            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+        sandbox.count("core.dispatch.awaiting_slot")?;
+        let mut daemon = sandbox.start()?;
+        sandbox.spawn("holder")?;
+        sandbox.await_file("holder.entered")?;
+        let (session, _) = sandbox.spawn("waiting")?;
+        wait_until("the turn waits for a slot", Duration::from_secs(20), || {
+            sandbox
+                .next_hit("core.dispatch.awaiting_slot")
+                .is_ok_and(|next| next > 1)
+        })?;
+        let action = if variant == "persistent" {
+            "fail_io_persist"
+        } else {
+            "fail_io"
+        };
+        sandbox.arm("store.commit.rider", 1, action)?;
+        if variant == "unfinished" {
+            sandbox.arm("core.retry.before", 1, "pause")?;
+        }
+        sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        sandbox.ack(&daemon, "store.commit.rider", 1, "fail_io")?;
+        if variant == "unfinished" {
+            sandbox.ack(&daemon, "core.retry.before", 1, "pause")?;
+            // A durable turn the daemon does not know: Store refuses the
+            // retried close while it is unfinished.
+            let store = rusqlite::Connection::open(sandbox.state.join("store.sqlite3"))?;
+            store.execute(
+                "INSERT INTO turns(session_id,number,prompt,effective,state,queued_at,queued_seq)
+                 VALUES(?1,2,'unregistered','{}','queued','2026-01-01T00:00:00.000Z',1000)",
+                [session.as_str()],
+            )?;
+            drop(store);
+            sandbox.resume_point("core.retry.before", 1)?;
+        }
+        let status = daemon.exit(Duration::from_secs(20))?;
+        let summary = daemon.summary()?;
+        let turn: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        let closed: i64 = sandbox.query(&format!(
+            "SELECT count(*) FROM sessions WHERE id='{session}' AND state='closed'"
+        ))?;
+        let expected = match variant {
+            "once" => {
+                status.code() == Some(0)
+                    && summary["store_failed"] == false
+                    && turn == "cancelled"
+                    && closed == 1
+            }
+            "persistent" => {
+                status.code() == Some(4) && summary["store_failed"] == true && turn == "queued"
+            }
+            _ => {
+                status.code() == Some(4)
+                    && summary["store_failed"] == false
+                    && summary["unclosed_sessions"] == 1
+                    && turn == "cancelled"
+                    && closed == 0
+            }
+        };
+        check(expected, || {
+            format!("{variant}: exit {status}, turn 1 {turn}, closed {closed}: {summary}")
+        })?;
+        sandbox.verify_anchors()?;
+    }
+    Ok(())
 }

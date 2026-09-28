@@ -509,7 +509,7 @@ fn spawn_params() -> SpawnParams {
 /// A turn's frozen effective values as Core stores them.
 fn frozen() -> serde_json::Value {
     json!({"model":"fake","effort":null,"bound":null,
-        "deadlines":{"wall_ms":30_000,"idle_ms":null},"max_steps":null})
+        "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null})
 }
 
 fn wait(address: &str) -> WaitParams {

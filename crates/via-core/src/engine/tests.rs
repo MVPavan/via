@@ -585,9 +585,11 @@ fn a_turn_granted_before_force_submits_then_ends_forced_without_launch() {
     });
 }
 
-/// Design §2.3: a `queued → cancelled` commit that fails under force latches;
+/// Design §2.3 and §7.2 row 9: a `queued → cancelled` commit under force
+/// that fails, and whose one same-sequence retry fails too, latches;
 /// nothing more is written, the session is not closed, and the shutdown is
-/// unclean (exit 4).
+/// unclean (exit 4). Re-pointed in S5: one not-committed failure is now
+/// retried, so the fault fails both attempts.
 #[test]
 fn a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open() {
     let Some(root) =
@@ -600,7 +602,7 @@ fn a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open() {
         let session = new_session(&engine).await;
         resume(&engine, &session, None).await;
         engine.request_stop(&force()).await.unwrap();
-        engine.faults.cancel_fails.store(1, Ordering::Release);
+        engine.faults.cancel_fails.store(2, Ordering::Release);
         dispatch(&engine, &session).await;
         assert!(engine.store_failed());
         assert_eq!(

@@ -6,6 +6,7 @@ use via_adapters::{Cleanup, StopCause};
 
 use std::sync::Arc;
 
+use super::batch::{self, AffectedTurn, FailureBatches};
 use super::drive::FORCE_CLOSE_REASON;
 use super::journal::Head;
 use super::latch::{
@@ -64,6 +65,8 @@ pub struct EngineShutdown {
     /// Dispatchers that had not joined when final shutdown settled: their
     /// sessions' turns were left to restart recovery (design §6.8 step 3).
     pub unjoined_dispatchers: usize,
+    /// Failure-resolution batches committed or skipped (design §7.4).
+    pub failure_batches: FailureBatches,
 }
 
 impl EngineShutdown {
@@ -244,16 +247,63 @@ impl Engine {
 
     /// Pipeline step 5 for one forced turn (design §6.8): its terminal
     /// with Route's close evidence and reconciliation's, bounded by
-    /// `min(FINALIZE_WRITE, remaining)`. Whether it committed.
+    /// `min(FINALIZE_WRITE, remaining)`. Whether it committed. An affected
+    /// turn, one of whose own writes was uncertain, takes the same evidence
+    /// through the failure-resolution batch instead (design §7.4), which
+    /// counts in `batches`, not as an uncommitted terminal.
     async fn finalize_forced(
         &self,
         turn: super::ForcedTurn,
         report: &via_adapters::FakeShutdown,
         deadline: Deadline,
+        batches: &mut FailureBatches,
     ) -> bool {
         // Test builds: the evidence is in, the terminal not yet committed.
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("core.shutdown.before_forced_terminal").await;
+        let by = deadline
+            .instant()
+            .min(tokio::time::Instant::now() + FINALIZE_WRITE);
+        if batch::affected(&turn.record) {
+            let raw_incomplete = turn.raw_owed;
+            // After the first failure `cancel.settled` is not written: no I/O.
+            let (started, record, terminal) = self.forced_terminal(turn, report).await;
+            let affected = AffectedTurn {
+                started,
+                record,
+                terminal,
+                raw_incomplete,
+            };
+            self.resolve_affected(affected, deadline, batches).await;
+            return true;
+        }
+        let commit = async {
+            let (started, record, terminal) = self.forced_terminal(turn, report).await;
+            // C1 §3.14: close only once every other turn of the session
+            // has a durable disposition. Design §3.2: once
+            // `failure_pending` is observed no new close-bearing commit
+            // starts; Store refuses `session.closed` in the same
+            // transaction while any other turn is queued or running, which
+            // covers a turn an uncertain receipt committed unregistered.
+            let admission = self.admission.lock().await;
+            let close =
+                !self.store_failed() && !self.unresolved.others(&started.session, started.turn);
+            self.finish(&started, record, terminal, close, Some(&admission))
+                .await
+        };
+        // Per pipeline, not per turn [r5.10]: each commit takes at most
+        // `FINALIZE_WRITE`, and one cut at the deadline is uncommitted.
+        matches!(tokio::time::timeout_at(by, commit).await, Ok(Ok(())))
+    }
+
+    /// A forced turn's terminal from Route's close evidence and
+    /// reconciliation's (C1 §7.6 force row), after committing its
+    /// `cancel.settled`.
+    async fn forced_terminal(
+        &self,
+        turn: super::ForcedTurn,
+        report: &via_adapters::FakeShutdown,
+    ) -> (super::Started, TurnRecord, Terminal) {
         let evidence = report.recovery.iter().find(|record| {
             record.session_id == turn.started.session && record.turn == turn.started.turn
         });
@@ -277,65 +327,45 @@ impl Engine {
             "unknown"
         };
         let (outcome, cleanup) = stop_outcome(quiescent, forced);
-        let commit = async {
-            let mut record = turn.record;
-            let cancel = self
-                .settle(&mut record, turn.requested_at, outcome, cleanup)
-                .await;
-            let mut terminal = Terminal {
-                state,
-                failure: None,
-                // C1 §7.6: an unconfirmed stop, like transport loss, is an error.
-                stop_reason: if state == "cancelled" {
-                    "interrupted"
-                } else {
-                    "error"
-                },
-                vendor_stop_reason: None,
-                final_text: String::new(),
-                exit: None,
-                raw_ref: None,
-                raw_incomplete: false,
-                warnings: Vec::new(),
-                cancel: Some(cancel),
-            };
-            if turn.raw_incomplete {
-                // `raw_log.incomplete` committed when the drive ended.
-                terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
-            }
-            if turn.cause == Some(StopCause::IdleDeadline) {
-                // Design §2: force took over an idle stop.
-                terminal.fail(
-                    FailureClass::DeadlineIdle,
-                    "no progress within the idle deadline",
-                );
-                terminal.stop_reason = "deadline";
-            }
-            if record.first_failure.is_some() {
-                // C1 §8.2: the durable stream already lost an event; a
-                // cancellation must not present it as a complete record.
-                terminal.fail(FailureClass::Store, "a turn event could not be recorded");
-            }
-            // C1 §3.14: close only once every other turn of the session
-            // has a durable disposition. Design §3.2: once
-            // `failure_pending` is observed no new close-bearing commit
-            // starts; Store refuses `session.closed` in the same
-            // transaction while any other turn is queued or running, which
-            // covers a turn an uncertain receipt committed unregistered.
-            let admission = self.admission.lock().await;
-            let close = !self.store_failed()
-                && !self
-                    .unresolved
-                    .others(&turn.started.session, turn.started.turn);
-            self.finish(&turn.started, record, terminal, close, Some(&admission))
-                .await
+        let mut record = turn.record;
+        let cancel = self
+            .settle(&mut record, turn.requested_at, outcome, cleanup)
+            .await;
+        let mut terminal = Terminal {
+            state,
+            failure: None,
+            // C1 §7.6: an unconfirmed stop, like transport loss, is an error.
+            stop_reason: if state == "cancelled" {
+                "interrupted"
+            } else {
+                "error"
+            },
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            cancel: Some(cancel),
         };
-        // Per pipeline, not per turn [r5.10]: each commit takes at most
-        // `FINALIZE_WRITE`, and one cut at the deadline is uncommitted.
-        let by = deadline
-            .instant()
-            .min(tokio::time::Instant::now() + FINALIZE_WRITE);
-        matches!(tokio::time::timeout_at(by, commit).await, Ok(Ok(())))
+        if turn.raw_incomplete {
+            // `raw_log.incomplete` committed when the drive ended.
+            terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
+        }
+        if turn.cause == Some(StopCause::IdleDeadline) {
+            // Design §2: force took over an idle stop.
+            terminal.fail(
+                FailureClass::DeadlineIdle,
+                "no progress within the idle deadline",
+            );
+            terminal.stop_reason = "deadline";
+        }
+        if record.first_failure.is_some() {
+            // C1 §8.2: the durable stream already lost an event; a
+            // cancellation must not present it as a complete record.
+            terminal.fail(FailureClass::Store, "a turn event could not be recorded");
+        }
+        (turn.started, record, terminal)
     }
 
     /// The accepted `daemon/stop` mode, if any; daemon main reads it on notice.
@@ -389,13 +419,25 @@ impl Engine {
         let unjoined = lock(&self.dispatching).clone();
         let forced = std::mem::take(&mut *lock(&self.forced));
         let mut uncommitted_turns = 0;
+        let mut batches = FailureBatches::default();
         for turn in forced {
             if unjoined.contains(&turn.started.session) {
                 continue;
             }
-            if !self.finalize_forced(turn, &report, deadline).await {
+            if !self
+                .finalize_forced(turn, &report, deadline, &mut batches)
+                .await
+            {
                 uncommitted_turns += 1;
             }
+        }
+        // Design §7.4: running turns whose terminal failed, after the forced
+        // ones and Host reconciliation.
+        for turn in self.take_affected() {
+            if unjoined.contains(&turn.started.session) {
+                continue;
+            }
+            self.resolve_affected(turn, deadline, &mut batches).await;
         }
         let unclosed_sessions =
             tokio::time::timeout_at(deadline.instant(), self.close_forced_sessions(&unjoined))
@@ -419,6 +461,7 @@ impl Engine {
             unstarted_dispatchers,
             unclosed_sessions,
             unjoined_dispatchers: unjoined.len(),
+            failure_batches: batches,
         }
     }
 
