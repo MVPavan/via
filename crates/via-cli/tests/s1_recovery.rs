@@ -13,6 +13,9 @@ mod anchors;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
+#[cfg(feature = "test-failpoints")]
+#[path = "support/hits.rs"]
+mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]
@@ -1528,9 +1531,9 @@ fn s1_f12_live_corrupt_row_fails_at_the_head() -> TestResult {
 /// valid turn behind it is cancelled too. Turn 2 is valid and queued at the
 /// crash, so the handoff enqueues turn 3 behind it; after the restart turn
 /// 2 runs and a cancel whose `Stop` reply is lost
-/// (`host.anchor.final_reply_lost`) ends it `unknown`. (A durable `unknown`
-/// with `pending` cleanup cannot be produced end to end; this is the
-/// reachable case of the same dispatcher path.)
+/// (`host.anchor.final_reply_lost`) ends it `unknown`. (The durable
+/// `unknown` with `pending` cleanup is
+/// `s1_recovery_corrupt_row_behind_a_pending_unknown_progresses_once_settled`.)
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_recovery_corrupt_row_behind_a_live_unknown_is_cancelled() -> TestResult {
@@ -1576,6 +1579,100 @@ fn s1_recovery_corrupt_row_behind_a_live_unknown_is_cancelled() -> TestResult {
         }
         Ok(())
     })
+}
+
+/// Design §7.3 with C1 §7.3 and P6 (carried from S4 [s4.4, s4.8]; T3-S5
+/// round 1, decision 7): a row Store cannot read, queued behind a durable
+/// `unknown` turn whose cleanup is `pending`, waits; once the cleanup
+/// settles, the live dispatcher cancels it from its committed `turn.queued`,
+/// never submitted, and the valid turn behind it too.
+///
+/// No product path writes `pending` cleanup into a durable envelope (the
+/// engine test `a_successor_waits_behind_a_cleanup_pending_predecessor`
+/// notes it), so the state is written into Store while no daemon runs.
+/// Turn 1 is recovered `unknown` by a restart held at the handoff's first
+/// queued-row read (`store.read.queued_turn`) and killed there, before the
+/// handoff's own P6 cancellation; its cleanup is then set to `pending`. The
+/// next daemon's dispatcher waits (its predecessor reads, counted at
+/// `store.read.dispatch`, repeat while turns 2 and 3 stay queued); the
+/// cleanup is then set to `quiescent` while the daemon runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_behind_a_pending_unknown_progresses_once_settled() -> TestResult {
+    let fixture = json!({"scripts":[hanging("p1"), completes("p2", 2), completes("p3", 3)]});
+    scenario(
+        "s1_recovery_pending_unknown",
+        &fixture,
+        |paths, evidence| {
+            let (session, _crashed) = crash_behind_running(paths, evidence, &["p1", "p2", "p3"])?;
+            let point = "store.read.queued_turn";
+            paths.failpoints.arm(point, 1, "pause").map_err(infra)?;
+            let mut held = Daemon::spawn(paths, evidence, "held", &[])?;
+            paths
+                .failpoints
+                .wait_ack(point, 1, "pause", held.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            held.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            recovered_unknown(paths, &session)?;
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} at the crash: {state}")
+                })?;
+            }
+            let set_cleanup = |cleanup: &str| -> Result<(), ScenarioError> {
+                let store =
+                    rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+                store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
+                let changed = store
+                    .execute(
+                        "UPDATE turns SET envelope=json_set(envelope,'$.cancel.cleanup',?2)
+                     WHERE session_id=?1 AND number=1",
+                        rusqlite::params![session, cleanup],
+                    )
+                    .map_err(infra)?;
+                check(changed == 1, || "turn 1 was not updated".to_owned())?;
+                let (_, envelope) = paths.turn(&session, 1)?;
+                check(envelope["cancel"]["cleanup"] == cleanup, || {
+                    format!("turn 1 cleanup: {envelope}")
+                })
+            };
+            set_cleanup("pending")?;
+            let reads = "store.read.dispatch";
+            let dir = paths
+                .state
+                .parent()
+                .ok_or_else(|| infra("the state directory has no parent"))?
+                .join("failpoints");
+            hits::count(&dir, reads).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            // The handoff reads turns 2 and 3's predecessors once each; the
+            // dispatcher's decisions for turn 2 follow, each a Wait.
+            let waited = Instant::now() + Duration::from_secs(20);
+            while hits::hits(&dir, reads).map_err(infra)? < 4 {
+                check(Instant::now() < waited, || {
+                    "the dispatcher did not re-read its predecessor".to_owned()
+                })?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} behind pending cleanup: {state}")
+                })?;
+            }
+            set_cleanup("quiescent")?;
+            for n in [2, 3] {
+                let envelope = wait(paths, evidence, &format!("{session}/{n}"))?;
+                check(envelope["timestamps"]["submitted_at"].is_null(), || {
+                    format!("turn {n} was submitted: {envelope}")
+                })?;
+                cancelled_behind_unknown(paths, &session, n)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Design §7.3 [s4.8] (characterization: S4 built the handoff path): a row
