@@ -246,6 +246,12 @@ async fn open_engine(
     if recovered > 0 {
         tracing::warn!(turns = recovered, "recovered unfinished turns as unknown");
     }
+    // Design §8: before any launch, so resumed paging never reads an anchor
+    // of this daemon.
+    engine
+        .bound_resumed_paging()
+        .await
+        .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
     // Design §10: every surviving queued turn is cancelled or enqueued
     // before admission; a Store failure here fails startup.
     let handoff = engine

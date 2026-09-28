@@ -267,6 +267,22 @@ impl AdapterRuntime {
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(AdapterError::Open)
     }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only: resumed
+    /// paging never challenges an anchor committed after startup.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: via_routes::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<FakeRecovery>, AdapterError> {
+        self.route
+            .recover_cohort_page(after, limit, cohort, deadline)
+            .await
+            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
+            .map_err(AdapterError::Open)
+    }
 }
 
 /// Resolves once `force` is set; never when its sender is gone unset.

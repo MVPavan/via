@@ -229,6 +229,19 @@ impl FakeRoute {
         self.wire.recover_page(after, limit, deadline).await
     }
 
+    /// [`Self::recover_page`] of the anchors in `cohort` only.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: via_wire::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.wire
+            .recover_cohort_page(after, limit, cohort, deadline)
+            .await
+    }
+
     /// One non-signalling re-probe pass over held groups, optionally only
     /// one session's (design §8).
     pub async fn reprobe_held(

@@ -21,6 +21,9 @@ struct Recovered {
     unidentified: usize,
     /// Where the startup reconciliation's paging stopped at its deadline.
     cursor: Option<String>,
+    /// The anchors committed before serving: resumed paging reads only
+    /// these (design §8); `None` until daemon main records it.
+    cohort: Option<via_store::AnchorCohort>,
 }
 
 impl Recovered {
@@ -48,6 +51,7 @@ impl Recovered {
 /// startup paging stopped, while unread groups remain.
 pub(super) struct Unread {
     pub(super) cursor: Option<String>,
+    pub(super) cohort: Option<via_store::AnchorCohort>,
 }
 
 /// Counts of [`RecoveredSlots`] for `daemon/status` (design §6.6).
@@ -89,11 +93,17 @@ impl RecoveredSlots {
         self.lock().cursor = cursor;
     }
 
+    /// Saves the startup cohort resumed paging is bounded to.
+    pub(super) fn save_cohort(&self, cohort: via_store::AnchorCohort) {
+        self.lock().cohort = Some(cohort);
+    }
+
     /// Where resumed paging starts, while unread groups remain.
     pub(super) fn unread(&self) -> Option<Unread> {
         let recovered = self.lock();
         (recovered.unidentified > 0).then(|| Unread {
             cursor: recovered.cursor.clone(),
+            cohort: recovered.cohort,
         })
     }
 

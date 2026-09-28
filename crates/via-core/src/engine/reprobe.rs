@@ -2,10 +2,9 @@
 //! daemon main spawns at serve start and joins in final shutdown's first
 //! pipeline step. Only a proof releases a holding (design §11).
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use tokio::sync::OwnedSemaphorePermit;
-use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner};
+use via_store::{ANCHOR_PAGE_LIMIT, AnchorCohort, AnchorOwner};
 
 use super::Engine;
 use super::queue::CONNECTION_SLOTS;
@@ -25,11 +24,29 @@ const IDLE_CHECK: Duration = Duration::from_secs(1);
 /// Host's native 3 s.
 const PASS_BOUND: Duration = Duration::from_secs(3);
 
-/// The connection permits that were free when a page read began, held
-/// until it ends (`None` when none were free).
-struct Fence(#[expect(dead_code, reason = "held only for its drop")] Option<OwnedSemaphorePermit>);
-
 impl Engine {
+    /// Bounds resumed paging to the anchors committed before serving
+    /// (design §8): daemon main calls it after [`Engine::recover`] and before
+    /// admission, when no anchor of this daemon exists yet. Only when startup
+    /// reconciliation left anchors unread is the cohort read: one read-only
+    /// Store query, whose failure fails startup like recovery's own reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Store read failure.
+    pub async fn bound_resumed_paging(&self) -> Result<(), String> {
+        if self.recovered.unread().is_none() {
+            return Ok(());
+        }
+        let cohort = self
+            .store
+            .anchor_cohort()
+            .await
+            .map_err(|error| format!("store_error: {error}"))?;
+        self.recovered.save_cohort(cohort);
+        Ok(())
+    }
+
     /// Runs re-probe passes while holdings exist (design §8): at 1 s,
     /// doubling to 10 s, and back to 1 s whenever Host signals an added
     /// holding, during a wait or a pass. It continues through a drain, so
@@ -87,8 +104,10 @@ impl Engine {
         // retries; a not-committed proof keeps its token too (§7.2 row 12).
         // S5 owns the latch on an uncertain proof commit (row 12, O1.D10).
         let _ = self.adapter.reprobe_held(deadline, None).await;
-        if let Some(unread) = self.recovered.unread() {
-            self.resume_paging(unread.cursor, deadline).await;
+        if let Some(unread) = self.recovered.unread()
+            && let Some(cohort) = unread.cohort
+        {
+            self.resume_paging(unread.cursor, cohort, deadline).await;
         }
     }
 
@@ -99,23 +118,21 @@ impl Engine {
     ///
     /// Anchor ids are random, so this daemon's own anchors sort among the
     /// unread ones, and reconciliation would challenge and stop a live one.
-    /// The page is therefore read only behind [`Engine::own_groups_fence`].
-    async fn resume_paging(&self, after: Option<String>, deadline: Deadline) {
-        let Some(_fence) = self.own_groups_fence() else {
-            return;
-        };
+    /// Every read is therefore bounded to the startup `cohort`, which holds
+    /// no anchor of this daemon: paging progresses while its groups run.
+    async fn resume_paging(&self, after: Option<String>, cohort: AnchorCohort, deadline: Deadline) {
         // A failed read or reconciliation leaves the page unread: the next
         // pass retries it from the same cursor.
         let Ok(owners) = self
             .store
-            .anchor_owners_page(after.clone(), ANCHOR_PAGE_LIMIT)
+            .cohort_owners_page(after.clone(), ANCHOR_PAGE_LIMIT, cohort)
             .await
         else {
             return;
         };
         let Ok(reports) = self
             .adapter
-            .recover_page(after, ANCHOR_PAGE_LIMIT, deadline)
+            .recover_cohort_page(after, ANCHOR_PAGE_LIMIT, cohort, deadline)
             .await
         else {
             return;
@@ -133,36 +150,11 @@ impl Engine {
         // and drops its old token, so the counts stay balanced.
         if let Ok(unread) = self
             .store
-            .unproven_anchors_up_to(cursor.clone(), pool)
+            .unproven_cohort_anchors_up_to(cursor.clone(), pool, cohort)
             .await
         {
             self.recovered.resume(cursor, unread);
         }
-    }
-
-    /// Takes every free connection permit and keeps them while no permit is
-    /// out for a group of this daemon: every outstanding permit is one
-    /// `RecoveredSlots` holds, no control or acquisition is live, and every
-    /// Host holding is a recovered group. No launch can then start before
-    /// the fence drops, since each one first reserves a permit, so the page
-    /// holds only anchors of earlier daemons, or proved ones. `None` while
-    /// this daemon owns a group; the next pass tries again.
-    fn own_groups_fence(&self) -> Option<Fence> {
-        let available = self.slots.available_permits();
-        let fence = match u32::try_from(available) {
-            Ok(0) | Err(_) => None,
-            Ok(count) => Arc::clone(&self.slots).try_acquire_many_owned(count).ok(),
-        };
-        let taken = fence.as_ref().map_or(0, OwnedSemaphorePermit::num_permits);
-        let outstanding = self
-            .slot_limit
-            .saturating_sub(self.slots.available_permits())
-            .saturating_sub(taken);
-        let held = self.recovered.held();
-        let own = outstanding != held.permits
-            || self.adapter.pending_cleanup() > 0
-            || self.adapter.held_unproven() > held.identified;
-        (!own).then_some(Fence(fence))
     }
 
     /// Holds a slot for each anchor of the page Host did not prove absent,

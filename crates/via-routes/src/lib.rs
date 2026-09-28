@@ -4,7 +4,9 @@
 use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use thiserror::Error;
 
-pub use via_wire::{CloseRequest, Deadline, ExitReport, RawRef, SendOutcome, TurnNumber};
+pub use via_wire::{
+    AnchorCohort, CloseRequest, Deadline, ExitReport, RawRef, SendOutcome, TurnNumber,
+};
 
 /// Maximum bytes retained for an unknown fake notification's raw payload.
 pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;

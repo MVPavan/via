@@ -1,8 +1,8 @@
 //! Durable anchor identity, ARM intent and absence journal.
 
 use super::{
-    AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorQuery,
-    AnchorRecord, Connection, GroupAbsenceRecord, PathBuf, SessionId, StoreError,
+    AnchorCohort, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase,
+    AnchorQuery, AnchorRecord, Connection, GroupAbsenceRecord, PathBuf, SessionId, StoreError,
     TransactionBehavior, TurnNumber, params,
     sql::{before_commit, commit, sql_error},
 };
@@ -204,7 +204,7 @@ pub(super) fn read_anchor_records(
         "SELECT anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,
                 phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors
                 WHERE (?1 IS NULL OR anchor_id>?1) AND (?3=0 OR absence_time IS NULL)
-                  AND (?4 IS NULL OR owner_session=?4)
+                  AND (?4 IS NULL OR owner_session=?4) AND (?5 IS NULL OR rowid<=?5)
                 ORDER BY anchor_id LIMIT ?2"
     ).map_err(sql_error)?;
     let rows = query
@@ -213,7 +213,8 @@ pub(super) fn read_anchor_records(
                 page.after,
                 page.limit,
                 page.unproven,
-                page.owner.as_ref().map(SessionId::as_str)
+                page.owner.as_ref().map(SessionId::as_str),
+                page.cohort.map(|cohort| cohort.0)
             ],
             |row| {
                 let owner: String = row.get(4)?;
@@ -276,22 +277,28 @@ pub(super) fn read_anchor_records(
     rows.map(|row| row.map_err(sql_error)).collect()
 }
 
-/// Counts committed anchors after `after` with no absence proof, up to ?2.
+/// Counts committed anchors after `after` with no absence proof, up to ?2,
+/// only those in cohort ?3 when it is set.
 pub(super) const UNPROVEN_ANCHORS_UP_TO: &str = "SELECT count(*) FROM (SELECT 1 FROM anchors
-     WHERE anchor_id>?1 AND absence_time IS NULL ORDER BY anchor_id LIMIT ?2)";
+     WHERE anchor_id>?1 AND absence_time IS NULL AND (?3 IS NULL OR rowid<=?3)
+     ORDER BY anchor_id LIMIT ?2)";
 
 /// Committed anchors after `after` in `anchor_id` order with no absence proof.
 /// Saturates at `limit`: a bounded range seek on the `anchors_unproven`
 /// partial index, visiting at most `limit` unproven rows, never the whole
 /// historical suffix. No anchor id is empty, so `''` starts at the first.
+/// A cohort bound is checked on the index entries, which carry the rowid;
+/// the seek then also passes the unproven anchors committed after the
+/// cohort, at most one per live or held group of the current daemon.
 pub(super) fn count_unproven_anchors(
     conn: &Connection,
     after: Option<&str>,
     limit: u32,
+    cohort: Option<AnchorCohort>,
 ) -> Result<u64, StoreError> {
     conn.query_row(
         UNPROVEN_ANCHORS_UP_TO,
-        params![after.unwrap_or(""), limit],
+        params![after.unwrap_or(""), limit, cohort.map(|cohort| cohort.0)],
         |row| row.get::<_, i64>(0),
     )
     .map(i64::cast_unsigned)
@@ -305,36 +312,54 @@ pub(super) fn read_anchor_owners(
     conn: &Connection,
     after: Option<&str>,
     limit: u32,
+    cohort: Option<AnchorCohort>,
 ) -> Result<Vec<AnchorOwner>, StoreError> {
     let mut query = conn
         .prepare(
             "SELECT a.anchor_id,a.owner_session,a.owner_turn,t.state='running',a.phase FROM anchors a
              JOIN turns t ON t.session_id=a.owner_session AND t.number=a.owner_turn
-             WHERE ?1 IS NULL OR a.anchor_id>?1 ORDER BY a.anchor_id LIMIT ?2",
+             WHERE (?1 IS NULL OR a.anchor_id>?1) AND (?3 IS NULL OR a.rowid<=?3)
+             ORDER BY a.anchor_id LIMIT ?2",
         )
         .map_err(sql_error)?;
     let rows = query
-        .query_map(params![after, limit], |row| {
-            let owner: String = row.get(1)?;
-            let session =
-                SessionId::try_from(owner.as_str()).map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let turn = TurnNumber::try_from(row.get::<_, u32>(2)?)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            Ok(AnchorOwner {
-                anchor_id: row.get(0)?,
-                session_id: session,
-                turn,
-                turn_running: row.get(3)?,
-                phase: AnchorPhase::parse(&row.get::<_, String>(4)?).ok(),
-            })
-        })
+        .query_map(
+            params![after, limit, cohort.map(|cohort| cohort.0)],
+            |row| {
+                let owner: String = row.get(1)?;
+                let session = SessionId::try_from(owner.as_str())
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let turn = TurnNumber::try_from(row.get::<_, u32>(2)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(AnchorOwner {
+                    anchor_id: row.get(0)?,
+                    session_id: session,
+                    turn,
+                    turn_running: row.get(3)?,
+                    phase: AnchorPhase::parse(&row.get::<_, String>(4)?).ok(),
+                })
+            },
+        )
         .map_err(sql_error)?;
     rows.map(|row| row.map_err(sql_error)).collect()
 }
 
+/// The cohort of every committed anchor: the largest anchor rowid, 0 when
+/// there is none. A read-only aggregate on the rowid.
+pub(super) fn read_anchor_cohort(conn: &Connection) -> Result<AnchorCohort, StoreError> {
+    conn.query_row("SELECT coalesce(max(rowid),0) FROM anchors", [], |row| {
+        row.get(0)
+    })
+    .map(AnchorCohort)
+    .map_err(sql_error)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Connection, UNPROVEN_ANCHORS_UP_TO, count_unproven_anchors};
+    use super::{
+        AnchorCohort, AnchorQuery, Connection, UNPROVEN_ANCHORS_UP_TO, count_unproven_anchors,
+        read_anchor_cohort, read_anchor_records,
+    };
 
     /// A current-schema Store with `total` anchors, every third one proved absent.
     fn store_with_anchors(total: u32) -> (tempfile::TempDir, Connection) {
@@ -348,7 +373,7 @@ mod tests {
             let absence = (index % 3 == 0).then_some("1");
             conn.execute(
                 "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,absence_time)
-                 VALUES (?1,'g','m','/s','s_x',1,0,'b','n','intent',1,?2)",
+                 VALUES (?1,'g','m','/s','s_000000000000',1,0,'b','n','intent',1,?2)",
                 super::params![format!("a{index:05}"), absence],
             )
             .expect("insert");
@@ -365,7 +390,7 @@ mod tests {
             .prepare(&format!("EXPLAIN QUERY PLAN {UNPROVEN_ANCHORS_UP_TO}"))
             .expect("plan");
         let details: Vec<String> = plan
-            .query_map(super::params!["", 4], |row| row.get(3))
+            .query_map(super::params!["", 4, None::<i64>], |row| row.get(3))
             .expect("plan rows")
             .collect::<Result<_, _>>()
             .expect("plan details");
@@ -376,14 +401,81 @@ mod tests {
             }),
             "{details:?}"
         );
+        // A cohort bound keeps the same seek (round 1 decision 3).
+        let details: Vec<String> = plan
+            .query_map(super::params!["", 4, 10], |row| row.get(3))
+            .expect("plan rows")
+            .collect::<Result<_, _>>()
+            .expect("plan details");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.ends_with("INDEX anchors_unproven (anchor_id>?)")),
+            "{details:?}"
+        );
         // 20 unproven anchors: from the start, after a00020 (7 remain), past the end.
-        assert_eq!(count_unproven_anchors(&conn, None, 4).expect("count"), 4);
-        assert_eq!(count_unproven_anchors(&conn, None, 100).expect("count"), 20);
-        let tail = count_unproven_anchors(&conn, Some("a00020"), 100).expect("count");
+        assert_eq!(
+            count_unproven_anchors(&conn, None, 4, None).expect("count"),
+            4
+        );
+        assert_eq!(
+            count_unproven_anchors(&conn, None, 100, None).expect("count"),
+            20
+        );
+        let tail = count_unproven_anchors(&conn, Some("a00020"), 100, None).expect("count");
         assert_eq!(tail, 6);
         assert_eq!(
-            count_unproven_anchors(&conn, Some("a00029"), 4).expect("count"),
+            count_unproven_anchors(&conn, Some("a00029"), 4, None).expect("count"),
             0
         );
+    }
+
+    /// Round 1 decision 3: a cohort read before later anchors commit bounds
+    /// the unread count and the record page to the anchors before it,
+    /// wherever the later ids sort.
+    #[test]
+    fn a_cohort_excludes_anchors_committed_after_it() {
+        let (_dir, conn) = store_with_anchors(30);
+        let cohort = read_anchor_cohort(&conn).expect("cohort");
+        for id in ["0-later", "a00015x", "b-later"] {
+            conn.execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
+                 VALUES (?1,'g','m','/s','s_000000000000',1,0,'b','n','intent',1)",
+                super::params![id],
+            )
+            .expect("insert");
+        }
+        assert_eq!(
+            count_unproven_anchors(&conn, None, 100, None).expect("count"),
+            23
+        );
+        let bounded = count_unproven_anchors(&conn, None, 100, Some(cohort)).expect("count");
+        assert_eq!(bounded, 20);
+        let page = |cohort| {
+            let query = AnchorQuery {
+                after: None,
+                limit: 256,
+                unproven: false,
+                owner: None,
+                cohort,
+            };
+            read_anchor_records(&conn, &query)
+                .expect("records")
+                .into_iter()
+                .map(|record| record.intent.anchor_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(None).len(), 33);
+        let read = page(Some(cohort));
+        assert_eq!(read.len(), 30);
+        assert!(
+            read.iter()
+                .all(|id| !id.contains("later") && id != "a00015x"),
+            "{read:?}"
+        );
+        let empty = tempfile::tempdir().expect("temporary directory");
+        let mut fresh = Connection::open(empty.path().join("store.sqlite3")).expect("open");
+        super::super::configure(&mut fresh, true).expect("schema");
+        assert_eq!(read_anchor_cohort(&fresh).expect("cohort"), AnchorCohort(0));
     }
 }

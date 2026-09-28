@@ -426,6 +426,14 @@ pub struct AnchorOwner {
     pub phase: Option<AnchorPhase>,
 }
 
+/// The anchors committed when [`Store::anchor_cohort`] read it, as a bound
+/// for later anchor reads (design §8): a read bounded by it never returns
+/// an anchor committed afterwards. Anchors are rows of a rowid table that
+/// VIA never deletes, replaces or vacuums, so SQLite gives every later
+/// insert a rowid above the largest one here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorCohort(i64);
+
 /// Largest anchor page one read returns; callers page with a cursor.
 pub const ANCHOR_PAGE_LIMIT: u32 = 256;
 
@@ -761,13 +769,16 @@ enum Command {
     AnchorOwners(
         Option<String>,
         u32,
+        Option<AnchorCohort>,
         oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
     ),
     UnprovenAnchors(
         Option<String>,
         u32,
+        Option<AnchorCohort>,
         oneshot::Sender<Result<u64, StoreError>>,
     ),
+    AnchorCohort(oneshot::Sender<Result<AnchorCohort, StoreError>>),
     QueuedTurns(
         Option<(SessionId, TurnNumber)>,
         u32,
@@ -800,12 +811,13 @@ enum Command {
 }
 
 /// One page of anchor records: after `after`, at most `limit`, optionally
-/// only unproven ones and only one owner session's.
+/// only unproven ones, only one owner session's and only one cohort's.
 struct AnchorQuery {
     after: Option<String>,
     limit: u32,
     unproven: bool,
     owner: Option<SessionId>,
+    cohort: Option<AnchorCohort>,
 }
 
 enum RawCommand {
@@ -1325,11 +1337,37 @@ impl StoreClient {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<AnchorOwner>, StoreError> {
+        self.anchor_owners(after, limit, None).await
+    }
+
+    /// [`Self::anchor_owners_page`] of the anchors in `cohort` only.
+    pub async fn cohort_owners_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
+        self.anchor_owners(after, limit, Some(cohort)).await
+    }
+
+    async fn anchor_owners(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
         if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
             return Err(StoreError::Constraint("anchor page limit must be 1 to 256"));
         }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorOwners(after, limit, reply))?;
+        self.send(Command::AnchorOwners(after, limit, cohort, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads the cohort of every anchor committed so far (read-only).
+    pub async fn anchor_cohort(&self) -> Result<AnchorCohort, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AnchorCohort(reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
@@ -1344,8 +1382,27 @@ impl StoreClient {
         after: Option<String>,
         limit: u32,
     ) -> Result<u64, StoreError> {
+        self.unproven_anchors(after, limit, None).await
+    }
+
+    /// [`Self::unproven_anchors_up_to`] of the anchors in `cohort` only.
+    pub async fn unproven_cohort_anchors_up_to(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<u64, StoreError> {
+        self.unproven_anchors(after, limit, Some(cohort)).await
+    }
+
+    async fn unproven_anchors(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+    ) -> Result<u64, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::UnprovenAnchors(after, limit, reply))?;
+        self.send(Command::UnprovenAnchors(after, limit, cohort, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
@@ -1474,7 +1531,18 @@ impl ProcessJournal {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
-        self.records_page(after, limit, false, None).await
+        self.records_page(after, limit, false, None, None).await
+    }
+
+    /// [`Self::list_anchor_records_page`] of the anchors in `cohort` only.
+    pub async fn list_cohort_records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        self.records_page(after, limit, false, None, Some(cohort))
+            .await
     }
 
     /// [`Self::list_anchor_records_page`] of the anchors with no absence
@@ -1485,7 +1553,7 @@ impl ProcessJournal {
         limit: u32,
         owner: Option<SessionId>,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
-        self.records_page(after, limit, true, owner).await
+        self.records_page(after, limit, true, owner, None).await
     }
 
     async fn records_page(
@@ -1494,6 +1562,7 @@ impl ProcessJournal {
         limit: u32,
         unproven: bool,
         owner: Option<SessionId>,
+        cohort: Option<AnchorCohort>,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
         if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
             return Err(StoreFailureKind::Write);
@@ -1504,6 +1573,7 @@ impl ProcessJournal {
             limit,
             unproven,
             owner,
+            cohort,
         };
         self.send(Command::AnchorRecords(query, reply))
             .map_err(|error| error.kind())?;
@@ -1538,7 +1608,8 @@ mod sql;
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, count_unproven_anchors, read_anchor_owners, read_anchor_records,
+    commit_vendor_facts, count_unproven_anchors, read_anchor_cohort, read_anchor_owners,
+    read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};

@@ -159,6 +159,21 @@ impl WireRuntime {
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(WireError::Host)
     }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: crate::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.host
+            .recover_cohort_page(after, limit, cohort, deadline)
+            .await
+            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
+            .map_err(WireError::Host)
+    }
 }
 
 impl WireError {

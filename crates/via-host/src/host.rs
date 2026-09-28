@@ -23,8 +23,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use via_store::{
-    AnchorIdentity, AnchorIntent, AnchorPhase, AnchorRecord, CommitOutcome, GroupAbsenceRecord,
-    ProcessJournal, StoreFailureKind,
+    AnchorCohort, AnchorIdentity, AnchorIntent, AnchorPhase, AnchorRecord, CommitOutcome,
+    GroupAbsenceRecord, ProcessJournal, StoreFailureKind,
 };
 
 use crate::{
@@ -1425,17 +1425,48 @@ impl Host {
         limit: u32,
         deadline: Deadline,
     ) -> Result<Vec<RecoveryReport>, HostError> {
+        self.reconcile_page(after, limit, None, deadline).await
+    }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only: resumed
+    /// paging never reads, so never challenges, an anchor this daemon
+    /// committed after startup (design §8).
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<RecoveryReport>, HostError> {
+        self.reconcile_page(after, limit, Some(cohort), deadline)
+            .await
+    }
+
+    async fn reconcile_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+        deadline: Deadline,
+    ) -> Result<Vec<RecoveryReport>, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
+        let read = async {
+            match cohort {
+                Some(cohort) => {
+                    self.journal
+                        .list_cohort_records_page(after, limit, cohort)
+                        .await
+                }
+                None => self.journal.list_anchor_records_page(after, limit).await,
+            }
+        };
         // A read that never completed is a Store failure, not unproven cleanup.
-        let records = timeout_at(
-            deadline.instant(),
-            self.journal.list_anchor_records_page(after, limit),
-        )
-        .await
-        .map_err(|_| HostError::Store("anchor journal page read timed out"))?
-        .map_err(HostError::StoreUnavailable)?;
+        let records = timeout_at(deadline.instant(), read)
+            .await
+            .map_err(|_| HostError::Store("anchor journal page read timed out"))?
+            .map_err(HostError::StoreUnavailable)?;
         let mut results = Vec::with_capacity(records.len());
         for record in records {
             let anchor_id = record.intent.anchor_id.clone();

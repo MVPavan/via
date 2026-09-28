@@ -1266,6 +1266,52 @@ fn insert_anchors(sandbox: &Sandbox, owner: &str, prefix: &str, count: u32) -> T
     Ok(())
 }
 
+/// Restarts a stopped daemon over 300 proven synthetic anchors and one
+/// unread one (see [`insert_anchors`]), owned by `owner`'s turn 1.
+/// Startup reconciliation stops at its deadline at a page boundary before
+/// `1-unread`, which it counts unread: that anchor holds one slot.
+#[cfg(feature = "test-failpoints")]
+fn restart_with_unread<'a>(sandbox: &'a Sandbox, owner: &str) -> TestResult<Daemon<'a>> {
+    insert_anchors(sandbox, owner, "0-synthetic", 300)?;
+    let boundary = "core.recovery.page_boundary";
+    sandbox.arm(boundary, 1, "pause")?;
+    let run = sandbox.runs.get() + 1;
+    sandbox.runs.set(run);
+    let trace = sandbox.root.path().join(format!("daemon-{run}.trace"));
+    let mut command = sandbox.command_fp();
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(&trace)?);
+    let mut daemon = Daemon {
+        child: command.spawn()?,
+        sandbox,
+        trace,
+    };
+    sandbox.ack(&daemon, boundary, 1, "pause")?;
+    // Recovery's deadline began before the acknowledgement: 5 s after it
+    // has passed, so paging stops with the unread anchor counted.
+    thread::sleep(Duration::from_millis(5_200));
+    sandbox.resume_point(boundary, 1)?;
+    daemon.ready()?;
+    sandbox.disarm(boundary)?;
+    Ok(daemon)
+}
+
+/// Removes the synthetic anchors of [`insert_anchors`] from a stopped
+/// daemon's Store, then checks every real one is proved absent.
+#[cfg(feature = "test-failpoints")]
+fn remove_synthetic_anchors(sandbox: &Sandbox) -> TestResult {
+    let store = rusqlite::Connection::open(sandbox.state.join("store.sqlite3"))?;
+    store.execute(
+        "DELETE FROM anchors WHERE anchor_id LIKE '0-synthetic%' OR anchor_id='1-unread'",
+        [],
+    )?;
+    drop(store);
+    sandbox.verify_anchors()
+}
+
 /// Design §8 [r1.15]: startup reconciliation stops at its deadline before
 /// an anchor it counts as unread, which holds the only slot. A drain is
 /// accepted while a turn waits for that slot. The re-probe loop's resumed
@@ -1282,30 +1328,7 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
     let (seed, _) = sandbox.spawn("seed")?;
     sandbox.wait(&format!("{seed}/1"))?;
     daemon.finish()?;
-    insert_anchors(&sandbox, &seed, "0-synthetic", 300)?;
-    let boundary = "core.recovery.page_boundary";
-    sandbox.arm(boundary, 1, "pause")?;
-    let run = sandbox.runs.get() + 1;
-    sandbox.runs.set(run);
-    let trace = sandbox.root.path().join(format!("daemon-{run}.trace"));
-    let mut command = sandbox.command_fp();
-    command
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(File::create(&trace)?);
-    let mut daemon = Daemon {
-        child: command.spawn()?,
-        sandbox: &sandbox,
-        trace,
-    };
-    sandbox.ack(&daemon, boundary, 1, "pause")?;
-    // Recovery's deadline began before the acknowledgement: 5 s after it
-    // has passed, so paging stops with the unread anchor counted.
-    thread::sleep(Duration::from_millis(5_200));
-    sandbox.resume_point(boundary, 1)?;
-    daemon.ready()?;
-    sandbox.disarm(boundary)?;
+    let mut daemon = restart_with_unread(&sandbox, &seed)?;
     let held = sandbox.status()?;
     check(
         held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
@@ -1335,13 +1358,65 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
     })?;
     drop(daemon);
     sandbox.disarm(waiting)?;
-    let store = rusqlite::Connection::open(sandbox.state.join("store.sqlite3"))?;
-    store.execute(
-        "DELETE FROM anchors WHERE anchor_id LIKE '0-synthetic%' OR anchor_id='1-unread'",
-        [],
+    remove_synthetic_anchors(&sandbox)
+}
+
+/// Design §8, round 1 decision 3: resumed paging progresses while this
+/// daemon owns a live group. Of two slots, an earlier daemon's unread
+/// anchor holds one and a live turn of this daemon the other; a third turn
+/// waits. Paging reads only the startup cohort, so it never challenges the
+/// live group: it proves the unread anchor absent while that group runs,
+/// and the waiting turn completes before the live one is released.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_resumed_paging_progresses_with_a_live_current_group() -> TestResult {
+    let mut sandbox = Sandbox::new(&scripts(&[
+        completes("seed", 1),
+        held("live", 1),
+        completes("later", 1),
+    ]))?;
+    sandbox
+        .env
+        .push(("VIA_TEST_CONNECTION_SLOTS", "2".to_owned()));
+    let daemon = sandbox.start()?;
+    let (seed, _) = sandbox.spawn("seed")?;
+    sandbox.wait(&format!("{seed}/1"))?;
+    daemon.finish()?;
+    let mut daemon = restart_with_unread(&sandbox, &seed)?;
+    let held = sandbox.status()?;
+    check(
+        held["connections"] == json!({"limit":2,"in_use":1,"held_unproven":1}),
+        || format!("unread holding: {held}"),
     )?;
-    drop(store);
-    sandbox.verify_anchors()
+    let (live, _) = sandbox.spawn("live")?;
+    sandbox.await_file("live.entered")?;
+    let (later, _) = sandbox.spawn("later")?;
+    let state = |session: &str| {
+        sandbox.query::<String>(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))
+    };
+    wait_until(
+        "the waiting turn completes while the live group runs",
+        Duration::from_secs(20),
+        || state(&later).is_ok_and(|state| state == "completed"),
+    )?;
+    let running = state(&live)?;
+    let proved: i64 = sandbox.query(
+        "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
+    )?;
+    check(running == "running" && proved == 1, || {
+        format!("live turn {running}, unread anchor proved {proved}")
+    })?;
+    sandbox.release("live")?;
+    let envelope = sandbox.wait(&format!("{live}/1"))?;
+    check(envelope["state"] == "completed", || envelope.to_string())?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    let status = daemon.exit(Duration::from_secs(30))?;
+    check(status.code() == Some(0), || format!("stop exit: {status}"))?;
+    drop(daemon);
+    remove_synthetic_anchors(&sandbox)
 }
 
 /// Design §6.8 [r5.1]: Host's early-stop task, wired at serve start, ends
