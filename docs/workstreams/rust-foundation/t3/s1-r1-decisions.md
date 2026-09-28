@@ -94,3 +94,20 @@ on three runs, F08–F12 17.
 
 The orchestrator makes the design and contract edits the report lists
 when S1 merges.
+
+## Round 2 check (Sol medium, `sol-review-S1-r2.md`)
+
+Round 2 (`a35a5c6`, `84ac4bb`) applied decision 8 on the three ledger
+paths. Gate: failpoints 263/2 three times. Sol: SOUND WITH CHANGES, with
+one finding.
+
+11. **The caller's stop check also keeps the early-stop deadline.**
+    - Under a daemon force, `stopped()` (the caller's order or force
+      watch) and the ledger's `stopping` are usually both set.
+    - `stopped()` returns before `begin_arming` reads the ledger, so that
+      path still got a fresh 3 s.
+    - On its true branch, read the ledger's stopping deadline and call
+      `stop_early` when present.
+    - A caller-only stop (a Route order with no Host early stop) keeps the
+      fresh allowance.
+    - Test the overlap: the caller check is set and `stopping` is set.
