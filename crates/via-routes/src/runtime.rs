@@ -297,9 +297,14 @@ impl FakeRoute {
                 // (already in the raw log) the wait is bounded by the cleanup
                 // allowance and anything but a confirmed exit is transport
                 // loss, never a protocol failure.
+                // Under the daemon force the exit is the force's own stop
+                // (Host's early stop, design §6.8): the force row, never
+                // `ProcessExited`.
                 end @ (Next::Eof | Next::Unterminated) => {
+                    control.after_terminal()?;
                     let unterminated = matches!(end, Next::Unterminated);
                     let exit = control.wait_exit(wire, deadline, unterminated).await?;
+                    control.after_terminal()?;
                     return Err(Failed {
                         cause: RouteError::ProcessExited { turn },
                         evidence: None,
