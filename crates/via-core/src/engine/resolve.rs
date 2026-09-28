@@ -229,12 +229,18 @@ impl Engine {
         self.store_failure(FailureSite::Read, WriteOutcome::NotCommitted, scope)
             .finish()
             .await;
-        let Ok(queueing) = self.queueing(session, turn).await else {
-            slot.rollback(turn);
-            self.store_failure(FailureSite::Resolution, WriteOutcome::NotCommitted, scope)
-                .finish()
-                .await;
-            return Step::Next;
+        let queueing = match self.queueing(session, turn).await {
+            Ok(queueing) => queueing,
+            Err(outcome) => {
+                // The resolution write cannot be issued: it escalates. A
+                // corrupt read was recorded at Store's read reply
+                // (T3-S5 round 3, decision 13).
+                slot.rollback(turn);
+                self.store_failure(FailureSite::Resolution, outcome, scope)
+                    .finish()
+                    .await;
+                return Step::Next;
+            }
         };
         self.submit_failed(slot, session, turn, queueing, READ_FAILED)
             .await

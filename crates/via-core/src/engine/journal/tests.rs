@@ -747,7 +747,8 @@ async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
 /// T3-S5 round 1, decision 2 (design §7.1): SQLite corruption on the
 /// session-head read before an event is the turn's first failure with the
 /// outcome `Corrupt`, which the failure hook latches, not a clean
-/// not-committed failure. Nothing is written.
+/// not-committed failure. Nothing is written. Since round 3 (decision 13)
+/// the outcome is `ReadCorrupt`: Store's read reply already recorded it.
 #[tokio::test]
 async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
     let root = tempfile::tempdir().unwrap();
@@ -774,7 +775,10 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
     let note = record
         .first_failure
         .expect("the head read failed the event");
-    assert_eq!(note.outcome, crate::engine::latch::WriteOutcome::Corrupt);
+    assert_eq!(
+        note.outcome,
+        crate::engine::latch::WriteOutcome::ReadCorrupt
+    );
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(events.len(), 2, "nothing was written");
 }
@@ -782,7 +786,8 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
 /// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
 /// session-head read before a terminal commit is reported as `Corrupt`,
 /// which the failure hook latches, not as a not-committed failure. Nothing
-/// is written.
+/// is written. Since round 3 (decision 13) the outcome is `ReadCorrupt`:
+/// Store's read reply already recorded it.
 #[tokio::test]
 async fn a_corrupt_head_read_before_a_terminal_is_a_corrupt_failure() {
     let root = tempfile::tempdir().unwrap();
@@ -799,7 +804,10 @@ async fn a_corrupt_head_read_before_a_terminal_is_a_corrupt_failure() {
     let failed = Engine::commit_turn_ended(&journal, &started(), record, store_failure(), false)
         .await
         .unwrap_err();
-    assert_eq!(failed.outcome, crate::engine::latch::WriteOutcome::Corrupt);
+    assert_eq!(
+        failed.outcome,
+        crate::engine::latch::WriteOutcome::ReadCorrupt
+    );
     assert_eq!(failed.error.kind, "store_error");
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(events.len(), 2, "nothing was written");

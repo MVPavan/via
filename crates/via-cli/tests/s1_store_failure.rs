@@ -2008,10 +2008,11 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
     sandbox.release("accepted")?;
     sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
     sandbox.ack(&daemon, point, next, "fail_io")?;
-    // The latch, the head read's corruption at Store's read reply (T3-S5
-    // round 2, decision 11), then the batch's own failed write.
-    wait_until("the batch's failure", Duration::from_secs(4), || {
-        store_failure(&sandbox).is_ok_and(|failure| failure["count"] == 3)
+    // The latch, then the head read's corruption at Store's read reply
+    // (T3-S5 round 2, decision 11). The batch's write it aborted records
+    // nothing more (round 3, decision 13); the summary shows it skipped.
+    wait_until("the head read's failure", Duration::from_secs(4), || {
+        store_failure(&sandbox).is_ok_and(|failure| failure["count"] == 2)
     })?;
     let failure = store_failure(&sandbox)?;
     check(

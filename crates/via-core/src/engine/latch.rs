@@ -153,6 +153,12 @@ pub(super) enum WriteOutcome {
     Uncertain,
     /// SQLite reported corruption (`SQLITE_CORRUPT`, `SQLITE_NOTADB`).
     Corrupt,
+    /// The write's prerequisite read returned SQLite corruption, so the
+    /// write was never issued and nothing was written. Store's read reply
+    /// already reported that failure through the hook (T3-S5 round 2,
+    /// decision 11), so it latches like [`Self::Corrupt`] but is not
+    /// recorded a second time (round 3, decision 13).
+    ReadCorrupt,
 }
 
 impl WriteOutcome {
@@ -170,10 +176,11 @@ impl WriteOutcome {
 
     /// Classifies a failed read taken before a write, such as the session
     /// head's: nothing was written, so it is not committed, unless SQLite
-    /// reported corruption, which latches (design §7.1).
+    /// reported corruption, which latches (design §7.1) and which Store's
+    /// read reply has already recorded ([`Self::ReadCorrupt`]).
     pub(super) fn of_read(error: &StoreError) -> Self {
         match Self::of(error) {
-            Self::Corrupt => Self::Corrupt,
+            Self::Corrupt | Self::ReadCorrupt => Self::ReadCorrupt,
             Self::NotCommitted | Self::Uncertain => Self::NotCommitted,
         }
     }
@@ -183,7 +190,7 @@ impl WriteOutcome {
     pub(super) fn head_unknown(self) -> bool {
         match self {
             Self::NotCommitted => false,
-            Self::Uncertain | Self::Corrupt => true,
+            Self::Uncertain | Self::Corrupt | Self::ReadCorrupt => true,
         }
     }
 
@@ -192,7 +199,7 @@ impl WriteOutcome {
     pub(super) fn api_error(self) -> ApiError {
         match self {
             Self::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-            Self::Uncertain | Self::Corrupt => ApiError::RECEIPT_UNKNOWN,
+            Self::Uncertain | Self::Corrupt | Self::ReadCorrupt => ApiError::RECEIPT_UNKNOWN,
         }
     }
 }
@@ -244,7 +251,7 @@ struct LatestFailure {
 /// outcome, then the site's own kind.
 fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
     match outcome {
-        WriteOutcome::Corrupt => "corrupt_store",
+        WriteOutcome::Corrupt | WriteOutcome::ReadCorrupt => "corrupt_store",
         WriteOutcome::Uncertain => "commit_uncertain",
         WriteOutcome::NotCommitted => match site {
             FailureSite::Receipt
@@ -479,13 +486,17 @@ impl Signal {
 
     /// The failure hook's body ([`Engine::store_failure`]): records the
     /// failure and, when it latches, runs phase one. Returns whether it
-    /// latches.
+    /// latches. A write aborted by a corrupt prerequisite read is not
+    /// recorded again: Store's read reply recorded that one failure
+    /// (T3-S5 round 3, decision 13).
     fn report(&self, site: FailureSite, outcome: WriteOutcome, scope: FailureScope<'_>) -> bool {
         let latches = match outcome {
-            WriteOutcome::Uncertain | WriteOutcome::Corrupt => true,
+            WriteOutcome::Uncertain | WriteOutcome::Corrupt | WriteOutcome::ReadCorrupt => true,
             WriteOutcome::NotCommitted => !site.scoped(),
         };
-        self.record_failure(site, outcome, scope, latches);
+        if outcome != WriteOutcome::ReadCorrupt {
+            self.record_failure(site, outcome, scope, latches);
+        }
         if latches {
             self.fail_pending();
         }

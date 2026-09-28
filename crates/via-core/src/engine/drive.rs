@@ -116,9 +116,10 @@ impl Cancelled {
             Self::Committed(_) => QueuedOutcome::Committed,
             Self::Unread | Self::Expired => QueuedOutcome::ReadFailed,
             Self::Failed(WriteOutcome::NotCommitted) => QueuedOutcome::NotCommitted,
-            Self::Failed(WriteOutcome::Uncertain | WriteOutcome::Corrupt) | Self::Latched => {
-                QueuedOutcome::Uncertain
-            }
+            Self::Failed(
+                WriteOutcome::Uncertain | WriteOutcome::Corrupt | WriteOutcome::ReadCorrupt,
+            )
+            | Self::Latched => QueuedOutcome::Uncertain,
         }
     }
 }

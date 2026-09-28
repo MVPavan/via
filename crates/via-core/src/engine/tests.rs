@@ -1909,10 +1909,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
         let finished = engine.finish(&started, record, terminal, false, None).await;
         assert_eq!(finished.unwrap_err().kind, "store_error");
         assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
-        assert!(engine.store_failed(), "the corrupt head read latched");
-        let status = engine.store_failure_status().unwrap();
-        assert_eq!(status["kind"], "corrupt_store");
-        assert_eq!(status["scope"], "daemon");
+        assert_corruption_latched(&engine);
     });
 }
 
@@ -1971,12 +1968,7 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
             .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
             .await;
         assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
-        assert!(
-            engine.store_failed(),
-            "the resolution write's failure latched"
-        );
-        let status = engine.store_failure_status().unwrap();
-        assert_eq!(status["kind"], "corrupt_store");
+        assert_corruption_latched(&engine);
         let types = event_types(&engine, &session).await;
         assert_eq!(types, ["turn.queued"], "nothing was written");
     });
@@ -2022,12 +2014,15 @@ fn acked(dir: &Path, point: &str, n: u64) -> bool {
     dir.join(format!("{point}.{n}.ack")).exists()
 }
 
-/// Asserts the latch's phase one ran with `corrupt_store` (design §7.1).
+/// Asserts the latch's phase one ran with `corrupt_store` (design §7.1),
+/// recorded once: Store's read reply reported the one corrupt read, and
+/// no aborted write recorded it again (T3-S5 round 3, decision 13).
 fn assert_corruption_latched(engine: &Engine) {
     assert!(engine.store_failed(), "the corrupt read latched");
     let status = engine.store_failure_status().unwrap();
     assert_eq!(status["kind"], "corrupt_store", "{status}");
     assert_eq!(status["scope"], "daemon", "{status}");
+    assert_eq!(status["count"], 1, "one failure, one record: {status}");
 }
 
 /// The force closure pass of one session whose only turn was cancelled,
@@ -2147,8 +2142,16 @@ fn a_corrupt_reconcile_read_before_a_terminal_latches() {
 }
 
 /// Final shutdown's batch for turn 1 of a session with turn 2 queued, with
-/// `point` failing its next hit as SQLite corruption: the batch is skipped.
-fn batch_read_corruption(root: &Path, point: &str) {
+/// `record` as turn 1's and `point` failing its next hit as SQLite
+/// corruption: the batch is skipped. A step 1 read skips it before its
+/// write, so phase two waits for final shutdown's entry; a read the write
+/// needs aborts that write, whose hook call finishes phase two.
+fn batch_read_corruption(
+    root: &Path,
+    point: &str,
+    record: fn(&SessionId) -> super::TurnRecord,
+    aborts_write: bool,
+) {
     let points = count_points(root, &[point]);
     run(async {
         let engine = open(root);
@@ -2156,7 +2159,7 @@ fn batch_read_corruption(root: &Path, point: &str) {
         resume(&engine, &session, None).await;
         let affected = super::batch::AffectedTurn {
             started: started_one(&session),
-            record: turn_one(&session, true),
+            record: record(&session),
             terminal: store_terminal(),
             raw_incomplete: false,
         };
@@ -2169,8 +2172,9 @@ fn batch_read_corruption(root: &Path, point: &str) {
         assert!(acked(&points, point, n), "{point} #{n} was not reached");
         assert_corruption_latched(&engine);
         assert_eq!((batches.committed, batches.skipped), (0, 1));
-        // Phase two waits for `admission`: final shutdown's entry takes it.
-        assert!(!engine.latch_finalized(), "phase two ran without admission");
+        // Phase two waits for `admission`: the aborted write's hook call or
+        // final shutdown's entry takes it.
+        assert_eq!(engine.latch_finalized(), aborts_write);
         engine.enter_final_shutdown().await;
         assert!(
             engine.latch_finalized(),
@@ -2186,7 +2190,12 @@ fn a_corrupt_result_read_in_the_batch_latches() {
     let Some(root) = child("a_corrupt_result_read_in_the_batch_latches") else {
         return;
     };
-    batch_read_corruption(&root, "store.read.corrupt.result");
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.result",
+        |session| turn_one(session, true),
+        false,
+    );
 }
 
 /// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
@@ -2196,7 +2205,12 @@ fn a_corrupt_reconcile_read_in_the_batch_latches() {
     let Some(root) = child("a_corrupt_reconcile_read_in_the_batch_latches") else {
         return;
     };
-    batch_read_corruption(&root, "store.read.corrupt.events");
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.events",
+        |session| turn_one(session, true),
+        false,
+    );
 }
 
 /// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
@@ -2206,7 +2220,117 @@ fn a_corrupt_queued_row_read_in_the_batch_latches() {
     let Some(root) = child("a_corrupt_queued_row_read_in_the_batch_latches") else {
         return;
     };
-    batch_read_corruption(&root, "store.read.corrupt.queued_turn");
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.queued_turn",
+        |session| turn_one(session, true),
+        false,
+    );
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.5): SQLite corruption on
+/// the batch's session-head read (`store.read.corrupt.next_seq`) aborts the
+/// batch's write. Store's read reply recorded it, so the batch records no
+/// second failure; the batch is still skipped and the latch stands. The
+/// record's head is unknown, as after the uncertain write that makes the
+/// batch read it.
+#[test]
+fn a_corrupt_head_read_in_the_batch_records_one_failure() {
+    let Some(root) = child("a_corrupt_head_read_in_the_batch_records_one_failure") else {
+        return;
+    };
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.next_seq",
+        |session| super::TurnRecord {
+            head: super::journal::Head::new(None),
+            ..turn_one(session, false)
+        },
+        true,
+    );
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.5): SQLite corruption on
+/// the acceptance's session-head read (`drive.rs` `observe`,
+/// `store.read.corrupt.next_seq`) aborts the acceptance write. Store's read
+/// reply recorded it, so `store_failure.count` is 1; the turn keeps its
+/// first failure (row 5) and the latch stands. The record's head is
+/// unknown, as after an uncertain write.
+#[test]
+fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
+    let Some(root) = child("a_corrupt_head_read_before_an_acceptance_records_one_failure") else {
+        return;
+    };
+    let point = "store.read.corrupt.next_seq";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let (_route, orders) = slot.start_running(turn(1), wall);
+        let mut record = super::TurnRecord {
+            head: super::journal::Head::new(None),
+            ..turn_one(&session, false)
+        };
+        let effective: crate::api::Effective = serde_json::from_value(json!({
+            "model":"fake","effort":null,"bound":null,
+            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+        }))
+        .unwrap();
+        let raw_ref = crate::RawRef::new(
+            crate::ConnectionId::try_from("c_000000000000").unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
+        let accepted =
+            via_adapters::FakeObservation::Accepted(via_adapters::FakeAcceptanceObservation {
+                correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
+                vendor_turn_id: via_adapters::VendorTurnId::try_from("v_1".to_owned()).unwrap(),
+                raw_ref,
+            });
+        let n = arm_next(&points, point);
+        engine
+            .drain_queued(&slot, &mut record, &effective, orders, vec![accepted])
+            .await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        let note = record.first_failure.expect("the acceptance write failed");
+        assert_eq!(note.site, super::latch::FailureSite::Event);
+        assert!(record.accepted.is_none(), "nothing was accepted");
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.3, §7.5): when a read
+/// streak expires, SQLite corruption on the queueing read that row 2's
+/// resolution write needs (`store.read.corrupt.events`) aborts that write.
+/// The expired streak records its own failure; Store's read reply records
+/// the corruption, which stays the latest, and the aborted resolution
+/// write records nothing more: two failures, two records.
+#[test]
+fn a_corrupt_queueing_read_after_a_read_streak_records_one_failure() {
+    let Some(root) = child("a_corrupt_queueing_read_after_a_read_streak_records_one_failure")
+    else {
+        return;
+    };
+    let point = "store.read.corrupt.events";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let n = arm_next(&points, point);
+        engine.read_expired(&slot, &session, turn(1)).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert!(engine.store_failed(), "the corrupt read latched");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store", "{status}");
+        assert_eq!(status["scope"], "daemon", "{status}");
+        assert_eq!(status["count"], 2, "the streak and the read: {status}");
+        let types = event_types(&engine, &session).await;
+        assert_eq!(types, ["turn.queued"], "nothing was written");
+    });
 }
 
 /// T3-S5 round 2, decision 12 (design §6.8, §7.4): after a latch the

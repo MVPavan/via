@@ -229,7 +229,7 @@ impl Engine {
         let queueing = self
             .queueing(session, turn)
             .await
-            .map_err(|error| format!("store_error: {}", error.kind))?;
+            .map_err(|_| format!("store_error: {}", ApiError::STORE.kind))?;
         let slot = self.slot_for(session);
         let (started, record, terminal, extras) =
             queued_cancellation(&slot, session, turn, queueing, cause);
@@ -268,7 +268,7 @@ impl Engine {
         let queueing = self
             .queueing(session, turn)
             .await
-            .map_err(|error| format!("store_error: {}", error.kind))?;
+            .map_err(|_| format!("store_error: {}", ApiError::STORE.kind))?;
         let slot = self.slot_for(session);
         resolve::commit_submit_failed(
             &self.store,
@@ -284,12 +284,15 @@ impl Engine {
     /// The committed queueing of `turn` (its `turn.queued` time and
     /// sequence), read from the session's history, for a row Store cannot
     /// read (design §7.3): shared by the restart handoff and the live
-    /// dispatcher.
+    /// dispatcher. When it cannot be read, the error is the outcome of the
+    /// write that needed it: nothing was written, and a corrupt read is
+    /// [`WriteOutcome::ReadCorrupt`], which Store's read reply already
+    /// recorded (T3-S5 round 3, decision 13).
     pub(super) async fn queueing(
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Queueing, ApiError> {
+    ) -> Result<Queueing, WriteOutcome> {
         let History {
             queued_at,
             queued_seq,
@@ -412,7 +415,10 @@ impl Engine {
             requested_at,
             settled,
             raw_logged,
-        } = self.history(&session, turn).await?;
+        } = self
+            .history(&session, turn)
+            .await
+            .map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -564,8 +570,14 @@ impl Engine {
     }
 
     /// Reads the session's committed events in pages and keeps what the
-    /// recovered envelope of `turn` cites.
-    async fn history(&self, session: &SessionId, turn: TurnNumber) -> Result<History, ApiError> {
+    /// recovered envelope of `turn` cites. An unreadable or incomplete
+    /// history fails with the outcome of the write that needed it, as
+    /// [`Engine::queueing`] reports it.
+    async fn history(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<History, WriteOutcome> {
         let mut last_seq = 0;
         let mut queued_at = None;
         let mut queued_seq = None;
@@ -579,7 +591,7 @@ impl Engine {
                 .store
                 .events(session, last_seq + 1, PAGE)
                 .await
-                .map_err(|_| ApiError::STORE)?;
+                .map_err(|error| WriteOutcome::of_read(&error))?;
             let full = page.len() == PAGE as usize;
             for stored in page {
                 last_seq = stored.seq;
@@ -602,7 +614,10 @@ impl Engine {
                         requested_at = at.map(str::to_owned);
                     }
                     Some("cancel.settled") if settled.is_none() => {
-                        settled = Some(DurableSettlement::read(&stored.event)?);
+                        settled = Some(
+                            DurableSettlement::read(&stored.event)
+                                .map_err(|_| WriteOutcome::NotCommitted)?,
+                        );
                     }
                     Some("raw_log.incomplete") => raw_logged = true,
                     _ => {}
@@ -614,8 +629,8 @@ impl Engine {
         }
         Ok(History {
             last_seq,
-            queued_at: queued_at.ok_or(ApiError::STORE)?,
-            queued_seq: queued_seq.ok_or(ApiError::STORE)?,
+            queued_at: queued_at.ok_or(WriteOutcome::NotCommitted)?,
+            queued_seq: queued_seq.ok_or(WriteOutcome::NotCommitted)?,
             started,
             spans,
             requested_at,
