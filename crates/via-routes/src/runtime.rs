@@ -399,7 +399,15 @@ impl FakeRoute {
         }
         loop {
             match wire.wait_exit(deadline).await {
-                Ok(exit) => return Ok(exit),
+                // Host's early stop raises the force before it stops the
+                // vendor (design §6.8), so an exit it caused is read under a
+                // set force. Wire hands back a recorded exit without
+                // consulting the force, so read it here: the force row, never
+                // an exit status Route reports as the vendor's own.
+                Ok(exit) => {
+                    control.after_terminal()?;
+                    return Ok(exit);
+                }
                 Err(WireError::Woken) => control.after_terminal()?,
                 Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
             }
