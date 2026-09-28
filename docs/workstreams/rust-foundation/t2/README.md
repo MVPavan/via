@@ -17,3 +17,12 @@ Review loop: `../cloud-and-local.md` §6.
 Shared files: `via-core/src/engine/drive.rs` and Store's spawn/submission
 commit path. T2-A's hunks there are failpoint call sites only; T2-B owns
 the logic. Each names its shared hunks in its report.
+
+Task 2 slice review r2 (`task2-sol-high-review-r2.md`, on T2-E at 847b9a0),
+orchestrator dispositions: `bound: null` → `invalid_params` (C1 §1 field
+rules; applied also to `effort` and `deadlines` null); the fixed sleep in the
+deadline test → a bounded `wait` asserting `wait_timeout`; the `events` FK
+finding is withdrawn (the FK is declared inline at `sql.rs:107`). Deferred:
+queued-row read error vs latch and a restart test with a nondefault frozen
+value → `via-jm4.7.7`; the fake's 30 000 ms default and other spawn CLI
+options → `via-jm4.7.8`.
