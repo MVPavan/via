@@ -39,7 +39,7 @@ pub enum RawEvidence {
 pub struct WireSignals {
     /// The daemon force watch: once set, every wait on the vendor ends with
     /// [`WireError::Cancelled`].
-    pub force: watch::Receiver<bool>,
+    pub force: watch::Receiver<Option<tokio::time::Instant>>,
     /// Route's wake: each change ends the current wait on the vendor once
     /// with [`WireError::Woken`], before any byte is read, so Route can act on
     /// its turn's stop order without losing bytes.
@@ -297,7 +297,7 @@ pub struct WireConnection {
     control: ProcessControl,
     exits: ExitReceiver,
     /// Caller's cancel signal; checked only where waiting loses no bytes.
-    cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<Option<tokio::time::Instant>>,
     /// Route's wake, likewise checked only where waiting loses no bytes.
     wake: watch::Receiver<u64>,
 }
@@ -704,8 +704,8 @@ async fn woken(wake: &mut watch::Receiver<u64>) {
 }
 
 /// Resolves once `cancel` is set; never when its sender is gone unset.
-async fn cancelled(cancel: &mut watch::Receiver<bool>) {
-    if cancel.wait_for(|cancel| *cancel).await.is_err() {
+async fn cancelled(cancel: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    if cancel.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
 }

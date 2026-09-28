@@ -81,7 +81,7 @@ impl FakeRoute {
         start: FakeStart,
         observations: mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-        force: watch::Receiver<bool>,
+        force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
     ) -> Result<FakeRouteResult, RouteFailure> {
         let turn = start.turn();
@@ -95,7 +95,7 @@ impl FakeRoute {
             forced: false,
             journal_uncertain: false,
         };
-        if *force.borrow() {
+        if force.borrow().is_some() {
             return Err(not_launched(RouteError::ForceStopped { turn }));
         }
         // An order set before submission reached Route: nothing starts, and
@@ -107,7 +107,7 @@ impl FakeRoute {
         let gate = {
             let force = force.clone();
             let stop = stop.clone();
-            Arc::new(move || *force.borrow() || stop.borrow().is_some())
+            Arc::new(move || force.borrow().is_some() || stop.borrow().is_some())
         };
         let signals = WireSignals {
             force: force.clone(),
@@ -142,7 +142,7 @@ impl FakeRoute {
         observations: &mpsc::Sender<RouteMessage>,
         deadline: Deadline,
         signals: WireSignals,
-        (force, stop): (watch::Receiver<bool>, StopWatch),
+        (force, stop): (watch::Receiver<Option<tokio::time::Instant>>, StopWatch),
     ) -> Result<FakeRouteResult, RouteFailure> {
         let turn = start.turn();
         let mut wire = self
@@ -279,7 +279,7 @@ impl FakeRoute {
         start: FakeStart,
         observations: &mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-        (force, stop): &(watch::Receiver<bool>, StopWatch),
+        (force, stop): &(watch::Receiver<Option<tokio::time::Instant>>, StopWatch),
     ) -> Result<Finished, Failed> {
         let turn = start.turn();
         let mut force = force.clone();
@@ -427,7 +427,7 @@ enum Finished {
 /// Route's side of a turn's stop order after the start frame was written.
 struct Control {
     turn: TurnNumber,
-    force: watch::Receiver<bool>,
+    force: watch::Receiver<Option<tokio::time::Instant>>,
     stop: StopWatch,
     /// The one interrupt was sent.
     interrupted: bool,
@@ -442,7 +442,7 @@ impl Control {
         wire: &mut WireConnection,
         deadline: Deadline,
     ) -> Result<(), Failed> {
-        if *self.force.borrow() {
+        if self.force.borrow().is_some() {
             return Err(RouteError::ForceStopped { turn: self.turn }.into());
         }
         let Some((force_at, close_by)) = self
@@ -477,7 +477,7 @@ impl Control {
 
     /// After the terminal only the daemon force ends the turn early.
     fn after_terminal(&self) -> Result<(), Failed> {
-        if *self.force.borrow() {
+        if self.force.borrow().is_some() {
             return Err(RouteError::ForceStopped { turn: self.turn }.into());
         }
         Ok(())
@@ -740,7 +740,7 @@ async fn forward(
     message: RouteMessage,
     turn: TurnNumber,
     deadline: Deadline,
-    force: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), Failed> {
     let sent = tokio::select! {
         // Capacity first: a draining consumer still receives frames already read.
@@ -751,14 +751,14 @@ async fn forward(
     match sent {
         Ok(Ok(())) => Ok(()),
         // A forced Adapter stops taking messages; that is the force, not overflow.
-        Ok(Err(_)) if *force.borrow() => Err(RouteError::ForceStopped { turn }.into()),
+        Ok(Err(_)) if force.borrow().is_some() => Err(RouteError::ForceStopped { turn }.into()),
         Ok(Err(_)) | Err(_) => Err(RouteError::Overflow { turn }.into()),
     }
 }
 
 /// Resolves once `force` is set; never when its sender is gone unset.
-async fn forced(force: &mut watch::Receiver<bool>) {
-    if force.wait_for(|force| *force).await.is_err() {
+async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    if force.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
 }
@@ -769,7 +769,7 @@ async fn forced(force: &mut watch::Receiver<bool>) {
 fn acquire_failure(
     turn: TurnNumber,
     error: &WireError,
-    force: &watch::Receiver<bool>,
+    force: &watch::Receiver<Option<tokio::time::Instant>>,
 ) -> RouteFailure {
     let (cause, launched, raw, cleanup, forced, journal_uncertain) = if let WireError::Acquire {
         cause,
@@ -792,7 +792,7 @@ fn acquire_failure(
         (error, false, RawEvidence::Complete, None, false, false)
     };
     let cause = if matches!(cause, WireError::Host(HostError::Stopped)) {
-        if *force.borrow() {
+        if force.borrow().is_some() {
             RouteError::ForceStopped { turn }
         } else {
             RouteError::Stopped { turn }

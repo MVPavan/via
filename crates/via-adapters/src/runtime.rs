@@ -111,7 +111,7 @@ impl AdapterRuntime {
         prompt: String,
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
-        force: watch::Receiver<bool>,
+        force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
         capacity: via_routes::CapacityToken,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
@@ -293,8 +293,8 @@ impl AdapterRuntime {
 }
 
 /// Resolves once `force` is set; never when its sender is gone unset.
-async fn forced(force: &mut watch::Receiver<bool>) {
-    if force.wait_for(|force| *force).await.is_err() {
+async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    if force.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
 }
@@ -313,7 +313,7 @@ async fn deliver(
     message: RouteMessage,
     observations: &mpsc::Sender<FakeObservation>,
     deadline: Deadline,
-    force: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), ()> {
     for observation in normalize(message)? {
         let sent = tokio::select! {

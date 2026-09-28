@@ -441,8 +441,9 @@ impl Engine {
     }
 
     /// Wakes when a force stop is accepted or Store failure latches; daemon
-    /// main then starts final shutdown in the mode `stop_mode` reports.
-    pub fn force_signal(&self) -> watch::Receiver<bool> {
+    /// main then starts final shutdown in the mode `stop_mode` reports. The
+    /// value is the instant the force was raised, `None` until then.
+    pub fn force_signal(&self) -> watch::Receiver<Option<tokio::time::Instant>> {
         self.signal.force.subscribe()
     }
 }
@@ -460,11 +461,14 @@ pub(super) struct Signal {
     /// never cleared.
     pub(super) stop: StdMutex<Option<StopMode>>,
     /// Tells running drives to force-close their execution (C1 §3.14 `force`).
-    pub(super) force: watch::Sender<bool>,
-    /// When the force was first raised, for Host's early stop: its 3 s
-    /// bound runs from this instant, not from when its task wakes (design
-    /// §6.8). Raised only with `force`, by [`Signal::raise_force`].
-    pub(super) forced_at: watch::Sender<Option<tokio::time::Instant>>,
+    /// One watch carries both the fact and the instant: `Some(at)` is the
+    /// force, raised at `at`, and every reader derives "forced" from
+    /// presence. Route can therefore never read "unforced" after Host's
+    /// early stop has woken on the same force, which would let the vendor's
+    /// exit miss the force row (design §6.8). Host's 3 s early-stop bound
+    /// runs from `at`, not from when its task wakes. Written only by
+    /// [`Signal::raise_force`], first raise wins.
+    pub(super) force: watch::Sender<Option<tokio::time::Instant>>,
     /// When the force stop was accepted: every forced turn's `requested_at`.
     pub(super) force_requested_at: OnceLock<String>,
     /// Phase one of the latch: a failed or uncertain write, or corruption,
@@ -480,8 +484,7 @@ impl Signal {
     pub(super) fn new() -> Self {
         Self {
             stop: StdMutex::new(None),
-            force: watch::Sender::new(false),
-            forced_at: watch::Sender::new(None),
+            force: watch::Sender::new(None),
             force_requested_at: OnceLock::new(),
             failure_pending: AtomicBool::new(false),
             failures: StdMutex::new(FailureRecord::default()),
@@ -556,17 +559,49 @@ impl Signal {
         self.raise_force();
     }
 
-    /// Raises the force: records the instant for Host's early stop, first
-    /// raise wins (a force stop and the latch may both raise it), then wakes
-    /// the force watchers.
+    /// Raises the force in one publication that carries its instant: first
+    /// raise wins (a force stop and the latch may both raise it) and later
+    /// ones wake no one.
     pub(super) fn raise_force(&self) {
-        self.forced_at.send_if_modified(|at| {
+        self.force.send_if_modified(|at| {
             let first = at.is_none();
             if first {
                 *at = Some(tokio::time::Instant::now());
             }
             first
         });
-        self.force.send_replace(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Signal;
+
+    /// The force is one publication carrying its instant, so no observer can
+    /// see "forced" without the instant Host's early stop is bounded by
+    /// (T3 decision 5, round 2); the first raise wins and later ones wake no
+    /// one, so neither the latch after a force stop nor the reverse can move it.
+    #[tokio::test]
+    async fn the_first_raise_publishes_the_instant_and_later_raises_wake_no_one() {
+        let signal = Signal::new();
+        let mut watcher = signal.force.subscribe();
+        assert_eq!(*watcher.borrow_and_update(), None);
+
+        signal.raise_force();
+        watcher
+            .changed()
+            .await
+            .expect("the raise wakes the watcher");
+        let first = watcher
+            .borrow_and_update()
+            .expect("forced carries its instant");
+        assert!(first <= tokio::time::Instant::now());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        signal.raise_force();
+        assert!(!watcher.has_changed().expect("sender alive"));
+        assert_eq!(*watcher.borrow(), Some(first));
     }
 }

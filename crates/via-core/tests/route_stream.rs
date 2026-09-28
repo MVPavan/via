@@ -160,7 +160,7 @@ impl Child {
         let deadline = Deadline::at(tokio::time::Instant::now() + turn);
         let mut observed = Vec::new();
         // Never set: these turns are not force-stopped.
-        let (_force, force) = tokio::sync::watch::channel(false);
+        let (_force, force) = tokio::sync::watch::channel(None);
         let result = runtime.block_on(async {
             let execute = adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
@@ -442,7 +442,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
     // Never read: the adapter and then Route block on observation capacity.
     let (sender, _receiver) = mpsc::channel(1);
     let probe = sender.clone();
-    let (force_tx, force) = tokio::sync::watch::channel(false);
+    let (force_tx, force) = tokio::sync::watch::channel(None);
     let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
     let (result, elapsed) = child.runtime.block_on(async {
         let execute = child.adapter.execute(
@@ -482,7 +482,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
             "the observation channel must stay full"
         );
         let forced_at = tokio::time::Instant::now();
-        force_tx.send_replace(true);
+        force_tx.send_replace(Some(tokio::time::Instant::now()));
         let result = execute.await;
         (result, forced_at.elapsed())
     });
@@ -524,7 +524,7 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
     let child = Child::open_with_anchor(&root, anchor);
     let (sender, _receiver) = mpsc::channel(4);
     // Never set: this failure is the acquisition deadline, not a force.
-    let (_force, force) = tokio::sync::watch::channel(false);
+    let (_force, force) = tokio::sync::watch::channel(None);
     let result = child.runtime.block_on(async {
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
@@ -577,7 +577,7 @@ fn stalled_acquisition_with_force(
     .install(&anchor);
     let child = Child::open_with_anchor(&root, anchor);
     let (sender, _receiver) = mpsc::channel(4);
-    let (force_tx, force) = tokio::sync::watch::channel(false);
+    let (force_tx, force) = tokio::sync::watch::channel(None);
     let result = child.runtime.block_on(async {
         let deadline = tokio::time::Instant::now() + deadline;
         let execute = child.adapter.execute(
@@ -593,7 +593,7 @@ fn stalled_acquisition_with_force(
         );
         let (result, ()) = tokio::join!(execute, async {
             force_at(&root, deadline).await;
-            force_tx.send_replace(true);
+            force_tx.send_replace(Some(tokio::time::Instant::now()));
         });
         result
     });

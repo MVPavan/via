@@ -218,7 +218,7 @@ impl Engine {
     /// its runtime, before it serves; Host's shutdown retires the task when
     /// force never came.
     pub fn watch_force(&self) {
-        self.adapter.watch_force(self.signal.forced_at.subscribe());
+        self.adapter.watch_force(self.signal.force.subscribe());
     }
 
     /// When final shutdown's dispatcher join (pipeline step 3) gives up, so

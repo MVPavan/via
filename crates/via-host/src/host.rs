@@ -70,8 +70,19 @@ struct Ledger {
     /// their launch phase [r6.1]; an entry whose control was dropped is
     /// pruned lazily.
     live: HashMap<String, LiveControl>,
-    /// Sticky: the early stop's deadline, once the force signal came.
+    /// The daemon force watch, set by [`Host::watch_force`] before its task
+    /// is spawned. Ledger sections read it (a non-blocking `borrow`, no
+    /// await, no other lock) to derive `stopping`, so no phase decision
+    /// depends on when the early-stop task runs.
+    force: Option<watch::Receiver<Option<Instant>>>,
+    /// Sticky: the early stop's deadline (the force's instant plus 3 s),
+    /// once any ledger section saw the force. See [`Ledger::stopping`].
     stopping: Option<Instant>,
+    /// The controls that were `Armed` at the section that set `stopping`:
+    /// the early-stop task's snapshot, taken once by
+    /// [`Capacity::begin_stopping`]. Fixing it there keeps each entry with
+    /// exactly one owner of its stop, however late the task runs.
+    swept: Vec<LiveControl>,
     /// Advanced on every added holding: a held entry, or an uncertain
     /// settlement that leaves one for re-probe (design §8). Core's re-probe
     /// loop resets its backoff on it.
@@ -126,6 +137,30 @@ impl Ledger {
         )
     }
 
+    /// The sticky `stopping` deadline, set by the first ledger section that
+    /// finds the force raised, whoever it is: a registration, an ARM gate, a
+    /// `Spawned` marking or the early-stop task itself. The deadline is the
+    /// force's instant plus 3 s and never comes from the clock here, so a
+    /// delayed section gains no fresh budget (design §6.8). The section that
+    /// sets it also fixes `swept`, the `Armed` controls it leaves to the
+    /// early-stop task; an entry in any other phase is handled by its owner.
+    /// Callers that change an entry's phase call this first, so the entry is
+    /// never both `swept` and handled by its owner.
+    fn stopping(&mut self) -> Option<Instant> {
+        if self.stopping.is_none()
+            && let Some(at) = self.force.as_ref().and_then(|force| *force.borrow())
+        {
+            self.stopping = Some(at + EARLY_STOP);
+            self.swept = self
+                .live
+                .values()
+                .filter(|control| control.phase == LaunchPhase::Armed)
+                .cloned()
+                .collect();
+        }
+        self.stopping
+    }
+
     /// Whether an acquisition or a live control still owns the group.
     fn busy(&self, anchor_id: &str) -> bool {
         self.acquiring.contains(anchor_id)
@@ -168,45 +203,44 @@ impl Capacity {
     }
 
     /// Registers a verified control; returns the early stop's deadline when
-    /// it has already taken its snapshot, so the caller stops at once.
+    /// the force is already raised, so the caller stops at once. The force
+    /// is read in the same section, not left to the early-stop task: a task
+    /// that has not run yet cannot let a registration through.
     fn register(&self, anchor_id: &str, control: LiveControl) -> Option<Instant> {
         let mut ledger = self.lock();
         ledger
             .live
             .retain(|_, control| control.stream.strong_count() > 0);
+        let stopping = ledger.stopping();
         ledger.live.insert(anchor_id.to_owned(), control);
-        ledger.stopping
+        stopping
     }
 
-    /// Sets the sticky `stopping` flag to `deadline`, the force's instant
-    /// plus 3 s, and snapshots the armed live controls, atomically with
-    /// registration, the ARM gate and the armed mark (design §6.8 [r5.2,
-    /// r6.1]). The deadline is never taken from the clock here: a delayed
-    /// task must not gain a fresh budget.
-    fn begin_stopping(&self, deadline: Instant) -> (Instant, Vec<LiveControl>) {
+    /// Sets `stopping` if the force is raised and takes the early-stop
+    /// task's snapshot: the controls that were `Armed` when it was set, by
+    /// this section or an earlier one (design §6.8 [r5.2, r6.1]). Returns
+    /// `None` when the force is not raised, which the task's own wake rules
+    /// out.
+    fn begin_stopping(&self) -> Option<(Instant, Vec<LiveControl>)> {
         let mut ledger = self.lock();
-        let deadline = *ledger.stopping.get_or_insert(deadline);
-        let controls = ledger
-            .live
-            .values()
-            .filter(|control| {
-                control.phase == LaunchPhase::Armed && control.stream.strong_count() > 0
-            })
-            .cloned()
-            .collect();
-        (deadline, controls)
+        let deadline = ledger.stopping()?;
+        let mut controls = std::mem::take(&mut ledger.swept);
+        controls.retain(|control| control.stream.strong_count() > 0);
+        Some((deadline, controls))
     }
 
-    /// The early stop's deadline, once it set `stopping`.
+    /// The early stop's deadline once the force is raised, for the caller's
+    /// own stop check.
     fn stopping(&self) -> Option<Instant> {
-        self.lock().stopping
+        self.lock().stopping()
     }
 
     /// The ARM gate's ledger half: refused with the early stop's deadline
-    /// once `stopping` is set, else the entry is `Arming`.
+    /// once the force is raised, else the entry is `Arming`. The force is
+    /// read in this section, so a force raised before it always refuses ARM.
     fn begin_arming(&self, anchor_id: &str) -> Result<(), Instant> {
         let mut ledger = self.lock();
-        if let Some(deadline) = ledger.stopping {
+        if let Some(deadline) = ledger.stopping() {
             return Err(deadline);
         }
         if let Some(control) = ledger.live.get_mut(anchor_id) {
@@ -216,14 +250,17 @@ impl Capacity {
     }
 
     /// Marks the entry `Armed` once the vendor spawned; returns the early
-    /// stop's deadline when it already took its snapshot, so the owner
-    /// sends `Stop` itself.
+    /// stop's deadline when the force is already raised, in which case the
+    /// entry was not `Armed` when `stopping` was set and the owner sends
+    /// `Stop` itself. `stopping` is derived before the phase changes, so
+    /// this entry is never in the task's snapshot as well.
     fn armed(&self, anchor_id: &str) -> Option<Instant> {
         let mut ledger = self.lock();
+        let stopping = ledger.stopping();
         if let Some(control) = ledger.live.get_mut(anchor_id) {
             control.phase = LaunchPhase::Armed;
         }
-        ledger.stopping
+        stopping
     }
 
     /// Releases the anchor's capacity once its group is proved absent.
@@ -513,6 +550,22 @@ impl ControlConnection {
         self.reader
             .read(&self.stream)
             .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
+    }
+
+    /// Like [`Self::transact`], but only the wait for the reply ends at
+    /// `deadline`: the request is written first, whether or not the
+    /// deadline has passed, so a caller past its deadline still delivers it.
+    async fn transact_by(
+        &mut self,
+        request: &Request,
+        max: usize,
+        deadline: Instant,
+    ) -> io::Result<Reply> {
+        protocol::write_frame(&mut self.stream, request, max).await?;
+        timeout_at(deadline, self.reader.read(&self.stream))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline"))??
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
     }
 }
@@ -819,23 +872,32 @@ impl Host {
     /// in the control's stop facts; it polls no caller and commits nothing.
     /// The signal carries the instant Core raised the force (`None` until
     /// then), and that instant, not the one this task runs at, anchors the
-    /// bound and every stop after it. A control registered after the
-    /// snapshot is stopped at once. The task is Host-owned:
-    /// [`Host::shutdown`] retires it when force never came.
+    /// bound and every stop after it.
+    ///
+    /// The ledger holds the same signal, and its sections derive `stopping`
+    /// from it (registration, the ARM gate, the `Spawned` marking), so a
+    /// group is covered from the moment the force is raised, whether or not
+    /// this task has run. The task stops the entries that were `Armed` when
+    /// `stopping` was set; an owner stops an entry that became `Armed`
+    /// after. The task is Host-owned: [`Host::shutdown`] retires it when
+    /// force never came.
     pub fn watch_force(&self, mut forced: watch::Receiver<Option<Instant>>) {
         let ledger = self.capacity.clone();
+        ledger.lock().force = Some(forced.clone());
         let mut retire = self.retire.subscribe();
         let task = tokio::spawn(async move {
-            let forced_at = tokio::select! {
+            tokio::select! {
                 biased;
-                at = raised_at(&mut forced) => at,
+                () = force_raised(&mut forced) => {}
                 () = raised(&mut retire) => return Ok(()),
-            };
+            }
             // Test builds: the force woke this task, which has taken nothing
             // yet; a pause here delays the task as a blocked runtime would.
             #[cfg(feature = "test-failpoints")]
             let _ = via_store::failpoint::hit_async("host.early_stop.woken").await;
-            let (deadline, controls) = ledger.begin_stopping(forced_at + EARLY_STOP);
+            let Some((deadline, controls)) = ledger.begin_stopping() else {
+                return Ok(());
+            };
             // Test builds: the snapshot is taken and no Stop sent yet.
             #[cfg(feature = "test-failpoints")]
             let _ = via_store::failpoint::hit_async("host.early_stop.snapshot").await;
@@ -1940,42 +2002,39 @@ async fn raised(signal: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Resolves with the instant the force was raised; never when its sender is
-/// gone unraised.
-async fn raised_at(signal: &mut watch::Receiver<Option<Instant>>) -> Instant {
-    if let Ok(at) = signal.wait_for(Option::is_some).await
-        && let Some(at) = *at
-    {
-        return at;
+/// Resolves once the force is raised; never when its sender is gone
+/// unraised.
+async fn force_raised(signal: &mut watch::Receiver<Option<Instant>>) {
+    if signal.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
     }
-    std::future::pending().await
 }
 
-/// Sends `Stop` through a verified control, bounded by `deadline`; records
-/// and returns whether the anchor stopped a live vendor. `Stop` is
-/// idempotent and only shortens the anchor's deadline, so a second request
-/// through the same control owner changes nothing (runtime §5.1).
+/// Sends `Stop` through a verified control; records and returns whether the
+/// anchor stopped a live vendor. The one write is attempted whatever the
+/// clock says: a `deadline` already past (a task or owner that ran late)
+/// still gets its `Stop`, which the anchor honours at once, since it caps its
+/// grace at the time left. Only the wait for the reply is bounded by
+/// `deadline`, with no fresh allowance, so a late `Stop` whose reply is not
+/// in hand by then records no forced evidence. The lock and the write are
+/// not bounded by it: the control's other holders each run under their own
+/// deadline, and a `Stop` frame is far smaller than the socket buffer.
+/// `Stop` is idempotent and only shortens the anchor's deadline, so a second
+/// request through the same control owner changes nothing (runtime §5.1).
 async fn stop_through(
     control: &Mutex<ControlConnection>,
     generation: &str,
     stop: &StopFacts,
     deadline: Deadline,
 ) -> bool {
-    let reply = timeout_at(deadline.instant(), async {
-        control
-            .lock()
-            .await
-            .transact(
-                &Request::Stop {
-                    generation: generation.to_owned(),
-                    deadline_monotonic_ns: monotonic_deadline(deadline),
-                },
-                1024,
-            )
-            .await
-    })
-    .await;
-    let forced = matches!(reply, Ok(Ok(Reply::Stopping { stopped_live: true })));
+    let mut stream = control.lock().await;
+    let request = Request::Stop {
+        generation: generation.to_owned(),
+        deadline_monotonic_ns: monotonic_deadline(deadline),
+    };
+    let reply = stream.transact_by(&request, 1024, deadline.instant()).await;
+    drop(stream);
+    let forced = matches!(reply, Ok(Reply::Stopping { stopped_live: true }));
     if forced {
         stop.forced.store(true, Ordering::Release);
     }
@@ -2286,5 +2345,246 @@ mod tests {
         );
         drop(release);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A control over a socket pair, and the anchor's side of it.
+    fn control_pair() -> (Arc<Mutex<ControlConnection>>, UnixStream) {
+        let (ours, peer) = UnixStream::pair().expect("socket pair");
+        let control = Arc::new(Mutex::new(ControlConnection {
+            stream: ours,
+            reader: protocol::FrameReader::new(1024),
+        }));
+        (control, peer)
+    }
+
+    /// Whether the anchor's side received a `Stop` for `generation`.
+    async fn received_stop(peer: &mut UnixStream, generation: &str) -> bool {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                protocol::read_frame::<Request>(peer, 1024)
+            )
+            .await,
+            Ok(Ok(Some(Request::Stop { generation: sent, .. }))) if sent == generation
+        )
+    }
+
+    fn already_past() -> Deadline {
+        Deadline::at(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a second before now"),
+        )
+    }
+
+    /// Sol review of Task 3 round 2, decision D5-3: a task or owner that runs
+    /// after the recorded deadline still writes its one `Stop`, waits for no
+    /// reply, and so records no forced evidence. The anchor never replies
+    /// here, so the absence of evidence is not a race.
+    #[tokio::test]
+    async fn a_stop_past_its_deadline_is_written_and_records_no_evidence() {
+        let (control, mut peer) = control_pair();
+        let stop = StopFacts::default();
+        let forced = stop_through(&control, "g1", &stop, already_past()).await;
+        assert!(!forced);
+        assert!(!stop.forced.load(Ordering::Acquire));
+        assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
+    }
+
+    /// The same, when the control is busy at the deadline: a holder such as
+    /// the status poll or a concurrent close has the mutex, and the `Stop`
+    /// still goes out once it is free.
+    #[tokio::test]
+    async fn a_stop_past_its_deadline_waits_for_a_busy_control_and_is_written() {
+        let (control, mut peer) = control_pair();
+        let stop = Arc::new(StopFacts::default());
+        let busy = control.clone().lock_owned().await;
+        let stopping = tokio::spawn({
+            let (control, stop) = (control.clone(), stop.clone());
+            async move { stop_through(&control, "g1", &stop, already_past()).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        drop(busy);
+        assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
+        assert!(!stopping.await.expect("stop task"));
+        assert!(!stop.forced.load(Ordering::Acquire));
+    }
+
+    /// A reply inside the deadline still records the forced evidence.
+    #[tokio::test]
+    async fn a_stopped_live_reply_inside_the_deadline_records_forced_evidence() {
+        let (control, mut peer) = control_pair();
+        let stop = StopFacts::default();
+        let anchor = tokio::spawn(async move {
+            let sent = protocol::read_frame::<Request>(&mut peer, 1024).await;
+            assert!(matches!(sent, Ok(Some(Request::Stop { .. }))));
+            protocol::write_frame(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
+                .await
+                .expect("reply");
+            peer
+        });
+        let deadline = Deadline::at(Instant::now() + Duration::from_secs(5));
+        assert!(stop_through(&control, "g1", &stop, deadline).await);
+        assert!(stop.forced.load(Ordering::Acquire));
+        drop(anchor.await.expect("anchor side"));
+    }
+
+    /// A live control in `phase` over a socket pair; keep the returned
+    /// handles alive, the ledger holds the control weakly.
+    fn live_control(
+        generation: &str,
+    ) -> (LiveControl, (Arc<Mutex<ControlConnection>>, UnixStream)) {
+        let (control, peer) = control_pair();
+        let live = LiveControl {
+            stream: Arc::downgrade(&control),
+            generation: generation.to_owned(),
+            stop: Arc::new(StopFacts::default()),
+            phase: LaunchPhase::Verified,
+        };
+        (live, (control, peer))
+    }
+
+    /// A ledger wired to a force watch, as `Host::watch_force` wires it.
+    fn ledger_with_force() -> (Capacity, watch::Sender<Option<Instant>>) {
+        let (force, signal) = watch::channel(None);
+        let capacity = Capacity::default();
+        capacity.lock().force = Some(signal);
+        (capacity, force)
+    }
+
+    fn forced_long_ago() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("ten seconds before now")
+    }
+
+    /// Sol review of Task 3 round 2, decision D5-5: the deadline a ledger
+    /// section derives is exactly the force's instant plus 3 s, whenever the
+    /// section runs and whichever section it is; none reads the clock.
+    #[tokio::test]
+    async fn stopping_is_the_force_instant_plus_three_seconds_in_every_section() {
+        let (capacity, force) = ledger_with_force();
+        let (verified, _keep_first) = live_control("g1");
+        assert_eq!(capacity.register("a1", verified), None);
+        assert_eq!(capacity.stopping(), None);
+        let at = forced_long_ago();
+        force.send_replace(Some(at));
+        let expected = Some(at + EARLY_STOP);
+        assert_eq!(capacity.stopping(), expected);
+        let (late, _keep_second) = live_control("g2");
+        assert_eq!(capacity.register("a2", late), expected);
+        assert_eq!(capacity.begin_arming("a1"), Err(at + EARLY_STOP));
+        assert_eq!(capacity.armed("a1"), expected);
+        assert_eq!(
+            capacity.begin_stopping().map(|(deadline, _)| deadline),
+            expected
+        );
+    }
+
+    /// Decision D5-2: the ARM gate reads the force in its own ledger
+    /// section. No early-stop task has run, and the gate still refuses.
+    #[tokio::test]
+    async fn the_arm_gate_refuses_once_the_force_is_raised_though_no_task_ran() {
+        let (capacity, force) = ledger_with_force();
+        let (control, _keep) = live_control("g1");
+        assert_eq!(capacity.register("a1", control), None);
+        force.send_replace(Some(Instant::now()));
+        assert!(capacity.begin_arming("a1").is_err());
+        let phase = capacity.lock().live["a1"].phase;
+        assert_eq!(phase, LaunchPhase::Verified, "the refused entry advanced");
+    }
+
+    /// Before the force is raised the gate passes and marks the entry.
+    #[tokio::test]
+    async fn the_arm_gate_passes_before_the_force() {
+        let (capacity, _force) = ledger_with_force();
+        let (control, _keep) = live_control("g1");
+        assert_eq!(capacity.register("a1", control), None);
+        assert_eq!(capacity.begin_arming("a1"), Ok(()));
+        assert_eq!(capacity.armed("a1"), None);
+        assert_eq!(capacity.lock().live["a1"].phase, LaunchPhase::Armed);
+    }
+
+    /// The control connections and their anchor-side ends, kept open by the
+    /// test so the entries stay live.
+    type Kept = Vec<(Arc<Mutex<ControlConnection>>, UnixStream)>;
+
+    /// The registered entries of one ledger in each phase: `g_verified`
+    /// before the gate, `g_arming` past it, `g_armed` after `Spawned`.
+    fn one_entry_per_phase() -> (Capacity, watch::Sender<Option<Instant>>, Kept) {
+        let (capacity, force) = ledger_with_force();
+        let mut keep = Vec::new();
+        for (anchor, phase) in [("a_v", 0), ("a_r", 1), ("a_a", 2)] {
+            let (control, handles) = live_control(&format!("g_{anchor}"));
+            assert_eq!(capacity.register(anchor, control), None);
+            keep.push(handles);
+            if phase >= 1 {
+                assert_eq!(capacity.begin_arming(anchor), Ok(()));
+            }
+            if phase >= 2 {
+                assert_eq!(capacity.armed(anchor), None);
+            }
+        }
+        (capacity, force, keep)
+    }
+
+    fn generations(controls: &[LiveControl]) -> Vec<&str> {
+        controls
+            .iter()
+            .map(|control| control.generation.as_str())
+            .collect()
+    }
+
+    /// Design §6.8 [r5.2, r6.1], exactly one of three covers each entry,
+    /// when the first section to see the force is the owner's `armed`
+    /// marking rather than the task: the `Armed` entry is the task's, the
+    /// `Arming` entry, marked `Armed` in the section that set `stopping`, is
+    /// its owner's and is not also in the snapshot, and the `Verified`
+    /// entry meets the gate refusal.
+    #[tokio::test]
+    async fn an_owner_that_sets_stopping_keeps_its_entry_out_of_the_snapshot() {
+        let (capacity, force, _keep) = one_entry_per_phase();
+        let at = Instant::now();
+        force.send_replace(Some(at));
+        assert_eq!(capacity.armed("a_r"), Some(at + EARLY_STOP));
+        assert!(capacity.begin_arming("a_v").is_err());
+        let (deadline, snapshot) = capacity.begin_stopping().expect("force is raised");
+        assert_eq!(deadline, at + EARLY_STOP);
+        assert_eq!(generations(&snapshot), ["g_a_a"]);
+        assert!(
+            capacity
+                .begin_stopping()
+                .is_some_and(|(_, again)| again.is_empty())
+        );
+    }
+
+    /// The same, when the task is first: the snapshot is the `Armed`
+    /// entry, and each entry that was not `Armed` finds `stopping` set at its
+    /// own next section, whatever the task does after.
+    #[tokio::test]
+    async fn a_task_that_sets_stopping_leaves_the_other_entries_to_their_owners() {
+        let (capacity, force, _keep) = one_entry_per_phase();
+        let at = Instant::now();
+        force.send_replace(Some(at));
+        let (deadline, snapshot) = capacity.begin_stopping().expect("force is raised");
+        assert_eq!(deadline, at + EARLY_STOP);
+        assert_eq!(generations(&snapshot), ["g_a_a"]);
+        assert_eq!(capacity.armed("a_r"), Some(at + EARLY_STOP));
+        assert!(capacity.begin_arming("a_v").is_err());
+        let (late, _keep_late) = live_control("g_late");
+        assert_eq!(capacity.register("a_late", late), Some(at + EARLY_STOP));
+    }
+
+    /// A ledger no force watch is wired to never derives `stopping`.
+    #[tokio::test]
+    async fn a_ledger_without_a_force_watch_never_stops() {
+        let capacity = Capacity::default();
+        let (control, _keep) = live_control("g1");
+        assert_eq!(capacity.register("a1", control), None);
+        assert_eq!(capacity.begin_arming("a1"), Ok(()));
+        assert_eq!(capacity.armed("a1"), None);
+        assert!(capacity.begin_stopping().is_none());
     }
 }

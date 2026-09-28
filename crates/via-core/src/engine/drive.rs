@@ -207,7 +207,7 @@ impl Engine {
         let mut streak = ReadStreak::new();
         let mut refused = false;
         loop {
-            if *force.borrow() {
+            if force.borrow().is_some() {
                 self.force_exit(&slot, &session).await;
                 return Ok(());
             }
@@ -295,10 +295,14 @@ impl Engine {
     }
 
     /// Waits for a wake, a force stop or the read-retry timer.
-    async fn await_wake(slot: &Slot, force: &mut watch::Receiver<bool>, delay: Duration) {
+    async fn await_wake(
+        slot: &Slot,
+        force: &mut watch::Receiver<Option<tokio::time::Instant>>,
+        delay: Duration,
+    ) {
         tokio::select! {
             () = slot.woken() => {}
-            _ = force.wait_for(|forced| *forced) => {}
+            _ = force.wait_for(Option::is_some) => {}
             () = tokio::time::sleep(delay) => {}
         }
     }
@@ -429,7 +433,7 @@ impl Engine {
         loop {
             tokio::select! {
                 biased;
-                _ = force.wait_for(|forced| *forced) => return None,
+                _ = force.wait_for(Option::is_some) => return None,
                 permit = &mut acquire => {
                     return permit.ok().filter(|_| slot.waiting_head(turn));
                 }
