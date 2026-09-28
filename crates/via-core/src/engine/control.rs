@@ -80,17 +80,7 @@ impl Engine {
                         Some(Ack::Requested(requested_at)) => {
                             acknowledged = true;
                             if !params.wait {
-                                return Ok(json!({
-                                    "turn": address,
-                                    "state": "running",
-                                    "already_terminal": false,
-                                    "cancel": {
-                                        "outcome": "requested",
-                                        "cleanup": "pending",
-                                        "requested_at": requested_at,
-                                        "settled_at": null,
-                                    },
-                                }));
+                                return Ok(requested(&address, &requested_at));
                             }
                             while ack.changed().await.is_ok() {}
                         }
@@ -196,6 +186,22 @@ fn queued_failure(outcome: Option<QueuedOutcome>) -> Result<(), ApiError> {
         Some(QueuedOutcome::NotCommitted) => Err(ApiError::RECEIPT_NOT_COMMITTED),
         Some(QueuedOutcome::Uncertain) => Err(ApiError::RECEIPT_UNKNOWN),
     }
+}
+
+/// The C1 §3.5 result for a running turn whose order was acknowledged
+/// (A8): `requested`, cleanup `pending`.
+fn requested(address: &str, requested_at: &str) -> Value {
+    json!({
+        "turn": address,
+        "state": "running",
+        "already_terminal": false,
+        "cancel": {
+            "outcome": "requested",
+            "cleanup": "pending",
+            "requested_at": requested_at,
+            "settled_at": null,
+        },
+    })
 }
 
 /// The C1 §3.5 result from a committed envelope.
