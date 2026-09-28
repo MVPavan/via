@@ -779,17 +779,23 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     let (wall_start, monotonic_start) = (SystemTime::now(), Instant::now());
     let (session, _) = sandbox.spawn("idle", &["--idle-ms", "2000", "--wall-ms", "20000"])?;
     sandbox.await_file("noise1.entered")?;
+    // The fake entered its first gate after emitting `accepted`: the idle
+    // clock started no later than this.
+    let accepted_seen = Instant::now();
     // Elapsed time only: noise lands inside the idle window.
     thread::sleep(Duration::from_millis(800));
     sandbox.release("noise1")?;
     sandbox.await_file("noise2.entered")?;
     thread::sleep(Duration::from_millis(600));
     sandbox.release("noise2")?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    // A monotonic observation of the idle order itself.
+    sandbox.wait_for_event(&session, "cancel.requested")?;
+    let ordered_seen = accepted_seen.elapsed();
     let monotonic = monotonic_start.elapsed();
     let wall = SystemTime::now()
         .duration_since(wall_start)
         .unwrap_or_default();
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
     check(
         envelope["state"] == "failed"
             && envelope["failure"]["class"] == "deadline_idle"
@@ -808,18 +814,21 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     };
     let idle_after = epoch_ms(&at("cancel.requested")?)? - epoch_ms(&at("turn.started")?)?;
     // A wall-clock step (seen under WSL2 load) moves the durable timestamps
-    // but not the monotonic clock: the interval is then bounded from the
-    // harness's monotonic spawn-to-terminal time instead.
+    // but not the monotonic clock: the idle order is then bounded by the
+    // harness's monotonic observation of `cancel.requested`, from the
+    // fake's first gate (after acceptance) to the event's first read
+    // (10 ms polling) [s2-r1.2].
     let stepped = wall.abs_diff(monotonic) > Duration::from_millis(250);
     let timely = if stepped {
-        (Duration::from_millis(1950)..Duration::from_millis(4000)).contains(&monotonic)
+        (Duration::from_millis(1900)..Duration::from_millis(3000)).contains(&ordered_seen)
     } else {
         (1950..2800).contains(&idle_after)
     };
     check(timely, || {
         format!(
-            "the idle stop came {idle_after} ms after acceptance (harness elapsed: \
-             wall {wall:?}, monotonic {monotonic:?}; events {events:?})"
+            "the idle stop came {idle_after} ms after acceptance (harness: order seen \
+             {ordered_seen:?} after acceptance; elapsed wall {wall:?}, monotonic \
+             {monotonic:?}; events {events:?})"
         )
     })?;
     check(
