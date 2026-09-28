@@ -11,6 +11,7 @@ orchestrator dispatches implementation slices on disjoint files.
 | Task | Scope | Model | Brief |
 |---|---|---|---|
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
+| T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
 
 ## Carried into Task 3
 
@@ -55,3 +56,7 @@ Round 2 on `f145ff2`: `astra-review-design-r2.md` (UNSOUND) and
 `fable-review-design-r2.md` (SOUND WITH CHANGES); decisions in
 `design-r3-decisions.md`. S0 (moves only, `s0.md`) starts in parallel with
 design round 3.
+
+Round 3 on `4531dd0`: `astra-review-design-r3.md` (UNSOUND, no blocker)
+and `fable-review-design-r3.md` (SOUND WITH CHANGES); decisions in
+`design-r4-decisions.md`.
