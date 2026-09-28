@@ -80,8 +80,12 @@ the historical checkpoint; its findings table is updated by this section.
   ([t3/owner-decisions.md](t3/owner-decisions.md)): Store failures scoped
   when the outcome is known, latch only on unknown outcome (amends runtime
   §7); drain keeps sessions resumable; force closes only sessions with
-  unfinished work. Round 2 (F12 design under those decisions) is with the
-  worker; then Astra medium and Fable high re-review, then slices S0–S4. Then Task 4 (`.7.8`), final critique
+  unfinished work. Design rounds 2–4 reviewed by Astra medium and Fable
+  high, decisions in `t3/design-r{3,4}-decisions.md`; design at `1a814d6`
+  (round 4), narrow round-4 re-review running. S0 (file split) merged at
+  `08fffce`. S1 (Store/Host/Wire/Route primitives, [t3/s1.md](t3/s1.md))
+  running in Opus 5.5 high `session_01YVUZbU8b2HpcRwvyHqKvSB`. Then S2
+  (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique
   (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
   `scratchpad/cloud/watch-branches.sh`).
