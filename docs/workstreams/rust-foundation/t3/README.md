@@ -66,3 +66,9 @@ Round 4 on `1a814d6`: `astra-review-design-r4.md` (UNSOUND, no blocker)
 and `fable-review-design-r4.md` (SOUND WITH CHANGES, one blocker in S1's
 early-stop lifetime); decisions in `design-r5-decisions.md`, with 1–7 sent
 to S1 directly.
+
+Round 5 on `bf27db6` (final narrow pass): `astra-review-design-r5.md` and
+`fable-review-design-r5.md`, both SOUND WITH CHANGES with no blocker;
+final decisions in `design-r6-decisions.md` (1–5 sent to S1 directly).
+The design is final after round 6; later findings go to slice code
+reviews.
