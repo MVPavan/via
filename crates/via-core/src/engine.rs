@@ -19,6 +19,8 @@ use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
 use via_store::{Store, StoreClient};
 
+mod close;
+mod control;
 mod drive;
 mod journal;
 mod latch;
@@ -97,6 +99,10 @@ pub struct Engine {
     slots: Arc<tokio::sync::Semaphore>,
     /// Slots held for groups an earlier daemon left unproven (design §11).
     recovered: slots::RecoveredSlots,
+    /// Sessions durably `closing`, or treated so after an uncertain
+    /// `Closing` (design §4 step 7, §6.6 [r3.5]); a confirmed `Closed`
+    /// removes one. Changed only under `admission`.
+    closing: StdMutex<HashSet<SessionId>>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -133,6 +139,12 @@ struct Faults {
     hold_after_close_check: AtomicBool,
     /// A granted turn waits for `release` before its submission commit.
     hold_after_grant: AtomicBool,
+    /// The next close caller waits for `release` before it subscribes to
+    /// the close watch, holding `admission`.
+    hold_before_subscribe: AtomicBool,
+    /// The next close pass waits for `release` after its absence check,
+    /// before it takes `admission` for `Closed`.
+    hold_before_closed: AtomicBool,
     granted: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -149,6 +161,9 @@ struct ForcedTurn {
     /// Route's own Host close: its stop found the vendor live, and whether it
     /// proved group absence; recovery can add to these, never retract them.
     close: RouteClose,
+    /// The turn's stop order's cause, if any: an idle order ends the forced
+    /// turn `failed(deadline_idle)` (design §2).
+    cause: Option<via_adapters::StopCause>,
 }
 
 /// Evidence from Route's verified Host close of a forced turn.
@@ -251,6 +266,7 @@ impl Engine {
             pending_starts: StdMutex::new(HashSet::new()),
             slots: connection_slots(),
             recovered: slots::RecoveredSlots::default(),
+            closing: StdMutex::new(HashSet::new()),
             #[cfg(test)]
             faults: Faults::default(),
         })
@@ -328,6 +344,18 @@ impl Engine {
     /// Returns the number of receipted turns not yet settled.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// Sessions in the durable closing set (design §6.6 `sessions.closing`):
+    /// each counts as active work for a plain stop and idle exit.
+    pub fn closing_sessions(&self) -> usize {
+        lock(&self.closing).len()
+    }
+
+    /// Groups whose cleanup a live control or acquisition still owns
+    /// (design §6.4): Host's owned pending cleanup, which blocks idle exit.
+    pub fn pending_cleanup(&self) -> usize {
+        self.adapter.pending_cleanup()
     }
 
     /// The session's dispatch slot, created when it has none. Whether a new

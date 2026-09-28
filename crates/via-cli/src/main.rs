@@ -21,6 +21,8 @@ enum Command {
     Spawn(SpawnArgs),
     Resume(ResumeArgs),
     Steer(SteerArgs),
+    Cancel(CancelArgs),
+    Close(CloseArgs),
     Result(ReadArgs),
     Wait(WaitArgs),
     Events(ReadArgs),
@@ -166,6 +168,44 @@ struct SteerArgs {
 }
 
 #[derive(Args)]
+struct CancelArgs {
+    session: String,
+    #[arg(long)]
+    turn: Option<u32>,
+    #[arg(long = "force-after")]
+    force_after: Option<u64>,
+    #[arg(long)]
+    wait: bool,
+    #[arg(long)]
+    handle: Option<String>,
+    #[arg(long)]
+    handle_file: Option<PathBuf>,
+    #[arg(long)]
+    handle_stdin: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct CloseArgs {
+    session: String,
+    #[arg(long, value_parser = ["graceful", "force"])]
+    mode: Option<String>,
+    #[arg(long)]
+    deadline_ms: Option<u64>,
+    #[arg(long)]
+    op_key: Option<String>,
+    #[arg(long)]
+    handle: Option<String>,
+    #[arg(long)]
+    handle_file: Option<PathBuf>,
+    #[arg(long)]
+    handle_stdin: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct ReadArgs {
     address: String,
     #[arg(long)]
@@ -298,6 +338,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 true,
             )
         }
+        Command::Cancel(args) => cancel(&args),
+        Command::Close(args) => close(args),
         Command::Result(args) => {
             client::call("result", &json!({"address":args.address}), true, true)
         }
@@ -318,6 +360,61 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Logs(args) => client::call("logs", &json!({"session":args.address}), true, true),
     }
 }
+
+/// `via cancel` (C1 §3.5).
+fn cancel(args: &CancelArgs) -> anyhow::Result<i32> {
+    let handle = client::read_handle(
+        args.handle_file.as_deref(),
+        args.handle_stdin,
+        args.handle.as_deref(),
+        false,
+    )?;
+    let mut params = json!({"session":args.session,"handle":handle});
+    if let Some(turn) = args.turn {
+        params["turn"] = Value::from(turn);
+    }
+    if let Some(force_after) = args.force_after {
+        params["force_after_ms"] = Value::from(force_after);
+    }
+    // With `--wait` the reply comes once the turn is terminal, which
+    // its own deadlines bound.
+    let read = if args.wait {
+        params["wait"] = Value::Bool(true);
+        CANCEL_WAIT_READ
+    } else {
+        Duration::from_secs(30)
+    };
+    client::call_within("cancel", &params, true, true, read)
+}
+
+/// `via close` (C1 §3.6).
+fn close(args: CloseArgs) -> anyhow::Result<i32> {
+    let handle = client::read_handle(
+        args.handle_file.as_deref(),
+        args.handle_stdin,
+        args.handle.as_deref(),
+        false,
+    )?;
+    let mut params = json!({"session":args.session,"handle":handle});
+    if let Some(mode) = args.mode {
+        params["mode"] = Value::String(mode);
+    }
+    let mut read = Duration::from_millis(via_core::DEFAULT_CLOSE_DEADLINE_MS);
+    if let Some(deadline) = args.deadline_ms {
+        params["deadline_ms"] = Value::from(deadline);
+        read = Duration::from_millis(deadline);
+    }
+    if let Some(key) = args.op_key {
+        params["op_key"] = Value::String(key);
+    }
+    // The close replies once settled, within its deadline plus the
+    // time a running turn's terminal takes.
+    let read = read.saturating_add(Duration::from_secs(30));
+    client::call_within("close", &params, true, true, read)
+}
+
+/// Read bound of `cancel --wait`, whose reply waits for the turn's terminal.
+const CANCEL_WAIT_READ: Duration = Duration::from_hours(24);
 
 fn write_json(mut output: impl io::Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut output, value)?;

@@ -35,6 +35,10 @@ pub(super) enum FailureSite {
     QueuedCancel,
     /// The force closure pass's standalone `session.closed` (row 14).
     SessionClosed,
+    /// A close's `Closing` commit (row 10).
+    Closing,
+    /// A close's `Closed` commit (row 11).
+    Closed,
 }
 
 /// A failed write's durable outcome (design §7.1).

@@ -88,8 +88,8 @@ pub struct ResumeParams {
 struct DeadlineParams {
     #[serde(default)]
     wall_ms: Option<u64>,
-    #[serde(default, deserialize_with = "present")]
-    idle_ms: Option<Value>,
+    #[serde(default)]
+    idle_ms: Option<u64>,
 }
 
 /// Keeps an explicit `null` distinct from an omitted member: `Some(Null)`.
@@ -126,6 +126,7 @@ pub(crate) struct PerTurn<'a> {
 /// What a turn sets for itself on the fake route; anything else inherits.
 pub(crate) struct Overrides {
     wall_ms: Option<u64>,
+    idle_ms: Option<u64>,
 }
 
 impl SpawnParams {
@@ -272,7 +273,12 @@ impl PerTurn<'_> {
             ));
         }
         let deadlines = match self.deadlines {
-            None => return Ok(Overrides { wall_ms: None }),
+            None => {
+                return Ok(Overrides {
+                    wall_ms: None,
+                    idle_ms: None,
+                });
+            }
             Some(Nullable::Null) => {
                 return Err(ApiError::naming(
                     ApiError::INVALID_PARAMS,
@@ -282,12 +288,12 @@ impl PerTurn<'_> {
             }
             Some(Nullable::Given(deadlines)) => deadlines,
         };
-        // Core enforces no idle deadline yet (via-jm4.7.7).
-        if given(deadlines.idle_ms.as_ref()) {
+        // Design §5: an idle deadline of 0 would stop every turn at once.
+        if deadlines.idle_ms == Some(0) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
-                &const { Named::fake("deadlines.idle_ms") },
-                "deadlines.idle_ms is not enforced on route fake",
+                &const { Named::field("deadlines.idle_ms") },
+                "deadlines.idle_ms must be at least 1",
             ));
         }
         if deadlines.wall_ms == Some(0) {
@@ -299,6 +305,7 @@ impl PerTurn<'_> {
         }
         Ok(Overrides {
             wall_ms: deadlines.wall_ms,
+            idle_ms: deadlines.idle_ms,
         })
     }
 }
@@ -316,6 +323,62 @@ pub struct WaitParams {
 
 /// `wait` bound when the caller gives no `timeout_ms`.
 pub const DEFAULT_WAIT_MS: u64 = 30_000;
+
+/// Strict C1 §3.5 `cancel` parameters (design §3).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelParams {
+    /// Session whose turn is cancelled.
+    pub session: SessionId,
+    /// Caller-owned bearer handle.
+    pub handle: String,
+    /// One-based turn; omitted, the running turn, else the latest one.
+    #[serde(default)]
+    pub turn: Option<u32>,
+    /// Grace before a running turn is force-closed;
+    /// [`DEFAULT_FORCE_AFTER_MS`] when absent.
+    #[serde(default)]
+    pub force_after_ms: Option<u64>,
+    /// Reply only once the turn is terminal.
+    #[serde(default)]
+    pub wait: bool,
+}
+
+/// `cancel` grace when the caller gives no `force_after_ms` (C1 §3.5).
+pub const DEFAULT_FORCE_AFTER_MS: u64 = 10_000;
+
+/// C1 §3.6 `close` mode.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseMode {
+    /// Running work gets until shortly before the deadline to stop.
+    #[default]
+    Graceful,
+    /// Running work is force-closed at once.
+    Force,
+}
+
+/// Strict C1 §3.6 `close` parameters (design §4).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseParams {
+    /// Session to close.
+    pub session: SessionId,
+    /// Caller-owned bearer handle.
+    pub handle: String,
+    /// Graceful by default.
+    #[serde(default)]
+    pub mode: CloseMode,
+    /// Close deadline from acceptance; [`DEFAULT_CLOSE_DEADLINE_MS`] when absent.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    /// C1 §3 retry key: the same key and params replay the close result.
+    #[serde(default)]
+    pub op_key: Option<String>,
+}
+
+/// `close` deadline when the caller gives no `deadline_ms` (design §4).
+pub const DEFAULT_CLOSE_DEADLINE_MS: u64 = 10_000;
 
 /// Strict C1 steer parameters; fake must refuse after authentication.
 #[derive(Deserialize)]
@@ -656,6 +719,17 @@ impl ApiError {
         commit_outcome: None,
         named: None,
     };
+    /// Store refused `Closed` twice while a turn of the closing session was
+    /// still queued or running (design §4 dispatcher step 6).
+    pub const CLOSE_REFUSED: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "the session still has unfinished turns",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+    };
     /// A retry key was reused with another handle or other params (C1 P4).
     pub const IDEMPOTENCY_CONFLICT: Self = Self {
         code: -32602,
@@ -808,6 +882,8 @@ pub(crate) const FAKE_ROUTE: &str = "fake";
 /// default is 3 600 000 ms; the fake route keeps 30 s so a hung fake turn in
 /// a test that sets nothing ends in bounded time.
 pub(crate) const FAKE_WALL_MS: u64 = 30_000;
+/// C1 §4 `deadlines.idle_ms` default (design §5).
+pub(crate) const DEFAULT_IDLE_MS: u64 = 600_000;
 
 /// One `support` entry of the C1 §4.1 capabilities DTO.
 #[derive(Clone, Copy, Serialize)]
@@ -860,8 +936,8 @@ impl Capabilities {
                 spawn: Support::Native,
                 resume: Support::Native,
                 steer: unsupported("the fake route has no steer input"),
-                cancel: unsupported("cancel is not implemented in S1"),
-                close: unsupported("close is not implemented in S1"),
+                cancel: Support::Native,
+                close: Support::Native,
             },
             params: ParamSupport {
                 instructions: unsupported("the fake route has no instructions input"),
@@ -883,8 +959,8 @@ impl Capabilities {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub(crate) struct Deadlines {
     wall_ms: u64,
-    /// No idle deadline is enforced on the fake route.
-    idle_ms: Option<u64>,
+    /// Longest time without meaningful progress (design §5).
+    idle_ms: u64,
 }
 
 /// Values frozen at acceptance (§3.2 `effective`, `turn.started` payload),
@@ -907,7 +983,7 @@ impl Effective {
             bound: None,
             deadlines: Deadlines {
                 wall_ms: overrides.wall_ms.unwrap_or(FAKE_WALL_MS),
-                idle_ms: None,
+                idle_ms: overrides.idle_ms.unwrap_or(DEFAULT_IDLE_MS),
             },
             max_steps: None,
         }
@@ -920,12 +996,20 @@ impl Effective {
         if let Some(wall_ms) = overrides.wall_ms {
             effective.deadlines.wall_ms = wall_ms;
         }
+        if let Some(idle_ms) = overrides.idle_ms {
+            effective.deadlines.idle_ms = idle_ms;
+        }
         effective
     }
 
     /// The turn's Core-owned wall deadline budget.
     pub(crate) fn wall(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.deadlines.wall_ms)
+    }
+
+    /// The turn's Core-owned idle deadline budget (design §5).
+    pub(crate) fn idle(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.deadlines.idle_ms)
     }
 }
 
@@ -1032,6 +1116,8 @@ pub(crate) struct Bound {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureClass {
     DeadlineWall,
+    /// C1 §8.2: no meaningful progress within `idle_ms` (design §5).
+    DeadlineIdle,
     SubmitFailed,
     VendorError,
     ProcessExited,

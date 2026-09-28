@@ -69,6 +69,14 @@ POINTS = [
     "host.anchor.arm_received",
     "host.early_stop.snapshot",
     "host.early_stop.sent",
+    # Task 3 S2 (design §10): turn-control seams.
+    "core.dispatch.awaiting_slot",
+    "core.wait.registered",
+    "core.submit.before_commit",
+    "core.run.settling",
+    "core.run.before_handoff",
+    "core.close.before_subscribe",
+    "core.cancel.settling",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 MARKERS = [*ACTIVATION, *POINTS, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]

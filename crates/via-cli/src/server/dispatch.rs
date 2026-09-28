@@ -12,8 +12,8 @@ use tokio::{
     time::timeout,
 };
 use via_core::{
-    ApiError, DaemonStatusParams, DaemonStopParams, Engine, HelloParams, ReadParams, Receipted,
-    ResumeParams, SessionReadParams, SpawnParams, SteerParams, WaitParams,
+    ApiError, CancelParams, CloseParams, DaemonStatusParams, DaemonStopParams, Engine, HelloParams,
+    ReadParams, Receipted, ResumeParams, SessionReadParams, SpawnParams, SteerParams, WaitParams,
 };
 
 use super::Client;
@@ -165,6 +165,12 @@ async fn dispatch(
             Ok(receipt)
         }
         "steer" => Ok(engine.steer(typed::<SteerParams>(params)?).await?),
+        "cancel" => Ok(engine.cancel(typed::<CancelParams>(params)?).await?),
+        "close" => {
+            // A keyed close's retry identity is the params' exact bytes.
+            let raw = raw_params(line)?;
+            Ok(engine.close(typed::<CloseParams>(params)?, raw).await?)
+        }
         "result" => Ok(engine.result(&typed::<ReadParams>(params)?.address).await?),
         "wait" => Ok(engine.wait(typed::<WaitParams>(params)?).await?),
         "events" => Ok(engine

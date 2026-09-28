@@ -76,6 +76,14 @@ impl TurnJournal for FaultJournal {
         TurnJournal::commit_terminal(&self.store, record, closed).await
     }
 
+    async fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: via_store::TerminalExtras,
+    ) -> Result<(), StoreError> {
+        self.store.commit_terminal_with(record, extras).await
+    }
+
     async fn events(
         &self,
         session: &SessionId,

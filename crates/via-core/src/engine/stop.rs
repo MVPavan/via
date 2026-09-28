@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use via_adapters::Cleanup;
+use via_adapters::{Cleanup, StopCause};
 
 use std::sync::Arc;
 
@@ -211,6 +211,14 @@ impl Engine {
                 if turn.raw_incomplete {
                     // `raw_log.incomplete` committed when the drive ended.
                     terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
+                }
+                if turn.cause == Some(StopCause::IdleDeadline) {
+                    // Design §2: force took over an idle stop.
+                    terminal.fail(
+                        FailureClass::DeadlineIdle,
+                        "no progress within the idle deadline",
+                    );
+                    terminal.stop_reason = "deadline";
                 }
                 if record.first_failure.is_some() {
                     // C1 §8.2: the durable stream already lost an event; a

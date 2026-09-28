@@ -16,7 +16,8 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalRecord,
+    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord,
+    TerminalExtras, TerminalRecord,
 };
 
 use super::latch::{FailureSite, WriteOutcome};
@@ -46,6 +47,13 @@ pub(super) trait TurnJournal: Sync {
         record: TerminalRecord,
         closed: Option<Value>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Commits the terminal with the facts of its own transaction, such as
+    /// a cancellation's `cancel_cause` (design §4, §10).
+    fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: TerminalExtras,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Reads a bounded page of durable events from `from_seq`.
     fn events(
         &self,
@@ -95,6 +103,14 @@ impl TurnJournal for StoreClient {
             Some(closed) => Self::commit_closing_terminal(self, record, closed).await,
             None => Self::commit_terminal(self, record).await.map(|()| false),
         }
+    }
+
+    async fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: TerminalExtras,
+    ) -> Result<(), StoreError> {
+        Self::commit_terminal_with(self, record, extras).await
     }
 
     async fn events(
@@ -452,8 +468,29 @@ pub(super) async fn commit_terminal(
     record: TerminalRecord,
     closed: Option<Value>,
 ) -> Result<Durable, ApiError> {
+    commit_terminal_with(journal, record, closed, TerminalExtras::default()).await
+}
+
+/// [`commit_terminal`] with the terminal's `extras` (design §4, §10). A
+/// cancellation's cause never rides with a force closure: the two are
+/// refused together, writing nothing.
+pub(super) async fn commit_terminal_with(
+    journal: &impl TurnJournal,
+    record: TerminalRecord,
+    closed: Option<Value>,
+    extras: TerminalExtras,
+) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
-    match journal.commit_terminal(record, closed).await {
+    let plain = extras.cancel_cause.is_none() && extras.raw_incomplete.is_none();
+    let committed = match (closed, plain) {
+        (closed, true) => journal.commit_terminal(record, closed).await,
+        (None, false) => journal
+            .commit_terminal_with(record, extras)
+            .await
+            .map(|()| false),
+        (Some(_), false) => return Err(ApiError::RECEIPT_NOT_COMMITTED),
+    };
+    match committed {
         Ok(closed) => Ok(Durable {
             uncertain: false,
             closed,
