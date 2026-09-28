@@ -120,17 +120,18 @@ impl Engine {
     }
 
     /// Design §7.2 row 12 [O1.D10]: reports a pass's absence proofs whose
-    /// commit failed to the failure hook. One that did not commit is scoped:
-    /// its token stays held and the next pass retries it. One whose commit
-    /// may have committed latches. A pass that failed otherwise keeps every
-    /// token and reports nothing. A not-committed proof is recorded against
-    /// its owner session; `scope` covers an uncertain pass, which has no
-    /// owner. The caller holds no lock.
+    /// commit failed to the failure hook, and returns the worst outcome
+    /// reported. One that did not commit is scoped: its token stays held and
+    /// the next pass retries it. One whose commit may have committed
+    /// latches. A pass that failed otherwise keeps every token and reports
+    /// nothing. A not-committed proof is recorded against its owner session;
+    /// `scope` covers an uncertain pass, which has no owner. The caller
+    /// holds no lock.
     pub(super) async fn proof_failures(
         &self,
         pass: &Result<ReprobeReport, AdapterError>,
         scope: FailureScope<'_>,
-    ) {
+    ) -> Option<WriteOutcome> {
         match pass {
             Ok(report) => {
                 for owner in &report.not_committed {
@@ -139,6 +140,7 @@ impl Engine {
                         .finish()
                         .await;
                 }
+                (!report.not_committed.is_empty()).then_some(WriteOutcome::NotCommitted)
             }
             Err(error) => self.proof_error(error, scope).await,
         }
@@ -147,14 +149,20 @@ impl Engine {
     /// Design §7.2 row 12 [O1.D10]: reports the error of a re-probe pass or
     /// of a resumed-paging page to the failure hook. An absence proof whose
     /// commit may have committed but did not answer latches, whichever call
-    /// carried it. Any other error keeps every token and reports nothing:
-    /// the next pass retries. The caller holds no lock.
-    async fn proof_error(&self, error: &AdapterError, scope: FailureScope<'_>) {
-        if error.journal_uncertain() {
-            self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
-                .finish()
-                .await;
+    /// carried it, and is returned. Any other error keeps every token and
+    /// reports nothing: the next pass retries. The caller holds no lock.
+    async fn proof_error(
+        &self,
+        error: &AdapterError,
+        scope: FailureScope<'_>,
+    ) -> Option<WriteOutcome> {
+        if !error.journal_uncertain() {
+            return None;
         }
+        self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
+            .finish()
+            .await;
+        Some(WriteOutcome::Uncertain)
     }
 
     /// Reads one page of the anchors startup reconciliation left unread

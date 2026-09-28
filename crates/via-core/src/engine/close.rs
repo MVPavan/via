@@ -275,7 +275,9 @@ impl Engine {
         tokio::select! {
             biased;
             _ = force.wait_for(|forced| *forced) => return Some(Step::Next),
-            () = self.absence_check(session, bound) => {}
+            // The hook has recorded a failed proof write, and `Closed`
+            // derives its cleanup from the durable proofs.
+            _ = self.absence_check(session, bound) => {}
         }
         #[cfg(test)]
         self.hold(&self.faults.hold_before_closed).await;
@@ -320,32 +322,52 @@ impl Engine {
 
     /// Design §4's bounded absence check: re-probe passes over held groups,
     /// the session's own first, until nothing is held or `bound`. A group
-    /// still unproven leaves the close's cleanup `uncertain`, which `Closed`
-    /// derives from the durable proofs.
-    async fn absence_check(&self, session: &SessionId, bound: tokio::time::Instant) {
+    /// still unproved leaves the close's cleanup `uncertain`, which `Closed`
+    /// derives from the durable proofs; that is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// The Store failure of a proof write, as the failure hook classified it,
+    /// even when a later pass retried the write: a not-committed proof is
+    /// recorded against the session, an uncertain one has latched and ends
+    /// the check. The live close leaves both to the hook and derives its
+    /// cleanup as above; the restart close completion fails startup on
+    /// either [O1.D9].
+    async fn absence_check(
+        &self,
+        session: &SessionId,
+        bound: tokio::time::Instant,
+    ) -> Result<(), WriteOutcome> {
+        let mut failed = None;
         loop {
-            let pass = tokio::time::timeout_at(
-                bound,
-                self.adapter
-                    .reprobe_held(Deadline::at(bound), Some(session.clone())),
-            )
-            .await;
-            if let Ok(pass) = &pass {
-                self.proof_failures(pass, FailureScope::Session(session))
-                    .await;
+            // Host ends the pass by `bound` itself, and reports a proof
+            // commit that outlived it as uncertain: a second timeout at
+            // `bound` here would race that report and could drop it.
+            let pass = self
+                .adapter
+                .reprobe_held(Deadline::at(bound), Some(session.clone()))
+                .await;
+            if let Some(outcome) = self
+                .proof_failures(&pass, FailureScope::Session(session))
+                .await
+            {
+                // An uncertain outcome ends the loop below, so the last
+                // outcome recorded is the worst.
+                failed = Some(outcome);
             }
             match pass {
-                Ok(Ok(report)) if report.held == report.proved => return,
+                Ok(report) if report.held == report.proved => break,
                 // An uncertain proof commit latched (design §7.2 row 12).
-                Ok(Err(_)) | Err(_) => return,
-                Ok(Ok(_)) => {}
+                Err(_) => break,
+                Ok(_) => {}
             }
             let now = tokio::time::Instant::now();
             if now >= bound {
-                return;
+                break;
             }
             tokio::time::sleep_until(bound.min(now + ABSENCE_POLL)).await;
         }
+        failed.map_or(Ok(()), Err)
     }
 
     /// Commits `Closed` for a closing session at its head's next sequence;
@@ -428,7 +450,13 @@ impl Engine {
         session: &SessionId,
         bound: tokio::time::Instant,
     ) -> Result<(), String> {
-        self.absence_check(session, bound).await;
+        // A failed proof write fails startup before `Closed` [O1.D9].
+        if let Err(outcome) = self.absence_check(session, bound).await {
+            return Err(format!(
+                "store_error: closing session {session} could not be closed: \
+                 an absence proof was not recorded ({outcome:?})"
+            ));
+        }
         let slot = self.slot_for(session);
         let closed = self.commit_closed(&slot, session, None).await;
         drop(slot);

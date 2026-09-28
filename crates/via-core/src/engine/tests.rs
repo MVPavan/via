@@ -1460,6 +1460,185 @@ fn the_restart_handoff_completes_a_closing_session() {
     });
 }
 
+/// Releases a paused point on drop, so Store's writer can join even when an
+/// assertion fails first.
+struct Release(PathBuf);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"");
+    }
+}
+
+/// A durably `closing` session an earlier daemon left, with one queued turn
+/// and one anchor of that turn that has no absence proof yet: `identified`
+/// and, when `provable`, in this boot and namespace with a group id above
+/// any `pid_max`, so a re-probe proves it absent. Otherwise its identity is
+/// of another boot, which no probe can prove.
+async fn closing_with_anchor(root: &Path, provable: bool) -> SessionId {
+    use std::os::unix::fs::MetadataExt;
+    let session = {
+        let earlier = open(root);
+        let session = new_session(&earlier).await;
+        earlier
+            .store
+            .commit_closing(via_store::ClosingRecord {
+                session_id: session.clone(),
+                operation: None,
+            })
+            .await
+            .unwrap();
+        session
+    };
+    let store = via_store::Store::open(&root.join("state")).unwrap();
+    let (_raw, journal) = store.runtime_resources().into_wire_parts();
+    let (boot_id, pid_namespace) = if provable {
+        (
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+                .to_owned(),
+            fs::read_link("/proc/self/ns/pid")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        ("another-boot".to_owned(), "another-namespace".to_owned())
+    };
+    let uid = fs::metadata("/proc/self").unwrap().uid();
+    let intent = via_store::AnchorIntent {
+        anchor_id: "0-anchor".to_owned(),
+        generation: "g0".to_owned(),
+        marker: "marker".to_owned(),
+        socket_path: root.join("runtime/anchors/0.sock"),
+        owner_session: session.clone(),
+        owner_turn: turn(1),
+        uid,
+        boot_id: boot_id.clone(),
+        pid_namespace: pid_namespace.clone(),
+    };
+    let via_store::CommitOutcome::Committed(receipt) = journal.commit_anchor_intent(intent).await
+    else {
+        panic!("the anchor intent did not commit");
+    };
+    // A group id above Linux's `pid_max` (4194304) names no group.
+    let identity = via_store::AnchorIdentity {
+        pid: 4_194_305,
+        pgid: 4_194_305,
+        uid,
+        boot_id,
+        pid_namespace,
+        start_ticks: 1,
+        marker: "marker".to_owned(),
+    };
+    let identified = journal
+        .commit_anchor_identified("0-anchor", "g0", receipt.record_version, identity)
+        .await;
+    assert!(matches!(identified, via_store::CommitOutcome::Committed(_)));
+    session
+}
+
+/// Design §4 "Restart", [O1.D9] and §7.2 row 12: the restart close
+/// completion's absence check re-probes the session's held group and its
+/// proof is not committed. The failed write fails startup before `Closed`;
+/// nothing is closed, and the scoped failure is recorded against the session.
+#[test]
+fn a_failed_proof_write_fails_the_restart_close_before_closed() {
+    let Some(root) = child("a_failed_proof_write_fails_the_restart_close_before_closed") else {
+        return;
+    };
+    let points = fail_first(&root, "store.journal.absence");
+    run(async {
+        let session = closing_with_anchor(&root, true).await;
+        let engine = open(&root);
+        engine
+            .adapter
+            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        let refused = engine.hand_off_queued().await.unwrap_err();
+        assert!(refused.starts_with("store_error:"), "{refused}");
+        assert!(acked(&points, "store.journal.absence", 1));
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"],
+            "no session.closed"
+        );
+        // Not committed: recorded against the session, not latched.
+        assert!(!engine.store_failed());
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "session", "{status}");
+        assert_eq!(status["affected"]["addresses"], json!([session.as_str()]));
+    });
+}
+
+/// As above, but the proof's commit does not answer within the bound: its
+/// outcome is uncertain, so startup fails before `Closed` and the daemon
+/// latches [O1, §7.2 row 12].
+#[test]
+fn an_uncertain_proof_write_fails_the_restart_close_before_closed() {
+    let Some(root) = child("an_uncertain_proof_write_fails_the_restart_close_before_closed") else {
+        return;
+    };
+    let points = pause_first(&root, "store.journal.absence");
+    run(async {
+        let session = closing_with_anchor(&root, true).await;
+        let engine = open(&root);
+        // Declared after the Engine, so it drops first: Store's writer is
+        // released before the Engine joins it.
+        let release = Release(points.join("store.journal.absence.1.release"));
+        engine
+            .adapter
+            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        // Store's writer stays paused: a `Closed` commit would wait on it.
+        let refused = tokio::time::timeout(Duration::from_secs(10), engine.hand_off_queued())
+            .await
+            .expect("startup fails without committing `Closed`")
+            .unwrap_err();
+        assert!(refused.starts_with("store_error:"), "{refused}");
+        assert!(engine.store_failed(), "the uncertain proof latches");
+        // Store reads wait behind the paused writer: let the proof commit
+        // finish first. Its reply has no reader left.
+        drop(release);
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"],
+            "no session.closed"
+        );
+    });
+}
+
+/// Design §4 "Restart": a held group no probe can prove (an earlier boot's)
+/// is ordinary unproved absence, not a Store failure. The completion still
+/// commits `Closed`, and its cleanup derives `uncertain` from the missing
+/// proof.
+#[test]
+fn an_unprovable_group_leaves_the_restart_close_cleanup_uncertain() {
+    let Some(root) = child("an_unprovable_group_leaves_the_restart_close_cleanup_uncertain") else {
+        return;
+    };
+    run(async {
+        let session = closing_with_anchor(&root, false).await;
+        let engine = open(&root);
+        engine
+            .adapter
+            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        let handoff = engine.hand_off_queued().await.unwrap();
+        assert_eq!((handoff.cancelled, handoff.closed), (1, 1), "{handoff:?}");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+        let result = engine
+            .store
+            .session_close_result(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["cleanup"], "uncertain", "{result}");
+        assert!(!engine.store_failed());
+    });
+}
+
 /// Design §4 steps 2–4 [r1.5]: after an idle stop is accepted a new close is
 /// `daemon_stopping`, and a keyed replay of a committed close still replays
 /// its result.
@@ -1853,6 +2032,18 @@ fn fail_first(root: &Path, point: &str) -> PathBuf {
     let dir = root.join("failpoints");
     fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io"});
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// In a child, activates Store's failpoints before the Engine opens, with
+/// `point` pausing its first hit until its release file exists; returns
+/// their directory.
+fn pause_first(root: &Path, point: &str) -> PathBuf {
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"pause"});
     fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
     via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
     dir
