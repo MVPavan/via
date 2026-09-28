@@ -76,6 +76,14 @@ impl TurnJournal for FaultJournal {
         TurnJournal::commit_terminal(&self.store, record, closed).await
     }
 
+    async fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: via_store::TerminalExtras,
+    ) -> Result<(), StoreError> {
+        self.store.commit_terminal_with(record, extras).await
+    }
+
     async fn events(
         &self,
         session: &SessionId,
@@ -197,7 +205,7 @@ fn record() -> TurnRecord {
         head: Head::new(Some(3)),
         accepted: None,
         spans: Vec::new(),
-        store_failed: false,
+        first_failure: None,
         uncertain: None,
     }
 }
@@ -234,7 +242,10 @@ async fn observe_then_finish(
         is_final: false,
     };
     commit_event(journal, &mut record, body, Some(raw_ref.clone())).await;
-    assert!(record.store_failed, "the injected fault reached Core");
+    assert!(
+        record.first_failure.is_some(),
+        "the injected fault reached Core"
+    );
     Engine::finish_turn(
         journal,
         unresolved,
@@ -336,7 +347,10 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         is_final: false,
     };
     commit_event(&journal, &mut record, body, Some(raw_ref)).await;
-    assert!(record.store_failed, "the injected fault reached Core");
+    assert!(
+        record.first_failure.is_some(),
+        "the injected fault reached Core"
+    );
     let head = record.head.lock(&journal, &session()).await.unwrap();
     assert_eq!(head.next(), 3, "the head is re-read from the Store");
     let queued = Event {
@@ -564,7 +578,7 @@ async fn a_submission_commit_with_an_unknown_outcome_fails_and_unsettles_the_hea
     };
     let head = Head::new(Some(2));
     let submitted = Engine::commit_submission(&journal, &session(), turn(), &head).await;
-    assert!(matches!(submitted, Err(SubmitFailure::Failed)));
+    assert!(matches!(submitted, Err(SubmitFailure::Failed(_))));
     let reread = head.lock(&engine.store, &session()).await.unwrap();
     assert_eq!(reread.next(), 2, "the head was re-read from Store");
 }

@@ -926,10 +926,11 @@ fn started_effective(history: &[Value], turns: u32) -> Vec<Value> {
         .collect()
 }
 
-/// The fake route's frozen values with `wall_ms`: nothing else is settable.
+/// The fake route's frozen values with `wall_ms` and the default `idle_ms`
+/// (design T3 §5): nothing else is set here.
 fn fake_effective(wall_ms: u64) -> Value {
     json!({"model":"fake","effort":null,"bound":null,
-        "deadlines":{"wall_ms":wall_ms,"idle_ms":null},"max_steps":null})
+        "deadlines":{"wall_ms":wall_ms,"idle_ms":600_000},"max_steps":null})
 }
 
 /// C1 §3.3/§4 P5: per-turn values freeze at receipt. Turn 1 sets `wall_ms`
@@ -1218,12 +1219,6 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
                     json!({"fake":{"k":"v"}}),
                     "invalid_params",
                     "vendor",
-                ),
-                (
-                    "deadlines",
-                    json!({"idle_ms":60_000}),
-                    "invalid_params",
-                    "deadlines.idle_ms",
                 ),
             ];
             let spawn_base = json!({"harness":"fake","model":"fake","prompt":"x","handle":HANDLE});

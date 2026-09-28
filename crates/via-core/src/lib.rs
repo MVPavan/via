@@ -86,9 +86,10 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 }
 
 pub use api::{
-    ApiError, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, Named, ReadParams,
-    ReceiptOutcome, ResumeParams, SessionReadParams, SpawnParams, SteerParams, Unpersisted,
-    WaitParams, hash_handle, parse_address, retry_identity,
+    ApiError, CancelParams, CloseMode, CloseParams, DEFAULT_CLOSE_DEADLINE_MS,
+    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, Named,
+    ReadParams, ReceiptOutcome, ResumeParams, SessionReadParams, SpawnParams, SteerParams,
+    Unpersisted, WaitParams, hash_handle, parse_address, retry_identity,
 };
 
 impl Serialize for C1TurnState {

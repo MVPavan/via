@@ -88,6 +88,23 @@ impl Fixture {
         }
     }
 
+    /// Commits another session, so anchors can name it as their owner.
+    async fn spawn_session(&self, session_id: SessionId) {
+        self.store
+            .client()
+            .commit_spawn(SpawnRecord {
+                session_id,
+                handle_hash: [8_u8; 32],
+                receipt: serde_json::json!({"state":"queued"}),
+                params: serde_json::json!({"harness":"fake"}),
+                prompt: "fixture".into(),
+                effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
+                initial_event: serde_json::json!({"seq":1,"type":"turn.queued"}),
+            })
+            .await
+            .unwrap();
+    }
+
     fn host(&self) -> Host {
         Host::new(
             self.store.runtime_resources().into_wire_parts().1,
@@ -162,6 +179,10 @@ impl Drop for Fixture {
 
 fn session() -> SessionId {
     SessionId::try_from("s_0123456789ab").unwrap()
+}
+
+fn other_session() -> SessionId {
+    SessionId::try_from("s_0123456789ac").unwrap()
 }
 
 fn random_hex() -> String {
@@ -525,6 +546,77 @@ fn an_unproven_row_four_group_keeps_its_token_until_reprobe_proves_it() {
         // Nothing is held: a pass reads nothing and probes nothing.
         let idle = host.reprobe_held(within(2), None).await.unwrap();
         assert_eq!((idle.held, idle.proved), (0, 0));
+    });
+}
+
+/// Design §4 dispatcher step 5, §8 [T3-S2 r1.3]: with a session filter, a
+/// re-probe pass reports as held only that session's groups, so a close's
+/// absence check does not wait on another session's group; `None` keeps the
+/// daemon-wide count. A pass that ends before its pages did (here a spent
+/// deadline) still counts every group of the session, examined or not, and
+/// only those, so no caller takes an unread group of the session for proved.
+#[test]
+fn a_session_filtered_reprobe_counts_only_that_sessions_groups() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        fixture.spawn_session(other_session()).await;
+        let host = fixture.host();
+        // Every identified commit fails and every anchor is slow to exit, so
+        // each acquisition leaves its group held and unproven.
+        fixture.arm_with("store.journal.identified", "fail_io", true);
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        for owner in [session(), session(), other_session()] {
+            let mut spec = fixture.spec("/bin/cat", &[]);
+            spec.owner.session_id = owner;
+            spec.capacity = Some(Box::new(Token(Arc::new(AtomicBool::new(false)))));
+            let failure = host
+                .acquire_retaining(spec, within(4), &LaunchPipes::default(), &never())
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+                "{failure:?}"
+            );
+        }
+        assert_eq!(host.held_unproven(), 3);
+        let all = host.reprobe_held(within(2), None).await.unwrap();
+        assert_eq!((all.held, all.proved), (3, 0), "{all:?}");
+        let mine = host.reprobe_held(within(2), Some(session())).await.unwrap();
+        assert_eq!((mine.held, mine.proved), (2, 0), "{mine:?}");
+        let theirs = host
+            .reprobe_held(within(2), Some(other_session()))
+            .await
+            .unwrap();
+        assert_eq!((theirs.held, theirs.proved), (1, 0), "{theirs:?}");
+        // Spent before any page: the session's two groups still count, and
+        // only they do; nothing examined is never "all proved".
+        let spent = Deadline::at(tokio::time::Instant::now());
+        let cut = host.reprobe_held(spent, Some(session())).await.unwrap();
+        assert_eq!((cut.held, cut.proved), (2, 0), "{cut:?}");
+        let cut = host
+            .reprobe_held(spent, Some(other_session()))
+            .await
+            .unwrap();
+        assert_eq!((cut.held, cut.proved), (1, 0), "{cut:?}");
+        fixture.release("host.anchor.before_eof_cleanup");
+        let mut proved = 0;
+        for _ in 0..500 {
+            proved += host
+                .reprobe_held(within(2), Some(session()))
+                .await
+                .unwrap()
+                .proved;
+            if proved == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(proved, 2);
+        // The other session's group was never examined, and stays held.
+        assert_eq!(host.held_unproven(), 1);
+        let done = host.reprobe_held(within(2), Some(session())).await.unwrap();
+        assert_eq!((done.held, done.proved), (0, 0), "{done:?}");
     });
 }
 

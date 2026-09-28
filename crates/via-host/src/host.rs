@@ -97,6 +97,18 @@ enum LaunchPhase {
 
 impl Ledger {
     /// Whether an acquisition or a live control still owns the group.
+    /// Holds `token` for `owner`'s group until its absence is proved.
+    fn hold(&mut self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
+        self.held.insert(
+            anchor_id,
+            Held {
+                _token: token,
+                identity: None,
+                owner,
+            },
+        );
+    }
+
     fn busy(&self, anchor_id: &str) -> bool {
         self.acquiring.contains(anchor_id)
             || self
@@ -113,6 +125,9 @@ struct Held {
     /// Owned for its drop, which releases the capacity.
     _token: crate::CapacityToken,
     identity: Option<(ProcessIdentity, String)>,
+    /// The session that owns the group, for a session-filtered re-probe's
+    /// count [T3-S2 r2.5].
+    owner: crate::SessionId,
 }
 
 impl Capacity {
@@ -122,14 +137,8 @@ impl Capacity {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn hold(&self, anchor_id: String, token: crate::CapacityToken) {
-        self.lock().held.insert(
-            anchor_id,
-            Held {
-                _token: token,
-                identity: None,
-            },
-        );
+    fn hold(&self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
+        self.lock().hold(anchor_id, owner, token);
     }
 
     /// Records the identity Host verified for a launched anchor.
@@ -395,7 +404,8 @@ impl std::error::Error for AcquireFailure {}
 /// One re-probe pass over held groups (design §8).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReprobeReport {
-    /// Held groups without a live control, as the pass found them.
+    /// Held groups without a live control, as the pass found them; with a
+    /// session filter, only that session's (see [`Host::reprobe_held`]).
     pub held: usize,
     /// Groups proved absent and released by this pass.
     pub proved: usize,
@@ -732,10 +742,15 @@ impl Host {
     }
 
     /// Holds capacity for a group this Host did not launch, such as one an
-    /// earlier daemon left whose absence recovery did not prove; a later
-    /// absence proof for `anchor_id` releases it.
-    pub fn hold_capacity(&self, anchor_id: String, token: crate::CapacityToken) {
-        self.capacity.hold(anchor_id, token);
+    /// earlier daemon left whose absence recovery did not prove, owned by
+    /// session `owner`; a later absence proof for `anchor_id` releases it.
+    pub fn hold_capacity(
+        &self,
+        anchor_id: String,
+        owner: crate::SessionId,
+        token: crate::CapacityToken,
+    ) {
+        self.capacity.hold(anchor_id, owner, token);
     }
 
     /// Held groups with no live control: the ledger entries only a proof
@@ -807,6 +822,11 @@ impl Host {
     /// commit that is not committed keeps the token for the next pass; an
     /// uncertain one is returned, and latches. Nothing is read while
     /// nothing is held; a group with no identity keeps its token.
+    ///
+    /// `held` counts every eligible group for `None`, and with `owner` only
+    /// that session's, examined or not: a pass that ends before its pages
+    /// did still counts them, so a caller never takes an unread group of the
+    /// session for proved [T3-S2 r1.3, r2.5].
     pub async fn reprobe_held(
         &self,
         deadline: Deadline,
@@ -817,7 +837,10 @@ impl Host {
             ledger
                 .held
                 .iter()
-                .filter(|(anchor_id, _)| !ledger.busy(anchor_id))
+                .filter(|(anchor_id, held)| {
+                    !ledger.busy(anchor_id)
+                        && owner.as_ref().is_none_or(|owner| *owner == held.owner)
+                })
                 .map(|(anchor_id, held)| (anchor_id.clone(), held.identity.clone()))
                 .collect()
         };
@@ -921,7 +944,7 @@ impl Host {
             generation: generation.clone(),
             marker: marker.clone(),
             socket_path: socket_path.clone(),
-            owner_session: owner.session_id,
+            owner_session: owner.session_id.clone(),
             owner_turn: owner.turn,
             uid: rustix::process::getuid().as_raw(),
             boot_id: linux::boot_id()?,
@@ -949,13 +972,7 @@ impl Host {
             let mut ledger = self.capacity.lock();
             ledger.acquiring.insert(anchor_id.clone());
             if let Some(token) = capacity {
-                ledger.held.insert(
-                    anchor_id.clone(),
-                    Held {
-                        _token: token,
-                        identity: None,
-                    },
-                );
+                ledger.hold(anchor_id.clone(), owner.session_id, token);
             }
         }
         state.spawned = Some(anchor_id.clone());

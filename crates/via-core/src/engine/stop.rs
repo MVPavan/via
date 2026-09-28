@@ -5,12 +5,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use via_adapters::Cleanup;
+use via_adapters::{Cleanup, StopCause};
 
 use std::sync::Arc;
 
 use super::drive::FORCE_CLOSE_REASON;
-use super::journal::{self, Head};
+use super::journal::Head;
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::{Admission, Engine, Terminal, TurnRecord, lock};
 use crate::api::{Cancel, Event, EventBody, FailureClass, Warning, rfc3339};
 use crate::{ApiError, DaemonStopParams, Deadline, SessionId, TurnNumber};
@@ -211,7 +212,15 @@ impl Engine {
                     // `raw_log.incomplete` committed when the drive ended.
                     terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
                 }
-                if record.store_failed {
+                if turn.cause == Some(StopCause::IdleDeadline) {
+                    // Design §2: force took over an idle stop.
+                    terminal.fail(
+                        FailureClass::DeadlineIdle,
+                        "no progress within the idle deadline",
+                    );
+                    terminal.stop_reason = "deadline";
+                }
+                if record.first_failure.is_some() {
                     // C1 §8.2: the durable stream already lost an event; a
                     // cancellation must not present it as a complete record.
                     terminal.fail(FailureClass::Store, "a turn event could not be recorded");
@@ -326,10 +335,16 @@ impl Engine {
             // Store found the session closed or a turn unfinished: nothing written.
             Ok(false) => false,
             Err(error) => {
-                if journal::may_have_committed(&error) {
+                let outcome = WriteOutcome::of(&error);
+                if outcome == WriteOutcome::Uncertain {
                     guard.lost();
                 }
-                self.latch_held(admission);
+                self.store_failure(
+                    FailureSite::SessionClosed,
+                    outcome,
+                    FailureScope::Session(session),
+                )
+                .finish_held(admission);
                 false
             }
         }

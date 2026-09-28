@@ -66,6 +66,7 @@ impl Engine {
             .ok_or(ApiError::INVALID_PARAMS)?;
         let (session, turn) = self.address(&params.address).await?;
         let mut checked = false;
+        let mut registered = false;
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
@@ -85,7 +86,36 @@ impl Engine {
             if now >= deadline {
                 return Err(ApiError::WAIT_TIMEOUT);
             }
+            if !registered {
+                registered = true;
+                // The first read found no terminal; the waiter is registered.
+                #[cfg(feature = "test-failpoints")]
+                let _ = via_store::failpoint::hit_async("core.wait.registered").await;
+            }
             tokio::time::sleep_until(deadline.min(now + Duration::from_millis(20))).await;
+        }
+    }
+
+    /// Waits, unbounded, for the turn's durable terminal as `wait` reads it
+    /// (design §3.3 [r3.4]): a turn's own deadlines bound it. Once final
+    /// shutdown finalized, a turn recorded unpersisted is `store_error` and
+    /// any other is `daemon_stopping`.
+    pub(super) async fn await_terminal(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Value, ApiError> {
+        loop {
+            let finalized = self.finalized.load(Ordering::Acquire);
+            if let Some(result) =
+                journal::read_result(&self.store, &self.unresolved, session, turn).await?
+            {
+                return Ok(result);
+            }
+            if finalized {
+                return Err(ApiError::DAEMON_STOPPING);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 

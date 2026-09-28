@@ -11,6 +11,7 @@ use via_store::{
 };
 
 use super::journal::{self, Head};
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
 use super::{Admission, Engine, Receipted, lock};
 use crate::api::{
@@ -27,11 +28,12 @@ impl Engine {
     /// with `retry: same_key_only` when it may have committed. Restart
     /// recovery settles an unknown one.
     fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
-        self.latch_held(admission);
-        if journal::may_have_committed(error) {
-            ApiError::RECEIPT_UNKNOWN
-        } else {
-            ApiError::RECEIPT_NOT_COMMITTED
+        let outcome = WriteOutcome::of(error);
+        self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
+            .finish_held(admission);
+        match outcome {
+            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
+            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
         }
     }
 
@@ -212,7 +214,9 @@ impl Engine {
             }
             None => None,
         };
-        if snapshot.closed {
+        // Design §4: a closing session refuses `resume`, from Store's gate
+        // or, after an uncertain `Closing`, from memory.
+        if snapshot.closed || snapshot.closing || lock(&self.closing).contains(&session) {
             return Err(ApiError::SESSION_CLOSED);
         }
         if lock(&self.stop).is_some() {
@@ -300,6 +304,14 @@ impl Engine {
             .await;
         match self.receipt_reply(committed) {
             Ok(()) => head.committed(1),
+            // Store's same-transaction closing check: a refusal, not a
+            // Store failure; nothing was written (design §4).
+            Err(StoreError::Refused(_)) => {
+                drop(head);
+                drop(slot);
+                self.retire(&session);
+                return Err(ApiError::SESSION_CLOSED);
+            }
             Err(error) => {
                 if journal::may_have_committed(&error) {
                     head.lost();

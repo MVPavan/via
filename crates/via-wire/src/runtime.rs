@@ -102,8 +102,13 @@ impl WireRuntime {
     }
 
     /// Hands Host capacity for a group it did not launch (design §11).
-    pub fn hold_capacity(&self, anchor_id: String, token: via_host::CapacityToken) {
-        self.host.hold_capacity(anchor_id, token);
+    pub fn hold_capacity(
+        &self,
+        anchor_id: String,
+        owner: via_store::SessionId,
+        token: via_host::CapacityToken,
+    ) {
+        self.host.hold_capacity(anchor_id, owner, token);
     }
 
     /// One non-signalling re-probe pass over Host's held groups, optionally

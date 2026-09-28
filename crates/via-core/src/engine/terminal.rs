@@ -1,8 +1,13 @@
 //! Core's terminal decision from adapter evidence and the C1 §5 envelope.
 
 use serde_json::json;
-use via_adapters::{AdapterError, Cleanup, FakeTerminalEvidence, RouteError, VendorTerminalStatus};
+use via_adapters::{
+    AdapterError, Cleanup, FakeTerminalEvidence, RouteError, RouteFailure, StopCause, StopOrder,
+    VendorTerminalStatus, WireCleanup,
+};
+use via_store::CancelCause;
 
+use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
     Bound, Cost, Envelope, EventRange, Exit, FailureClass, RawSpan, Requested, RoutePlan,
@@ -92,13 +97,193 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         RouteError::Overflow { .. } => ("failed", Some(FailureClass::Overflow), "error"),
         RouteError::Store { .. } => ("failed", Some(FailureClass::Store), "error"),
         RouteError::Deadline { .. } => ("failed", Some(FailureClass::DeadlineWall), "deadline"),
-        // Core settles a force stop itself; this is only the C1 §7.6 force row.
-        // T3-S1 compile allowance: a stop order's `Stopped` takes that row too.
+        // Core settles a force stop itself, and `dispose` a stop order's
+        // `Stopped`; this is only the C1 §7.6 force row.
         RouteError::ForceStopped { .. } | RouteError::Stopped { .. } => {
             ("cancelled", None, "interrupted")
         }
         // Input may have reached the vendor and no exit is confirmed (§7.6).
         RouteError::TransportLost { .. } => ("unknown", None, "error"),
+    }
+}
+
+/// Core's disposition of a turn's evidence, with any stop it settles.
+pub(super) struct Disposed {
+    pub(super) terminal: Terminal,
+    /// The C1 §3.5 `cancel` outcome and cleanup to settle: under a stop
+    /// order, or when the wall deadline stopped the turn.
+    pub(super) stop: Option<(&'static str, &'static str)>,
+    /// Who cancelled the turn, recorded when it ends `cancelled` (design §4).
+    pub(super) cancel_cause: Option<CancelCause>,
+}
+
+/// Design §2's disposition table (C1 §7.6; the first matching row wins).
+/// `wall` is the turn's wall deadline: a `Deadline` coincident with an
+/// order's `force_at` takes the order's row [r1.9].
+pub(super) fn dispose(
+    accepted: bool,
+    outcome: Result<FakeTerminalEvidence, AdapterError>,
+    order: Option<&StopOrder>,
+    wall: tokio::time::Instant,
+) -> Disposed {
+    let Some(order) = order else {
+        // C1 §7.6: Core's deadline cancels the turn; Route force-closed its group.
+        let stop = match &outcome {
+            Err(AdapterError::Route(route))
+                if matches!(route.cause, RouteError::Deadline { .. }) =>
+            {
+                Some(stop_outcome(
+                    route.cleanup == Some(WireCleanup::Quiescent),
+                    route.forced,
+                ))
+            }
+            Ok(_) | Err(_) => None,
+        };
+        return Disposed {
+            terminal: classify(accepted, outcome),
+            stop,
+            cancel_cause: None,
+        };
+    };
+    let cause = order.cause;
+    let requested = match cause {
+        StopCause::Cancel => Some(CancelCause::Cancel),
+        StopCause::Close => Some(CancelCause::Close),
+        StopCause::IdleDeadline | StopCause::Store => None,
+    };
+    match outcome {
+        Ok(evidence) => {
+            let cleanup = cleanup_word(evidence.cleanup == Cleanup::Quiescent);
+            let interrupted = evidence.status == VendorTerminalStatus::Interrupted;
+            let mut terminal = classify(accepted, Ok(evidence));
+            let stop = match (interrupted, cause) {
+                (_, StopCause::Store) => {
+                    terminal.fail(FailureClass::Store, STORE_STOP);
+                    ("requested", cleanup)
+                }
+                (true, StopCause::Cancel | StopCause::Close) => {
+                    terminal.state = "cancelled";
+                    terminal.failure = None;
+                    terminal.stop_reason = "interrupted";
+                    ("acknowledged", cleanup)
+                }
+                (true, StopCause::IdleDeadline) => {
+                    idle(&mut terminal);
+                    ("acknowledged", cleanup)
+                }
+                // Completed or failed on its own: the vendor ignored the order.
+                (false, _) => ("requested", cleanup),
+            };
+            Disposed {
+                terminal,
+                stop: Some(stop),
+                cancel_cause: requested,
+            }
+        }
+        Err(AdapterError::Route(route)) => stopped(route, cause, order, wall, requested),
+        // Nothing launched: the adapter refused the turn before Route.
+        Err(error) => Disposed {
+            terminal: failed_terminal(error),
+            stop: Some(("requested", "quiescent")),
+            cancel_cause: None,
+        },
+    }
+}
+
+/// Message of a turn stopped because its own Store write failed.
+const STORE_STOP: &str = "a turn event could not be recorded";
+
+/// C1 §3.5 cleanup word.
+fn cleanup_word(quiescent: bool) -> &'static str {
+    if quiescent { "quiescent" } else { "uncertain" }
+}
+
+/// The `failed(deadline_idle)` row (design §5).
+fn idle(terminal: &mut Terminal) {
+    terminal.fail(
+        FailureClass::DeadlineIdle,
+        "no progress within the idle deadline",
+    );
+    terminal.stop_reason = "deadline";
+}
+
+/// Route's failure under a stop order (design §2's table).
+fn stopped(
+    route: RouteFailure,
+    cause: StopCause,
+    order: &StopOrder,
+    wall: tokio::time::Instant,
+    requested: Option<CancelCause>,
+) -> Disposed {
+    // Design §2 [r1.8]: quiescent only with Host's absence proof, or with
+    // no anchor intent at all (an order set before `execute`).
+    let quiescent = match route.cleanup {
+        Some(cleanup) => cleanup == WireCleanup::Quiescent,
+        None => !route.launched && matches!(route.cause, RouteError::Stopped { .. }),
+    };
+    let (outcome, cleanup) = stop_outcome(quiescent, route.forced);
+    let by_order = match route.cause {
+        RouteError::Stopped { .. } => true,
+        RouteError::Deadline { .. } => order.force_at.instant() == wall,
+        RouteError::Protocol { .. }
+        | RouteError::TransportLost { .. }
+        | RouteError::ProcessExited { .. }
+        | RouteError::Overflow { .. }
+        | RouteError::Store { .. }
+        | RouteError::ForceStopped { .. } => false,
+    };
+    let launched = route.launched;
+    let forced = route.forced;
+    let mut terminal = failed_terminal(AdapterError::Route(route));
+    if cause == StopCause::Store {
+        terminal.fail(FailureClass::Store, STORE_STOP);
+        return Disposed {
+            terminal,
+            stop: Some((outcome, cleanup)),
+            cancel_cause: None,
+        };
+    }
+    if !by_order {
+        // Deadline before the order's force, process exit, transport loss
+        // and other failures keep their own row.
+        return Disposed {
+            terminal,
+            stop: Some((outcome, cleanup)),
+            cancel_cause: None,
+        };
+    }
+    match cause {
+        StopCause::IdleDeadline => {
+            idle(&mut terminal);
+            Disposed {
+                terminal,
+                stop: Some((outcome, cleanup)),
+                cancel_cause: None,
+            }
+        }
+        StopCause::Cancel | StopCause::Close | StopCause::Store => {
+            terminal.failure = None;
+            let stop = if !launched {
+                // Nothing launched: stopped before the vendor could act.
+                terminal.state = "cancelled";
+                terminal.stop_reason = "interrupted";
+                ("requested", cleanup)
+            } else if forced {
+                terminal.state = "cancelled";
+                terminal.stop_reason = "interrupted";
+                ("forced", cleanup)
+            } else {
+                // A vendor may have run with neither stop nor terminal proved.
+                terminal.state = "unknown";
+                terminal.stop_reason = "error";
+                ("requested", cleanup)
+            };
+            Disposed {
+                cancel_cause: requested.filter(|_| terminal.state == "cancelled"),
+                terminal,
+                stop: Some(stop),
+            }
+        }
     }
 }
 

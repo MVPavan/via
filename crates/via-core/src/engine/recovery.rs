@@ -9,13 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use via_adapters::FakeRecovery;
-use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, TerminalRecord, UnfinishedTurn};
+use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, TerminalRecord, UnfinishedTurn};
 
 use std::sync::atomic::Ordering;
 
 use super::drive::Cancelled;
 use super::journal::Head;
-use super::queue::CONNECTION_SLOTS;
+use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
@@ -32,8 +32,11 @@ const HANDOFF_PAGE: u32 = 256;
 pub struct Handoff {
     /// Enqueued with their session's dispatcher.
     pub enqueued: usize,
-    /// Committed `queued → cancelled` behind an `unknown` predecessor.
+    /// Committed `queued → cancelled` behind an `unknown` predecessor, or
+    /// for a durably `closing` session.
     pub cancelled: usize,
+    /// Durably `closing` sessions the restart closed (design §4).
+    pub closed: usize,
 }
 /// Startup budget for Host's anchor reconciliation (its native stop is 3 s).
 const HOST_RECOVERY: Duration = Duration::from_secs(5);
@@ -77,8 +80,13 @@ impl Engine {
     /// enqueued, with its dispatcher start requested. Nothing is resent. Any
     /// Store failure fails startup: the daemon never admits on a partial
     /// handoff.
+    ///
+    /// A durably `closing` session is finished before admission (design §4
+    /// "Restart"): its queued turns are cancelled with cause `close`, then
+    /// `Closed` commits after one bounded absence check.
     pub async fn hand_off_queued(&self) -> Result<Handoff, String> {
         let mut handoff = Handoff::default();
+        let closing = self.closing_on_disk().await?;
         let mut after = None;
         loop {
             let page = self
@@ -104,10 +112,13 @@ impl Engine {
                 self.unresolved.receipt(&session, turn);
                 self.active.fetch_add(1, Ordering::AcqRel);
                 self.queued.fetch_add(1, Ordering::AcqRel);
-                if cancel {
+                let close = closing.contains(&session);
+                if cancel || close {
+                    let cause = close.then(|| (CancelCause::Close, rfc3339(SystemTime::now())));
                     if !matches!(
-                        self.cancel_queued(&slot, &session, turn, false).await,
-                        Cancelled::Committed
+                        self.cancel_queued(&slot, &session, turn, false, cause)
+                            .await,
+                        Cancelled::Committed(_)
                     ) {
                         return Err(format!(
                             "store_error: queued turn {session}/{} could not be cancelled",
@@ -123,9 +134,15 @@ impl Engine {
                 }
             }
             if !full {
-                return Ok(handoff);
+                break;
             }
         }
+        let bound = tokio::time::Instant::now() + CLOSE_ALLOWANCE;
+        for session in closing {
+            self.finish_restart_close(&session, bound).await?;
+            handoff.closed += 1;
+        }
+        Ok(handoff)
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -200,8 +217,11 @@ impl Engine {
             });
             if !proved {
                 let token = self.recovered.hold(&self.slots);
-                self.adapter
-                    .hold_capacity(owner.anchor_id.clone(), Box::new(token));
+                self.adapter.hold_capacity(
+                    owner.anchor_id.clone(),
+                    owner.session_id.clone(),
+                    Box::new(token),
+                );
             }
         }
     }
@@ -236,7 +256,7 @@ impl Engine {
             head: std::sync::Arc::clone(&head),
             accepted,
             spans,
-            store_failed: false,
+            first_failure: None,
             uncertain: None,
         };
         let cancel = self.settle_recovered(&mut record, reconciled).await?;
@@ -335,7 +355,7 @@ impl Engine {
         self.commit_event(record, EventBody::CancelRequested {}, None)
             .await;
         let cancel = self.settle(record, requested_at, outcome, cleanup).await;
-        if record.store_failed {
+        if record.first_failure.is_some() {
             // Recovery must be durable before admission; startup fails instead.
             return Err(ApiError::STORE);
         }

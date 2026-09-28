@@ -16,11 +16,13 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalRecord,
+    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord,
+    TerminalExtras, TerminalRecord,
 };
 
-use super::{Accepted, TurnRecord, lock};
-use crate::api::{Event, EventBody, RawSpan, rfc3339};
+use super::latch::{FailureSite, WriteOutcome};
+use super::{Accepted, FailureNote, TurnRecord, lock};
+use crate::api::{Event, EventBody, RawSpan, ReceiptOutcome, rfc3339};
 use crate::{ApiError, RawRef, SessionId, TurnNumber, TurnState};
 
 /// Core's narrow Store port for one turn: `StoreClient` in production, a closed
@@ -45,6 +47,13 @@ pub(super) trait TurnJournal: Sync {
         record: TerminalRecord,
         closed: Option<Value>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Commits the terminal with the facts of its own transaction, such as
+    /// a cancellation's `cancel_cause` (design §4, §10).
+    fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: TerminalExtras,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// Reads a bounded page of durable events from `from_seq`.
     fn events(
         &self,
@@ -94,6 +103,14 @@ impl TurnJournal for StoreClient {
             Some(closed) => Self::commit_closing_terminal(self, record, closed).await,
             None => Self::commit_terminal(self, record).await.map(|()| false),
         }
+    }
+
+    async fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: TerminalExtras,
+    ) -> Result<(), StoreError> {
+        Self::commit_terminal_with(self, record, extras).await
     }
 
     async fn events(
@@ -322,34 +339,55 @@ async fn settle_failed(journal: &impl TurnJournal, unresolved: &Unresolved) {
 }
 
 /// Commits one non-lifecycle event of the running turn at the next sequence.
+/// After the turn's first failed write nothing more is written; a failure
+/// is recorded as the turn's `first_failure` (design §7.2).
 pub(super) async fn commit_event(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
     body: EventBody,
     raw_ref: Option<RawRef>,
 ) {
-    if record.store_failed {
+    let at = rfc3339(SystemTime::now());
+    commit_event_at(journal, record, body, raw_ref, &at).await;
+}
+
+/// [`commit_event`] at a given wall time: a stop order's `cancel.requested`
+/// keeps the order's `requested_at` (design §2).
+pub(super) async fn commit_event_at(
+    journal: &impl TurnJournal,
+    record: &mut TurnRecord,
+    body: EventBody,
+    raw_ref: Option<RawRef>,
+    at: &str,
+) {
+    if record.first_failure.is_some() {
         return;
     }
+    let failed = |outcome| {
+        Some(FailureNote {
+            site: FailureSite::Event,
+            outcome,
+        })
+    };
     let shared = Arc::clone(&record.head);
     let Ok(head) = shared.lock(journal, &record.session).await else {
-        record.store_failed = true;
+        // The head's read failed: nothing was written.
+        record.first_failure = failed(WriteOutcome::NotCommitted);
         return;
     };
     let seq = head.next();
-    let at = rfc3339(SystemTime::now());
     let event = Event {
         seq,
         session_id: &record.session,
         turn: Some(record.turn.get()),
         late: false,
-        at: &at,
+        at,
         raw_ref: raw_ref.as_ref(),
         body,
     }
     .to_value();
     let Ok(event) = event else {
-        record.store_failed = true;
+        record.first_failure = failed(WriteOutcome::NotCommitted);
         return;
     };
     let committed = journal
@@ -361,8 +399,9 @@ pub(super) async fn commit_event(
         })
         .await;
     if let Err(error) = committed {
-        record.store_failed = true;
-        if may_have_committed(&error) {
+        let outcome = WriteOutcome::of(&error);
+        record.first_failure = failed(outcome);
+        if outcome == WriteOutcome::Uncertain {
             head.lost();
             record.uncertain = Some(UncertainEvent {
                 seq,
@@ -422,14 +461,36 @@ pub(super) struct Durable {
 }
 
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
-/// uncertain failure is settled by reading back the durable result.
+/// uncertain failure is settled by reading back the durable result. A
+/// failure carries its outcome in `commit_outcome` ([`outcome_of`]).
 pub(super) async fn commit_terminal(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
 ) -> Result<Durable, ApiError> {
+    commit_terminal_with(journal, record, closed, TerminalExtras::default()).await
+}
+
+/// [`commit_terminal`] with the terminal's `extras` (design §4, §10). A
+/// cancellation's cause never rides with a force closure: the two are
+/// refused together, writing nothing.
+pub(super) async fn commit_terminal_with(
+    journal: &impl TurnJournal,
+    record: TerminalRecord,
+    closed: Option<Value>,
+    extras: TerminalExtras,
+) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
-    match journal.commit_terminal(record, closed).await {
+    let plain = extras.cancel_cause.is_none() && extras.raw_incomplete.is_none();
+    let committed = match (closed, plain) {
+        (closed, true) => journal.commit_terminal(record, closed).await,
+        (None, false) => journal
+            .commit_terminal_with(record, extras)
+            .await
+            .map(|()| false),
+        (Some(_), false) => return Err(ApiError::RECEIPT_NOT_COMMITTED),
+    };
+    match committed {
         Ok(closed) => Ok(Durable {
             uncertain: false,
             closed,
@@ -439,9 +500,18 @@ pub(super) async fn commit_terminal(
                 uncertain: true,
                 closed: false,
             }),
-            Ok(None) | Err(_) => Err(ApiError::STORE),
+            Ok(None) | Err(_) => Err(ApiError::RECEIPT_UNKNOWN),
         },
-        Err(_) => Err(ApiError::STORE),
+        Err(_) => Err(ApiError::RECEIPT_NOT_COMMITTED),
+    }
+}
+
+/// The outcome of a failed terminal commit (design §7.1): unknown only when
+/// the commit may have written; an error before it wrote nothing.
+pub(super) fn outcome_of(error: &ApiError) -> WriteOutcome {
+    match error.commit_outcome {
+        Some(ReceiptOutcome::Unknown) => WriteOutcome::Uncertain,
+        Some(ReceiptOutcome::NotCommitted) | None => WriteOutcome::NotCommitted,
     }
 }
 
