@@ -848,7 +848,9 @@ fn s1_f12_force_closure_not_committed_counts_unclosed() -> TestResult {
 /// Design §7.2 row 15 [r3.11]: a forced terminal in final shutdown that is
 /// not committed counts in `uncommitted_turns` (exit 4), with no latch and
 /// no retry. With `store.commit.reply_lost` instead, the uncertain commit
-/// latches: `store_failed: true`.
+/// latches: `store_failed: true`, and the force session the closure pass
+/// can no longer close counts in `unclosed_sessions` (T3-S5 round 1,
+/// decision 4).
 #[test]
 fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
     for uncertain in [false, true] {
@@ -873,7 +875,7 @@ fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
         let status = daemon.exit(Duration::from_secs(20))?;
         let summary = daemon.summary()?;
         let expected = if uncertain {
-            summary["store_failed"] == true
+            summary["store_failed"] == true && summary["unclosed_sessions"] == 1
         } else {
             summary["uncommitted_turns"] == 1 && summary["store_failed"] == false
         };

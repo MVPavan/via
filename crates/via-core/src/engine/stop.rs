@@ -470,20 +470,24 @@ impl Engine {
     /// is still open in Store is closed with `session.closed`
     /// (`daemon_stop_force`) once every turn has a durable disposition.
     /// Returns how many could not be closed. Skipped after a Store failure,
-    /// whose exit is already incomplete; a session already closed in-path is
+    /// whose exit is already incomplete, and each session it leaves open
+    /// counts as unclosed; a session already closed in-path is
     /// read as closed and never closed twice. A session in `unjoined`, whose
     /// dispatcher still owns it, is not closed.
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
+        let total = sessions.len();
         let mut unclosed = 0;
-        for session in sessions {
+        for (index, session) in sessions.into_iter().enumerate() {
             if unjoined.contains(&session) {
                 unclosed += 1;
                 continue;
             }
             let admission = self.admission.lock().await;
             if self.store_failed() {
-                return 0;
+                // The pass cannot run: this and every later session stay
+                // open (T3-S5 round 1, decision 4).
+                return unclosed + (total - index);
             }
             if !self.close_forced(&session, &admission).await {
                 unclosed += 1;
