@@ -473,31 +473,50 @@ impl Engine {
     /// is still open in Store is closed with `session.closed`
     /// (`daemon_stop_force`) once every turn has a durable disposition.
     /// Returns how many could not be closed. Skipped after a Store failure,
-    /// whose exit is already incomplete, and each session it leaves open
-    /// counts as unclosed; a session already closed in-path is
-    /// read as closed and never closed twice. A session in `unjoined`, whose
-    /// dispatcher still owns it, is not closed.
+    /// whose exit is already incomplete: each session it has not visited is
+    /// then read, and counts as unclosed unless Store reads it closed (a
+    /// forced terminal may have closed it and lost its reply); an unreadable
+    /// one counts as unclosed (T3-S5 round 2, decision 12). A session
+    /// already closed in-path is read as closed and never closed twice. A
+    /// session in `unjoined`, whose dispatcher still owns it, is not closed.
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
-        let total = sessions.len();
         let mut unclosed = 0;
-        for (index, session) in sessions.into_iter().enumerate() {
-            if unjoined.contains(&session) {
+        for (index, session) in sessions.iter().enumerate() {
+            if unjoined.contains(session) {
                 unclosed += 1;
                 continue;
             }
             let admission = self.admission.lock().await;
             if self.store_failed() {
-                // The pass cannot run: this and every later session stay
-                // open (T3-S5 round 1, decision 4).
-                return unclosed + (total - index);
+                // The pass cannot run: this and every later session count
+                // unless they are durably closed (round 1 decision 4, round
+                // 2 decision 12).
+                drop(admission);
+                return unclosed + self.durably_open(&sessions[index..]).await;
             }
-            if !self.close_forced(&session, &admission).await {
+            if !self.close_forced(session, &admission).await {
                 unclosed += 1;
             }
         }
         lock(&self.force_sessions).take();
         unclosed
+    }
+
+    /// How many of `sessions` Store does not read as closed: a read that
+    /// fails counts the session as open. Read-only; Store's read reply
+    /// reports corruption (design §7.1).
+    async fn durably_open(&self, sessions: &[SessionId]) -> usize {
+        let mut open = 0;
+        for session in sessions {
+            if !matches!(
+                self.store.session_snapshot(session).await,
+                Ok(Some(snapshot)) if snapshot.closed
+            ) {
+                open += 1;
+            }
+        }
+        open
     }
 
     /// Closes one session for the closure pass; true when it is durably closed.

@@ -2208,3 +2208,57 @@ fn a_corrupt_queued_row_read_in_the_batch_latches() {
     };
     batch_read_corruption(&root, "store.read.corrupt.queued_turn");
 }
+
+/// T3-S5 round 2, decision 12 (design §6.8, §7.4): after a latch the
+/// closure pass does not run; it counts each force session Store does not
+/// read as closed. A durably closed session is not counted; an open one and
+/// one whose snapshot read is corrupt (`store.read.corrupt.snapshot`) are.
+#[test]
+fn after_a_latch_the_closure_pass_counts_durably_open_sessions() {
+    let Some(root) = child("after_a_latch_the_closure_pass_counts_durably_open_sessions") else {
+        return;
+    };
+    let point = "store.read.corrupt.snapshot";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let closed = new_session(&engine).await;
+        cancel(&engine, &closed, 1).await.unwrap();
+        let event = Event {
+            seq: 3,
+            session_id: &closed,
+            turn: None,
+            late: false,
+            at: &rfc3339(std::time::SystemTime::now()),
+            raw_ref: None,
+            body: EventBody::SessionClosed {
+                reason: super::drive::FORCE_CLOSE_REASON,
+            },
+        }
+        .to_value()
+        .unwrap();
+        assert!(
+            engine
+                .store
+                .commit_session_closed(&closed, event)
+                .await
+                .unwrap()
+        );
+        let open_session = new_session(&engine).await;
+        let unreadable = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![
+            closed.clone(),
+            open_session.clone(),
+            unreadable.clone(),
+        ]);
+        engine.latch().await;
+        // The pass reads the three snapshots in order: the third fails.
+        let n = arm_next(&points, point) + 2;
+        let command = json!({"token":FAILPOINT_TOKEN,"occurrence":n,"action":"fail_io"});
+        fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
+        let report = shutdown(&engine).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_eq!(report.unclosed_sessions, 2, "{report:?}");
+        assert_corruption_latched(&engine);
+    });
+}

@@ -848,16 +848,18 @@ fn s1_f12_force_closure_not_committed_counts_unclosed() -> TestResult {
 /// Design §7.2 row 15 [r3.11]: a forced terminal in final shutdown that is
 /// not committed counts in `uncommitted_turns` (exit 4), with no latch and
 /// no retry. With `store.commit.reply_lost` instead, the uncertain commit
-/// latches: `store_failed: true`, and the force session the closure pass
-/// can no longer close counts in `unclosed_sessions` (T3-S5 round 1,
-/// decision 4).
+/// latches: `store_failed: true`. The forced terminal carried
+/// `session.closed` and its reply was lost after it committed, so the
+/// session is durably closed and `unclosed_sessions` is 0: the pass that
+/// can no longer run counts only what is durably open (T3-S5 round 2,
+/// decision 12).
 #[test]
 fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
     for uncertain in [false, true] {
         let sandbox = Sandbox::new(&held("held", 1))?;
         sandbox.count("store.commit.reply_lost")?;
         let mut daemon = sandbox.start()?;
-        sandbox.spawn("held")?;
+        let (session, _) = sandbox.spawn("held")?;
         sandbox.await_file("held.entered")?;
         sandbox.arm("core.shutdown.before_forced_terminal", 1, "pause")?;
         sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -874,13 +876,17 @@ fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
         sandbox.ack(&daemon, point, occurrence, "fail_io")?;
         let status = daemon.exit(Duration::from_secs(20))?;
         let summary = daemon.summary()?;
+        let state: String =
+            sandbox.query(&format!("SELECT state FROM sessions WHERE id='{session}'"))?;
         let expected = if uncertain {
-            summary["store_failed"] == true && summary["unclosed_sessions"] == 1
+            summary["store_failed"] == true
+                && state == "closed"
+                && summary["unclosed_sessions"] == 0
         } else {
             summary["uncommitted_turns"] == 1 && summary["store_failed"] == false
         };
         check(status.code() == Some(4) && expected, || {
-            format!("uncertain {uncertain}: unexpected exit {status}: {summary}")
+            format!("uncertain {uncertain}: unexpected exit {status}, session {state}: {summary}")
         })?;
         sandbox.verify_anchors()?;
     }
