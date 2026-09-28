@@ -761,3 +761,327 @@ fn released_control_after_unobserved_vendor_exit_is_not_forced() {
         panic!("Host's status poll saw every vendor exit first");
     });
 }
+
+// ---------------------------------------------------------------------------
+// F22 isolated negatives (design T3 §9, §11; runtime §5.1–§5.2, §11): an
+// anchor record whose identity does not verify gets no command, and nothing
+// short of a same-boot, same-namespace `ESRCH` is quiescence.
+
+/// How the test-controlled listener at a forged anchor's socket answers.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// Nothing listens at the socket path.
+    Absent,
+    /// Replies to a challenge with the stored identity and the nonce.
+    Echo,
+    /// Replies with a nonce other than the one Host sent.
+    WrongNonce,
+    /// Replies with the stored identity under another marker.
+    OtherMarker,
+}
+
+/// This process's identity, which a same-process listener satisfies at
+/// the peer-credential check.
+fn own_identity(marker: &str) -> via_store::AnchorIdentity {
+    let process = std::process::id();
+    let (group, start_ticks) = process_stat(process).unwrap();
+    via_store::AnchorIdentity {
+        pid: process,
+        pgid: group,
+        uid: rustix::process::getuid().as_raw(),
+        boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned(),
+        pid_namespace: fs::read_link("/proc/self/ns/pid")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        start_ticks,
+        marker: marker.to_owned(),
+    }
+}
+
+/// `(pgid, start_ticks)` from `/proc/<pid>/stat`, if the process exists.
+fn process_stat(pid: u32) -> Option<(u32, u64)> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = text.get(text.rfind(')')? + 2..)?.split(' ').collect();
+    Some((fields.get(2)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
+/// A journal write's committed value; the fixture fails loudly otherwise.
+fn committed<T>(outcome: via_store::CommitOutcome<T>) -> T {
+    match outcome {
+        via_store::CommitOutcome::Committed(value) => Some(value),
+        via_store::CommitOutcome::NotCommitted(_) | via_store::CommitOutcome::Uncertain(_) => None,
+    }
+    .unwrap()
+}
+
+/// A live process in its own new group: a group Host must never signal.
+fn decoy_group() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
+/// Commits `identity` as a crashed daemon's anchor at `arm_intent`, serves
+/// its socket per `answer`, and runs one reconciliation bounded by 1 s.
+/// Returns Host's report and the request kinds the listener received.
+async fn reconcile_forged(
+    identity: via_store::AnchorIdentity,
+    answer: Answer,
+) -> (via_host::RecoveryReport, Vec<String>) {
+    let fixture = Fixture::new().await;
+    let journal = fixture.store.runtime_resources().into_wire_parts().1;
+    let (anchor_id, generation) = ("forged-anchor", "forged-generation");
+    let socket = fixture.root.join("anchors").join("forged.sock");
+    let intent = via_store::AnchorIntent {
+        anchor_id: anchor_id.to_owned(),
+        generation: generation.to_owned(),
+        marker: identity.marker.clone(),
+        socket_path: socket.clone(),
+        owner_session: SessionId::try_from("s_0123456789ab").unwrap(),
+        owner_turn: TurnNumber::try_from(1).unwrap(),
+        uid: identity.uid,
+        boot_id: identity.boot_id.clone(),
+        pid_namespace: identity.pid_namespace.clone(),
+    };
+    let version = committed(journal.commit_anchor_intent(intent).await).record_version;
+    let version = committed(
+        journal
+            .commit_anchor_identified(anchor_id, generation, version, identity.clone())
+            .await,
+    );
+    committed(
+        journal
+            .commit_arm_intent(anchor_id, generation, version)
+            .await,
+    );
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = match answer {
+        Answer::Absent => None,
+        Answer::Echo | Answer::WrongNonce | Answer::OtherMarker => {
+            Some(tokio::net::UnixListener::bind(&socket).unwrap())
+        }
+    };
+    let served = listener.map(|listener| {
+        let received = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_forged(stream, &identity, answer, &received).await;
+            }
+        })
+    });
+    let host = fixture.host();
+    let reports = host
+        .recover_page(
+            None,
+            via_store::ANCHOR_PAGE_LIMIT,
+            Deadline::at(tokio::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    if let Some(served) = served {
+        served.abort();
+    }
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let received = received.lock().unwrap().clone();
+    (reports.into_iter().next().unwrap(), received)
+}
+
+/// Records each request's kind and answers a challenge per `answer`.
+async fn serve_forged(
+    stream: tokio::net::UnixStream,
+    identity: &via_store::AnchorIdentity,
+    answer: Answer,
+    received: &std::sync::Mutex<Vec<String>>,
+) {
+    use tokio::io::AsyncBufReadExt as _;
+    let (read, mut write) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let kind = request["kind"].as_str().unwrap_or_default().to_owned();
+        received.lock().unwrap().push(kind.clone());
+        let reply = match kind.as_str() {
+            "challenge" => {
+                let nonce = match answer {
+                    Answer::WrongNonce => "0".repeat(32),
+                    Answer::Absent | Answer::Echo | Answer::OtherMarker => {
+                        request["nonce"].as_str().unwrap().to_owned()
+                    }
+                };
+                let marker = match answer {
+                    Answer::OtherMarker => "another-anchors-marker".to_owned(),
+                    Answer::Absent | Answer::Echo | Answer::WrongNonce => identity.marker.clone(),
+                };
+                serde_json::json!({"kind":"challenge","nonce":nonce,"identity":{
+                    "pid":identity.pid,"pgid":identity.pgid,"uid":identity.uid,
+                    "boot_id":identity.boot_id,"pid_namespace":identity.pid_namespace,
+                    "start_ticks":identity.start_ticks,"marker":marker}})
+            }
+            "stop" => serde_json::json!({"kind":"stopping","stopped_live":true}),
+            _ => return,
+        };
+        let mut bytes = serde_json::to_vec(&reply).unwrap();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Runtime §5.1, §11: a uid, start-ticks, group or marker mismatch between
+/// the stored identity and the live peer, its challenge reply or `/proc`
+/// never sends `Stop`, and the still-present group is never quiescent.
+#[test]
+fn recovery_sends_no_stop_on_an_identity_mismatch() {
+    runtime().block_on(async {
+        let mut decoy = decoy_group();
+        let own = own_identity("forged-marker");
+        let mut uid = own.clone();
+        uid.uid += 1;
+        uid.pgid = decoy.id();
+        let mut ticks = own.clone();
+        ticks.start_ticks += 1;
+        let mut group = own.clone();
+        group.pgid = decoy.id();
+        let cases = [
+            ("uid", uid, Answer::Echo),
+            ("start ticks", ticks, Answer::Echo),
+            ("pgid", group, Answer::Echo),
+            ("marker", own, Answer::OtherMarker),
+        ];
+        for (name, identity, answer) in cases {
+            let (report, received) = reconcile_forged(identity, answer).await;
+            assert!(
+                !received.iter().any(|kind| kind == "stop"),
+                "{name}: Host commanded an unverified anchor: {received:?}"
+            );
+            assert!(
+                matches!(report.cleanup, CleanupEvidence::Uncertain(_)) && !report.forced,
+                "{name}: {report:?}"
+            );
+        }
+        assert!(process_live(decoy.id()), "the decoy group was signalled");
+        decoy.kill().unwrap();
+        decoy.wait().unwrap();
+    });
+}
+
+/// Runtime §5.1, §11: a challenge reply that does not echo Host's nonce is
+/// refused although the identity matches: no `Stop`, no quiescence.
+#[test]
+fn recovery_refuses_a_forged_challenge() {
+    runtime().block_on(async {
+        let (report, received) =
+            reconcile_forged(own_identity("forged-marker"), Answer::WrongNonce).await;
+        assert_eq!(received, ["challenge"], "{report:?}");
+        assert!(
+            matches!(report.cleanup, CleanupEvidence::Uncertain(_)) && !report.forced,
+            "{report:?}"
+        );
+    });
+}
+
+/// Runtime §5.2: the anchor (group leader) exited alone and an original
+/// member survives. Nothing answers at the socket, so nothing is commanded;
+/// the group query still finds the member, so cleanup is never quiescent,
+/// and the member is never signalled.
+#[test]
+fn recovery_never_proves_a_group_whose_leader_alone_exited() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt;
+    runtime().block_on(async {
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & echo $!"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let member: u32 = line.trim().parse().unwrap();
+        let group = leader.id();
+        leader.wait().unwrap();
+        assert!(!process_live(group) && process_live(member));
+        let mut identity = own_identity("forged-marker");
+        identity.pid = group;
+        identity.pgid = group;
+        identity.start_ticks = 1;
+        let (report, received) = reconcile_forged(identity, Answer::Absent).await;
+        assert!(received.is_empty());
+        assert_eq!(
+            report.cleanup,
+            CleanupEvidence::Uncertain(via_host::CleanupReason::Deadline),
+            "{report:?}"
+        );
+        assert!(process_live(member), "the surviving member was signalled");
+        let member = rustix::process::Pid::from_raw(i32::try_from(member).unwrap()).unwrap();
+        rustix::process::kill_process(member, rustix::process::Signal::KILL).unwrap();
+    });
+}
+
+/// Runtime §5.2: a stored namespace other than this one is refused after
+/// the challenge and never probed; a group query denied by permission
+/// (another user's group, where one exists) is never absence.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "a machine without another user's group cannot show the denied probe; say so"
+)]
+fn recovery_never_proves_absence_from_a_foreign_namespace_or_denied_probe() {
+    runtime().block_on(async {
+        let mut decoy = decoy_group();
+        let mut foreign = own_identity("forged-marker");
+        foreign.pid_namespace = "pid:[1]".to_owned();
+        foreign.pgid = decoy.id();
+        let (report, received) = reconcile_forged(foreign, Answer::Echo).await;
+        assert!(!received.iter().any(|kind| kind == "stop"), "{received:?}");
+        assert_eq!(
+            report.cleanup,
+            CleanupEvidence::Uncertain(via_host::CleanupReason::UnverifiedAnchor),
+            "{report:?}"
+        );
+        assert!(process_live(decoy.id()), "the decoy group was signalled");
+        decoy.kill().unwrap();
+        decoy.wait().unwrap();
+        // A denied probe needs a group this user may not signal; a root
+        // run, or a machine without one, cannot show it.
+        let Some(other) = denied_group() else {
+            eprintln!("no group of another user to probe: denied-probe case not exercised");
+            return;
+        };
+        let mut denied = own_identity("forged-marker");
+        denied.pid = other;
+        denied.pgid = other;
+        let (report, received) = reconcile_forged(denied, Answer::Absent).await;
+        assert!(received.is_empty());
+        assert_eq!(
+            report.cleanup,
+            CleanupEvidence::Uncertain(via_host::CleanupReason::ProbeDenied),
+            "{report:?}"
+        );
+    });
+}
+
+/// A live group leader (pid = pgid > 1) whose group this process may not
+/// signal: the existence query itself answers `EPERM`.
+fn denied_group() -> Option<u32> {
+    fs::read_dir("/proc").ok()?.find_map(|entry| {
+        let leader: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+        let (group, _) = process_stat(leader)?;
+        let query = rustix::process::Pid::from_raw(i32::try_from(group).ok()?)?;
+        (group == leader
+            && group > 1
+            && rustix::process::test_kill_process_group(query) == Err(rustix::io::Errno::PERM))
+        .then_some(group)
+    })
+}

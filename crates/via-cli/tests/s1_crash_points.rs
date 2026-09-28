@@ -2128,10 +2128,11 @@ fn s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits() -> TestRes
             check(resume.status.success(), || "resume refused".to_owned())?;
             daemon.kill()?;
             drop(daemon);
-            // Recovery commits turn 1's `cancel.requested`, `cancel.settled`
-            // and terminal; the handoff's cancellation of turn 2 is fourth.
+            // Recovery commits turn 1's `raw_log.incomplete`,
+            // `cancel.requested`, `cancel.settled` and terminal; the
+            // handoff's cancellation of turn 2 is fifth.
             let lost = "store.commit.reply_lost";
-            paths.failpoints.arm(lost, 4, "fail_io").map_err(infra)?;
+            paths.failpoints.arm(lost, 5, "fail_io").map_err(infra)?;
             let (status, trace) = refused_start(paths, evidence, "refused")?;
             check(
                 !status.success() && trace.contains("restart handoff failed"),
