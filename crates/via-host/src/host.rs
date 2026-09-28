@@ -178,14 +178,14 @@ impl Capacity {
         ledger.stopping
     }
 
-    /// Sets the sticky `stopping` flag and snapshots the armed live
-    /// controls, atomically with registration, the ARM gate and the armed
-    /// mark (design §6.8 [r5.2, r6.1]).
-    fn begin_stopping(&self) -> (Instant, Vec<LiveControl>) {
+    /// Sets the sticky `stopping` flag to `deadline`, the force's instant
+    /// plus 3 s, and snapshots the armed live controls, atomically with
+    /// registration, the ARM gate and the armed mark (design §6.8 [r5.2,
+    /// r6.1]). The deadline is never taken from the clock here: a delayed
+    /// task must not gain a fresh budget.
+    fn begin_stopping(&self, deadline: Instant) -> (Instant, Vec<LiveControl>) {
         let mut ledger = self.lock();
-        let deadline = *ledger
-            .stopping
-            .get_or_insert_with(|| Instant::now() + EARLY_STOP);
+        let deadline = *ledger.stopping.get_or_insert(deadline);
         let controls = ledger
             .live
             .values()
@@ -817,18 +817,25 @@ impl Host {
     /// the ledger through its verified control, concurrently, each bounded
     /// at the signal time plus 3 s, recording the anchor's `stopped_live`
     /// in the control's stop facts; it polls no caller and commits nothing.
-    /// A control registered after that snapshot is stopped at once. The task
-    /// is Host-owned: [`Host::shutdown`] retires it when force never came.
-    pub fn watch_force(&self, mut force: watch::Receiver<bool>) {
+    /// The signal carries the instant Core raised the force (`None` until
+    /// then), and that instant, not the one this task runs at, anchors the
+    /// bound and every stop after it. A control registered after the
+    /// snapshot is stopped at once. The task is Host-owned:
+    /// [`Host::shutdown`] retires it when force never came.
+    pub fn watch_force(&self, mut forced: watch::Receiver<Option<Instant>>) {
         let ledger = self.capacity.clone();
         let mut retire = self.retire.subscribe();
         let task = tokio::spawn(async move {
-            tokio::select! {
+            let forced_at = tokio::select! {
                 biased;
-                () = raised(&mut force) => {}
+                at = raised_at(&mut forced) => at,
                 () = raised(&mut retire) => return Ok(()),
-            }
-            let (deadline, controls) = ledger.begin_stopping();
+            };
+            // Test builds: the force woke this task, which has taken nothing
+            // yet; a pause here delays the task as a blocked runtime would.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("host.early_stop.woken").await;
+            let (deadline, controls) = ledger.begin_stopping(forced_at + EARLY_STOP);
             // Test builds: the snapshot is taken and no Stop sent yet.
             #[cfg(feature = "test-failpoints")]
             let _ = via_store::failpoint::hit_async("host.early_stop.snapshot").await;
@@ -1931,6 +1938,17 @@ async fn raised(signal: &mut watch::Receiver<bool>) {
     if signal.wait_for(|raised| *raised).await.is_err() {
         std::future::pending::<()>().await;
     }
+}
+
+/// Resolves with the instant the force was raised; never when its sender is
+/// gone unraised.
+async fn raised_at(signal: &mut watch::Receiver<Option<Instant>>) -> Instant {
+    if let Ok(at) = signal.wait_for(Option::is_some).await
+        && let Some(at) = *at
+    {
+        return at;
+    }
+    std::future::pending().await
 }
 
 /// Sends `Stop` through a verified control, bounded by `deadline`; records

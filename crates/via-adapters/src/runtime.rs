@@ -254,9 +254,10 @@ impl AdapterRuntime {
     }
 
     /// Subscribes Host's early-stop task to the daemon force signal (design
-    /// §6.8); call once, from within the daemon's runtime.
-    pub fn watch_force(&self, force: watch::Receiver<bool>) {
-        self.route.watch_force(force);
+    /// §6.8), which carries the instant the force was raised (`None` until
+    /// then); call once, from within the daemon's runtime.
+    pub fn watch_force(&self, forced: watch::Receiver<Option<tokio::time::Instant>>) {
+        self.route.watch_force(forced);
     }
 
     /// Recovers one page of committed anchors, up to `limit` after the

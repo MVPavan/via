@@ -67,6 +67,7 @@ POINTS = [
     "host.anchor.defer_cleanup",
     "host.anchor.stop_received",
     "host.anchor.arm_received",
+    "host.early_stop.woken",
     "host.early_stop.snapshot",
     "host.early_stop.sent",
     # Task 3 S2 (design §10): turn-control seams.

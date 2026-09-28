@@ -268,9 +268,10 @@ impl FakeRoute {
         self.wire.pending_cleanup()
     }
 
-    /// Subscribes Host's early stop to the daemon force signal (design §6.8).
-    pub fn watch_force(&self, force: watch::Receiver<bool>) {
-        self.wire.watch_force(force);
+    /// Subscribes Host's early stop to the daemon force signal (design §6.8),
+    /// which carries the instant the force was raised.
+    pub fn watch_force(&self, forced: watch::Receiver<Option<tokio::time::Instant>>) {
+        self.wire.watch_force(forced);
     }
 
     async fn drive(

@@ -461,6 +461,10 @@ pub(super) struct Signal {
     pub(super) stop: StdMutex<Option<StopMode>>,
     /// Tells running drives to force-close their execution (C1 §3.14 `force`).
     pub(super) force: watch::Sender<bool>,
+    /// When the force was first raised, for Host's early stop: its 3 s
+    /// bound runs from this instant, not from when its task wakes (design
+    /// §6.8). Raised only with `force`, by [`Signal::raise_force`].
+    pub(super) forced_at: watch::Sender<Option<tokio::time::Instant>>,
     /// When the force stop was accepted: every forced turn's `requested_at`.
     pub(super) force_requested_at: OnceLock<String>,
     /// Phase one of the latch: a failed or uncertain write, or corruption,
@@ -477,6 +481,7 @@ impl Signal {
         Self {
             stop: StdMutex::new(None),
             force: watch::Sender::new(false),
+            forced_at: watch::Sender::new(None),
             force_requested_at: OnceLock::new(),
             failure_pending: AtomicBool::new(false),
             failures: StdMutex::new(FailureRecord::default()),
@@ -548,6 +553,20 @@ impl Signal {
         self.failed_at.get_or_init(tokio::time::Instant::now);
         self.force_requested_at
             .get_or_init(|| rfc3339(SystemTime::now()));
+        self.raise_force();
+    }
+
+    /// Raises the force: records the instant for Host's early stop, first
+    /// raise wins (a force stop and the latch may both raise it), then wakes
+    /// the force watchers.
+    pub(super) fn raise_force(&self) {
+        self.forced_at.send_if_modified(|at| {
+            let first = at.is_none();
+            if first {
+                *at = Some(tokio::time::Instant::now());
+            }
+            first
+        });
         self.force.send_replace(true);
     }
 }
