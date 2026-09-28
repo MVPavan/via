@@ -615,3 +615,98 @@ Run at `f7a06a5`, each a separate step, logs in `scratchpad/t3-force-row/g2-*.lo
    (`eventually`, 3 s) because the acquisition returns as soon as its write
    completes, before the anchor process acknowledges. My first draft asserted
    it immediately and failed for that reason only.
+
+# Decision 5, round 3: a late `Stopping` reply records no forced evidence
+
+Status: DONE_WITH_CONCERNS. Commit `0c345c5` on `wt/t3-force-row`, on top of
+`b08b4e8`. Sol's review of round 2 (SOUND WITH CHANGES) confirmed D5-1 and
+D5-2, the exactly-one-of-three argument and the lock order. Its first
+finding, a late reply recording forced evidence, is fixed here. Its second
+finding, the spec wording on the 3 s bound against a late write, is the
+coordinator's to write into runtime-contracts §7 and design §6.8; no spec or
+design text and no bounded-write change is made here.
+
+## The finding and the fix
+
+`ControlConnection::transact_by` waited for the reply with
+`timeout_at(deadline, read)`. Tokio polls the wrapped future before the timer,
+so a task that ran after the deadline, with the reply already waiting, got
+`Ok(reply)` back, and `stop_through` recorded `StopFacts.forced` from it.
+D5-3 said a reply at or after the recorded deadline records no forced
+evidence; this path broke that.
+
+`transact_by` now checks the clock right after a successful read and returns
+the same `TimedOut` error if `Instant::now() >= deadline`. `stop_through` is
+unchanged: an `Err` reply already records nothing, and the cleanup deadline is
+set by the caller before the `Stop` (`stop_early` or `cleanup_by`), so the
+cleanup stays `Uncertain(Deadline)` and step 4 supplies the proof, as in the
+round-2 test `a_stop_after_its_deadline_is_still_sent_and_leaves_absence_to_reconciliation`
+(asserts `!failure.forced` and `Uncertain`). The check is in `transact_by`
+rather than `stop_through` so the clock read sits next to the read that
+returned; a reply that arrived a moment before the deadline but was polled
+just after it is treated as late, which is the conservative side.
+
+## Test
+
+`a_ready_reply_after_the_deadline_records_no_forced_evidence` (Host unit, socket
+pair, no clock, no sleep): the anchor's side writes `Stopping { stopped_live:
+true }` first, the test awaits the control socket readable so the reactor has
+recorded its readiness, then `stop_through` runs with an already expired
+deadline. It asserts no forced return, no forced fact on `StopFacts`, and that
+the `Stop` was still written.
+
+- RED on the round-2 tip (test only added, uncommitted): fails with
+  `a reply past the deadline recorded forced evidence`
+  (`scratchpad/t3-force-row/red-r3.log`). Again by mutation, the clock check
+  removed from the fixed tree, three runs, three failures
+  (`red-r3-x3.log`); the fix was restored byte for byte from a saved copy.
+- A first draft without the `readable().await` passed on the tip. A fresh
+  `UnixStream` records no readiness until the reactor runs once, so the read's
+  first poll was pending and the expired timer won; that draft did not
+  exercise the finding. Awaiting readability is what makes the reply "in hand"
+  for the first poll, which is the blocked-runtime case Sol described.
+- GREEN: the test passes, five repeats of the four `stop_through` tests all
+  pass; the Host suite passed 63 of 63 five times.
+
+## Files changed
+
+`crates/via-host/src/host.rs` only: `transact_by`, the `stop_through` doc, and
+the new unit test. No other file, no failpoint, no shared or worker-X file.
+
+## Gate
+
+Run at `0c345c5`, each a separate step, logs in `scratchpad/t3-force-row/g3-*.log`.
+
+| Step | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings`, default and `--features via-cli/test-failpoints` | pass, pass |
+| `cargo nextest run --locked --workspace` | 297 passed, 1 skipped (was 296; +1 test). See concern 1: the first run had one intermittent failure, then three clean reruns |
+| `cargo nextest run --locked --workspace --features via-cli/test-failpoints`, run 1 to 3 | 430 passed, 1 skipped each time (was 429; +1 test) |
+| `cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 52 passed (unchanged) |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+| `python3 scripts/check-layers.py` | pass |
+| `cargo build --locked --release -p via-cli --no-default-features`, then `python3 scripts/check-release-features.py target/release/via` | pass: none of 90 markers present |
+| Host suite with failpoints x5 | 63 of 63 each time |
+
+## Concerns and limits
+
+1. The first default run failed one test,
+   `via-core::route_stream::acquisition_deadline_before_force_keeps_deadline`
+   (`ForceStopped` instead of `Deadline`, `g3-default.log`). Three reruns of
+   the whole suite passed 297 of 297, and ten runs of the test alone passed.
+   This is the intermittent already recorded for the test in `T3-S1.md`
+   ("one warm run ... passed 12 of 12 in isolation"): it races the acquisition
+   deadline against a force 50 ms later. Round 3 changes `host.rs`'s
+   `transact_by` only, which that test's path does not call (it takes no
+   early stop). I did not fix the test; it is not in scope, and its 50 ms
+   margin is the cause.
+2. `ProcessControl::close` (`host.rs`, `timeout_at` around the lock, the
+   `Stop` write and the reply) has the same polled-first shape: a reply ready
+   after the request deadline would set `StopFacts.forced`. It was not
+   changed: the brief is `stop_through`, and `close`'s deadline is the
+   caller's own request deadline, not the recorded force bound. The
+   coordinator may want the same clock check there under runtime §7's wording.
+3. The check refuses a reply polled at or after the deadline even if the anchor
+   sent it earlier. Forced evidence is then lost and step 4 decides, which is
+   the direction the decision names.
