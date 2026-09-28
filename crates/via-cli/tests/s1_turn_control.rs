@@ -2038,6 +2038,87 @@ fn s1_close_failed_closed_keeps_closing_count() -> TestResult {
     Ok(())
 }
 
+/// Design §4 steps 4–5, §6.8 [r4.6, r5.9], the force variant (S5 owns the
+/// latch variant): a close waits in its bounded absence check, its
+/// session's group unproven (the anchor held at
+/// `host.anchor.before_eof_cleanup`), and a second close subscribes to the
+/// same attempt. The second close holds `admission` from its pause at
+/// `core.close.before_subscribe` through its subscription, and a stop
+/// takes `admission`, so it subscribes before the force. `daemon stop
+/// --force` ends the absence check on the force watch, so the attempt
+/// publishes no close result, and both waiters reply `daemon_stopping`. No
+/// waiter is left: the daemon exits once the group is gone.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_waiter_resolves_on_force() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "slow",
+        1,
+        vec![json!({"action":"report_pids"}), accepted(1)],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let arm_intent = "host.anchor.after_arm_intent_commit";
+    let eof_cleanup = "host.anchor.before_eof_cleanup";
+    let subscribe = "core.close.before_subscribe";
+    sandbox.arm(arm_intent, 1, "pause")?;
+    sandbox.arm(eof_cleanup, 1, "pause")?;
+    let (session, handle) = sandbox.spawn("slow", &[])?;
+    sandbox.ack(&daemon, arm_intent, 1, "pause")?;
+    sandbox.ok(&["cancel", &session, "--handle", &handle, "--json"])?;
+    sandbox.resume_point(arm_intent, 1)?;
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    check(envelope["cancel"]["cleanup"] == "uncertain", || {
+        format!("the group was proved absent: {envelope}")
+    })?;
+    sandbox.arm(subscribe, 2, "pause")?;
+    let close = [
+        "close",
+        &session,
+        "--deadline-ms",
+        "30000",
+        "--handle",
+        &handle,
+        "--json",
+    ];
+    let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
+        let first = scope.spawn(|| {
+            sandbox
+                .refused(&close, "daemon_stopping")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.await_row(
+            &format!("SELECT admission FROM sessions WHERE id='{session}'"),
+            "closing",
+        )?;
+        let second = scope.spawn(|| {
+            sandbox
+                .refused(&close, "daemon_stopping")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.ack(&daemon, subscribe, 2, "pause")?;
+        sandbox.resume_point(subscribe, 2)?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        let first = first.join().map_err(|_| "first close panicked")??;
+        let second = second.join().map_err(|_| "second close panicked")??;
+        Ok((first, second))
+    })?;
+    check(
+        first["data"]["kind"] == "daemon_stopping" && second["data"]["kind"] == "daemon_stopping",
+        || format!("close replies: {first} {second}"),
+    )?;
+    sandbox.process_ack(eof_cleanup, 1, "pause")?;
+    sandbox.resume_point(eof_cleanup, 1)?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(0), || {
+        format!("force exit {status}: {}", sandbox.trace())
+    })?;
+    drop(daemon);
+    sandbox.disarm(eof_cleanup)?;
+    sandbox.disarm(subscribe)?;
+    Ok(())
+}
+
 /// Design §3.4, §6.8 [r3.4, r4.9]: a `cancel --wait` whose order is in
 /// place, then `daemon stop --force`. The turn is handed to final shutdown,
 /// paused at `core.shutdown.before_forced_terminal`; the waiter has not
