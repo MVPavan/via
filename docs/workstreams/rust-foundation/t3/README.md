@@ -14,7 +14,8 @@ orchestrator dispatches implementation slices on disjoint files.
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
 | T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); three local fix rounds; merged `4a1c11c` (Sol medium SOUND, `sol-review-S1-r3.md`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); rounds 1–3: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
 | T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2); two local fix rounds; merged `dd2a81d` (Sol medium SOUND, `sol-review-S2-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md`, `s2-r1-decisions.md` |
-| T3-S3 | Daemon lifecycle: stop, drain, force, idle exit, final-shutdown pipeline, status, re-probe loop, early-stop wiring (design §13 S3) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s3` | `s3.md` |
+| T3-S3 | Daemon lifecycle: stop, drain, force, idle exit, final-shutdown pipeline, status, re-probe loop, early-stop wiring (design §13 S3); two local fix rounds; merged `d69e6d0` (Sol medium; last finding deferred to `via-pvj.2`, `sol-review-S3-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s3` | `s3.md`, `s3-r1-decisions.md` |
+| T3-S5 | Store failures: F12 and O1, scoped and latch paths, status health, carried items from S1–S4 (design §13 S5) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s5` | `s5.md` |
 | T3-S4 | Recovery evidence: raw incompleteness, durable cancel events, corrupt-row handoff, F9, F22, F23 (design §13 S4); parallel with S3; two local fix rounds; merged `3ca53e4` (Sol medium SOUND, `sol-review-S4-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s4` | `s4.md`, `s4-r1-decisions.md` |
 
 ## Carried into Task 3
@@ -121,3 +122,18 @@ of failing them, and carries the warning. Sol round-2 check SOUND
 (`sol-review-S4-r2.md`). S4 merged at `3ca53e4` (gate: 243 / 2, failpoints 316 / 2 three times,
 F08–F12 19, release check clean); decisions 1–8 are in
 `s4-r1-decisions.md`, and the items carried into S5 are in design §13.
+
+S3 delivered at `e3d542d`. Sol medium reviewed it in two parts
+(`sol-review-S3-shutdown.md`, `sol-review-S3-serving.md`), both SOUND WITH
+CHANGES: a force-set read across two locks, a dispatcher aborted but not
+joined before Host reconciliation, resumed paging starved while this
+daemon owned groups, an unbounded pre-`hello` read, the Store probe's
+writer boundary, the re-probe backoff reset and a nested ledger lock.
+Round 1 (`ec5880d`) fixed all of them (decisions 1–9); the resumed-paging
+fix bounds paging to the startup anchor cohort. Round 2 (`0079b0d`) bound
+`StoreLock` to its State directory (decision 10). Sol's last finding, a
+same-user replacement of the State directory between lock and open, is
+deferred to the platform gate `via-pvj.2` under runtime §6 (decision 11).
+S3 merged at `d69e6d0`, on top of S4. The gate on the merged tree:
+263 / 1, failpoints 351 / 1 three times, F08–F12 19, release check clean. S5 then starts (`s5.md`); its §13 entry carries S1–S4's
+leftovers.

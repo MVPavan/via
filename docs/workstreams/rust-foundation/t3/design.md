@@ -8,7 +8,8 @@ the final `design-r6-decisions.md` (`[r6.1]`). The design is final after
 round 6; later findings are handled in the slices' code reviews. S1's
 review decisions are in `s1-r1-decisions.md` (`[s1.4]`), and choices S1
 made where the design was open are in `reports/T3-S1.md` (`[S1]`). S2's
-are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`), and S4's
+are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`), S3's in
+`s3-r1-decisions.md` (`[s3.1]`) and `reports/T3-S3.md` (`[S3]`), and S4's
 in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
@@ -637,8 +638,21 @@ Then subscribe to the slot's close watch, still under `admission`; release
      the budget ends.
   4. Any other child exit: print the captured stderr and exit 4.
   5. A connect, reset or EOF before `hello` completes is retried within the
-     budget. A failure after a request was written is never retried: no
+     budget, and each pre-`hello` read is bounded by the remaining budget,
+     not the request's read timeout [s3.4]. A failure after a request was
+     written is never retried: no
      request is resent.
+- **Existing-Store probe** (F11) [s3.5, s3.10]. It runs only under
+  `store.lock`, and the lock guard is bound to the State directory's
+  identity (device and inode); a mismatch is refused. With no `-wal` the
+  probe opens the Store `immutable=1`, which creates no sidecar. With a
+  `-wal` it uses the ordinary read-only open, which may create `-shm`:
+  SQLite has no read of a WAL that leaves the directory untouched
+  (`immutable` ignores the WAL). That sidecar is a documented limit; the
+  refusal itself stays correct. Writers outside VIA's locks are
+  unsupported. A same-user replacement of the State directory between the
+  lock and the path-based open is not detected: descriptor-relative opens
+  are the platform gate's (runtime §6, `via-pvj.2`) [s3.11].
 - **CLI runtime directory check.** Before it connects or spawns, the CLI
   runs the daemon's own check (`server::validate_dir`) on an existing
   runtime root. An unsafe root is reported and exits 4 (F3).
@@ -828,6 +842,10 @@ policy.
    dispatcher start under `admission`, so the start drain below sees it.
 5. The re-check only feeds pipeline step 2. It never returns daemon main to
    serving work [r4.7].
+6. Daemon main keeps accepting and serving requests while entry and the
+   pipeline run; only its starts arm is disabled once entry begins. Idle
+   expiry is the exception: it drops the listener and unlinks the socket
+   before entry [S3].
 
 **Ordered pipeline.** Final shutdown runs these steps in order:
 
@@ -835,7 +853,12 @@ policy.
 2. drain the dispatcher starts (the start channel and the pending set,
    dispatch-design §5);
 3. join the dispatchers, and collect their handoffs: forced turns, and
-   the affected turns for the batch;
+   the affected turns for the batch. The join is bounded at
+   `deadline − (FINALIZE_RESERVE + ABORTED_JOIN)`; the remaining
+   dispatchers are then aborted and joined until
+   `deadline − FINALIZE_RESERVE`. A session whose dispatcher still has not
+   joined is left out of steps 4–6: its turns stay for restart recovery,
+   and shutdown is incomplete (exit 4) [s3.2];
 4. **Host reconciliation** over the collected turns (`adapter.shutdown`),
    gathering its evidence: proved absence and `forced` [r4.2]. It connects,
    challenges and sends `Stop` only to an anchor whose durable phase is
@@ -844,7 +867,10 @@ policy.
    controller. It gets the absence check alone (A20) [s1.5];
 5. **finalize exactly those turns with that evidence**: each ordinary
    forced terminal, or the latch batch (§7.4). Route's close evidence and
-   reconciliation's evidence each count (runtime §6.2) [r4.2];
+   reconciliation's evidence each count (runtime §6.2) [r4.2]. With the
+   early stop wired, Host may end the vendor before Route sees the force;
+   a vendor exit Route observes under the daemon force is the force row
+   (`ForceStopped`), not `process_exited` [S3];
 6. the closure pass.
 
 **Shutdown budgets** [r4.2, r5.10]. This is the one table of final-shutdown
@@ -1340,7 +1366,9 @@ It runs only while holdings exist:
 - `RecoveredSlots` groups, identified or unidentified;
 - Host ledger entries with no live control.
 
-It passes at 1 s, doubling to 10 s, and resets when a holding is added.
+It passes at 1 s, doubling to 10 s, and resets when a holding is added:
+Host's holdings generation wakes the loop, also during a wait or a pass
+[s3.6].
 
 **Lifetime** [r1.15]. Re-probing continues through a drain, so capacity can
 return while drained turns wait for a slot. It stops, and is joined by
@@ -1378,6 +1406,13 @@ Each pass does two things:
 2. **Unidentified groups.**
    - The interrupted startup reconciliation resumes from the cursor saved
      in `engine/slots.rs`, one `recover_page` per pass.
+   - It reads only the startup cohort. When startup left anchors unread,
+     daemon main reads the largest anchor rowid after recovery and before
+     any dispatcher start or admission, and every resumed read is bounded
+     by it. This daemon's anchors are all above the bound, so paging
+     progresses while it owns groups. The bound holds because Store never
+     deletes, replaces or vacuums an anchor, and because of that startup
+     order. Revisit if anchor retention is added [s3.3].
    - Each anchor read becomes an identified holding or a proof.
    - After the page, the unidentified count is recomputed with
      `unproven_anchors_up_to(cursor, pool)`. It reaches 0 when the cursor
@@ -1499,7 +1534,8 @@ Failpoints, in test builds only:
 | `daemon.shutdown.idle_final` | inside idle-mode final shutdown, after the socket unlink (F6) [r1.23] |
 
 Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
-`client_version` (F4) [r1.23].
+`client_version` (F4) [r1.23], and the version of a daemon that CLI spawns
+[S3].
 
 **F12 seams** [O1], in test builds only:
 
@@ -1688,6 +1724,23 @@ latch. S5 lists each re-pointed test in its report.
   `s1_cancel_queued_read_failure_is_plain_store_error` (transient read).
 - A session-filtered re-probe counts only that session's held groups
   [s2.3].
+
+**S3 adaptations** [S3] (`reports/T3-S3.md`):
+
+- `s1_close_failed_closed_keeps_closing_count`: a pause inside
+  `store.commit.closed` holds `admission`, so `daemon stop` blocks rather
+  than being refused. S3's status half holds the close in its absence
+  check instead (anchor paused at `host.anchor.before_eof_cleanup`). S5's
+  failure half uses `fail_io`, not a pause [s3.8].
+- `s1_close_outcome_retained_for_late_subscriber`, force variant: the
+  caller paused at `core.close.before_subscribe` is a keyed replay that
+  enters after the force; the first caller, which passed the seam earlier,
+  proves publication.
+- The `s1_crash_points.rs` barriers count seam hits with a
+  different-token command (`support/hits.rs`), so the waiters' own hits do
+  not pause.
+- `s1_close_waiter_resolves_on_force_and_latch`: S3 has the force
+  variant; the latch variant is S5's [s3.8].
 
 ## 12. Amendments requested
 
@@ -1946,6 +1999,12 @@ behaviour change.
   - new `via-cli/tests/s1_store_failure.rs`, the F12 unit tests in
     `engine/tests.rs`, and the re-pointed latch tests in
     `s1_crash_points.rs` and `s1_daemon_stop.rs`.
+- Carried from S3 [s3.8]: the latch variant of
+  `s1_close_waiter_resolves_on_force_and_latch`; the two variants of
+  `s1_cancel_wait_across_force_handoff` (an unacknowledged order replying
+  `already_terminal: true`; a forced terminal that never commits); the
+  failure half of `s1_close_failed_closed_keeps_closing_count`, with
+  `fail_io`; the row-12 latch in the re-probe pass.
 - Carried from S4 [s4.4, s4.8]:
   - the live corrupt-row rule must make progress for a corrupt row queued
     behind an `unknown` turn once its cleanup settles (today

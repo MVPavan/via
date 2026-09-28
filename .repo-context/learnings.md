@@ -32,3 +32,18 @@ in the design record (`docs/`), not here.
   (orphan set, then a 250 ms polling wait loop) that the next review found
   broken. Design the state machine first and review the design; see
   `docs/workstreams/rust-foundation/cloud-and-local.md` §6 "Convergence".
+- Local implementer workers committed trees that fail clippy three times
+  despite the brief (T3-S2 `42acc87`, `536b5c9`; T3-S3 `3448112`); once a
+  `| tail -1` pipe hid the failing exit status. Dispatch must say: run the
+  gate in order, stop at the first failure, never pipe a check so its status
+  is lost, never commit a tree that fails fmt or clippy. The orchestrator's
+  merged-tree gate catches the result, not the intermediate commit.
+- Writing a Codex review brief with an unquoted heredoc (`<<EOF`) executes
+  backticked names such as `via cancel` as commands and silently drops them
+  from the brief. Use `<<'EOF'`, and check the brief before launch.
+- Claude Code subagent transcripts (`<session>/subagents/*.jsonl`, CLI
+  2.1.283) log each message's stream-start usage: `output_tokens` is 2–16,
+  never the final count; input and cache fields are complete. Main-session
+  and `claude -p` transcripts log final usage. Estimate subagent output
+  from content size, calibrated on main-session messages, and label it an
+  estimate (a local script is in the gitignored `scratchpad/usage/`).

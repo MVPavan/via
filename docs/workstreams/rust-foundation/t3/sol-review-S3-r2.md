@@ -1,0 +1,11 @@
+GPT-6 Sol medium check of T3-S3 fix round 2 (`ec5880d..0079b0d` on local `wt/t3-s3`): decision 10.
+
+**Verdict: SOUND WITH CHANGES.** Decision 10 closes the wrong-directory guard case, but the directory identity is not pinned through the open.
+
+**Important — directory replacement can separate the lock from the Store.** At `wt/t3-s3:crates/via-store/src/runtime.rs:868–881`, `StoreLock::acquire` opens and locks `store.lock`, then obtains the State identity by looking up the path again. If that directory is replaced between those steps, the recorded device and inode can belong to a directory that does not contain the locked file. At `runtime.rs:935–948`, `open_locked` rejects an observed mismatch before reading the Store, but replacement after its identity check can make the later path-based database open reach a different directory. `validate_state` checks a path at one instant; `NOFOLLOW` on the lock and SQLite files does not prevent directory renames or swaps. **Fix:** retain an opened State directory descriptor, acquire `store.lock` relative to it, and open Store resources relative to that same descriptor; add a directory-replacement regression.
+
+The inspected callers pass the expected path: daemon startup acquires the lock for `paths.state` and passes that path to `Engine::open_locked`; `Store::open` acquires its own lock, and the other in-tree test calls use it. I found no direct caller that deliberately opens a Store with an unrelated guard. Those call paths remain subject to the directory-replacement race above.
+
+The new wrong-directory test **would fail before the fix for the stated reason**: the old `open_locked` accepted A’s guard while opening B despite B’s held lock. The worker reports it passes after `fd25ad3`; I verified the test and code paths, but did not run or independently reproduce either result.
+
+I inspected the specified diff, prior review and decision, worker report, validation code, and callers. I did not run `cargo` or `bd`, inspect the worker’s local logs, check out the branch, or trial-merge S3.
