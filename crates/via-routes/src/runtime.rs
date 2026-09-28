@@ -425,8 +425,15 @@ impl Control {
                 "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
                 self.turn.get()
             );
-            // Not written or cut short: `force_at` still bounds the turn.
-            let _ = wire.write_frame(frame.as_bytes(), deadline).await;
+            // Not written or cut short: `force_at` still bounds the turn. A
+            // raw evidence failure fails the connection (design §7.2 row 6):
+            // the group is force-closed under `now + 3 s` and the cause keeps
+            // its Store kind, so `WriterLost` and `Uncertain` still latch.
+            if let Err(error) = wire.write_frame(frame.as_bytes(), deadline).await
+                && let Some(cause) = interrupt_failure(self.turn, &error)
+            {
+                return Err(cause.into());
+            }
         }
         Ok(())
     }
@@ -784,6 +791,32 @@ fn raw_failure(error: &StoreError) -> StoreFailure {
     }
 }
 
+/// The cause a failed interrupt write ends the turn with (design §2 rule 3,
+/// §7.2 row 6). The interrupt's raw record failed: the connection fails with
+/// its classified cause. A transport failure is tolerated, because
+/// `force_at` still bounds the turn.
+fn interrupt_failure(turn: TurnNumber, error: &WireError) -> Option<RouteError> {
+    match error {
+        WireError::Raw(_)
+        | WireError::RawDeadline
+        | WireError::Frame(WireFailure::RawStore | WireFailure::RawRangeMismatch) => {
+            Some(wire_cause(turn, error))
+        }
+        WireError::Host(_)
+        | WireError::Io(_)
+        | WireError::Deadline
+        | WireError::Cancelled
+        | WireError::Woken
+        | WireError::Acquire { .. }
+        | WireError::Frame(
+            WireFailure::FrameTooLarge
+            | WireFailure::UnterminatedFrame
+            | WireFailure::Overflow
+            | WireFailure::Transport,
+        ) => None,
+    }
+}
+
 /// Keeps a Wire failure's cause for Core's C1 class decision.
 fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
     match error {
@@ -844,7 +877,7 @@ fn transport(turn: TurnNumber) -> RouteError {
 mod tests {
     use super::{
         FakeMessage, HostError, Phase, RouteError, StoreError, StoreFailure, TurnNumber, WireError,
-        raw_failure, wire_cause,
+        WireFailure, interrupt_failure, raw_failure, wire_cause,
     };
 
     fn decode(json: &str) -> FakeMessage {
@@ -955,6 +988,45 @@ mod tests {
                 }),
             );
             assert_eq!(cause, RouteError::Store { turn, kind });
+        }
+    }
+
+    /// S1 round-1 decision 4: a raw failure at the interrupt write ends the
+    /// turn with its Store kind, so `WriterLost` and `Uncertain` still latch;
+    /// a transport failure there is tolerated.
+    #[test]
+    fn interrupt_write_failures_keep_their_store_kind() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        for (error, kind) in [
+            (StoreError::WriterLost, StoreFailure::WriterLost),
+            (
+                StoreError::Uncertain("commit".into()),
+                StoreFailure::Uncertain,
+            ),
+            (StoreError::Raw("io".into()), StoreFailure::Raw),
+        ] {
+            assert_eq!(
+                interrupt_failure(turn, &WireError::Raw(error)),
+                Some(RouteError::Store { turn, kind })
+            );
+        }
+        assert_eq!(
+            interrupt_failure(turn, &WireError::Frame(WireFailure::RawStore)),
+            Some(RouteError::Store {
+                turn,
+                kind: StoreFailure::Raw
+            })
+        );
+        assert_eq!(
+            interrupt_failure(turn, &WireError::RawDeadline),
+            Some(RouteError::Deadline { turn })
+        );
+        for tolerated in [
+            WireError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            WireError::Cancelled,
+            WireError::Frame(WireFailure::Transport),
+        ] {
+            assert_eq!(interrupt_failure(turn, &tolerated), None);
         }
     }
 }

@@ -137,7 +137,11 @@ impl Child {
     }
 
     fn arm(&self, point: &str, action: &str) {
-        let command = serde_json::json!({"token":TOKEN,"occurrence":1,"action":action});
+        self.arm_at(point, 1, action);
+    }
+
+    fn arm_at(&self, point: &str, occurrence: u64, action: &str) {
+        let command = serde_json::json!({"token":TOKEN,"occurrence":occurrence,"action":action});
         fs::write(
             self.root.join("points").join(format!("{point}.json")),
             command.to_string(),
@@ -374,6 +378,51 @@ fn a_raw_failure_reports_store_kind_raw() {
     );
     assert!(failure.launched && failure.raw_incomplete, "{failure:?}");
     assert_eq!(failure.cleanup, Some(via_adapters::WireCleanup::Quiescent));
+}
+
+/// Design §7.2 row 6, S1 round-1 decision 4: the interrupt's raw record
+/// fails. That is a raw Store failure, not a transport error: Route
+/// force-closes the group under `now + 3 s` and reports `Store` with kind
+/// `Raw` at once, instead of reading on until `force_at`.
+#[test]
+fn a_raw_failure_at_the_interrupt_write_reports_store_kind_raw() {
+    let Some(root) = child_root() else {
+        return run_child(
+            "a_raw_failure_at_the_interrupt_write_reports_store_kind_raw",
+            &format!("read -r start\nprintf '%s\\n' '{ACCEPTED}'\nexec sleep 60\n"),
+        );
+    };
+    let child = Child::open(&root);
+    // Raw appends: 1 the start frame (stdin), 2 the acceptance (stdout),
+    // 3 the interrupt (stdin).
+    child.arm_at("raw.append.fail", 3, "fail_io");
+    let force_after = Duration::from_secs(6);
+    let started = Instant::now();
+    let outcome = child.execute(
+        Duration::from_secs(20),
+        watch::channel(None),
+        |order, observation| {
+            if matches!(observation, FakeObservation::Accepted(_)) {
+                order.send_replace(Some(self::order(force_after)));
+            }
+        },
+    );
+    let elapsed = started.elapsed();
+    assert!(root.join("points/raw.append.fail.3.ack").exists());
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(
+            failure.cause,
+            RouteError::Store {
+                kind: StoreFailure::Raw,
+                ..
+            }
+        ),
+        "{failure:?}"
+    );
+    assert!(failure.launched && failure.raw_incomplete, "{failure:?}");
+    assert_eq!(failure.cleanup, Some(via_adapters::WireCleanup::Quiescent));
+    assert!(elapsed < force_after, "reported only after {elapsed:?}");
 }
 
 /// Design §7.2 row 3: an anchor intent that is not committed starts no

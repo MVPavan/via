@@ -23,8 +23,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use via_store::{
-    AnchorIdentity, AnchorIntent, AnchorRecord, CommitOutcome, GroupAbsenceRecord, ProcessJournal,
-    StoreFailureKind,
+    AnchorIdentity, AnchorIntent, AnchorPhase, AnchorRecord, CommitOutcome, GroupAbsenceRecord,
+    ProcessJournal, StoreFailureKind,
 };
 
 use crate::{
@@ -431,6 +431,9 @@ struct Acquisition {
     started: Option<(String, String, ProcessIdentity)>,
     /// Host's row-4 `Stop` stopped a live vendor.
     forced: bool,
+    /// Row 4's one cleanup deadline, set before its `Stop`: the absence
+    /// check that follows uses what remains of it (design §7.2 row 4).
+    cleanup_by: Option<Deadline>,
     /// The acquisition observed Host's early stop: any failure is then
     /// [`HostError::Stopped`] (design §6.8 [r6.1]).
     stopping: bool,
@@ -672,7 +675,9 @@ impl Host {
         );
         let cleanup = match &state.started {
             Some((anchor_id, generation, identity)) => {
-                let cleanup = Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP);
+                let cleanup = state
+                    .cleanup_by
+                    .unwrap_or_else(|| Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP));
                 let evidence =
                     match wait_absence(&self.journal, anchor_id, generation, identity, cleanup)
                         .await
@@ -1115,7 +1120,9 @@ impl Host {
         ) {
             // Design §7.2 row 4: after ARM the vendor runs; Host stops the
             // group through the still-live control and keeps its evidence.
+            // The `Stop` and the absence check share this one deadline.
             let deadline = Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP);
+            state.cleanup_by = Some(deadline);
             state.forced = stop_through(&control, &generation, &stop, deadline).await;
             if state.forced {
                 self.tasks
@@ -1422,8 +1429,17 @@ impl Host {
                 observed_at: absence.observed_at,
             }));
         }
+        // Round-6 decision 1: only an anchor that ARM may have launched
+        // (`arm_intent`) accepts `Stop`. Before ARM the anchor exits on its
+        // control's EOF, so reconciliation opens no control connection and
+        // only proves absence.
+        let armed = match record.phase {
+            AnchorPhase::ArmIntent => true,
+            AnchorPhase::Intent | AnchorPhase::Identified => false,
+        };
         let stopped = timeout_at(deadline.instant(), async {
-            if let Ok(mut stream) = UnixStream::connect(&record.intent.socket_path).await
+            if armed
+                && let Ok(mut stream) = UnixStream::connect(&record.intent.socket_path).await
                 && verify_peer_and_challenge(&mut stream, &identity)
                     .await
                     .is_ok()

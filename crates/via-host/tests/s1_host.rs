@@ -289,6 +289,132 @@ fn vendor_facts_failure_stops_the_group_through_the_live_control() {
     });
 }
 
+/// Design §7.2 row 4, S1 round-1 decision 6: the row-4 `Stop` and the
+/// absence check after it share one 3 s cleanup deadline. The anchor holds
+/// the `Stop` (`host.anchor.stop_received`), so the `Stop` spends the whole
+/// allowance; the absence check then starts no fresh 3 s, and the failure
+/// returns unproven within the one bound.
+#[test]
+fn a_slow_row_four_stop_and_its_absence_check_share_one_deadline() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.vendor_facts", "fail_io");
+        fixture.arm("host.anchor.stop_received", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                host.acquire_retaining(spec, within(10), &LaunchPipes::default(), &never())
+                    .await
+                    .err()
+            }
+        });
+        // The row-4 deadline starts at the vendor-facts failure, just before
+        // the anchor receives the `Stop`.
+        assert!(
+            eventually(Duration::from_secs(5), || fixture
+                .acked("host.anchor.stop_received"))
+            .await
+        );
+        let stop_received = tokio::time::Instant::now();
+        let failure = acquiring.await.unwrap().unwrap();
+        let elapsed = stop_received.elapsed();
+        fixture.release("host.anchor.stop_received");
+        assert!(fixture.acked("store.journal.vendor_facts"));
+        assert!(
+            matches!(
+                failure.error,
+                HostError::Journal {
+                    site: JournalSite::VendorFacts,
+                    uncertain: false
+                }
+            ),
+            "{failure:?}"
+        );
+        assert!(!failure.forced, "{failure:?}");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "cleanup took {elapsed:?} after the Stop arrived"
+        );
+    });
+}
+
+/// Round-6 decision 1, S1 round-1 decision 5: reconciliation sends `Stop`
+/// only where ARM may have launched a vendor. The ARM intent commit fails,
+/// so the anchor stays `identified` (pre-ARM) and is held alive at
+/// `host.anchor.before_eof_cleanup`. A witness listener takes the anchor's
+/// socket path: reconciliation opens no control connection to it (so it
+/// sends no `Stop`), reports cleanup unproven while the anchor lives, and
+/// proves absence without force evidence once the anchor exits on its EOF.
+#[test]
+fn reconciliation_sends_no_stop_to_a_pre_arm_anchor() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.arm_intent", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let failure = host
+            .acquire_retaining(
+                fixture.spec("/bin/cat", &[]),
+                within(4),
+                &LaunchPipes::default(),
+                &never(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                failure.error,
+                HostError::Journal {
+                    site: JournalSite::ArmIntent,
+                    uncertain: false
+                }
+            ),
+            "{failure:?}"
+        );
+        assert!(fixture.acked("host.anchor.before_eof_cleanup"));
+        let records = fixture.records().await;
+        assert_eq!(records[0].phase, AnchorPhase::Identified);
+        let pgid = records[0].identity.as_ref().unwrap().pgid;
+        let socket = records[0].intent.socket_path.clone();
+        fs::remove_file(&socket).unwrap();
+        let witness = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        witness.set_nonblocking(true).unwrap();
+        let unproven = host
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(1))
+            .await
+            .unwrap();
+        assert!(
+            matches!(unproven[0].cleanup, CleanupEvidence::Uncertain(_)),
+            "{unproven:?}"
+        );
+        assert!(!unproven[0].forced, "{unproven:?}");
+        let contacted = witness.accept();
+        assert!(
+            matches!(&contacted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "reconciliation contacted a pre-ARM anchor: {contacted:?}"
+        );
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
+        let proved = host
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(3))
+            .await
+            .unwrap();
+        assert!(
+            matches!(proved[0].cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{proved:?}"
+        );
+        assert!(!proved[0].forced, "{proved:?}");
+        assert_eq!(host.held_unproven(), 0);
+    });
+}
+
 /// Design §7.2 row 3: an anchor intent that is not committed starts no
 /// process, and the failure says no anchor intent exists (no cleanup).
 #[test]
@@ -473,7 +599,10 @@ fn early_stop_stops_live_groups_on_the_force_signal() {
 /// sees the sticky `stopping` flag when it registers, and is stopped at once
 /// (dropped before ARM): no vendor launches and absence is proved. The
 /// acquisition is held at `store.journal.anchor_intent`, before its anchor
-/// exists, while the force signal is raised.
+/// exists, until the early stop acknowledges its snapshot
+/// (`host.early_stop.snapshot`). The identified commit, which comes after
+/// registration and before the ARM gate, is never reached: registration
+/// stopped the group, not the gate.
 #[test]
 fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
     runtime().block_on(async {
@@ -482,6 +611,8 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
         let (force, signal) = tokio::sync::watch::channel(false);
         host.watch_force(signal);
         fixture.arm("store.journal.anchor_intent", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("store.journal.identified", "fail_io");
         let acquiring = tokio::spawn({
             let host = host.clone();
             let spec = fixture.spec("/bin/cat", &[]);
@@ -500,14 +631,20 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
             .await
         );
         force.send_replace(true);
-        // On this current-thread runtime the woken early-stop task runs its
-        // snapshot before this task is polled again.
-        tokio::task::yield_now().await;
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
         fixture.release("store.journal.anchor_intent");
         let (failure, launched) = acquiring.await.unwrap();
         let failure = failure.unwrap();
         assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
         assert!(!launched);
+        assert!(
+            !fixture.acked("store.journal.identified"),
+            "the acquisition passed registration"
+        );
         assert!(
             matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
             "{failure:?}"
