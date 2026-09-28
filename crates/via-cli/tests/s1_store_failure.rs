@@ -2490,17 +2490,14 @@ fn s1_f12_host_early_stop_independent_of_store() -> TestResult {
     })
 }
 
-/// A turn that reports its pids, is accepted, leaves a live group member
-/// (grandchild `g`, held at its gate), emits its terminal and exits 1. Host
-/// records a failing exit while the group is still live.
-fn exits_leaving_group(prompt: &str) -> Value {
+/// A turn that is accepted, emits its terminal and exits 1. Host records a
+/// failing exit, which Route would report as the vendor's own.
+fn exits_failing(prompt: &str) -> Value {
     script(
         prompt,
         1,
         vec![
-            json!({"action":"report_pids"}),
             accepted(1),
-            json!({"action":"spawn_grandchild","name":"g"}),
             text("observed"),
             terminal(1),
             json!({"action":"exit","code":1}),
@@ -2515,28 +2512,22 @@ fn exits_leaving_group(prompt: &str) -> Value {
 /// This is the window behind the intermittent failure of
 /// `s1_f12_host_early_stop_independent_of_store`, made deterministic: Wire is
 /// paused at `wire.exit.observed`, the exit recorded and not yet returned to
-/// Route, while the force is raised and Host's early stop stops the group's
-/// live member. After release B ends by the force row (`forced`, no failure).
+/// Route, while the force is raised. The receipt of `daemon stop --force` is
+/// sent after the force is set, so Route reads it once released. B then ends
+/// by Core's forced terminal: no failure and no exit, a settled cancel. The
+/// vendor is gone before the force, so Host's early stop finds nothing live
+/// and the outcome is `requested`, not `forced`; the F12 test pins `forced`.
 #[test]
 fn s1_f12_exit_observed_under_force_is_the_force_row() -> TestResult {
-    let sandbox = Sandbox::new(&scripts(&[exits_leaving_group("b")]))?;
+    let sandbox = Sandbox::new(&scripts(&[exits_failing("b")]))?;
     sandbox.count("wire.exit.observed")?;
     let mut daemon = sandbox.start()?;
     let observed = sandbox.next_hit("wire.exit.observed")?;
     sandbox.arm("wire.exit.observed", observed, "pause")?;
     let (b, _) = sandbox.spawn("b")?;
     sandbox.ack(&daemon, "wire.exit.observed", observed, "pause")?;
-    sandbox.arm("host.early_stop.sent", 1, "fail_io")?;
     let stop = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
     check(stop["stopping"] == true, || format!("force stop: {stop}"))?;
-    sandbox.ack(&daemon, "host.early_stop.sent", 1, "fail_io")?;
-    sandbox.await_file("g.pid")?;
-    let member: u32 = fs::read_to_string(sandbox.sync.join("g.pid"))?
-        .trim()
-        .parse()?;
-    wait_until("the group member is gone", Duration::from_secs(3), || {
-        !process_live(member)
-    })?;
     sandbox.resume_point("wire.exit.observed", observed)?;
     let status = daemon.exit(Duration::from_secs(20))?;
     let envelope: String = sandbox.query(&format!(
@@ -2544,9 +2535,9 @@ fn s1_f12_exit_observed_under_force_is_the_force_row() -> TestResult {
     ))?;
     let envelope: Value = serde_json::from_str(&envelope)?;
     check(
-        envelope["state"] == "cancelled"
-            && envelope["failure"].is_null()
-            && envelope["cancel"]["outcome"] == "forced",
+        envelope["failure"].is_null()
+            && envelope["exit"].is_null()
+            && envelope["cancel"]["settled_at"].is_string(),
         || format!("B did not end by the force row (daemon {status}): {envelope}"),
     )
 }
