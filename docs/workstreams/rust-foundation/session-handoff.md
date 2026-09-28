@@ -71,9 +71,17 @@ the historical checkpoint; its findings table is updated by this section.
   Sol medium on round 1 ([t2/task2-sol-review-r3.md](t2/task2-sol-review-r3.md),
   SOUND); gate 180 / 2, failpoints 210 / 2, F08–F12 17. **Task 2
   (`.7.6`) is closed.** Now Task 3 (`.7.7`, [t3/README.md](t3/README.md)):
-  design-first T3-0 ([t3/t0.md](t3/t0.md), Opus 5.5 high, fresh session)
-  writes the gap inventory, normative design and slice plan; Sol high
-  reviews it before any code. Then Task 4 (`.7.8`), final critique
+  design-first T3-0 ([t3/t0.md](t3/t0.md), Opus 5.5 high,
+  `session_01JvsKhcyrWwPXLVcSKKEB1J`, branch
+  `claude/t3-0-gap-inventory-design-wcxo29`) writes the gap inventory,
+  normative design and slice plan. Design reviews (owner): GPT-6 Astra
+  medium and Fable 5.1 high; round 1 decisions in
+  [t3/design-r1-decisions.md](t3/design-r1-decisions.md). Owner decisions
+  ([t3/owner-decisions.md](t3/owner-decisions.md)): Store failures scoped
+  when the outcome is known, latch only on unknown outcome (amends runtime
+  §7); drain keeps sessions resumable; force closes only sessions with
+  unfinished work. Round 2 (F12 design under those decisions) is with the
+  worker; then Astra medium and Fable high re-review, then slices S0–S4. Then Task 4 (`.7.8`), final critique
   (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
   `scratchpad/cloud/watch-branches.sh`).

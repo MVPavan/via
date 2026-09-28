@@ -1,0 +1,45 @@
+**Verdict: SOUND WITH CHANGES.** No blocker. All 23 round-1 decisions and O1–O3 are implemented as decided. Three majors: a close-path wait that reads as holding `admission` (deadlock if implemented as written), and two amendments that are not exact (A15 drops normative C1 text; A16 leaves most of dispatch-design still saying failed writes latch). The rest are minors. Line numbers are `design.md` at f145ff2 unless a file is named.
+
+## Findings
+
+**Major**
+
+1. **§4 admission steps 2 and 5 wait inside the "under `admission`" list** (lines 406–436). Step 2 says a close in progress under the key "waits for it"; step 5 says an in-progress close order "wait for that close". Both sit inside the list headed "Admission step, under `admission`", and "Then release `admission`" comes only after step 7. The dispatcher's `Closed` commit (step 5 of the dispatcher step, line 447) takes `admission`. Scenario: caller A's close is in progress; caller B replays the key or sends a second close, enters the admission step, reaches step 2 or 5 and waits on the close watch while holding `admission`; A's dispatcher blocks on `admission` for `Closed`; neither finishes. §1 line 78 states the opposite rule, so the text contradicts itself. Fix: in steps 2 and 5, write "release `admission`, then wait on the slot's close watch and reply from its outcome". Test `s1_close_keyed_retry_and_second_close` (line 1178) would hang on the bug, so it detects it.
+
+2. **A15 is not a minimal replacement of C1 §3.14** (lines 1312–1334). The replaced passage in `docs/specs/via-api-v1.md:128-138` contains two normative sentences the new text drops: "`drain` with `force` is `invalid_params`; after acceptance new work is refused `daemon_stopping`." and "The result `{"stopping":true}` only acknowledges acceptance; it is not evidence that work stopped or the daemon exited." Only the drain bullet keeps the `daemon_stopping` refusal. Fix: re-insert both sentences after the bullets. Also the status shape list at `via-api-v1.md:126-128` still omits `store_failure` and `connections` that the prose now describes; add them to the braces.
+
+3. **A16 amends only dispatch-design §3 opening and §3.2** (line 1269). Under O1, dispatch-design §2.2 step 5 ("If the commit fails or is uncertain, latch"), step 6 ("Failed or uncertain: latch"), step 7 ("The failure also latches"), §2.3 ("The first failed or uncertain cancellation latches"), §2.4 ("A failed close commit latches"), §6 ("A failed write latches and turns the drain into a force-mode shutdown"), §7 ("Writes after a failed write: none from dispatch") and §8 all still say the opposite of §7.2 rows 2, 5, 7, 9 and 14. The design declares dispatch-design in force except where amended, so an implementer following §2.2 step 6 latches on a not-committed submission. Fix: extend A16 with one sentence per site: "not committed: design §7.2 row N; uncertain: latch".
+
+**Minor**
+
+4. **Runtime §6.2 and the kept §7 paragraph still measure from "first Store failure"** (`runtime-contracts.md:891-893`, `:956-958`; A14 at line 1267). Under O1 the first failure may be a scoped one hours before the latch. Fix: amend both to "from the latching failure (`failed_at`)".
+
+5. **Row 9 and row 14 conflict on the closing rider** (lines 773, 778). The rider rides in the cancellation's transaction; if that transaction is not committed, the cancellation did not commit either, so row 9 applies (retry once, then latch), while row 14 says "latches nothing" and "the turns keep their committed dispositions". Fix: row 14 covers `commit_session_closed` alone; a failed closing-cancellation transaction is row 9, and if its retry is refused as a close (turn unfinished) the session counts unclosed.
+
+6. **Failure-hook stub has no owner before S5** (lines 1402–1405, 1440, 1353–1356). S2 must call the hook, S5 owns `engine/latch.rs`, and S0 is moves only. Fix: give S2 the hook stub in `latch.rs` (signature plus "latch on every failure"), and have S5 keep that signature so `recovery.rs` (S4, parallel with S5, lines 1464–1466) is not broken by a changed `commit_event`/`settle`/`commit_terminal` shape.
+
+7. **§3.3 drop without acknowledgement on a forced hand-off** (lines 364–369; §2 lines 139–141). When the run loop drops the sender after handing a forced turn to final shutdown, the waiter "reads the terminal" but none exists yet. Fix: state that the waiter then behaves like `wait`: it polls until the terminal commits or `finalized` is set, then `daemon_stopping`.
+
+8. **`Disconnected` classified as `NotEnqueued`** (lines 710–712). A dead writer with no request in flight then makes every later request `not_committed`, and the daemon stays `health: healthy` with a dead Store until idle exit or a stop. Fix: keep `Full` as `NotEnqueued`; treat `Disconnected` as `WriterLost` (latch, `corrupt_store`-style certainty that the Store is gone). Related: a transient `Full` on a running turn's event path (row 5) fails the turn `failed(store)` with no retry until Task 4's lanes exist; consider one retry for `Full` before it counts as the first failure.
+
+9. **Row 6 says nothing about stopping the group** (line 770). A raw append failure fails the connection, but the row does not say Route force-closes the group under `close_by` or how the cleanup evidence reaches the terminal (`cancel` object or none). Fix: add "Route closes with `Close(Force)` under `now + 3 s`; the terminal carries the cleanup evidence as in row 5".
+
+10. **Forced running turn's terminal not committed in final shutdown** (§7.4 lines 920–922; row 7 line 771). Row 7 says retry once, §7.4 says single best-effort bounded by 2 s, and neither says whether a not-committed forced terminal latches. Both paths exit 4, but `store_failed` in the summary and the batch machinery differ. Fix: "in final shutdown, a not-committed forced terminal counts `uncommitted_turns` and latches nothing; uncertain latches".
+
+11. **Keyed replay against a durably `closing` session with no close in progress** (lines 409–412, 419–422). After row 11 clears the order, the intent row has no result; step 2 must fall through to step 5 rather than "wait for it". Fix: step 2 reads "a close in progress under the key (a slot with a close order) waits; an intent row with no result and no order continues at step 5".
+
+12. **Row 4, identified-not-committed, needs a Host restructure the design should name** (line 768; `crates/via-host/src/host.rs:567-570`). Today `started` is set after `start_anchor` returns, so a failed `commit_anchor_identified` skips the failed-acquisition absence check and leaks the token until reconciliation. The row's intent is right; S1 must record the identity before that commit. Fix: add "Host records the identity for cleanup before `commit_anchor_identified`".
+
+13. **A15 says sessions without unfinished work "stay open"** (line 1331). A durably `closing` session with no work is not touched by force but is not open or resumable. Fix: "stay as they were (open, or `closing` for restart to finish)".
+
+## Answers to the five questions
+
+- **Round-1 decisions.** All 23 are implemented where the report maps them. No new race, lost wake, double writer or untruthful outcome found in the healthy paths. The one deadlock is finding 1 (a wording contradiction, not a new mechanism). Decision 4's forced hand-off case is finding 7. Decision 20's compile allowance is adequate: no Core integration test constructs `RouteFailure` or calls `execute` directly.
+- **F12 under O1.** For every row the known-not-committed response resends nothing after a possible submission, claims no success, gives `quiescent` only with proof or no anchor intent, reuses the failed sequence number through an unchanged `HeadGuard`, and keeps permits and the Host ledger consistent. Escalation is bounded to one resolution write per turn. The latch path is consistent with the scoped path except findings 4, 5 and 10. Interactions with stop orders, claims, drain, force, slots, re-probe and restart hold; finding 8 is the only classification concern.
+- **O2/O3.** Drain closing nothing and the force set are implemented consistently in §4, §6.3, the restart handoff and tests; finding 13 is wording only.
+- **Amendments.** A14 is exact and consistent. A15 and A16 are not exact (findings 2, 3). Runtime §6.2 needs a companion edit (finding 4). A5, A7, A8, A17, A18 are fine.
+- **Slices and tests.** S0 ∥ S1 and S3 ∥ S4 and S4 ∥ S5 own disjoint files. Gate-green independence has two gaps (finding 6). The tests prove their orderings through the named seams, not sleeps; the F12 bound tests use wall-clock upper bounds against failpoint acknowledgements, which is acceptable.
+
+## Not checked
+
+Wire internals, the anchor binary, the fake agent fixtures, the C2 contract, the platform packet, the T2 Sol reviews, and the bodies of existing tests beyond those cited. I read the design at f145ff2 in full and the round-2 decision map, but did not read the full 42993bc→f145ff2 diff line by line. No code was run, no `cargo`, no `bd`, and no files were edited.
