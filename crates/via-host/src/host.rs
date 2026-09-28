@@ -169,6 +169,11 @@ impl Capacity {
         (deadline, controls)
     }
 
+    /// The early stop's deadline, once it set `stopping`.
+    fn stopping(&self) -> Option<Instant> {
+        self.lock().stopping
+    }
+
     /// The ARM gate's ledger half: refused with the early stop's deadline
     /// once `stopping` is set, else the entry is `Arming`.
     fn begin_arming(&self, anchor_id: &str) -> Result<(), Instant> {
@@ -1094,6 +1099,11 @@ impl Host {
         // returning drops the anchor control, so the anchor exits on EOF and
         // stops its group. Past this check ARM wins and the launch is in flight.
         if stopped() {
+            // Under Host's early stop the cleanup keeps its deadline (design
+            // §6.8); only a caller-only stop gets the fresh allowance.
+            if let Some(deadline) = self.capacity.stopping() {
+                state.stop_early(deadline);
+            }
             return Err(HostError::Stopped);
         }
         if let Err(deadline) = self.capacity.begin_arming(&anchor_id) {

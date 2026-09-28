@@ -723,6 +723,68 @@ fn a_late_registered_control_is_cleaned_up_under_the_early_stop_deadline() {
     });
 }
 
+/// S1 round-3 decision 11: the caller's stop check (here the daemon force
+/// signal, as Route's gate reads it) is set together with the ledger's
+/// `stopping`. The caller's check refuses ARM first, and the cleanup still
+/// runs under the early stop's deadline, not a fresh 3 s. The anchor holds
+/// its EOF exit at `host.anchor.before_eof_cleanup`, so absence stays
+/// unproven until that deadline.
+#[test]
+fn a_caller_stop_under_the_early_stop_keeps_its_deadline() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(false);
+        let caller = signal.clone();
+        host.watch_force(signal);
+        fixture.arm("host.anchor.after_arm_intent_commit", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let stopped = move || *caller.borrow();
+                let failure = host
+                    .acquire_retaining(spec, within(10), &launch, &stopped)
+                    .await
+                    .err();
+                (failure, launch.take().is_some())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.after_arm_intent_commit"))
+            .await
+        );
+        let forced_at = tokio::time::Instant::now();
+        force.send_replace(true);
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        tokio::time::sleep_until(forced_at + LATE_STEP).await;
+        fixture.release("host.anchor.after_arm_intent_commit");
+        let (failure, launched) = acquiring.await.unwrap();
+        let elapsed = forced_at.elapsed();
+        let failure = failure.unwrap();
+        assert!(fixture.acked("host.anchor.before_eof_cleanup"));
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(!launched, "the caller's check refused ARM");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < EARLY_STOP_BOUND,
+            "cleanup returned {elapsed:?} after the force signal"
+        );
+    });
+}
+
 /// S1 round-2 decision 8, the `Spawned` path: ARM completes after the early
 /// stop's snapshot, so the owner sends `Stop` itself. The anchor defers
 /// that cleanup (`host.anchor.defer_cleanup`), so absence stays unproven,
