@@ -78,6 +78,7 @@ fn open_with(root: &Path, start_capacity: usize) -> Engine {
         FakeConfig::from_environment().unwrap(),
         root.join("absent-anchor"),
         start_capacity,
+        None,
     )
     .unwrap()
 }
@@ -126,10 +127,12 @@ fn force() -> DaemonStopParams {
     serde_json::from_value(json!({"force":true})).unwrap()
 }
 
+/// Final shutdown under the daemon's one 10 s budget, from which the
+/// design §6.8 table measures its reserves.
 async fn shutdown(engine: &Engine) -> super::EngineShutdown {
     engine
         .shutdown(Deadline::at(
-            tokio::time::Instant::now() + Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_secs(10),
         ))
         .await
 }
@@ -1092,8 +1095,9 @@ fn a_stalled_force_path_read_expires_at_the_cutoff() {
             .hold_cancel_read
             .store(true, Ordering::Release);
         let started = tokio::time::Instant::now();
-        // The cutoff is 4 s before this deadline: 500 ms from now.
-        engine.begin_final_shutdown(started + Duration::from_millis(4_500));
+        // The cutoff is `FINALIZE_RESERVE + 3 s` = 8 s before this
+        // deadline (design §6.7 [r5.10]): 500 ms from now.
+        engine.begin_final_shutdown(started + Duration::from_millis(8_500));
         dispatch(&engine, &session).await;
         let elapsed = started.elapsed();
         assert!(
@@ -1421,5 +1425,252 @@ fn a_close_after_an_idle_stop_is_fenced_and_a_replay_still_replays() {
             .expect("the fence replies at once");
         assert_eq!(fenced.unwrap_err().kind, "daemon_stopping");
         assert_eq!(close(&engine, &session, Some("k")).await.unwrap(), first);
+    });
+}
+
+fn plain() -> DaemonStopParams {
+    serde_json::from_value(json!({})).unwrap()
+}
+
+/// Design §6.3 [r3.5, r5.12]: with no active turn, a plain stop is still
+/// refused while a session is in the durable closing set, which
+/// `daemon/status` reports; once `Closed` commits it is accepted.
+#[test]
+fn a_plain_stop_is_refused_while_a_session_is_closing() {
+    let Some(root) = child("a_plain_stop_is_refused_while_a_session_is_closing") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session),
+            async {
+                engine.faults.granted.notified().await;
+                assert_eq!(engine.active(), 0);
+                assert_eq!(engine.counts().closing, 1);
+                let refused = engine.request_stop(&plain()).await.unwrap_err();
+                assert_eq!(refused.message, "sessions are active");
+                assert_eq!(engine.stop_mode(), None);
+                engine.faults.release.notify_one();
+            }
+        );
+        assert_eq!(closed.unwrap()["state"], "closed");
+        assert_eq!(engine.counts().closing, 0);
+        assert_eq!(
+            engine.request_stop(&plain()).await.unwrap(),
+            super::StopMode::Idle
+        );
+    });
+}
+
+/// Design §6.3 [O3, r5.12]: the force set is the sessions with a queued,
+/// claimed, cancelling, running or settling turn. A session whose close
+/// is in progress with no turn left is not in it, and stays for its close.
+#[test]
+fn the_force_set_leaves_out_a_session_with_only_a_close_in_progress() {
+    let Some(root) = child("the_force_set_leaves_out_a_session_with_only_a_close_in_progress")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closing = new_session(&engine).await;
+        // A queued turn no dispatcher has claimed.
+        let queued = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &closing, None),
+            dispatch_closing(&engine, &closing),
+            async {
+                engine.faults.granted.notified().await;
+                engine.request_stop(&force()).await.unwrap();
+                let set = super::lock(&engine.force_sessions).clone();
+                assert_eq!(set, Some(vec![queued.clone()]));
+                engine.faults.release.notify_one();
+            }
+        );
+        assert_eq!(closed.unwrap_err().kind, "daemon_stopping");
+    });
+}
+
+/// T3-S3 round 1, decision 1 (design §6.3 [O3]): each slot is read for
+/// the force set in one slot-state section. A session whose only turn left
+/// the queue for `running` is in the set; once its run loop is done with
+/// the turn, it is not. (Characterization: the move itself is one section.)
+#[test]
+fn the_force_set_reads_a_slot_in_one_section() {
+    let Some(root) = child("the_force_set_reads_a_slot_in_one_section") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let _orders = slot.start_running(turn(1), tokio::time::Instant::now());
+        assert!(slot.queued().is_empty());
+        assert_eq!(engine.unfinished_sessions(), std::slice::from_ref(&session));
+        slot.finish_running(turn(1));
+        assert!(engine.unfinished_sessions().is_empty());
+    });
+}
+
+/// T3-S3 round 1, decision 2 (design §6.8 step 3): a dispatcher that has
+/// not joined still owns its session. Turn 1 was handed to final shutdown,
+/// and the dispatcher is held in turn 2's force-path cancellation read when
+/// final shutdown settles: nothing of that session is settled, neither turn
+/// 1's forced terminal nor the closure; both stay for restart recovery, and
+/// the shutdown is not clean.
+#[test]
+fn final_settlement_skips_a_session_whose_dispatcher_has_not_joined() {
+    let Some(root) = child("final_settlement_skips_a_session_whose_dispatcher_has_not_joined")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        engine
+            .faults
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine
+                .faults
+                .hold_cancel_read
+                .store(true, Ordering::Release);
+            engine.faults.release.notify_one();
+            // Turn 1 was handed off; the dispatcher holds turn 2's read.
+            engine.faults.granted.notified().await;
+            assert_eq!(super::lock(&engine.forced).len(), 1, "turn 1 handed off");
+            let report = shutdown(&engine).await;
+            assert!(!report.is_clean(), "{report:?}");
+            assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+            assert_eq!(report.unresolved_turns, 2, "{report:?}");
+            let types = event_types(&engine, &session).await;
+            assert!(
+                !types.iter().any(|kind| kind == "turn.ended"),
+                "final shutdown settled a turn its dispatcher still owns: {types:?}"
+            );
+            engine.faults.release.notify_one();
+        });
+    });
+}
+
+/// Design §6.8 entry [r3.2]: under a drain, `close` still works until
+/// daemon main enters final shutdown; from entry on, new close work is
+/// `daemon_stopping`, and a keyed replay of a committed close replays.
+#[test]
+fn final_shutdown_entry_fences_new_close_work_under_drain() {
+    let Some(root) = child("final_shutdown_entry_fences_new_close_work_under_drain") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let other = new_session(&engine).await;
+        // Launches fail here: each turn ends and leaves no active work.
+        dispatch(&engine, &other).await;
+        let drain = serde_json::from_value(json!({"drain":true})).unwrap();
+        assert_eq!(
+            engine.request_stop(&drain).await.unwrap(),
+            super::StopMode::Drain
+        );
+        let (first, ()) = tokio::join!(
+            close(&engine, &session, Some("k")),
+            dispatch_closing(&engine, &session)
+        );
+        let first = first.unwrap();
+        assert_eq!(first["state"], "closed", "{first}");
+        let entry = engine.enter_final_shutdown().await;
+        assert_eq!(entry.active, 0, "{entry:?}");
+        let fenced = tokio::time::timeout(Duration::from_secs(5), close(&engine, &other, None))
+            .await
+            .expect("the fence replies at once");
+        assert_eq!(fenced.unwrap_err().kind, "daemon_stopping");
+        assert_eq!(close(&engine, &session, Some("k")).await.unwrap(), first);
+    });
+}
+
+/// Design §8: the re-probe loop returns at final-shutdown entry and on
+/// force, so final shutdown's first step joins it at once.
+#[test]
+fn the_reprobe_loop_returns_at_entry_and_on_force() {
+    let Some(root) = child("the_reprobe_loop_returns_at_entry_and_on_force") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let ((), _) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(2), engine.reprobe())
+                    .await
+                    .expect("entry ends the loop");
+            },
+            engine.enter_final_shutdown()
+        );
+        drop(engine);
+        let forced = open(&root);
+        let stop = force();
+        let ((), _) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(2), forced.reprobe())
+                    .await
+                    .expect("force ends the loop");
+            },
+            forced.request_stop(&stop)
+        );
+    });
+}
+
+/// T3-S3 round 1, decision 6 (design §8): the re-probe backoff resets to
+/// 1 s on every added holding, including one added while the loop waits.
+/// A held group with no identity keeps its token at every pass: after the
+/// passes at 1, 3 and 7 s the loop waits 8 s. A holding added once the
+/// third pass began is re-probed within 1 s (2.5 s allowed), not 8 s later.
+#[test]
+fn an_added_holding_resets_the_reprobe_backoff() {
+    let Some(root) = child("an_added_holding_resets_the_reprobe_backoff") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let passes = || engine.faults.reprobe_passes.load(Ordering::Acquire);
+        engine
+            .adapter
+            .hold_capacity("0-held".to_owned(), session.clone(), Box::new(()));
+        let stop = force();
+        let ((), ()) = tokio::join!(engine.reprobe(), async {
+            // During the third pass or the 8 s wait after it.
+            until(|| passes() == 3).await;
+            engine
+                .adapter
+                .hold_capacity("1-held".to_owned(), session.clone(), Box::new(()));
+            let added = tokio::time::Instant::now();
+            let reset = tokio::time::timeout(Duration::from_millis(2_500), async {
+                while passes() < 4 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                reset.is_ok(),
+                "no pass within 2.5 s of the addition ({:?})",
+                added.elapsed()
+            );
+            engine.request_stop(&stop).await.unwrap();
+        });
     });
 }

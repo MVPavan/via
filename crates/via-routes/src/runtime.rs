@@ -229,6 +229,19 @@ impl FakeRoute {
         self.wire.recover_page(after, limit, deadline).await
     }
 
+    /// [`Self::recover_page`] of the anchors in `cohort` only.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: via_wire::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.wire
+            .recover_cohort_page(after, limit, cohort, deadline)
+            .await
+    }
+
     /// One non-signalling re-probe pass over held groups, optionally only
     /// one session's (design §8).
     pub async fn reprobe_held(
@@ -242,6 +255,11 @@ impl FakeRoute {
     /// Held groups no live control owns (design §6.6).
     pub fn held_unproven(&self) -> usize {
         self.wire.held_unproven()
+    }
+
+    /// Advances on every added holding (design §8).
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.wire.holdings_changed()
     }
 
     /// Groups whose cleanup a live control or acquisition still owns
@@ -297,9 +315,14 @@ impl FakeRoute {
                 // (already in the raw log) the wait is bounded by the cleanup
                 // allowance and anything but a confirmed exit is transport
                 // loss, never a protocol failure.
+                // Under the daemon force the exit is the force's own stop
+                // (Host's early stop, design §6.8): the force row, never
+                // `ProcessExited`.
                 end @ (Next::Eof | Next::Unterminated) => {
+                    control.after_terminal()?;
                     let unterminated = matches!(end, Next::Unterminated);
                     let exit = control.wait_exit(wire, deadline, unterminated).await?;
+                    control.after_terminal()?;
                     return Err(Failed {
                         cause: RouteError::ProcessExited { turn },
                         evidence: None,

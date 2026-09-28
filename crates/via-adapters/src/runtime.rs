@@ -235,6 +235,12 @@ impl AdapterRuntime {
         self.route.held_unproven()
     }
 
+    /// Advances on every added holding: the re-probe loop resets its
+    /// backoff when it changes (design §8).
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.route.holdings_changed()
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns, which
     /// block idle exit (design §6.4).
     pub fn pending_cleanup(&self) -> usize {
@@ -257,6 +263,22 @@ impl AdapterRuntime {
     ) -> Result<Vec<FakeRecovery>, AdapterError> {
         self.route
             .recover_page(after, limit, deadline)
+            .await
+            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
+            .map_err(AdapterError::Open)
+    }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only: resumed
+    /// paging never challenges an anchor committed after startup.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: via_routes::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<FakeRecovery>, AdapterError> {
+        self.route
+            .recover_cohort_page(after, limit, cohort, deadline)
             .await
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(AdapterError::Open)

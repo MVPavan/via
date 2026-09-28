@@ -150,6 +150,8 @@ impl Engine {
     pub async fn dispatcher(&self, session: SessionId) -> Result<(), ApiError> {
         let slot = self.slot(&session).ok_or(ApiError::STORE)?;
         slot.live();
+        // Held until this future ends or is dropped (design §6.8 step 3).
+        let _dispatching = self.dispatching(&session);
         let mut force = self.force.subscribe();
         let mut backoff = Backoff::new();
         let mut refused = false;

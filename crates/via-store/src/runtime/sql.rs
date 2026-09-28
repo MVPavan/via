@@ -10,7 +10,8 @@ use super::{
     SubmitFailedRecord, TerminalExtras, TerminalRecord, TransactionBehavior, TurnNumber,
     UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
     commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
-    oneshot, params, read_anchor_owners, read_anchor_records, read_raw_ref, validate_raw_ref,
+    oneshot, params, read_anchor_cohort, read_anchor_owners, read_anchor_records, read_raw_ref,
+    validate_raw_ref,
 };
 
 /// Classifies a SQLite error before `COMMIT`: corruption is `Corrupt`, which
@@ -88,7 +89,7 @@ pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn current_uid() -> Result<u32, StoreError> {
+pub(super) fn current_uid() -> Result<u32, StoreError> {
     // Linux S1 reads its own kernel process metadata; no vendor environment is inspected.
     let status = fs::read_to_string("/proc/self/status")
         .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -237,6 +238,7 @@ impl Command {
                 | Self::Unfinished(..)
                 | Self::AnchorOwners(..)
                 | Self::UnprovenAnchors(..)
+                | Self::AnchorCohort(..)
                 | Self::QueuedTurns(..)
                 | Self::AnchorRecords(..)
         )
@@ -264,7 +266,8 @@ impl Command {
             Self::Snapshot(_, reply) => drop(reply.send(Err(error))),
             Self::QueuedTurn(_, _, reply) => drop(reply.send(Err(error))),
             Self::NextSeq(_, reply) => drop(reply.send(Err(error))),
-            Self::UnprovenAnchors(_, _, reply) => drop(reply.send(Err(error))),
+            Self::UnprovenAnchors(_, _, _, reply) => drop(reply.send(Err(error))),
+            Self::AnchorCohort(reply) => drop(reply.send(Err(error))),
             Self::Predecessors(_, _, reply) => drop(reply.send(Err(error))),
             Self::ClosingTerminal(_, _, reply) | Self::SessionClosed(_, _, reply) => {
                 drop(reply.send(Err(error)));
@@ -280,7 +283,7 @@ impl Command {
             Self::Events(_, _, _, reply) => drop(reply.send(Err(error))),
             Self::Logs(_, reply) => drop(reply.send(Err(error))),
             Self::Unfinished(reply) => drop(reply.send(Err(error))),
-            Self::AnchorOwners(_, _, reply) => drop(reply.send(Err(error))),
+            Self::AnchorOwners(_, _, _, reply) => drop(reply.send(Err(error))),
             Self::Authenticate(_, _, reply) => drop(reply.send(Err(error))),
             Self::AnchorIntent(_, reply) => drop(reply.send(error.journal_outcome())),
             Self::AnchorIdentified(.., reply) | Self::ArmIntent(.., reply) => {
@@ -374,11 +377,19 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         Command::Unfinished(reply) => {
             let _ = reply.send(read_unfinished(conn));
         }
-        Command::AnchorOwners(after, limit, reply) => {
-            let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit));
+        Command::AnchorOwners(after, limit, cohort, reply) => {
+            let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit, cohort));
         }
-        Command::UnprovenAnchors(after, limit, reply) => {
-            let _ = reply.send(count_unproven_anchors(conn, after.as_deref(), limit));
+        Command::UnprovenAnchors(after, limit, cohort, reply) => {
+            let _ = reply.send(count_unproven_anchors(
+                conn,
+                after.as_deref(),
+                limit,
+                cohort,
+            ));
+        }
+        Command::AnchorCohort(reply) => {
+            let _ = reply.send(read_anchor_cohort(conn));
         }
         Command::QueuedTurns(after, limit, reply) => {
             let _ = reply.send(read_queued_turns(conn, after.as_ref(), limit));
@@ -499,6 +510,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         | Command::Unfinished(..)
         | Command::AnchorOwners(..)
         | Command::UnprovenAnchors(..)
+        | Command::AnchorCohort(..)
         | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
         | Command::Shutdown => {}

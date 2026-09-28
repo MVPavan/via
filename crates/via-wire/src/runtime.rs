@@ -129,6 +129,11 @@ impl WireRuntime {
         self.host.held_unproven()
     }
 
+    /// Advances on every added holding (design §8).
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.host.holdings_changed()
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns
     /// (design §6.4).
     pub fn pending_cleanup(&self) -> usize {
@@ -150,6 +155,21 @@ impl WireRuntime {
     ) -> Result<Vec<WireRecovery>, WireError> {
         self.host
             .recover_page(after, limit, deadline)
+            .await
+            .map(|reports| reports.into_iter().map(normalize_recovery).collect())
+            .map_err(WireError::Host)
+    }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only.
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: crate::AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<WireRecovery>, WireError> {
+        self.host
+            .recover_cohort_page(after, limit, cohort, deadline)
             .await
             .map(|reports| reports.into_iter().map(normalize_recovery).collect())
             .map_err(WireError::Host)

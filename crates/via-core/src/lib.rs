@@ -5,7 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use via_adapters::FakeConfig;
 pub use via_adapters::{AcceptanceToken, CancelOutcome, Cleanup, StartOutcome};
-pub use via_store::{CommitOutcome, ConnectionId, Deadline, RawRef, SessionId, TurnNumber};
+pub use via_store::{
+    CommitOutcome, ConnectionId, Deadline, RawRef, SessionId, StoreLock, TurnNumber,
+};
 
 /// Strict parameters for C1's mandatory first `hello` request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,7 +80,14 @@ pub enum C1TurnState {
 mod api;
 mod engine;
 
-pub use engine::{Engine, EngineShutdown, Handoff, Receipted, StopMode};
+pub use engine::{
+    Connections, DaemonCounts, Engine, EngineShutdown, FinalEntry, Handoff, Receipted, StopMode,
+};
+
+/// Test builds only: the named failpoint controller (runtime-contracts §11),
+/// for the daemon's own seams in `via-cli` (design §10).
+#[cfg(feature = "test-failpoints")]
+pub use via_store::failpoint;
 
 /// Hidden executable entrypoint forwarded through the architecture layers.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

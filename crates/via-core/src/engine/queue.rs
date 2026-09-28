@@ -558,6 +558,15 @@ impl Slot {
         self.wake();
     }
 
+    /// Whether the session has a queue entry (`Waiting`, `Claimed` or
+    /// `Cancelling`) or a running or settling turn, read under one slot
+    /// state lock, so no queue-to-running move falls between two reads
+    /// (the force set, design §6.3 [O3]).
+    pub(super) fn unfinished(&self) -> bool {
+        let state = lock(&self.state);
+        !state.queue.is_empty() || state.running.is_some()
+    }
+
     /// The session's running turn, if any.
     pub(super) fn running_turn(&self) -> Option<TurnNumber> {
         lock(&self.state)

@@ -5,7 +5,7 @@ pub use via_host::{
     CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
     PrivateProcessSpec, ProcessOwner, TurnNumber,
 };
-pub use via_store::{ConnectionId, Deadline, RawRef, RuntimeResources, SessionId};
+pub use via_store::{AnchorCohort, ConnectionId, Deadline, RawRef, RuntimeResources, SessionId};
 
 /// The maximum complete stdout frame, including its trailing LF.
 pub const MAX_STDOUT_FRAME_BYTES: usize = 1024 * 1024;

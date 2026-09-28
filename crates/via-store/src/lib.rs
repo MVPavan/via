@@ -225,14 +225,15 @@ pub mod failpoint;
 mod runtime;
 
 pub use runtime::{
-    ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt,
-    AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent, ClosedOutcome, ClosedRecord,
-    ClosingRecord, DurableRaw, EventRecord, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord,
-    GroupAbsenceRecord, KeyedOperation, OperationRecord, OperationVerb, Predecessors,
-    ProcessJournal, QueuedTurn, RawFactory, RawStream, RawWriter, ReceiptRecord, ResumeRecord,
-    RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord, Store,
-    StoreClient, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
-    TerminalExtras, TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorCohort, AnchorIdentity, AnchorIntent,
+    AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent,
+    ClosedOutcome, ClosedRecord, ClosingRecord, DurableRaw, EventRecord,
+    FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, GroupAbsenceRecord, KeyedOperation,
+    OperationRecord, OperationVerb, Predecessors, ProcessJournal, QueuedTurn, RawFactory,
+    RawStream, RawWriter, ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT,
+    SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent,
+    StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord,
+    UnfinishedTurn,
 };
 
 #[cfg(feature = "test-failpoints")]

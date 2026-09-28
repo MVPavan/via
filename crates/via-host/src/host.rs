@@ -23,8 +23,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use via_store::{
-    AnchorIdentity, AnchorIntent, AnchorPhase, AnchorRecord, CommitOutcome, GroupAbsenceRecord,
-    ProcessJournal, StoreFailureKind,
+    AnchorCohort, AnchorIdentity, AnchorIntent, AnchorPhase, AnchorRecord, CommitOutcome,
+    GroupAbsenceRecord, ProcessJournal, StoreFailureKind,
 };
 
 use crate::{
@@ -72,6 +72,10 @@ struct Ledger {
     live: HashMap<String, LiveControl>,
     /// Sticky: the early stop's deadline, once the force signal came.
     stopping: Option<Instant>,
+    /// Advanced on every added holding: a held entry, or an uncertain
+    /// settlement that leaves one for re-probe (design §8). Core's re-probe
+    /// loop resets its backoff on it.
+    holdings: watch::Sender<u64>,
 }
 
 /// A verified control and its launch phase.
@@ -96,9 +100,22 @@ enum LaunchPhase {
 }
 
 impl Ledger {
-    /// Whether an acquisition or a live control still owns the group.
-    /// Holds `token` for `owner`'s group until its absence is proved.
-    fn hold(&mut self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
+    /// Holds `token` for `owner`'s group until its absence is proved, and
+    /// returns an entry it replaced. The caller drops that after the ledger
+    /// guard: a recovered group's token takes the `RecoveredSlots` mutex,
+    /// and the two are never nested (design §1).
+    #[must_use = "drop a replaced entry after the ledger guard"]
+    fn hold(
+        &mut self,
+        anchor_id: String,
+        owner: crate::SessionId,
+        token: crate::CapacityToken,
+    ) -> Option<Held> {
+        // A group an acquisition still owns is not a holding yet: its
+        // uncertain settlement signals it.
+        if !self.busy(&anchor_id) {
+            self.holdings.send_modify(|generation| *generation += 1);
+        }
         self.held.insert(
             anchor_id,
             Held {
@@ -106,9 +123,10 @@ impl Ledger {
                 identity: None,
                 owner,
             },
-        );
+        )
     }
 
+    /// Whether an acquisition or a live control still owns the group.
     fn busy(&self, anchor_id: &str) -> bool {
         self.acquiring.contains(anchor_id)
             || self
@@ -138,7 +156,8 @@ impl Capacity {
     }
 
     fn hold(&self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
-        self.lock().hold(anchor_id, owner, token);
+        let replaced = self.lock().hold(anchor_id, owner, token);
+        drop(replaced);
     }
 
     /// Records the identity Host verified for a launched anchor.
@@ -212,6 +231,12 @@ impl Capacity {
         if matches!(cleanup, CleanupEvidence::GroupAbsent(_)) {
             let held = self.lock().held.remove(anchor_id);
             drop(held);
+        } else {
+            // The group stays held: now a holding only a re-probe can release.
+            let ledger = self.lock();
+            if ledger.held.contains_key(anchor_id) {
+                ledger.holdings.send_modify(|generation| *generation += 1);
+            }
         }
     }
 }
@@ -753,6 +778,12 @@ impl Host {
         self.capacity.hold(anchor_id, owner, token);
     }
 
+    /// Advances on every added holding (design §8): Core's re-probe loop
+    /// resets its backoff to 1 s when it changes.
+    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
+        self.capacity.lock().holdings.subscribe()
+    }
+
     /// Held groups with no live control: the ledger entries only a proof
     /// can release (design §6.6 `connections.held_unproven`, §8).
     pub fn held_unproven(&self) -> usize {
@@ -968,13 +999,12 @@ impl Host {
         let (pipes, anchor_process_id) = self.spawn_anchor(&config_path)?;
         // The group exists from here: its capacity stays with Host until
         // absence is proved. A failure above dropped it with no group.
-        {
+        let replaced = {
             let mut ledger = self.capacity.lock();
             ledger.acquiring.insert(anchor_id.clone());
-            if let Some(token) = capacity {
-                ledger.hold(anchor_id.clone(), owner.session_id, token);
-            }
-        }
+            capacity.and_then(|token| ledger.hold(anchor_id.clone(), owner.session_id, token))
+        };
+        drop(replaced);
         state.spawned = Some(anchor_id.clone());
         let mut stream = connect_anchor(&socket_path).await?;
         let ready = protocol::read_frame::<Reply>(&mut stream, 1024)
@@ -1395,17 +1425,48 @@ impl Host {
         limit: u32,
         deadline: Deadline,
     ) -> Result<Vec<RecoveryReport>, HostError> {
+        self.reconcile_page(after, limit, None, deadline).await
+    }
+
+    /// [`Self::recover_page`] of the anchors in `cohort` only: resumed
+    /// paging never reads, so never challenges, an anchor this daemon
+    /// committed after startup (design §8).
+    pub async fn recover_cohort_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+        deadline: Deadline,
+    ) -> Result<Vec<RecoveryReport>, HostError> {
+        self.reconcile_page(after, limit, Some(cohort), deadline)
+            .await
+    }
+
+    async fn reconcile_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+        deadline: Deadline,
+    ) -> Result<Vec<RecoveryReport>, HostError> {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
+        let read = async {
+            match cohort {
+                Some(cohort) => {
+                    self.journal
+                        .list_cohort_records_page(after, limit, cohort)
+                        .await
+                }
+                None => self.journal.list_anchor_records_page(after, limit).await,
+            }
+        };
         // A read that never completed is a Store failure, not unproven cleanup.
-        let records = timeout_at(
-            deadline.instant(),
-            self.journal.list_anchor_records_page(after, limit),
-        )
-        .await
-        .map_err(|_| HostError::Store("anchor journal page read timed out"))?
-        .map_err(HostError::StoreUnavailable)?;
+        let records = timeout_at(deadline.instant(), read)
+            .await
+            .map_err(|_| HostError::Store("anchor journal page read timed out"))?
+            .map_err(HostError::StoreUnavailable)?;
         let mut results = Vec::with_capacity(records.len());
         for record in records {
             let anchor_id = record.intent.anchor_id.clone();
@@ -1963,6 +2024,42 @@ pub(crate) fn monotonic_remaining(deadline_ns: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capacity token that records, when dropped, whether the ledger
+    /// mutex was held at that moment.
+    struct Probe {
+        ledger: Capacity,
+        locked: Arc<AtomicBool>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let held = self.ledger.0.try_lock().is_err();
+            self.locked.store(held, Ordering::Release);
+        }
+    }
+
+    /// T3-S3 round 1, decision 7 (design §1): holding an anchor again
+    /// replaces its entry, and the replaced token, whose drop takes the
+    /// `RecoveredSlots` mutex, is dropped after the ledger guard is gone,
+    /// so the two locks are never nested.
+    #[test]
+    fn a_replaced_token_is_dropped_outside_the_ledger_lock() {
+        let capacity = Capacity::default();
+        let locked = Arc::new(AtomicBool::new(false));
+        let owner = crate::SessionId::try_from("s_0123456789ab")
+            .unwrap_or_else(|_| unreachable!("valid session id"));
+        let first = Probe {
+            ledger: capacity.clone(),
+            locked: Arc::clone(&locked),
+        };
+        capacity.hold("a1".to_owned(), owner.clone(), Box::new(first));
+        capacity.hold("a1".to_owned(), owner, Box::new(()));
+        assert!(
+            !locked.load(Ordering::Acquire),
+            "the replaced token was dropped under the ledger mutex"
+        );
+    }
 
     #[tokio::test]
     async fn closed_exit_watch_does_not_spin_until_force_deadline() {

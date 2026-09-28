@@ -13,6 +13,8 @@
 
 #[path = "support/failpoints.rs"]
 mod failpoints;
+#[path = "support/hits.rs"]
+mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]
@@ -43,7 +45,7 @@ const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const OTHER_HANDLE: &str = "h_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
 struct Paths {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -75,7 +77,7 @@ impl Paths {
         fs::write(&fixture_path, serde_json::to_vec(fixture)?)?;
         let failpoints = Failpoints::new(root.path())?;
         Ok(Self {
-            _root: root,
+            root,
             via,
             fake,
             state,
@@ -84,6 +86,11 @@ impl Paths {
             fixture: fixture_path,
             failpoints,
         })
+    }
+
+    /// The failpoint directory `Failpoints::new` created under the root.
+    fn failpoint_dir(&self) -> PathBuf {
+        self.root.path().join("failpoints")
     }
 
     /// A client command: it never carries the failpoint activation inputs.
@@ -536,6 +543,30 @@ fn check(condition: bool, detail: impl FnOnce() -> String) -> Result<(), Scenari
     } else {
         Err(ScenarioError::Failure(detail()))
     }
+}
+
+/// Waits until `point` was hit at least `at_least` times; counting began
+/// with [`hits::count`] before the first hit.
+fn wait_hits(paths: &Paths, point: &str, at_least: u64) -> Result<(), ScenarioError> {
+    let dir = paths.failpoint_dir();
+    let deadline = Instant::now() + ACK_WAIT;
+    while hits::hits(&dir, point).map_err(infra)? < at_least {
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!(
+                "{point} was not hit {at_least} times"
+            )));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+/// A turn reached a pending, registered connection-slot reservation (§10).
+const AWAITING_SLOT: &str = "core.dispatch.awaiting_slot";
+
+/// Starts counting reservations that wait for a slot; call before the spawns.
+fn count_waiters(paths: &Paths) -> Result<(), ScenarioError> {
+    hits::count(&paths.failpoint_dir(), AWAITING_SLOT).map_err(infra)
 }
 
 fn wait_file(path: &std::path::Path) -> Result<(), ScenarioError> {
@@ -1709,6 +1740,8 @@ fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
                 .ok_or_else(|| fail("receipt has no turn"))?
                 .to_owned();
             wait_file(&paths.sync.join("accepted.entered"))?;
+            let registered = "core.wait.registered";
+            hits::count(&paths.failpoint_dir(), registered).map_err(infra)?;
             let out = evidence.dir.join("wait.stdout");
             let mut waiter = paths.command();
             waiter
@@ -1718,7 +1751,7 @@ fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
                 .stderr(File::create(evidence.dir.join("wait.stderr")).map_err(infra)?);
             let mut waiter = waiter.spawn().map_err(infra)?;
             // The waiter is attached before the terminal commits.
-            thread::sleep(Duration::from_millis(300));
+            wait_hits(paths, registered, 1)?;
             fs::write(paths.sync.join("accepted.release"), b"").map_err(infra)?;
             paths
                 .failpoints
@@ -2174,8 +2207,10 @@ fn release_six(paths: &Paths) -> Result<(), ScenarioError> {
     Ok(())
 }
 
-/// Spawns six sessions and waits until four turns are accepted and holding.
+/// Spawns six sessions and waits until four turns are accepted and holding
+/// and the other two wait, registered, for a connection slot.
 fn spawn_six_held(paths: &Paths, evidence: &Evidence) -> Result<Vec<String>, ScenarioError> {
+    count_waiters(paths)?;
     let mut sessions = Vec::new();
     for index in 0..6 {
         let prompt = format!("s{index}");
@@ -2200,8 +2235,9 @@ fn spawn_six_held(paths: &Paths, evidence: &Evidence) -> Result<Vec<String>, Sce
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // Longer than a launch: a fifth would have been created by now.
-    thread::sleep(Duration::from_millis(500));
+    // Both other reservations are pending in the slot queue: neither
+    // launches until a slot frees.
+    wait_hits(paths, AWAITING_SLOT, 2)?;
     Ok(sessions)
 }
 
@@ -2360,10 +2396,11 @@ fn spawn_session(
         .to_owned())
 }
 
-/// A turn that waits for a connection slot: still `queued`, never submitted
-/// and never launched, well past the time a launch takes.
+/// A turn that waits for a connection slot: its reservation is pending and
+/// registered, and it is still `queued`, never submitted and never
+/// launched. Counting began with [`count_waiters`] before its spawn.
 fn still_waiting(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
-    thread::sleep(Duration::from_millis(1_000));
+    wait_hits(paths, AWAITING_SLOT, 1)?;
     let (state, envelope) = turn_n(paths, session, 1)?;
     let submitted = store_count(
         paths,
@@ -2426,6 +2463,7 @@ fn s1_t2d_uncertain_cleanup_keeps_its_connection_slot() -> TestResult {
             check(store_count(paths, unproven)? == 1, || {
                 format!("turn A's group was proved absent: {envelope}")
             })?;
+            count_waiters(paths)?;
             let second = spawn_session(paths, evidence, "spawn-b", "s1")?;
             still_waiting(paths, &second)?;
             force_cancels_waiting(paths, evidence, &mut daemon, &second, 0)?;
@@ -2464,6 +2502,7 @@ fn s1_t2d_unproven_recovered_group_reduces_capacity() -> TestResult {
             .map_err(infra)?;
         check(changed == 1, || "no anchor to copy".to_owned())?;
         let mut daemon = Daemon::start_slots(paths, evidence, "restarted", 1, None)?;
+        count_waiters(paths)?;
         let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
         still_waiting(paths, &waiting)?;
         // The group is still unproven at shutdown: `incomplete`, exit 4.
@@ -2552,6 +2591,7 @@ fn s1_t2d_recovery_deadline_counts_unread_unproven_anchors() -> TestResult {
         paths.failpoints.release(boundary, 1).map_err(infra)?;
         daemon.wait_ready()?;
         paths.failpoints.disarm(boundary).map_err(infra)?;
+        count_waiters(paths)?;
         let waiting = spawn_session(paths, evidence, "spawn-b", "s1")?;
         still_waiting(paths, &waiting)?;
         force_cancels_waiting(paths, evidence, &mut daemon, &waiting, 4)?;

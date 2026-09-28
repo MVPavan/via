@@ -98,8 +98,11 @@ impl Engine {
                 .map_err(|_| ApiError::STORE)?
                 .ok_or(ApiError::STORE);
         }
-        // Step 4: the stop fence [r1.5, r3.2]. S3 adds `final_shutdown`.
-        if matches!(*lock(&self.stop), Some(StopMode::Idle | StopMode::Force)) {
+        // Step 4: the stop fence [r1.5, r3.2]: final shutdown was entered,
+        // whatever the stop mode, or an idle or force stop was accepted.
+        if self.final_shutdown()
+            || matches!(*lock(&self.stop), Some(StopMode::Idle | StopMode::Force))
+        {
             return Err(ApiError::DAEMON_STOPPING);
         }
         let slot = self.slot_for(&session);

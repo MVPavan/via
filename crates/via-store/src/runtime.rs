@@ -53,6 +53,7 @@ pub enum StoreError {
     /// The State directory or database cannot be opened safely.
     #[error("Store open failed: {0}")]
     Open(String),
+
     /// A mutation failed before a positive commit receipt.
     #[error("Store write failed: {0}")]
     Write(String),
@@ -425,6 +426,14 @@ pub struct AnchorOwner {
     pub phase: Option<AnchorPhase>,
 }
 
+/// The anchors committed when [`Store::anchor_cohort`] read it, as a bound
+/// for later anchor reads (design §8): a read bounded by it never returns
+/// an anchor committed afterwards. Anchors are rows of a rowid table that
+/// VIA never deletes, replaces or vacuums, so SQLite gives every later
+/// insert a rowid above the largest one here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorCohort(i64);
+
 /// Largest anchor page one read returns; callers page with a cursor.
 pub const ANCHOR_PAGE_LIMIT: u32 = 256;
 
@@ -636,6 +645,8 @@ pub struct Store {
     raw_sender: SyncSender<RawCommand>,
     writer_join: Option<JoinHandle<()>>,
     raw_join: Option<JoinHandle<()>>,
+    /// Released after `Drop` joined the workers: the last field.
+    _lock: StoreLock,
 }
 
 /// Releases a stalled raw worker when dropped.
@@ -758,13 +769,16 @@ enum Command {
     AnchorOwners(
         Option<String>,
         u32,
+        Option<AnchorCohort>,
         oneshot::Sender<Result<Vec<AnchorOwner>, StoreError>>,
     ),
     UnprovenAnchors(
         Option<String>,
         u32,
+        Option<AnchorCohort>,
         oneshot::Sender<Result<u64, StoreError>>,
     ),
+    AnchorCohort(oneshot::Sender<Result<AnchorCohort, StoreError>>),
     QueuedTurns(
         Option<(SessionId, TurnNumber)>,
         u32,
@@ -797,12 +811,13 @@ enum Command {
 }
 
 /// One page of anchor records: after `after`, at most `limit`, optionally
-/// only unproven ones and only one owner session's.
+/// only unproven ones, only one owner session's and only one cohort's.
 struct AnchorQuery {
     after: Option<String>,
     limit: u32,
     unproven: bool,
     owner: Option<SessionId>,
+    cohort: Option<AnchorCohort>,
 }
 
 enum RawCommand {
@@ -818,20 +833,119 @@ enum RawCommand {
     Shutdown,
 }
 
+/// `<state>/store.lock`, held for the life of the [`Store`] opened under
+/// it: VIA's writer exclusion for the State directory (runtime §6.1). One
+/// daemon holds it; a writer that ignores it is unsupported. It is bound to
+/// that directory's identity (device and inode), so it opens no other.
+pub struct StoreLock {
+    _file: File,
+    state: (u64, u64),
+}
+
+/// The filesystem identity of `state`: its device and inode.
+fn directory_identity(state: &Path) -> Result<(u64, u64), StoreError> {
+    let metadata = fs::metadata(state)
+        .map_err(|error| StoreError::Open(format!("{}: {error}", state.display())))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+impl StoreLock {
+    /// Takes `<state>/store.lock` without waiting; [`StoreError::Open`]
+    /// when another holder has it (the State directory is in use by another
+    /// VIA daemon) or the lock file is unsafe.
+    pub fn acquire(state: &Path) -> Result<Self, StoreError> {
+        let path = state.join("store.lock");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.file_type().is_file()
+                || metadata.uid() != current_uid()?
+                || metadata.mode() & 0o777 != 0o600)
+        {
+            return Err(StoreError::Open(format!(
+                "unsafe VIA lock file: {}",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(&path)
+            .map_err(|error| StoreError::Open(format!("store.lock: {error}")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self {
+                _file: file,
+                state: directory_identity(state)?,
+            }),
+            Err(fs::TryLockError::WouldBlock) => Err(StoreError::Open(
+                "store.lock is held: the State directory is in use by another VIA daemon"
+                    .to_owned(),
+            )),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(StoreError::Open(format!("store.lock: {error}")))
+            }
+        }
+    }
+}
+
+/// The read-only connection that checks an existing Store before any
+/// mutation (runtime §6, F11). It runs only under `lock`, so no VIA writer
+/// can change the file meanwhile. With no `-wal` file every committed page
+/// is in the main file, so it is read as immutable: a refused Store gets no
+/// `-wal` or `-shm` sidecar. A `-wal` left by a crash is read through an
+/// ordinary read-only connection, since `immutable` ignores the WAL
+/// (sqlite.org/uri.html) and no read-only open reads a WAL without its
+/// wal-index (sqlite.org/wal.html, "Read-Only Databases"). Limit: when the
+/// `-shm` is missing, SQLite creates it in the State directory, even for a
+/// Store it then refuses.
+fn probe(db: &Path, _lock: &StoreLock) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    if Path::new(&wal).exists() {
+        return Connection::open_with_flags(db, flags);
+    }
+    let mut uri = String::from("file:");
+    for character in db.to_string_lossy().chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)
+}
+
 impl Store {
-    /// Opens `<state>/store.sqlite3`, refusing an unsafe, older or newer
-    /// Store before mutation. Only a file this call creates is initialized.
+    /// Opens `<state>/store.sqlite3` under a [`StoreLock`] it takes first,
+    /// refusing an unsafe, older or newer Store before mutation. Only a file
+    /// this call creates is initialized.
     pub fn open(state: &Path) -> Result<Self, StoreError> {
         validate_state(state)?;
+        Self::open_locked(state, StoreLock::acquire(state)?)
+    }
+
+    /// [`Store::open`] under `lock`, which the Store holds until it drops.
+    /// A lock taken for another State directory is refused before the Store
+    /// is read: it excludes no writer here.
+    pub fn open_locked(state: &Path, lock: StoreLock) -> Result<Self, StoreError> {
+        validate_state(state)?;
+        if directory_identity(state)? != lock.state {
+            return Err(StoreError::Open(format!(
+                "store.lock was taken for another State directory than {}",
+                state.display()
+            )));
+        }
         let db = state.join("store.sqlite3");
         let created = !db.exists();
         if !created {
             validate_regular(&db)?;
-            let readonly = Connection::open_with_flags(
-                &db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .map_err(|error| StoreError::Open(error.to_string()))?;
+            let readonly =
+                probe(&db, &lock).map_err(|error| StoreError::Open(error.to_string()))?;
             let version: i64 = readonly
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -893,6 +1007,7 @@ impl Store {
             raw_sender,
             writer_join: Some(writer_join),
             raw_join: Some(raw_join),
+            _lock: lock,
         })
     }
 
@@ -1242,11 +1357,37 @@ impl StoreClient {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<AnchorOwner>, StoreError> {
+        self.anchor_owners(after, limit, None).await
+    }
+
+    /// [`Self::anchor_owners_page`] of the anchors in `cohort` only.
+    pub async fn cohort_owners_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
+        self.anchor_owners(after, limit, Some(cohort)).await
+    }
+
+    async fn anchor_owners(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+    ) -> Result<Vec<AnchorOwner>, StoreError> {
         if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
             return Err(StoreError::Constraint("anchor page limit must be 1 to 256"));
         }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorOwners(after, limit, reply))?;
+        self.send(Command::AnchorOwners(after, limit, cohort, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads the cohort of every anchor committed so far (read-only).
+    pub async fn anchor_cohort(&self) -> Result<AnchorCohort, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AnchorCohort(reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
@@ -1261,8 +1402,27 @@ impl StoreClient {
         after: Option<String>,
         limit: u32,
     ) -> Result<u64, StoreError> {
+        self.unproven_anchors(after, limit, None).await
+    }
+
+    /// [`Self::unproven_anchors_up_to`] of the anchors in `cohort` only.
+    pub async fn unproven_cohort_anchors_up_to(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<u64, StoreError> {
+        self.unproven_anchors(after, limit, Some(cohort)).await
+    }
+
+    async fn unproven_anchors(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: Option<AnchorCohort>,
+    ) -> Result<u64, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::UnprovenAnchors(after, limit, reply))?;
+        self.send(Command::UnprovenAnchors(after, limit, cohort, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
@@ -1391,7 +1551,18 @@ impl ProcessJournal {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
-        self.records_page(after, limit, false, None).await
+        self.records_page(after, limit, false, None, None).await
+    }
+
+    /// [`Self::list_anchor_records_page`] of the anchors in `cohort` only.
+    pub async fn list_cohort_records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        cohort: AnchorCohort,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        self.records_page(after, limit, false, None, Some(cohort))
+            .await
     }
 
     /// [`Self::list_anchor_records_page`] of the anchors with no absence
@@ -1402,7 +1573,7 @@ impl ProcessJournal {
         limit: u32,
         owner: Option<SessionId>,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
-        self.records_page(after, limit, true, owner).await
+        self.records_page(after, limit, true, owner, None).await
     }
 
     async fn records_page(
@@ -1411,6 +1582,7 @@ impl ProcessJournal {
         limit: u32,
         unproven: bool,
         owner: Option<SessionId>,
+        cohort: Option<AnchorCohort>,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
         if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
             return Err(StoreFailureKind::Write);
@@ -1421,6 +1593,7 @@ impl ProcessJournal {
             limit,
             unproven,
             owner,
+            cohort,
         };
         self.send(Command::AnchorRecords(query, reply))
             .map_err(|error| error.kind())?;
@@ -1455,10 +1628,11 @@ mod sql;
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, count_unproven_anchors, read_anchor_owners, read_anchor_records,
+    commit_vendor_facts, count_unproven_anchors, read_anchor_cohort, read_anchor_owners,
+    read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
-use sql::{configure, validate_regular, validate_state, writer_loop};
+use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};
 
 #[cfg(test)]
 mod tests {

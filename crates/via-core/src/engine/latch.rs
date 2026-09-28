@@ -16,9 +16,38 @@ use super::{Admission, Engine, lock};
 use crate::api::rfc3339;
 use crate::{SessionId, TurnNumber};
 
-/// Part of final shutdown's deadline that force-path read retries leave for
-/// Host cleanup (its 3 s native stop) and forced terminals.
-const READ_RETRY_RESERVE: Duration = Duration::from_secs(4);
+/// Final shutdown's budgets (design §6.8, the one table [r4.2, r5.10]),
+/// each measured back from the final deadline. The reserve is per pipeline,
+/// not per turn: later commits cut at the deadline count as uncommitted.
+///
+/// | Budget | Ends at |
+/// |---|---|
+/// | force-path read cutoff (§6.7) | `deadline − (FINALIZE_RESERVE + 3 s)` |
+/// | dispatcher joins, then abort (step 3) | `deadline − (FINALIZE_RESERVE + ABORTED_JOIN)` |
+/// | aborted dispatchers' joins (step 3) | `deadline − FINALIZE_RESERVE` |
+/// | Host reconciliation (pipeline step 4) | `deadline − FINALIZE_RESERVE` |
+/// | each step 5 write | `min(now + FINALIZE_WRITE, deadline)` |
+/// | client joins, then the Store join | `deadline − 2 s`, then `deadline` |
+///
+/// `FINALIZE_RESERVE` covers 2 s for §7.4's re-read, 2 s for the batch or a
+/// forced terminal and 1 s for the closure pass.
+pub(super) const FINALIZE_RESERVE: Duration = Duration::from_secs(5);
+
+/// Pipeline step 3's wait for the dispatchers it aborted, before Host
+/// reconciliation begins (design §6.8): an abort takes effect when the task
+/// is next polled, so a dispatcher is joined, not only cancelled.
+pub(super) const ABORTED_JOIN: Duration = Duration::from_secs(1);
+
+/// Bound of each finalization write in pipeline step 5 (design §6.8).
+pub(super) const FINALIZE_WRITE: Duration = Duration::from_secs(2);
+
+/// Host's native stop and absence verification ahead of finalization: the
+/// force-path read cutoff leaves it this much before `FINALIZE_RESERVE`.
+const HOST_STOP: Duration = Duration::from_secs(3);
+
+/// Part of final shutdown's deadline that force-path reads leave, so the
+/// dispatchers join before Host reconciliation needs its time (§6.7).
+const READ_RETRY_RESERVE: Duration = FINALIZE_RESERVE.saturating_add(HOST_STOP);
 
 /// Where a Core Store write failed: one site per row of design §7.2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

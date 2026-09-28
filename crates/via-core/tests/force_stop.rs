@@ -103,8 +103,10 @@ fn force_before_dispatch_cancels_the_queued_turn_without_submission() {
         assert_eq!(engine.request_stop(&force).await.unwrap(), StopMode::Force);
         engine.dispatcher(session.clone()).await.unwrap();
         let report = engine
+            // The daemon's 10 s budget: Host reconciliation ends 5 s
+            // before it (design §6.8).
             .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(10),
             ))
             .await;
         assert!(report.is_clean(), "{report:?}");
@@ -206,8 +208,10 @@ fn force_during_stalled_acquisition_settles_the_turn() {
         let elapsed = forced_at.get().unwrap().elapsed();
         assert!(elapsed < Duration::from_secs(4), "drive took {elapsed:?}");
         let report = engine
+            // The daemon's 10 s budget: Host reconciliation ends 5 s
+            // before it (design §6.8).
             .shutdown(Deadline::at(
-                tokio::time::Instant::now() + Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(10),
             ))
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
