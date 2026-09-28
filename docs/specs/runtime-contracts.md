@@ -953,13 +953,15 @@ within 2 s means skip the failure write, keep health failed, and clean up.
 
 Host independently stops private groups using §5 within 3 s of failure
 notification; this does not wait for Store. The 3 s bound runs from the
-instant the failure is raised, not from when a Host task first runs. It
-bounds the `Stop` attempt and the wait for its reply: every armed group is
-sent one `Stop`, even when the bound has already passed. A reply received
-after the bound never counts as force evidence; cleanup that is not proved
-stays uncertain until reconciliation proves absence. The runtime cannot
-promise a completed write to an anchor socket the kernel will not accept
-bytes on, and reports that group's cleanup as uncertain. Drain reads until EOF/deadline.
+instant the failure is raised, not from when a Host task first runs, and
+no later step grants a fresh allowance. Host attempts one `Stop` for every
+armed group, even when the bound has already passed; it waits for the
+reply only until the bound. In that early-stop exchange, a reply read at
+or after the bound does not count as force evidence. A `Stop` that cannot
+be delivered by the bound, or whose cleanup is not proved, leaves the
+group's cleanup uncertain until reconciliation proves absence. The runtime
+cannot promise a completed write to an anchor socket the kernel will not
+accept bytes on. Drain reads until EOF/deadline.
 The daemon remains available for diagnostic/read requests for at most 5 s
 after first failure, attempts raw/Store flush and task joins within a total
 10 s shutdown bound measured from first failure (§6.2), then exits 4. No successful graceful-stop result
