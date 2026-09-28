@@ -18,18 +18,20 @@ use super::stop::{StopMode, stop_outcome};
 use super::terminal::{classify, terminal_envelope};
 use super::{Accepted, Engine, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock};
 use crate::api::{
-    Effective, Event, EventBody, FAKE_WALL_MS, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
+    Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
 };
 use crate::{ApiError, ConnectionId, Deadline, RawRef, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 
-/// A committed submission: the queued turn's facts and the submission time.
+/// A committed submission: the queued turn's facts, its frozen effective
+/// values and the submission time.
 pub(super) struct Submission {
     session: SessionId,
     turn: TurnNumber,
     queued: QueuedTurn,
+    effective: Effective,
     submitted: SystemTime,
     clock: Instant,
 }
@@ -342,6 +344,7 @@ impl Engine {
             session,
             turn,
             queued,
+            effective,
             submitted,
             clock,
         } = submission;
@@ -365,14 +368,12 @@ impl Engine {
             store_failed: false,
             uncertain: None,
         };
-        let wall = Duration::from_millis(FAKE_WALL_MS);
-        let deadline = Deadline::at(tokio::time::Instant::now() + wall);
-        let deadline_at = rfc3339(SystemTime::now() + wall);
+        let (deadline, deadline_at) = wall_deadline(&effective);
         let outcome = match self
             .execute(
                 &mut record,
                 connection.clone(),
-                queued.prompt,
+                (queued.prompt, &effective),
                 deadline,
                 Box::new(capacity),
             )
@@ -709,7 +710,7 @@ impl Engine {
         &self,
         record: &mut TurnRecord,
         connection: ConnectionId,
-        prompt: String,
+        (prompt, effective): (String, &Effective),
         deadline: Deadline,
         capacity: via_adapters::CapacityToken,
     ) -> Driven {
@@ -731,11 +732,11 @@ impl Engine {
         loop {
             tokio::select! {
                 Some(observation) = observed_rx.recv() => {
-                    self.observe(record, observation).await;
+                    self.observe(record, effective, observation).await;
                 }
                 result = &mut execute => {
                     while let Ok(observation) = observed_rx.try_recv() {
-                        self.observe(record, observation).await;
+                        self.observe(record, effective, observation).await;
                     }
                     return match result {
                         Err(AdapterError::Route(route))
@@ -764,7 +765,12 @@ impl Engine {
 
     /// Commits one adapter observation at the next sequence, in decode order.
     /// After the first Store failure the rest are dropped and the turn fails `store`.
-    async fn observe(&self, record: &mut TurnRecord, observation: FakeObservation) {
+    async fn observe(
+        &self,
+        record: &mut TurnRecord,
+        effective: &Effective,
+        observation: FakeObservation,
+    ) {
         match observation {
             FakeObservation::Accepted(observation) => {
                 // Route admits one acceptance; a repeat would be deduplicated anyway.
@@ -779,7 +785,7 @@ impl Engine {
                 };
                 let seq = head.next();
                 match self
-                    .accept(&record.session, record.turn, seq, observation)
+                    .accept(&record.session, record.turn, seq, effective, observation)
                     .await
                 {
                     Ok(accepted) => {
@@ -879,6 +885,10 @@ impl Engine {
         let Ok(Some(queued)) = journal.queued_turn(session, turn).await else {
             return Err(SubmitFailure::Unread);
         };
+        // A frozen row Core cannot read is a Store failure: nothing is sent.
+        let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
+            return Err(SubmitFailure::Failed);
+        };
         let Ok(head) = head.lock(journal, session).await else {
             return Err(SubmitFailure::Unread);
         };
@@ -915,6 +925,7 @@ impl Engine {
             session: session.clone(),
             turn,
             queued,
+            effective,
             submitted,
             clock,
         })
@@ -927,6 +938,7 @@ impl Engine {
         session: &SessionId,
         turn: TurnNumber,
         seq: u64,
+        effective: &Effective,
         observation: FakeAcceptanceObservation,
     ) -> Result<Accepted, Option<Accepted>> {
         let at = rfc3339(SystemTime::now());
@@ -938,7 +950,7 @@ impl Engine {
             at: &at,
             raw_ref: Some(&observation.raw_ref),
             body: EventBody::TurnStarted {
-                effective: Effective::fake("fake"),
+                effective: effective.clone(),
             },
         }
         .to_value()
@@ -972,6 +984,22 @@ impl Engine {
             Err(error) => Err(journal::may_have_committed(&error).then_some(accepted)),
         }
     }
+}
+
+/// The turn's absolute Core deadline from its own frozen wall budget (C1 §4)
+/// and that deadline's wall time. A budget too far off to represent never
+/// expires in practice.
+fn wall_deadline(effective: &Effective) -> (Deadline, String) {
+    let wall = effective.wall();
+    let now = tokio::time::Instant::now();
+    let far = || now + Duration::from_hours(24 * 365 * 30);
+    let at = SystemTime::now()
+        .checked_add(wall)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    (
+        Deadline::at(now.checked_add(wall).unwrap_or_else(far)),
+        rfc3339(at),
+    )
 }
 
 /// The facts, record and terminal of a never-submitted turn's cancellation.

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{ConnectionId, RawRef, SessionId, TurnNumber, TurnState};
 
-/// Strict C1 parameters for creating Task 1's fake session and first turn.
+/// Strict C1 §3.2 parameters for creating a fake session and its first turn.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnParams {
@@ -26,9 +26,22 @@ pub struct SpawnParams {
     /// C1 P4 retry key: the same key, handle and params replay the receipt.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    effort: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    bound: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    deadlines: Option<DeadlineParams>,
+    #[serde(default, deserialize_with = "present")]
+    max_steps: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    vendor: Option<Value>,
 }
 
-/// Strict C1 §3.3 `resume` parameters; the fake route has no per-turn options.
+/// Strict C1 §3.3 `resume` parameters. Session-scope members are accepted
+/// only to be refused by name (C1 §4 `session_scope_on_resume`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResumeParams {
@@ -41,6 +54,212 @@ pub struct ResumeParams {
     /// C1 §3 retry key: the same key and params replay the turn receipt.
     #[serde(default)]
     pub op_key: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    effort: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    bound: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    deadlines: Option<DeadlineParams>,
+    #[serde(default, deserialize_with = "present")]
+    max_steps: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    vendor: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    harness: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    model: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    allow_untested: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    instructions: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    cwd: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    require: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    label: Option<Value>,
+}
+
+/// C1 §4 `deadlines` as sent: `{wall_ms?, idle_ms?}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeadlineParams {
+    #[serde(default)]
+    wall_ms: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    idle_ms: Option<Value>,
+}
+
+/// Keeps an explicit `null` distinct from an omitted member: `Some(Null)`.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// The C1 §4 per-turn parameters of one `spawn` or `resume`, as sent.
+pub(crate) struct PerTurn<'a> {
+    effort: Option<&'a Value>,
+    bound: Option<&'a Value>,
+    output_schema: Option<&'a Value>,
+    deadlines: Option<&'a DeadlineParams>,
+    max_steps: Option<&'a Value>,
+    vendor: Option<&'a Value>,
+}
+
+/// What a turn sets for itself on the fake route; anything else inherits.
+pub(crate) struct Overrides {
+    wall_ms: Option<u64>,
+}
+
+impl SpawnParams {
+    pub(crate) fn per_turn(&self) -> PerTurn<'_> {
+        PerTurn {
+            effort: self.effort.as_ref(),
+            bound: self.bound.as_ref(),
+            output_schema: self.output_schema.as_ref(),
+            deadlines: self.deadlines.as_ref(),
+            max_steps: self.max_steps.as_ref(),
+            vendor: self.vendor.as_ref(),
+        }
+    }
+}
+
+impl ResumeParams {
+    pub(crate) fn per_turn(&self) -> PerTurn<'_> {
+        PerTurn {
+            effort: self.effort.as_ref(),
+            bound: self.bound.as_ref(),
+            output_schema: self.output_schema.as_ref(),
+            deadlines: self.deadlines.as_ref(),
+            max_steps: self.max_steps.as_ref(),
+            vendor: self.vendor.as_ref(),
+        }
+    }
+
+    /// C1 §3.3/§4: session-scope parameters, `allow_untested` included, are
+    /// fixed at spawn; any of them on `resume` is refused by name.
+    pub(crate) fn refuse_session_scope(&self) -> Result<(), ApiError> {
+        let members = [
+            (
+                &self.harness,
+                &const { Named::field("harness") },
+                "harness is session scope; resume cannot set it",
+            ),
+            (
+                &self.model,
+                &const { Named::field("model") },
+                "model is session scope; resume cannot set it",
+            ),
+            (
+                &self.allow_untested,
+                &const { Named::field("allow_untested") },
+                "allow_untested is session scope; resume cannot set it",
+            ),
+            (
+                &self.instructions,
+                &const { Named::field("instructions") },
+                "instructions is session scope; resume cannot set it",
+            ),
+            (
+                &self.cwd,
+                &const { Named::field("cwd") },
+                "cwd is session scope; resume cannot set it",
+            ),
+            (
+                &self.require,
+                &const { Named::field("require") },
+                "require is spawn scope; resume cannot set it",
+            ),
+            (
+                &self.label,
+                &const { Named::field("label") },
+                "label is session scope; resume cannot set it",
+            ),
+        ];
+        match members.into_iter().find(|(value, ..)| value.is_some()) {
+            Some((_, named, message)) => Err(ApiError {
+                kind2: Some("session_scope_on_resume"),
+                ..ApiError::naming(ApiError::INVALID_PARAMS, named, message)
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+impl PerTurn<'_> {
+    /// Validates the values against the fake route's capabilities
+    /// ([`Capabilities::fake`]). Null or omitted values inherit; a null
+    /// `output_schema` clears, which on this route is already the state.
+    pub(crate) fn fake_overrides(&self) -> Result<Overrides, ApiError> {
+        let given = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+        if given(self.effort) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("effort") },
+                "effort is unsupported on route fake",
+            ));
+        }
+        if given(self.output_schema) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("output_schema") },
+                "output_schema is unsupported on route fake",
+            ));
+        }
+        if given(self.max_steps) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("max_steps") },
+                "max_steps is unsupported on route fake",
+            ));
+        }
+        // The fake route declares no bounds, so any bound, even null, is
+        // unenforceable.
+        if self.bound.is_some() {
+            return Err(ApiError::naming(
+                ApiError::BOUND_UNSUPPORTED,
+                &const { Named::fake("bound") },
+                "bound is unsupported on route fake, which declares no bounds",
+            ));
+        }
+        // Only `{}` or empty per-harness objects: the fake declares no options.
+        let empty = |value: &Value| {
+            value.as_object().is_some_and(|options| {
+                options
+                    .values()
+                    .all(|harness| harness.as_object().is_some_and(serde_json::Map::is_empty))
+            })
+        };
+        if self.vendor.is_some_and(|vendor| !empty(vendor)) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("vendor") },
+                "vendor options are unsupported on route fake",
+            ));
+        }
+        let Some(deadlines) = self.deadlines else {
+            return Ok(Overrides { wall_ms: None });
+        };
+        // Core enforces no idle deadline yet (via-jm4.7.7).
+        if given(deadlines.idle_ms.as_ref()) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("deadlines.idle_ms") },
+                "deadlines.idle_ms is not enforced on route fake",
+            ));
+        }
+        if deadlines.wall_ms == Some(0) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("deadlines.wall_ms") },
+                "deadlines.wall_ms must be at least 1",
+            ));
+        }
+        Ok(Overrides {
+            wall_ms: deadlines.wall_ms,
+        })
+    }
 }
 
 /// Strict C1 §3.8 `wait` parameters.
@@ -117,6 +336,33 @@ pub struct ApiError {
     pub kind2: Option<&'static str>,
     /// C1 §8.1 `store_error` before a receipt: what happened to its commit.
     pub commit_outcome: Option<ReceiptOutcome>,
+    /// The refused request member and route, named in `data`.
+    pub named: Option<&'static Named>,
+}
+
+/// A refused request member (`data.field`) and, when a route's capabilities
+/// refused it, that route (`data.route`).
+#[derive(Debug)]
+pub struct Named {
+    /// Request member, dotted for a nested one.
+    pub field: &'static str,
+    /// Route whose capabilities refuse the member.
+    pub route: Option<&'static str>,
+}
+
+impl Named {
+    /// A member refused regardless of route.
+    const fn field(field: &'static str) -> Self {
+        Self { field, route: None }
+    }
+
+    /// A per-turn member the fake route's capabilities refuse.
+    const fn fake(field: &'static str) -> Self {
+        Self {
+            field,
+            route: Some(FAKE_ROUTE),
+        }
+    }
 }
 
 /// C1 §8.1 `data.commit_outcome` of a `store_error` before a receipt.
@@ -191,7 +437,22 @@ impl ApiError {
             data["durable_state"] = json!(turn.durable_state.as_str());
             data["terminal_persisted"] = json!(false);
         }
+        if let Some(named) = self.named {
+            data["field"] = json!(named.field);
+            if let Some(route) = named.route {
+                data["route"] = json!(route);
+            }
+        }
         data
+    }
+
+    /// A refusal naming the member (and route) in `named`.
+    fn naming(base: Self, named: &'static Named, message: &'static str) -> Self {
+        Self {
+            message,
+            named: Some(named),
+            ..base
+        }
     }
 
     /// Invalid request fields or identifier format.
@@ -202,6 +463,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// A caller handle did not authorize a mutation.
     pub const INVALID_HANDLE: Self = Self {
@@ -211,6 +473,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The selected route has no such control capability.
     pub const UNSUPPORTED_VERB: Self = Self {
@@ -220,6 +483,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The fake route is not configured or selected.
     pub const HARNESS_UNAVAILABLE: Self = Self {
@@ -229,6 +493,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The daemon accepted a stop and admits no new work.
     pub const DAEMON_STOPPING: Self = Self {
@@ -238,6 +503,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// Active sessions refuse a plain stop (C1 §3.14).
     pub const SESSIONS_ACTIVE: Self = Self {
@@ -247,6 +513,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The daemon already retains its bound of turns without a durable terminal.
     pub const TURNS_AT_CAPACITY: Self = Self {
@@ -256,6 +523,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
@@ -265,6 +533,17 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
+    };
+    /// A bound the route cannot enforce (C1 §4.2).
+    pub const BOUND_UNSUPPORTED: Self = Self {
+        code: -32008,
+        kind: "bound_unsupported",
+        message: "bound is unsupported on this route",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
     };
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
@@ -274,6 +553,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// A wait deadline elapsed while the turn remains active.
     pub const WAIT_TIMEOUT: Self = Self {
@@ -283,6 +563,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The requested session is absent.
     pub const SESSION_NOT_FOUND: Self = Self {
@@ -292,6 +573,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The session is closed or closing.
     pub const SESSION_CLOSED: Self = Self {
@@ -301,6 +583,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The session exists but has no such turn.
     pub const TURN_NOT_FOUND: Self = Self {
@@ -310,6 +593,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The session already holds its bound of queued turns (C1 P6).
     pub const QUEUE_FULL: Self = Self {
@@ -319,6 +603,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// The daemon already holds its bound of queued turns (runtime §8).
     pub const QUEUED_AT_CAPACITY: Self = Self {
@@ -328,6 +613,7 @@ impl ApiError {
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
+        named: None,
     };
     /// A retry key was reused with another handle or other params (C1 P4).
     pub const IDEMPOTENCY_CONFLICT: Self = Self {
@@ -337,6 +623,7 @@ impl ApiError {
         unpersisted: None,
         kind2: Some("idempotency_conflict"),
         commit_outcome: None,
+        named: None,
     };
 }
 
@@ -476,7 +763,9 @@ pub(crate) fn new_session_id() -> Result<SessionId, ApiError> {
 
 /// The only route this build can plan.
 pub(crate) const FAKE_ROUTE: &str = "fake";
-/// Absolute wall deadline Core applies to a fake turn; reported as effective.
+/// Wall deadline of a fake turn that neither sets nor inherits one. C1 §4's
+/// default is 3 600 000 ms; the fake route keeps 30 s so a hung fake turn in
+/// a test that sets nothing ends in bounded time.
 pub(crate) const FAKE_WALL_MS: u64 = 30_000;
 
 /// One `support` entry of the C1 §4.1 capabilities DTO.
@@ -550,15 +839,16 @@ impl Capabilities {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub(crate) struct Deadlines {
     wall_ms: u64,
     /// No idle deadline is enforced on the fake route.
     idle_ms: Option<u64>,
 }
 
-/// Values frozen at acceptance (§3.2 `effective`, `turn.started` payload).
-#[derive(Clone, Serialize)]
+/// Values frozen at acceptance (§3.2 `effective`, `turn.started` payload),
+/// stored in the turn's Store row and driven from.
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Effective {
     model: String,
     effort: Option<String>,
@@ -568,17 +858,33 @@ pub(crate) struct Effective {
 }
 
 impl Effective {
-    pub(crate) fn fake(model: &str) -> Self {
+    /// Turn 1 of a fake session: its own values, else the fake route's defaults.
+    pub(crate) fn fake(model: &str, overrides: &Overrides) -> Self {
         Self {
             model: model.to_owned(),
             effort: None,
             bound: None,
             deadlines: Deadlines {
-                wall_ms: FAKE_WALL_MS,
+                wall_ms: overrides.wall_ms.unwrap_or(FAKE_WALL_MS),
                 idle_ms: None,
             },
             max_steps: None,
         }
+    }
+
+    /// C1 P5: a later turn's values, each omitted one inherited from the
+    /// latest accepted turn's frozen `self`.
+    pub(crate) fn inherit(&self, overrides: &Overrides) -> Self {
+        let mut effective = self.clone();
+        if let Some(wall_ms) = overrides.wall_ms {
+            effective.deadlines.wall_ms = wall_ms;
+        }
+        effective
+    }
+
+    /// The turn's Core-owned wall deadline budget.
+    pub(crate) fn wall(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.deadlines.wall_ms)
     }
 }
 
@@ -960,7 +1266,41 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{ConnectionId, EventBody, UNIX_EPOCH, retry_identity, retry_key, rfc3339};
+    use super::{
+        ConnectionId, EventBody, SpawnParams, UNIX_EPOCH, retry_identity, retry_key, rfc3339,
+    };
+
+    /// Fake-route edge rules: an empty options object per harness passes, a
+    /// null `bound` is still a bound, and a zero wall budget is refused.
+    #[test]
+    fn fake_per_turn_edge_values() {
+        let check = |extra: serde_json::Value| {
+            let mut params = json!({"harness":"fake","model":"fake","prompt":"p","handle":"h"});
+            for (member, value) in extra.as_object().unwrap() {
+                params[member] = value.clone();
+            }
+            let params: SpawnParams = serde_json::from_value(params).unwrap();
+            params
+                .per_turn()
+                .fake_overrides()
+                .map(|overrides| overrides.wall_ms)
+                .map_err(|error| (error.kind, error.named.map(|named| named.field)))
+        };
+        assert_eq!(check(json!({"vendor":{"fake":{},"codex":{}}})), Ok(None));
+        assert_eq!(check(json!({"deadlines":{"wall_ms":7}})), Ok(Some(7)));
+        assert_eq!(
+            check(json!({"bound":null})),
+            Err(("bound_unsupported", Some("bound")))
+        );
+        assert_eq!(
+            check(json!({"vendor":{"fake":{"k":"v"}}})),
+            Err(("invalid_params", Some("vendor")))
+        );
+        assert_eq!(
+            check(json!({"deadlines":{"wall_ms":0}})),
+            Err(("invalid_params", Some("deadlines.wall_ms")))
+        );
+    }
 
     #[test]
     fn observation_events_use_c1_tags_and_fields() {

@@ -547,6 +547,7 @@ async fn dispatch(
             unpersisted: None,
             kind2: None,
             commit_outcome: None,
+            named: None,
         })),
     }
 }
@@ -558,6 +559,7 @@ const HANDSHAKE_REQUIRED: ApiError = ApiError {
     unpersisted: None,
     kind2: None,
     commit_outcome: None,
+    named: None,
 };
 
 const VERSION_MISMATCH: ApiError = ApiError {
@@ -567,6 +569,7 @@ const VERSION_MISMATCH: ApiError = ApiError {
     unpersisted: None,
     kind2: None,
     commit_outcome: None,
+    named: None,
 };
 
 const PARSE_ERROR: ApiError = ApiError {
@@ -576,6 +579,7 @@ const PARSE_ERROR: ApiError = ApiError {
     unpersisted: None,
     kind2: None,
     commit_outcome: None,
+    named: None,
 };
 
 const INVALID_REQUEST: ApiError = ApiError {
@@ -585,6 +589,7 @@ const INVALID_REQUEST: ApiError = ApiError {
     unpersisted: None,
     kind2: None,
     commit_outcome: None,
+    named: None,
 };
 
 /// A request error plus the optional C1 `data.kind2` refinement.

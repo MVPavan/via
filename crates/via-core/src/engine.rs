@@ -498,6 +498,7 @@ impl Engine {
         if params.model != "fake" || params.prompt.is_empty() {
             return Err(ApiError::INVALID_PARAMS);
         }
+        let effective = Effective::fake(&params.model, &params.per_turn().fake_overrides()?);
         if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
             return Err(ApiError::QUEUED_AT_CAPACITY);
         }
@@ -511,7 +512,7 @@ impl Engine {
             warnings: plan.warnings(),
             plan,
             capabilities: Capabilities::fake(),
-            effective: Effective::fake(&params.model),
+            effective,
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
         let at = rfc3339(SystemTime::now());
@@ -535,6 +536,7 @@ impl Engine {
                     handle_hash: hash,
                     receipt: receipt.clone(),
                     params: json!({"harness":"fake","model":"fake"}),
+                    effective: receipt["effective"].clone(),
                     prompt: params.prompt,
                     initial_event,
                 },
@@ -569,6 +571,8 @@ impl Engine {
         if params.prompt.is_empty() {
             return Err(ApiError::INVALID_PARAMS);
         }
+        params.refuse_session_scope()?;
+        let overrides = params.per_turn().fake_overrides()?;
         let session = params.session;
         let snapshot = self
             .store
@@ -619,17 +623,33 @@ impl Engine {
         if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
             return Err(ApiError::QUEUED_AT_CAPACITY);
         }
-        self.queue_turn(session, &snapshot, params.prompt, operation, &admission)
-            .await
+        // C1 P5: omitted values inherit from the latest accepted turn,
+        // resolved under `admission`, which every receipt commit holds;
+        // Store's next-turn check in the same transaction confirms it.
+        let latest: Effective = snapshot
+            .latest_effective
+            .clone()
+            .and_then(|latest| serde_json::from_value(latest).ok())
+            .ok_or(ApiError::STORE)?;
+        let effective = latest.inherit(&overrides);
+        self.queue_turn(
+            session,
+            &snapshot,
+            (params.prompt, effective),
+            operation,
+            &admission,
+        )
+        .await
     }
 
-    /// Commits the session's next turn `queued`, its `turn.queued` event at the
-    /// shared head and any `op_key` result, then returns the turn receipt.
+    /// Commits the session's next turn `queued` with its frozen effective
+    /// values, its `turn.queued` event at the shared head and any `op_key`
+    /// result, then returns the turn receipt.
     async fn queue_turn(
         &self,
         session: SessionId,
         snapshot: &SessionSnapshot,
-        prompt: String,
+        (prompt, effective): (String, Effective),
         operation: Option<(String, Vec<u8>)>,
         admission: &Admission<'_>,
     ) -> Result<Receipted, ApiError> {
@@ -639,7 +659,7 @@ impl Engine {
             turn: format!("{}/{}", session.as_str(), turn.get()),
             state: "queued",
             queue_position: snapshot.queued,
-            effective: Effective::fake("fake"),
+            effective,
             warnings: RoutePlan::fake().warnings(),
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
@@ -667,6 +687,7 @@ impl Engine {
                 session_id: session.clone(),
                 turn,
                 prompt,
+                effective: receipt["effective"].clone(),
                 event,
                 operation: operation.map(|(op_key, identity)| OperationRecord {
                     op_key,

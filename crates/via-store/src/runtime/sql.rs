@@ -52,9 +52,16 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
+/// Configures the sole writable connection; initializes the schema only in
+/// a database this open `created`. The version is checked again before the
+/// first mutation, the journal-mode switch.
+pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), StoreError> {
     conn.busy_timeout(Duration::from_millis(250))
         .map_err(|error| StoreError::Open(error.to_string()))?;
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| StoreError::Open(error.to_string()))?;
+    check_schema_version(version, created)?;
     let journal: String = conn
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -72,10 +79,6 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
         "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;",
     )
     .map_err(|error| StoreError::Open(error.to_string()))?;
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| StoreError::Open(error.to_string()))?;
-    check_schema_version(version)?;
     if version == 0 {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -87,7 +90,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 next_seq INTEGER NOT NULL CHECK(next_seq>=2));
              CREATE TABLE turns (
                 session_id TEXT NOT NULL REFERENCES sessions(id), number INTEGER NOT NULL,
-                prompt TEXT NOT NULL, state TEXT NOT NULL, queued_at TEXT,
+                prompt TEXT NOT NULL, effective TEXT NOT NULL, state TEXT NOT NULL, queued_at TEXT,
                 queued_seq INTEGER NOT NULL, submitted_at TEXT,
                 accepted_at TEXT, correlation TEXT, envelope TEXT,
                 PRIMARY KEY(session_id,number));
@@ -113,7 +116,7 @@ pub(super) fn configure(conn: &mut Connection) -> Result<(), StoreError> {
                 absence_time TEXT,
                 FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
              CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
-             PRAGMA user_version=3;",
+             PRAGMA user_version=4;",
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
         tx.commit()
@@ -329,6 +332,7 @@ fn commit_spawn(
     }
     let receipt = json(&record.receipt)?;
     let params_json = json(&record.params)?;
+    let effective = json(&record.effective)?;
     let event = json(&record.initial_event)?;
     // Core's queued event always carries its time; bare fixtures of lower layers may not.
     let queued_at = record.initial_event.get("at").and_then(Value::as_str);
@@ -341,8 +345,8 @@ fn commit_spawn(
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.execute(
-        "INSERT INTO turns(session_id,number,prompt,state,queued_at,queued_seq) VALUES (?1,1,?2,'queued',?3,1)",
-        params![record.session_id.as_str(), record.prompt, queued_at],
+        "INSERT INTO turns(session_id,number,prompt,effective,state,queued_at,queued_seq) VALUES (?1,1,?2,?3,'queued',?4,1)",
+        params![record.session_id.as_str(), record.prompt, effective, queued_at],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     tx.execute(
@@ -392,8 +396,11 @@ fn read_spawn_key(conn: &Connection, key: &str) -> Result<Option<StoredSpawnKey>
     .transpose()
 }
 
-/// Commits a queued turn at the session's next number with its `turn.queued`
-/// event and, when keyed, the `op_key` result, in one transaction.
+/// Commits a queued turn at the session's next number with its frozen
+/// effective values, its `turn.queued` event and, when keyed, the `op_key`
+/// result, in one transaction. Checking that the turn is the session's next
+/// inside the transaction also proves that the latest turn Core inherited
+/// from under admission is still the latest (C1 P5).
 fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), StoreError> {
     let session = &record.session_id;
     let queued_at = event_at(&record.event)?;
@@ -422,8 +429,15 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
         return Err(StoreError::Constraint("session queue is full"));
     }
     tx.execute(
-        "INSERT INTO turns(session_id,number,prompt,state,queued_at,queued_seq) VALUES (?1,?2,?3,'queued',?4,?5)",
-        params![session.as_str(), record.turn.get(), record.prompt, queued_at, queued_seq],
+        "INSERT INTO turns(session_id,number,prompt,effective,state,queued_at,queued_seq) VALUES (?1,?2,?3,?4,'queued',?5,?6)",
+        params![
+            session.as_str(),
+            record.turn.get(),
+            record.prompt,
+            json(&record.effective)?,
+            queued_at,
+            queued_seq
+        ],
     )
     .map_err(|error| StoreError::Write(error.to_string()))?;
     insert_event(&tx, session, &record.event, None)?;
@@ -476,22 +490,30 @@ fn read_snapshot(
     conn: &Connection,
     session: &SessionId,
 ) -> Result<Option<SessionSnapshot>, StoreError> {
-    conn.query_row(
-        "SELECT state,
-            (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
-            (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued')
-         FROM sessions WHERE id=?1",
-        [session.as_str()],
-        |row| {
-            Ok(SessionSnapshot {
-                closed: row.get::<_, String>(0)? == "closed",
-                turns: row.get(1)?,
-                queued: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| StoreError::Write(error.to_string()))
+    let row: Option<(String, u32, u32, Option<String>)> = conn
+        .query_row(
+            "SELECT state,
+                (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
+                (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
+                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1)
+             FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::Write(error.to_string()))?;
+    row.map(|(state, turns, queued, latest)| {
+        Ok(SessionSnapshot {
+            closed: state == "closed",
+            turns,
+            queued,
+            latest_effective: latest
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|_| StoreError::CorruptEvidence)?,
+        })
+    })
+    .transpose()
 }
 
 /// One page of durable `queued` turns in `(session, turn)` order after `after`.
@@ -531,17 +553,18 @@ fn read_queued_turn(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<QueuedTurn>, StoreError> {
-    let row: Option<(String, Option<String>, i64)> = conn
+    let row: Option<(String, String, Option<String>, i64)> = conn
         .query_row(
-            "SELECT prompt,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
+            "SELECT prompt,effective,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
             params![session.as_str(), turn.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|error| StoreError::Write(error.to_string()))?;
-    row.map(|(prompt, queued_at, queued_seq)| {
+    row.map(|(prompt, effective, queued_at, queued_seq)| {
         Ok(QueuedTurn {
             prompt,
+            effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
             queued_at: queued_at.ok_or(StoreError::CorruptEvidence)?,
             queued_seq: u64::try_from(queued_seq).map_err(|_| StoreError::CorruptEvidence)?,
         })

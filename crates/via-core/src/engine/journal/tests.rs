@@ -156,6 +156,7 @@ async fn running_turn(root: &tempfile::TempDir) -> (Store, RawRef) {
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
             prompt: "hello".to_owned(),
+            effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
         })
         .await
@@ -355,6 +356,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
             session_id: session(),
             turn: TurnNumber::try_from(2).unwrap(),
             prompt: "next".to_owned(),
+            effective: frozen(),
             event: queued,
             operation: None,
         })
@@ -467,6 +469,7 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
             prompt: "hello".to_owned(),
+            effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
         })
         .await
@@ -484,13 +487,15 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
 }
 
 fn spawn_params() -> SpawnParams {
-    SpawnParams {
-        harness: "fake".to_owned(),
-        model: "fake".to_owned(),
-        prompt: "hello".to_owned(),
-        handle: format!("h_{}", "A".repeat(43)),
-        idempotency_key: None,
-    }
+    serde_json::from_value(json!({"harness":"fake","model":"fake","prompt":"hello",
+        "handle":format!("h_{}", "A".repeat(43))}))
+    .unwrap()
+}
+
+/// A turn's frozen effective values as Core stores them.
+fn frozen() -> serde_json::Value {
+    json!({"model":"fake","effort":null,"bound":null,
+        "deadlines":{"wall_ms":30_000,"idle_ms":null},"max_steps":null})
 }
 
 fn wait(address: &str) -> WaitParams {
