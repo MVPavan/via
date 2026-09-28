@@ -12,7 +12,8 @@ orchestrator dispatches implementation slices on disjoint files.
 |---|---|---|---|
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
-| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); round 1 fixes in local worktree branch `wt/t3-s1` | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); round 1: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
+| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); three local fix rounds; merged `4a1c11c` (Sol medium SOUND, `sol-review-S1-r3.md`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); rounds 1–3: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
+| T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md` |
 
 ## Carried into Task 3
 
@@ -82,3 +83,10 @@ Round 1 (local `wt/t3-s1`, `4352602..020ac95`) fixed decisions 1–7. Gate:
 213 / 2, failpoints 261 / 2 three times, F08–F12 17. The Sol medium
 re-review (`sol-review-S1-r1.md`) is SOUND: merge after decision 8, with no
 findings. Round 2 is decision 8 alone.
+
+Rounds 2 and 3: decision 8 (`a35a5c6`); Sol found that the caller's stop
+check bypassed it (`sol-review-S1-r2.md`, decision 11), fixed in `aac45b7`.
+Sol round-3 check SOUND (`sol-review-S1-r3.md`). S1 merged at `4a1c11c`.
+The gate on the merged tree: 213 / 2, failpoints 264 / 2 three times,
+F08–F12 17, release check clean. The design edits S1 needed are in
+`8eb4ed0` (tags `[s1.N]`, `[S1]`, amendment A20).

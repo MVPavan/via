@@ -84,32 +84,20 @@ the historical checkpoint; its findings table is updated by this section.
   high, decisions in `t3/design-r{3,4}-decisions.md`; design at `1a814d6`
   final after round 6 and merged at `68aa7b6` ([t3/design.md](t3/design.md)).
   S0 (file split) merged at `08fffce`. S1 (Store/Host/Wire/Route
-  primitives, [t3/s1.md](t3/s1.md), last cloud worker) delivered on
-  `claude/t3-s1-task-execution-60rojp` at `8d2a7b6`. Sol medium: Store
-  SOUND WITH CHANGES, Host/Wire/Route UNSOUND (the interrupt write drops a
-  raw Store failure) (`t3/sol-review-S1-*.md`). Local gate clean (207 / 2
-  three times, failpoints 253 / 2 five times, F08–F12 17). Round-1
-  decisions [t3/s1-r1-decisions.md](t3/s1-r1-decisions.md); a local
-  `implementer-high` subagent fixed 1–7 in worktree `../via-wt/t3-s1`
-  (local branch `wt/t3-s1` at `020ac95`, not pushed; report
-  `t3/reports/T3-S1.md` "Round 1"; gate 213 / 2, failpoints 261 / 2 ×3,
-  F08–F12 17). Decision 8 (post-`stopping` acquisitions keep the early
-  stop's deadline) and dispositions 9–10 are in the same decisions file.
-  The Sol medium re-review of `4352602..020ac95` is SOUND: merge after
-  decision 8, with no findings (`t3/sol-review-S1-r1.md`). Round 2
-  (decision 8 only) is with the round-1 worker in the same worktree; it
-  appends "Round 2" to the report. **Resume here:**
-  1. If the worker died, check `wt/t3-s1` past `020ac95` and dispatch a
-     fresh `implementer-high` for whatever of decision 8 is missing.
-  2. Get a narrow Sol check of round 2.
-  3. Merge `wt/t3-s1` into `rust-foundation`, run the gate, push. Delete the
-     remote `claude/t3-s1-task-execution-60rojp` and the worktree.
-  4. Make the design and contract edits all the S1 report sections list.
-  5. S2. **From 2026-09-28 no new cloud work: Claude workers are local
+  primitives, [t3/s1.md](t3/s1.md)) came from the last cloud worker at
+  `8d2a7b6`. Three local `implementer-high` fix rounds followed
+  ([t3/s1-r1-decisions.md](t3/s1-r1-decisions.md) 1–11). Sol medium
+  reviews: `t3/sol-review-S1-{store,host,r1,r2,r3}.md`, the last SOUND. S1
+  merged at `4a1c11c`, with the design edits in `8eb4ed0`. Gate: 213 / 2,
+  failpoints 264 / 2 three times, F08–F12 17, release check clean. **Now
+  S2** (turn control, [t3/s2.md](t3/s2.md)): a local `implementer-high`
+  subagent in worktree `../via-wt/t3-s2`, on branch `wt/t3-s2`, which is
+  not pushed. If the session died, inspect that branch and re-dispatch
+  from its last commit with the same brief. Then comes Sol medium review
+  in tmux, then merge, then S3 → S5 with S4 in parallel. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
-  reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). Then S2
-  (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique
-  (`.7.9`). After a reboot, restore tmux session
+  reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After
+  Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
   `scratchpad/cloud/watch-branches.sh`).
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
