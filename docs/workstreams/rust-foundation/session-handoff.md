@@ -101,12 +101,15 @@ the historical checkpoint; its findings table is updated by this section.
   lifecycle, [t3/s3.md](t3/s3.md)) merged at `d69e6d0` after two local fix
   rounds ([t3/s3-r1-decisions.md](t3/s3-r1-decisions.md) 1–11; Sol
   `t3/sol-review-S3-{shutdown,serving,r1,r2}.md`; the last finding deferred
-  to `via-pvj.2`). Gate: 263 / 1, failpoints 351 / 1 three times, F08–F12 19, release check clean. **Now S5** (Store failures,
-  [t3/s5.md](t3/s5.md)): a local `implementer-high` subagent in worktree
-  `../via-wt/t3-s5` on branch `wt/t3-s5`, not pushed. If the session died,
-  inspect that branch and its report, then re-dispatch what is missing.
-  Then Sol medium, merge, gate and push; then Sol high on the whole task
-  and close `via-jm4.7.7`. **From 2026-09-28 no new cloud work: Claude workers are local
+  to `via-pvj.2`). Gate: 263 / 1, failpoints 351 / 1 three times, F08–F12 19, release check clean. S5 (Store failures,
+  [t3/s5.md](t3/s5.md)) merged at `9efbab8` after four local fix rounds
+  ([t3/s5-r1-decisions.md](t3/s5-r1-decisions.md) 1–16; Sol
+  `t3/sol-review-S5-*.md`, the last SOUND). Gate: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push. **Now: Sol
+  high on the whole of Task 3**, then close `via-jm4.7.7`. From
+  2026-09-28 new implementation slices use Sonnet 5.5
+  (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
+  owner decision), compared with Opus in
+  [model-observations.md](model-observations.md). **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session

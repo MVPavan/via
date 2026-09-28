@@ -15,7 +15,7 @@ orchestrator dispatches implementation slices on disjoint files.
 | T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); three local fix rounds; merged `4a1c11c` (Sol medium SOUND, `sol-review-S1-r3.md`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); rounds 1–3: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
 | T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2); two local fix rounds; merged `dd2a81d` (Sol medium SOUND, `sol-review-S2-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md`, `s2-r1-decisions.md` |
 | T3-S3 | Daemon lifecycle: stop, drain, force, idle exit, final-shutdown pipeline, status, re-probe loop, early-stop wiring (design §13 S3); two local fix rounds; merged `d69e6d0` (Sol medium; last finding deferred to `via-pvj.2`, `sol-review-S3-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s3` | `s3.md`, `s3-r1-decisions.md` |
-| T3-S5 | Store failures: F12 and O1, scoped and latch paths, status health, carried items from S1–S4 (design §13 S5) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s5` | `s5.md` |
+| T3-S5 | Store failures: F12 and O1, scoped and latch paths, read-corruption boundary, status health, carried items from S1–S4 (design §13 S5); four local fix rounds; merged `9efbab8` (Sol medium SOUND, `sol-review-S5-r4.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s5` | `s5.md`, `s5-r1-decisions.md` |
 | T3-S4 | Recovery evidence: raw incompleteness, durable cancel events, corrupt-row handoff, F9, F22, F23 (design §13 S4); parallel with S3; two local fix rounds; merged `3ca53e4` (Sol medium SOUND, `sol-review-S4-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s4` | `s4.md`, `s4-r1-decisions.md` |
 
 ## Carried into Task 3
@@ -137,3 +137,14 @@ deferred to the platform gate `via-pvj.2` under runtime §6 (decision 11).
 S3 merged at `d69e6d0`, on top of S4. The gate on the merged tree:
 263 / 1, failpoints 351 / 1 three times, F08–F12 19, release check clean. S5 then starts (`s5.md`); its §13 entry carries S1–S4's
 leftovers.
+
+S5 delivered at `b08093c`. Sol medium reviewed it in two parts:
+`sol-review-S5-latch.md` (SOUND WITH CHANGES) and `sol-review-S5-scoped.md`
+(UNSOUND: a later uncertain failure ignored, corrupt head reads treated as
+clean, a missing row-5 order). Round 1 fixed those and every head read
+(decisions 1–10). Round 2 classified read corruption once, at Store's read
+reply (decision 11), instead of site by site. Rounds 3 and 4 settled the
+failure count and the unclosed-session count (decisions 12–16). Sol's
+round-4 check was SOUND. Each round was narrower than the last. S5 merged at
+`9efbab8`. The gate on the merged tree: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push. Next: Sol high on the
+whole task, then close `via-jm4.7.7`.

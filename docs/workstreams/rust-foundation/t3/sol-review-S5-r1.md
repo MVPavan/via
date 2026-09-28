@@ -1,0 +1,18 @@
+GPT-6 Sol medium check of T3-S5 fix round 1 (`b08093c..72def69` on local `wt/t3-s5`): decisions 1-7 and 10.
+
+**Verdict: SOUND WITH CHANGES — do not merge S5 yet.** Decisions 1–3, 5–7 and 10 address their named findings. I found no new unowned state, lost wake, lock-order violation or double owner in those fixes. Decision 4 replaces an undercount with a possible overcount, and several reads still discard SQLite corruption.
+
+### Findings, ranked
+
+1. **Important — corruption can escape the latch.** `wt/t3-s5:crates/via-core/src/engine/stop.rs:502,511` discards errors from the closure pass’s snapshot and predecessor reads. The terminal reconcile read is mapped to a plain API error at `drive.rs:1197`; the batch discards result, reconcile and queued-row read errors at `batch.rs:95-101`. Section 7.1 says SQLite-level corruption on **any read** latches; §7.3’s “Reads otherwise never latch” exempts other read failures, not corruption. **Fix:** classify corruption once at the Store read-reply boundary before returning the reply to Core, feeding Core’s existing failure hook. Run phase one synchronously, defer phase two until `admission` can be taken, and remove duplicate site-level corruption reports. Cover all read commands, including the four paths above, with a corruption seam and an acknowledgement.
+
+2. **Important — `unclosed_sessions` can overcount.** `wt/t3-s5:crates/via-core/src/engine/stop.rs:487-490` counts every remaining force session as open after a latch. A forced terminal can commit `session.closed` in its transaction (`stop.rs:280-296`) and then lose its reply: the reply-loss seam fires *after* the transaction (`crates/via-store/src/runtime/sql.rs:524-532`). In that case the new test’s expected count of one may be false. **Fix:** use a read-only closed-state check for remaining sessions; count an unreadable state conservatively as unverified/unclosed, and classify corruption on that read. Assert the durable `closed` value alongside the summary in the reply-loss test.
+
+`WriteOutcome::of_read` is the right **outcome classification** for head reads: a failed read wrote nothing, while `Corrupt` still latches. Applying write uncertainty to ordinary read I/O would conflict with §7.3. `Unended { error, outcome }` is sound: `drive.rs:1202-1208` preserves `Corrupt` for `finished` and the hook (`drive.rs:1092-1102`), while callers still return the same `store_error`.
+
+**Decision 7:** the handoff’s `cleanup != "pending"` branch is reachable for durable `quiescent` or `uncertain` cleanup. Its *waiting* case for durable `pending` has no production writer today. The direct DB update is an honest synthetic state-machine test, as the report says, but it does not prove a production transition to or from `pending`.
+
+**Decision 3:** the engine test is adequate for the extracted drain’s stop-order wiring. The reported end-to-end attempt did not deterministically select that `tokio::select!` branch, so it supplied no regression proof. The test stops at the order; it does not independently check the resulting cancel and cleanup envelope.
+
+The reported REDs precede fixes for decisions 1–6 and 10, with seams or acknowledgements where needed. Decision 3’s RED used the extracted drain before its wiring fix. Decision 7 passed initially and was RED only under a fallback-removal mutation; it is characterization, not a pre-fix failure. I inspected refs and working-tree documents only. I did not run tests, `bd`, or `cargo`, inspect the local RED logs, edit files, or check out the branch; the worker’s gate counts remain reported results rather than independent verification.
+

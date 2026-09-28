@@ -9,8 +9,9 @@ round 6; later findings are handled in the slices' code reviews. S1's
 review decisions are in `s1-r1-decisions.md` (`[s1.4]`), and choices S1
 made where the design was open are in `reports/T3-S1.md` (`[S1]`). S2's
 are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`), S3's in
-`s3-r1-decisions.md` (`[s3.1]`) and `reports/T3-S3.md` (`[S3]`), and S4's
-in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`).
+`s3-r1-decisions.md` (`[s3.1]`) and `reports/T3-S3.md` (`[S3]`), S4's
+in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`), and
+S5's in `s5-r1-decisions.md` (`[s5.1]`) and `reports/T3-S5.md` (`[S5]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -420,7 +421,10 @@ Then it waits, holding no lock, on the acknowledgement **or** the drop.
   cancel}`, taken from the envelope.
 - **Drop without an acknowledgement.** The order was never observed. It
   waits for the terminal as below, and replies `{turn, state,
-  already_terminal: true, cancel}` with the envelope's `cancel`.
+  already_terminal: true, cancel}` with the envelope's `cancel`. The only
+  reachable form is a cancel that finds the turn `settling`: a settled
+  order is always observed, and a cancel after force acceptance is refused
+  at step 3 [S5].
 - **Waiting for the terminal after the drop** [r3.4]. A dropped sender does
   not prove a committed terminal, because a forced turn's terminal commits
   later, in final shutdown. The waiter reads the result as `wait` does
@@ -1058,6 +1062,18 @@ write or a raw append or sync, has exactly one outcome:
   read or write is the new `StoreError::Corrupt`. It always latches (kind
   `corrupt_store`). At open it is F11's refusal (existing `quick_check`
   path) [O1.D8].
+  - Read corruption is classified once, at Store's read reply
+    (`Store::on_read_corruption`, an observer Core registers, so Store
+    does not depend on Core). It runs the hook's phase one (`Read`,
+    `Corrupt`) on the SQLite worker thread before the reply is sent, for
+    all 20 read commands. Phase two runs under `admission` at
+    final-shutdown entry (§6.8) [s5.11].
+  - A write that its prerequisite read's corruption aborted
+    (`WriteOutcome::ReadCorrupt`) records no failure of its own: the
+    read's record is the one record. It still latches, and the turn's
+    resolution is unchanged [s5.13].
+  - Any other failed read before a write is not committed: nothing was
+    written (`of_read`) [s5.10].
 - **Refusals.** A constraint that Store defines as a refusal (a `Closed`
   refused while a turn is unfinished, `commit_resume` on a closing session,
   a closure pass that finds unfinished work) is not a failure.
@@ -1208,8 +1224,10 @@ the resolution write's `turn.ended` and envelope.
     live dispatcher [s4.8].
   - It is not a startup refusal. In the handoff, a failure of that write
     fails startup (row 13).
-- **SQLite-level corruption** latches (§7.1). At startup it is F11's
-  refusal.
+- **SQLite-level corruption** latches (§7.1), through the read boundary
+  rather than per read [s5.11]. At startup it is F11's refusal: a corrupt
+  read in startup recovery exits 4, unlinks the socket and releases both
+  locks [s5.15].
 - A request's transient read failure returns a plain `store_error`
   (r1.13). Reads otherwise never latch.
 - **Interactions.** The streak lives in the dispatcher and needs no lock.
@@ -1312,6 +1330,13 @@ Scope of the batch:
   releases permits. Re-probe stops (§8).
 - **Restart:** it settles every unresolved turn (C1 §7.5) and finishes
   durable closes (§4).
+- **After the latch** the force path writes no queued cancellation. A
+  session without an affected turn keeps its queued turns `queued` for
+  the restart handoff [S5].
+- **Closure count.** The closure pass counts each force session it does
+  not close, including unjoined ones, by its durable closed state; an
+  unreadable or missing state counts as unclosed. Unjoined sessions get no
+  closure write [s5.4, s5.12, s5.14, s5.16].
 
 ### 7.5 `daemon/status` health and `store_failure` [O1.D6]
 
@@ -1340,6 +1365,12 @@ Scope of the batch:
   `store_failure.scope` is the latest recorded failure's scope, which may
   be `daemon` or a later narrower one. The two contracts say the same
   (A14, A15) [r3.14].
+
+- `count` counts failures, not hook calls [s5.13]. Corrupt rows the restart
+  handoff fails are recorded (`corrupt_row`, scope `turn`) before admission
+  opens; cancelled corrupt rows and transient request read failures are
+  not recorded [s5.5, S5]. A re-probe proof failure records scope
+  `session` with its owner [s5.6].
 
 ### 7.6 Followers [O1.D7]
 
@@ -1576,6 +1607,8 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `core.cancel.settling` | acknowledgement only, in `cancel`'s settling branch (`s1_cancel_during_settlement_completes`) [S2] |
 | `core.cancel.ordered` | acknowledgement only, once `cancel` has attached its order (idle-disarm interleaving) [s2.1] |
 | `core.run.idle_expired` | acknowledgement only, when the idle timer fires and before its order is issued (idle-disarm interleaving) [s2.1] |
+| `core.cancel.admitted` | acknowledgement or pause after `cancel`'s step 3, before the slot step (the unacknowledged cancel-wait variant) [S5] |
+| `store.read.corrupt.<command>` | Store read reply returns `Corrupt` for that read command (20 points; read-boundary tests) [s5.11] |
 | `core.close.before_subscribe` | pauses a close caller after its order check and before it subscribes to the close watch (§4 steps 2 and 5) [r6.6] |
 | `core.run.before_handoff` | the run loop, before it hands a forced turn to final shutdown [r3.3] |
 | `core.shutdown.before_forced_terminal` | final shutdown, before a forced turn's terminal commit [r3.4] |
@@ -1724,6 +1757,23 @@ latch. S5 lists each re-pointed test in its report.
   `s1_cancel_queued_read_failure_is_plain_store_error` (transient read).
 - A session-filtered re-probe counts only that session's held groups
   [s2.3].
+
+**S5 adaptations** [S5] (`reports/T3-S5.md`):
+
+- `s1_f12_dispatcher_reads_fail_then_turn_fails` fails
+  `store.commit.terminal`, not `store.commit.submission`, alongside the
+  read streak.
+- The carried variants are separate tests:
+  `s1_close_waiter_resolves_on_force` and
+  `s1_close_waiter_resolves_on_latch`.
+- `s1_f12_latch_pipeline_orders_handoffs` forces both run loops, and holds
+  B with `core.run.before_handoff`.
+- Engine-level regressions stand in where `tokio::select!` or the serving
+  window makes the path unreachable on demand end to end: the row-5 drain
+  and the predecessor, terminal-reconcile and batch corruption reads. The
+  pending-cleanup handoff test writes `pending` into the stored envelope
+  with no daemon running, because no production path stores it; it is a
+  characterization [s5.3, s5.7].
 
 **S3 adaptations** [S3] (`reports/T3-S3.md`):
 
