@@ -77,6 +77,8 @@ POINTS = [
     "core.run.before_handoff",
     "core.close.before_subscribe",
     "core.cancel.settling",
+    "core.run.idle_expired",
+    "core.cancel.ordered",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 MARKERS = [*ACTIVATION, *POINTS, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]

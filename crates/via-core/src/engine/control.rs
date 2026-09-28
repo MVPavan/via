@@ -67,6 +67,9 @@ impl Engine {
             match step {
                 CancelStep::Queued => return self.cancel_waiting(&session, turn, &address).await,
                 CancelStep::Ordered(mut ack) => {
+                    // The order is attached (acknowledgement-only seam).
+                    #[cfg(feature = "test-failpoints")]
+                    let _ = via_store::failpoint::hit_async("core.cancel.ordered").await;
                     // Waits holding no lock for the acknowledgement or the drop.
                     let observed = ack
                         .wait_for(Option::is_some)

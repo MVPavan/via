@@ -16,7 +16,7 @@ use via_store::{
 
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot, StopSpec};
+use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
 use super::stop::StopMode;
 use super::terminal::{dispose, terminal_envelope};
 use super::{
@@ -1128,7 +1128,10 @@ impl Engine {
                 () = sleep_until_some(idle_at), if idle_at.is_some() => {
                     // Design §5: no meaningful progress within the budget.
                     control.idle_at = None;
-                    control.slot.order(control.turn, StopSpec::Idle, tokio::time::Instant::now());
+                    // The timer fired; its order is not issued yet (design §10).
+                    #[cfg(feature = "test-failpoints")]
+                    let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
+                    control.slot.idle_order(control.turn, tokio::time::Instant::now());
                 }
                 result = &mut execute => {
                     while let Ok(observation) = observed_rx.try_recv() {

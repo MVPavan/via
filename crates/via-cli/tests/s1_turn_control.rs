@@ -1782,3 +1782,73 @@ fn s1_close_cleanup_uncertain_with_unproven_group() -> TestResult {
     })?;
     daemon.finish()
 }
+
+/// Design §5 [s2-r1.1]: the idle timer disarms once any order exists. The
+/// run loop is held at `core.run.idle_expired` (its timer fired, its idle
+/// order not yet issued) while a cancel with a 15 s grace attaches its
+/// order (`core.cancel.ordered`). Released, the timer issues nothing: the
+/// cancel's `force_at` is not shortened to the idle order's 10 s, so the
+/// vendor, which ignores the interrupt, is still running 11.5 s later; a
+/// second, short cancel then forces it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_idle_timer_disarms_once_an_order_exists() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let daemon = sandbox.start()?;
+    sandbox.arm("core.run.idle_expired", 1, "pause")?;
+    let (session, handle) = sandbox.spawn("hang", &["--idle-ms", "500"])?;
+    sandbox.ack(&daemon, "core.run.idle_expired", 1, "pause")?;
+    sandbox.arm("core.cancel.ordered", 1, "fail_io")?;
+    let reply = thread::scope(|scope| -> TestResult<Value> {
+        let cancel = scope.spawn(|| {
+            sandbox
+                .ok(&[
+                    "cancel",
+                    &session,
+                    "--force-after",
+                    "15000",
+                    "--handle",
+                    &handle,
+                    "--json",
+                ])
+                .map_err(|error| error.to_string())
+        });
+        // The cancel's order is attached before the timer issues its own.
+        sandbox.ack(&daemon, "core.cancel.ordered", 1, "fail_io")?;
+        sandbox.resume_point("core.run.idle_expired", 1)?;
+        Ok(cancel.join().map_err(|_| "cancel panicked")??)
+    })?;
+    check(
+        reply["state"] == "running" && reply["cancel"]["outcome"] == "requested",
+        || format!("cancel acknowledgement: {reply}"),
+    )?;
+    // Elapsed time only: past an idle order's 10 s grace, short of 15 s.
+    thread::sleep(Duration::from_millis(11_500));
+    let state: String = sandbox.query(&format!(
+        "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+    ))?;
+    check(state == "running", || {
+        format!("the idle timer shortened the cancel's grace: the turn is {state}")
+    })?;
+    let forced = sandbox.ok(&[
+        "cancel",
+        &session,
+        "--force-after",
+        "100",
+        "--wait",
+        "--handle",
+        &handle,
+        "--json",
+    ])?;
+    check(
+        forced["state"] == "cancelled"
+            && forced["cancel"]["outcome"] == "forced"
+            && forced["cancel"]["requested_at"] == reply["cancel"]["requested_at"],
+        || format!("forced after the second cancel: {forced}"),
+    )?;
+    daemon.finish()
+}

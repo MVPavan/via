@@ -487,23 +487,35 @@ impl Slot {
         receivers
     }
 
-    /// Attaches the run loop's own order (the idle deadline) unless the turn
-    /// is settling. Wakes: a stop order attached.
-    pub(super) fn order(&self, turn: TurnNumber, spec: StopSpec, now: tokio::time::Instant) {
-        {
+    /// Issues the idle deadline's order (design §5) unless the turn is
+    /// settling or already has an order: the timer disarms once any order
+    /// exists, so it never shortens a cancel's or a close's `force_at`. The
+    /// check and the attach are one transition under the slot state, which
+    /// every other order's attach also takes [s2-r1.1]. Wakes: an order
+    /// attached.
+    pub(super) fn idle_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
+        let issued = {
             let state = lock(&self.state);
-            if let Some(running) = state
+            match state
                 .running
                 .as_ref()
                 .filter(|running| running.turn == turn && !running.settling)
             {
-                let requested_at = rfc3339(std::time::SystemTime::now());
-                running
-                    .stop
-                    .attach(spec.order(requested_at, now, Some(running.wall)));
+                Some(running) if running.stop.order.borrow().is_none() => {
+                    let requested_at = rfc3339(std::time::SystemTime::now());
+                    running.stop.attach(StopSpec::Idle.order(
+                        requested_at,
+                        now,
+                        Some(running.wall),
+                    ));
+                    true
+                }
+                _ => false,
             }
+        };
+        if issued {
+            self.wake();
         }
-        self.wake();
     }
 
     /// Publishes the run loop's acknowledgement of the turn's order.
