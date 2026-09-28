@@ -1516,7 +1516,7 @@ fn the_force_set_reads_a_slot_in_one_section() {
         let slot = engine.slot(&session).unwrap();
         let _orders = slot.start_running(turn(1), tokio::time::Instant::now());
         assert!(slot.queued().is_empty());
-        assert_eq!(engine.unfinished_sessions(), [session.clone()]);
+        assert_eq!(engine.unfinished_sessions(), std::slice::from_ref(&session));
         slot.finish_running(turn(1));
         assert!(engine.unfinished_sessions().is_empty());
     });
