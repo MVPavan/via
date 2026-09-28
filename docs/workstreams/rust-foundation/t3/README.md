@@ -56,3 +56,7 @@ Round 2 on `f145ff2`: `astra-review-design-r2.md` (UNSOUND) and
 `fable-review-design-r2.md` (SOUND WITH CHANGES); decisions in
 `design-r3-decisions.md`. S0 (moves only, `s0.md`) starts in parallel with
 design round 3.
+
+Round 3 on `4531dd0`: `astra-review-design-r3.md` (UNSOUND, no blocker)
+and `fable-review-design-r3.md` (SOUND WITH CHANGES); decisions in
+`design-r4-decisions.md`.
