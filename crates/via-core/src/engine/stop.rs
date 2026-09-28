@@ -147,17 +147,17 @@ impl Engine {
     /// or settling turn. A slot whose dispatcher is merely exiting with an
     /// empty queue, or that carries only a close order, is not in it. Taken
     /// under `admission`: `sessions`, then each slot's state, each released
-    /// before the next. `Claimed → running` moves a turn out of the queue and
-    /// into `running` in one slot-state section, so reading the queue first
-    /// never misses it.
-    fn unfinished_sessions(&self) -> Vec<SessionId> {
+    /// before the next. Each slot is read in one slot-state section
+    /// ([`super::Slot::unfinished`]), which a dispatcher's queue-to-running
+    /// move cannot split.
+    pub(super) fn unfinished_sessions(&self) -> Vec<SessionId> {
         let slots: Vec<(SessionId, Arc<super::Slot>)> = lock(&self.sessions)
             .iter()
             .map(|(session, slot)| (session.clone(), Arc::clone(slot)))
             .collect();
         slots
             .into_iter()
-            .filter(|(_, slot)| !slot.queued().is_empty() || slot.running_turn().is_some())
+            .filter(|(_, slot)| slot.unfinished())
             .map(|(session, _)| session)
             .collect()
     }

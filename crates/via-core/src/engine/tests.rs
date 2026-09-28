@@ -1501,6 +1501,27 @@ fn the_force_set_leaves_out_a_session_with_only_a_close_in_progress() {
     });
 }
 
+/// T3-S3 round 1, decision 1 (design §6.3 [O3]): each slot is read for
+/// the force set in one slot-state section. A session whose only turn left
+/// the queue for `running` is in the set; once its run loop is done with
+/// the turn, it is not. (Characterization: the move itself is one section.)
+#[test]
+fn the_force_set_reads_a_slot_in_one_section() {
+    let Some(root) = child("the_force_set_reads_a_slot_in_one_section") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let _orders = slot.start_running(turn(1), tokio::time::Instant::now());
+        assert!(slot.queued().is_empty());
+        assert_eq!(engine.unfinished_sessions(), [session.clone()]);
+        slot.finish_running(turn(1));
+        assert!(engine.unfinished_sessions().is_empty());
+    });
+}
+
 /// Design §6.8 entry [r3.2]: under a drain, `close` still works until
 /// daemon main enters final shutdown; from entry on, new close work is
 /// `daemon_stopping`, and a keyed replay of a committed close replays.
