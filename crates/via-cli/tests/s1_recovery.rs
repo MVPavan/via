@@ -816,7 +816,8 @@ fn s1_f22_autonomous_eof_cleanup_proved_on_restart() -> TestResult {
 /// the crash (`host.anchor.defer_cleanup` defers its EOF cleanup, and its
 /// acknowledgement is the anchor's). Restart verifies the live anchor,
 /// stops its group through it (`forced`), and proves `ESRCH`
-/// (`quiescent`); the harness sees vendor and grandchild gone.
+/// (`quiescent`); the harness sees vendor and grandchild gone. It passes
+/// on the base: a proof of existing Host recovery, not a regression.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f22_surviving_anchor_verified_and_stopped_on_restart() -> TestResult {
@@ -874,7 +875,8 @@ fn s1_f22_surviving_anchor_verified_and_stopped_on_restart() -> TestResult {
 
 /// F23 (design §9 [r1.17]): the vendor sees exactly the fake adapter's
 /// allow list plus Host's own `VIA_PROCESS_MARKER`, whose value is not the
-/// anchor's private marker; no daemon-only secret reaches it.
+/// anchor's private marker; no daemon-only secret reaches it. It passes
+/// on the base: a proof of existing Host behaviour, not a regression.
 #[test]
 fn s1_f23_agent_sees_only_allow_listed_env() -> TestResult {
     let fixture = script(
@@ -1212,7 +1214,8 @@ fn s1_recovery_corrupt_row_write_failure_fails_startup() -> TestResult {
 /// the crash, and after restart runs under them: its `turn.started`
 /// carries them, and the frozen 1.5 s idle deadline (not the 600 s
 /// default) ends it `deadline_idle`. Keyed `spawn` and `resume` replays
-/// after the restart return the original receipts.
+/// after the restart return the original receipts. It passes on the base:
+/// a proof of existing handoff behaviour, not a regression.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_restart_keeps_nondefault_frozen_values() -> TestResult {
