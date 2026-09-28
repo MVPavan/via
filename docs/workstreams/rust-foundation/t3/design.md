@@ -929,8 +929,9 @@ a Store operation, a session head, or `admission`.
   alone), it sets the ledger's sticky `stopping` flag and snapshots the live
   controls.
   - It sends `Stop` to all of the snapshot's **`armed`** entries
-    **concurrently**, each bounded at the force instant `+ 3 s`, never at
-    a fresh `now + 3 s` [r5.3, r6.1, t3r.5].
+    **concurrently**. Each reply is awaited until the force instant
+    `+ 3 s`, never a fresh `now + 3 s`; the control lock and the write are
+    not bounded (A23) [r5.3, r6.1, t3r.5].
   - **`Stop` delivery** (runtime §7) [t3r.5]. A `Stop` is always written
     once, even when the deadline has already passed; only the wait for its
     reply is bounded by the deadline. A reply read at or after the deadline
@@ -1305,8 +1306,9 @@ the latch:
     are served.
   - When the window ends, daemon main sends `closing`, drops the listener
     and unlinks the socket. The existing client-join rules then apply.
-- **Host 3 s.** Host's early-stop task (§6.8) sends `Stop` to every armed
-  group and waits for replies until the force instant `+ 3 s` (A23). It is independent of Core, the
+- **Host 3 s.** Host's early-stop task (§6.8) attempts `Stop` for every
+  armed group; only the reply wait is bounded, at the force instant
+  `+ 3 s`, and the sends may finish later (A23). It is independent of Core, the
   dispatchers and Store. Route's own force close is a second request
   through the same control owner, and a no-op [r4.3]. Tested in §11.
 - The window and the bound apply only to the latch path. A scoped failure
