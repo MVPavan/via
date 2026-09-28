@@ -1172,6 +1172,11 @@ impl Sandbox {
         Ok(self.failpoints.release(point, occurrence)?)
     }
 
+    /// Whether `point` acknowledged `occurrence`.
+    fn acked(&self, point: &str, occurrence: u64) -> bool {
+        self.failpoints.ack_bytes(point, occurrence).is_ok()
+    }
+
     fn disarm(&self, point: &str) -> TestResult {
         Ok(self.failpoints.disarm(point)?)
     }
@@ -2098,7 +2103,8 @@ fn s1_cancel_wait_across_force_handoff() -> TestResult {
 /// watch and is paused at `core.close.before_subscribe`. The dispatcher's
 /// force exit then publishes `daemon_stopping` to the first caller, and the
 /// replay, released after the publication, receives it from the retained
-/// outcome.
+/// outcome. A third keyed replay, after the force exit, finds no attempt in
+/// progress and is fenced [r5.8].
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
@@ -2156,6 +2162,13 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
         })?;
         sandbox.resume_point(subscribe, 2)?;
         replay.join().map_err(|_| "replay panicked")??;
+        // After the force exit no attempt is in progress: a keyed replay is
+        // fenced before it could subscribe, so the armed pause never acts.
+        sandbox.arm(subscribe, 3, "pause")?;
+        sandbox.refused(&keyed, "daemon_stopping")?;
+        check(!sandbox.acked(subscribe, 3), || {
+            "the fenced replay reached the close watch".to_owned()
+        })?;
         sandbox.resume_point(fence, 1)?;
         Ok(())
     })?;

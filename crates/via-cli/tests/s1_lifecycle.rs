@@ -1,7 +1,9 @@
 //! The daemon lifecycle through the real `via` binary (design T3 §6, §8):
 //! startup and lock contention (F1–F3, F11), version mismatch (F4), idle
 //! exit (F6), the `daemon stop` modes (F7), Ctrl-C on a foreground spawn
-//! (F29) and the re-probe loop. Waits are bounded waits on failpoint
+//! (F29), the re-probe loop, Host's early stop under a plain stop and a
+//! drain (r5.1), and a force-path read stalled past the cutoff (§6.7,
+//! r5.10). Waits are bounded waits on failpoint
 //! acknowledgements, durable rows, sockets or process exit; a sleep only
 //! lets time pass, never orders two events.
 
@@ -503,7 +505,6 @@ impl Daemon<'_> {
         }
     }
 
-    #[cfg(feature = "test-failpoints")]
     /// The daemon's final shutdown summary.
     fn summary(&self) -> TestResult<Value> {
         fs::read_to_string(&self.trace)?
@@ -552,7 +553,6 @@ fn script(prompt: &str, turn: u32, steps: Vec<Value>) -> Value {
     script
 }
 
-#[cfg(feature = "test-failpoints")]
 fn scripts(scripts: &[Value]) -> Value {
     json!({ "scripts": scripts })
 }
@@ -1278,4 +1278,195 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
     )?;
     drop(store);
     sandbox.verify_anchors()
+}
+
+/// Design §6.8 [r5.1]: Host's early-stop task, wired at serve start, ends
+/// on Host's retire signal when no force comes. A plain stop of an idle
+/// daemon and a drain that finishes a held turn both exit 0, and the
+/// shutdown summary reports no pending or failed task.
+#[test]
+fn s1_host_early_stop_exits_on_plain_stop_and_drain() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("plain", 1), held("drained", 1)]))?;
+    let clean = |daemon: &mut Daemon<'_>, what: &str| -> TestResult {
+        let status = daemon.exit(Duration::from_secs(15))?;
+        let summary = daemon.summary()?;
+        check(
+            status.code() == Some(0)
+                && summary["disposition"] == "clean"
+                && summary["pending_joins"] == 0
+                && summary["failed_joins"] == 0,
+            || format!("{what}: exit {status}, summary {summary}"),
+        )
+    };
+    let mut daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("plain")?;
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    check(envelope["state"] == "completed", || envelope.to_string())?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    clean(&mut daemon, "plain stop")?;
+    drop(daemon);
+    let mut daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("drained")?;
+    sandbox.await_file("drained.entered")?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.release("drained")?;
+    clean(&mut daemon, "drain")?;
+    drop(daemon);
+    let daemon = sandbox.start()?;
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    check(envelope["state"] == "completed", || envelope.to_string())?;
+    daemon.finish()
+}
+
+/// A force stop whose force-path read stalls in the Store worker.
+#[cfg(feature = "test-failpoints")]
+struct StalledRead {
+    session: String,
+    /// From the force request to `core.shutdown.reconcile_entry`.
+    reconciled_after: Duration,
+    /// From the force request to the daemon's exit.
+    exited_after: Duration,
+    status: ExitStatus,
+    summary: Value,
+}
+
+/// Turn 1 runs (`hang`) and turn 2 is queued behind it. A force stop pauses
+/// the dispatcher at `core.force.cancel_read`, before turn 2's cancellation
+/// read; the next read the Store worker dequeues is then held at
+/// `store.read.stall`, and every later read waits behind it. The dispatcher
+/// abandons the read at the cutoff. `core.shutdown.reconcile_entry` is
+/// paused to time Host reconciliation's start. With `release`, the worker
+/// is released there; otherwise never.
+#[cfg(feature = "test-failpoints")]
+fn force_with_stalled_read(sandbox: &Sandbox, release: bool) -> TestResult<StalledRead> {
+    let cancel_read = "core.force.cancel_read";
+    let stall = "store.read.stall";
+    let reconcile = "core.shutdown.reconcile_entry";
+    sandbox.count(stall)?;
+    sandbox.arm(cancel_read, 1, "pause")?;
+    sandbox.arm(reconcile, 1, "pause")?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("hang")?;
+    let running =
+        format!("SELECT count(*) FROM turns WHERE session_id='{session}' AND state='running'");
+    wait_until("turn 1 runs", Duration::from_secs(20), || {
+        sandbox.query::<i64>(&running).is_ok_and(|count| count == 1)
+    })?;
+    sandbox.ok(&[
+        "resume", &session, "--prompt", "q", "--handle", &handle, "--json",
+    ])?;
+    let started = Instant::now();
+    let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.ack(&daemon, cancel_read, 1, "pause")?;
+    let next = sandbox.next_hit(stall)?;
+    sandbox.arm(stall, next, "pause")?;
+    sandbox.resume_point(cancel_read, 1)?;
+    sandbox.ack(&daemon, stall, next, "pause")?;
+    sandbox.ack(&daemon, reconcile, 1, "pause")?;
+    let reconciled_after = started.elapsed();
+    if release {
+        sandbox.resume_point(stall, next)?;
+    }
+    sandbox.resume_point(reconcile, 1)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let exited_after = started.elapsed();
+    let summary = daemon.summary()?;
+    drop(daemon);
+    for point in [cancel_read, stall, reconcile] {
+        sandbox.disarm(point)?;
+    }
+    Ok(StalledRead {
+        session,
+        reconciled_after,
+        exited_after,
+        status,
+        summary,
+    })
+}
+
+/// Design §6.8 budget table [r5.10]: a force-path read stalled in the
+/// Store worker is abandoned at `deadline − 8 s`, so the dispatchers join
+/// and Host reconciliation starts (`core.shutdown.reconcile_entry`) before
+/// `deadline − 5 s`: under 5 s from the force request, which precedes the
+/// deadline's start. With the old `deadline − 4 s` cutoff it started only
+/// when the dispatcher join timed out at `deadline − 5 s`. The forced
+/// running turn's terminal carries reconciliation's evidence; the queued
+/// turn stays unresolved, so the exit is 4.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_shutdown_budget_read_cutoff_before_reconciliation() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let run = force_with_stalled_read(&sandbox, true)?;
+    check(run.reconciled_after < Duration::from_secs(5), || {
+        format!(
+            "reconciliation began {:?} after the force",
+            run.reconciled_after
+        )
+    })?;
+    let summary = &run.summary;
+    check(
+        run.status.code() == Some(4)
+            && summary["unresolved_turns"] == 1
+            && summary["uncommitted_turns"] == 0
+            && summary["store"] == "joined",
+        || format!("exit {}, summary {summary}", run.status),
+    )?;
+    let session = &run.session;
+    let forced: String = sandbox.query(&format!(
+        "SELECT state || ' ' || json_extract(envelope,'$.cancel.outcome') || ' '
+                || json_extract(envelope,'$.cancel.cleanup')
+         FROM turns WHERE session_id='{session}' AND number=1"
+    ))?;
+    check(forced == "cancelled forced quiescent", || {
+        format!("turn 1: {forced}")
+    })?;
+    let queued: String = sandbox.query(&format!(
+        "SELECT state FROM turns WHERE session_id='{session}' AND number=2"
+    ))?;
+    check(queued == "queued", || format!("turn 2: {queued}"))?;
+    sandbox.start()?.finish()
+}
+
+/// Design §6.7: a force-path read abandoned at the cutoff leaves its turn
+/// unresolved, so the exit is 4 however the worker ends. Released, the
+/// Store's drop joins the worker (`store: joined`); held, the join times
+/// out at the final deadline (`join_timed_out`), and the daemon still exits
+/// within its bound.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_force_cutoff_worker_stalled_read_is_never_clean() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    for (release, store) in [(true, "joined"), (false, "join_timed_out")] {
+        let run = force_with_stalled_read(&sandbox, release)?;
+        let summary = &run.summary;
+        check(
+            run.status.code() == Some(4)
+                && summary["disposition"] == "incomplete"
+                && summary["unresolved_turns"].as_u64() >= Some(1)
+                && summary["store"] == store
+                && run.exited_after < Duration::from_secs(13),
+            || {
+                format!(
+                    "released {release}: exit {} after {:?}, summary {summary}",
+                    run.status, run.exited_after
+                )
+            },
+        )?;
+        // The next daemon recovers the unresolved turns, and its fake
+        // re-runs no turn: every session here is forced or queued.
+        let daemon = sandbox.start()?;
+        daemon.finish()?;
+    }
+    Ok(())
 }
