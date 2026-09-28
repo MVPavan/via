@@ -58,3 +58,39 @@ on branch `wt/t3-s1`.
 Rule 2's missing isolated test stays with S2's end-to-end
 `s1_close_reaches_claimed_turn`, as the report says. The design and
 contract edits the report lists are made by the orchestrator at merge.
+
+## Round-1 worker concerns (dispositions)
+
+The worker's report is `reports/T3-S1.md`, "Round 1" (commits `ba305f8`,
+`5c4bb6f`, `020ac95`). The gate was clean: default 213/2, failpoints 261/2
+on three runs, F08–F12 17.
+
+8. **Every post-`stopping` acquisition uses the early stop's deadline.**
+   - Once an acquisition observes `stopping`, its cleanup runs under the
+     original force deadline (§6.8). This covers:
+     - registration (`register` returns the deadline);
+     - the ARM gate (`begin_arming` returns `Err(deadline)`);
+     - `Spawned` (`armed()` returns the deadline).
+   - Cleanup here means the EOF drop or the owner's `Stop`, and the absence
+     check that follows. Today each path discards the deadline, so
+     `failed_acquisition` starts a fresh 3 s.
+   - Set `cleanup_by` from that deadline. If absence is unproven when it
+     passes, the entry stays held, and final reconciliation (§6.8 step 4)
+     supplies the proof.
+   - Test: a late-registered control whose anchor delays its EOF exit. The
+     failure returns by the early stop's deadline plus a small margin, not
+     a fresh 3 s.
+9. **Accepted choices.**
+   - `RawDeadline` at the interrupt write maps to `Deadline`, as at every
+     other Wire call site.
+   - `StoreError::Refused` is the failure batch's refusal.
+   - A pre-ARM anchor gets no control connection at all. That is stronger
+     than "no `Stop` frame". The test's listener in place of the anchor's
+     socket is a legitimate witness.
+10. **Accepted limit.** Decision 1's `Corrupt` mapping is tested through the
+    shared `commit` helper with synthetic SQLite codes. Every commit site
+    calls that helper. A real `COMMIT` corruption would need a custom VFS,
+    which is not worth it here.
+
+The orchestrator makes the design and contract edits the report lists
+when S1 merges.

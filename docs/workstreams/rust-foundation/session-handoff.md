@@ -90,11 +90,24 @@ the historical checkpoint; its findings table is updated by this section.
   raw Store failure) (`t3/sol-review-S1-*.md`). Local gate clean (207 / 2
   three times, failpoints 253 / 2 five times, F08–F12 17). Round-1
   decisions [t3/s1-r1-decisions.md](t3/s1-r1-decisions.md); a local
-  `implementer-high` subagent is fixing them in worktree `../via-wt/t3-s1`
-  (branch `wt/t3-s1`, not pushed). If the session died, inspect that
-  branch and re-dispatch from its last commit. Next: Sol medium re-review
-  in tmux, then merge, gate and push, then the design and contract edits
-  listed in `t3/reports/T3-S1.md`. **From 2026-09-28 no new cloud work: Claude workers are local
+  `implementer-high` subagent fixed 1–7 in worktree `../via-wt/t3-s1`
+  (local branch `wt/t3-s1` at `020ac95`, not pushed; report
+  `t3/reports/T3-S1.md` "Round 1"; gate 213 / 2, failpoints 261 / 2 ×3,
+  F08–F12 17). Decision 8 (post-`stopping` acquisitions keep the early
+  stop's deadline) and dispositions 9–10 are in the same decisions file.
+  A Sol medium re-review of `4352602..020ac95` is running in tmux window
+  `sol-s1-r1`. Its output goes to the gitignored
+  `scratchpad/reviews/t3/review-s1-r1.md`, and its brief is
+  `brief-s1-r1.md` alongside. **Resume here:**
+  1. Read the review, copy it to `t3/sol-review-S1-r1.md`, and decide its
+     findings.
+  2. Dispatch a fresh `implementer-high` in that worktree for decision 8 and
+     any findings.
+  3. Get a narrow Sol check of that round.
+  4. Merge `wt/t3-s1` into `rust-foundation`, run the gate, push. Delete the
+     remote `claude/t3-s1-task-execution-60rojp` and the worktree.
+  5. Make the design and contract edits both S1 report sections list.
+  6. S2. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). Then S2
   (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique
