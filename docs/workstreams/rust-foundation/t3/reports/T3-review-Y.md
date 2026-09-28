@@ -240,3 +240,90 @@ next full run was repeated, and each test passed on rerun):
   added here fire only in `finalize_forced`, after that test's checkpoint
   (`reconcile_entry`), so it is not evidently related. Reported as a new
   intermittent failure to investigate.
+
+## Round 3
+
+Sol review of round 2 (SOUND WITH CHANGES; Host-hit drop and occurrence keying
+accepted). Two items.
+
+### 1. The absence seam must observe what the terminal consumes
+
+Finding: the seam read the reconciliation record in `finalize_forced`, while
+`forced_terminal` read it again, so the test passed even if the terminal's
+cleanup calculation ignored the record and inferred quiescence from a
+failure-free report.
+
+Option taken: single-read restructuring, at the owning point
+(`crates/via-core/src/engine/stop.rs`); it was small, so the mutation-only
+alternative was not needed. New `Engine::forced_facts(&turn, report)` reads the
+turn's record once and returns `(quiescent, forced)` (Route's close OR the
+record's fact); `forced_terminal` takes that pair instead of the report, and
+`finalize_forced` computes it once before the terminal seam. In test builds
+each seam fires in the branch that consumes the field:
+`evidence_absent` inside the `Some(record)` arm of the cleanup calculation,
+`evidence_stopped_live` where `record.forced` is read. The cleanup expression
+is now computed without short-circuiting on Route's close (pure, same
+values). No production behaviour change. Because a function whose only awaits
+are test seams trips `clippy::unused_async` and `unused_async_trait_impl` in
+default builds, it carries a `cfg_attr(not(test-failpoints), expect(...,
+reason))`.
+
+Why the seam had to move into the arm: replacing the cleanup calculation with
+inference gives the same value in these scenarios (the report has no failure
+and the record is Quiescent), so the envelope alone cannot detect it; only the
+seam's position in the consuming branch does.
+
+RED (`i7r3-mut-infer.log`; backup, restored, `diff` clean): the record arm
+replaced by `Some(_) => report.failure.is_none()`. Both tests fail: `Core
+received 1 stopped_live and 0 absence facts` (deferred), `0 stopped_live and 0
+absence facts` (lost). GREEN after restore: both pass, three repeated runs.
+A mutation that keeps the seam and changes only the value is not caught by
+this test; that is inherent to observing a value at its use.
+
+Commit 91b5d1b.
+
+### 2. Intermittent `s1_shutdown_budget_read_cutoff_before_reconciliation`
+
+Not reproduced; no code change. The one failure (2.1 s, round 2, log not
+captured) is unexplained. Attempts, logs under `scratchpad/t3-rev-y/`
+(`r3-stress1.log`, `r3-stress2.log`, `r3-stress3.log`, `r3-gate*.log`):
+
+- `--stress-count 150` of the target, with eight concurrent failpoint suite
+  runs alongside: 150/150 passed (`r3-stress1.log`).
+- `--stress-count 60` of the target plus `s1_force_cutoff_worker_stalled_read_is_never_clean`
+  (120 test runs) with three concurrent looping failpoint suites:
+  60/60 iterations passed (`r3-stress2.log`); 18 concurrent full suite runs
+  had no failures.
+- `--stress-count 300` of the target with two concurrent looping suites:
+  300/300 passed (`r3-stress3.log`); the 20 concurrent suite runs had no
+  failures.
+- 18 unloaded full failpoint suite runs, plus 3 gate runs and the round 2
+  runs: no failure.
+
+That is about 510 target iterations under load and about 60 full-suite runs,
+short of the 1000 iteration budget but with no failure. The failed
+assertion is unknown, so neither the global-read-arming hypothesis
+(`force_with_stalled_read` arms "the next global Store read" after pausing
+`core.force.cancel_read`, so a different read could reach the marker) nor the
+Route exit-versus-force race (c966a71) can be confirmed or ruled out. A 2.1 s
+failure is well under the 5 s reconciliation bound, so it was an outcome
+assertion (exit, summary, or the `cancelled forced quiescent` check), not the
+timing check. Sol's source reading is plausible; the fix (arming a named
+`store.read.<command>` seam) was not applied because it would be a guess
+without a reproduction. If it recurs, capture the nextest output for the
+failure.
+
+### Gate (round 3)
+
+| Step | Result |
+| --- | --- |
+| fmt, clippy (default, `via-cli/test-failpoints`) | clean |
+| default nextest | 287 passed, 1 skipped |
+| failpoint nextest, three runs | 418 passed, 1 skipped, all three |
+| `s1_f(08\|09\|10\|12)_` selection | 53 passed |
+| `cargo deny check`, `check-layers.py` | ok |
+| release build and `check-release-features.py` | ok, 90 markers absent |
+
+Design edits still needed (owner adds at merge): the two seam names in the §10
+table, described as reporting reconciliation-record fields, consumed where the
+terminal calculation reads them (`forced_facts`), not Route-close evidence.
