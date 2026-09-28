@@ -1843,3 +1843,139 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
         assert!(!engine.store_failed(), "the failure is scoped");
     });
 }
+
+/// Failpoint token of a child that arms a Store seam.
+const FAILPOINT_TOKEN: &str = "engine-tests-failpoint-token";
+
+/// In a child, activates Store's failpoints before the Engine opens, with
+/// `point` failing its first hit (`fail_io`); returns their directory.
+fn fail_first(root: &Path, point: &str) -> PathBuf {
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io"});
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
+/// session-head read before a terminal commit (`store.sqlite.corrupt_head`)
+/// reaches the failure hook as `Corrupt`, which latches even at final
+/// shutdown's scoped forced-terminal site. While serving, the head is
+/// unknown there only after an uncertain write, which has already latched
+/// (the restart handoff's terminal fails startup on any error), so the
+/// record here starts with an unknown head.
+#[test]
+fn a_corrupt_head_read_before_a_terminal_latches() {
+    let Some(root) = child("a_corrupt_head_read_before_a_terminal_latches") else {
+        return;
+    };
+    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let started = super::Started {
+            session: session.clone(),
+            turn: turn(1),
+            queued_at: rfc3339(std::time::SystemTime::now()),
+            first_seq: 1,
+            submitted: None,
+        };
+        let record = super::TurnRecord {
+            session: session.clone(),
+            turn: turn(1),
+            head: super::journal::Head::new(None),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: None,
+            uncertain: None,
+        };
+        let terminal = super::Terminal {
+            state: "failed",
+            failure: Some(super::failure(
+                crate::api::FailureClass::Store,
+                "a turn event could not be recorded".to_owned(),
+                None,
+            )),
+            stop_reason: "error",
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            cancel: None,
+        };
+        let finished = engine.finish(&started, record, terminal, false, None).await;
+        assert_eq!(finished.unwrap_err().kind, "store_error");
+        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(engine.store_failed(), "the corrupt head read latched");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store");
+        assert_eq!(status["scope"], "daemon");
+    });
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the force
+/// closure pass's session-head read latches, and the session counts as
+/// unclosed. The pass reads the head from Store only for a session with no
+/// slot or an unknown head. End to end every force session keeps its slot,
+/// whose head its last write left known (an unknown one follows a latching
+/// write, which skips the pass), so the slot is removed here.
+#[test]
+fn a_corrupt_head_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_head_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        cancel(&engine, &session, 1).await.unwrap();
+        super::lock(&engine.sessions).remove(&session);
+        super::lock(&engine.force_sessions).replace(vec![session.clone()]);
+        let report = shutdown(&engine).await;
+        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(report.store_failed, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store");
+        assert_eq!(status["affected"]["addresses"], json!([session.as_str()]));
+        assert!(
+            !event_types(&engine, &session)
+                .await
+                .contains(&"session.closed".to_owned())
+        );
+    });
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1, §7.2 row 2): SQLite corruption
+/// on the session-head read of row 2's resolution write
+/// (`commit_submit_failed`) is reported as `corrupt_store`, not as a failed
+/// commit. The dispatcher's slot is fresh after a restart, so its head is
+/// unknown; the slot here starts that way.
+#[test]
+fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
+    let Some(root) = child("a_corrupt_head_read_before_a_submit_failed_write_is_corrupt") else {
+        return;
+    };
+    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let queueing = engine.queueing(&session, turn(1)).await.unwrap();
+        let slot = super::queue::Slot::new(super::journal::Head::new(None));
+        engine
+            .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
+            .await;
+        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(
+            engine.store_failed(),
+            "the resolution write's failure latched"
+        );
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store");
+        let types = event_types(&engine, &session).await;
+        assert_eq!(types, ["turn.queued"], "nothing was written");
+    });
+}

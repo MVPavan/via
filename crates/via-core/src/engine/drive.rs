@@ -16,7 +16,7 @@ use via_store::{
 };
 
 use super::batch::AffectedTurn;
-use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
+use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
 use super::resolve::{Queueing, ReadStreak};
@@ -908,8 +908,8 @@ impl Engine {
             .await;
         let durable = match committed {
             Ok(durable) => durable,
-            Err(error) => {
-                let outcome = journal::outcome_of(&error);
+            Err(unended) => {
+                let outcome = unended.outcome;
                 let site = match owner {
                     Owner::Request => FailureSite::RequestCancel,
                     // The retry failed, or the first write was uncertain.
@@ -962,10 +962,10 @@ impl Engine {
         (record, terminal): (TurnRecord, Terminal),
         (close, extras): (bool, TerminalExtras),
         retry: bool,
-    ) -> Result<Durable, ApiError> {
+    ) -> Result<Durable, Unended> {
         let faulted = self.cancel_fault();
         if faulted && (!retry || self.cancel_fault()) {
-            return Err(ApiError::STORE);
+            return Err(ApiError::STORE.into());
         }
         let mode = Commit {
             retry: retry && !faulted,
@@ -1025,7 +1025,7 @@ impl Engine {
         // best-effort write; it is never retried.
         let sites = (FailureSite::ForcedTerminal, FailureSite::ForcedTerminal);
         self.finished(started, &finished, held, sites).await;
-        finished.map(drop)
+        finished.map(drop).map_err(|unended| unended.error)
     }
 
     /// `finish` for a running turn's own terminal, with the `cancel_cause`
@@ -1075,17 +1075,17 @@ impl Engine {
         }
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
         self.finished(&started, &finished, None, sites).await;
-        finished.map(drop)
+        finished.map(drop).map_err(|unended| unended.error)
     }
 
     /// Reports a terminal commit to the failure hook: a first attempt that
     /// did not commit before its retry committed at `first`, and a failed
-    /// or uncertain final write at `last` (an uncertain one latches at any
-    /// site).
+    /// or uncertain final write at `last` (an uncertain one, or a corrupt
+    /// head read before it, latches at any site).
     async fn finished(
         &self,
         started: &Started,
-        finished: &Result<Durable, ApiError>,
+        finished: &Result<Durable, Unended>,
         held: Option<&super::Admission<'_>>,
         (first, last): (FailureSite, FailureSite),
     ) {
@@ -1093,7 +1093,7 @@ impl Engine {
             Ok(durable) if durable.uncertain => Some((first, WriteOutcome::Uncertain)),
             Ok(durable) if durable.retried => Some((first, WriteOutcome::NotCommitted)),
             Ok(_) => None,
-            Err(error) => Some((last, journal::outcome_of(error))),
+            Err(unended) => Some((last, unended.outcome)),
         };
         if let Some((site, outcome)) = failed {
             let scope = FailureScope::Turn(&started.session, started.turn);
@@ -1112,7 +1112,7 @@ impl Engine {
         record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-    ) -> Result<Durable, ApiError> {
+    ) -> Result<Durable, Unended> {
         Self::finish_turn_with(
             journal,
             unresolved,
@@ -1135,7 +1135,7 @@ impl Engine {
         close_session: bool,
         extras: TerminalExtras,
         mode: Commit,
-    ) -> Result<Durable, ApiError> {
+    ) -> Result<Durable, Unended> {
         let committed = Self::commit_turn_ended_with(
             journal,
             started,
@@ -1161,7 +1161,7 @@ impl Engine {
         record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-    ) -> Result<Durable, ApiError> {
+    ) -> Result<Durable, Unended> {
         Self::commit_turn_ended_with(
             journal,
             started,
@@ -1193,15 +1193,19 @@ impl Engine {
         close_session: bool,
         mut extras: TerminalExtras,
         mode: Commit,
-    ) -> Result<Durable, ApiError> {
+    ) -> Result<Durable, Unended> {
         journal::reconcile(journal, &mut record)
             .await
             .map_err(|_| ApiError::STORE)?;
         let shared = Arc::clone(&record.head);
+        // A corrupt head read writes nothing, yet latches (design §7.1).
         let head = shared
             .lock(journal, &started.session)
             .await
-            .map_err(|_| ApiError::STORE)?;
+            .map_err(|error| Unended {
+                error: ApiError::STORE,
+                outcome: WriteOutcome::of_read(&error),
+            })?;
         let first = head.next();
         let mut seq = first;
         if mode.raw_owed {
@@ -1251,7 +1255,7 @@ impl Engine {
             // Uncertain: re-read the head before the session's next event.
             Ok(_) | Err(_) => head.lost(),
         }
-        committed
+        committed.map_err(Unended::from)
     }
 
     /// Drives the adapter under the turn deadline, committing each observation it

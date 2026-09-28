@@ -585,6 +585,25 @@ fn duplicate(record: &TerminalRecord) -> TerminalRecord {
     }
 }
 
+/// A terminal commit that did not become durable: the `store_error` its
+/// caller reports, and the outcome the failure hook classifies (design
+/// §7.1). A corrupt session-head read before the commit is `Corrupt`
+/// although the reply is a plain `store_error` (T3-S5 round 1, decision 10).
+#[derive(Debug)]
+pub(super) struct Unended {
+    pub(super) error: ApiError,
+    pub(super) outcome: WriteOutcome,
+}
+
+impl From<ApiError> for Unended {
+    fn from(error: ApiError) -> Self {
+        Self {
+            outcome: outcome_of(&error),
+            error,
+        }
+    }
+}
+
 /// The outcome of a failed terminal commit (design §7.1): unknown only when
 /// the commit may have written; an error before it wrote nothing.
 pub(super) fn outcome_of(error: &ApiError) -> WriteOutcome {

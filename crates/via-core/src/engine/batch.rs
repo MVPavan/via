@@ -137,19 +137,26 @@ impl Engine {
             raw_incomplete,
         };
         let write = async {
-            let head = shared.lock(&self.store, session).await.ok()?;
+            // A failed head read writes nothing; a corrupt one is reported
+            // as corruption (design §7.1, T3-S5 round 1, decision 10).
+            let head = match shared.lock(&self.store, session).await {
+                Ok(head) => head,
+                Err(error) => return Err(WriteOutcome::of_read(&error)),
+            };
             let queued = turns.iter().copied().zip(rows).collect();
-            let (batch, written) = build(affected, slot.as_deref(), queued, head.next())?;
+            // A record that cannot be encoded writes nothing.
+            let (batch, written) = build(affected, slot.as_deref(), queued, head.next())
+                .ok_or(WriteOutcome::NotCommitted)?;
             let committed = self.store.commit_failure_resolution(batch).await;
             match &committed {
                 Ok(()) => head.committed(written),
                 Err(error) if !WriteOutcome::of(error).head_unknown() => drop(head),
                 Err(_) => head.lost(),
             }
-            Some(committed)
+            committed.map_err(|error| WriteOutcome::of(&error))
         };
         let outcome = match tokio::time::timeout_at(write_by, write).await {
-            Ok(Some(Ok(()))) => {
+            Ok(Ok(())) => {
                 batches.committed += 1;
                 self.unresolved.resolve(session, number);
                 for turn in &turns {
@@ -162,9 +169,7 @@ impl Engine {
                 }
                 return;
             }
-            // Nothing was written: the head or an encoding failed.
-            Ok(None) => WriteOutcome::NotCommitted,
-            Ok(Some(Err(error))) => WriteOutcome::of(&error),
+            Ok(Err(outcome)) => outcome,
             // No reply within the bound: the head is re-read by restart.
             Err(_) => WriteOutcome::Uncertain,
         };

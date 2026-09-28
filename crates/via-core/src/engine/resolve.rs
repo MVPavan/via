@@ -133,10 +133,12 @@ pub(super) enum SubmitFailed {
 }
 
 impl SubmitFailed {
-    /// The write's outcome (design §7.1): only a commit can be uncertain.
+    /// The write's outcome (design §7.1): only a commit can be uncertain;
+    /// a corrupt head read is corruption (T3-S5 round 1, decision 10).
     pub(super) fn outcome(&self) -> WriteOutcome {
         match self {
-            Self::Head(_) | Self::Exhausted | Self::Encode => WriteOutcome::NotCommitted,
+            Self::Head(error) => WriteOutcome::of_read(error),
+            Self::Exhausted | Self::Encode => WriteOutcome::NotCommitted,
             Self::Commit(error) => WriteOutcome::of(error),
         }
     }

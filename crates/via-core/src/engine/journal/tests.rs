@@ -269,6 +269,7 @@ async fn observe_then_finish(
     )
     .await
     .map(drop)
+    .map_err(|unended| unended.error)
 }
 
 fn event_types(events: &[StoredEvent]) -> Vec<(u64, String)> {
@@ -560,7 +561,7 @@ async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
         false,
     )
     .await;
-    assert_eq!(finished.unwrap_err().kind, "store_error");
+    assert_eq!(finished.unwrap_err().error.kind, "store_error");
     let address = format!("{SESSION}/1");
     for read in [
         engine.result(&address).await,
@@ -774,6 +775,32 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
         .first_failure
         .expect("the head read failed the event");
     assert_eq!(note.outcome, crate::engine::latch::WriteOutcome::Corrupt);
+    let events = store.client().events(&session(), 1, 10).await.unwrap();
+    assert_eq!(events.len(), 2, "nothing was written");
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
+/// session-head read before a terminal commit is reported as `Corrupt`,
+/// which the failure hook latches, not as a not-committed failure. Nothing
+/// is written.
+#[tokio::test]
+async fn a_corrupt_head_read_before_a_terminal_is_a_corrupt_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, _) = running_turn(&root).await;
+    let journal = FaultJournal {
+        store: store.client(),
+        event: EventFault::CommittedThenUncertain,
+        head: HeadFault::Corrupt,
+        submission_fails: false,
+        delayed_results: false,
+    };
+    let mut record = record();
+    record.head = Head::new(None);
+    let failed = Engine::commit_turn_ended(&journal, &started(), record, store_failure(), false)
+        .await
+        .unwrap_err();
+    assert_eq!(failed.outcome, crate::engine::latch::WriteOutcome::Corrupt);
+    assert_eq!(failed.error.kind, "store_error");
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(events.len(), 2, "nothing was written");
 }

@@ -1965,6 +1965,55 @@ fn corrupt_head_read(verb: &str) -> TestResult {
     Ok(())
 }
 
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
+/// session-head read of final shutdown's failure-resolution batch is
+/// reported as corruption. A lost event reply (`store.commit.reply_lost`)
+/// latches and leaves the head unknown, so the batch reads it
+/// (`store.sqlite.corrupt_head`): the batch is skipped, and the latest
+/// `store_failure`, served in the diagnostic window, is `corrupt_store`.
+#[test]
+fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
+    let point = "store.sqlite.corrupt_head";
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![
+            accepted(1),
+            gate("accepted"),
+            text("lost"),
+            gate("first"),
+            terminal(1),
+        ],
+    ))?;
+    sandbox.count("store.commit.reply_lost")?;
+    sandbox.count(point)?;
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    let next = sandbox.next_hit(point)?;
+    sandbox.arm(point, next, "fail_io")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    sandbox.ack(&daemon, point, next, "fail_io")?;
+    // The latch, then the batch's failure.
+    wait_until("the batch's failure", Duration::from_secs(4), || {
+        store_failure(&sandbox).is_ok_and(|failure| failure["count"] == 2)
+    })?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "corrupt_store" && failure["scope"] == "daemon",
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    let summary = daemon.latched_exit()?;
+    check(
+        summary["failure_batches"] == json!({"committed": 0, "skipped": 1}),
+        || format!("unexpected summary: {summary}"),
+    )
+}
+
 // -------------------------------------------------------- latch path (§7.4)
 
 /// Slack for the harness's own polling and process exit when it checks a

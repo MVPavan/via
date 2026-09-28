@@ -514,8 +514,21 @@ impl Engine {
         let head = self
             .slot(session)
             .map_or_else(|| Head::new(None), |slot| Arc::clone(&slot.head));
-        let Ok(guard) = head.lock(&self.store, session).await else {
-            return false;
+        let guard = match head.lock(&self.store, session).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                // A failed head read writes nothing; a corrupt one latches
+                // (design §7.1, T3-S5 round 1, decision 10).
+                if WriteOutcome::of_read(&error) == WriteOutcome::Corrupt {
+                    self.store_failure(
+                        FailureSite::SessionClosed,
+                        WriteOutcome::Corrupt,
+                        FailureScope::Session(session),
+                    )
+                    .finish_held(admission);
+                }
+                return false;
+            }
         };
         let Ok(closed) = (Event {
             seq: guard.next(),
