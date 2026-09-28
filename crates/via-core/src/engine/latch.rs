@@ -165,6 +165,16 @@ impl WriteOutcome {
         }
     }
 
+    /// Classifies a failed read taken before a write, such as the session
+    /// head's: nothing was written, so it is not committed, unless SQLite
+    /// reported corruption, which latches (design §7.1).
+    pub(super) fn of_read(error: &StoreError) -> Self {
+        match Self::of(error) {
+            Self::Corrupt => Self::Corrupt,
+            Self::NotCommitted | Self::Uncertain => Self::NotCommitted,
+        }
+    }
+
     /// Whether the write may be durable, so the session head is re-read
     /// before its next event (design §7.1 sequence numbers).
     pub(super) fn head_unknown(self) -> bool {

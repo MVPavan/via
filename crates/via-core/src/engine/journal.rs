@@ -381,10 +381,13 @@ pub(super) async fn commit_event_at(
         })
     };
     let shared = Arc::clone(&record.head);
-    let Ok(head) = shared.lock(journal, &record.session).await else {
-        // The head's read failed: nothing was written.
-        record.first_failure = failed(WriteOutcome::NotCommitted);
-        return;
+    let head = match shared.lock(journal, &record.session).await {
+        Ok(head) => head,
+        Err(error) => {
+            // The head's read failed: nothing was written; corruption latches.
+            record.first_failure = failed(WriteOutcome::of_read(&error));
+            return;
+        }
     };
     let seq = head.next();
     let event = Event {

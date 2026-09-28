@@ -267,11 +267,18 @@ impl Engine {
             warnings: RoutePlan::fake().warnings(),
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
-        let head = slot
-            .head
-            .lock(&self.store, &session)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        let head = match slot.head.lock(&self.store, &session).await {
+            Ok(head) => head,
+            Err(error) => {
+                // Nothing was written; SQLite corruption latches (§7.1).
+                let outcome = WriteOutcome::of_read(&error);
+                if outcome == WriteOutcome::Corrupt {
+                    self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
+                        .finish_held(admission);
+                }
+                return Err(ApiError::STORE);
+            }
+        };
         let at = rfc3339(SystemTime::now());
         let event = Event {
             seq: head.next(),

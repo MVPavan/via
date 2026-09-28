@@ -300,8 +300,9 @@ impl Command {
 
 /// Test-only seams on a read the worker dequeued (design §6.7, §7.1, §7.3):
 /// `store.read.stall` pauses the worker; `store.sqlite.corrupt` reports
-/// corruption; `store.read.dispatch` fails the dispatcher's head reads
-/// (predecessors, the queued row, the head's next sequence) and
+/// corruption, and `store.sqlite.corrupt_head` only on a session-head read
+/// (the next sequence); `store.read.dispatch` fails the dispatcher's head
+/// reads (predecessors, the queued row, the head's next sequence) and
 /// `store.read.queued_turn` only the queued-row read.
 #[cfg(feature = "test-failpoints")]
 fn read_seams(command: &Command) -> Result<(), StoreError> {
@@ -309,6 +310,9 @@ fn read_seams(command: &Command) -> Result<(), StoreError> {
     let injected = |error: std::io::Error| StoreError::Write(error.to_string());
     hit("store.read.stall").map_err(injected)?;
     hit("store.sqlite.corrupt").map_err(|error| StoreError::Corrupt(error.to_string()))?;
+    if matches!(command, Command::NextSeq(..)) {
+        hit("store.sqlite.corrupt_head").map_err(|error| StoreError::Corrupt(error.to_string()))?;
+    }
     if matches!(
         command,
         Command::Predecessors(..) | Command::QueuedTurn(..) | Command::NextSeq(..)

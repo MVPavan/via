@@ -37,12 +37,22 @@ enum EventFault {
     UncertainNotCommitted,
 }
 
+/// How reads of the durable event head behave.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadFault {
+    Readable,
+    /// They fail, so nothing can be settled.
+    Unreadable,
+    /// Session-head reads (the next sequence) report SQLite corruption.
+    Corrupt,
+}
+
 /// Closed fault backend: a real Store whose event commits take one fixed fault.
 struct FaultJournal {
     store: StoreClient,
     event: EventFault,
-    /// Reads of the durable event head fail, so nothing can be settled.
-    head_unreadable: bool,
+    /// Reads of the durable event head.
+    head: HeadFault,
     /// Submission commits report an uncertain outcome and leave nothing durable.
     submission_fails: bool,
     /// Result reads of every session but `SESSION` stall past the settle bound.
@@ -90,7 +100,7 @@ impl TurnJournal for FaultJournal {
         from_seq: u64,
         limit: u32,
     ) -> Result<Vec<StoredEvent>, StoreError> {
-        if self.head_unreadable {
+        if self.head == HeadFault::Unreadable {
             return Err(StoreError::WriterLost);
         }
         self.store.events(session, from_seq, limit).await
@@ -123,7 +133,10 @@ impl TurnJournal for FaultJournal {
     }
 
     async fn next_seq(&self, session: &SessionId) -> Result<Option<u64>, StoreError> {
-        if self.head_unreadable {
+        if self.head == HeadFault::Corrupt {
+            return Err(StoreError::Corrupt("injected corruption".to_owned()));
+        }
+        if self.head == HeadFault::Unreadable {
             return Err(StoreError::WriterLost);
         }
         self.store.next_seq(session).await
@@ -272,7 +285,7 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
-        head_unreadable: false,
+        head: HeadFault::Readable,
         submission_fails: false,
         delayed_results: false,
     };
@@ -311,7 +324,7 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::UncertainNotCommitted,
-        head_unreadable: false,
+        head: HeadFault::Readable,
         submission_fails: false,
         delayed_results: false,
     };
@@ -337,7 +350,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::UncertainNotCommitted,
-        head_unreadable: false,
+        head: HeadFault::Readable,
         submission_fails: false,
         delayed_results: false,
     };
@@ -419,7 +432,7 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
-        head_unreadable: true,
+        head: HeadFault::Unreadable,
         submission_fails: false,
         delayed_results: false,
     };
@@ -532,7 +545,7 @@ async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
     let journal = FaultJournal {
         store: engine.store.clone(),
         event: EventFault::CommittedThenUncertain,
-        head_unreadable: true,
+        head: HeadFault::Unreadable,
         submission_fails: false,
         delayed_results: false,
     };
@@ -572,7 +585,7 @@ async fn a_submission_commit_with_an_unknown_outcome_fails_and_unsettles_the_hea
     let journal = FaultJournal {
         store: engine.store.clone(),
         event: EventFault::UncertainNotCommitted,
-        head_unreadable: false,
+        head: HeadFault::Readable,
         submission_fails: true,
         delayed_results: false,
     };
@@ -714,7 +727,7 @@ async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
     let journal = FaultJournal {
         store: engine.store.clone(),
         event: EventFault::UncertainNotCommitted,
-        head_unreadable: false,
+        head: HeadFault::Readable,
         submission_fails: false,
         delayed_results: true,
     };
@@ -728,4 +741,39 @@ async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
     let retained = engine.unresolved.turns();
     assert_eq!(retained.len(), UNRESOLVED_LIMIT - 1);
     assert!(!retained.contains(&(session(), turn())));
+}
+
+/// T3-S5 round 1, decision 2 (design §7.1): SQLite corruption on the
+/// session-head read before an event is the turn's first failure with the
+/// outcome `Corrupt`, which the failure hook latches, not a clean
+/// not-committed failure. Nothing is written.
+#[tokio::test]
+async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, _) = running_turn(&root).await;
+    let journal = FaultJournal {
+        store: store.client(),
+        event: EventFault::CommittedThenUncertain,
+        head: HeadFault::Corrupt,
+        submission_fails: false,
+        delayed_results: false,
+    };
+    let mut record = record();
+    record.head = Head::new(None);
+    commit_event(
+        &journal,
+        &mut record,
+        EventBody::AssistantText {
+            text: "lost".to_owned(),
+            is_final: false,
+        },
+        None,
+    )
+    .await;
+    let note = record
+        .first_failure
+        .expect("the head read failed the event");
+    assert_eq!(note.outcome, crate::engine::latch::WriteOutcome::Corrupt);
+    let events = store.client().events(&session(), 1, 10).await.unwrap();
+    assert_eq!(events.len(), 2, "nothing was written");
 }

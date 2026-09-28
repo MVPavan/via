@@ -1361,10 +1361,15 @@ impl Engine {
                     return;
                 }
                 let shared = Arc::clone(&record.head);
-                let Ok(head) = shared.lock(&self.store, &record.session).await else {
-                    // The head's read failed: nothing was written.
-                    self.event_failed(record, WriteOutcome::NotCommitted).await;
-                    return;
+                let head = match shared.lock(&self.store, &record.session).await {
+                    Ok(head) => head,
+                    Err(error) => {
+                        // The head's read failed: nothing was written;
+                        // corruption latches (design §7.1).
+                        self.event_failed(record, WriteOutcome::of_read(&error))
+                            .await;
+                        return;
+                    }
                 };
                 let seq = head.next();
                 match self

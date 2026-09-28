@@ -347,7 +347,7 @@ impl Engine {
 
     /// Commits `Closed` for a closing session at its head's next sequence;
     /// the caller holds `admission` (lock order `admission` → head). A head
-    /// that cannot be read wrote nothing.
+    /// that cannot be read wrote nothing; a corrupt one latches (§7.1).
     async fn commit_closed(
         &self,
         slot: &Slot,
@@ -358,7 +358,7 @@ impl Engine {
             .head
             .lock(&self.store, session)
             .await
-            .map_err(|_| WriteOutcome::NotCommitted)?;
+            .map_err(|error| WriteOutcome::of_read(&error))?;
         let event = Event {
             seq: head.next(),
             session_id: session,

@@ -1919,6 +1919,48 @@ fn s1_f12_sqlite_corruption_latches() -> TestResult {
     })
 }
 
+/// T3-S5 round 1, decision 2 (design §7.1): SQLite corruption on the
+/// session-head read that a receipt (`resume`) or `Closed` (`close`) takes
+/// latches, rather than being a plain or scoped failure. A restarted
+/// daemon keeps no head for an idle session, so the verb's commit reads it
+/// (`store.sqlite.corrupt_head`); the request replies `store_error`,
+/// `store_failure` is `corrupt_store` with scope `daemon`, and the exit is 4.
+#[test]
+fn s1_f12_corrupt_head_read_latches() -> TestResult {
+    for verb in ["resume", "close"] {
+        corrupt_head_read(verb).map_err(|error| format!("{verb}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn corrupt_head_read(verb: &str) -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("first", 1)]))?;
+    let daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("first")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(first["state"] == "completed", || format!("turn 1: {first}"))?;
+    daemon.stop_clean()?;
+    let daemon = sandbox.start()?;
+    let point = "store.sqlite.corrupt_head";
+    sandbox.arm(point, 1, "fail_io")?;
+    let args: Vec<&str> = if verb == "resume" {
+        vec![
+            "resume", &session, "--prompt", "second", "--handle", &handle, "--json",
+        ]
+    } else {
+        vec!["close", &session, "--handle", &handle, "--json"]
+    };
+    sandbox.refused(&args, "store_error")?;
+    sandbox.ack(&daemon, point, 1, "fail_io")?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        failure["kind"] == "corrupt_store" && failure["scope"] == "daemon",
+        || format!("unexpected store_failure: {failure}"),
+    )?;
+    daemon.latched_exit()?;
+    Ok(())
+}
+
 // -------------------------------------------------------- latch path (§7.4)
 
 /// Slack for the harness's own polling and process exit when it checks a
