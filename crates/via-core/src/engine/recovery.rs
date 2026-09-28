@@ -575,8 +575,10 @@ impl Engine {
 
     /// Design §9: commits `raw_log.incomplete` for a turn whose raw log may be
     /// incomplete, unless an earlier recovery attempt did; returns whether it
-    /// may be incomplete. A failed commit is the record's first failure,
-    /// which fails startup once the settlement is written.
+    /// may be incomplete. A durable event decides on its own: the envelope
+    /// carries its warning whatever this attempt's inventory shows. A failed
+    /// commit is the record's first failure, which fails startup once the
+    /// settlement is written.
     async fn record_raw_incomplete(
         &self,
         record: &mut TurnRecord,
@@ -590,7 +592,7 @@ impl Engine {
             self.commit_event(record, EventBody::RawLogIncomplete { connection_id }, None)
                 .await;
         }
-        Ok(raw_incomplete)
+        Ok(raw_incomplete || raw_logged)
     }
 
     /// Records the recovery stop of the turn's orphaned execution (C1 §7.5):

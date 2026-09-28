@@ -9,10 +9,6 @@
 
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
-#[expect(
-    dead_code,
-    reason = "these scenarios crash paused points, never release them"
-)]
 mod failpoints;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
@@ -1047,6 +1043,121 @@ fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
                     && cancel["cleanup"] == settled["cleanup"],
                 || format!("the durable cancel was not kept: {cancel} vs {requested} {settled}"),
             )
+        },
+    )
+}
+
+/// Commits `count` synthetic anchors owned by turn 1 of `owner`, each with
+/// the identity of an existing real anchor and a committed absence proof,
+/// so Host accepts them without probing; their groups (`pgid` beyond
+/// Linux's `pid_max`) cannot exist. Ids start with `prefix`.
+#[cfg(feature = "test-failpoints")]
+fn insert_proven_absent(
+    paths: &Paths,
+    owner: &str,
+    prefix: &str,
+    count: u32,
+) -> Result<(), ScenarioError> {
+    let mut store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+    let tx = store.transaction().map_err(infra)?;
+    for index in 0..count {
+        let changed = tx
+            .execute(
+                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
+                 SELECT ?1,'g'||?1,a.marker,'/nonexistent',?2,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,?3,?3,1,'1'
+                 FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
+                rusqlite::params![format!("{prefix}{index:05}"), owner, 4_194_305 + index],
+            )
+            .map_err(infra)?;
+        check(changed == 1, || "no real anchor to copy".to_owned())?;
+    }
+    tx.commit().map_err(infra)
+}
+
+/// Removes the synthetic anchors while no daemon runs, so teardown and the
+/// next recovery see only anchors that ran.
+#[cfg(feature = "test-failpoints")]
+fn delete_synthetic(paths: &Paths, prefix: &str) -> Result<(), ScenarioError> {
+    let store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+    store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
+    store
+        .execute(
+            "DELETE FROM anchors WHERE anchor_id LIKE ?1",
+            [format!("{prefix}%")],
+        )
+        .map(drop)
+        .map_err(infra)
+}
+
+/// Design §9: a durable `raw_log.incomplete` carries its warning. The
+/// crashed turn never launched. The first restart's inventory is
+/// incomplete (held at the page boundary past the 5 s reconciliation
+/// deadline over 300 synthetic anchors), so it commits the event, and its
+/// terminal write fails (`store.commit.terminal`): startup fails. The
+/// second restart's inventory is complete and shows no armed anchor, yet
+/// the envelope carries `raw_log_incomplete`, with the one durable event.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_durable_raw_log_incomplete_keeps_its_warning() -> TestResult {
+    let fixture = json!({"scripts":[completes("seed", 1), completes("held", 1)]});
+    scenario(
+        "s1_recovery_durable_raw_incomplete",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let seed = session_of(&spawn(paths, evidence, "spawn-seed", "seed", &[])?)?;
+            let seeded = wait(paths, evidence, &format!("{seed}/1"))?;
+            check(seeded["state"] == "completed", || format!("seed: {seeded}"))?;
+            // The seed turn was hit 1; the crashed turn is hit 2.
+            let intent = "core.intent.after_commit";
+            paths.failpoints.arm(intent, 2, "pause").map_err(infra)?;
+            let session = session_of(&spawn(paths, evidence, "spawn", "held", &[])?)?;
+            paths
+                .failpoints
+                .wait_ack(intent, 2, "pause", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {intent}: {error}")))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(intent).map_err(infra)?;
+            check(paths.anchors_of_turn(&session, 1)? == 0, || {
+                "the held submission launched".to_owned()
+            })?;
+            // Ids sort before the real anchor's hex id: two pages.
+            insert_proven_absent(paths, &seed, "0-synthetic", 300)?;
+            let boundary = "core.recovery.page_boundary";
+            paths.failpoints.arm(boundary, 1, "pause").map_err(infra)?;
+            let terminal = "store.commit.terminal";
+            paths
+                .failpoints
+                .arm(terminal, 1, "fail_io")
+                .map_err(infra)?;
+            let mut refused = Daemon::spawn(paths, evidence, "refused", &[])?;
+            paths
+                .failpoints
+                .wait_ack(boundary, 1, "pause", refused.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {boundary}: {error}")))?;
+            // Elapsed time only: the deadline began before the acknowledgement.
+            thread::sleep(Duration::from_millis(5_200));
+            paths.failpoints.release(boundary, 1).map_err(infra)?;
+            let status = wait_child(&mut refused.child, Duration::from_secs(15))?
+                .ok_or_else(|| fail("the daemon admitted after a failed recovery terminal"))?;
+            check(!status.success(), || {
+                format!("startup did not fail on the terminal write ({status})")
+            })?;
+            let (state, _) = paths.turn(&session, 1)?;
+            let types = paths.turn_types(&session, 1)?;
+            check(
+                state == "running" && types.contains(&"raw_log.incomplete".to_owned()),
+                || format!("before the second recovery: {state} {types:?}"),
+            )?;
+            delete_synthetic(paths, "0-synthetic")?;
+            drop(refused);
+            paths.failpoints.disarm(boundary).map_err(infra)?;
+            paths.failpoints.disarm(terminal).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let envelope = recovered_unknown(paths, &session)?;
+            // Never launched: turn 1's connection is named from its session.
+            let connection = format!("c_{}", session.trim_start_matches("s_"));
+            raw_incomplete_recorded(paths, &session, &envelope, &connection)
         },
     )
 }
