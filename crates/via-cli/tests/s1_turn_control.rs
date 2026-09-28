@@ -1859,3 +1859,313 @@ fn s1_idle_timer_disarms_once_an_order_exists() -> TestResult {
     )?;
     daemon.finish()
 }
+
+/// The last final-shutdown summary in the daemon trace.
+#[cfg(feature = "test-failpoints")]
+fn shutdown_summary(sandbox: &Sandbox) -> TestResult<Value> {
+    sandbox
+        .trace()
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|line| line.get("daemon_shutdown").cloned())
+        .ok_or_else(|| "the daemon wrote no shutdown summary".into())
+}
+
+/// Design §4 step 4, §6.8 entry [r3.2, r4.1]. **Before the fence:** a drain
+/// is accepted and its last turn ends; daemon main, entering final
+/// shutdown, is paused at `daemon.shutdown.before_fence`, still serving. A
+/// close commits `Closing` and requests its dispatcher start; released,
+/// the start drain starts it (`queued_drives: 1`) and the close completes.
+/// **After the fence:** paused at `daemon.shutdown.after_fence`, a new close
+/// is `daemon_stopping`, and a keyed replay of a committed close replays.
+/// (The incomplete keyed close whose `Closed` failed is S5's.)
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_at_final_shutdown_entry_refused() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(vec![
+        completes("idle", 1),
+        script(
+            "last",
+            1,
+            vec![
+                accepted(1),
+                gate("last"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        completes("keyed", 1),
+    ]))?;
+    let before = "daemon.shutdown.before_fence";
+    sandbox.arm(before, 1, "pause")?;
+    let mut daemon = sandbox.start()?;
+    let (idle, idle_handle) = sandbox.spawn("idle", &[])?;
+    sandbox.wait(&format!("{idle}/1"))?;
+    let (last, last_handle) = sandbox.spawn("last", &[])?;
+    sandbox.await_file("last.entered")?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.release("last")?;
+    sandbox.ack(&daemon, before, 1, "pause")?;
+    let closed = thread::scope(|scope| -> TestResult<Value> {
+        let close = scope.spawn(|| {
+            sandbox
+                .ok(&["close", &idle, "--handle", &idle_handle, "--json"])
+                .map_err(|error| error.to_string())
+        });
+        // `Closing` is durable, so its dispatcher start was requested.
+        sandbox.await_row(
+            &format!("SELECT admission FROM sessions WHERE id='{idle}'"),
+            "closing",
+        )?;
+        sandbox.resume_point(before, 1)?;
+        Ok(close.join().map_err(|_| "close panicked")??)
+    })?;
+    check(closed["state"] == "closed", || format!("close: {closed}"))?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    let summary = shutdown_summary(&sandbox)?;
+    check(
+        status.code() == Some(0) && summary["queued_drives"] == 1,
+        || format!("drain exit {status}: {summary}"),
+    )?;
+    drop(daemon);
+    sandbox.disarm(before)?;
+    let after = "daemon.shutdown.after_fence";
+    sandbox.arm(after, 1, "pause")?;
+    let mut daemon = sandbox.start()?;
+    let (keyed, keyed_handle) = sandbox.spawn("keyed", &[])?;
+    sandbox.wait(&format!("{keyed}/1"))?;
+    let replayed = [
+        "close",
+        &keyed,
+        "--op-key",
+        "k1",
+        "--handle",
+        &keyed_handle,
+        "--json",
+    ];
+    let first = sandbox.ok(&replayed)?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.ack(&daemon, after, 1, "pause")?;
+    sandbox.refused(
+        &["close", &last, "--handle", &last_handle, "--json"],
+        "daemon_stopping",
+    )?;
+    let replay = sandbox.ok(&replayed)?;
+    check(replay == first, || format!("keyed replay: {replay}"))?;
+    sandbox.resume_point(after, 1)?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(0), || format!("drain exit {status}"))?;
+    drop(daemon);
+    sandbox.disarm(after)?;
+    Ok(())
+}
+
+/// Design §6.3, §6.6 [r3.5], the status half (S5 adds the failed
+/// `Closed`): a close whose session's group is unproven (its anchor held at
+/// `host.anchor.before_eof_cleanup`) waits in its bounded absence check,
+/// holding no `admission`. Meanwhile the session is in the durable closing
+/// set: `sessions.closing` is 1 with no active turn, and a plain stop is
+/// refused. Once the group is gone the close completes, the count is 0 and
+/// a plain stop is accepted.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_failed_closed_keeps_closing_count() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "slow",
+        1,
+        vec![json!({"action":"report_pids"}), accepted(1)],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let arm_intent = "host.anchor.after_arm_intent_commit";
+    let eof_cleanup = "host.anchor.before_eof_cleanup";
+    sandbox.arm(arm_intent, 1, "pause")?;
+    sandbox.arm(eof_cleanup, 1, "pause")?;
+    let (session, handle) = sandbox.spawn("slow", &[])?;
+    sandbox.ack(&daemon, arm_intent, 1, "pause")?;
+    sandbox.ok(&["cancel", &session, "--handle", &handle, "--json"])?;
+    sandbox.resume_point(arm_intent, 1)?;
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    check(envelope["cancel"]["cleanup"] == "uncertain", || {
+        format!("the group was proved absent: {envelope}")
+    })?;
+    thread::scope(|scope| -> TestResult {
+        let close = scope.spawn(|| {
+            sandbox
+                .ok(&[
+                    "close",
+                    &session,
+                    "--deadline-ms",
+                    "30000",
+                    "--handle",
+                    &handle,
+                    "--json",
+                ])
+                .map_err(|error| error.to_string())
+        });
+        sandbox.await_row(
+            &format!("SELECT admission FROM sessions WHERE id='{session}'"),
+            "closing",
+        )?;
+        let status = sandbox.ok(&["daemon", "status", "--json"])?;
+        check(
+            status["sessions"]["closing"] == 1 && status["sessions"]["active"] == 0,
+            || format!("closing count: {status}"),
+        )?;
+        let refused = sandbox.refused(&["daemon", "stop", "--json"], "admission_refused")?;
+        check(refused["message"] == "sessions are active", || {
+            refused.to_string()
+        })?;
+        sandbox.process_ack(eof_cleanup, 1, "pause")?;
+        sandbox.resume_point(eof_cleanup, 1)?;
+        let closed = close.join().map_err(|_| "close panicked")??;
+        check(closed["state"] == "closed", || closed.to_string())
+    })?;
+    sandbox.disarm(eof_cleanup)?;
+    let status = sandbox.ok(&["daemon", "status", "--json"])?;
+    check(status["sessions"]["closing"] == 0, || status.to_string())?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    check(exit.code() == Some(0), || format!("plain stop exit {exit}"))?;
+    drop(daemon);
+    Ok(())
+}
+
+/// Design §3.4, §6.8 [r3.4, r4.9]: a `cancel --wait` whose order is in
+/// place, then `daemon stop --force`. The turn is handed to final shutdown,
+/// paused at `core.shutdown.before_forced_terminal`; the waiter has not
+/// replied (a dropped sender is not a terminal). Released, it replies with
+/// the committed forced terminal.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_cancel_wait_across_force_handoff() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("hang", &[])?;
+    sandbox.wait_for_event(&session, "turn.started")?;
+    let point = "core.shutdown.before_forced_terminal";
+    sandbox.arm(point, 1, "pause")?;
+    let reply = thread::scope(|scope| -> TestResult<Value> {
+        let waiter = scope.spawn(|| {
+            sandbox
+                .ok(&[
+                    "cancel",
+                    &session,
+                    "--force-after",
+                    "60000",
+                    "--wait",
+                    "--handle",
+                    &handle,
+                    "--json",
+                ])
+                .map_err(|error| error.to_string())
+        });
+        sandbox.wait_for_event(&session, "cancel.requested")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.ack(&daemon, point, 1, "pause")?;
+        check(!waiter.is_finished(), || {
+            "the waiter replied before the forced terminal".to_owned()
+        })?;
+        sandbox.resume_point(point, 1)?;
+        Ok(waiter.join().map_err(|_| "waiter panicked")??)
+    })?;
+    check(
+        reply["state"] == "cancelled" && reply["cancel"]["outcome"] == "forced",
+        || format!("waiter reply: {reply}"),
+    )?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(0), || {
+        format!("force exit {status}: {}", sandbox.trace())
+    })?;
+    drop(daemon);
+    sandbox.disarm(point)?;
+    Ok(())
+}
+
+/// Design §4 "Force" [r4.6, r5.8, r6.6], force variant of
+/// `s1_close_outcome_retained_for_late_subscriber`: a keyed close is in
+/// progress when a force is accepted. Daemon main, paused at
+/// `daemon.shutdown.after_fence`, still serves, and the running turn's
+/// dispatcher is held at `core.run.before_handoff`, so the close is still
+/// in progress: a keyed replay connecting after the force reaches the close
+/// watch and is paused at `core.close.before_subscribe`. The dispatcher's
+/// force exit then publishes `daemon_stopping` to the first caller, and the
+/// replay, released after the publication, receives it from the retained
+/// outcome.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("hang", &[])?;
+    sandbox.wait_for_event(&session, "turn.started")?;
+    let keyed = [
+        "close",
+        &session,
+        "--op-key",
+        "k1",
+        "--deadline-ms",
+        "60000",
+        "--handle",
+        &handle,
+        "--json",
+    ];
+    let fence = "daemon.shutdown.after_fence";
+    let handoff = "core.run.before_handoff";
+    let subscribe = "core.close.before_subscribe";
+    thread::scope(|scope| -> TestResult {
+        let first = scope.spawn(|| {
+            sandbox
+                .refused(&keyed, "daemon_stopping")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.wait_for_event(&session, "cancel.requested")?;
+        sandbox.arm(fence, 1, "pause")?;
+        sandbox.arm(handoff, 1, "pause")?;
+        // The first caller passed the seam unarmed: this is its second hit.
+        sandbox.arm(subscribe, 2, "pause")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.ack(&daemon, fence, 1, "pause")?;
+        sandbox.ack(&daemon, handoff, 1, "pause")?;
+        let replay = scope.spawn(|| {
+            sandbox
+                .refused(&keyed, "daemon_stopping")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.ack(&daemon, subscribe, 2, "pause")?;
+        check(!first.is_finished(), || {
+            "the close replied before the force exit".to_owned()
+        })?;
+        sandbox.resume_point(handoff, 1)?;
+        // The force exit published: the first caller has its outcome.
+        first.join().map_err(|_| "first close panicked")??;
+        check(!replay.is_finished(), || {
+            "the paused replay replied before its release".to_owned()
+        })?;
+        sandbox.resume_point(subscribe, 2)?;
+        replay.join().map_err(|_| "replay panicked")??;
+        sandbox.resume_point(fence, 1)?;
+        Ok(())
+    })?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(0), || {
+        format!("force exit {status}: {}", sandbox.trace())
+    })?;
+    drop(daemon);
+    for point in [fence, handoff, subscribe] {
+        sandbox.disarm(point)?;
+    }
+    Ok(())
+}
