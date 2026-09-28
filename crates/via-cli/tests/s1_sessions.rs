@@ -1057,7 +1057,8 @@ fn s1_params_queued_turns_inherit_frozen_per_turn_values() -> TestResult {
 
 /// C1 §4 / §8.2: Core drives each turn from its own frozen `wall_ms`. Turn 1
 /// hangs under a short one and ends `deadline_wall` well before the fake's
-/// default; turn 2 sets a longer one, outlives turn 1's budget and completes.
+/// default; turn 2 sets a longer one, is still live (`wait_timeout`) past
+/// turn 1's budget, and completes once released.
 #[test]
 fn s1_params_frozen_wall_deadline_applies_to_its_turn_only() -> TestResult {
     let hang = json!({"expected_request":{"type":"start","id":1,"turn":1,"prompt":"d1"},
@@ -1110,9 +1111,22 @@ fn s1_params_frozen_wall_deadline_applies_to_its_turn_only() -> TestResult {
                     "turn 1 did not end at its own 1500 ms deadline: {first}"
                 )));
             }
-            // Turn 2 holds past turn 1's whole budget under its own 60 s one.
+            // Turn 2 is still live 2 s after reaching its gate, past turn 1's
+            // whole 1500 ms budget: its own 60 s deadline applies.
             sandbox.await_gate("hold_d2")?;
-            thread::sleep(Duration::from_millis(2_000));
+            refused(
+                &sandbox,
+                evidence,
+                "wait_2_held",
+                &[
+                    "wait",
+                    &format!("{session}/2"),
+                    "--timeout-ms",
+                    "2000",
+                    "--json",
+                ],
+                "wait_timeout",
+            )?;
             sandbox.release_gate("hold_d2")?;
             let last = wait_completed(
                 &sandbox,
@@ -1149,7 +1163,7 @@ fn s1_params_frozen_wall_deadline_applies_to_its_turn_only() -> TestResult {
 /// C1 §4/§4.2/§8.1 against the fake route's capabilities: each unsupported
 /// per-turn value is refused with its canonical kind, naming field and
 /// route; session-scope parameters on `resume` are `session_scope_on_resume`.
-/// Null and empty values are accepted and follow inheritance. A refusal
+/// Nullable and empty values are accepted and follow inheritance. A refusal
 /// commits nothing.
 #[test]
 #[expect(
@@ -1256,8 +1270,9 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
             if sandbox.count("SELECT count(*) FROM turns")? != 1 {
                 return Err(failure("a refused request committed a turn"));
             }
-            // Null and empty values pass; null `output_schema` clears.
-            let nulls = json!({"effort":null,"output_schema":null,"max_steps":null,
+            // Nullable members accept null (`output_schema: null` clears);
+            // empty values pass.
+            let nulls = json!({"output_schema":null,"max_steps":null,
                 "vendor":{},"deadlines":{"wall_ms":null,"idle_ms":null}});
             let mut params = spawn_base.clone();
             params["prompt"] = json!("n1");

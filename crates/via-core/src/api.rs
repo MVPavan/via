@@ -32,8 +32,8 @@ pub struct SpawnParams {
     bound: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     output_schema: Option<Value>,
-    #[serde(default)]
-    deadlines: Option<DeadlineParams>,
+    #[serde(default, deserialize_with = "nullable")]
+    deadlines: Option<Nullable<DeadlineParams>>,
     #[serde(default, deserialize_with = "present")]
     max_steps: Option<Value>,
     #[serde(default, deserialize_with = "present")]
@@ -60,8 +60,8 @@ pub struct ResumeParams {
     bound: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     output_schema: Option<Value>,
-    #[serde(default)]
-    deadlines: Option<DeadlineParams>,
+    #[serde(default, deserialize_with = "nullable")]
+    deadlines: Option<Nullable<DeadlineParams>>,
     #[serde(default, deserialize_with = "present")]
     max_steps: Option<Value>,
     #[serde(default, deserialize_with = "present")]
@@ -97,12 +97,28 @@ fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<V
     Value::deserialize(deserializer).map(Some)
 }
 
+/// A present typed member: an explicit `null`, or its value.
+enum Nullable<T> {
+    Null,
+    Given(T),
+}
+
+/// Like [`present`] for a typed member, keeping an explicit `null`.
+fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Nullable<T>>, D::Error> {
+    Ok(Some(match Option::<T>::deserialize(deserializer)? {
+        None => Nullable::Null,
+        Some(value) => Nullable::Given(value),
+    }))
+}
+
 /// The C1 §4 per-turn parameters of one `spawn` or `resume`, as sent.
 pub(crate) struct PerTurn<'a> {
     effort: Option<&'a Value>,
     bound: Option<&'a Value>,
     output_schema: Option<&'a Value>,
-    deadlines: Option<&'a DeadlineParams>,
+    deadlines: Option<&'a Nullable<DeadlineParams>>,
     max_steps: Option<&'a Value>,
     vendor: Option<&'a Value>,
 }
@@ -189,10 +205,21 @@ impl ResumeParams {
 
 impl PerTurn<'_> {
     /// Validates the values against the fake route's capabilities
-    /// ([`Capabilities::fake`]). Null or omitted values inherit; a null
-    /// `output_schema` clears, which on this route is already the state.
+    /// ([`Capabilities::fake`]). Omitted values inherit. C1 §1 lets only
+    /// members typed "or null" be null: a null `output_schema` or
+    /// `max_steps` is accepted (`output_schema: null` clears, which on this
+    /// route is already the state); a null `effort`, `bound` or `deadlines`
+    /// is `invalid_params`.
     pub(crate) fn fake_overrides(&self) -> Result<Overrides, ApiError> {
         let given = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+        let null = |value: Option<&Value>| value.is_some_and(Value::is_null);
+        if null(self.effort) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("effort") },
+                "effort cannot be null",
+            ));
+        }
         if given(self.effort) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
@@ -214,8 +241,14 @@ impl PerTurn<'_> {
                 "max_steps is unsupported on route fake",
             ));
         }
-        // The fake route declares no bounds, so any bound, even null, is
-        // unenforceable.
+        if null(self.bound) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("bound") },
+                "bound cannot be null",
+            ));
+        }
+        // The fake route declares no bounds, so any bound is unenforceable.
         if self.bound.is_some() {
             return Err(ApiError::naming(
                 ApiError::BOUND_UNSUPPORTED,
@@ -238,8 +271,16 @@ impl PerTurn<'_> {
                 "vendor options are unsupported on route fake",
             ));
         }
-        let Some(deadlines) = self.deadlines else {
-            return Ok(Overrides { wall_ms: None });
+        let deadlines = match self.deadlines {
+            None => return Ok(Overrides { wall_ms: None }),
+            Some(Nullable::Null) => {
+                return Err(ApiError::naming(
+                    ApiError::INVALID_PARAMS,
+                    &const { Named::fake("deadlines") },
+                    "deadlines cannot be null",
+                ));
+            }
+            Some(Nullable::Given(deadlines)) => deadlines,
         };
         // Core enforces no idle deadline yet (via-jm4.7.7).
         if given(deadlines.idle_ms.as_ref()) {
@@ -1270,8 +1311,10 @@ mod tests {
         ConnectionId, EventBody, SpawnParams, UNIX_EPOCH, retry_identity, retry_key, rfc3339,
     };
 
-    /// Fake-route edge rules: an empty options object per harness passes, a
-    /// null `bound` is still a bound, and a zero wall budget is refused.
+    /// Fake-route edge rules: an empty options object per harness passes; a
+    /// null `bound`, `effort` or `deadlines` is `invalid_params` while a
+    /// present bound is `bound_unsupported`; nullable `output_schema` and
+    /// `max_steps` accept null; a zero wall budget is refused.
     #[test]
     fn fake_per_turn_edge_values() {
         let check = |extra: serde_json::Value| {
@@ -1284,21 +1327,42 @@ mod tests {
                 .per_turn()
                 .fake_overrides()
                 .map(|overrides| overrides.wall_ms)
-                .map_err(|error| (error.kind, error.named.map(|named| named.field)))
+                .map_err(|error| {
+                    (
+                        error.kind,
+                        error.named.map(|named| (named.field, named.route)),
+                    )
+                })
         };
         assert_eq!(check(json!({"vendor":{"fake":{},"codex":{}}})), Ok(None));
         assert_eq!(check(json!({"deadlines":{"wall_ms":7}})), Ok(Some(7)));
         assert_eq!(
             check(json!({"bound":null})),
-            Err(("bound_unsupported", Some("bound")))
+            Err(("invalid_params", Some(("bound", Some("fake")))))
+        );
+        assert_eq!(
+            check(json!({"bound":{"mode":"full","extra_write_dirs":[],"network":true}})),
+            Err(("bound_unsupported", Some(("bound", Some("fake")))))
+        );
+        assert_eq!(
+            check(json!({"effort":null})),
+            Err(("invalid_params", Some(("effort", Some("fake")))))
+        );
+        assert_eq!(
+            check(json!({"deadlines":null})),
+            Err(("invalid_params", Some(("deadlines", Some("fake")))))
+        );
+        assert_eq!(
+            check(json!({"output_schema":null,"max_steps":null})),
+            Ok(None)
         );
         assert_eq!(
             check(json!({"vendor":{"fake":{"k":"v"}}})),
-            Err(("invalid_params", Some("vendor")))
+            Err(("invalid_params", Some(("vendor", Some("fake")))))
         );
         assert_eq!(
             check(json!({"deadlines":{"wall_ms":0}})),
-            Err(("invalid_params", Some("deadlines.wall_ms")))
+            Err(("invalid_params", Some(("deadlines.wall_ms", None))))
         );
     }
 
