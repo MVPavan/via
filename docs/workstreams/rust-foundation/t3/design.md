@@ -915,8 +915,9 @@ budgets. Every time is measured back from the final `deadline`: start +
 serves requests **concurrently** with this pipeline. It never reorders the
 pipeline.
 
-**Host's early stop** [r4.3]. Runtime §7 requires Host to stop private
-groups within 3 s of failure notification, without waiting for Store. That
+**Host's early stop** [r4.3]. Runtime §7 requires Host to start stopping
+private groups on failure notification, without waiting for Store, with
+each `Stop` reply awaited only until the force instant `+ 3 s` (A23). That
 cannot depend on Core polling Route, because a run loop may be blocked on
 a Store operation, a session head, or `admission`.
 
@@ -1304,8 +1305,8 @@ the latch:
     are served.
   - When the window ends, daemon main sends `closing`, drops the listener
     and unlinks the socket. The existing client-join rules then apply.
-- **Host 3 s.** Host's early-stop task (§6.8) stops every live group
-  within 3 s of the force signal. It is independent of Core, the
+- **Host 3 s.** Host's early-stop task (§6.8) sends `Stop` to every armed
+  group and waits for replies until the force instant `+ 3 s` (A23). It is independent of Core, the
   dispatchers and Store. Route's own force close is a second request
   through the same control owner, and a no-op [r4.3]. Tested in §11.
 - The window and the bound apply only to the latch path. A scoped failure
@@ -1870,7 +1871,7 @@ latch. S5 lists each re-pointed test in its report.
 | A20 | runtime §5.1 | Recovery reconnects (Challenge, Status, `Stop`) only to an anchor whose durable phase is `arm_intent`. A pre-ARM anchor (`intent`, `identified`) serves only its bootstrap controller. Recovery opens no control connection to it and proves cleanup by the absence predicate after its EOF exit [s1.5]. |
 | A21 | C1 §4 `deadlines` | `idle_ms` is a positive integer; `0` is `invalid_params`. Like `wall_ms`, it is frozen at receipt and inherited (P5) [S2]. |
 | A22 | C1 §3.6 | A close whose `Closed` is refused a second time because turns are unfinished replies `admission_refused` (design §4 step 6) [r1.7, S2]. |
-| A23 | runtime §7 | Host's 3 s bound on failure runs from the force instant and bounds the `Stop` attempt and the reply wait, not the group's disappearance. After the force, no launch passes the ARM gate; a launch already past it is stopped by its owner at `Spawned`. A `Stop` is attempted even past the bound; an early-stop reply read at or after it is not force evidence; unproved cleanup stays uncertain until reconciliation. Replaces the unqualified "stops within 3 s", which no implementation can guarantee against a slow or unwritable anchor [t3r.5]. |
+| A23 | runtime §7 | Host's 3 s bound on failure runs from the force instant and bounds the wait for each `Stop` reply; it does not bound the control lock and write, nor the group's disappearance. After the force, no launch passes the ARM gate; a launch already past it is sent `Stop` by its owner once Host receives `Spawned`, and a lost `Spawned` reply takes the failed acquisition's EOF cleanup. A `Stop` is attempted even past the bound; an early-stop reply read at or after it is not force evidence; unproved cleanup stays uncertain until reconciliation. Replaces the unqualified "stops within 3 s", which no implementation can guarantee against a slow or unwritable anchor [t3r.5]. |
 
 Withdrawn as moot: A10 (O1.D8 replaces the persistent-read latch), and the
 round-1 "owner-pending" A5 (now replaced below).

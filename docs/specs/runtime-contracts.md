@@ -889,7 +889,7 @@ Without `drain` or `force`, a stop with active turns is refused
 Final shutdown has **one absolute 10 s deadline** covering client closes,
 Host control closes, anchor reconciliation, task joins, final durable
 records, raw sync and the Store join; no phase receives a fresh budget. F12
-measures the same total from first Store failure and does not restart it
+measures the same total from the latching Store failure (`failed_at`) and does not restart it
 when final shutdown begins. Order: stop listening and admission; settle or
 classify turns; request owned-group cleanup; collect process/task evidence;
 commit final records while the Store owner is alive; then join Store off the
@@ -955,10 +955,12 @@ Host independently starts stopping private groups using §5 on failure
 notification, without waiting for Store. Its bound is 3 s from the instant
 the failure is raised, not from when a Host task first runs, and no later
 step grants a fresh allowance. Once the failure is raised, Host sends no
-new ARM from a launch that has not passed its ARM gate; a launch already
-past the gate is stopped as soon as it spawns. Host
-attempts one `Stop` for every armed group, even when the
-bound has already passed, and waits for the reply only until the bound.
+new ARM from a launch that has not passed its ARM gate. A launch already
+past the gate is sent `Stop` by its owner once Host receives its `Spawned`
+reply; if that reply is lost, the failed acquisition's EOF cleanup applies.
+Host attempts one `Stop` for every armed group, even when the bound has
+already passed. The bound applies to the wait for the reply; the control
+lock and the write themselves are not bounded.
 In that early-stop exchange, a reply read at or after the bound does not
 count as force evidence. A group whose `Stop` is not answered in time, or
 whose cleanup is not proved, has uncertain cleanup until reconciliation
@@ -967,8 +969,8 @@ proves absence. The runtime does not promise that a group is gone within
 will not accept bytes on cannot be completed (amendment A23 in the Task 3
 design). Drain reads until EOF/deadline.
 The daemon remains available for diagnostic/read requests for at most 5 s
-after first failure, attempts raw/Store flush and task joins within a total
-10 s shutdown bound measured from first failure (§6.2), then exits 4. No successful graceful-stop result
+after the latching failure (`failed_at`), attempts raw/Store flush and task
+joins within a total 10 s shutdown bound measured from that failure (§6.2), then exits 4. No successful graceful-stop result
 is returned for failed flush/join. Synchronous disk I/O can hang in the kernel:
 it cannot be cancelled by a Rust timeout. Retain/report the unjoined thread;
 the outer process supervisor enforces the process-exit bound in tests. The
