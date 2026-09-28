@@ -11,6 +11,7 @@ use via_store::{
 };
 
 use super::journal::{self, Head};
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
 use super::{Admission, Engine, Receipted, lock};
 use crate::api::{
@@ -27,11 +28,12 @@ impl Engine {
     /// with `retry: same_key_only` when it may have committed. Restart
     /// recovery settles an unknown one.
     fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
-        self.latch_held(admission);
-        if journal::may_have_committed(error) {
-            ApiError::RECEIPT_UNKNOWN
-        } else {
-            ApiError::RECEIPT_NOT_COMMITTED
+        let outcome = WriteOutcome::of(error);
+        self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
+            .finish_held(admission);
+        match outcome {
+            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
+            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
         }
     }
 

@@ -236,7 +236,7 @@ impl Engine {
             head: std::sync::Arc::clone(&head),
             accepted,
             spans,
-            store_failed: false,
+            first_failure: None,
             uncertain: None,
         };
         let cancel = self.settle_recovered(&mut record, reconciled).await?;
@@ -335,7 +335,7 @@ impl Engine {
         self.commit_event(record, EventBody::CancelRequested {}, None)
             .await;
         let cancel = self.settle(record, requested_at, outcome, cleanup).await;
-        if record.store_failed {
+        if record.first_failure.is_some() {
             // Recovery must be durable before admission; startup fails instead.
             return Err(ApiError::STORE);
         }

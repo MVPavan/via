@@ -13,10 +13,13 @@ use via_adapters::{
 use via_store::{AcceptanceRecord, QueuedTurn, SubmissionRecord, TerminalRecord};
 
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{Backoff, Slot};
 use super::stop::{StopMode, stop_outcome};
 use super::terminal::{classify, terminal_envelope};
-use super::{Accepted, Engine, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock};
+use super::{
+    Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
+};
 use crate::api::{
     Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
 };
@@ -54,7 +57,7 @@ pub(super) enum SubmitFailure {
     /// A read before the commit failed; nothing was written.
     Unread,
     /// The commit failed or its outcome is unknown: Store failure latches.
-    Failed,
+    Failed(WriteOutcome),
 }
 
 /// A queued turn's dispatch decision from its predecessors' durable state.
@@ -211,8 +214,14 @@ impl Engine {
         let submission = match self.submit(slot, session, turn).await {
             Ok(submission) => submission,
             Err(SubmitFailure::Unread) => return Step::Wait,
-            Err(SubmitFailure::Failed) => {
-                self.latch().await;
+            Err(SubmitFailure::Failed(outcome)) => {
+                self.store_failure(
+                    FailureSite::Submission,
+                    outcome,
+                    FailureScope::Turn(session, turn),
+                )
+                .finish()
+                .await;
                 return Step::Next;
             }
         };
@@ -365,7 +374,7 @@ impl Engine {
             head: Arc::clone(&slot.head),
             accepted: None,
             spans: Vec::new(),
-            store_failed: false,
+            first_failure: None,
             uncertain: None,
         };
         let (deadline, deadline_at) = wall_deadline(&effective);
@@ -432,7 +441,7 @@ impl Engine {
                     .await,
             );
         }
-        if record.store_failed {
+        if record.first_failure.is_some() {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
@@ -527,10 +536,19 @@ impl Engine {
         } else {
             Self::commit_turn_ended(&self.store, &started, record, terminal, close).await
         };
-        let Ok(durable) = committed else {
-            self.unresolved.fail(session, turn, TurnState::Queued);
-            self.latch_with(admission.as_ref()).await;
-            return Cancelled::Latched;
+        let durable = match committed {
+            Ok(durable) => durable,
+            Err(error) => {
+                self.unresolved.fail(session, turn, TurnState::Queued);
+                self.store_failure(
+                    FailureSite::QueuedCancel,
+                    journal::outcome_of(&error),
+                    FailureScope::Turn(session, turn),
+                )
+                .finish_with(admission.as_ref())
+                .await;
+                return Cancelled::Latched;
+            }
         };
         slot.pop(turn);
         self.unresolved.resolve(session, turn);
@@ -539,18 +557,16 @@ impl Engine {
         if durable.uncertain {
             // The terminal is durable, but the commit itself was uncertain:
             // a Store failure, so the restart handoff fails startup (§10).
-            self.latch_with(admission.as_ref()).await;
+            self.store_failure(
+                FailureSite::QueuedCancel,
+                WriteOutcome::Uncertain,
+                FailureScope::Turn(session, turn),
+            )
+            .finish_with(admission.as_ref())
+            .await;
             return Cancelled::Latched;
         }
         Cancelled::Committed
-    }
-
-    /// Latches Store failure, with `admission` if the caller holds it.
-    async fn latch_with(&self, admission: Option<&super::Admission<'_>>) {
-        match admission {
-            Some(admission) => self.latch_held(admission),
-            None => self.latch().await,
-        }
     }
 
     /// Commits the turn's terminal; one that cannot be made durable is recorded so
@@ -576,8 +592,16 @@ impl Engine {
             close_session,
         )
         .await;
-        if !finished.as_ref().is_ok_and(|durable| !durable.uncertain) {
-            self.latch_with(held).await;
+        let failed = match &finished {
+            Ok(durable) if !durable.uncertain => None,
+            Ok(_) => Some(WriteOutcome::Uncertain),
+            Err(error) => Some(journal::outcome_of(error)),
+        };
+        if let Some(outcome) = failed {
+            let scope = FailureScope::Turn(&started.session, started.turn);
+            self.store_failure(FailureSite::Terminal, outcome, scope)
+                .finish_with(held)
+                .await;
         }
         finished.map(drop)
     }
@@ -776,13 +800,13 @@ impl Engine {
         match observation {
             FakeObservation::Accepted(observation) => {
                 // Route admits one acceptance; a repeat would be deduplicated anyway.
-                if record.store_failed || record.accepted.is_some() {
+                if record.first_failure.is_some() || record.accepted.is_some() {
                     return;
                 }
                 let shared = Arc::clone(&record.head);
                 let Ok(head) = shared.lock(&self.store, &record.session).await else {
-                    record.store_failed = true;
-                    self.latch().await;
+                    // The head's read failed: nothing was written.
+                    self.event_failed(record, WriteOutcome::NotCommitted).await;
                     return;
                 };
                 let seq = head.next();
@@ -796,19 +820,20 @@ impl Engine {
                         record.accepted = Some(accepted);
                     }
                     Err(uncertain) => {
-                        record.store_failed = true;
-                        if let Some(accepted) = uncertain {
+                        let outcome = if let Some(accepted) = uncertain {
                             head.lost();
                             record.uncertain = Some(UncertainEvent {
                                 seq,
                                 raw_ref: Some(accepted.raw_ref.clone()),
                                 accepted: Some(accepted),
                             });
+                            WriteOutcome::Uncertain
                         } else {
                             drop(head);
-                        }
+                            WriteOutcome::NotCommitted
+                        };
                         // The head lock is released before the latch takes admission.
-                        self.latch().await;
+                        self.event_failed(record, outcome).await;
                     }
                 }
             }
@@ -829,11 +854,30 @@ impl Engine {
         body: EventBody,
         raw_ref: Option<RawRef>,
     ) {
-        let failed = record.store_failed;
+        let failed = record.first_failure.is_some();
         journal::commit_event(&self.store, record, body, raw_ref).await;
-        if record.store_failed && !failed {
-            self.latch().await;
+        self.report_first_failure(record, failed).await;
+    }
+
+    /// Reports a turn's first failed write, if `record` gained one since
+    /// `failed` was read, through the failure hook.
+    pub(super) async fn report_first_failure(&self, record: &TurnRecord, failed: bool) {
+        if let (false, Some(note)) = (failed, record.first_failure) {
+            let scope = FailureScope::Turn(&record.session, record.turn);
+            self.store_failure(note.site, note.outcome, scope)
+                .finish()
+                .await;
         }
+    }
+
+    /// Records a failed acceptance commit as the turn's first failure and
+    /// reports it.
+    async fn event_failed(&self, record: &mut TurnRecord, outcome: WriteOutcome) {
+        record.first_failure = Some(FailureNote {
+            site: FailureSite::Event,
+            outcome,
+        });
+        self.report_first_failure(record, false).await;
     }
 
     /// Commits submission intent with `turn.submitted` before any agent I/O;
@@ -855,7 +899,7 @@ impl Engine {
             if let Ok(head) = slot.head.lock(&self.store, session).await {
                 head.lost();
             }
-            return Err(SubmitFailure::Failed);
+            return Err(SubmitFailure::Failed(WriteOutcome::Uncertain));
         }
         // Submission intent is durable and no agent I/O has happened yet. An
         // injected failure here is a failed write after the commit: the turn
@@ -869,7 +913,7 @@ impl Engine {
             self.unresolved.fail(session, turn, TurnState::Running);
             slot.pop(turn);
             self.queued.fetch_sub(1, Ordering::AcqRel);
-            return Err(SubmitFailure::Failed);
+            return Err(SubmitFailure::Failed(WriteOutcome::Uncertain));
         }
         submitted
     }
@@ -889,7 +933,7 @@ impl Engine {
         };
         // A frozen row Core cannot read is a Store failure: nothing is sent.
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
-            return Err(SubmitFailure::Failed);
+            return Err(SubmitFailure::Failed(WriteOutcome::NotCommitted));
         };
         let Ok(head) = head.lock(journal, session).await else {
             return Err(SubmitFailure::Unread);
@@ -906,7 +950,7 @@ impl Engine {
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()
-        .map_err(|_| SubmitFailure::Failed)?;
+        .map_err(|_| SubmitFailure::Failed(WriteOutcome::NotCommitted))?;
         let committed = journal
             .commit_submission(SubmissionRecord {
                 session_id: session.clone(),
@@ -917,10 +961,11 @@ impl Engine {
         match committed {
             Ok(()) => head.committed(1),
             Err(error) => {
-                if journal::may_have_committed(&error) {
+                let outcome = WriteOutcome::of(&error);
+                if outcome == WriteOutcome::Uncertain {
                     head.lost();
                 }
-                return Err(SubmitFailure::Failed);
+                return Err(SubmitFailure::Failed(outcome));
             }
         }
         Ok(Submission {
@@ -1024,7 +1069,7 @@ fn queued_cancellation(
         head: Arc::clone(&slot.head),
         accepted: None,
         spans: Vec::new(),
-        store_failed: false,
+        first_failure: None,
         uncertain: None,
     };
     let terminal = Terminal {

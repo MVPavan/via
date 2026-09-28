@@ -8,15 +8,114 @@ use std::{
 
 use tokio::sync::watch;
 
+use via_store::StoreError;
+
+use super::journal::may_have_committed;
 use super::stop::StopMode;
 use super::{Admission, Engine, lock};
 use crate::api::rfc3339;
+use crate::{SessionId, TurnNumber};
 
 /// Part of final shutdown's deadline that force-path read retries leave for
 /// Host cleanup (its 3 s native stop) and forced terminals.
 const READ_RETRY_RESERVE: Duration = Duration::from_secs(4);
 
+/// Where a Core Store write failed: one site per row of design §7.2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FailureSite {
+    /// A `spawn` or `resume` receipt (row 1).
+    Receipt,
+    /// Submission intent, `turn.submitted` (row 2).
+    Submission,
+    /// Acceptance, a turn event or `cancel.requested` (row 5).
+    Event,
+    /// A running turn's terminal (row 7) or its resolution write.
+    Terminal,
+    /// A `queued → cancelled` commit (rows 8 and 9).
+    QueuedCancel,
+    /// The force closure pass's standalone `session.closed` (row 14).
+    SessionClosed,
+}
+
+/// A failed write's durable outcome (design §7.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WriteOutcome {
+    /// Rolled back or never enqueued: nothing was written.
+    NotCommitted,
+    /// The write may have committed.
+    Uncertain,
+}
+
+impl WriteOutcome {
+    /// Classifies a Store error by whether its write may have committed.
+    pub(super) fn of(error: &StoreError) -> Self {
+        if may_have_committed(error) {
+            Self::Uncertain
+        } else {
+            Self::NotCommitted
+        }
+    }
+}
+
+/// Who a failed write belongs to (design §7.2 scope).
+#[derive(Clone, Copy, Debug)]
+#[expect(
+    dead_code,
+    reason = "the addresses are for S5's failure record (design §7.5); the hook stub latches"
+)]
+pub(super) enum FailureScope<'a> {
+    /// A request that has not been receipted.
+    Request,
+    /// A receipted turn.
+    Turn(&'a SessionId, TurnNumber),
+    /// A session-level write.
+    Session(&'a SessionId),
+}
+
+/// Phase two of a latch the failure hook began; the caller finishes it
+/// under `admission`, as its lock position allows.
+#[must_use = "phase two of the latch runs under admission"]
+pub(super) struct Latching<'a>(&'a Engine);
+
+impl Latching<'_> {
+    /// Takes `admission` and finalizes the latch; the caller holds no slot,
+    /// session or head lock.
+    pub(super) async fn finish(self) {
+        let admission = self.0.admission.lock().await;
+        self.0.latch_held(&admission);
+    }
+
+    /// Finalizes the latch under the caller's `admission`.
+    pub(super) fn finish_held(self, admission: &Admission<'_>) {
+        self.0.latch_held(admission);
+    }
+
+    /// Finalizes the latch, under `admission` if the caller holds it.
+    pub(super) async fn finish_with(self, admission: Option<&Admission<'_>>) {
+        match admission {
+            Some(admission) => self.finish_held(admission),
+            None => self.finish().await,
+        }
+    }
+}
+
 impl Engine {
+    /// Core's one Store write-failure entry point (design §7 [r3.18]):
+    /// every failure site reports its site, outcome and scope. S5 applies
+    /// design §7.2's table here; until then every failure latches, as
+    /// before. Phase one runs now; the caller finishes phase two.
+    pub(super) fn store_failure(
+        &self,
+        site: FailureSite,
+        outcome: WriteOutcome,
+        scope: FailureScope<'_>,
+    ) -> Latching<'_> {
+        // Safe to ignore until S5: the latch is the same for every failure.
+        let _ = (site, outcome, scope);
+        self.fail_pending();
+        Latching(self)
+    }
+
     /// Latches Store failure after Core's first failed or uncertain state
     /// write (runtime §7), in two phases (design §3.2). Phase one runs now,
     /// before anything is awaited: `failure_pending` and the force signal are
@@ -24,6 +123,7 @@ impl Engine {
     /// new receipt passes from here on. Phase two, the returned future,
     /// finalizes the latch under `admission`, ordered after any receipt
     /// already inside it. The caller holds no slot, session or head lock.
+    #[cfg(test)]
     pub(super) fn latch(&self) -> impl Future<Output = ()> + '_ {
         self.fail_pending();
         async move {

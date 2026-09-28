@@ -33,6 +33,7 @@ mod terminal;
 mod tests;
 
 use journal::{Head, UncertainEvent, Unresolved};
+use latch::{FailureSite, WriteOutcome};
 use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
 pub use stop::{EngineShutdown, StopMode};
@@ -355,9 +356,19 @@ struct TurnRecord {
     head: Arc<Head>,
     accepted: Option<Accepted>,
     spans: Vec<RawSpan>,
-    store_failed: bool,
+    /// The turn's first failed Store write (design §7.2): after it the turn
+    /// writes nothing but its one resolution write.
+    first_failure: Option<FailureNote>,
     /// The event commit Store left uncertain, settled before `turn.ended`.
     uncertain: Option<UncertainEvent>,
+}
+
+/// A turn's first failed Store write: where it failed and whether it may
+/// have committed (design §7.1, §7.2 [r3.18]).
+#[derive(Clone, Copy, Debug)]
+struct FailureNote {
+    site: FailureSite,
+    outcome: WriteOutcome,
 }
 
 /// Core's terminal decision from adapter evidence (C1 §5, §8.2).
