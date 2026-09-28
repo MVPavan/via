@@ -1389,3 +1389,37 @@ fn the_restart_handoff_completes_a_closing_session() {
         assert!(report.is_clean(), "{report:?}");
     });
 }
+
+/// Design §4 steps 2–4 [r1.5]: after an idle stop is accepted a new close is
+/// `daemon_stopping`, and a keyed replay of a committed close still replays
+/// its result.
+#[test]
+fn a_close_after_an_idle_stop_is_fenced_and_a_replay_still_replays() {
+    let Some(root) = child("a_close_after_an_idle_stop_is_fenced_and_a_replay_still_replays")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let other = new_session(&engine).await;
+        // Launches fail here: each turn ends and leaves no active work.
+        dispatch(&engine, &other).await;
+        let (first, ()) = tokio::join!(
+            close(&engine, &session, Some("k")),
+            dispatch_closing(&engine, &session)
+        );
+        let first = first.unwrap();
+        assert_eq!(first["state"], "closed", "{first}");
+        let plain = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            engine.request_stop(&plain).await.unwrap(),
+            super::StopMode::Idle
+        );
+        let fenced = tokio::time::timeout(Duration::from_secs(5), close(&engine, &other, None))
+            .await
+            .expect("the fence replies at once");
+        assert_eq!(fenced.unwrap_err().kind, "daemon_stopping");
+        assert_eq!(close(&engine, &session, Some("k")).await.unwrap(), first);
+    });
+}
