@@ -151,3 +151,92 @@ No intermittent failure observed, including
   merge if wanted.
 - The item 7 lost variant relies on persistent `fail_io_persist` on
   `final_reply_lost`; `verify_anchors` confirms the anchor points at the end.
+
+## Round 2: Core-side acknowledgements for item 7
+
+Sol medium review (SOUND WITH CHANGES): items 6, 8 and 9 passed. Major
+finding: the item 7 test asserted Host and anchor hits, which do not show
+that Core received the same turn's `stopped_live` and absence evidence before
+the terminal commit (the absence failpoint fires before the journal commit,
+and Core can infer quiescence when the report has no failure).
+
+Change (Core engine stop path only, `crates/via-core/src/engine/stop.rs`,
+`finalize_forced`; no `reprobe.rs`, `close.rs`, `drive.rs` or `batch.rs`
+edit): two test-only, count-or-pause seams, acknowledgement style as
+`core.shutdown.reconcile_entry`:
+
+- `core.shutdown.evidence_stopped_live`: hit once for a forced turn whose
+  reconciliation record (matched by session and turn) has `forced`.
+- `core.shutdown.evidence_absent`: hit once for a forced turn whose
+  reconciliation record has `cleanup == Quiescent`.
+
+Both fire ahead of `core.shutdown.before_forced_terminal`, after
+`adapter.shutdown` returned the report, inside
+`#[cfg(feature = "test-failpoints")]`. Both are listed in
+`scripts/check-release-features.py` (marker scan: 90 markers absent from the
+release binary, was 88). Failpoint points are static names, so "keyed to the
+turn" is by construction: a seam fires per matching record, so N forced
+turns give occurrences 1..N in `finalize_forced` order; the test drives one
+forced turn.
+
+Test (`evidence_before_terminal`): counts both seams; at the
+`before_forced_terminal` pause the group is gone, the turn has no terminal,
+and, deferred: 1 `stopped_live` and 1 absence receipt; lost-stop variant: 0
+`stopped_live` receipts and 1 absence receipt, the `final_reply_lost` ack
+present, envelope `unknown` / `requested` / `quiescent`. The Host/anchor
+hit-count proxies were dropped (except the pre-reconciliation `proofs == 0`
+check in the deferred case). Five repeated runs of both green.
+
+Mutation RED (backup `cp`, restored, `diff` clean):
+- skip the `stopped_live` delivery (`if false`): `Core received 0
+  stopped_live and 1 absence facts` (`i7r2-mut-skip.log`); the deferred test
+  fails.
+- deliver both after the terminal seam (`before_forced_terminal` moved above
+  them): `Core received 0 stopped_live and 0 absence facts` in both tests
+  (`i7r2-mut-after.log`). This is the observable "delivered after the
+  terminal" position: the harness holds the terminal seam.
+- Round 1 mutation (ignore reconciliation's `forced` in `forced_terminal`)
+  still fails the envelope check.
+
+The test is a characterization of ordering that the code already had; the
+seams make the ordering observable.
+
+Commit 0785aaa (trailer `Claude Sonnet 5.5`, per the coordinator).
+
+### Design edits needed (round 2)
+
+- §10 seam table: add `core.shutdown.evidence_stopped_live` (acknowledgement
+  when Core reads a forced turn's reconciliation record with `forced`, in
+  `finalize_forced`, before `core.shutdown.before_forced_terminal`) and
+  `core.shutdown.evidence_absent` (same, for `cleanup == Quiescent`).
+- §11 `s1_f12_evidence_before_terminal`: "their delivery is acknowledged"
+  means these two seams. The lost-stop variant: the `stopped_live` seam does
+  not fire, the absence seam does, terminal `unknown` / `requested` /
+  `quiescent`. Drop the earlier remark about Host-side proxies from the
+  round 1 edits above.
+- Seam semantics limitation: the seams report facts in the reconciliation
+  record, not Route-close evidence (`turn.close`); cleanup proved only by
+  Route's close fires no `evidence_absent`.
+
+### Gate (round 2)
+
+| Step | Result |
+| --- | --- |
+| fmt, clippy (default, `via-cli/test-failpoints`) | clean |
+| default nextest | 287 passed, 1 skipped |
+| failpoint nextest | 418 passed, 1 skipped on 7 of 9 full runs (see below) |
+| `s1_f(08\|09\|10\|12)_` selection | 53 passed |
+| `cargo deny check`, `check-layers.py` | ok |
+| release build and `check-release-features.py` | ok, 90 markers absent |
+
+Intermittent failures over nine full failpoint runs (not retried away; the
+next full run was repeated, and each test passed on rerun):
+- `s1_f12_host_early_stop_independent_of_store` failed once (known flaky
+  under load, another worker's fix pending): `B did not end by the force
+  row`.
+- `s1_shutdown_budget_read_cutoff_before_reconciliation` failed once
+  (2.1 s, log not captured), then passed 20 of 20 in an isolated
+  `--stress-count 20` and in every later full run. Cause unknown; the seams
+  added here fire only in `finalize_forced`, after that test's checkpoint
+  (`reconcile_entry`), so it is not evidently related. Reported as a new
+  intermittent failure to investigate.
