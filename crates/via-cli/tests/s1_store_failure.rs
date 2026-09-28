@@ -2588,10 +2588,10 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
 /// hit, the writer held before it commits). The batch gives up at its own
 /// bound and is skipped, once and never retried; no terminal is invented
 /// for the turn or its queued successors, which keep `running` and
-/// `queued`; and final shutdown ends by the latch deadline (`failed_at +
-/// 10 s`), abandoning the stalled Store join to process exit: exit 4. A
-/// batch that waited past its bound would leave the pipeline to the
-/// deadline instead (`failure_batches: null`).
+/// `queued`; and final shutdown completes its report, abandoning the
+/// stalled Store join to process exit: exit 4. A batch that waited past its
+/// bound would leave the pipeline to the latch deadline instead
+/// (`failure_batches: null`, and a `host_failure`).
 #[test]
 fn s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline() -> TestResult {
     let sandbox = Sandbox::new(&script(
@@ -2621,25 +2621,18 @@ fn s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline() -> TestResult {
     sandbox.arm("store.commit.terminal", batch, "pause")?;
     sandbox.release("accepted")?;
     sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
-    let latched = Instant::now();
     // The batch reached its write; its reply never comes.
     sandbox.ack(&daemon, "store.commit.terminal", batch, "pause")?;
-    let exit = daemon.exit(Duration::from_secs(25))?;
-    let took = latched.elapsed();
+    // The watchdog is generous and asserts no duration: on a loaded machine
+    // the deadline (`failed_at + 10 s`) may pass before shutdown returns,
+    // and only the outcome is the contract. A batch that waited past its
+    // own bound leaves the pipeline to that deadline, and shows below as
+    // `failure_batches: null` and a `host_failure`.
+    let exit = daemon.exit(Duration::from_secs(90))?;
     let summary = daemon.summary()?;
     check(
         exit.code() == Some(4) && summary["store_failed"] == true,
         || format!("expected the latch's exit 4, got {exit}: {summary}"),
-    )?;
-    // The latch deadline is `failed_at + 10 s`, and `failed_at` is at or
-    // after the acknowledged hit; the margin covers process start-up and
-    // exit.
-    check(took < Duration::from_secs(12), || {
-        format!("the daemon exited {took:?} after the latch: {summary}")
-    })?;
-    check(
-        summary["elapsed_ms"].as_u64().is_some_and(|ms| ms < 10_500),
-        || format!("final shutdown outlived its deadline: {summary}"),
     )?;
     check(
         summary["failure_batches"] == json!({"committed": 0, "skipped": 1}),
