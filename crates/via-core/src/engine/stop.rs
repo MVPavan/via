@@ -478,35 +478,45 @@ impl Engine {
     /// forced terminal may have closed it and lost its reply); an unreadable
     /// one counts as unclosed (T3-S5 round 2, decision 12). A session
     /// already closed in-path is read as closed and never closed twice. A
-    /// session in `unjoined`, whose dispatcher still owns it, is not closed.
+    /// session in `unjoined`, whose dispatcher still owns it, is not closed:
+    /// it counts as unclosed, or after a Store failure by the same read
+    /// (round 3, decision 14).
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
         let mut unclosed = 0;
+        let mut unvisited = Vec::new();
         for (index, session) in sessions.iter().enumerate() {
             if unjoined.contains(session) {
-                unclosed += 1;
+                unvisited.push(session);
                 continue;
             }
             let admission = self.admission.lock().await;
             if self.store_failed() {
                 // The pass cannot run: this and every later session count
-                // unless they are durably closed (round 1 decision 4, round
-                // 2 decision 12).
+                // unless they are durably closed, and so do the unjoined
+                // ones skipped so far (round 1 decision 4, round 2
+                // decision 12, round 3 decision 14).
                 drop(admission);
-                return unclosed + self.durably_open(&sessions[index..]).await;
+                unvisited.extend(&sessions[index..]);
+                return unclosed + self.durably_open(&unvisited).await;
             }
             if !self.close_forced(session, &admission).await {
                 unclosed += 1;
             }
         }
+        let skipped = if self.store_failed() {
+            self.durably_open(&unvisited).await
+        } else {
+            unvisited.len()
+        };
         lock(&self.force_sessions).take();
-        unclosed
+        unclosed + skipped
     }
 
     /// How many of `sessions` Store does not read as closed: a read that
     /// fails counts the session as open. Read-only; Store's read reply
     /// reports corruption (design §7.1).
-    async fn durably_open(&self, sessions: &[SessionId]) -> usize {
+    async fn durably_open(&self, sessions: &[&SessionId]) -> usize {
         let mut open = 0;
         for session in sessions {
             if !matches!(

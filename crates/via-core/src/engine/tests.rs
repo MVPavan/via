@@ -2333,6 +2333,35 @@ fn a_corrupt_queueing_read_after_a_read_streak_records_one_failure() {
     });
 }
 
+/// A session whose only turn was cancelled and which Store then closed
+/// with the closure pass's `session.closed`, as a forced terminal whose
+/// reply was lost leaves it.
+async fn durably_closed_session(engine: &Engine) -> SessionId {
+    let session = new_session(engine).await;
+    cancel(engine, &session, 1).await.unwrap();
+    let event = Event {
+        seq: 3,
+        session_id: &session,
+        turn: None,
+        late: false,
+        at: &rfc3339(std::time::SystemTime::now()),
+        raw_ref: None,
+        body: EventBody::SessionClosed {
+            reason: super::drive::FORCE_CLOSE_REASON,
+        },
+    }
+    .to_value()
+    .unwrap();
+    assert!(
+        engine
+            .store
+            .commit_session_closed(&session, event)
+            .await
+            .unwrap()
+    );
+    session
+}
+
 /// T3-S5 round 2, decision 12 (design §6.8, §7.4): after a latch the
 /// closure pass does not run; it counts each force session Store does not
 /// read as closed. A durably closed session is not counted; an open one and
@@ -2346,28 +2375,7 @@ fn after_a_latch_the_closure_pass_counts_durably_open_sessions() {
     let points = count_points(&root, &[point]);
     run(async {
         let engine = open(&root);
-        let closed = new_session(&engine).await;
-        cancel(&engine, &closed, 1).await.unwrap();
-        let event = Event {
-            seq: 3,
-            session_id: &closed,
-            turn: None,
-            late: false,
-            at: &rfc3339(std::time::SystemTime::now()),
-            raw_ref: None,
-            body: EventBody::SessionClosed {
-                reason: super::drive::FORCE_CLOSE_REASON,
-            },
-        }
-        .to_value()
-        .unwrap();
-        assert!(
-            engine
-                .store
-                .commit_session_closed(&closed, event)
-                .await
-                .unwrap()
-        );
+        let closed = durably_closed_session(&engine).await;
         let open_session = new_session(&engine).await;
         let unreadable = new_session(&engine).await;
         super::lock(&engine.force_sessions).replace(vec![
@@ -2384,5 +2392,57 @@ fn after_a_latch_the_closure_pass_counts_durably_open_sessions() {
         assert!(acked(&points, point, n), "{point} #{n} was not reached");
         assert_eq!(report.unclosed_sessions, 2, "{report:?}");
         assert_corruption_latched(&engine);
+    });
+}
+
+/// T3-S5 round 3, decision 14 (design §6.8, §7.4): after a latch, an
+/// unjoined force session is counted by its durable state too. A durably
+/// closed one is not counted; an open one is, and so is an open joined
+/// session after them. Unjoined sessions get no closure write.
+#[test]
+fn after_a_latch_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("after_a_latch_unjoined_sessions_count_by_their_durable_state") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        let open_joined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![
+            closed.clone(),
+            open_unjoined.clone(),
+            open_joined.clone(),
+        ]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        engine.latch().await;
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unjoined_dispatchers, 2, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 2, "{report:?}");
+        let types = event_types(&engine, &open_unjoined).await;
+        assert!(!types.contains(&"session.closed".to_owned()), "{types:?}");
+    });
+}
+
+/// T3-S5 round 3, decision 14 (design §6.8, §7.4): after a latch, when
+/// every force session is unjoined the pass visits none of them, and each
+/// still counts only if Store does not read it closed.
+#[test]
+fn after_a_latch_only_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("after_a_latch_only_unjoined_sessions_count_by_their_durable_state")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![closed.clone(), open_unjoined.clone()]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        engine.latch().await;
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
     });
 }
