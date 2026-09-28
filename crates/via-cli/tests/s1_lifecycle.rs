@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -606,6 +606,69 @@ fn s1_f02_stale_socket_replaced_after_lock() -> TestResult {
     second.finish()
 }
 
+/// The socket's identity: inode and device.
+fn socket_identity(runtime: &Path) -> TestResult<(u64, u64)> {
+    let metadata = fs::symlink_metadata(runtime.join("via.sock"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// F2 (design §6.1): both locks precede any replacement of the socket. A
+/// daemon that loses `daemon.lock` (exit 75), or `store.lock` (exit 4), leaves
+/// a live socket exactly as it was: the same inode, still answering its owner.
+/// A stale socket is replaced only under both locks (the test above).
+#[test]
+fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
+    // `daemon.lock` held by a live daemon.
+    let sandbox = Sandbox::new(&json!({}))?;
+    let owner = sandbox.start()?;
+    let before = socket_identity(&sandbox.runtime)?;
+    let mut direct = sandbox.command();
+    direct.arg("daemon");
+    let loser = run_command(&mut direct, Duration::from_secs(10))?;
+    check(loser.status.code() == Some(75), || {
+        format!("the losing daemon: {}", loser.status)
+    })?;
+    check(
+        socket_identity(&sandbox.runtime).ok() == Some(before),
+        || "the losing daemon removed or replaced the socket".to_owned(),
+    )?;
+    check(sandbox.status()?["pid"] == owner.pid(), || {
+        "the owner no longer answers on its socket".to_owned()
+    })?;
+    owner.finish()?;
+    // `store.lock` held by another process, no `daemon.lock` holder: the
+    // socket is one the harness listens on.
+    let sandbox = Sandbox::new(&json!({}))?;
+    let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+    listener.set_nonblocking(true)?;
+    let before = socket_identity(&sandbox.runtime)?;
+    let store_lock = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(sandbox.state.join("store.lock"))?;
+    store_lock.try_lock()?;
+    let mut direct = sandbox.command();
+    direct.arg("daemon");
+    let loser = run_command(&mut direct, Duration::from_secs(10))?;
+    let stderr = String::from_utf8_lossy(&loser.stderr);
+    check(
+        loser.status.code() == Some(4) && stderr.contains("store.lock is held"),
+        || format!("the store-lock loser: {} {stderr}", loser.status),
+    )?;
+    check(
+        socket_identity(&sandbox.runtime).ok() == Some(before),
+        || "the store-lock loser removed or replaced the socket".to_owned(),
+    )?;
+    let _client = UnixStream::connect(sandbox.runtime.join("via.sock"))?;
+    listener
+        .accept()
+        .map_err(|error| format!("the harness's socket has no connection: {error}"))?;
+    Ok(())
+}
+
 /// F3 (design §6.1): an unsafe runtime root (a symlink, mode 0755, another
 /// owner) is refused by the CLI's own check before it connects or spawns:
 /// the daemon's message, exit 4, and nothing created.
@@ -972,6 +1035,109 @@ fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
     sandbox.stop_auto(stop, pid)
 }
 
+/// F4, explicit stop (design §6.2 items 3 and 5, review Y item 6): `via
+/// daemon stop` from another version's CLI against an idle, Store-matched
+/// daemon sends the permitted plain stop on the mismatched connection, and
+/// never starts a replacement. A Store mismatch exits 4 and a connected
+/// client gets `admission_refused`; `--force` is not the permitted stop, so
+/// the daemon is untouched. Any replacement would hit
+/// `daemon.startup.after_lock`, armed to pause and acknowledge.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> TestResult {
+    const OTHER: &str = "0.0.0-f04-stop";
+    let sandbox = Sandbox::new(&json!({}))?;
+    let mut daemon = sandbox.start()?;
+    sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
+    let stop = |state: &Path, extra: &[&str]| -> TestResult<Captured> {
+        let mut command = sandbox.command_fp();
+        command
+            .env("VIA_TEST_CLIENT_VERSION", OTHER)
+            .env("VIA_STATE_DIR", state)
+            .args(["daemon", "stop"])
+            .args(extra)
+            .arg("--json");
+        run_command(&mut command, Duration::from_secs(40))
+    };
+    let untouched = |what: &str| -> TestResult {
+        check(sandbox.status()?["pid"] == daemon.pid(), || {
+            format!("{what}: the daemon was stopped or replaced")
+        })
+    };
+    // A Store mismatch: exit 4, and nothing is sent.
+    let elsewhere = sandbox.root.path().join("elsewhere");
+    fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
+    let captured = stop(&elsewhere, &[])?;
+    check(
+        captured.status.code() == Some(4)
+            && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
+        || {
+            format!(
+                "store mismatch: {}",
+                String::from_utf8_lossy(&captured.stderr)
+            )
+        },
+    )?;
+    untouched("store mismatch")?;
+    // `--force` is not the permitted plain stop: reported, daemon untouched.
+    let captured = stop(&sandbox.state, &["--force"])?;
+    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+    check(
+        captured.status.code() == Some(2) && error["data"]["kind"] == "version_mismatch",
+        || format!("forced stop: {} {error}", captured.status),
+    )?;
+    untouched("forced stop")?;
+    // Another client connected: the idle-only stop is refused.
+    let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    let captured = stop(&sandbox.state, &[])?;
+    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+    check(
+        captured.status.code() == Some(2)
+            && error["data"]["kind"] == "admission_refused"
+            && error["message"] == "daemon not idle",
+        || format!("busy daemon: {} {error}", captured.status),
+    )?;
+    untouched("busy daemon")?;
+    drop(connected);
+    // Idle and Store-matched. A closed connection's task ends shortly after
+    // the close; a refusal while one is still counted is retried in bound.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let captured = loop {
+        let captured = stop(&sandbox.state, &[])?;
+        let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+        if error["message"] != "daemon not idle" || Instant::now() >= deadline {
+            break captured;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let reply: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
+    check(
+        captured.status.success() && reply["stopping"] == true,
+        || {
+            format!(
+                "idle daemon: {} {reply} {}",
+                captured.status,
+                String::from_utf8_lossy(&captured.stderr)
+            )
+        },
+    )?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    let summary = daemon.summary()?;
+    check(exit.code() == Some(0) && summary["mode"] == "idle", || {
+        format!("stopped daemon: {exit} {summary}")
+    })?;
+    // The CLI has returned and the daemon is gone: no replacement was
+    // started (it would have paused and acknowledged at its lock).
+    check(
+        !sandbox.runtime.join("via.sock").exists()
+            && sandbox
+                .failpoints
+                .ack_bytes("daemon.startup.after_lock", 1)
+                .is_err(),
+        || "a replacement daemon was started".to_owned(),
+    )
+}
+
 /// F6 (design §6.4): with a lowered idle interval the daemon never exits
 /// while a client is connected or a turn runs, and exits `idle` (0) once
 /// neither holds. A client that arrives while an exiting daemon is paused
@@ -1176,6 +1342,232 @@ fn s1_f07_stop_refused_drain_keeps_sessions_force_closes_unfinished() -> TestRes
     let later = sandbox.wait(&format!("{idle}/2"))?;
     check(later["state"] == "completed", || later.to_string())?;
     daemon.finish()
+}
+
+/// F7's `Cancelling` state (design §6.3, review Y item 8): a session whose
+/// only unfinished turn is a queued turn being cancelled is in the force
+/// set. The queued turn is held while a `cancel` request owns it
+/// (`Cancelling{request}`), its commit paused at `store.commit.cancel`, and
+/// a force is accepted on a connection taken before daemon main pauses at
+/// `daemon.dispatcher.before_start`. Once the cancel has committed and daemon
+/// main resumes, final shutdown closes the session exactly once,
+/// `daemon_stop_force`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f07_force_set_includes_session_in_cancelling_state() -> TestResult {
+    let start = "daemon.dispatcher.before_start";
+    let commit = "store.commit.cancel";
+    let sandbox = Sandbox::new(&completes("queued", 1))?;
+    let mut daemon = sandbox.start()?;
+    // Both connections are accepted before daemon main pauses: it accepts
+    // no other, and one carries the force, the other the cancel.
+    let (mut forcer, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    let (mut canceller, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    sandbox.arm(start, 1, "pause")?;
+    let (session, handle) = sandbox.spawn("queued")?;
+    sandbox.ack(&daemon, start, 1, "pause")?;
+    // The turn is `Waiting` with no dispatcher: the cancel takes it
+    // (`Cancelling{request}`) and parks at its commit.
+    sandbox.arm(commit, 1, "pause")?;
+    let params = json!({"session":session,"handle":handle});
+    let cancel = thread::spawn(move || {
+        canceller
+            .call("cancel", &params)
+            .map_err(|error| error.to_string())
+    });
+    sandbox.ack(&daemon, commit, 1, "pause")?;
+    let stop = forcer.call("daemon/stop", &json!({"force":true}))?;
+    check(stop["result"]["stopping"] == true, || stop.to_string())?;
+    // The cancellation commits; only then does daemon main run final shutdown.
+    sandbox.resume_point(commit, 1)?;
+    let reply = cancel.join().map_err(|_| "the cancel thread panicked")??;
+    check(
+        reply["result"]["state"] == "cancelled" && reply["result"]["already_terminal"] == false,
+        || format!("cancel: {reply}"),
+    )?;
+    sandbox.resume_point(start, 1)?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    let summary = daemon.summary()?;
+    check(status.code() == Some(0), || {
+        format!("force exit: {status} {summary}")
+    })?;
+    drop(forcer);
+    drop(daemon);
+    let closed: i64 = sandbox.query(&format!(
+        "SELECT count(*) FROM events WHERE session_id='{session}'
+         AND json_extract(event,'$.type')='session.closed'"
+    ))?;
+    let reason = sandbox.closed_reason(&session)?;
+    check(
+        closed == 1 && reason.as_deref() == Some("daemon_stop_force"),
+        || format!("{closed} closures, reason {reason:?}"),
+    )?;
+    let turn: String = sandbox.query(&format!(
+        "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+    ))?;
+    check(turn == "cancelled", || format!("turn state {turn}"))?;
+    sandbox.disarm(start)?;
+    sandbox.disarm(commit)?;
+    sandbox.verify_anchors()
+}
+
+/// The pid of the fake vendor, once it reported it.
+#[cfg(feature = "test-failpoints")]
+fn vendor_pid(sandbox: &Sandbox) -> TestResult<u32> {
+    sandbox.await_file("agent.pid")?;
+    Ok(fs::read_to_string(sandbox.sync.join("agent.pid"))?
+        .trim()
+        .parse()?)
+}
+
+/// Design §11 `s1_f12_evidence_before_terminal` [r6.3, r4.2, r5.4]: a
+/// force ends a running turn whose anchor stops answering usefully, then
+/// final shutdown's Host reconciliation supplies the stop evidence and the
+/// absence proof, and Core has both **before** the forced terminal commits.
+/// Final shutdown is paused at reconciliation's entry
+/// (`core.shutdown.reconcile_entry`) and at the terminal's seam
+/// (`core.shutdown.before_forced_terminal`). Core acknowledges its receipt
+/// of each of the turn's reconciliation facts at
+/// `core.shutdown.evidence_stopped_live` and `core.shutdown.evidence_absent`
+/// (counted, never paused), both ahead of the terminal seam: at the seam the
+/// group is gone, the acks are recorded and the turn has no terminal.
+/// `deferred`: the anchor defers `begin_cleanup` and withholds
+/// `stopped_live` (`host.anchor.defer_cleanup`, persistent) until the
+/// harness disarms it at the first pause, so reconciliation's `Stop` is the
+/// only source of `forced`: both acks, then `cancelled` / `forced` /
+/// `quiescent`. Otherwise the anchor loses every `Stop` reply
+/// (`host.anchor.final_reply_lost`, persistent): no `stopped_live` ack,
+/// the absence ack alone, and the turn is `unknown`, `requested`, with
+/// cleanup `quiescent` decided independently by the absence proof.
+#[cfg(feature = "test-failpoints")]
+fn evidence_before_terminal(deferred: bool) -> TestResult {
+    let reconcile = "core.shutdown.reconcile_entry";
+    let before_terminal = "core.shutdown.before_forced_terminal";
+    let absence = "host.recovery.absence_commit";
+    let anchor_point = if deferred {
+        "host.anchor.defer_cleanup"
+    } else {
+        "host.anchor.final_reply_lost"
+    };
+    let sandbox = Sandbox::new(&script(
+        "hold",
+        1,
+        vec![
+            json!({"action":"report_pids"}),
+            accepted(1),
+            gate("hold"),
+            terminal(1),
+        ],
+    ))?;
+    let evidence_stopped_live = "core.shutdown.evidence_stopped_live";
+    let evidence_absent = "core.shutdown.evidence_absent";
+    sandbox.count(absence)?;
+    sandbox.count(evidence_stopped_live)?;
+    sandbox.count(evidence_absent)?;
+    sandbox.arm(anchor_point, 1, "fail_io_persist")?;
+    sandbox.arm(reconcile, 1, "pause")?;
+    sandbox.arm(before_terminal, 1, "pause")?;
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("hold")?;
+    let vendor = vendor_pid(&sandbox)?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.ack(&daemon, reconcile, 1, "pause")?;
+    let turn_state = || -> TestResult<String> {
+        sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))
+    };
+    // Absence proofs committed so far (Route's close and the early stop's,
+    // before reconciliation).
+    let proofs = sandbox.next_hit(absence)? - 1;
+    if deferred {
+        // Route's close found no evidence: the anchor kept the group, and
+        // nothing proved its absence.
+        check(
+            !gone(vendor) && turn_state()? == "running" && proofs == 0,
+            || format!("the deferred anchor did not keep the group: {proofs} proofs"),
+        )?;
+        sandbox.disarm(anchor_point)?;
+    }
+    sandbox.resume_point(reconcile, 1)?;
+    sandbox.ack(&daemon, before_terminal, 1, "pause")?;
+    // The evidence is in and the terminal is not: the group is gone, and
+    // Core has acknowledged receipt of this turn's reconciliation facts
+    // (both seams precede `before_forced_terminal` in Core), each once.
+    check(gone(vendor), || {
+        "the group was not gone at the terminal seam".to_owned()
+    })?;
+    let got_stopped_live = sandbox.next_hit(evidence_stopped_live)? - 1;
+    let got_absent = sandbox.next_hit(evidence_absent)? - 1;
+    if deferred {
+        // Only reconciliation's `Stop` can have supplied `stopped_live`, and
+        // no absence proof existed before it (`proofs == 0`).
+        check(got_stopped_live == 1 && got_absent == 1, || {
+            format!("Core received {got_stopped_live} stopped_live and {got_absent} absence facts")
+        })?;
+    } else {
+        // Every stop reply is lost: no `stopped_live` reached Core, yet the
+        // absence proof did, independently.
+        check(
+            sandbox.failpoints.ack_bytes(anchor_point, 1).is_ok(),
+            || "no lost stop reply was acknowledged".to_owned(),
+        )?;
+        check(got_stopped_live == 0 && got_absent == 1, || {
+            format!("Core received {got_stopped_live} stopped_live and {got_absent} absence facts")
+        })?;
+    }
+    let state = turn_state()?;
+    check(state == "running", || {
+        format!("the terminal committed before its seam: {state}")
+    })?;
+    sandbox.resume_point(before_terminal, 1)?;
+    let mut daemon = daemon;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    check(status.code() == Some(0), || {
+        format!(
+            "force exit: {status} {}",
+            fs::read_to_string(&daemon.trace).unwrap_or_default()
+        )
+    })?;
+    drop(daemon);
+    let raw: String = sandbox.query(&format!(
+        "SELECT envelope FROM turns WHERE session_id='{session}' AND number=1"
+    ))?;
+    let envelope: Value = serde_json::from_str(&raw)?;
+    let expected = if deferred {
+        ("cancelled", "forced")
+    } else {
+        ("unknown", "requested")
+    };
+    check(
+        envelope["state"] == expected.0
+            && envelope["cancel"]["outcome"] == expected.1
+            && envelope["cancel"]["cleanup"] == "quiescent",
+        || format!("terminal: {envelope}"),
+    )?;
+    sandbox.disarm(reconcile)?;
+    sandbox.disarm(before_terminal)?;
+    sandbox.verify_anchors()
+}
+
+/// Design §11 `s1_f12_evidence_before_terminal`, positive case. A
+/// characterization: the code already ordered this. Mutation RED: skipping
+/// the `stopped_live` acknowledgement, or delivering both after the terminal
+/// seam, fails the receipt check; making `forced_terminal` ignore
+/// reconciliation's `forced` evidence ends the turn `unknown`, failing the
+/// envelope check.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f12_evidence_before_terminal() -> TestResult {
+    evidence_before_terminal(true)
+}
+
+/// Design §11 `s1_f12_evidence_before_terminal`, lost-evidence variant.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f12_evidence_before_terminal_lost_stop_evidence_is_unknown() -> TestResult {
+    evidence_before_terminal(false)
 }
 
 /// Design §8, §6.6: a group whose close was uncertain holds its connection

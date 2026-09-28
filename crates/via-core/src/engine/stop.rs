@@ -261,6 +261,10 @@ impl Engine {
         deadline: Deadline,
         batches: &mut FailureBatches,
     ) -> bool {
+        // One read of the turn's evidence, before the terminal seam: the
+        // facts the terminal is built from (test builds acknowledge each
+        // reconciliation fact where it is consumed).
+        let facts = Self::forced_facts(&turn, report).await;
         // Test builds: the evidence is in, the terminal not yet committed.
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("core.shutdown.before_forced_terminal").await;
@@ -270,7 +274,7 @@ impl Engine {
         if batch::affected(&turn.record) {
             let raw_incomplete = turn.raw_owed;
             // After the first failure `cancel.settled` is not written: no I/O.
-            let (started, record, terminal) = self.forced_terminal(turn, report).await;
+            let (started, record, terminal) = self.forced_terminal(turn, facts).await;
             let affected = AffectedTurn {
                 started,
                 record,
@@ -281,7 +285,7 @@ impl Engine {
             return true;
         }
         let commit = async {
-            let (started, record, terminal) = self.forced_terminal(turn, report).await;
+            let (started, record, terminal) = self.forced_terminal(turn, facts).await;
             // C1 §3.14: close only once every other turn of the session
             // has a durable disposition. Design §3.2: once
             // `failure_pending` is observed no new close-bearing commit
@@ -299,31 +303,64 @@ impl Engine {
         matches!(tokio::time::timeout_at(by, commit).await, Ok(Ok(())))
     }
 
-    /// A forced turn's terminal from Route's close evidence and
-    /// reconciliation's (C1 §7.6 force row), after committing its
-    /// `cancel.settled`.
-    async fn forced_terminal(
-        &self,
-        turn: super::ForcedTurn,
+    /// The facts a forced turn's terminal is built from (C1 §7.6 force row),
+    /// read once from Route's close and reconciliation's record for the turn:
+    /// `(quiescent, forced)`. Host's proof that its stop found the vendor
+    /// live ends the turn `cancelled` with `forced`. Before ARM no vendor
+    /// could launch: `cancelled` and `requested`, cleanup as proved (a
+    /// complete journal without an anchor intent has nothing to clean).
+    /// Otherwise a vendor may have run with neither stop nor terminal proved:
+    /// the turn is `unknown`. Each fact holds if Route's close or recovery
+    /// proved it, so a failed or late recovery never discards what Route's
+    /// close proved. Outcome and cleanup stay independent.
+    ///
+    /// Test builds acknowledge, per turn, each reconciliation fact at the
+    /// point where the record supplies it
+    /// (`core.shutdown.evidence_stopped_live`, `core.shutdown.evidence_absent`).
+    #[cfg_attr(
+        not(feature = "test-failpoints"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "only test builds await the evidence seams"
+        )
+    )]
+    async fn forced_facts(
+        turn: &super::ForcedTurn,
         report: &via_adapters::FakeShutdown,
-    ) -> (super::Started, TurnRecord, Terminal) {
+    ) -> (bool, bool) {
         let evidence = report.recovery.iter().find(|record| {
             record.session_id == turn.started.session && record.turn == turn.started.turn
         });
-        // C1 §7.6 force row, outcome and cleanup kept independent. Host's
-        // proof that its stop found the vendor live ends the turn `cancelled`
-        // with `forced`. Before ARM no vendor could launch: `cancelled` and
-        // `requested`, cleanup as proved (a complete journal without an
-        // anchor intent has nothing to clean). Otherwise a vendor may have
-        // run with neither stop nor terminal proved: the turn is `unknown`.
-        // Each fact holds if Route's close or recovery proved it, so a failed
-        // or late recovery never discards what Route's close proved.
-        let quiescent = turn.close.quiescent
-            || match evidence {
-                Some(record) => record.cleanup == Cleanup::Quiescent,
-                None => report.failure.is_none(),
-            };
-        let forced = turn.close.forced || evidence.is_some_and(|record| record.forced);
+        let recovered_quiescent = match evidence {
+            Some(record) => {
+                let quiescent = record.cleanup == Cleanup::Quiescent;
+                #[cfg(feature = "test-failpoints")]
+                if quiescent {
+                    let _ = via_store::failpoint::hit_async("core.shutdown.evidence_absent").await;
+                }
+                quiescent
+            }
+            None => report.failure.is_none(),
+        };
+        let recovered_forced = evidence.is_some_and(|record| record.forced);
+        #[cfg(feature = "test-failpoints")]
+        if recovered_forced {
+            let _ = via_store::failpoint::hit_async("core.shutdown.evidence_stopped_live").await;
+        }
+        (
+            turn.close.quiescent || recovered_quiescent,
+            turn.close.forced || recovered_forced,
+        )
+    }
+
+    /// A forced turn's terminal from its [`Engine::forced_facts`], after
+    /// committing its `cancel.settled`.
+    async fn forced_terminal(
+        &self,
+        turn: super::ForcedTurn,
+        (quiescent, forced): (bool, bool),
+    ) -> (super::Started, TurnRecord, Terminal) {
         let state = if forced || !turn.launched {
             "cancelled"
         } else {
