@@ -97,6 +97,18 @@ enum LaunchPhase {
 
 impl Ledger {
     /// Whether an acquisition or a live control still owns the group.
+    /// Holds `token` for `owner`'s group until its absence is proved.
+    fn hold(&mut self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
+        self.held.insert(
+            anchor_id,
+            Held {
+                _token: token,
+                identity: None,
+                owner,
+            },
+        );
+    }
+
     fn busy(&self, anchor_id: &str) -> bool {
         self.acquiring.contains(anchor_id)
             || self
@@ -126,14 +138,7 @@ impl Capacity {
     }
 
     fn hold(&self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
-        self.lock().held.insert(
-            anchor_id,
-            Held {
-                _token: token,
-                identity: None,
-                owner,
-            },
-        );
+        self.lock().hold(anchor_id, owner, token);
     }
 
     /// Records the identity Host verified for a launched anchor.
@@ -967,14 +972,7 @@ impl Host {
             let mut ledger = self.capacity.lock();
             ledger.acquiring.insert(anchor_id.clone());
             if let Some(token) = capacity {
-                ledger.held.insert(
-                    anchor_id.clone(),
-                    Held {
-                        _token: token,
-                        identity: None,
-                        owner: owner.session_id,
-                    },
-                );
+                ledger.hold(anchor_id.clone(), owner.session_id, token);
             }
         }
         state.spawned = Some(anchor_id.clone());
