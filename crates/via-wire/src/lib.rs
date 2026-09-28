@@ -130,8 +130,10 @@ mod runtime;
 // and Host process control remain private to Wire.
 pub use runtime::{
     RawEvidence, RuntimeConfig, WireCloseReport, WireConnection, WireError, WireRecovery,
-    WireRuntime, WireShutdown, WireTurnRecovery,
+    WireRuntime, WireShutdown, WireSignals, WireTurnRecovery,
 };
+pub use via_host::{JournalSite, ReprobeReport};
+pub use via_store::StoreError;
 
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

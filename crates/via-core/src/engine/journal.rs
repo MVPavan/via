@@ -189,7 +189,7 @@ impl HeadGuard<'_> {
 
 /// Whether a failed commit may nonetheless be durable.
 pub(super) fn may_have_committed(error: &StoreError) -> bool {
-    matches!(error, StoreError::Uncertain(_) | StoreError::Unavailable)
+    matches!(error, StoreError::Uncertain(_) | StoreError::WriterLost)
 }
 
 /// An event commit Store did not confirm but may have made durable. After the

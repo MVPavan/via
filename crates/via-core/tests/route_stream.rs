@@ -170,6 +170,7 @@ impl Child {
                 sender,
                 deadline,
                 force,
+                tokio::sync::watch::channel(None).1,
                 Box::new(()),
             );
             tokio::pin!(execute);
@@ -452,6 +453,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
             sender,
             deadline,
             force,
+            tokio::sync::watch::channel(None).1,
             Box::new(()),
         );
         tokio::pin!(execute);
@@ -532,6 +534,7 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
             sender,
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
             force,
+            tokio::sync::watch::channel(None).1,
             Box::new(()),
         );
         // The stand-in writes flags beside its anchor directory.
@@ -585,6 +588,7 @@ fn stalled_acquisition_with_force(
             sender,
             Deadline::at(deadline),
             force,
+            tokio::sync::watch::channel(None).1,
             Box::new(()),
         );
         let (result, ()) = tokio::join!(execute, async {

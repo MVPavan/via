@@ -48,6 +48,10 @@ async fn run(path: &Path) -> io::Result<()> {
     if bootstrap.marker.len() != 32 || bootstrap.generation.len() != 32 {
         return Err(io::Error::other("invalid bootstrap"));
     }
+    #[cfg(feature = "test-failpoints")]
+    if let Some((dir, token)) = &bootstrap.failpoints {
+        via_store::failpoint::activate(dir, token).map_err(io::Error::other)?;
+    }
     let mut terminate = signal(SignalKind::terminate())
         .map_err(|error| io::Error::new(error.kind(), format!("signal: {error}")))?;
     let listener = UnixListener::bind(&bootstrap.socket_path)
@@ -119,6 +123,7 @@ async fn serve(
                 let Some(vendor) = configured.take() else {
                     return Err(io::Error::other("missing vendor configuration"));
                 };
+                arm_received_seam().await;
                 return armed(listener, stream, bootstrap, vendor, terminate).await;
             }
             Some(Request::Challenge { nonce, proof })
@@ -147,7 +152,10 @@ async fn serve(
                 )
                 .await?;
             }
-            None => return Ok(()),
+            None => {
+                eof_cleanup_seam().await;
+                return Ok(());
+            }
             _ => return Err(io::Error::other("invalid pre-arm control")),
         }
     }
@@ -169,6 +177,9 @@ async fn armed(
     let mut kill_at: Option<Instant> = None;
     // Set once cleanup begins: whether the vendor was then still live.
     let mut stopped_live: Option<bool> = None;
+    // A Host `Stop` began the cleanup, not an EOF or `SIGTERM`: only then is
+    // `stopped_live` Host force evidence, repeated on every later `Stop`.
+    let mut stopped_by_host = false;
     loop {
         tokio::select! {
             incoming = async {
@@ -195,11 +206,20 @@ async fn armed(
                         }
                     }
                     Ok(Some(Request::Stop { generation, deadline_monotonic_ns })) if verified_connection && generation == bootstrap.generation => {
-                        // Cleanup begins before the reply, which reports its evidence.
-                        let grace = crate::monotonic_remaining(deadline_monotonic_ns).unwrap_or(Duration::ZERO);
-                        begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, grace.min(Duration::from_millis(200)));
-                        let reply = Reply::Stopping { stopped_live: stopped_live == Some(true) };
+                        stop_received_seam().await;
+                        // Cleanup begins before the reply, which reports its
+                        // evidence; a test-deferred cleanup reports none.
+                        let reply = if cleanup_deferred().await {
+                            Reply::Stopping { stopped_live: false }
+                        } else {
+                            stopped_by_host |= kill_at.is_none();
+                            let grace = crate::monotonic_remaining(deadline_monotonic_ns).unwrap_or(Duration::ZERO);
+                            begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, grace.min(Duration::from_millis(200)));
+                            Reply::Stopping { stopped_live: stopped_by_host && stopped_live == Some(true) }
+                        };
                         match controller.as_mut() {
+                            // Runtime §11: the reply is lost; the stop still runs.
+                            Some(_) if final_reply_lost().await => true,
                             Some(active) => protocol::write_frame(active, &reply, 1024).await.is_err(),
                             None => true,
                         }
@@ -210,7 +230,12 @@ async fn armed(
                     controller = None;
                     reader.reset();
                     verified_connection = false;
-                    begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, Duration::from_millis(200));
+                    if kill_at.is_none() {
+                        eof_cleanup_seam().await;
+                    }
+                    if !cleanup_deferred().await {
+                        begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, Duration::from_millis(200));
+                    }
                 }
             }
             accepted = listener.accept(), if controller.is_none() => {
@@ -325,6 +350,76 @@ fn begin_cleanup(
         let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
         *kill_at = Some(proposed);
     }
+}
+
+/// Test-only `host.anchor.before_eof_cleanup`: a pause holds the anchor
+/// before its EOF cleanup, the slow anchor exit of design §10 [r1.8].
+#[cfg(feature = "test-failpoints")]
+async fn eof_cleanup_seam() {
+    let _ = via_store::failpoint::hit_async("host.anchor.before_eof_cleanup").await;
+}
+
+/// Release builds have no seam before the EOF cleanup.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn eof_cleanup_seam() {}
+
+/// Test-only `host.anchor.arm_received`: a pause holds a received ARM
+/// before the vendor spawns, so ARM is in flight (design §11 [r6.1]).
+#[cfg(feature = "test-failpoints")]
+async fn arm_received_seam() {
+    let _ = via_store::failpoint::hit_async("host.anchor.arm_received").await;
+}
+
+/// Release builds never hold an ARM.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn arm_received_seam() {}
+
+/// Test-only `host.anchor.stop_received`: a pause holds this anchor's
+/// `Stop` before it is handled, keeping its control busy (design §11 [r6.5]).
+#[cfg(feature = "test-failpoints")]
+async fn stop_received_seam() {
+    let _ = via_store::failpoint::hit_async("host.anchor.stop_received").await;
+}
+
+/// Release builds never hold a `Stop`.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn stop_received_seam() {}
+
+/// Test-only `host.anchor.defer_cleanup` (design §11 [r6.3]): while a
+/// `fail_io` is armed (persistently, each trigger one occurrence), a `Stop`
+/// or EOF starts no cleanup and a `Stop` reply withholds `stopped_live`;
+/// the first trigger after the harness disarms it runs the cleanup.
+#[cfg(feature = "test-failpoints")]
+async fn cleanup_deferred() -> bool {
+    via_store::failpoint::hit_async("host.anchor.defer_cleanup")
+        .await
+        .is_err()
+}
+
+/// Release builds never defer cleanup.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds can defer here")]
+async fn cleanup_deferred() -> bool {
+    false
+}
+
+/// Test-only `host.anchor.final_reply_lost` (runtime §11): true drops the
+/// `Stop` reply; the cleanup it started continues.
+#[cfg(feature = "test-failpoints")]
+async fn final_reply_lost() -> bool {
+    via_store::failpoint::hit_async("host.anchor.final_reply_lost")
+        .await
+        .is_err()
+}
+
+/// Release builds never lose a reply.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds can lose the reply here")]
+async fn final_reply_lost() -> bool {
+    false
 }
 
 fn current_identity(marker: &str) -> io::Result<WireIdentity> {

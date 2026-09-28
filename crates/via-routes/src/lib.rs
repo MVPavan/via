@@ -202,9 +202,21 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
-    /// The required raw evidence could not be made durable.
-    #[error("fake raw store failed in turn {turn:?}")]
+    /// A Store write the turn depends on failed: raw evidence (design §7.2
+    /// row 6) or a Host journal write (rows 3 and 4), with its classified
+    /// outcome [r5.5].
+    #[error("fake store failed in turn {turn:?}: {kind:?}")]
     Store {
+        /// Affected turn.
+        turn: TurnNumber,
+        /// The classified failure; [`StoreFailure::latches`] tells Core to latch.
+        kind: StoreFailure,
+    },
+    /// The turn's stop order was honoured (design §2): before launch nothing
+    /// started; after it, the group was force-closed at `force_at` under
+    /// `close_by` and both pipes were drained.
+    #[error("fake turn stopped in turn {turn:?}")]
+    Stopped {
         /// Affected turn.
         turn: TurnNumber,
     },
@@ -223,10 +235,68 @@ pub enum RouteError {
     },
 }
 
+/// The classified Store failure behind [`RouteError::Store`] (design §7.1,
+/// §7.2 rows 3, 4 and 6 [r5.5]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFailure {
+    /// A raw append or sync failed or the raw queue was full: not committed
+    /// (row 6).
+    Raw,
+    /// A Host journal write was not committed (rows 3 and 4).
+    NotCommitted,
+    /// The SQLite writer's queue was full: never enqueued, not committed.
+    NotEnqueued,
+    /// The SQLite writer or raw thread is gone: uncertain.
+    WriterLost,
+    /// The write's outcome is unknown.
+    Uncertain,
+}
+
+impl StoreFailure {
+    /// Whether the outcome is uncertain, so the daemon latches (design §7.4).
+    pub fn latches(self) -> bool {
+        matches!(self, Self::WriterLost | Self::Uncertain)
+    }
+}
+
+/// Why a turn is asked to stop (design §2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopCause {
+    /// A caller `cancel`.
+    Cancel,
+    /// A session `close`.
+    Close,
+    /// Core's idle deadline.
+    IdleDeadline,
+    /// The turn's own Store write failed (design §7.2 row 5).
+    Store,
+}
+
+/// A stop order for one submitted turn (design §2). Core owns the cause and
+/// times; Route acts only on `force_at` and `close_by`.
+#[derive(Clone, Debug)]
+pub struct StopOrder {
+    /// Why the turn stops.
+    pub cause: StopCause,
+    /// Wall time of the request.
+    pub requested_at: String,
+    /// When Route force-closes a turn with no terminal.
+    pub force_at: Deadline,
+    /// Absolute bound on the force close and drain.
+    pub close_by: Deadline,
+}
+
+/// The turn's stop-order watch: `None` until Core orders a stop.
+pub type StopWatch = tokio::sync::watch::Receiver<Option<StopOrder>>;
+
 /// A failed route turn: the first typed cause plus the evidence Route still holds
 /// after its forced cleanup and bounded drain.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{cause}")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is independent evidence Core weighs separately"
+)]
 pub struct RouteFailure {
     /// First cause; later cleanup failures never replace it.
     pub cause: RouteError,
@@ -242,6 +312,9 @@ pub struct RouteFailure {
     pub cleanup: Option<WireCleanup>,
     /// Host stopped the group while its vendor was live (Host force evidence).
     pub forced: bool,
+    /// A Host journal write in the turn's cleanup had an uncertain outcome:
+    /// the daemon must latch (design §7.2 row 12).
+    pub journal_uncertain: bool,
 }
 
 #[derive(Deserialize)]
@@ -475,9 +548,10 @@ pub struct RouteMessage {
 mod runtime;
 
 pub use runtime::{FakeRoute, FakeRouteResult};
+pub use via_wire::StoreError;
 pub use via_wire::{
-    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
-    RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
+    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport,
+    RuntimeConfig, RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
     WireTurnRecovery,
 };
 

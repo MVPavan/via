@@ -93,7 +93,10 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         RouteError::Store { .. } => ("failed", Some(FailureClass::Store), "error"),
         RouteError::Deadline { .. } => ("failed", Some(FailureClass::DeadlineWall), "deadline"),
         // Core settles a force stop itself; this is only the C1 §7.6 force row.
-        RouteError::ForceStopped { .. } => ("cancelled", None, "interrupted"),
+        // T3-S1 compile allowance: a stop order's `Stopped` takes that row too.
+        RouteError::ForceStopped { .. } | RouteError::Stopped { .. } => {
+            ("cancelled", None, "interrupted")
+        }
         // Input may have reached the vendor and no exit is confirmed (§7.6).
         RouteError::TransportLost { .. } => ("unknown", None, "error"),
     }
@@ -220,6 +223,7 @@ mod tests {
             launched: false,
             cleanup: None,
             forced: false,
+            journal_uncertain: false,
         })
     }
 
@@ -229,7 +233,13 @@ mod tests {
         let turn = TurnNumber::try_from(1).unwrap();
         for (cause, class) in [
             (RouteError::Overflow { turn }, FailureClass::Overflow),
-            (RouteError::Store { turn }, FailureClass::Store),
+            (
+                RouteError::Store {
+                    turn,
+                    kind: via_adapters::StoreFailure::Raw,
+                },
+                FailureClass::Store,
+            ),
             (RouteError::Deadline { turn }, FailureClass::DeadlineWall),
             (
                 RouteError::ProcessExited { turn },

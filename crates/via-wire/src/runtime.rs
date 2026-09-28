@@ -6,9 +6,13 @@ use tokio::{
 };
 
 use super::{
-    BoundedBytes, ConnectionId, Deadline, Frame, PrivateProcessSpec, SendOutcome, WireFailure,
+    BoundedBytes, ConnectionId, Deadline, Frame, PrivateProcessSpec, SendOutcome, WireCleanup,
+    WireFailure,
 };
-use via_host::{AcquiredProcess, ExitReceiver, Host, LaunchPipes, OwnedPipes, ProcessControl};
+use via_host::{
+    AcquireFailure, AcquiredProcess, CleanupEvidence, ExitReceiver, Host, LaunchPipes, OwnedPipes,
+    ProcessControl,
+};
 use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
 
 /// Raw unit size for a retained line recorded by the failure drain.
@@ -29,6 +33,19 @@ pub enum RawEvidence {
     Complete,
     /// Some bytes were lost or left unread; counters cannot make the log complete.
     Incomplete,
+}
+
+/// The signals Route hands Wire for one connection (design §2).
+pub struct WireSignals {
+    /// The daemon force watch: once set, every wait on the vendor ends with
+    /// [`WireError::Cancelled`].
+    pub force: watch::Receiver<bool>,
+    /// Route's wake: each change ends the current wait on the vendor once
+    /// with [`WireError::Woken`], before any byte is read, so Route can act on
+    /// its turn's stop order without losing bytes.
+    pub wake: watch::Receiver<u64>,
+    /// Host's pre-ARM gate (design §2 rule 1): true stops the launch.
+    pub gate: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Deployment paths for the sole Host anchor service.
@@ -54,21 +71,23 @@ impl WireRuntime {
     }
 
     /// Opens one private connection with a Store-owned synced raw writer.
-    /// Once `cancel` is set, waits for vendor input, output or exit end with
-    /// [`WireError::Cancelled`]; bytes already read still reach the raw log.
+    /// Once `signals.force` is set, waits for vendor input, output or exit
+    /// end with [`WireError::Cancelled`]; bytes already read still reach the
+    /// raw log. A failed acquisition is [`WireError::Acquire`] with Host's
+    /// cleanup evidence.
     pub async fn open_connection(
         &self,
         connection_id: ConnectionId,
         spec: PrivateProcessSpec,
         deadline: Deadline,
-        cancel: watch::Receiver<bool>,
+        signals: WireSignals,
     ) -> Result<WireConnection, WireError> {
         Box::pin(WireConnection::open(
             &self.host,
             spec,
             self.raw.open(connection_id),
             deadline,
-            cancel,
+            signals,
         ))
         .await
     }
@@ -85,6 +104,35 @@ impl WireRuntime {
     /// Hands Host capacity for a group it did not launch (design §11).
     pub fn hold_capacity(&self, anchor_id: String, token: via_host::CapacityToken) {
         self.host.hold_capacity(anchor_id, token);
+    }
+
+    /// One non-signalling re-probe pass over Host's held groups, optionally
+    /// only one session's (design §8).
+    pub async fn reprobe_held(
+        &self,
+        deadline: Deadline,
+        owner: Option<via_store::SessionId>,
+    ) -> Result<via_host::ReprobeReport, WireError> {
+        self.host
+            .reprobe_held(deadline, owner)
+            .await
+            .map_err(WireError::Host)
+    }
+
+    /// Held groups no live control owns (design §6.6).
+    pub fn held_unproven(&self) -> usize {
+        self.host.held_unproven()
+    }
+
+    /// Groups whose cleanup a live control or acquisition still owns
+    /// (design §6.4).
+    pub fn pending_cleanup(&self) -> usize {
+        self.host.pending_cleanup()
+    }
+
+    /// Subscribes Host's early stop to the daemon force signal (design §6.8).
+    pub fn watch_force(&self, force: watch::Receiver<bool>) {
+        self.host.watch_force(force);
     }
 
     /// Reconciles one page of up to `limit` committed anchors after the
@@ -111,7 +159,9 @@ impl WireError {
             self,
             Self::Raw(_)
                 | Self::Host(
-                    via_host::HostError::Store(_) | via_host::HostError::StoreUnavailable(_)
+                    via_host::HostError::Store(_)
+                        | via_host::HostError::StoreUnavailable(_)
+                        | via_host::HostError::Journal { .. }
                 )
         )
     }
@@ -141,6 +191,9 @@ pub struct WireCloseReport {
     pub vendor_exit: Option<super::ExitReport>,
     /// Host's verified anchor accepted the stop while the vendor was live.
     pub forced: bool,
+    /// The absence proof's commit had an uncertain outcome: the daemon must
+    /// latch (design §7.2 row 12).
+    pub journal_uncertain: bool,
 }
 
 /// Failure of a private byte transport; an uncertain write never permits resend.
@@ -164,14 +217,26 @@ pub enum WireError {
     /// The caller's cancel signal ended a wait on the vendor.
     #[error("vendor wait cancelled")]
     Cancelled,
-    /// Acquisition failed or was cancelled after ARM, when the vendor may have
-    /// launched; `raw` says whether the drain recorded all of its output.
-    #[error("acquisition failed after vendor launch: {cause}")]
-    AfterLaunch {
+    /// Route's wake ended a wait on the vendor before any byte was read.
+    #[error("vendor wait woken")]
+    Woken,
+    /// Acquisition failed, was stopped at the gate or was cancelled, with
+    /// the evidence Host's cleanup left (design §2 rule 1, §7.2 rows 3, 4).
+    #[error("acquisition failed: {cause}")]
+    Acquire {
         /// The acquisition's own failure.
         cause: Box<WireError>,
+        /// ARM was sent: the vendor may have launched.
+        launched: bool,
         /// Whether every byte the vendor wrote reached the raw log.
         raw: RawEvidence,
+        /// Host's bounded absence verification; `None` when no anchor
+        /// intent was committed, so no group can exist.
+        cleanup: Option<WireCleanup>,
+        /// Host's `Stop` stopped a live vendor.
+        forced: bool,
+        /// A journal write had an uncertain outcome: the daemon must latch.
+        journal_uncertain: bool,
     },
     /// Frame contract failure.
     #[error("vendor frame failure: {0:?}")]
@@ -194,6 +259,8 @@ pub struct WireConnection {
     exits: ExitReceiver,
     /// Caller's cancel signal; checked only where waiting loses no bytes.
     cancel: watch::Receiver<bool>,
+    /// Route's wake, likewise checked only where waiting loses no bytes.
+    wake: watch::Receiver<u64>,
 }
 
 impl WireConnection {
@@ -203,13 +270,17 @@ impl WireConnection {
         spec: PrivateProcessSpec,
         raw: RawWriter,
         deadline: Deadline,
-        mut cancel: watch::Receiver<bool>,
+        signals: WireSignals,
     ) -> Result<Self, WireError> {
+        let WireSignals {
+            force: mut cancel,
+            wake,
+            gate,
+        } = signals;
         let launch = LaunchPipes::default();
-        // The same signal gates ARM inside Host: set before its last check,
+        // The gate is checked inside Host just before ARM: set by then,
         // nothing launches.
-        let gate = cancel.clone();
-        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &gate));
+        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &*gate));
         let acquired = tokio::select! {
             // A force already set when the acquisition's own result is observed
             // came first.
@@ -219,15 +290,14 @@ impl WireConnection {
                 // acquisition deadline) is the force's, not its own cause.
                 match tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire).await {
                     Ok(Ok(acquired)) => Ok(acquired),
-                    Ok(Err(_)) | Err(_) => Err(WireError::Cancelled),
+                    Ok(Err(failure)) => Err((WireError::Cancelled, evidence(&failure))),
+                    // Abandoned mid-way: nothing proved the group absent.
+                    Err(_) => Err((WireError::Cancelled, Evidence::abandoned())),
                 }
             }
-            acquired = &mut acquire => acquired.map_err(|error| {
-                if matches!(error, via_host::HostError::Stopped) {
-                    WireError::Cancelled
-                } else {
-                    WireError::Host(error)
-                }
+            acquired = &mut acquire => acquired.map_err(|failure| {
+                let evidence = evidence(&failure);
+                (WireError::Host(failure.error), evidence)
             }),
         };
         let AcquiredProcess {
@@ -236,18 +306,23 @@ impl WireConnection {
             exits,
         } = match acquired {
             Ok(acquired) => acquired,
-            Err(cause) => {
+            Err((cause, evidence)) => {
                 // Dropping the acquisition closes its anchor control: an anchor
                 // that connected exits on EOF and stops its group, one that did
                 // not at its own bootstrap deadline; Host recovery reports what
                 // it can prove. After ARM the vendor pipes are still ours.
                 drop(acquire);
-                return Err(match launch.take() {
-                    Some(pipes) => WireError::AfterLaunch {
-                        cause: Box::new(cause),
-                        raw: Box::pin(drain_pipes(pipes, &raw)).await,
-                    },
-                    None => cause,
+                let (launched, raw) = match launch.take() {
+                    Some(pipes) => (true, Box::pin(drain_pipes(pipes, &raw)).await),
+                    None => (false, RawEvidence::Complete),
+                };
+                return Err(WireError::Acquire {
+                    cause: Box::new(cause),
+                    launched,
+                    raw,
+                    cleanup: evidence.cleanup,
+                    forced: evidence.forced,
+                    journal_uncertain: evidence.journal_uncertain,
                 });
             }
         };
@@ -264,6 +339,7 @@ impl WireConnection {
             control,
             exits,
             cancel,
+            wake,
         })
     }
 
@@ -436,6 +512,7 @@ impl WireConnection {
         let mut err = [0; 8192];
         tokio::select! {
             () = cancelled(&mut self.cancel), if !stdout_raw => return Err(WireError::Cancelled),
+            () = woken(&mut self.wake), if !stdout_raw => return Err(WireError::Woken),
             read = timeout_at(deadline.instant(), self.stdout.read(&mut out)), if !self.stdout_eof => {
                 let count = read.map_err(|_| WireError::Deadline)??;
                 if count == 0 {
@@ -470,6 +547,7 @@ impl WireConnection {
             }
             let changed = tokio::select! {
                 () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
+                () = woken(&mut self.wake) => return Err(WireError::Woken),
                 changed = timeout_at(deadline.instant(), self.exits.changed()) => changed,
             };
             changed
@@ -483,12 +561,10 @@ impl WireConnection {
     pub async fn close(&self, request: super::CloseRequest) -> WireCloseReport {
         let report = self.control.close(request).await;
         WireCloseReport {
-            cleanup: match report.cleanup {
-                via_host::CleanupEvidence::GroupAbsent(_) => super::WireCleanup::Quiescent,
-                via_host::CleanupEvidence::Uncertain(_) => super::WireCleanup::Uncertain,
-            },
+            cleanup: wire_cleanup(&report.cleanup),
             vendor_exit: report.vendor_exit,
             forced: report.forced,
+            journal_uncertain: report.journal_uncertain,
         }
     }
 }
@@ -537,6 +613,46 @@ async fn drain_pipes(pipes: OwnedPipes, raw: &RawWriter) -> RawEvidence {
         }
     }
     evidence
+}
+
+/// Host's evidence from a failed acquisition, as Wire passes it up.
+struct Evidence {
+    cleanup: Option<WireCleanup>,
+    forced: bool,
+    journal_uncertain: bool,
+}
+
+impl Evidence {
+    /// An acquisition abandoned mid-way: its group, if any, is unproven.
+    fn abandoned() -> Self {
+        Self {
+            cleanup: Some(WireCleanup::Uncertain),
+            forced: false,
+            journal_uncertain: false,
+        }
+    }
+}
+
+fn evidence(failure: &AcquireFailure) -> Evidence {
+    Evidence {
+        cleanup: failure.cleanup.as_ref().map(wire_cleanup),
+        forced: failure.forced,
+        journal_uncertain: failure.journal_uncertain,
+    }
+}
+
+fn wire_cleanup(cleanup: &CleanupEvidence) -> WireCleanup {
+    match cleanup {
+        CleanupEvidence::GroupAbsent(_) => WireCleanup::Quiescent,
+        CleanupEvidence::Uncertain(_) => WireCleanup::Uncertain,
+    }
+}
+
+/// Resolves on the next change of Route's wake; never once its sender is gone.
+async fn woken(wake: &mut watch::Receiver<u64>) {
+    if wake.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Resolves once `cancel` is set; never when its sender is gone unset.

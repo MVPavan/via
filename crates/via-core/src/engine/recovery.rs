@@ -482,6 +482,7 @@ mod tests {
             session_id: session.clone(),
             turn: TurnNumber::try_from(1).expect("turn"),
             turn_running,
+            phase: Some(via_store::AnchorPhase::ArmIntent),
         }
     }
 

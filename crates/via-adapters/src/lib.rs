@@ -4,7 +4,8 @@
 use std::num::NonZeroU64;
 
 pub use via_routes::{
-    Deadline, MAX_OBSERVATION_BYTES, RawRef, RouteError, RouteFailure, ToolStatus, TurnNumber,
+    Deadline, MAX_OBSERVATION_BYTES, RawRef, ReprobeReport, RouteError, RouteFailure, StopCause,
+    StopOrder, StopWatch, StoreFailure, ToolStatus, TurnNumber,
 };
 
 /// Correlates a start reply with its acceptance observation within one turn.
@@ -246,6 +247,9 @@ pub struct FakeTerminalEvidence {
     pub exit: via_routes::ExitReport,
     /// Private-group cleanup certainty after vendor exit.
     pub cleanup: Cleanup,
+    /// A Host journal write in the turn's cleanup had an uncertain outcome:
+    /// the daemon must latch (design §7.2 row 12).
+    pub journal_uncertain: bool,
 }
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.
