@@ -60,8 +60,13 @@ the historical checkpoint; its findings table is updated by this section.
   runtime §8's 4-slot connection limit, slots owned per process group
   until proved absent, recovered and unread unproven groups held; Store
   schema v3) merged at `3955933` (Sol r3 SOUND); gate 173 / 2,
-  failpoints 203 / 2 (3 runs), F08–F12 17. Now: Sol high slice review of
-  Task 2 (`scratchpad/reviews/task2/`), then close `.7.6`; then
+  failpoints 203 / 2 (3 runs), F08–F12 17. Sol high slice review of Task
+  2 ([t2/task2-sol-high-review.md](t2/task2-sol-high-review.md)): ACCEPT
+  AFTER CHANGES. Now T2-E ([t2/e.md](t2/e.md): frozen per-turn
+  parameters, one launch per turn in F13/F14/F17/F28, version-0 Store
+  refusal) in a fresh Opus 5.5 high session
+  `session_01YHMezY6BkxmEWfYAi52b9g` (the T2-B2 session went idle without
+  starting it). Then re-review and close `.7.6`; then
   Task 3 (`.7.7`, carries the F12 remainder and deferred items), Task 4
   (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
