@@ -389,3 +389,229 @@ Run from the worktree at `7678f84`, each a separate step, logs in
   the fixed path acknowledges at about 3.05 s against a 4 s limit; that is
   0.9 s of margin under load. The 2.5 s hold is elapsed time on the test's
   clock, not an ordering assertion.
+
+# Decision 5, round 2: one force watch, `stopping` derived in each ledger decision
+
+Status: DONE_WITH_CONCERNS. Commit `f7a06a5` on `wt/t3-force-row`, on top of
+`be754ec`. Sol's verdict on round 1 was UNSOUND. The recorded forced-at
+instant was right; the carrier, the delayed-task windows and the late stop were
+not. The orchestrator's decisions D5-1 to D5-5 settle the design and this
+section supersedes the round-1 "second watch" text above.
+
+## What changed, by decision
+
+- D5-1, one force. `Signal.force` is `watch::Sender<Option<Instant>>` and the
+  separate `forced_at` watch is gone. `Signal::raise_force` is one
+  `send_if_modified`: it stores `Instant::now()` if unset and wakes no one on
+  a later raise (first wins). Every reader derives "forced" from presence:
+  `wait_for(Option::is_some)`, `borrow().is_some()`. `raise_force` is the sole
+  production writer: `git grep` finds the field written only at
+  `latch.rs` `raise_force`, and everything else calls `subscribe()`
+  (`drive.rs`, `close.rs`, `reprobe.rs`, `stop.rs`, `latch.rs::force_signal`).
+  It is called from `request_stop` (`stop.rs`) and `fail_pending` (`latch.rs`).
+  The payload is the raw `Option<tokio::time::Instant>` at every hop, because
+  the lower layers cannot name a Host type (`scripts/check-layers.py`).
+- D5-2, `stopping` derived atomically with each phase decision. The ledger
+  keeps a clone of the force receiver (`Host::watch_force` stores it) and a
+  single `Ledger::stopping()` reads it with a non-blocking `borrow()`. On
+  `Some(at)` it sets the sticky `stopping = at + EARLY_STOP` if unset and
+  fixes `swept`, the entries that are `Armed` at that moment. `register`,
+  `begin_arming`, `armed` and `begin_stopping` each call it inside their own
+  ledger-mutex section, before they change any entry. No await is held across
+  the mutex and no lock is added on the Host side. `borrow()` takes the watch's
+  internal value lock for the copy of an `Option<Instant>`; the only writer of
+  that lock is `raise_force`, which takes nothing else, so the order is
+  ledger mutex then watch value lock, one way, and no cycle exists.
+- D5-3, the `Stop` is always attempted. `stop_through` locks the control,
+  writes `Stop`, then waits for the reply with `timeout_at(deadline, ..)`
+  (`ControlConnection::transact_by`). The write happens whether or not the
+  deadline has passed, because the timeout wraps only the read. There is no
+  fresh reply allowance. Without a `Stopping { stopped_live: true }` reply by
+  the recorded deadline no forced evidence is recorded, and the cleanup stays
+  `Uncertain(Deadline)` for step 4.
+- D5-4, registration and ARM gate are tested as separate paths (below).
+- D5-5, the deadline Host used is asserted without a clock. The daemon
+  test with its 1 s wall-clock margin is removed.
+
+## Coverage argument: exactly one of three per entry
+
+Design §6.8 [r5.2, r6.1] says each live control is handled by exactly one of:
+the early-stop task's snapshot, the owner's `Spawned` marking, or the ARM gate
+refusal (an entry registered after the force is refused at registration, which
+is the ARM gate's earlier twin). This still holds with `stopping` set by
+whichever section sees the force first.
+
+Force is monotone: `None` to `Some(at)` once, never changed after (first
+raise wins). Ledger sections are totally ordered by the mutex. Let `S` be the
+first section that reads `Some`. It sets `stopping` and `swept` (the entries
+`Armed` at `S`) before it does anything else, so every entry has exactly one
+of these relations to `S`:
+
+1. Registered at or after `S`. `register` calls `stopping()` before it inserts
+   the entry, so the entry is not in `swept`. It gets `Some(deadline)` back,
+   the acquisition drops the control (EOF, cleanup under the deadline) and
+   returns `Stopped`. The entry never reaches `begin_arming` or `armed`.
+2. Registered before `S`, `Verified` at `S`. Its `begin_arming` runs after
+   `S`, reads the same `Some`, returns `Err(deadline)`, ARM is not sent, the
+   control is dropped. Not in `swept` (phase is not `Armed`). It never reaches
+   `armed`.
+3. Registered before `S`, `Arming` at `S` (past the gate, ARM in flight). Not
+   in `swept`. Its `armed` runs after `S`, `stopping()` returns the existing
+   `Some`, and `armed` returns it, so the owner sends `Stop` itself and no
+   `Stop` was sent before ARM. `stopping()` runs before `phase = Armed`, so
+   the entry is never in `swept`.
+4. Registered before `S`, `Armed` at `S`. In `swept`, so the task stops it.
+   `armed` for it already ran and does not run again.
+
+`begin_stopping` takes `swept` once (`mem::take`), so a second call sees an
+empty set; an entry is never stopped twice by Host. The force is read inside
+each section, so a force raised before a section is always seen by it, and a
+force raised after the last section that touches an entry is seen by the task
+(case 4) or by nothing that entry still needs.
+A caller's own stop check (`stopped()`) is unchanged and is read before the
+ledger's gate, as before.
+
+What made round 1 unsound is now closed: a task delayed after the force can
+no longer let a registration, an ARM gate or a `Spawned` marking pass, since
+none depends on the task having run. Unit tests pin each case
+(`an_owner_that_sets_stopping_keeps_its_entry_out_of_the_snapshot`,
+`a_task_that_sets_stopping_leaves_the_other_entries_to_their_owners`,
+`the_arm_gate_refuses_once_the_force_is_raised_though_no_task_ran`).
+
+## Tests
+
+Failure-first. Scratch logs in the gitignored `scratchpad/t3-force-row/`.
+
+| Decision | Test | Level | RED (uncommitted, base tree plus the test) |
+|---|---|---|---|
+| D5-2 registration | `a_control_registering_before_the_delayed_early_stop_task_runs_is_stopped_at_once` | Host integration | fails: the acquisition passed registration and reached the identified commit, `AcquireFailure { error: Journal { site: Identified, .. } }` (`red-d52-d53.log`) |
+| D5-2 ARM gate | `the_arm_gate_refuses_after_the_force_though_the_early_stop_task_is_delayed` | Host integration | fails: the gate passed, ARM reached the anchor (held at `host.anchor.arm_received`) and the acquisition ended `Deadline` after 9 s instead of `Stopped` |
+| D5-2 `Spawned` | `a_vendor_spawned_under_a_delayed_early_stop_task_is_stopped_by_its_owner` | Host integration | fails: the acquisition returned `Ok`, the spawned vendor was never stopped |
+| D5-3 | `a_stop_past_its_deadline_is_written_and_records_no_evidence`, `a_stop_past_its_deadline_waits_for_a_busy_control_and_is_written` | Host unit, socket pair, no clock | both fail with `no Stop was written` (2.00 s each): the base wrapped write and read in one `timeout_at` |
+| D5-3 | `a_stop_after_its_deadline_is_still_sent_and_leaves_absence_to_reconciliation` | Host integration | passes on base: on a warm socket the base also wrote before the timer was polled. It characterises the end result: `Stop` received (`host.anchor.stop_received` acked), no forced evidence, `Uncertain`, then step 4 proves `GroupAbsent` |
+| D5-1 | see concern 1 | | no behavioural RED |
+| D5-4 | `a_force_older_than_the_early_stop_task_bounds_a_late_registered_cleanup` (existing, with a path witness added) and the ARM-gate test above | Host integration | see D5-4 finding |
+| D5-5 | `stopping_is_the_force_instant_plus_three_seconds_in_every_section` | Host unit | `register`, `begin_arming`, `armed` and `begin_stopping` return exactly `at + EARLY_STOP` for a force 10 s old; equality, no tolerance, no clock |
+
+Also added, no RED needed: `a_stopped_live_reply_inside_the_deadline_records_forced_evidence`,
+`the_arm_gate_passes_before_the_force`, `a_ledger_without_a_force_watch_never_stops`,
+and Core's `the_first_raise_publishes_the_instant_and_later_raises_wake_no_one`
+(`latch.rs`), which pins first-raise-wins on the one watch.
+
+GREEN: all of the above pass; Host suite 62 of 62 five times in a row, the
+F12 selection 36 of 36 three times, and the full gate below.
+
+D5-4 finding. Sol's review said the late-registration test pauses at
+`store.journal.anchor_intent` after registration. It does not: that seam is the
+anchor-intent commit, which precedes the spawn of the anchor, so the paused
+acquisition has not registered. To make that checkable rather than argued, the
+test now arms `store.journal.identified` (`fail_io`, acknowledged when hit) and
+asserts it was never acknowledged. The identified commit follows registration
+directly, so an acquisition that had passed registration would hit it; this one
+returns `Stopped` at registration with the force's original deadline. The ARM
+gate has its own test, held at `host.anchor.after_arm_intent_commit`, which is
+after registration and before the gate, and asserts no ARM and no `Stop`
+reached the anchor.
+
+D5-5. The wall-clock daemon test `s1_f12_host_early_stop_deadline_is_from_the_force`
+was removed; `crates/via-cli/tests/s1_store_failure.rs` is now identical to its
+state before round 1. The Host integration tests that still measure elapsed
+time now have a 1 s margin instead of 0.5 s (`LATE_STEP` 1.5 s to 2 s,
+`EARLY_STOP_BOUND` 3.5 s to 4 s), and their doc says the deadline value is
+asserted by the unit test.
+
+## Files changed
+
+Edits in Worker X's files are mechanical type and predicate changes forced by
+the payload, eight hunks in all; `batch.rs` is untouched:
+
+| File | Edit |
+|---|---|
+| `crates/via-core/src/engine/drive.rs` | 4 hunks: `if *force.borrow()` to `force.borrow().is_some()` (~210); `await_wake` parameter type `Receiver<Option<Instant>>` (~298); `wait_for(Option::is_some)` at two sites (~305, ~436) |
+| `crates/via-core/src/engine/close.rs` | 3 hunks: one `borrow().is_some()` (~244), two `wait_for(Option::is_some)` (~252, ~277) |
+| `crates/via-core/src/engine/reprobe.rs` | 1 hunk: `wait_for(Option::is_some)` (~72) |
+
+Other shared files:
+
+| File | Edit |
+|---|---|
+| `crates/via-core/src/engine/latch.rs` | `force` field type, `forced_at` removed, `raise_force` rewritten, `force_signal()` type, comments; new `#[cfg(test)]` module with one test |
+| `crates/via-core/src/engine/stop.rs` | `watch_force` subscribes `force` (was `forced_at`) |
+| `crates/via-adapters/src/runtime.rs`, `crates/via-routes/src/runtime.rs`, `crates/via-wire/src/runtime.rs` | force types and `.is_some()` reads; no logic change |
+| `crates/via-cli/src/server/serving.rs` | one line: `forced.wait_for(Option::is_some)` |
+| `crates/via-core/tests/route_stop.rs`, `route_stream.rs` | channel type and `send_replace(Some(Instant::now()))` |
+| `crates/via-host/src/host.rs` | ledger derives `stopping`; reworked `Capacity` methods; `watch_force` stores the receiver; `transact_by`; `stop_through`; unit tests |
+| `crates/via-host/tests/s1_host.rs` | four new integration tests, `eventually_recovered`, the D5-4 witness, wider margins |
+| `crates/via-cli/tests/s1_store_failure.rs` | the daemon test and its constant removed |
+
+`scripts/check-release-features.py` is unchanged: no failpoint was added
+(`host.early_stop.woken`, `.snapshot` and `.sent` already exist).
+
+## Design edits needed (not made)
+
+- §6.8: the force is one watch carrying the instant of the first raise; the
+  ledger derives `stopping` (that instant plus 3 s) in each of its sections
+  (registration, ARM gate, `Spawned` marking, the early-stop task) and fixes
+  the set of `Armed` entries at that moment for the task; the exactly-one
+  argument above replaces "the task takes the snapshot and sets `stopping`".
+  State that a task delayed past the force changes nothing.
+- §6.8 and runtime §7 on a late stop: `Stop` is always written once even past
+  the deadline, the reply is awaited only until the recorded deadline, no
+  fresh allowance, and no forced evidence is recorded without the reply;
+  absence is then left to step 4.
+- §3.2 and §7.5 force signal: remove the "second watch `forced_at`" wording
+  written for round 1; the force watch is `Option<Instant>`, and "forced" means
+  present.
+- §11 test list: replace `s1_f12_host_early_stop_deadline_is_from_the_force`
+  with the D5-2, D5-3 and D5-5 tests in the table above, and note the
+  `identified` witness on the late-registration test.
+
+## Gate
+
+Run at `f7a06a5`, each a separate step, logs in `scratchpad/t3-force-row/g2-*.log`.
+
+| Step | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings`, default and `--features via-cli/test-failpoints` | pass, pass (one `type_complexity` in a new test helper was fixed first with a `type` alias) |
+| `cargo nextest run --locked --workspace` | 296 passed, 1 skipped (was 286; +10: nine Host unit tests, one Core unit test) |
+| `cargo nextest run --locked --workspace --features via-cli/test-failpoints`, run 1 to 3 | 429 passed, 1 skipped each time (was 416; +14 new tests, -1 removed daemon test) |
+| `cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 52 passed (was 53; the removed daemon test) |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+| `python3 scripts/check-layers.py` | pass |
+| `cargo build --locked --release -p via-cli --no-default-features`, then `python3 scripts/check-release-features.py target/release/via` | pass: no `test-failpoints`, none of 90 markers present |
+| Host suite with failpoints x5, `s1_f12_` selection x3 | 62 of 62 five times, 36 of 36 three times |
+
+## Concerns and limits
+
+1. D5-1 has no behavioural RED. The two-state window Sol found is real by
+   source reading (`forced_at` published before `force`), but I could not make
+   a test see it. With a scratch 700 ms sleep between the two publications in
+   round 1's `raise_force`, `s1_f12_host_early_stop_independent_of_store` still
+   passed (`red-d51-two-watches.log`, 5.1 s); I did not establish why that
+   scenario is insensitive to the window. Showing the window needs a seam
+   between the two publications, which is exactly what the change removes, so
+   the fix is structural: one value, one publication. The guard is the type (a reader can
+   only ask whether the one value is present) and the Core unit test.
+2. `stop_through` locks the control without a deadline and writes without one.
+   A holder of the control mutex runs under its own deadline, and a `Stop`
+   frame is a few dozen bytes on a socket that carries one request and one
+   reply at a time, so the write finds an empty buffer. A wedged anchor with a
+   full buffer is not covered; the design's per-request bounds elsewhere
+   assume the same. Bounding the lock would reintroduce the lost `Stop` that
+   D5-3 removes.
+3. A late `Stop` whose reply arrives after the deadline is not recorded as
+   forced evidence. The outcome is then `requested` with cleanup `Uncertain`
+   until step 4 proves absence. That is the decision, and the conservative
+   direction.
+4. `Ledger::stopping()` reads the force from inside the mutex through a clone
+   of the receiver. If `Host::watch_force` is never called the ledger never
+   stops anything (`a_ledger_without_a_force_watch_never_stops`), as before.
+5. Round 1's report text above describes the `forced_at` watch and the "why a
+   second watch" argument. Both are superseded by D5-1 and left for history.
+6. Sol's D5-4 premise was wrong (the seam precedes registration). The witness
+   added makes the path checkable; no behaviour changed for it.
+7. The D5-3 integration test has to wait for `host.anchor.stop_received`
+   (`eventually`, 3 s) because the acquisition returns as soon as its write
+   completes, before the anchor process acknowledges. My first draft asserted
+   it immediately and failed for that reason only.
