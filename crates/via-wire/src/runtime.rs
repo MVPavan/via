@@ -580,7 +580,16 @@ impl WireConnection {
     /// Observes Host-confirmed vendor exit without treating a terminal frame as exit proof.
     pub async fn wait_exit(&mut self, deadline: Deadline) -> Result<super::ExitReport, WireError> {
         loop {
-            if let Some(exit) = *self.exits.borrow() {
+            // Copied out so no watch guard is held across the test seam's await.
+            let recorded = *self.exits.borrow();
+            if let Some(exit) = recorded {
+                // A recorded exit is returned without consulting `cancel`: the
+                // caller must read the daemon force after it (design §6.8).
+                // Test builds pause here, exit recorded and not yet returned.
+                #[cfg(feature = "test-failpoints")]
+                via_store::failpoint::hit_async("wire.exit.observed")
+                    .await
+                    .map_err(WireError::Io)?;
                 return Ok(exit);
             }
             let changed = tokio::select! {

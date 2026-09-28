@@ -113,6 +113,8 @@ POINTS = [
     "store.read.corrupt.anchor_cohort",
     "store.read.corrupt.queued_turns",
     "store.read.corrupt.anchor_records",
+    # Task 3 force row (design §6.8, §10): a recorded exit not yet returned.
+    "wire.exit.observed",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
