@@ -493,7 +493,7 @@ impl Engine {
             Ok(false) => false,
             Err(error) => {
                 let outcome = WriteOutcome::of(&error);
-                if outcome == WriteOutcome::Uncertain {
+                if outcome.head_unknown() {
                     guard.lost();
                 }
                 self.store_failure(

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use via_store::CancelCause;
 
 use super::drive::Cancelled;
-use super::queue::{Ack, CancelStep, QueuedOutcome, StopSpec};
+use super::queue::{Ack, CancelStep, Owner, QueuedOutcome, StopSpec};
 use super::stop::StopMode;
 use super::{Engine, journal, lock};
 use crate::api::{DEFAULT_FORCE_AFTER_MS, rfc3339};
@@ -155,7 +155,7 @@ impl Engine {
             .cancel_queued(
                 &slot,
                 session,
-                turn,
+                (turn, Owner::Request),
                 false,
                 Some((CancelCause::Cancel, requested_at)),
             )

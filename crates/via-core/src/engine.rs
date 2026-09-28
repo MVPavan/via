@@ -117,6 +117,10 @@ pub struct Engine {
     /// removed when its future ends or is dropped (design §6.8 step 3).
     /// Final shutdown settles nothing of a session still here.
     dispatching: StdMutex<HashSet<SessionId>>,
+    /// The latest Store failure and the count since start (design §7.5).
+    failures: StdMutex<latch::FailureRecord>,
+    /// Phase-one time of the latching failure (design §7.4 [r3.17]).
+    failed_at: OnceLock<tokio::time::Instant>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -308,6 +312,8 @@ impl Engine {
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),
             dispatching: StdMutex::new(HashSet::new()),
+            failures: StdMutex::new(latch::FailureRecord::default()),
+            failed_at: OnceLock::new(),
             #[cfg(test)]
             faults: Faults::default(),
         })

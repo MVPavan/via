@@ -93,7 +93,9 @@ impl Cancelled {
             Self::Committed(_) => QueuedOutcome::Committed,
             Self::Unread | Self::Expired => QueuedOutcome::ReadFailed,
             Self::Failed(WriteOutcome::NotCommitted) => QueuedOutcome::NotCommitted,
-            Self::Failed(WriteOutcome::Uncertain) | Self::Latched => QueuedOutcome::Uncertain,
+            Self::Failed(WriteOutcome::Uncertain | WriteOutcome::Corrupt) | Self::Latched => {
+                QueuedOutcome::Uncertain
+            }
         }
     }
 }
@@ -217,7 +219,9 @@ impl Engine {
         turn: TurnNumber,
     ) -> Step {
         let cause = slot.cause(turn);
-        let cancelled = self.cancel_queued(slot, session, turn, false, cause).await;
+        let cancelled = self
+            .cancel_queued(slot, session, (turn, Owner::Dispatcher), false, cause)
+            .await;
         match cancelled {
             Cancelled::Committed(_) => Step::Next,
             Cancelled::Unread => Step::Wait,
@@ -410,7 +414,13 @@ impl Engine {
                 }
                 // Force cancellations keep `cancel: null` (design §3.2).
                 let cancelled = self
-                    .cancel_queued(slot, session, turn, Some(turn) == last, None)
+                    .cancel_queued(
+                        slot,
+                        session,
+                        (turn, Owner::Dispatcher),
+                        Some(turn) == last,
+                        None,
+                    )
                     .await;
                 match cancelled {
                     Cancelled::Committed(_) => break,
@@ -704,17 +714,19 @@ impl Engine {
     /// Commits a never-submitted turn `queued → cancelled` (C1 §7.2), behind
     /// an `unknown` predecessor, under force, or for a caller `cancel` or a
     /// `close` (`cause`, with its `requested_at`); no vendor I/O happened.
-    /// The caller owns the turn's `Cancelling` claim. Once committed the turn
+    /// `owner` holds the turn's `Cancelling` claim. Once committed the turn
     /// leaves the queue. A failed or uncertain commit reaches the failure
-    /// hook; a failed read before it writes nothing. With `closing` (the last
-    /// queued turn under force), `admission` is held from the latch and
+    /// hook; a failed read before it writes nothing. A request's commit that
+    /// is not committed is scoped to the request (design §7.2 row 8): the
+    /// turn stays unresolved only as a receipted turn. With `closing` (the
+    /// last queued turn under force), `admission` is held from the latch and
     /// close check through the commit, and `session.closed` rides on it when
     /// no other turn of the session is unresolved.
     pub(super) async fn cancel_queued(
         &self,
         slot: &Slot,
         session: &SessionId,
-        turn: TurnNumber,
+        (turn, owner): (TurnNumber, Owner),
         closing: bool,
         cause: Option<(CancelCause, String)>,
     ) -> Cancelled {
@@ -787,15 +799,18 @@ impl Engine {
         let durable = match committed {
             Ok(durable) => durable,
             Err(error) => {
-                self.unresolved.fail(session, turn, TurnState::Queued);
                 let outcome = journal::outcome_of(&error);
-                self.store_failure(
-                    FailureSite::QueuedCancel,
-                    outcome,
-                    FailureScope::Turn(session, turn),
-                )
-                .finish_with(admission.as_ref())
-                .await;
+                let site = match owner {
+                    Owner::Request => FailureSite::RequestCancel,
+                    // Until the same-sequence retry (row 9), a dispatcher's
+                    // failed cancellation escalates at once.
+                    Owner::Dispatcher => FailureSite::Resolution,
+                };
+                let latching = self.store_failure(site, outcome, FailureScope::Turn(session, turn));
+                if latching.latches() {
+                    self.unresolved.fail(session, turn, TurnState::Queued);
+                }
+                latching.finish_with(admission.as_ref()).await;
                 return Cancelled::Failed(outcome);
             }
         };
@@ -859,7 +874,9 @@ impl Engine {
             TerminalExtras::default(),
         )
         .await;
-        self.finished(started, &finished, held).await;
+        // Design §7.2 row 15: a forced terminal is final shutdown's.
+        self.finished(started, &finished, held, FailureSite::ForcedTerminal)
+            .await;
         finished.map(drop)
     }
 
@@ -886,16 +903,19 @@ impl Engine {
             extras,
         )
         .await;
-        self.finished(started, &finished, held).await;
+        self.finished(started, &finished, held, FailureSite::Terminal)
+            .await;
         finished.map(drop)
     }
 
-    /// Reports a terminal commit that failed or was uncertain to the failure hook.
+    /// Reports a terminal commit at `site` that failed or was uncertain to
+    /// the failure hook.
     async fn finished(
         &self,
         started: &Started,
         finished: &Result<Durable, ApiError>,
         held: Option<&super::Admission<'_>>,
+        site: FailureSite,
     ) {
         let failed = match finished {
             Ok(durable) if !durable.uncertain => None,
@@ -904,7 +924,7 @@ impl Engine {
         };
         if let Some(outcome) = failed {
             let scope = FailureScope::Turn(&started.session, started.turn);
-            self.store_failure(FailureSite::Terminal, outcome, scope)
+            self.store_failure(site, outcome, scope)
                 .finish_with(held)
                 .await;
         }
@@ -1352,7 +1372,7 @@ impl Engine {
             Ok(()) => head.committed(1),
             Err(error) => {
                 let outcome = WriteOutcome::of(&error);
-                if outcome == WriteOutcome::Uncertain {
+                if outcome.head_unknown() {
                     head.lost();
                 }
                 return Err(SubmitFailure::Failed(outcome));

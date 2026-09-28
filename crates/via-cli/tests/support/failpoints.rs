@@ -65,7 +65,13 @@ impl Failpoints {
                 fs::remove_file(self.dir.join(name.as_ref())).map_err(|error| error.to_string())?;
             }
         }
-        let command = json!({"token":self.token,"occurrence":occurrence,"action":action});
+        // `fail_io_persist` is `fail_io` with `persist`: every hit from
+        // `occurrence` on fails, each acknowledged as `fail_io` (design §10).
+        let command = match action {
+            "fail_io_persist" => json!({"token":self.token,"occurrence":occurrence,
+                "action":"fail_io","persist":true}),
+            action => json!({"token":self.token,"occurrence":occurrence,"action":action}),
+        };
         let temporary = self.dir.join(format!(".{point}.json.tmp"));
         let mut file = OpenOptions::new()
             .write(true)

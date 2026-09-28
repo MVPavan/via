@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use super::drive::Cancelled;
 use super::journal::Head;
-use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS};
+use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Started, Terminal, TurnRecord, failure, journal};
@@ -154,8 +154,14 @@ impl Engine {
                 self.queued.fetch_add(1, Ordering::AcqRel);
                 if cancel || close {
                     if !matches!(
-                        self.cancel_queued(&slot, &session, turn, false, cause)
-                            .await,
+                        self.cancel_queued(
+                            &slot,
+                            &session,
+                            (turn, Owner::Dispatcher),
+                            false,
+                            cause
+                        )
+                        .await,
                         Cancelled::Committed(_)
                     ) {
                         return Err(format!(

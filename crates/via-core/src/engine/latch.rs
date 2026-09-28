@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use via_store::StoreError;
@@ -14,7 +15,7 @@ use super::journal::may_have_committed;
 use super::stop::StopMode;
 use super::{Admission, Engine, lock};
 use crate::api::rfc3339;
-use crate::{SessionId, TurnNumber};
+use crate::{ApiError, SessionId, TurnNumber};
 
 /// Final shutdown's budgets (design §6.8, the one table [r4.2, r5.10]),
 /// each measured back from the final deadline. The reserve is per pipeline,
@@ -49,7 +50,9 @@ const HOST_STOP: Duration = Duration::from_secs(3);
 /// dispatchers join before Host reconciliation needs its time (§6.7).
 const READ_RETRY_RESERVE: Duration = FINALIZE_RESERVE.saturating_add(HOST_STOP);
 
-/// Where a Core Store write failed: one site per row of design §7.2.
+/// Where a Core Store write failed: one site per row of design §7.2, plus
+/// the resolution write, the dispatcher's reads (§7.3) and the latch batch
+/// (§7.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FailureSite {
     /// A `spawn` or `resume` receipt (row 1).
@@ -58,9 +61,14 @@ pub(super) enum FailureSite {
     Submission,
     /// Acceptance, a turn event or `cancel.requested` (row 5).
     Event,
-    /// A running turn's terminal (row 7) or its resolution write.
+    /// A running turn's natural terminal, which is retried once (row 7).
     Terminal,
-    /// A `queued → cancelled` commit (rows 8 and 9).
+    /// A turn's one resolution write after its first failure, or the one
+    /// retry of rows 7 and 9 (design §7.2 escalation).
+    Resolution,
+    /// A caller's `queued → cancelled` (row 8).
+    RequestCancel,
+    /// A dispatcher's `queued → cancelled`, which is retried once (row 9).
     QueuedCancel,
     /// The force closure pass's standalone `session.closed` (row 14).
     SessionClosed,
@@ -68,6 +76,45 @@ pub(super) enum FailureSite {
     Closing,
     /// A close's `Closed` commit (row 11).
     Closed,
+    /// A forced turn's terminal in final shutdown (row 15).
+    ForcedTerminal,
+}
+
+impl FailureSite {
+    /// Whether a not-committed write at this site is scoped to its request,
+    /// turn or session (design §7.2): every row but the escalation.
+    fn scoped(self) -> bool {
+        match self {
+            Self::Receipt
+            | Self::RequestCancel
+            | Self::SessionClosed
+            | Self::Closing
+            | Self::Closed
+            | Self::ForcedTerminal => true,
+            // Until their resolution writes exist, these latch as before.
+            Self::Submission
+            | Self::Event
+            | Self::Terminal
+            | Self::QueuedCancel
+            | Self::Resolution => false,
+        }
+    }
+
+    /// `store_failure.scope` of a scoped failure (design §7.5): a receipt, a
+    /// caller cancel and `Closing` are the request's; `Closed` and a closure
+    /// commit the session's; the rest the turn's.
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Receipt | Self::RequestCancel | Self::Closing => "request",
+            Self::Closed | Self::SessionClosed => "session",
+            Self::Submission
+            | Self::Event
+            | Self::Terminal
+            | Self::Resolution
+            | Self::QueuedCancel
+            | Self::ForcedTerminal => "turn",
+        }
+    }
 }
 
 /// A failed write's durable outcome (design §7.1).
@@ -77,25 +124,45 @@ pub(super) enum WriteOutcome {
     NotCommitted,
     /// The write may have committed.
     Uncertain,
+    /// SQLite reported corruption (`SQLITE_CORRUPT`, `SQLITE_NOTADB`).
+    Corrupt,
 }
 
 impl WriteOutcome {
-    /// Classifies a Store error by whether its write may have committed.
+    /// Classifies a Store error (design §7.1's one mapping): corruption,
+    /// a write that may have committed, or one that did not.
     pub(super) fn of(error: &StoreError) -> Self {
-        if may_have_committed(error) {
+        if matches!(error, StoreError::Corrupt(_)) {
+            Self::Corrupt
+        } else if may_have_committed(error) {
             Self::Uncertain
         } else {
             Self::NotCommitted
         }
     }
+
+    /// Whether the write may be durable, so the session head is re-read
+    /// before its next event (design §7.1 sequence numbers).
+    pub(super) fn head_unknown(self) -> bool {
+        match self {
+            Self::NotCommitted => false,
+            Self::Uncertain | Self::Corrupt => true,
+        }
+    }
+
+    /// The `store_error` a request reports for its failed commit: `unknown`
+    /// unless nothing was written (C1 §8.1).
+    pub(super) fn api_error(self) -> ApiError {
+        match self {
+            Self::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
+            Self::Uncertain | Self::Corrupt => ApiError::RECEIPT_UNKNOWN,
+        }
+    }
 }
 
-/// Who a failed write belongs to (design §7.2 scope).
+/// Who a failed write belongs to (design §7.2 scope): the failure record's
+/// `affected` addresses (§7.5).
 #[derive(Clone, Copy, Debug)]
-#[expect(
-    dead_code,
-    reason = "the addresses are for S5's failure record (design §7.5); the hook stub latches"
-)]
 pub(super) enum FailureScope<'a> {
     /// A request that has not been receipted.
     Request,
@@ -105,22 +172,88 @@ pub(super) enum FailureScope<'a> {
     Session(&'a SessionId),
 }
 
-/// Phase two of a latch the failure hook began; the caller finishes it
-/// under `admission`, as its lock position allows.
+impl FailureScope<'_> {
+    /// The C1 addresses of the failure's turn or session.
+    fn addresses(self) -> Vec<String> {
+        match self {
+            Self::Request => Vec::new(),
+            Self::Turn(session, turn) => vec![format!("{}/{}", session.as_str(), turn.get())],
+            Self::Session(session) => vec![session.as_str().to_owned()],
+        }
+    }
+}
+
+/// Most addresses `store_failure.affected` lists (design §7.5).
+const AFFECTED_ADDRESSES: usize = 16;
+
+/// The latest Store failure and how many there were since daemon start
+/// (design §7.5): an Engine `std` mutex, taken alone, never across an
+/// `.await`. No wake.
+#[derive(Default)]
+pub(super) struct FailureRecord {
+    latest: Option<LatestFailure>,
+    count: u64,
+}
+
+/// The latest failure's `store_failure` fields; no prompt, payload or handle.
+struct LatestFailure {
+    kind: &'static str,
+    scope: &'static str,
+    since: String,
+    addresses: Vec<String>,
+}
+
+/// `store_failure.kind` (design §7.5): corruption first, then an uncertain
+/// outcome, then the site's own kind.
+fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
+    match outcome {
+        WriteOutcome::Corrupt => "corrupt_store",
+        WriteOutcome::Uncertain => "commit_uncertain",
+        WriteOutcome::NotCommitted => match site {
+            FailureSite::Receipt
+            | FailureSite::Submission
+            | FailureSite::Event
+            | FailureSite::Terminal
+            | FailureSite::Resolution
+            | FailureSite::RequestCancel
+            | FailureSite::QueuedCancel
+            | FailureSite::SessionClosed
+            | FailureSite::Closing
+            | FailureSite::Closed
+            | FailureSite::ForcedTerminal => "commit_failed",
+        },
+    }
+}
+
+/// Phase two of a latch the failure hook began, if it latched; the caller
+/// finishes it under `admission`, as its lock position allows. A scoped
+/// failure's finish does nothing.
 #[must_use = "phase two of the latch runs under admission"]
-pub(super) struct Latching<'a>(&'a Engine);
+pub(super) struct Latching<'a> {
+    engine: &'a Engine,
+    latches: bool,
+}
 
 impl Latching<'_> {
+    /// Whether the failure latched (design §7.4) rather than being scoped.
+    pub(super) fn latches(&self) -> bool {
+        self.latches
+    }
+
     /// Takes `admission` and finalizes the latch; the caller holds no slot,
-    /// session or head lock.
+    /// session or head lock. A scoped failure takes nothing.
     pub(super) async fn finish(self) {
-        let admission = self.0.admission.lock().await;
-        self.0.latch_held(&admission);
+        if self.latches {
+            let admission = self.engine.admission.lock().await;
+            self.engine.latch_held(&admission);
+        }
     }
 
     /// Finalizes the latch under the caller's `admission`.
     pub(super) fn finish_held(self, admission: &Admission<'_>) {
-        self.0.latch_held(admission);
+        if self.latches {
+            self.engine.latch_held(admission);
+        }
     }
 
     /// Finalizes the latch, under `admission` if the caller holds it.
@@ -134,19 +267,83 @@ impl Latching<'_> {
 
 impl Engine {
     /// Core's one Store write-failure entry point (design §7 [r3.18]):
-    /// every failure site reports its site, outcome and scope. S5 applies
-    /// design §7.2's table here; until then every failure latches, as
-    /// before. Phase one runs now; the caller finishes phase two.
+    /// every failure site reports its site, outcome and scope. Design §7.2's
+    /// split (O1): a not-committed write is scoped to its request, turn or
+    /// session; an uncertain one, SQLite corruption and a failed resolution
+    /// write (the escalation) latch. Either way the failure record is
+    /// updated (§7.5). A latch's phase one runs now; the caller finishes
+    /// phase two. Lock: the failure-record mutex alone, then, when latching,
+    /// the `stop` mutex alone. Wakes: the force watch (phase one).
     pub(super) fn store_failure(
         &self,
         site: FailureSite,
         outcome: WriteOutcome,
         scope: FailureScope<'_>,
     ) -> Latching<'_> {
-        // Safe to ignore until S5: the latch is the same for every failure.
-        let _ = (site, outcome, scope);
-        self.fail_pending();
-        Latching(self)
+        let latches = match outcome {
+            WriteOutcome::Uncertain | WriteOutcome::Corrupt => true,
+            WriteOutcome::NotCommitted => !site.scoped(),
+        };
+        self.record_failure(site, outcome, scope, latches);
+        if latches {
+            self.fail_pending();
+        }
+        Latching {
+            engine: self,
+            latches,
+        }
+    }
+
+    /// Records the latest failure (design §7.5); the latch's scope is
+    /// `daemon`.
+    fn record_failure(
+        &self,
+        site: FailureSite,
+        outcome: WriteOutcome,
+        scope: FailureScope<'_>,
+        latches: bool,
+    ) {
+        let latest = LatestFailure {
+            kind: failure_kind(site, outcome),
+            scope: if latches { "daemon" } else { site.scope() },
+            since: rfc3339(SystemTime::now()),
+            addresses: scope.addresses(),
+        };
+        let mut record = lock(&self.failures);
+        record.count = record.count.saturating_add(1);
+        record.latest = Some(latest);
+    }
+
+    /// `daemon/status` `health` (design §7.5): `store_failed` from the
+    /// latch's phase one on, sticky.
+    pub fn health(&self) -> &'static str {
+        if self.store_failed() {
+            "store_failed"
+        } else {
+            "healthy"
+        }
+    }
+
+    /// `daemon/status` `store_failure` (design §7.5, amendment A9): `None`
+    /// until the first failure, then the latest one with the count since
+    /// daemon start. It carries no prompt, payload or handle.
+    pub fn store_failure_status(&self) -> Option<Value> {
+        let record = lock(&self.failures);
+        let latest = record.latest.as_ref()?;
+        let listed: Vec<&String> = latest.addresses.iter().take(AFFECTED_ADDRESSES).collect();
+        Some(json!({
+            "kind": latest.kind,
+            "scope": latest.scope,
+            "since": latest.since,
+            "count": record.count,
+            "affected": {"addresses": listed, "count": latest.addresses.len()},
+        }))
+    }
+
+    /// The latching failure's phase-one time (design §7.4 [r3.17]): final
+    /// shutdown's deadline and diagnostic window run from it.
+    pub fn failed_at(&self) -> Option<tokio::time::Instant> {
+        self.failed_at.get().copied()
     }
 
     /// Latches Store failure after Core's first failed or uncertain state
@@ -182,6 +379,7 @@ impl Engine {
             return;
         }
         *stop = Some(StopMode::Force);
+        self.failed_at.get_or_init(tokio::time::Instant::now);
         self.force_requested_at
             .get_or_init(|| rfc3339(SystemTime::now()));
         self.force.send_replace(true);

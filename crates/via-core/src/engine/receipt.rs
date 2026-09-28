@@ -23,18 +23,16 @@ use crate::{
 };
 
 impl Engine {
-    /// A receipt commit that reported failure (C1 §8.1, runtime §7): latches
-    /// Store failure and is `store_error` with `commit_outcome`, `unknown`
-    /// with `retry: same_key_only` when it may have committed. Restart
-    /// recovery settles an unknown one.
+    /// A receipt commit that reported failure (C1 §8.1, design §7.2 row 1):
+    /// `store_error` with `commit_outcome`. Not committed, it is scoped to
+    /// the request; one that may have committed, or hit corruption, latches
+    /// and is `unknown` with `retry: same_key_only`, which restart recovery
+    /// settles.
     fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
         let outcome = WriteOutcome::of(error);
         self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
             .finish_held(admission);
-        match outcome {
-            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-        }
+        outcome.api_error()
     }
 
     /// A receipt commit's reply, lost by the test fault backend when armed.
@@ -313,7 +311,7 @@ impl Engine {
                 return Err(ApiError::SESSION_CLOSED);
             }
             Err(error) => {
-                if journal::may_have_committed(&error) {
+                if WriteOutcome::of(&error).head_unknown() {
                     head.lost();
                 } else {
                     drop(head);

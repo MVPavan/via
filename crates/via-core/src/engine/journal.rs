@@ -401,7 +401,7 @@ pub(super) async fn commit_event_at(
     if let Err(error) = committed {
         let outcome = WriteOutcome::of(&error);
         record.first_failure = failed(outcome);
-        if outcome == WriteOutcome::Uncertain {
+        if outcome.head_unknown() {
             head.lost();
             record.uncertain = Some(UncertainEvent {
                 seq,

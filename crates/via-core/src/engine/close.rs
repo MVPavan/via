@@ -15,7 +15,7 @@ use via_store::{
 
 use super::drive::{Cancelled, Step};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::{CLOSE_ALLOWANCE, CloseOrder, CloseWatch, Slot, Sweep};
+use super::queue::{CLOSE_ALLOWANCE, CloseOrder, CloseWatch, Owner, Slot, Sweep};
 use super::stop::StopMode;
 use super::{Admission, Engine, lock};
 use crate::api::{DEFAULT_CLOSE_DEADLINE_MS, Event, EventBody, retry_key, rfc3339};
@@ -183,7 +183,7 @@ impl Engine {
             return ApiError::SESSION_CLOSED;
         }
         let outcome = WriteOutcome::of(error);
-        if outcome == WriteOutcome::Uncertain {
+        if outcome.head_unknown() {
             lock(&self.closing).insert(session.clone());
         }
         self.retire(session);
@@ -193,10 +193,7 @@ impl Engine {
             FailureScope::Session(session),
         )
         .finish_held(admission);
-        match outcome {
-            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-        }
+        outcome.api_error()
     }
 
     /// Subscribes to the close attempt under `admission`, releases it, and
@@ -253,7 +250,9 @@ impl Engine {
                     }
                 }
                 Sweep::Cancel(turn, cause) => {
-                    let cancelled = self.cancel_queued(slot, session, turn, false, cause).await;
+                    let cancelled = self
+                        .cancel_queued(slot, session, (turn, Owner::Dispatcher), false, cause)
+                        .await;
                     match cancelled {
                         Cancelled::Committed(_) => {}
                         // The claim stays; the dispatcher timer retries it.
@@ -310,10 +309,7 @@ impl Engine {
                 *refused = false;
                 self.store_failure(FailureSite::Closed, outcome, FailureScope::Session(session))
                     .finish_held(&admission);
-                slot.finish_close(Err(match outcome {
-                    WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-                    WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-                }));
+                slot.finish_close(Err(outcome.api_error()));
                 Some(Step::Next)
             }
         }
@@ -388,7 +384,7 @@ impl Engine {
             Ok(ClosedOutcome::Unfinished) => Ok(ClosedOutcome::Unfinished),
             Err(error) => {
                 let outcome = WriteOutcome::of(&error);
-                if outcome == WriteOutcome::Uncertain {
+                if outcome.head_unknown() {
                     head.lost();
                 }
                 Err(outcome)
