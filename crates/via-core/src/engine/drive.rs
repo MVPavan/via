@@ -725,6 +725,8 @@ impl Engine {
             observed_tx,
             deadline,
             self.force.subscribe(),
+            // T3-S1 compile allowance: an inert stop watch; S2 owns orders.
+            tokio::sync::watch::channel(None).1,
             capacity,
         ));
         // No branch is cancelled mid-commit: an observation arm runs to completion

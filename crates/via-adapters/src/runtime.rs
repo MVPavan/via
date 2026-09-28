@@ -7,8 +7,8 @@ use tokio::{
 use crate::{
     AcceptanceToken, Cleanup, ConnectionId, Deadline, FakeAcceptanceObservation, FakeConfig,
     FakeObservation, FakeTerminalEvidence, MAX_OBSERVATION_BYTES, Observation, ProcessOwner,
-    RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, TurnNumber,
-    VendorTerminalStatus, VendorTurnId,
+    ReprobeReport, RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch,
+    TurnNumber, VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
     FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteMessage, TerminalStatus, WireRecovery,
@@ -92,6 +92,7 @@ impl AdapterRuntime {
     /// if Core cannot take an observation, the Route receiver is dropped so Route
     /// fails the turn as overflow and still performs its cleanup and drain.
     /// `force` set force-closes the turn through Route (C2 Close(Force)).
+    /// `stop` is the turn's stop order, passed through to Route (design §2).
     #[expect(
         clippy::too_many_arguments,
         reason = "each argument is a distinct input of the one turn"
@@ -105,6 +106,7 @@ impl AdapterRuntime {
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
         force: watch::Receiver<bool>,
+        stop: StopWatch,
         capacity: via_routes::CapacityToken,
     ) -> Result<FakeTerminalEvidence, AdapterError> {
         let owner = ProcessOwner {
@@ -129,6 +131,7 @@ impl AdapterRuntime {
             route_tx,
             deadline,
             force.clone(),
+            stop,
         );
         let mut force = force;
         tokio::pin!(route);
@@ -163,6 +166,7 @@ impl AdapterRuntime {
                             launched: true,
                             cleanup: None,
                             forced: false,
+                            journal_uncertain: result.journal_uncertain,
                         })),
                         Err(failure) => Err(AdapterError::Route(failure)),
                     };
@@ -204,6 +208,38 @@ impl AdapterRuntime {
     /// earlier daemon left unproved (design §11).
     pub fn hold_capacity(&self, anchor_id: String, token: via_routes::CapacityToken) {
         self.route.hold_capacity(anchor_id, token);
+    }
+
+    /// One non-signalling re-probe pass over held groups, optionally only
+    /// one session's (design §8, and §4's bounded absence check before
+    /// `Closed`). An uncertain proof commit is an error, which latches.
+    pub async fn reprobe_held(
+        &self,
+        deadline: Deadline,
+        owner: Option<SessionId>,
+    ) -> Result<ReprobeReport, AdapterError> {
+        self.route
+            .reprobe_held(deadline, owner)
+            .await
+            .map_err(AdapterError::Open)
+    }
+
+    /// Held groups no live control owns: `connections.held_unproven`'s Host
+    /// part (design §6.6).
+    pub fn held_unproven(&self) -> usize {
+        self.route.held_unproven()
+    }
+
+    /// Groups whose cleanup a live control or acquisition still owns, which
+    /// block idle exit (design §6.4).
+    pub fn pending_cleanup(&self) -> usize {
+        self.route.pending_cleanup()
+    }
+
+    /// Subscribes Host's early-stop task to the daemon force signal (design
+    /// §6.8); call once, from within the daemon's runtime.
+    pub fn watch_force(&self, force: watch::Receiver<bool>) {
+        self.route.watch_force(force);
     }
 
     /// Recovers one page of committed anchors, up to `limit` after the
@@ -368,6 +404,7 @@ fn normalize_terminal(result: FakeRouteResult) -> FakeTerminalEvidence {
             via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,
             via_routes::WireCleanup::Uncertain => Cleanup::Uncertain,
         },
+        journal_uncertain: result.journal_uncertain,
     }
 }
 

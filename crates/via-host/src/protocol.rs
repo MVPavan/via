@@ -22,6 +22,12 @@ pub(crate) struct Bootstrap {
     pub marker: String,
     pub controller_pid: u32,
     pub socket_path: PathBuf,
+    /// Test builds only: the daemon's failpoint directory and token. The
+    /// anchor runs without the daemon's environment, so its seams activate
+    /// from here (design §10).
+    #[cfg(feature = "test-failpoints")]
+    #[serde(default)]
+    pub failpoints: Option<(PathBuf, String)>,
 }
 
 #[derive(Serialize, Deserialize)]

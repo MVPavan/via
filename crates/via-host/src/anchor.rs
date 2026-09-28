@@ -48,6 +48,10 @@ async fn run(path: &Path) -> io::Result<()> {
     if bootstrap.marker.len() != 32 || bootstrap.generation.len() != 32 {
         return Err(io::Error::other("invalid bootstrap"));
     }
+    #[cfg(feature = "test-failpoints")]
+    if let Some((dir, token)) = &bootstrap.failpoints {
+        via_store::failpoint::activate(dir, token).map_err(io::Error::other)?;
+    }
     let mut terminate = signal(SignalKind::terminate())
         .map_err(|error| io::Error::new(error.kind(), format!("signal: {error}")))?;
     let listener = UnixListener::bind(&bootstrap.socket_path)
@@ -147,7 +151,19 @@ async fn serve(
                 )
                 .await?;
             }
-            None => return Ok(()),
+            // Host's early stop can reach a control before ARM (design §6.8
+            // [r5.2]): no vendor exists, so the anchor alone leaves its group.
+            Some(Request::Stop { generation, .. }) if generation == bootstrap.generation => {
+                let reply = Reply::Stopping {
+                    stopped_live: false,
+                };
+                let _ = protocol::write_frame(&mut stream, &reply, 1024).await;
+                return Ok(());
+            }
+            None => {
+                eof_cleanup_seam().await;
+                return Ok(());
+            }
             _ => return Err(io::Error::other("invalid pre-arm control")),
         }
     }
@@ -200,6 +216,8 @@ async fn armed(
                         begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, grace.min(Duration::from_millis(200)));
                         let reply = Reply::Stopping { stopped_live: stopped_live == Some(true) };
                         match controller.as_mut() {
+                            // Runtime §11: the reply is lost; the stop still runs.
+                            Some(_) if final_reply_lost().await => true,
                             Some(active) => protocol::write_frame(active, &reply, 1024).await.is_err(),
                             None => true,
                         }
@@ -210,6 +228,9 @@ async fn armed(
                     controller = None;
                     reader.reset();
                     verified_connection = false;
+                    if kill_at.is_none() {
+                        eof_cleanup_seam().await;
+                    }
                     begin_cleanup(&mut kill_at, &mut stopped_live, &mut child, Duration::from_millis(200));
                 }
             }
@@ -325,6 +346,34 @@ fn begin_cleanup(
         let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
         *kill_at = Some(proposed);
     }
+}
+
+/// Test-only `host.anchor.before_eof_cleanup`: a pause holds the anchor
+/// before its EOF cleanup, the slow anchor exit of design §10 [r1.8].
+#[cfg(feature = "test-failpoints")]
+async fn eof_cleanup_seam() {
+    let _ = via_store::failpoint::hit_async("host.anchor.before_eof_cleanup").await;
+}
+
+/// Release builds have no seam before the EOF cleanup.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn eof_cleanup_seam() {}
+
+/// Test-only `host.anchor.final_reply_lost` (runtime §11): true drops the
+/// `Stop` reply; the cleanup it started continues.
+#[cfg(feature = "test-failpoints")]
+async fn final_reply_lost() -> bool {
+    via_store::failpoint::hit_async("host.anchor.final_reply_lost")
+        .await
+        .is_err()
+}
+
+/// Release builds never lose a reply.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds can lose the reply here")]
+async fn final_reply_lost() -> bool {
+    false
 }
 
 fn current_identity(marker: &str) -> io::Result<WireIdentity> {
