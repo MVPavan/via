@@ -3,7 +3,9 @@
 Status: T3-0 round 4. It applies `design-r1-decisions.md` (tags such as
 `[r1.4]`), the owner's decisions in `owner-decisions.md` (tags such as
 `[O1.D4]`, `[O2]`, `[O3]`), `design-r3-decisions.md` (`[r3.7]`) and
-`design-r4-decisions.md` (`[r4.2]`) and `design-r5-decisions.md` (`[r5.1]`).
+`design-r4-decisions.md` (`[r4.2]`), `design-r5-decisions.md` (`[r5.1]`) and
+the final `design-r6-decisions.md` (`[r6.1]`). The design is final after
+round 6; later findings are handled in the slices' code reviews.
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -711,7 +713,8 @@ while the daemon is idle.
   - an empty durable closing set [r3.5];
   - no pending start;
   - no Host control or close task still running for a group this daemon
-    launched (runtime §8 "pending cleanup").
+    launched (runtime §8 "pending cleanup"). The Host early-stop task
+    (§6.8) is not pending cleanup and is excluded here [r6.2].
 - Cleanup already settled `uncertain`, and slots held for groups an earlier
   daemon left, do not block idle exit [r1.16]. The next start reconciles
   them again.
@@ -840,7 +843,7 @@ budgets. Every time is measured back from the final `deadline`: start +
 | Force-path read cutoff (§6.7) | `deadline − (FINALIZE_RESERVE + 3 s)` = `deadline − 8 s` | dispatcher reads under force, so the dispatchers join before Host reconciliation needs its time | `READ_RETRY_RESERVE = 4 s` (`crates/via-core/src/engine/latch.rs:17`) becomes `FINALIZE_RESERVE + 3 s` |
 | Host reconciliation (step 4) | `deadline − FINALIZE_RESERVE` = `deadline − 5 s` | Host's native 3 s stop and absence verification over the collected turns | the 1 s `FORCED_COMMIT_RESERVE` (`crates/via-core/src/engine/stop.rs:368`) |
 | `FINALIZE_RESERVE = 5 s` | `deadline` | 2 s for §7.4's re-read; 2 s for the batch or forced-terminal commit; 1 s for the closure pass | — |
-| Client joins, Store join | `deadline − 2 s` and `deadline` | `server/shutdown.rs`'s `STORE_RESERVE = 2 s` (unchanged) | — |
+| Client joins, Store join | `deadline − 2 s` and `deadline` | they run **after** the pipeline and take whatever time remains [r6.8]. `server/shutdown.rs`'s `STORE_RESERVE = 2 s` is unchanged. A pipeline that runs past `deadline − 2 s` already exits 4 | — |
 
 - **Per pipeline, not per turn** [r5.10]. The reserve covers one re-read,
   one commit and the closure pass. Each step 5 write is bounded by `min(2
@@ -866,15 +869,36 @@ a Store operation, a session head, or `admission`.
 - **Action.** On the signal, under the ledger mutex (a `std` mutex, taken
   alone), it sets the ledger's sticky `stopping` flag and snapshots the live
   controls.
-  - It sends `Stop` to all of them **concurrently**, each bounded at `now +
-    3 s` [r5.3].
+  - It sends `Stop` to all of the snapshot's **`armed`** entries
+    **concurrently**, each bounded at `now + 3 s` [r5.3, r6.1].
+  - It sends no `Stop` to a pre-ARM anchor. The anchor's pre-ARM loop
+    treats `Stop` as an invalid control and exits 1 [r6.1].
   - It polls no Core code, dispatcher or Route, and it takes no Core lock.
 - **Late registration** [r5.2]. A control is registered in the ledger as
   soon as it is verified, before ARM.
   - Registration and the early-stop snapshot are atomic under the ledger
     mutex.
-  - A control registered after the snapshot sees `stopping` and is stopped
-    at once, under the original force deadline.
+  - A control registered after the snapshot sees `stopping`. It is handled
+    by its phase, as below, under the original force deadline.
+- **Ledger phases** [r6.1]. Each ledger entry has a phase: `verified`,
+  `arming` or `armed`. Every phase change is made under the ledger mutex.
+  - **ARM gate.** The owner's ARM gate reads `stopping` under the ledger
+    mutex, atomically with the snapshot. If `stopping` is set, the gate
+    refuses with `HostError::Stopped`, and the control is dropped for the
+    EOF exit, as in §7.2 row 4. No `Stop` frame is sent. Otherwise it marks
+    the entry `arming` and sends ARM.
+  - **`Spawned`.** The owner marks the entry `armed` under the ledger mutex
+    immediately after `Spawned`, before `commit_vendor_facts`. If
+    `stopping` is set at that point, the owner itself sends `Stop` under
+    the original force deadline.
+  - **Stopped.** Any acquisition failure after `stopping` was observed
+    returns `HostError::Stopped`. Route reports it as `Stopped { launched:
+    false }` before ARM, and as the force row after `armed`.
+  - **Interactions.** Each phase change is one short ledger-mutex section,
+    taken alone. No new wakes. Every entry is covered by exactly one of
+    three: the early stop (`armed` at snapshot time), the owner's own
+    `Stop` (armed after the snapshot), or the ARM gate refusal (pre-ARM).
+    So no live vendor is missed, and no pre-ARM anchor ever gets a `Stop`.
 - **Single owner of each control.** Host's per-anchor control owner is the
   only writer to an anchor control. Route's own stop requests (§2 rules 2
   and 3, force, cancel and close) go through the same owner. The two stops
@@ -905,6 +929,9 @@ a Store operation, a session head, or `admission`.
 - **Interactions.**
   - Stop and drain: not triggered; the task exits on Host's shutdown
     signal [r5.1].
+  - Idle exit: the early-stop task is **not** pending cleanup. It is
+    excluded from the pending-cleanup count and from the §6.4 idle
+    predicate. Only Host's shutdown join counts it [r6.2].
   - Force and latch: triggered, including for late registrations [r5.2].
   - Connection slots: released only by proofs, unchanged.
   - Restart: nothing persists.
@@ -1157,7 +1184,8 @@ the latch:
   the ordered pipeline of §6.8 (re-probe join, start drain, dispatcher
   join and handoff collection, Host reconciliation, finalization with that
   evidence, closure pass). It never reorders it [r3.3, r4.2]. The window
-  starts at `enter_final_shutdown` on the latch's phase two (§6.8) [r4.7].
+  starts at `enter_final_shutdown`, which phase one's force signal
+  triggers (§6.8). It does not wait for phase two [r4.7, r6.7].
   - Mutations get `store_error`. `daemon/stop` gets `{"stopping": true}`.
   - Reads (`hello`, `daemon/status`, `result`, `wait`, `events`, `logs`)
     are served.
@@ -1442,7 +1470,9 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `host.early_stop.sent` | acknowledgement per group when Host's early-stop task has sent `Stop` (§6.8) [r4.3] |
 | `core.commit.before_send` | parks a dispatcher **before** it sends its Store operation, so the writer stays free (§11) [r5.7]. In S1's Store/Core compile allowance only if Core needs it; otherwise S5's |
 | `host.early_stop.snapshot` | pause after the early stop sets `stopping` and snapshots the ledger, before it sends (late-registration test) [r5.2] |
-| `host.anchor.withhold_stopped_live` | the fixture's anchor answers `Stop` without a positive `stopped_live` until reconciliation's `Stop`; its delivery is acknowledged (evidence test) [r5.4] |
+| `host.anchor.withhold_stopped_live` | fixture seam in the anchor. It defers `begin_cleanup` and withholds the positive `stopped_live` until reconciliation's `Stop`, identified by count (the Nth `Stop` received), which keeps the anchor alive until then. Route's close therefore reports `uncertain`. Delivery to reconciliation is acknowledged (evidence test) [r5.4, r6.3] |
+| `host.anchor.hold_stop` | fixture seam in the anchor: holds the named anchor's handling of `Stop` at a pause until released (concurrent-stops test) [r6.5] |
+| `core.close.before_subscribe` | pauses a close caller after its order check and before it subscribes to the close watch (§4 steps 2 and 5) [r6.6] |
 | `core.run.before_handoff` | the run loop, before it hands a forced turn to final shutdown [r3.3] |
 | `core.shutdown.before_forced_terminal` | final shutdown, before a forced turn's terminal commit [r3.4] |
 | `store.request.not_enqueued` | `NotEnqueued` (§7.1) |
@@ -1545,12 +1575,13 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f12_selective_queued_row_read_failure` | `store.read.queued_turn` persistent while predecessor reads succeed: the head turn is `failed(store)` at the lowered streak deadline without launch; the streak did not reset on the successful predecessor reads [r3.8] |
 | `s1_f12_latch_pipeline_orders_handoffs` | an uncertain event on turn A (`store.commit.reply_lost`) while turn B's run loop is paused at `core.run.before_handoff`. The window serves `daemon/status`. `core.shutdown.reconcile_entry` has not been acknowledged while B is unjoined, and its acknowledgement comes after B's handoff. B's group is already stopped (`host.early_stop.sent` and harness absence). After release, B's forced terminal uses reconciliation's evidence, and A's batch commits; both come before the exit (exit 4) [r3.3, r4.2, r4.9] |
 | `s1_f12_host_early_stop_independent_of_store` | turn B's dispatcher is parked at `core.commit.before_send` before sending its observation commit, so the writer stays free. The daemon latches through turn A's `store.commit.reply_lost`. Before B is released, the test asserts both `host.early_stop.sent` for B's group and the absence of B's group. After release, B ends by the force row, and the exit is 4 [r4.3, r5.7] |
-| `s1_f12_evidence_before_terminal` | force a turn while the fixture withholds the positive `stopped_live` until reconciliation (`host.anchor.withhold_stopped_live`), and Route's stop reply is lost (`host.anchor.final_reply_lost`). The delivery of `stopped_live` to reconciliation is acknowledged **before** the terminal commit, and the terminal is `cancelled` / `forced` with cleanup `quiescent`. **Variant:** all stop evidence is lost, so the terminal is `unknown`, with cleanup decided independently by the absence proof [r4.2, r5.4] |
+| `s1_f12_evidence_before_terminal` | force a turn while the anchor defers `begin_cleanup` and withholds the positive `stopped_live` until reconciliation's `Stop` (`host.anchor.withhold_stopped_live`), so the anchor stays alive and Route's close reports `uncertain`. Reconciliation supplies both facts: `stopped_live` and absence. Their delivery is acknowledged **before** the terminal commit, and the terminal is `cancelled` / `forced` with cleanup `quiescent` [r6.3]. **Variant:** all stop evidence is lost, so the terminal is `unknown`, with cleanup decided independently by the absence proof [r4.2, r5.4] |
 | `s1_close_waiter_resolves_on_force_and_latch` | a close is held at its absence check, and a second close subscribes. `daemon stop --force`: the absence check ends on the force watch, step 5's force re-check refuses `Closed`, and both waiters reply `daemon_stopping`. The variant with a latch: both reply `store_error`. No waiter is left to process exit [r4.6, r5.9] |
-| `s1_close_outcome_retained_for_late_subscriber` | the dispatcher publishes an outcome between a caller's order check and its subscription (a pause between the two steps). The caller still receives the outcome (`wait_for(Option::is_some)`). After a force exit, a keyed replay finds no attempt in progress and is fenced [r5.8] |
+| `s1_close_outcome_retained_for_late_subscriber` | two constraints hold: force is already accepted when the caller enters, and the racing publication is a force or latch exit. The caller is paused at `core.close.before_subscribe`, and the dispatcher's force (or latch) exit publishes in that window [r6.6]. The caller still receives the outcome (`wait_for(Option::is_some)`). After a force exit, a keyed replay finds no attempt in progress and is fenced [r5.8] |
 | `s1_host_early_stop_exits_on_plain_stop_and_drain` | a plain stop and a drain, with no force: exit 0, and the shutdown summary reports no pending Host task [r5.1] |
+| `s1_host_early_stop_arm_race` | the early stop is paused at `host.early_stop.snapshot` while a turn's ARM completes (`Spawned`): after release `host.early_stop.sent` is acknowledged for that group, sent by the owner or the snapshot, and the group is absent. **Pre-ARM variant:** `stopping` is set before the gate: the result is `Stopped { launched: false }`, and the anchor receives no `Stop` frame (it does not exit 1) [r6.1] |
 | `s1_host_early_stop_catches_late_registration` | a turn's control is verified and registered while the early stop is paused at `host.early_stop.snapshot`: after release the group is stopped under the original force deadline (`host.early_stop.sent` for it, and harness absence) [r5.2] |
-| `s1_host_early_stop_concurrent_stops` | two groups, one of whose anchor controls is held busy: the other group's `Stop` is sent without waiting for it, each within its own `now + 3 s` [r5.3] |
+| `s1_host_early_stop_concurrent_stops` | two groups; the fixture anchor of one holds its `Stop` at `host.anchor.hold_stop`. The other group's `host.early_stop.sent` acknowledgement arrives **while that pause is still held**. Each stop is within its own `now + 3 s` [r5.3, r6.5] |
 | `s1_shutdown_budget_read_cutoff_before_reconciliation` | a force-path read is stalled (`store.read.stall`): the read is abandoned by `deadline − 8 s`; `core.shutdown.reconcile_entry` is acknowledged before `deadline − 5 s`; forced terminals get reconciliation's evidence [r5.10] |
 | `s1_f12_forced_terminal_not_committed_in_shutdown` | force with `store.commit.terminal` armed at final shutdown's forced terminal: `uncommitted_turns: 1`, summary `store_failed: false`, exit 4. With `store.commit.reply_lost` instead: `store_failed: true` [r3.11] |
 | `s1_f12_status_reports_latest_failure` | `store_failure` shape after two scoped failures (`count: 2`, latest scope and addresses); an artifact scan finds no prompt, payload or handle (§7.5) |
@@ -1558,7 +1589,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f12_latch_batch_commits_or_is_skipped` | uncertain event on a turn with queued successors: the batch commits `failed(store)` and the cancellations. With `store.commit.fail_persistent` also armed: skipped within 2 s, `failure_batches.skipped: 1` (§7.4) |
 | `s1_f12_latch_cancel_and_close_return_store_error` | after the latch, `cancel` and `close` return `store_error`, and the force stop cleans up (§7.4, O1.D13) |
 | unit (`via-core` journal) | an event that is not committed leaves the head's `next` unchanged; an uncertain one calls `lost()` (§7.1) |
-| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; `try_send` `Full` gives `NotEnqueued`; `try_send` `Disconnected` and a dropped reply give `WriterLost`, for the writer and the raw thread alike; raw `Full` and raw I/O errors give `Raw` (row 6); `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`Raw`, `NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5] |
+| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; the SQLite writer's `try_send` `Full` gives `NotEnqueued` [r6.4]; `try_send` `Disconnected` and a dropped reply give `WriterLost`, for the writer and the raw thread alike; raw `Full` and raw I/O errors give `Raw` (row 6); `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`Raw`, `NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5] |
 
 The existing T2-B2 latch tests stay. Those that inject a **not committed**
 failure and expect the latch (for example
@@ -1711,6 +1742,8 @@ behaviour change.
     accessor, the anchor barrier and failpoints, the **early-stop task**
     and the single control owner (§6.8) [r4.3], with its shutdown signal,
     sticky `stopping`, concurrent stops and in-memory stop facts [r5.1–r5.4];
+    ledger phases, the ARM gate and `HostError::Stopped`; the task excluded
+    from pending cleanup [r6.1, r6.2]; the fixture seams [r6.3, r6.5];
     and the classified kind on `RouteError::Store` [r5.5], and §7.2 row 4 (stop
     through the live control when a journal write is not committed, and
     keep the in-memory identity with the ledger entry);
