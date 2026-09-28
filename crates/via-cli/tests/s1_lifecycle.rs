@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -604,6 +604,69 @@ fn s1_f02_stale_socket_replaced_after_lock() -> TestResult {
     let envelope = sandbox.wait(&format!("{session}/1"))?;
     check(envelope["state"] == "completed", || envelope.to_string())?;
     second.finish()
+}
+
+/// The socket's identity: inode and device.
+fn socket_identity(runtime: &Path) -> TestResult<(u64, u64)> {
+    let metadata = fs::symlink_metadata(runtime.join("via.sock"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// F2 (design §6.1): both locks precede any replacement of the socket. A
+/// daemon that loses `daemon.lock` (exit 75), or `store.lock` (exit 4), leaves
+/// a live socket exactly as it was: the same inode, still answering its owner.
+/// A stale socket is replaced only under both locks (the test above).
+#[test]
+fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
+    // `daemon.lock` held by a live daemon.
+    let sandbox = Sandbox::new(&json!({}))?;
+    let owner = sandbox.start()?;
+    let before = socket_identity(&sandbox.runtime)?;
+    let mut direct = sandbox.command();
+    direct.arg("daemon");
+    let loser = run_command(&mut direct, Duration::from_secs(10))?;
+    check(loser.status.code() == Some(75), || {
+        format!("the losing daemon: {}", loser.status)
+    })?;
+    check(
+        socket_identity(&sandbox.runtime).ok() == Some(before),
+        || "the losing daemon removed or replaced the socket".to_owned(),
+    )?;
+    check(sandbox.status()?["pid"] == owner.pid(), || {
+        "the owner no longer answers on its socket".to_owned()
+    })?;
+    owner.finish()?;
+    // `store.lock` held by another process, no `daemon.lock` holder: the
+    // socket is one the harness listens on.
+    let sandbox = Sandbox::new(&json!({}))?;
+    let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+    listener.set_nonblocking(true)?;
+    let before = socket_identity(&sandbox.runtime)?;
+    let store_lock = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(sandbox.state.join("store.lock"))?;
+    store_lock.try_lock()?;
+    let mut direct = sandbox.command();
+    direct.arg("daemon");
+    let loser = run_command(&mut direct, Duration::from_secs(10))?;
+    let stderr = String::from_utf8_lossy(&loser.stderr);
+    check(
+        loser.status.code() == Some(4) && stderr.contains("store.lock is held"),
+        || format!("the store-lock loser: {} {stderr}", loser.status),
+    )?;
+    check(
+        socket_identity(&sandbox.runtime).ok() == Some(before),
+        || "the store-lock loser removed or replaced the socket".to_owned(),
+    )?;
+    let _client = UnixStream::connect(sandbox.runtime.join("via.sock"))?;
+    listener
+        .accept()
+        .map_err(|error| format!("the harness's socket has no connection: {error}"))?;
+    Ok(())
 }
 
 /// F3 (design §6.1): an unsafe runtime root (a symlink, mode 0755, another
