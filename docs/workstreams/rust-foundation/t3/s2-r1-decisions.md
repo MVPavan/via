@@ -43,3 +43,24 @@ when S2 merges:
 - design §10: `core.cancel.settling`, plus any seam from decision 1;
 - design §11: the adapted tests;
 - C1: the `idle_ms` rules and the fake route's capabilities.
+
+## Round-1 check (Sol medium, `sol-review-S2-r1.md`)
+
+Round 1 (`42acc87`, `106ab23`, `1992a04`, `93f4ed4`, `77db485`): the gate
+was 231/2 and failpoints 295/2 three times. Sol: SOUND WITH CHANGES.
+Decision 1 is sound; decisions 2 and 3 fall short of their stated
+contracts.
+
+4. **F19's fallback interval starts no later than the idle origin.**
+   - The fallback started at the fake's gate, which is after acceptance
+     and after the idle clock's origin, so a late order could pass.
+   - Bound an interval on one monotonic clock that starts at or before
+     the origin. For example, the harness's own monotonic time before it
+     sends the request, through its observation of `cancel.requested`.
+   - Record a mutation RED: a late order that the old fallback passed.
+5. **An unfinished filtered re-probe counts only its session.**
+   - `held += remaining.len()` (`host.rs:869` at `77db485`) counts foreign
+     groups that were not yet examined.
+   - Keep the owner session with each held group, and count only the
+     requested session's groups, examined or not.
+   - The spent-deadline test asserts the exact count: two, not three.
