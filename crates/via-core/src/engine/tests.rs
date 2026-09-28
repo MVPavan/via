@@ -1476,6 +1476,16 @@ impl Drop for Release {
 /// any `pid_max`, so a re-probe proves it absent. Otherwise its identity is
 /// of another boot, which no probe can prove.
 async fn closing_with_anchor(root: &Path, provable: bool) -> SessionId {
+    closing_with_anchors(root, provable, 1).await
+}
+
+/// The id of [`closing_with_anchors`]'s `n`th anchor.
+fn anchor_id(n: usize) -> String {
+    format!("{n}-anchor")
+}
+
+/// [`closing_with_anchor`] with `count` such anchors, [`anchor_id`]`(0..count)`.
+async fn closing_with_anchors(root: &Path, provable: bool, count: usize) -> SessionId {
     use std::os::unix::fs::MetadataExt;
     let session = {
         let earlier = open(root);
@@ -1507,35 +1517,39 @@ async fn closing_with_anchor(root: &Path, provable: bool) -> SessionId {
         ("another-boot".to_owned(), "another-namespace".to_owned())
     };
     let uid = fs::metadata("/proc/self").unwrap().uid();
-    let intent = via_store::AnchorIntent {
-        anchor_id: "0-anchor".to_owned(),
-        generation: "g0".to_owned(),
-        marker: "marker".to_owned(),
-        socket_path: root.join("runtime/anchors/0.sock"),
-        owner_session: session.clone(),
-        owner_turn: turn(1),
-        uid,
-        boot_id: boot_id.clone(),
-        pid_namespace: pid_namespace.clone(),
-    };
-    let via_store::CommitOutcome::Committed(receipt) = journal.commit_anchor_intent(intent).await
-    else {
-        panic!("the anchor intent did not commit");
-    };
-    // A group id above Linux's `pid_max` (4194304) names no group.
-    let identity = via_store::AnchorIdentity {
-        pid: 4_194_305,
-        pgid: 4_194_305,
-        uid,
-        boot_id,
-        pid_namespace,
-        start_ticks: 1,
-        marker: "marker".to_owned(),
-    };
-    let identified = journal
-        .commit_anchor_identified("0-anchor", "g0", receipt.record_version, identity)
-        .await;
-    assert!(matches!(identified, via_store::CommitOutcome::Committed(_)));
+    for n in 0..count {
+        let (id, generation) = (anchor_id(n), format!("g{n}"));
+        let intent = via_store::AnchorIntent {
+            anchor_id: id.clone(),
+            generation: generation.clone(),
+            marker: "marker".to_owned(),
+            socket_path: root.join(format!("runtime/anchors/{n}.sock")),
+            owner_session: session.clone(),
+            owner_turn: turn(1),
+            uid,
+            boot_id: boot_id.clone(),
+            pid_namespace: pid_namespace.clone(),
+        };
+        let via_store::CommitOutcome::Committed(receipt) =
+            journal.commit_anchor_intent(intent).await
+        else {
+            panic!("the anchor intent did not commit");
+        };
+        // A group id above Linux's `pid_max` (4194304) names no group.
+        let identity = via_store::AnchorIdentity {
+            pid: 4_194_305,
+            pgid: 4_194_305,
+            uid,
+            boot_id: boot_id.clone(),
+            pid_namespace: pid_namespace.clone(),
+            start_ticks: 1,
+            marker: "marker".to_owned(),
+        };
+        let identified = journal
+            .commit_anchor_identified(&id, &generation, receipt.record_version, identity)
+            .await;
+        assert!(matches!(identified, via_store::CommitOutcome::Committed(_)));
+    }
     session
 }
 
@@ -1604,6 +1618,78 @@ fn an_uncertain_proof_write_fails_the_restart_close_before_closed() {
             ["turn.queued", "turn.ended"],
             "no session.closed"
         );
+    });
+}
+
+/// Design §4 "Restart", [O1.D9] and §7.2 row 12, T3 review round 2: a proof
+/// write that is not committed is not lost when the same re-probe pass then
+/// fails on its next page read. After the pass's first page of anchors,
+/// only a page read can fail without an uncertain proof (which latches on its
+/// own), so the session holds a page and one anchor: the writer is paused at
+/// the first proof, the second proof is armed to fail, and the read of the
+/// second page is armed to fail. Startup must still fail before `Closed`.
+#[test]
+fn a_failed_proof_before_a_page_read_failure_fails_the_restart_close() {
+    let Some(root) = child("a_failed_proof_before_a_page_read_failure_fails_the_restart_close")
+    else {
+        return;
+    };
+    let (proof, read) = ("store.journal.absence", "store.read.stall");
+    let points = count_points(&root, &[read]);
+    let arm = |occurrence: u64, action: &str| {
+        let command = json!({"token":FAILPOINT_TOKEN,"occurrence":occurrence,"action":action});
+        fs::write(points.join(format!("{proof}.json")), command.to_string()).unwrap();
+    };
+    arm(1, "pause");
+    run(async {
+        let anchors = via_store::ANCHOR_PAGE_LIMIT as usize + 1;
+        let session = closing_with_anchors(&root, true, anchors).await;
+        let engine = open(&root);
+        // Declared after the Engine, so it drops first: Store's writer is
+        // released before the Engine joins it.
+        let release = Release(points.join(format!("{proof}.1.release")));
+        for n in 0..anchors {
+            engine
+                .adapter
+                .hold_capacity(anchor_id(n), session.clone(), Box::new(()));
+        }
+        let (refused, read_hit) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(60), engine.hand_off_queued())
+                    .await
+                    .expect("startup ends")
+                    .unwrap_err()
+            },
+            async {
+                // The pass read its first page and its writer waits at the
+                // first proof: the second proof fails, and so does the next
+                // read, the second page's.
+                while !acked(&points, proof, 1) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                arm(2, "fail_io");
+                let read_hit = arm_next(&points, read);
+                drop(release);
+                read_hit
+            }
+        );
+        assert!(acked(&points, proof, 2), "the second proof did not fail");
+        assert!(
+            acked(&points, read, read_hit),
+            "{read} #{read_hit} was not reached"
+        );
+        assert!(
+            refused.contains("an absence proof was not recorded"),
+            "{refused}"
+        );
+        assert!(!engine.store_failed(), "not committed does not latch");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"],
+            "no session.closed"
+        );
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "session", "{status}");
     });
 }
 

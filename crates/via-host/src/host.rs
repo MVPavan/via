@@ -436,7 +436,9 @@ pub struct ReprobeReport {
     pub proved: usize,
     /// Owner sessions of proofs observed whose commit was not committed;
     /// their tokens stay held and the next pass retries (design §7.2 row
-    /// 12). Core records each failure against its session.
+    /// 12). Core records each failure against its session. A pass ends at
+    /// its first such proof, so this holds at most one owner, and a pass
+    /// that returns an error has none: an error never hides a failed proof.
     pub not_committed: Vec<crate::SessionId>,
 }
 
@@ -851,7 +853,9 @@ impl Host {
     /// full identity, or the in-memory one Host verified (§7.2 row 4); a
     /// same-boot `ESRCH` commits the proof, with that identity, and releases
     /// the token. No `Stop`, `Challenge` or other mutation is sent. A proof
-    /// commit that is not committed keeps the token for the next pass; an
+    /// commit that is not committed keeps the token for the next pass and
+    /// ends this one, reported in [`ReprobeReport::not_committed`]: an error
+    /// later in the pass would replace the report and lose the failure. An
     /// uncertain one is returned, and latches. Nothing is read while
     /// nothing is held; a group with no identity keeps its token.
     ///
@@ -906,7 +910,10 @@ impl Host {
                 };
                 match self.reprobe_one(record, memory, deadline).await? {
                     Reprobed::Proved => report.proved += 1,
-                    Reprobed::NotCommitted => report.not_committed.push(owner),
+                    Reprobed::NotCommitted => {
+                        report.not_committed.push(owner);
+                        return Ok(report);
+                    }
                     Reprobed::Held => {}
                 }
             }
