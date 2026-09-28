@@ -7,7 +7,8 @@ Status: T3-0 round 4. It applies `design-r1-decisions.md` (tags such as
 the final `design-r6-decisions.md` (`[r6.1]`). The design is final after
 round 6; later findings are handled in the slices' code reviews. S1's
 review decisions are in `s1-r1-decisions.md` (`[s1.4]`), and choices S1
-made where the design was open are in `reports/T3-S1.md` (`[S1]`).
+made where the design was open are in `reports/T3-S1.md` (`[S1]`). S2's
+are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -1358,6 +1359,12 @@ Each pass does two things:
      and the proof commit records that identity together with the proof.
    - An anchor with no durable identity cannot be probed and keeps its
      token (documented limit).
+   - The report's `held` count follows the filter. With a session filter
+     it counts exactly that session's held groups, examined or not, even
+     after an unfinished pass; without one it counts every held group.
+     Each held entry records its owner session, which `hold_capacity`
+     receives for every hold: a live acquisition, a close and a recovered
+     group [s2.3, s2.5].
 2. **Unidentified groups.**
    - The interrupted startup reconciliation resumes from the cursor saved
      in `engine/slots.rs`, one `recover_page` per pass.
@@ -1509,6 +1516,9 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `host.anchor.defer_cleanup` | fixture seam in the anchor (persistent `fail_io`; each trigger is one occurrence). It defers `begin_cleanup`, which keeps the anchor alive and withholds the positive `stopped_live` until a later Host `Stop`. Route's close therefore reports `uncertain`, and reconciliation's `Stop` supplies the evidence (evidence test) [r5.4, r6.3, S1] |
 | `host.anchor.stop_received` | fixture seam in the anchor: a pause when the anchor receives `Stop`, held until released (concurrent-stops and row-4 deadline tests) [r6.5, S1] |
 | `host.anchor.arm_received` | fixture seam in the anchor: a pause when ARM arrives, before the vendor spawn (owner-stop tests) [S1] |
+| `core.cancel.settling` | acknowledgement only, in `cancel`'s settling branch (`s1_cancel_during_settlement_completes`) [S2] |
+| `core.cancel.ordered` | acknowledgement only, once `cancel` has attached its order (idle-disarm interleaving) [s2.1] |
+| `core.run.idle_expired` | acknowledgement only, when the idle timer fires and before its order is issued (idle-disarm interleaving) [s2.1] |
 | `core.close.before_subscribe` | pauses a close caller after its order check and before it subscribes to the close watch (§4 steps 2 and 5) [r6.6] |
 | `core.run.before_handoff` | the run loop, before it hands a forced turn to final shutdown [r3.3] |
 | `core.shutdown.before_forced_terminal` | final shutdown, before a forced turn's terminal commit [r3.4] |
@@ -1634,6 +1644,26 @@ failure and expect the latch (for example
 `store.commit.reply_lost`, or at an escalation, so they still test the
 latch. S5 lists each re-pointed test in its report.
 
+**S2 adaptations** [S2] (`reports/T3-S2.md`, "Design-table tests adapted"):
+
+- `s1_close_cancels_turn_waiting_for_slot` uses `VIA_TEST_CONNECTION_SLOTS=1`
+  with another session's live turn holding the permit. The harness has no
+  failpoint that creates recovered groups.
+- `s1_close_outcome_retained_for_late_subscriber` is the latch variant.
+  The force variant, and a keyed replay fenced after a force exit, need
+  S3's serving window, so they move to S3.
+- `s1_close_cleanup_uncertain_with_unproven_group` makes its unproven group
+  with a close order at Host's pre-ARM gate while the anchor is held at the
+  EOF seam, because the fake's transport loss does not reach that seam.
+- `s1_cancel_claim_rollback_single_owner` and
+  `s1_close_second_caller_waits_without_admission` are engine tests,
+  because they need in-process control.
+- `s1_cancel_is_idempotent_and_coalesces` is covered by
+  `s1_cancel_running_turn_acknowledged` (coalescing) and
+  `s1_cancel_queued_read_failure_is_plain_store_error` (transient read).
+- A session-filtered re-probe counts only that session's held groups
+  [s2.3].
+
 ## 12. Amendments requested
 
 | # | Changes | Text |
@@ -1657,6 +1687,8 @@ latch. S5 lists each re-pointed test in its report.
 | A17 | C1 §8.1 `store_error` row | Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches [r4.5]. The rest is unchanged [O1.D2]. |
 | A18 | dispatch-design §2.4 | "request_stop records the sessions that have a slot" becomes "request_stop records the sessions whose slot has a queue entry or a running or settling turn (design §6.3)" [O3]. |
 | A20 | runtime §5.1 | Recovery reconnects (Challenge, Status, `Stop`) only to an anchor whose durable phase is `arm_intent`. A pre-ARM anchor (`intent`, `identified`) serves only its bootstrap controller. Recovery opens no control connection to it and proves cleanup by the absence predicate after its EOF exit [s1.5]. |
+| A21 | C1 §4 `deadlines` | `idle_ms` is a positive integer; `0` is `invalid_params`. Like `wall_ms`, it is frozen at receipt and inherited (P5) [S2]. |
+| A22 | C1 §3.6 | A close whose `Closed` is refused a second time because turns are unfinished replies `admission_refused` (design §4 step 6) [r1.7, S2]. |
 
 Withdrawn as moot: A10 (O1.D8 replaces the persistent-read latch), and the
 round-1 "owner-pending" A5 (now replaced below).

@@ -1,6 +1,6 @@
 # Rust foundation — paused checkpoint
 
-## Current state (2026-09-27, resumed)
+## Current state (2026-09-28, resumed)
 
 The owner resumed work under a cloud/local split:
 [cloud-and-local.md](cloud-and-local.md) §5–§6 holds the decisions, roster,
@@ -89,21 +89,23 @@ the historical checkpoint; its findings table is updated by this section.
   ([t3/s1-r1-decisions.md](t3/s1-r1-decisions.md) 1–11). Sol medium
   reviews: `t3/sol-review-S1-{store,host,r1,r2,r3}.md`, the last SOUND. S1
   merged at `4a1c11c`, with the design edits in `8eb4ed0`. Gate: 213 / 2,
-  failpoints 264 / 2 three times, F08–F12 17, release check clean. **Now
-  S2** (turn control, [t3/s2.md](t3/s2.md)): a local `implementer-high`
-  subagent in worktree `../via-wt/t3-s2`, on branch `wt/t3-s2`, which is
-  not pushed. It delivered at `bc34ee2`. The Sol medium reviews
-  (`t3/sol-review-S2-{core,close}.md`) are SOUND WITH CHANGES, and round 1
-  ([t3/s2-r1-decisions.md](t3/s2-r1-decisions.md)) is with the same
-  worker. If the session died, inspect that branch past `bc34ee2` and
-  re-dispatch whatever of the decisions is missing. Then comes a narrow
-  Sol check, then merge, the gate and push, then the design and contract
-  edits S2 listed, then S3 → S5 with S4 in parallel. **From 2026-09-28 no new cloud work: Claude workers are local
+  failpoints 264 / 2 three times, F08–F12 17, release check clean. S2
+  (turn control, [t3/s2.md](t3/s2.md)) came from a local `implementer-high`
+  subagent with two fix rounds ([t3/s2-r1-decisions.md](t3/s2-r1-decisions.md)
+  1–5); Sol medium reviews `t3/sol-review-S2-{core,close,r1,r2}.md`, the
+  last SOUND. S2 merged at `dd2a81d`. Gate: 231 / 2, failpoints 295 / 2
+  three times, F08–F12 17, release check clean. **Now S3 and S4 in
+  parallel** ([t3/s3.md](t3/s3.md), [t3/s4.md](t3/s4.md)): local
+  `implementer-high` subagents in worktrees `../via-wt/t3-s3` and
+  `../via-wt/t3-s4`, on branches `wt/t3-s3` and `wt/t3-s4`, which are not
+  pushed. If the session died, inspect those branches and their reports,
+  then re-dispatch what is missing. Each gets a Sol medium review, then
+  merge, gate and push; S5 follows S3; then Sol high on the whole task. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session
-  `via` (windows `main`, and `watch` running
-  `scratchpad/cloud/watch-branches.sh`).
+  `via` (window `main`; Sol reviews open their own windows). The cloud
+  sessions are archived, so no branch watcher runs.
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).

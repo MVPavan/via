@@ -13,7 +13,9 @@ orchestrator dispatches implementation slices on disjoint files.
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
 | T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); three local fix rounds; merged `4a1c11c` (Sol medium SOUND, `sol-review-S1-r3.md`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); rounds 1–3: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
-| T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md` |
+| T3-S2 | Turn control: cancel, close and closing, idle deadline, failure-record migration (design §13 S2); two local fix rounds; merged `dd2a81d` (Sol medium SOUND, `sol-review-S2-r2.md`) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s2` | `s2.md`, `s2-r1-decisions.md` |
+| T3-S3 | Daemon lifecycle: stop, drain, force, idle exit, final-shutdown pipeline, status, re-probe loop, early-stop wiring (design §13 S3) | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s3` | `s3.md` |
+| T3-S4 | Recovery evidence: raw incompleteness, recovered `cancel.requested`, corrupt-row handoff, F9, F22, F23 (design §13 S4); parallel with S3 | Opus 5.5 high, local `implementer-high` subagent, worktree branch `wt/t3-s4` | `s4.md` |
 
 ## Carried into Task 3
 
@@ -97,3 +99,14 @@ two parts: `sol-review-S2-core.md` and `sol-review-S2-close.md`, both SOUND
 WITH CHANGES with no blocker. Round-1 decisions are in
 `s2-r1-decisions.md`: the idle timer disarms under an existing order, F19
 bounds the idle order, and the held count follows the session filter.
+
+Round 1 (`77db485`): Sol's check (`sol-review-S2-r1.md`) found F19's
+fallback interval started too late and an unfinished filtered re-probe
+counted foreign groups: decisions 4 and 5. Round 2 (`d6e3452`) fixed both;
+counting by session required passing each held group's owner through
+`hold_capacity` (Wire, Route, Adapter, one call in `recovery.rs`), ratified
+by the orchestrator. Sol round-2 check SOUND (`sol-review-S2-r2.md`). S2
+merged at `dd2a81d`. The gate on the merged tree: 231 / 2, failpoints
+295 / 2 three times, F08–F12 17, release check clean. The design edits S2
+needed are tagged `[s2.N]` and `[S2]`, with amendments A21 and A22. S3 and
+S4 then start in parallel on disjoint files (design §13).
