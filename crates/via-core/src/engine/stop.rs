@@ -261,9 +261,22 @@ impl Engine {
         deadline: Deadline,
         batches: &mut FailureBatches,
     ) -> bool {
-        // Test builds: the evidence is in, the terminal not yet committed.
+        // Test builds: Core has received this turn's reconciliation facts;
+        // the evidence is in, the terminal not yet committed.
         #[cfg(feature = "test-failpoints")]
-        let _ = via_store::failpoint::hit_async("core.shutdown.before_forced_terminal").await;
+        {
+            let evidence = report.recovery.iter().find(|record| {
+                record.session_id == turn.started.session && record.turn == turn.started.turn
+            });
+            if evidence.is_some_and(|record| record.forced) {
+                let _ =
+                    via_store::failpoint::hit_async("core.shutdown.evidence_stopped_live").await;
+            }
+            if evidence.is_some_and(|record| record.cleanup == Cleanup::Quiescent) {
+                let _ = via_store::failpoint::hit_async("core.shutdown.evidence_absent").await;
+            }
+            let _ = via_store::failpoint::hit_async("core.shutdown.before_forced_terminal").await;
+        }
         let by = deadline
             .instant()
             .min(tokio::time::Instant::now() + FINALIZE_WRITE);

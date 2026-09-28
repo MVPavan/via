@@ -87,6 +87,9 @@ POINTS = [
     "daemon.shutdown.after_fence",
     "core.shutdown.reconcile_entry",
     "core.shutdown.before_forced_terminal",
+    # Task 3 review Y (design §10): Core-side receipt of reconciliation facts.
+    "core.shutdown.evidence_stopped_live",
+    "core.shutdown.evidence_absent",
     # Task 3 S5 (design §7.2, §10): same-sequence retry seams.
     "core.retry.before",
     "core.head.contended",

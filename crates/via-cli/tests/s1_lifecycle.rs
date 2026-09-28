@@ -1423,20 +1423,22 @@ fn vendor_pid(sandbox: &Sandbox) -> TestResult<u32> {
 /// Design §11 `s1_f12_evidence_before_terminal` [r6.3, r4.2, r5.4]: a
 /// force ends a running turn whose anchor stops answering usefully, then
 /// final shutdown's Host reconciliation supplies the stop evidence and the
-/// absence proof, and both are in **before** the forced terminal commits.
+/// absence proof, and Core has both **before** the forced terminal commits.
 /// Final shutdown is paused at reconciliation's entry
 /// (`core.shutdown.reconcile_entry`) and at the terminal's seam
-/// (`core.shutdown.before_forced_terminal`, "the evidence is in"). At the
-/// second, the group is already gone, the absence proof has been committed
-/// (`host.recovery.absence_commit` was hit), and the turn still has no
-/// terminal. `deferred`: the anchor defers `begin_cleanup` and withholds
+/// (`core.shutdown.before_forced_terminal`). Core acknowledges its receipt
+/// of each of the turn's reconciliation facts at
+/// `core.shutdown.evidence_stopped_live` and `core.shutdown.evidence_absent`
+/// (counted, never paused), both ahead of the terminal seam: at the seam the
+/// group is gone, the acks are recorded and the turn has no terminal.
+/// `deferred`: the anchor defers `begin_cleanup` and withholds
 /// `stopped_live` (`host.anchor.defer_cleanup`, persistent) until the
-/// harness disarms it at the first pause, so reconciliation's `Stop` is
-/// the only source of `forced`: `cancelled` / `forced` / `quiescent`.
-/// Otherwise the anchor loses every `Stop` reply
-/// (`host.anchor.final_reply_lost`, persistent): no stop evidence, so the
-/// turn is `unknown`, `requested`, with cleanup `quiescent` decided
-/// independently by the absence proof.
+/// harness disarms it at the first pause, so reconciliation's `Stop` is the
+/// only source of `forced`: both acks, then `cancelled` / `forced` /
+/// `quiescent`. Otherwise the anchor loses every `Stop` reply
+/// (`host.anchor.final_reply_lost`, persistent): no `stopped_live` ack,
+/// the absence ack alone, and the turn is `unknown`, `requested`, with
+/// cleanup `quiescent` decided independently by the absence proof.
 #[cfg(feature = "test-failpoints")]
 fn evidence_before_terminal(deferred: bool) -> TestResult {
     let reconcile = "core.shutdown.reconcile_entry";
@@ -1457,9 +1459,11 @@ fn evidence_before_terminal(deferred: bool) -> TestResult {
             terminal(1),
         ],
     ))?;
-    let stop_received = "host.anchor.stop_received";
+    let evidence_stopped_live = "core.shutdown.evidence_stopped_live";
+    let evidence_absent = "core.shutdown.evidence_absent";
     sandbox.count(absence)?;
-    sandbox.count(stop_received)?;
+    sandbox.count(evidence_stopped_live)?;
+    sandbox.count(evidence_absent)?;
     sandbox.arm(anchor_point, 1, "fail_io_persist")?;
     sandbox.arm(reconcile, 1, "pause")?;
     sandbox.arm(before_terminal, 1, "pause")?;
@@ -1474,47 +1478,44 @@ fn evidence_before_terminal(deferred: bool) -> TestResult {
             "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
         ))
     };
-    // Stops the anchor received and absence proofs committed so far: Route's
-    // close and the early stop's, before reconciliation.
-    let stops = sandbox.next_hit(stop_received)? - 1;
+    // Absence proofs committed so far (Route's close and the early stop's,
+    // before reconciliation).
     let proofs = sandbox.next_hit(absence)? - 1;
     if deferred {
         // Route's close found no evidence: the anchor kept the group, and
         // nothing proved its absence.
         check(
-            !gone(vendor) && turn_state()? == "running" && stops >= 1 && proofs == 0,
-            || {
-                format!(
-                    "the deferred anchor did not keep the group: {stops} stops, {proofs} proofs"
-                )
-            },
+            !gone(vendor) && turn_state()? == "running" && proofs == 0,
+            || format!("the deferred anchor did not keep the group: {proofs} proofs"),
         )?;
         sandbox.disarm(anchor_point)?;
     }
     sandbox.resume_point(reconcile, 1)?;
     sandbox.ack(&daemon, before_terminal, 1, "pause")?;
-    // The evidence is in and the terminal is not: the group is gone with its
-    // absence proof committed, and the anchor's stop evidence has been
-    // delivered (its `Stop` from reconciliation reached it), or, in the
-    // variant, lost (its reply drop was acknowledged).
+    // The evidence is in and the terminal is not: the group is gone, and
+    // Core has acknowledged receipt of this turn's reconciliation facts
+    // (both seams precede `before_forced_terminal` in Core), each once.
     check(gone(vendor), || {
         "the group was not gone at the terminal seam".to_owned()
     })?;
-    // Deferred: only reconciliation can have proved absence. In the variant
-    // Route's close may already have (`proofs`), independent of the evidence.
-    let proved = sandbox.next_hit(absence)? - 1;
-    check(proved > proofs || (!deferred && proved >= 1), || {
-        format!("no absence proof preceded the terminal: {proofs} then {proved}")
-    })?;
+    let got_stopped_live = sandbox.next_hit(evidence_stopped_live)? - 1;
+    let got_absent = sandbox.next_hit(evidence_absent)? - 1;
     if deferred {
-        check(sandbox.next_hit(stop_received)? - 1 > stops, || {
-            "reconciliation's Stop did not reach the anchor".to_owned()
+        // Only reconciliation's `Stop` can have supplied `stopped_live`, and
+        // no absence proof existed before it (`proofs == 0`).
+        check(got_stopped_live == 1 && got_absent == 1, || {
+            format!("Core received {got_stopped_live} stopped_live and {got_absent} absence facts")
         })?;
     } else {
+        // Every stop reply is lost: no `stopped_live` reached Core, yet the
+        // absence proof did, independently.
         check(
             sandbox.failpoints.ack_bytes(anchor_point, 1).is_ok(),
             || "no lost stop reply was acknowledged".to_owned(),
         )?;
+        check(got_stopped_live == 0 && got_absent == 1, || {
+            format!("Core received {got_stopped_live} stopped_live and {got_absent} absence facts")
+        })?;
     }
     let state = turn_state()?;
     check(state == "running", || {
@@ -1551,9 +1552,11 @@ fn evidence_before_terminal(deferred: bool) -> TestResult {
 }
 
 /// Design §11 `s1_f12_evidence_before_terminal`, positive case. A
-/// characterization: the code already ordered this. Mutation RED: making
-/// `forced_terminal` ignore reconciliation's `forced` evidence ends the turn
-/// `unknown`, failing the envelope check.
+/// characterization: the code already ordered this. Mutation RED: skipping
+/// the `stopped_live` acknowledgement, or delivering both after the terminal
+/// seam, fails the receipt check; making `forced_terminal` ignore
+/// reconciliation's `forced` evidence ends the turn `unknown`, failing the
+/// envelope check.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f12_evidence_before_terminal() -> TestResult {
