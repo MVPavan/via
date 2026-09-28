@@ -66,7 +66,12 @@ the historical checkpoint; its findings table is updated by this section.
   parameters, one launch per turn in F13/F14/F17/F28, version-0 Store
   refusal) in a fresh Opus 5.5 high session
   `session_01YHMezY6BkxmEWfYAi52b9g` (the T2-B2 session went idle without
-  starting it). Then re-review and close `.7.6`; then
+  starting it), branch `claude/t2-e-rust-foundation-u1wszb` at `847b9a0`:
+  local failpoints 210 / 2 ×5; Sol high re-review
+  ([t2/task2-sol-high-review-r2.md](t2/task2-sol-high-review-r2.md))
+  ACCEPT AFTER CHANGES, dispositions in [t2/README.md](t2/README.md);
+  round-1 fixes sent to the same session (`scratchpad/cloud/t2-e-r1.txt`).
+  Then Sol medium on the fix, merge, gate, close `.7.6`; then
   Task 3 (`.7.7`, carries the F12 remainder and deferred items), Task 4
   (`.7.8`), final critique (`.7.9`). After a reboot, restore tmux session
   `via` (windows `main`, and `watch` running
