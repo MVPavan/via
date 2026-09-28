@@ -922,10 +922,15 @@ fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
 }
 
 /// W1-D Sol finding 2 under runtime §7: a receipted turn whose terminal
-/// commit failed latches Store failure, so the daemon stops admission and
-/// dispatch and shuts itself down in force mode; the turn stays unresolved
-/// and the exit is 4, never clean. An outside SQLite writer lock makes the
-/// commit fail for real; it is released once final shutdown began.
+/// commit failed, and whose one same-sequence retry failed too, latches
+/// Store failure (design §7.2 row 7, escalation), so the daemon stops
+/// admission and dispatch and shuts itself down in force mode; the exit is
+/// 4, never clean. An outside SQLite writer lock makes both attempts fail
+/// for real; it is released once the daemon reports the latch, so the
+/// turn's failure-resolution batch commits it `failed(store)` (§7.4).
+/// Re-pointed in S5: the turn no longer stays unresolved, and the latch is
+/// read from `daemon/status` in the diagnostic window, not from the
+/// socket's removal.
 #[test]
 fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
     scenario(
@@ -937,7 +942,7 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
             wait_event(paths, &session, "assistant.text")?;
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
-            let latched = wait_socket_gone(paths);
+            let latched = wait_latched(paths);
             drop(lock);
             latched?;
             let status = daemon
@@ -954,27 +959,45 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
                 summary["disposition"] == "incomplete"
                     && summary["mode"] == "force"
                     && summary["store_failed"] == true
-                    && summary["unresolved_turns"] == 1,
+                    && summary["unresolved_turns"] == 0
+                    && summary["failure_batches"] == json!({"committed":1,"skipped":0}),
                 || format!("summary {summary}"),
+            )?;
+            let (envelope, _) = paths.committed(&session)?;
+            check(
+                envelope["state"] == "failed" && envelope["failure"]["class"] == "store",
+                || format!("the batch did not resolve the turn: {envelope}"),
             )
         },
     )
 }
 
-/// Waits until daemon main left serving: it removes its socket as final
-/// shutdown begins (a latched Store failure starts it without a request).
-fn wait_socket_gone(paths: &Paths) -> Result<(), ScenarioError> {
+/// Waits until the daemon reports the latch (`health: store_failed`,
+/// design §7.5), which it serves through the diagnostic window (§7.4); the
+/// socket stays until the window ends. Never auto-starts a second daemon:
+/// each probe needs the socket.
+fn wait_latched(paths: &Paths) -> Result<(), ScenarioError> {
     let socket = paths.runtime.join("via.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while socket.exists() {
+    loop {
+        if socket.exists() {
+            let mut status = paths.command();
+            status.args(["daemon", "status", "--json"]);
+            let capture = run_command(&mut status, Duration::from_secs(1)).map_err(infra)?;
+            let latched = capture.status.success()
+                && json_line(&capture.stdout)
+                    .is_ok_and(|status| status["health"] == "store_failed");
+            if latched {
+                return Ok(());
+            }
+        }
         if Instant::now() >= deadline {
             return Err(ScenarioError::Timeout(
-                "daemon never began final shutdown".to_owned(),
+                "the daemon never latched".to_owned(),
             ));
         }
         thread::sleep(Duration::from_millis(5));
     }
-    Ok(())
 }
 
 /// W1-D Sol finding 4: final shutdown lets a foreground `via spawn` already
@@ -1125,9 +1148,10 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("text.release"), b"").map_err(infra)?;
             // Past the Store's 250 ms busy timeout the text commit fails and
-            // latches; the lock is released once final shutdown began, so
-            // the forced terminal can commit.
-            let latched = wait_socket_gone(paths);
+            // latches; the lock is released once the daemon reports the
+            // latch, so the failure-resolution batch can commit (re-pointed
+            // in S5: the socket now stays through the diagnostic window).
+            let latched = wait_latched(paths);
             drop(lock);
             latched?;
             let status = daemon

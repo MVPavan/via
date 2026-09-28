@@ -87,10 +87,40 @@ POINTS = [
     "daemon.shutdown.after_fence",
     "core.shutdown.reconcile_entry",
     "core.shutdown.before_forced_terminal",
+    # Task 3 S5 (design §7.2, §10): same-sequence retry seams.
+    "core.retry.before",
+    "core.head.contended",
+    "core.commit.before_send",
+    "core.cancel.admitted",
+    # Task 3 S5 round 2 (design §7.1, §10): corruption on one read command.
+    "store.read.corrupt.spawn_key",
+    "store.read.corrupt.operation",
+    "store.read.corrupt.keyed_operation",
+    "store.read.corrupt.snapshot",
+    "store.read.corrupt.queued_turn",
+    "store.read.corrupt.predecessors",
+    "store.read.corrupt.next_seq",
+    "store.read.corrupt.result",
+    "store.read.corrupt.close_result",
+    "store.read.corrupt.closing_sessions",
+    "store.read.corrupt.terminated",
+    "store.read.corrupt.events",
+    "store.read.corrupt.logs",
+    "store.read.corrupt.authenticate",
+    "store.read.corrupt.unfinished",
+    "store.read.corrupt.anchor_owners",
+    "store.read.corrupt.unproven_anchors",
+    "store.read.corrupt.anchor_cohort",
+    "store.read.corrupt.queued_turns",
+    "store.read.corrupt.anchor_records",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
-OVERRIDES = {"VIA_TEST_CLIENT_VERSION": "0.0.0-release-check", "VIA_TEST_IDLE_EXIT_MS": "1"}
+OVERRIDES = {
+    "VIA_TEST_CLIENT_VERSION": "0.0.0-release-check",
+    "VIA_TEST_IDLE_EXIT_MS": "1",
+    "VIA_TEST_READ_FAILURE_MS": "1",
+}
 MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {
     "expected_request": {"type": "start", "id": 1, "turn": 1, "prompt": "release"},

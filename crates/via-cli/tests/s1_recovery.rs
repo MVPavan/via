@@ -8,8 +8,14 @@
 //! acknowledgements or process exit; no sleep orders two events.
 
 #[cfg(feature = "test-failpoints")]
+#[path = "support/anchors.rs"]
+mod anchors;
+#[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
+#[cfg(feature = "test-failpoints")]
+#[path = "support/hits.rs"]
+mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]
@@ -1047,10 +1053,7 @@ fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
     )
 }
 
-/// Commits `count` synthetic anchors owned by turn 1 of `owner`, each with
-/// the identity of an existing real anchor and a committed absence proof,
-/// so Host accepts them without probing; their groups (`pgid` beyond
-/// Linux's `pid_max`) cannot exist. Ids start with `prefix`.
+/// [`anchors::insert_proven_absent`] into the scenario's Store.
 #[cfg(feature = "test-failpoints")]
 fn insert_proven_absent(
     paths: &Paths,
@@ -1058,35 +1061,14 @@ fn insert_proven_absent(
     prefix: &str,
     count: u32,
 ) -> Result<(), ScenarioError> {
-    let mut store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-    let tx = store.transaction().map_err(infra)?;
-    for index in 0..count {
-        let changed = tx
-            .execute(
-                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
-                 SELECT ?1,'g'||?1,a.marker,'/nonexistent',?2,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,?3,?3,1,'1'
-                 FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
-                rusqlite::params![format!("{prefix}{index:05}"), owner, 4_194_305 + index],
-            )
-            .map_err(infra)?;
-        check(changed == 1, || "no real anchor to copy".to_owned())?;
-    }
-    tx.commit().map_err(infra)
+    anchors::insert_proven_absent(&paths.state.join("store.sqlite3"), owner, prefix, count)
+        .map_err(infra)
 }
 
-/// Removes the synthetic anchors while no daemon runs, so teardown and the
-/// next recovery see only anchors that ran.
+/// [`anchors::delete_synthetic`] from the scenario's Store.
 #[cfg(feature = "test-failpoints")]
 fn delete_synthetic(paths: &Paths, prefix: &str) -> Result<(), ScenarioError> {
-    let store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-    store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
-    store
-        .execute(
-            "DELETE FROM anchors WHERE anchor_id LIKE ?1",
-            [format!("{prefix}%")],
-        )
-        .map(drop)
-        .map_err(infra)
+    anchors::delete_synthetic(&paths.state.join("store.sqlite3"), prefix).map_err(infra)
 }
 
 /// Design §9: a durable `raw_log.incomplete` carries its warning. The
@@ -1323,7 +1305,10 @@ fn failed_on_corrupt_row(paths: &Paths, session: &str, n: u32) -> Result<(), Sce
 /// that is present but unparseable fails that turn `failed(store)` through
 /// `commit_submit_failed`, without agent I/O. Turn 2's `effective` is not
 /// JSON (Store cannot read the row); turn 3's is JSON Core cannot parse.
-/// The restarted daemon admits, and turn 4 runs.
+/// The restarted daemon admits, and turn 4 runs. Each corrupt row reaches
+/// the failure record before admission (design §7.5; T3-S5 round 1,
+/// decision 5): `store_failure` is `corrupt_row` for turn 3, scope `turn`,
+/// count 2, while `health` stays `healthy`.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f12_corrupt_frozen_row_fails_turn_on_restart() -> TestResult {
@@ -1336,6 +1321,16 @@ fn s1_f12_corrupt_frozen_row_fails_turn_on_restart() -> TestResult {
         let _daemon = Daemon::start(paths, evidence, "final")?;
         failed_on_corrupt_row(paths, &session, 2)?;
         failed_on_corrupt_row(paths, &session, 3)?;
+        let status = paths.ok(evidence, "status", &["daemon", "status", "--json"])?;
+        let failure = &status["store_failure"];
+        check(
+            status["health"] == "healthy"
+                && failure["kind"] == "corrupt_row"
+                && failure["scope"] == "turn"
+                && failure["count"] == 2
+                && failure["affected"]["addresses"] == json!([format!("{session}/3")]),
+            || format!("the handoff's corrupt rows were not recorded: {status}"),
+        )?;
         let fourth = wait(paths, evidence, &format!("{session}/4"))?;
         check(fourth["state"] == "completed", || {
             format!("turn 4 after the corrupt rows: {fourth}")
@@ -1486,6 +1481,266 @@ fn s1_recovery_corrupt_row_keeps_the_unknown_barrier_across_a_restart() -> TestR
             recovered_unknown(paths, &session)?;
             cancelled_behind_unknown(paths, &session, 3)?;
             cancelled_behind_unknown(paths, &session, 2)
+        },
+    )
+}
+
+/// The failure message of a turn failed on its corrupt frozen row (design
+/// §7.3), as opposed to the read streak's.
+#[cfg(feature = "test-failpoints")]
+const CORRUPT_ROW: &str = "a frozen value of the queued turn could not be read";
+
+/// Design §7.3, live half (carried from S4 [s4.3, s4.8]): the handoff
+/// enqueues a corrupt row behind an unresolved predecessor, and the
+/// dispatcher's live rule fails it at the head. Turn 2 is valid and still
+/// queued at the crash; turn 3's `effective` is not JSON (Store cannot read
+/// the row), and turn 4's is JSON Core cannot parse. After the restart
+/// turn 2 runs, turns 3 and 4 fail `failed(store)` without launch, each
+/// with the corrupt-row message, and turn 5 runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f12_live_corrupt_row_fails_at_the_head() -> TestResult {
+    let fixture = json!({"scripts":[
+        completes("l1", 1), completes("l2", 2), completes("l5", 5)
+    ]});
+    scenario("s1_f12_live_corrupt_row", &fixture, |paths, evidence| {
+        let (session, _) =
+            crash_with_queued_turns(paths, evidence, &["l1", "l2", "l3", "l4", "l5"], &[], &[])?;
+        corrupt_effective(paths, &session, 3, "not json {")?;
+        corrupt_effective(paths, &session, 4, r#"{"deadlines":"unparseable"}"#)?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        let fifth = wait(paths, evidence, &format!("{session}/5"))?;
+        check(fifth["state"] == "completed", || {
+            format!("turn 5 after the corrupt rows: {fifth}")
+        })?;
+        for n in [3, 4] {
+            failed_on_corrupt_row(paths, &session, n)?;
+            let (_, envelope) = paths.turn(&session, n)?;
+            check(envelope["failure"]["message"] == CORRUPT_ROW, || {
+                format!("turn {n} was not failed on its row: {envelope}")
+            })?;
+        }
+        let (second, _) = paths.turn(&session, 2)?;
+        check(second == "completed", || format!("turn 2: {second}"))
+    })
+}
+
+/// Design §7.3 with C1 P6, live (carried from S4 [s4.8]): a row Store
+/// cannot read, queued behind a turn that ends `unknown` after the restart,
+/// is cancelled from its committed `turn.queued`, never submitted, so the
+/// valid turn behind it is cancelled too. Turn 2 is valid and queued at the
+/// crash, so the handoff enqueues turn 3 behind it; after the restart turn
+/// 2 runs and a cancel whose `Stop` reply is lost
+/// (`host.anchor.final_reply_lost`) ends it `unknown`. (The durable
+/// `unknown` with `pending` cleanup is
+/// `s1_recovery_corrupt_row_behind_a_pending_unknown_progresses_once_settled`.)
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_behind_a_live_unknown_is_cancelled() -> TestResult {
+    let fixture = json!({"scripts":[
+        completes("u1", 1),
+        script("u2", 2, vec![accepted(2), step("hang")]),
+    ]});
+    scenario("s1_recovery_live_unknown", &fixture, |paths, evidence| {
+        let (session, _) =
+            crash_with_queued_turns(paths, evidence, &["u1", "u2", "u3", "u4"], &[], &[])?;
+        corrupt_effective(paths, &session, 3, "not json {")?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        paths.await_event(&session, 2, "turn.started")?;
+        paths
+            .failpoints
+            .arm("host.anchor.final_reply_lost", 1, "fail_io")
+            .map_err(infra)?;
+        let reply = paths.ok(
+            evidence,
+            "cancel-2",
+            &[
+                "cancel",
+                &session,
+                "--turn",
+                "2",
+                "--force-after",
+                "200",
+                "--wait",
+                "--handle",
+                HANDLE,
+                "--json",
+            ],
+        )?;
+        check(reply["state"] == "unknown", || {
+            format!("turn 2 did not end unknown: {reply}")
+        })?;
+        for n in [3, 4] {
+            let envelope = wait(paths, evidence, &format!("{session}/{n}"))?;
+            check(envelope["timestamps"]["submitted_at"].is_null(), || {
+                format!("turn {n} was submitted: {envelope}")
+            })?;
+            cancelled_behind_unknown(paths, &session, n)?;
+        }
+        Ok(())
+    })
+}
+
+/// Design §7.3 with C1 §7.3 and P6 (carried from S4 [s4.4, s4.8]; T3-S5
+/// round 1, decision 7): a row Store cannot read, queued behind a durable
+/// `unknown` turn whose cleanup is `pending`, waits; once the cleanup
+/// settles, the live dispatcher cancels it from its committed `turn.queued`,
+/// never submitted, and the valid turn behind it too.
+///
+/// No product path writes `pending` cleanup into a durable envelope (the
+/// engine test `a_successor_waits_behind_a_cleanup_pending_predecessor`
+/// notes it), so the state is written into Store while no daemon runs.
+/// Turn 1 is recovered `unknown` by a restart held at the handoff's first
+/// queued-row read (`store.read.queued_turn`) and killed there, before the
+/// handoff's own P6 cancellation; its cleanup is then set to `pending`. The
+/// next daemon's dispatcher waits (its predecessor reads, counted at
+/// `store.read.dispatch`, repeat while turns 2 and 3 stay queued); the
+/// cleanup is then set to `quiescent` while the daemon runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_behind_a_pending_unknown_progresses_once_settled() -> TestResult {
+    let fixture = json!({"scripts":[hanging("p1"), completes("p2", 2), completes("p3", 3)]});
+    scenario(
+        "s1_recovery_pending_unknown",
+        &fixture,
+        |paths, evidence| {
+            let (session, _crashed) = crash_behind_running(paths, evidence, &["p1", "p2", "p3"])?;
+            let point = "store.read.queued_turn";
+            paths.failpoints.arm(point, 1, "pause").map_err(infra)?;
+            let mut held = Daemon::spawn(paths, evidence, "held", &[])?;
+            paths
+                .failpoints
+                .wait_ack(point, 1, "pause", held.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            held.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            recovered_unknown(paths, &session)?;
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} at the crash: {state}")
+                })?;
+            }
+            let set_cleanup = |cleanup: &str| -> Result<(), ScenarioError> {
+                let store =
+                    rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
+                store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
+                let changed = store
+                    .execute(
+                        "UPDATE turns SET envelope=json_set(envelope,'$.cancel.cleanup',?2)
+                     WHERE session_id=?1 AND number=1",
+                        rusqlite::params![session, cleanup],
+                    )
+                    .map_err(infra)?;
+                check(changed == 1, || "turn 1 was not updated".to_owned())?;
+                let (_, envelope) = paths.turn(&session, 1)?;
+                check(envelope["cancel"]["cleanup"] == cleanup, || {
+                    format!("turn 1 cleanup: {envelope}")
+                })
+            };
+            set_cleanup("pending")?;
+            let reads = "store.read.dispatch";
+            let dir = paths
+                .state
+                .parent()
+                .ok_or_else(|| infra("the state directory has no parent"))?
+                .join("failpoints");
+            hits::count(&dir, reads).map_err(infra)?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            // The handoff reads turns 2 and 3's predecessors once each; the
+            // dispatcher's decisions for turn 2 follow, each a Wait.
+            let waited = Instant::now() + Duration::from_secs(20);
+            while hits::hits(&dir, reads).map_err(infra)? < 4 {
+                check(Instant::now() < waited, || {
+                    "the dispatcher did not re-read its predecessor".to_owned()
+                })?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} behind pending cleanup: {state}")
+                })?;
+            }
+            set_cleanup("quiescent")?;
+            for n in [2, 3] {
+                let envelope = wait(paths, evidence, &format!("{session}/{n}"))?;
+                check(envelope["timestamps"]["submitted_at"].is_null(), || {
+                    format!("turn {n} was submitted: {envelope}")
+                })?;
+                cancelled_behind_unknown(paths, &session, n)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Design §7.3 [s4.8] (characterization: S4 built the handoff path): a row
+/// Store cannot read, in a session whose close was durable at the crash, is
+/// cancelled at restart with the close's cause from its committed
+/// `turn.queued`, and the restart completes the close. The close's first
+/// queued cancellation crashes the daemon (`store.commit.cancel`), so turns
+/// 2 and 3 are still queued behind the running turn 1.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_unreadable_row_in_a_closing_session_is_cancelled() -> TestResult {
+    let fixture = json!({"scripts":[hanging("c1")]});
+    scenario(
+        "s1_recovery_closing_unreadable",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let session = session_of(&spawn(paths, evidence, "spawn", "c1", &[])?)?;
+            paths.await_event(&session, 1, "turn.started")?;
+            resume(paths, evidence, "resume-2", &session, "c2", &[])?;
+            resume(paths, evidence, "resume-3", &session, "c3", &[])?;
+            let point = "store.commit.cancel";
+            paths.failpoints.arm(point, 1, "crash").map_err(infra)?;
+            let close = paths.run(
+                evidence,
+                "close",
+                &["close", &session, "--handle", HANDLE, "--json"],
+            )?;
+            check(!close.status.success(), || {
+                "the close survived the crash".to_owned()
+            })?;
+            paths
+                .failpoints
+                .wait_ack(point, 1, "crash", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} before the restart: {state}")
+                })?;
+            }
+            corrupt_effective(paths, &session, 2, "not json {")?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            for n in [2, 3] {
+                cancelled_behind_unknown(paths, &session, n)?;
+                let cause: Option<String> = paths
+                    .store()?
+                    .query_row(
+                        "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=?2",
+                        rusqlite::params![session, n],
+                        |row| row.get(0),
+                    )
+                    .map_err(infra)?;
+                check(cause.as_deref() == Some("close"), || {
+                    format!("turn {n} cancel cause: {cause:?}")
+                })?;
+            }
+            let closed = paths
+                .events(&session)?
+                .iter()
+                .any(|(event, _)| event["type"] == "session.closed");
+            check(closed, || {
+                "the restart did not close the session".to_owned()
+            })?;
+            drop(daemon);
+            Ok(())
         },
     )
 }

@@ -25,13 +25,22 @@ impl Engine {
 
     /// The session's highest turn number; `session_not_found` without one.
     async fn turns(&self, session: &SessionId) -> Result<u32, ApiError> {
-        Ok(self
-            .store
-            .session_snapshot(session)
-            .await
-            .map_err(|_| ApiError::STORE)?
-            .ok_or(ApiError::SESSION_NOT_FOUND)?
-            .turns)
+        let Ok(snapshot) = self.store.session_snapshot(session).await else {
+            return Err(ApiError::STORE);
+        };
+        Ok(snapshot.ok_or(ApiError::SESSION_NOT_FOUND)?.turns)
+    }
+
+    /// The turn's durable result as `journal::read_result` reads it; Store's
+    /// read reply latches on SQLite corruption (design §7.1). No lock is
+    /// held.
+    pub(super) async fn read_result(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<Value>, ApiError> {
+        let read = self.store.result(session, turn).await;
+        journal::settled_result(&self.unresolved, session, turn, read)
     }
 
     /// Refuses a turn the session never had.
@@ -45,9 +54,7 @@ impl Engine {
     /// Reads a committed terminal result without waiting.
     pub async fn result(&self, address: &str) -> Result<Value, ApiError> {
         let (session, turn) = self.address(address).await?;
-        if let Some(result) =
-            journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-        {
+        if let Some(result) = self.read_result(&session, turn).await? {
             return Ok(result);
         }
         self.exists(&session, turn).await?;
@@ -70,9 +77,7 @@ impl Engine {
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
-            if let Some(result) =
-                journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-            {
+            if let Some(result) = self.read_result(&session, turn).await? {
                 return Ok(result);
             }
             if !checked {
@@ -107,9 +112,7 @@ impl Engine {
     ) -> Result<Value, ApiError> {
         loop {
             let finalized = self.finalized.load(Ordering::Acquire);
-            if let Some(result) =
-                journal::read_result(&self.store, &self.unresolved, session, turn).await?
-            {
+            if let Some(result) = self.read_result(session, turn).await? {
                 return Ok(result);
             }
             if finalized {
@@ -122,11 +125,9 @@ impl Engine {
     /// Reads the first bounded page of durable canonical events.
     pub async fn events(&self, session: &str) -> Result<Value, ApiError> {
         let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        let events = self
-            .store
-            .events(&id, 1, 1000)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        let Ok(events) = self.store.events(&id, 1, 1000).await else {
+            return Err(ApiError::STORE);
+        };
         let next_after = events.last().map_or(0, |event| event.seq);
         Ok(
             json!({"events":events.into_iter().map(|event| event.event).collect::<Vec<_>>(),"next_after":next_after,"more":false}),
@@ -136,6 +137,9 @@ impl Engine {
     /// Reads bounded raw excerpts referenced by committed events.
     pub async fn logs(&self, session: &str) -> Result<Value, ApiError> {
         let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        self.store.logs(&id).await.map_err(|_| ApiError::STORE)
+        match self.store.logs(&id).await {
+            Ok(logs) => Ok(logs),
+            Err(_) => Err(ApiError::STORE),
+        }
     }
 }

@@ -205,12 +205,13 @@ async fn dispatch(
     match method {
         "daemon/status" => {
             typed::<DaemonStatusParams>(params)?;
-            // Memory only: no Store read (design §6.6).
+            // Memory only: no Store read (design §6.6, §7.5).
             let counts = engine.counts();
             let connections = counts.connections;
             Ok(
                 json!({"daemon_version":crate::client::binary_version(),"pid":std::process::id(),
-                "socket_path":socket_path,"store_path":store_path,"health":"healthy",
+                "socket_path":socket_path,"store_path":store_path,"health":engine.health(),
+                "store_failure":engine.store_failure_status(),
                 "sessions":{"idle":0,"active":counts.active,"closing":counts.closing},
                 "connections":{"limit":connections.limit,"in_use":connections.in_use,
                     "held_unproven":connections.held_unproven},

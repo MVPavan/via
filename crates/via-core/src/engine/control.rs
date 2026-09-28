@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 use via_store::CancelCause;
 
 use super::drive::Cancelled;
-use super::queue::{Ack, CancelStep, QueuedOutcome, StopSpec};
+use super::queue::{Ack, CancelStep, Owner, QueuedOutcome, StopSpec};
 use super::stop::StopMode;
-use super::{Engine, journal, lock};
+use super::{Engine, lock};
 use crate::api::{DEFAULT_FORCE_AFTER_MS, rfc3339};
 use crate::{ApiError, CancelParams, SessionId, TurnNumber, hash_handle};
 
@@ -45,14 +45,16 @@ impl Engine {
         }
         let turn = self.cancel_target(&session, params.turn, snapshot.turns)?;
         let address = format!("{}/{}", session.as_str(), turn.get());
-        if let Some(envelope) =
-            journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-        {
+        if let Some(envelope) = self.read_result(&session, turn).await? {
             return Ok(reply(&address, &envelope, true));
         }
-        if *lock(&self.stop) == Some(StopMode::Force) {
+        if *lock(&self.signal.stop) == Some(StopMode::Force) {
             return Err(ApiError::DAEMON_STOPPING);
         }
+        // Past step 3: a force accepted from here finds this cancel admitted
+        // (a pause seam for the settling handoff).
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.cancel.admitted").await;
         let force_after = params.force_after_ms.unwrap_or(DEFAULT_FORCE_AFTER_MS);
         let spec = StopSpec::Cancel {
             force_after: Duration::from_millis(force_after),
@@ -155,7 +157,7 @@ impl Engine {
             .cancel_queued(
                 &slot,
                 session,
-                turn,
+                (turn, Owner::Request),
                 false,
                 Some((CancelCause::Cancel, requested_at)),
             )

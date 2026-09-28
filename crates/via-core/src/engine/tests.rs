@@ -585,9 +585,11 @@ fn a_turn_granted_before_force_submits_then_ends_forced_without_launch() {
     });
 }
 
-/// Design §2.3: a `queued → cancelled` commit that fails under force latches;
+/// Design §2.3 and §7.2 row 9: a `queued → cancelled` commit under force
+/// that fails, and whose one same-sequence retry fails too, latches;
 /// nothing more is written, the session is not closed, and the shutdown is
-/// unclean (exit 4).
+/// unclean (exit 4). Re-pointed in S5: one not-committed failure is now
+/// retried, so the fault fails both attempts.
 #[test]
 fn a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open() {
     let Some(root) =
@@ -600,7 +602,7 @@ fn a_failed_cancellation_under_force_is_unclean_and_leaves_the_session_open() {
         let session = new_session(&engine).await;
         resume(&engine, &session, None).await;
         engine.request_stop(&force()).await.unwrap();
-        engine.faults.cancel_fails.store(1, Ordering::Release);
+        engine.faults.cancel_fails.store(2, Ordering::Release);
         dispatch(&engine, &session).await;
         assert!(engine.store_failed());
         assert_eq!(
@@ -1218,6 +1220,70 @@ fn a_claim_rollback_has_one_cancellation_owner() {
     });
 }
 
+/// Design §7.3 [r1.13]: callers joined to a dispatcher-owned cancellation
+/// get a plain `store_error` when its read fails; the dispatcher keeps the
+/// claim, retries on its timer and commits the cancellation.
+#[test]
+fn a_dispatcher_cancellation_read_failure_replies_store_error_to_joined_callers() {
+    let Some(root) =
+        child("a_dispatcher_cancellation_read_failure_replies_store_error_to_joined_callers")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), (first, second)) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine
+                .faults
+                .hold_after_grant
+                .store(false, Ordering::Release);
+            let slot = engine.slot(&session).unwrap();
+            tokio::join!(cancel(&engine, &session, 1), async {
+                until(|| slot.watchers(turn(1)).0 == 1).await;
+                engine
+                    .faults
+                    .submission_unread
+                    .store(true, Ordering::Release);
+                engine
+                    .faults
+                    .hold_cancel_read
+                    .store(true, Ordering::Release);
+                engine.faults.cancel_read_fails.store(1, Ordering::Release);
+                engine.faults.release.notify_one();
+                // The rollback's dispatcher cancellation, before its read.
+                engine.faults.granted.notified().await;
+                let (second, ()) = tokio::join!(cancel(&engine, &session, 1), async {
+                    until(|| slot.watchers(turn(1)).1 == 2).await;
+                    engine.faults.release.notify_one();
+                });
+                second
+            })
+        });
+        for reply in [first, second] {
+            let error = reply.unwrap_err();
+            assert_eq!(error.kind, "store_error");
+            assert!(error.data().get("commit_outcome").is_none(), "plain");
+        }
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"],
+            "the retried cancellation committed"
+        );
+        let envelope = engine
+            .result(&format!("{}/1", session.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert!(!engine.store_failed(), "a read failure never latches");
+    });
+}
+
 /// Design §4 step 5 [r3.1]: a second close and a keyed replay arriving while
 /// the first close is held after its absence check wait without holding
 /// `admission` (another session's `resume` commits meanwhile), and all three
@@ -1672,5 +1738,735 @@ fn an_added_holding_resets_the_reprobe_backoff() {
             );
             engine.request_stop(&stop).await.unwrap();
         });
+    });
+}
+
+/// T3-S5 round 1, decision 1 (design §7.1, §7.2 rows 5 and 6 [O1.D2]): a
+/// turn whose event already failed cleanly (its first failure, scoped)
+/// then reports an uncertain Route Store failure, such as a raw write
+/// during cleanup. The uncertain outcome still latches, and the first note
+/// stays the turn's, for its resolution write.
+#[test]
+fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
+    let Some(root) = child("a_later_uncertain_route_failure_latches_after_a_clean_first_failure")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = super::queue::Slot::new(super::journal::Head::new(Some(2)));
+        let mut record = super::TurnRecord {
+            session: session.clone(),
+            turn: turn(1),
+            head: super::journal::Head::new(Some(2)),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: Some(super::FailureNote {
+                site: super::latch::FailureSite::Event,
+                outcome: super::latch::WriteOutcome::NotCommitted,
+            }),
+            uncertain: None,
+        };
+        assert!(!engine.store_failed(), "the clean failure is scoped");
+        let cause = via_adapters::RouteError::Store {
+            turn: turn(1),
+            kind: via_adapters::StoreFailure::Uncertain,
+        };
+        engine
+            .route_failed(&slot, &mut record, Some(&cause), false)
+            .await;
+        assert!(engine.store_failed(), "the uncertain failure latched");
+        let first = record.first_failure.expect("the first note is kept");
+        assert_eq!(first.site, super::latch::FailureSite::Event);
+        assert_eq!(first.outcome, super::latch::WriteOutcome::NotCommitted);
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "daemon");
+        assert_eq!(status["kind"], "commit_uncertain");
+    });
+}
+
+/// T3-S5 round 1, decision 3 (design §7.2 row 5): an observation still
+/// queued when `execute` completes is committed by the completion's drain.
+/// When that write is not committed (the record's head read fails and
+/// writes nothing), the turn's stop order with cause `store` attaches, as
+/// in the observation branch, so the disposition carries row 5's `cancel`
+/// evidence.
+#[test]
+fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
+    let Some(root) = child("a_drained_observation_whose_write_fails_attaches_the_store_order")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let (_route, orders) = slot.start_running(turn(1), wall);
+        let watched = orders.clone();
+        // A session Store does not hold: the head read writes nothing.
+        let mut record = super::TurnRecord {
+            session: SessionId::try_from("s_000000000000").unwrap(),
+            turn: turn(1),
+            head: super::journal::Head::new(None),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: None,
+            uncertain: None,
+        };
+        let effective: crate::api::Effective = serde_json::from_value(json!({
+            "model":"fake","effort":null,"bound":null,
+            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+        }))
+        .unwrap();
+        let raw_ref = crate::RawRef::new(
+            crate::ConnectionId::try_from("c_000000000000").unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
+        let queued = via_adapters::FakeObservation::Data {
+            observation: via_adapters::Observation::AssistantText {
+                text: "lost".to_owned(),
+            },
+            raw_ref,
+        };
+        engine
+            .drain_queued(&slot, &mut record, &effective, orders, vec![queued])
+            .await;
+        let note = record.first_failure.expect("the drained write failed");
+        assert_eq!(note.outcome, super::latch::WriteOutcome::NotCommitted);
+        let order = watched.borrow().clone();
+        let order = order.expect("row 5's stop order attached");
+        assert!(matches!(order.cause, via_adapters::StopCause::Store));
+        assert!(!engine.store_failed(), "the failure is scoped");
+    });
+}
+
+/// Failpoint token of a child that arms a Store seam.
+const FAILPOINT_TOKEN: &str = "engine-tests-failpoint-token";
+
+/// In a child, activates Store's failpoints before the Engine opens, with
+/// `point` failing its first hit (`fail_io`); returns their directory.
+fn fail_first(root: &Path, point: &str) -> PathBuf {
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io"});
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
+/// session-head read before a terminal commit (`store.read.corrupt.next_seq`)
+/// reaches the failure hook as `Corrupt`, which latches even at final
+/// shutdown's scoped forced-terminal site. While serving, the head is
+/// unknown there only after an uncertain write, which has already latched
+/// (the restart handoff's terminal fails startup on any error), so the
+/// record here starts with an unknown head.
+#[test]
+fn a_corrupt_head_read_before_a_terminal_latches() {
+    let Some(root) = child("a_corrupt_head_read_before_a_terminal_latches") else {
+        return;
+    };
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let started = super::Started {
+            session: session.clone(),
+            turn: turn(1),
+            queued_at: rfc3339(std::time::SystemTime::now()),
+            first_seq: 1,
+            submitted: None,
+        };
+        let record = super::TurnRecord {
+            session: session.clone(),
+            turn: turn(1),
+            head: super::journal::Head::new(None),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: None,
+            uncertain: None,
+        };
+        let terminal = super::Terminal {
+            state: "failed",
+            failure: Some(super::failure(
+                crate::api::FailureClass::Store,
+                "a turn event could not be recorded".to_owned(),
+                None,
+            )),
+            stop_reason: "error",
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            cancel: None,
+        };
+        let finished = engine.finish(&started, record, terminal, false, None).await;
+        assert_eq!(finished.unwrap_err().kind, "store_error");
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the force
+/// closure pass's session-head read latches, and the session counts as
+/// unclosed. Since round 2 (decision 11) Store's read reply reports it,
+/// once. The pass reads the head from Store only for a session with no
+/// slot or an unknown head. End to end every force session keeps its slot,
+/// whose head its last write left known (an unknown one follows a latching
+/// write, which skips the pass), so the slot is removed here.
+#[test]
+fn a_corrupt_head_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_head_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        cancel(&engine, &session, 1).await.unwrap();
+        super::lock(&engine.sessions).remove(&session);
+        super::lock(&engine.force_sessions).replace(vec![session.clone()]);
+        let report = shutdown(&engine).await;
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
+        assert!(report.store_failed, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store");
+        // Store's read reply reported it, once (T3-S5 round 2, decision 11).
+        assert_eq!(status["count"], 1, "{status}");
+        assert!(
+            !event_types(&engine, &session)
+                .await
+                .contains(&"session.closed".to_owned())
+        );
+    });
+}
+
+/// T3-S5 round 1, decision 10 (design §7.1, §7.2 row 2): SQLite corruption
+/// on the session-head read of row 2's resolution write
+/// (`commit_submit_failed`) is reported as `corrupt_store`, not as a failed
+/// commit. The dispatcher's slot is fresh after a restart, so its head is
+/// unknown; the slot here starts that way.
+#[test]
+fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
+    let Some(root) = child("a_corrupt_head_read_before_a_submit_failed_write_is_corrupt") else {
+        return;
+    };
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let queueing = engine.queueing(&session, turn(1)).await.unwrap();
+        let slot = super::queue::Slot::new(super::journal::Head::new(None));
+        engine
+            .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
+            .await;
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
+        assert_corruption_latched(&engine);
+        let types = event_types(&engine, &session).await;
+        assert_eq!(types, ["turn.queued"], "nothing was written");
+    });
+}
+
+/// In a child, activates Store's failpoints before the Engine opens and
+/// counts each of `points`: a command under another token is refused at
+/// every hit, leaving `<point>.<n>.refused`. Returns their directory.
+fn count_points(root: &Path, points: &[&str]) -> PathBuf {
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    for point in points {
+        let command = json!({"token":"counting-only-token","occurrence":1,"action":"pause"});
+        fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    }
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// Arms counted `point` to fail its next hit (`fail_io`); returns that
+/// occurrence.
+fn arm_next(dir: &Path, point: &str) -> u64 {
+    let prefix = format!("{point}.");
+    let counted = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)?
+                .strip_suffix(".refused")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    let next = counted + 1;
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":next,"action":"fail_io"});
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    next
+}
+
+/// Whether `point`'s occurrence `n` acted: its acknowledgement exists.
+fn acked(dir: &Path, point: &str, n: u64) -> bool {
+    dir.join(format!("{point}.{n}.ack")).exists()
+}
+
+/// Asserts the latch's phase one ran with `corrupt_store` (design §7.1),
+/// recorded once: Store's read reply reported the one corrupt read, and
+/// no aborted write recorded it again (T3-S5 round 3, decision 13).
+fn assert_corruption_latched(engine: &Engine) {
+    assert!(engine.store_failed(), "the corrupt read latched");
+    let status = engine.store_failure_status().unwrap();
+    assert_eq!(status["kind"], "corrupt_store", "{status}");
+    assert_eq!(status["scope"], "daemon", "{status}");
+    assert_eq!(status["count"], 1, "one failure, one record: {status}");
+}
+
+/// The force closure pass of one session whose only turn was cancelled,
+/// with `point` failing its next hit as SQLite corruption.
+fn closure_read_corruption(root: &Path, point: &str) {
+    let points = count_points(root, &[point]);
+    run(async {
+        let engine = open(root);
+        let session = new_session(&engine).await;
+        cancel(&engine, &session, 1).await.unwrap();
+        super::lock(&engine.force_sessions).replace(vec![session.clone()]);
+        let n = arm_next(&points, point);
+        let report = shutdown(&engine).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+        assert!(report.store_failed, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+    });
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// closure pass's snapshot read (`stop.rs` `close_forced`) latches.
+#[test]
+fn a_corrupt_snapshot_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_snapshot_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    closure_read_corruption(&root, "store.read.corrupt.snapshot");
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// closure pass's predecessor read (`stop.rs` `close_forced`) latches.
+#[test]
+fn a_corrupt_predecessors_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_predecessors_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    closure_read_corruption(&root, "store.read.corrupt.predecessors");
+}
+
+/// A turn record of `session`'s turn 1 at a known head, optionally with
+/// an uncertain event at sequence 2 to reconcile.
+fn turn_one(session: &SessionId, uncertain: bool) -> super::TurnRecord {
+    super::TurnRecord {
+        session: session.clone(),
+        turn: turn(1),
+        head: super::journal::Head::new(Some(2)),
+        accepted: None,
+        spans: Vec::new(),
+        first_failure: None,
+        uncertain: uncertain.then_some(super::journal::UncertainEvent {
+            seq: 2,
+            raw_ref: None,
+            accepted: None,
+        }),
+    }
+}
+
+/// Turn 1's `Started`, never submitted.
+fn started_one(session: &SessionId) -> super::Started {
+    super::Started {
+        session: session.clone(),
+        turn: turn(1),
+        queued_at: rfc3339(std::time::SystemTime::now()),
+        first_seq: 1,
+        submitted: None,
+    }
+}
+
+/// A `failed(store)` terminal.
+fn store_terminal() -> super::Terminal {
+    super::Terminal {
+        state: "failed",
+        failure: Some(super::failure(
+            crate::api::FailureClass::Store,
+            "a turn event could not be recorded".to_owned(),
+            None,
+        )),
+        stop_reason: "error",
+        vendor_stop_reason: None,
+        final_text: String::new(),
+        exit: None,
+        raw_ref: None,
+        raw_incomplete: false,
+        warnings: Vec::new(),
+        cancel: None,
+    }
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// terminal commit's reconcile read (`drive.rs` `commit_turn_ended_with`)
+/// latches; the caller's reply is the same `store_error`.
+#[test]
+fn a_corrupt_reconcile_read_before_a_terminal_latches() {
+    let Some(root) = child("a_corrupt_reconcile_read_before_a_terminal_latches") else {
+        return;
+    };
+    let point = "store.read.corrupt.events";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let n = arm_next(&points, point);
+        let finished = engine
+            .finish(
+                &started_one(&session),
+                turn_one(&session, true),
+                store_terminal(),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(finished.unwrap_err().kind, "store_error");
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// Final shutdown's batch for turn 1 of a session with turn 2 queued, with
+/// `record` as turn 1's and `point` failing its next hit as SQLite
+/// corruption: the batch is skipped. A step 1 read skips it before its
+/// write, so phase two waits for final shutdown's entry; a read the write
+/// needs aborts that write, whose hook call finishes phase two.
+fn batch_read_corruption(
+    root: &Path,
+    point: &str,
+    record: fn(&SessionId) -> super::TurnRecord,
+    aborts_write: bool,
+) {
+    let points = count_points(root, &[point]);
+    run(async {
+        let engine = open(root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        let affected = super::batch::AffectedTurn {
+            started: started_one(&session),
+            record: record(&session),
+            terminal: store_terminal(),
+            raw_incomplete: false,
+        };
+        let n = arm_next(&points, point);
+        let mut batches = super::batch::FailureBatches::default();
+        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(10));
+        engine
+            .resolve_affected(affected, deadline, &mut batches)
+            .await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+        assert_eq!((batches.committed, batches.skipped), (0, 1));
+        // Phase two waits for `admission`: the aborted write's hook call or
+        // final shutdown's entry takes it.
+        assert_eq!(engine.latch_finalized(), aborts_write);
+        engine.enter_final_shutdown().await;
+        assert!(
+            engine.latch_finalized(),
+            "final shutdown's entry finished it"
+        );
+    });
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's result read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_result_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_result_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.result",
+        |session| turn_one(session, true),
+        false,
+    );
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's reconcile read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_reconcile_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_reconcile_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.events",
+        |session| turn_one(session, true),
+        false,
+    );
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's queued-row read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_queued_row_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_queued_row_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.queued_turn",
+        |session| turn_one(session, true),
+        false,
+    );
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.5): SQLite corruption on
+/// the batch's session-head read (`store.read.corrupt.next_seq`) aborts the
+/// batch's write. Store's read reply recorded it, so the batch records no
+/// second failure; the batch is still skipped and the latch stands. The
+/// record's head is unknown, as after the uncertain write that makes the
+/// batch read it.
+#[test]
+fn a_corrupt_head_read_in_the_batch_records_one_failure() {
+    let Some(root) = child("a_corrupt_head_read_in_the_batch_records_one_failure") else {
+        return;
+    };
+    batch_read_corruption(
+        &root,
+        "store.read.corrupt.next_seq",
+        |session| super::TurnRecord {
+            head: super::journal::Head::new(None),
+            ..turn_one(session, false)
+        },
+        true,
+    );
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.5): SQLite corruption on
+/// the acceptance's session-head read (`drive.rs` `observe`,
+/// `store.read.corrupt.next_seq`) aborts the acceptance write. Store's read
+/// reply recorded it, so `store_failure.count` is 1; the turn keeps its
+/// first failure (row 5) and the latch stands. The record's head is
+/// unknown, as after an uncertain write.
+#[test]
+fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
+    let Some(root) = child("a_corrupt_head_read_before_an_acceptance_records_one_failure") else {
+        return;
+    };
+    let point = "store.read.corrupt.next_seq";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let (_route, orders) = slot.start_running(turn(1), wall);
+        let mut record = super::TurnRecord {
+            head: super::journal::Head::new(None),
+            ..turn_one(&session, false)
+        };
+        let effective: crate::api::Effective = serde_json::from_value(json!({
+            "model":"fake","effort":null,"bound":null,
+            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+        }))
+        .unwrap();
+        let raw_ref = crate::RawRef::new(
+            crate::ConnectionId::try_from("c_000000000000").unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
+        let accepted =
+            via_adapters::FakeObservation::Accepted(via_adapters::FakeAcceptanceObservation {
+                correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
+                vendor_turn_id: via_adapters::VendorTurnId::try_from("v_1".to_owned()).unwrap(),
+                raw_ref,
+            });
+        let n = arm_next(&points, point);
+        engine
+            .drain_queued(&slot, &mut record, &effective, orders, vec![accepted])
+            .await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        let note = record.first_failure.expect("the acceptance write failed");
+        assert_eq!(note.site, super::latch::FailureSite::Event);
+        assert!(record.accepted.is_none(), "nothing was accepted");
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// T3-S5 round 3, decision 13 (design §7.1, §7.3, §7.5): when a read
+/// streak expires, SQLite corruption on the queueing read that row 2's
+/// resolution write needs (`store.read.corrupt.events`) aborts that write.
+/// The expired streak records its own failure; Store's read reply records
+/// the corruption, which stays the latest, and the aborted resolution
+/// write records nothing more: two failures, two records.
+#[test]
+fn a_corrupt_queueing_read_after_a_read_streak_records_one_failure() {
+    let Some(root) = child("a_corrupt_queueing_read_after_a_read_streak_records_one_failure")
+    else {
+        return;
+    };
+    let point = "store.read.corrupt.events";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let slot = engine.slot(&session).unwrap();
+        let n = arm_next(&points, point);
+        engine.read_expired(&slot, &session, turn(1)).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert!(engine.store_failed(), "the corrupt read latched");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["kind"], "corrupt_store", "{status}");
+        assert_eq!(status["scope"], "daemon", "{status}");
+        assert_eq!(status["count"], 2, "the streak and the read: {status}");
+        let types = event_types(&engine, &session).await;
+        assert_eq!(types, ["turn.queued"], "nothing was written");
+    });
+}
+
+/// A session whose only turn was cancelled and which Store then closed
+/// with the closure pass's `session.closed`, as a forced terminal whose
+/// reply was lost leaves it.
+async fn durably_closed_session(engine: &Engine) -> SessionId {
+    let session = new_session(engine).await;
+    cancel(engine, &session, 1).await.unwrap();
+    let event = Event {
+        seq: 3,
+        session_id: &session,
+        turn: None,
+        late: false,
+        at: &rfc3339(std::time::SystemTime::now()),
+        raw_ref: None,
+        body: EventBody::SessionClosed {
+            reason: super::drive::FORCE_CLOSE_REASON,
+        },
+    }
+    .to_value()
+    .unwrap();
+    assert!(
+        engine
+            .store
+            .commit_session_closed(&session, event)
+            .await
+            .unwrap()
+    );
+    session
+}
+
+/// T3-S5 round 2, decision 12 (design §6.8, §7.4): after a latch the
+/// closure pass does not run; it counts each force session Store does not
+/// read as closed. A durably closed session is not counted; an open one and
+/// one whose snapshot read is corrupt (`store.read.corrupt.snapshot`) are.
+#[test]
+fn after_a_latch_the_closure_pass_counts_durably_open_sessions() {
+    let Some(root) = child("after_a_latch_the_closure_pass_counts_durably_open_sessions") else {
+        return;
+    };
+    let point = "store.read.corrupt.snapshot";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_session = new_session(&engine).await;
+        let unreadable = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![
+            closed.clone(),
+            open_session.clone(),
+            unreadable.clone(),
+        ]);
+        engine.latch().await;
+        // The pass reads the three snapshots in order: the third fails.
+        let n = arm_next(&points, point) + 2;
+        let command = json!({"token":FAILPOINT_TOKEN,"occurrence":n,"action":"fail_io"});
+        fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
+        let report = shutdown(&engine).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_eq!(report.unclosed_sessions, 2, "{report:?}");
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// T3-S5 round 3, decision 14 (design §6.8, §7.4): after a latch, an
+/// unjoined force session is counted by its durable state too. A durably
+/// closed one is not counted; an open one is, and so is an open joined
+/// session after them. Unjoined sessions get no closure write.
+#[test]
+fn after_a_latch_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("after_a_latch_unjoined_sessions_count_by_their_durable_state") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        let open_joined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![
+            closed.clone(),
+            open_unjoined.clone(),
+            open_joined.clone(),
+        ]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        engine.latch().await;
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unjoined_dispatchers, 2, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 2, "{report:?}");
+        let types = event_types(&engine, &open_unjoined).await;
+        assert!(!types.contains(&"session.closed".to_owned()), "{types:?}");
+    });
+}
+
+/// T3-S5 round 3, decision 14 (design §6.8, §7.4): after a latch, when
+/// every force session is unjoined the pass visits none of them, and each
+/// still counts only if Store does not read it closed.
+#[test]
+fn after_a_latch_only_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("after_a_latch_only_unjoined_sessions_count_by_their_durable_state")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![closed.clone(), open_unjoined.clone()]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        engine.latch().await;
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+    });
+}
+
+/// T3-S5 round 4, decision 16 (design §6.8): without a latch, an unjoined
+/// force session is also counted by its durable state. A durably closed one
+/// is not counted; an open one is. Neither gets a closure write.
+#[test]
+fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("without_a_latch_unjoined_sessions_count_by_their_durable_state") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![closed.clone(), open_unjoined.clone()]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        let report = shutdown(&engine).await;
+        assert!(!report.store_failed, "{report:?}");
+        assert_eq!(report.unjoined_dispatchers, 2, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+        let types = event_types(&engine, &open_unjoined).await;
+        assert!(!types.contains(&"session.closed".to_owned()), "{types:?}");
     });
 }

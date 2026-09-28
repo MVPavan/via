@@ -190,6 +190,19 @@ impl WireError {
                 )
         )
     }
+
+    /// A Host journal write had an uncertain outcome, as a re-probe proof
+    /// commit that outlived its pass: the daemon latches (design §7.2
+    /// row 12).
+    pub fn journal_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::Host(via_host::HostError::Journal {
+                uncertain: true,
+                ..
+            })
+        )
+    }
 }
 
 /// Passive recovery fact without process signalling authority.

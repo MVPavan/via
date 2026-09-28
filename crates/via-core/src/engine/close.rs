@@ -15,7 +15,7 @@ use via_store::{
 
 use super::drive::{Cancelled, Step};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::{CLOSE_ALLOWANCE, CloseOrder, CloseWatch, Slot, Sweep};
+use super::queue::{CLOSE_ALLOWANCE, CloseOrder, CloseWatch, Owner, Slot, Sweep};
 use super::stop::StopMode;
 use super::{Admission, Engine, lock};
 use crate::api::{DEFAULT_CLOSE_DEADLINE_MS, Event, EventBody, retry_key, rfc3339};
@@ -101,7 +101,10 @@ impl Engine {
         // Step 4: the stop fence [r1.5, r3.2]: final shutdown was entered,
         // whatever the stop mode, or an idle or force stop was accepted.
         if self.final_shutdown()
-            || matches!(*lock(&self.stop), Some(StopMode::Idle | StopMode::Force))
+            || matches!(
+                *lock(&self.signal.stop),
+                Some(StopMode::Idle | StopMode::Force)
+            )
         {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -183,7 +186,7 @@ impl Engine {
             return ApiError::SESSION_CLOSED;
         }
         let outcome = WriteOutcome::of(error);
-        if outcome == WriteOutcome::Uncertain {
+        if outcome.head_unknown() {
             lock(&self.closing).insert(session.clone());
         }
         self.retire(session);
@@ -193,10 +196,7 @@ impl Engine {
             FailureScope::Session(session),
         )
         .finish_held(admission);
-        match outcome {
-            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-        }
+        outcome.api_error()
     }
 
     /// Subscribes to the close attempt under `admission`, releases it, and
@@ -236,7 +236,7 @@ impl Engine {
     ) -> Option<Step> {
         let task = slot.close_task()?;
         let cause = (CancelCause::Close, task.requested_at.clone());
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         // Steps 1–2: cancel every `Waiting` turn FIFO with cause `close`;
         // wait for request-owned cancellations. Step 3: a running turn is
         // inline, so none runs here.
@@ -253,7 +253,9 @@ impl Engine {
                     }
                 }
                 Sweep::Cancel(turn, cause) => {
-                    let cancelled = self.cancel_queued(slot, session, turn, false, cause).await;
+                    let cancelled = self
+                        .cancel_queued(slot, session, (turn, Owner::Dispatcher), false, cause)
+                        .await;
                     match cancelled {
                         Cancelled::Committed(_) => {}
                         // The claim stays; the dispatcher timer retries it.
@@ -280,7 +282,7 @@ impl Engine {
         // Step 5: under `admission`, force is re-checked [r5.9]; none starts
         // once `failure_pending` is observed [O1.D12].
         let admission = self.admission.lock().await;
-        if *lock(&self.stop) == Some(StopMode::Force) || self.store_failed() {
+        if *lock(&self.signal.stop) == Some(StopMode::Force) || self.store_failed() {
             return Some(Step::Next);
         }
         match self.commit_closed(slot, session, task.operation).await {
@@ -310,10 +312,7 @@ impl Engine {
                 *refused = false;
                 self.store_failure(FailureSite::Closed, outcome, FailureScope::Session(session))
                     .finish_held(&admission);
-                slot.finish_close(Err(match outcome {
-                    WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-                    WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-                }));
+                slot.finish_close(Err(outcome.api_error()));
                 Some(Step::Next)
             }
         }
@@ -331,9 +330,13 @@ impl Engine {
                     .reprobe_held(Deadline::at(bound), Some(session.clone())),
             )
             .await;
+            if let Ok(pass) = &pass {
+                self.proof_failures(pass, FailureScope::Session(session))
+                    .await;
+            }
             match pass {
                 Ok(Ok(report)) if report.held == report.proved => return,
-                // An uncertain proof commit is design §7.2 row 12 (S5).
+                // An uncertain proof commit latched (design §7.2 row 12).
                 Ok(Err(_)) | Err(_) => return,
                 Ok(Ok(_)) => {}
             }
@@ -347,7 +350,7 @@ impl Engine {
 
     /// Commits `Closed` for a closing session at its head's next sequence;
     /// the caller holds `admission` (lock order `admission` → head). A head
-    /// that cannot be read wrote nothing.
+    /// that cannot be read wrote nothing; a corrupt one latches (§7.1).
     async fn commit_closed(
         &self,
         slot: &Slot,
@@ -358,7 +361,7 @@ impl Engine {
             .head
             .lock(&self.store, session)
             .await
-            .map_err(|_| WriteOutcome::NotCommitted)?;
+            .map_err(|error| WriteOutcome::of_read(&error))?;
         let event = Event {
             seq: head.next(),
             session_id: session,
@@ -388,7 +391,7 @@ impl Engine {
             Ok(ClosedOutcome::Unfinished) => Ok(ClosedOutcome::Unfinished),
             Err(error) => {
                 let outcome = WriteOutcome::of(&error);
-                if outcome == WriteOutcome::Uncertain {
+                if outcome.head_unknown() {
                     head.lost();
                 }
                 Err(outcome)

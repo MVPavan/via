@@ -4,9 +4,11 @@
 
 use std::time::Duration;
 
+use via_adapters::{AdapterError, ReprobeReport};
 use via_store::{ANCHOR_PAGE_LIMIT, AnchorCohort, AnchorOwner};
 
 use super::Engine;
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::CONNECTION_SLOTS;
 use crate::{Cleanup, Deadline};
 
@@ -59,7 +61,7 @@ impl Engine {
     /// force watch, the final-shutdown fence's watch and Host's holdings
     /// generation.
     pub async fn reprobe(&self) {
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         let mut entered = self.final_shutdown.subscribe();
         let mut added = self.adapter.holdings_changed();
         let mut interval = FIRST_PASS;
@@ -100,14 +102,45 @@ impl Engine {
             .reprobe_passes
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let deadline = Deadline::at(tokio::time::Instant::now() + PASS_BOUND);
-        // Safe to ignore: a failed pass keeps every token, and the next pass
-        // retries; a not-committed proof keeps its token too (§7.2 row 12).
-        // S5 owns the latch on an uncertain proof commit (row 12, O1.D10).
-        let _ = self.adapter.reprobe_held(deadline, None).await;
+        // A failed pass keeps every token, and the next pass retries.
+        let pass = self.adapter.reprobe_held(deadline, None).await;
+        // An uncertain pass latches (scope `daemon`); a not-committed proof
+        // is recorded against its owner session.
+        self.proof_failures(&pass, FailureScope::Request).await;
         if let Some(unread) = self.recovered.unread()
             && let Some(cohort) = unread.cohort
         {
             self.resume_paging(unread.cursor, cohort, deadline).await;
+        }
+    }
+
+    /// Design §7.2 row 12 [O1.D10]: reports a pass's absence proofs whose
+    /// commit failed to the failure hook. One that did not commit is scoped:
+    /// its token stays held and the next pass retries it. One whose commit
+    /// may have committed latches. A pass that failed otherwise keeps every
+    /// token and reports nothing. A not-committed proof is recorded against
+    /// its owner session; `scope` covers an uncertain pass, which has no
+    /// owner. The caller holds no lock.
+    pub(super) async fn proof_failures(
+        &self,
+        pass: &Result<ReprobeReport, AdapterError>,
+        scope: FailureScope<'_>,
+    ) {
+        match pass {
+            Ok(report) => {
+                for owner in &report.not_committed {
+                    let owner = FailureScope::Session(owner);
+                    self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, owner)
+                        .finish()
+                        .await;
+                }
+            }
+            Err(error) if error.journal_uncertain() => {
+                self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
+                    .finish()
+                    .await;
+            }
+            Err(_) => {}
         }
     }
 

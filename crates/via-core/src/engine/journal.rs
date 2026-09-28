@@ -162,12 +162,22 @@ impl Head {
     }
 
     /// Locks the head, first re-reading the durable next sequence when unknown.
+    /// A writer that finds the head held, as by a same-sequence retry
+    /// (design §7.2 [r3.7]), waits for it (test builds acknowledge the wait
+    /// at `core.head.contended`).
     pub(super) async fn lock(
         &self,
         journal: &impl TurnJournal,
         session: &SessionId,
     ) -> Result<HeadGuard<'_>, StoreError> {
-        let mut guard = self.0.lock().await;
+        let mut guard = if let Ok(guard) = self.0.try_lock() {
+            guard
+        } else {
+            // The head is held: this writer waits (acknowledgement only).
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.head.contended").await;
+            self.0.lock().await
+        };
         let next = match *guard {
             Some(next) => next,
             None => journal
@@ -211,6 +221,7 @@ pub(super) fn may_have_committed(error: &StoreError) -> bool {
 
 /// An event commit Store did not confirm but may have made durable. After the
 /// first Store failure Core commits nothing more, so a turn holds at most one.
+#[derive(Clone)]
 pub(super) struct UncertainEvent {
     pub(super) seq: u64,
     pub(super) raw_ref: Option<RawRef>,
@@ -370,10 +381,13 @@ pub(super) async fn commit_event_at(
         })
     };
     let shared = Arc::clone(&record.head);
-    let Ok(head) = shared.lock(journal, &record.session).await else {
-        // The head's read failed: nothing was written.
-        record.first_failure = failed(WriteOutcome::NotCommitted);
-        return;
+    let head = match shared.lock(journal, &record.session).await {
+        Ok(head) => head,
+        Err(error) => {
+            // The head's read failed: nothing was written; corruption latches.
+            record.first_failure = failed(WriteOutcome::of_read(&error));
+            return;
+        }
     };
     let seq = head.next();
     let event = Event {
@@ -390,6 +404,10 @@ pub(super) async fn commit_event_at(
         record.first_failure = failed(WriteOutcome::NotCommitted);
         return;
     };
+    // Test builds: the event is about to be sent to the Store writer, which
+    // stays free while this pauses (design §10 [r5.7]).
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_store::failpoint::hit_async("core.commit.before_send").await;
     let committed = journal
         .commit_event(EventRecord {
             session_id: record.session.clone(),
@@ -401,7 +419,7 @@ pub(super) async fn commit_event_at(
     if let Err(error) = committed {
         let outcome = WriteOutcome::of(&error);
         record.first_failure = failed(outcome);
-        if outcome == WriteOutcome::Uncertain {
+        if outcome.head_unknown() {
             head.lost();
             record.uncertain = Some(UncertainEvent {
                 seq,
@@ -454,10 +472,13 @@ pub(super) async fn reconcile(
 /// uncertain, which latches Store failure (runtime §7), while the committed
 /// result stays readable. `closed` when a requested `session.closed` is known
 /// written; Store refuses it while another turn of the session is unfinished.
+/// `retried` when the first attempt was not committed and the one
+/// same-sequence retry committed (design §7.2 rows 7 and 9).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Durable {
     pub(super) uncertain: bool,
     pub(super) closed: bool,
+    pub(super) retried: bool,
 }
 
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
@@ -468,41 +489,118 @@ pub(super) async fn commit_terminal(
     record: TerminalRecord,
     closed: Option<Value>,
 ) -> Result<Durable, ApiError> {
-    commit_terminal_with(journal, record, closed, TerminalExtras::default()).await
+    commit_terminal_with(journal, record, closed, TerminalExtras::default(), false).await
 }
 
 /// [`commit_terminal`] with the terminal's `extras` (design §4, §10). A
 /// cancellation's cause never rides with a force closure: the two are
 /// refused together, writing nothing.
+///
+/// With `retry` (design §7.2 rows 7 and 9 [r3.7, r3.13]), a first attempt
+/// that is known not committed is retried once with the same content and
+/// sequence numbers. The caller holds the session head across both
+/// attempts, so no other writer takes the sequence in between; test builds
+/// can pause before the retry at `core.retry.before`. The retry is the
+/// resolution write: its failure is returned as the terminal's.
 pub(super) async fn commit_terminal_with(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
     extras: TerminalExtras,
+    retry: bool,
 ) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
     let plain = extras.cancel_cause.is_none() && extras.raw_incomplete.is_none();
-    let committed = match (closed, plain) {
-        (closed, true) => journal.commit_terminal(record, closed).await,
-        (None, false) => journal
-            .commit_terminal_with(record, extras)
-            .await
-            .map(|()| false),
-        (Some(_), false) => return Err(ApiError::RECEIPT_NOT_COMMITTED),
-    };
+    if closed.is_some() && !plain {
+        return Err(ApiError::RECEIPT_NOT_COMMITTED);
+    }
+    let again = retry.then(|| {
+        (
+            duplicate(&record),
+            closed.clone(),
+            TerminalExtras {
+                cancel_cause: extras.cancel_cause,
+                raw_incomplete: extras.raw_incomplete.clone(),
+            },
+        )
+    });
+    let mut committed = attempt(journal, record, closed, extras).await;
+    let mut retried = false;
+    if let (Err(error), Some((record, closed, extras))) = (&committed, again)
+        && !may_have_committed(error)
+        && !matches!(error, StoreError::Corrupt(_))
+    {
+        // The first attempt rolled back; the retry holds the same head.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.retry.before").await;
+        retried = true;
+        committed = attempt(journal, record, closed, extras).await;
+    }
     match committed {
         Ok(closed) => Ok(Durable {
             uncertain: false,
             closed,
+            retried,
         }),
-        Err(error) if may_have_committed(&error) => match journal.result(&session, turn).await {
-            Ok(Some(_)) => Ok(Durable {
-                uncertain: true,
-                closed: false,
-            }),
-            Ok(None) | Err(_) => Err(ApiError::RECEIPT_UNKNOWN),
-        },
+        Err(error) if may_have_committed(&error) || matches!(error, StoreError::Corrupt(_)) => {
+            match journal.result(&session, turn).await {
+                Ok(Some(_)) => Ok(Durable {
+                    uncertain: true,
+                    closed: false,
+                    retried,
+                }),
+                Ok(None) | Err(_) => Err(ApiError::RECEIPT_UNKNOWN),
+            }
+        }
         Err(_) => Err(ApiError::RECEIPT_NOT_COMMITTED),
+    }
+}
+
+/// One attempt of [`commit_terminal_with`]; true when the close was written.
+async fn attempt(
+    journal: &impl TurnJournal,
+    record: TerminalRecord,
+    closed: Option<Value>,
+    extras: TerminalExtras,
+) -> Result<bool, StoreError> {
+    if extras.cancel_cause.is_none() && extras.raw_incomplete.is_none() {
+        journal.commit_terminal(record, closed).await
+    } else {
+        journal
+            .commit_terminal_with(record, extras)
+            .await
+            .map(|()| false)
+    }
+}
+
+/// A copy of `record` for the same-sequence retry: the same envelope and
+/// events.
+fn duplicate(record: &TerminalRecord) -> TerminalRecord {
+    TerminalRecord {
+        session_id: record.session_id.clone(),
+        turn: record.turn,
+        envelope: record.envelope.clone(),
+        event: record.event.clone(),
+        raw_ref: record.raw_ref.clone(),
+    }
+}
+
+/// A terminal commit that did not become durable: the `store_error` its
+/// caller reports, and the outcome the failure hook classifies (design
+/// §7.1). A corrupt session-head read before the commit is `Corrupt`
+/// although the reply is a plain `store_error` (T3-S5 round 1, decision 10).
+#[derive(Debug)]
+pub(super) struct Unended {
+    pub(super) error: ApiError,
+    pub(super) outcome: WriteOutcome,
+}
+
+impl From<ApiError> for Unended {
+    fn from(error: ApiError) -> Self {
+        Self {
+            outcome: outcome_of(&error),
+            error,
+        }
     }
 }
 
@@ -518,13 +616,28 @@ pub(super) fn outcome_of(error: &ApiError) -> WriteOutcome {
 /// Reads a durable terminal result as is; a turn whose terminal could not be
 /// made durable is C1 `store_error` with its last committed state, never a turn
 /// that looks still running.
+#[cfg(test)]
 pub(super) async fn read_result(
     journal: &impl TurnJournal,
     unresolved: &Unresolved,
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<Value>, ApiError> {
-    match journal.result(session, turn).await {
+    let read = journal.result(session, turn).await;
+    settled_result(unresolved, session, turn, read)
+}
+
+/// The result `read`, already made (the caller classifies its Store error
+/// first, design §7.3): a durable result settles the turn; a turn whose
+/// terminal could not be made durable is `store_error` with its last
+/// committed state.
+pub(super) fn settled_result(
+    unresolved: &Unresolved,
+    session: &SessionId,
+    turn: TurnNumber,
+    read: Result<Option<Value>, StoreError>,
+) -> Result<Option<Value>, ApiError> {
+    match read {
         Ok(Some(result)) => {
             unresolved.settle(session, turn);
             Ok(Some(result))

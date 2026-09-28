@@ -144,6 +144,8 @@ pub(super) enum StopSpec {
     },
     /// Core's idle deadline.
     Idle,
+    /// The turn's own write did not commit (design §7.2 row 5).
+    Store,
 }
 
 impl StopSpec {
@@ -168,6 +170,11 @@ impl StopSpec {
                     force_at,
                     force_at + CLOSE_ALLOWANCE,
                 )
+            }
+            Self::Store => {
+                let close_by = now + CLOSE_ALLOWANCE;
+                let close_by = wall.map_or(close_by, |wall| close_by.min(wall + CLOSE_ALLOWANCE));
+                (StopCause::Store, now, close_by.max(now))
             }
             Self::Close { mode, deadline } => {
                 let force_at = match mode {
@@ -518,6 +525,37 @@ impl Slot {
         }
     }
 
+    /// Sends the running turn an order with cause `store`, or upgrades its
+    /// order to it (design §7.2 row 5): force at once, closing by
+    /// `min(now + 3 s, wall + 3 s)`. A settling turn gets none: its
+    /// disposition reads the turn's first failure. One transition under the
+    /// slot state, like every other attach [s2-r1.1]. Wakes: an order
+    /// attached.
+    pub(super) fn store_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
+        let issued = {
+            let state = lock(&self.state);
+            match state
+                .running
+                .as_ref()
+                .filter(|running| running.turn == turn && !running.settling)
+            {
+                Some(running) => {
+                    let requested_at = rfc3339(std::time::SystemTime::now());
+                    running.stop.attach(StopSpec::Store.order(
+                        requested_at,
+                        now,
+                        Some(running.wall),
+                    ));
+                    true
+                }
+                None => false,
+            }
+        };
+        if issued {
+            self.wake();
+        }
+    }
+
     /// Publishes the run loop's acknowledgement of the turn's order.
     pub(super) fn acknowledge(&self, turn: TurnNumber, ack: Ack) {
         let state = lock(&self.state);
@@ -649,6 +687,20 @@ impl Slot {
         self.wake();
     }
 
+    /// A dispatcher-owned cancellation's read failed (design §7.3
+    /// [r1.13]): every caller joined so far gets a plain `store_error`. The
+    /// claim is kept, and a caller joining later waits for the retry. The
+    /// slot mutex alone. No wake: the claim is unchanged.
+    pub(super) fn read_failed(&self, turn: TurnNumber) {
+        let mut state = lock(&self.state);
+        if let Some(entry) = state.entry(turn)
+            && entry.claim == Claim::Cancelling(Owner::Dispatcher)
+        {
+            entry.outcome.send_replace(Some(QueuedOutcome::ReadFailed));
+            entry.outcome = watch::Sender::new(None);
+        }
+    }
+
     /// Takes the dispatcher's next cancellation for the close pass or force
     /// (design §3.1, §4 step 1): the first `Waiting` turn becomes
     /// `Cancelling{dispatcher}` with `cause`; one already dispatcher-owned is
@@ -732,8 +784,9 @@ impl Slot {
             .collect()
     }
 
-    /// Removes a turn that left the queue durably cancelled, publishing
-    /// `committed` to its joined callers. Wakes: the pop.
+    /// Removes a turn that left the queue durably terminal (cancelled, or
+    /// failed without agent I/O, design §7.2 row 2), publishing `committed`
+    /// to its joined callers. Wakes: the pop.
     pub(super) fn pop(&self, turn: TurnNumber) {
         {
             let mut state = lock(&self.state);

@@ -11,6 +11,8 @@
 //! precedes any agent I/O.
 #![cfg(feature = "test-failpoints")]
 
+#[path = "support/anchors.rs"]
+mod anchors;
 #[path = "support/failpoints.rs"]
 mod failpoints;
 #[path = "support/hits.rs"]
@@ -1330,44 +1332,20 @@ fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
     )
 }
 
-/// Commits `count` synthetic anchors owned by turn 1 of `owner`, each with a
-/// valid-looking identity copied from an existing real anchor and a committed
-/// absence proof, so Host accepts them without probing. Their groups
-/// (`pgid` beyond Linux's `pid_max`) cannot exist. Ids start with `prefix`.
+/// [`anchors::insert_proven_absent`] into the scenario's Store.
 fn insert_proven_absent(
     paths: &Paths,
     owner: &str,
     prefix: &str,
     count: u32,
 ) -> Result<(), ScenarioError> {
-    let mut store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-    let tx = store.transaction().map_err(infra)?;
-    for index in 0..count {
-        let changed = tx
-            .execute(
-                "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
-                 SELECT ?1,'g'||?1,a.marker,'/nonexistent',?2,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,?3,?3,1,'1'
-                 FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
-                rusqlite::params![format!("{prefix}{index:05}"), owner, 4_194_305 + index],
-            )
-            .map_err(infra)?;
-        check(changed == 1, || "no real anchor to copy".to_owned())?;
-    }
-    tx.commit().map_err(infra)
+    anchors::insert_proven_absent(&paths.state.join("store.sqlite3"), owner, prefix, count)
+        .map_err(infra)
 }
 
-/// Removes synthetic anchors after the daemon exited, so teardown verifies
-/// only anchors that ever ran.
+/// [`anchors::delete_synthetic`] from the scenario's Store.
 fn delete_synthetic(paths: &Paths, prefix: &str) -> Result<(), ScenarioError> {
-    let store = rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
-    store.busy_timeout(Duration::from_secs(5)).map_err(infra)?;
-    store
-        .execute(
-            "DELETE FROM anchors WHERE anchor_id LIKE ?1",
-            [format!("{prefix}%")],
-        )
-        .map(drop)
-        .map_err(infra)
+    anchors::delete_synthetic(&paths.state.join("store.sqlite3"), prefix).map_err(infra)
 }
 
 /// Runtime §7 availability and bounded memory: more than 10,000 committed

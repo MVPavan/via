@@ -23,18 +23,16 @@ use crate::{
 };
 
 impl Engine {
-    /// A receipt commit that reported failure (C1 §8.1, runtime §7): latches
-    /// Store failure and is `store_error` with `commit_outcome`, `unknown`
-    /// with `retry: same_key_only` when it may have committed. Restart
-    /// recovery settles an unknown one.
+    /// A receipt commit that reported failure (C1 §8.1, design §7.2 row 1):
+    /// `store_error` with `commit_outcome`. Not committed, it is scoped to
+    /// the request; one that may have committed, or hit corruption, latches
+    /// and is `unknown` with `retry: same_key_only`, which restart recovery
+    /// settles.
     fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
         let outcome = WriteOutcome::of(error);
         self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
             .finish_held(admission);
-        match outcome {
-            WriteOutcome::Uncertain => ApiError::RECEIPT_UNKNOWN,
-            WriteOutcome::NotCommitted => ApiError::RECEIPT_NOT_COMMITTED,
-        }
+        outcome.api_error()
     }
 
     /// A receipt commit's reply, lost by the test fault backend when armed.
@@ -91,7 +89,7 @@ impl Engine {
             }
             None => None,
         };
-        if lock(&self.stop).is_some() {
+        if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
         // Bounds the turns retained for their `store_error` reads.
@@ -219,7 +217,7 @@ impl Engine {
         if snapshot.closed || snapshot.closing || lock(&self.closing).contains(&session) {
             return Err(ApiError::SESSION_CLOSED);
         }
-        if lock(&self.stop).is_some() {
+        if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
         journal::admission(&self.store, &self.unresolved).await?;
@@ -269,11 +267,11 @@ impl Engine {
             warnings: RoutePlan::fake().warnings(),
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
-        let head = slot
-            .head
-            .lock(&self.store, &session)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        // Nothing was written; Store's read reply already reported SQLite
+        // corruption (design §7.1, T3-S5 round 2, decision 11).
+        let Ok(head) = slot.head.lock(&self.store, &session).await else {
+            return Err(ApiError::STORE);
+        };
         let at = rfc3339(SystemTime::now());
         let event = Event {
             seq: head.next(),
@@ -313,7 +311,7 @@ impl Engine {
                 return Err(ApiError::SESSION_CLOSED);
             }
             Err(error) => {
-                if journal::may_have_committed(&error) {
+                if WriteOutcome::of(&error).head_unknown() {
                     head.lost();
                 } else {
                     drop(head);

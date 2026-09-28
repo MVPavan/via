@@ -7,6 +7,9 @@
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
+#[cfg(feature = "test-failpoints")]
+#[path = "support/hits.rs"]
+mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 
@@ -1180,6 +1183,16 @@ impl Sandbox {
     fn disarm(&self, point: &str) -> TestResult {
         Ok(self.failpoints.disarm(point)?)
     }
+
+    /// Starts counting `point` (see `support/hits.rs`).
+    fn count(&self, point: &str) -> TestResult {
+        Ok(hits::count(&self.root.path().join("failpoints"), point)?)
+    }
+
+    /// The next occurrence of a counted `point`.
+    fn next_hit(&self, point: &str) -> TestResult<u64> {
+        Ok(hits::hits(&self.root.path().join("failpoints"), point)? + 1)
+    }
 }
 
 /// Design §3.1 [r1.1], §11: a close set while the dispatcher holds a claimed
@@ -1584,9 +1597,11 @@ fn s1_close_partial_restarts_keep_one_result() -> TestResult {
 /// Design §4 "Force" [r4.6, r5.8, r6.6], latch variant: a keyed replay of
 /// a close in progress reaches the close watch and is paused at
 /// `core.close.before_subscribe`, holding `admission`. Another session's
-/// terminal commit fails (`store.commit.terminal`), and the latch's first
-/// phase (which needs no `admission`) forces the closing session's running
-/// turn; the dispatcher's latch exit publishes `store_error` in that window.
+/// terminal commit and its one same-sequence retry fail (persistent
+/// `store.commit.terminal`, an escalation; re-pointed in S5, since one
+/// failure is now retried and scoped), and the latch's first phase (which
+/// needs no `admission`) forces the closing session's running turn; the
+/// dispatcher's latch exit publishes `store_error` in that window.
 /// The first caller receives it, and the paused replay, released after the
 /// publication, still receives it from the retained outcome. (The design's
 /// force variant needs a caller entering after force is accepted; the S2
@@ -1638,10 +1653,11 @@ fn s1_close_outcome_retained_for_late_subscriber() -> TestResult {
                 .map_err(|error| error.to_string())
         });
         sandbox.ack(&daemon, "core.close.before_subscribe", 2, "pause")?;
-        // No terminal committed yet: the other session's is the first.
-        sandbox.arm("store.commit.terminal", 1, "fail_io")?;
+        // No terminal committed yet: the other session's is the first, and
+        // its retry the second.
+        sandbox.arm("store.commit.terminal", 1, "fail_io_persist")?;
         sandbox.release("other")?;
-        sandbox.ack(&daemon, "store.commit.terminal", 1, "fail_io")?;
+        sandbox.ack(&daemon, "store.commit.terminal", 2, "fail_io")?;
         // The latch exit published: the first caller has its outcome.
         first.join().map_err(|_| "first close panicked")??;
         check(!replay.is_finished(), || {
@@ -2038,6 +2054,74 @@ fn s1_close_failed_closed_keeps_closing_count() -> TestResult {
     Ok(())
 }
 
+/// Design §7.2 row 11, §6.6 [r3.1, r3.5, r4.1, r4.9], the failure half of
+/// `s1_close_failed_closed_keeps_closing_count` (carried from S3 [s3.8]):
+/// a `Closed` commit that is not committed (`store.commit.closed`,
+/// `fail_io`) replies `store_error` and keeps `closing` durable:
+/// `sessions.closing` is 1 and a plain stop is refused. The daemon is still
+/// serving at twice `VIA_TEST_IDLE_EXIT_MS` after the failure's
+/// acknowledgement (a bounded negative: the sleep only lets time pass). A
+/// keyed replay, with no close in progress, passes steps 3–4 and reaches
+/// step 5 (the next `Closed` commit, failed again); a retried close then
+/// completes, and the count goes to 0.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_failed_closed_keeps_closing_count_after_failure() -> TestResult {
+    let mut sandbox = Sandbox::new(&script(
+        "done",
+        1,
+        vec![accepted(1), terminal(1, "completed", "end_turn")],
+    ))?;
+    let idle = Duration::from_millis(500);
+    sandbox
+        .env
+        .push(("VIA_TEST_IDLE_EXIT_MS", idle.as_millis().to_string()));
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("done", &[])?;
+    sandbox.wait(&format!("{session}/1"))?;
+    let closed = "store.commit.closed";
+    sandbox.arm(closed, 1, "fail_io")?;
+    let keyed = [
+        "close", &session, "--op-key", "k1", "--handle", &handle, "--json",
+    ];
+    sandbox.refused(&keyed, "store_error")?;
+    sandbox.ack(&daemon, closed, 1, "fail_io")?;
+    let failed = Instant::now();
+    sandbox.await_row(
+        &format!("SELECT admission FROM sessions WHERE id='{session}'"),
+        "closing",
+    )?;
+    let status = sandbox.ok(&["daemon", "status", "--json"])?;
+    check(
+        status["sessions"]["closing"] == 1
+            && status["sessions"]["active"] == 0
+            && status["health"] == "healthy",
+        || format!("after the failed Closed: {status}"),
+    )?;
+    sandbox.refused(&["daemon", "stop", "--json"], "admission_refused")?;
+    // Bounded negative: no idle exit while the close is durable.
+    thread::sleep((failed + idle * 2).saturating_duration_since(Instant::now()));
+    check(daemon.child.try_wait()?.is_none(), || {
+        "the daemon exited with a durable close".to_owned()
+    })?;
+    sandbox.arm(closed, 2, "fail_io")?;
+    sandbox.refused(&keyed, "store_error")?;
+    sandbox.ack(&daemon, closed, 2, "fail_io")?;
+    sandbox.disarm(closed)?;
+    let done = sandbox.ok(&keyed)?;
+    check(done["state"] == "closed", || {
+        format!("retried close: {done}")
+    })?;
+    let status = sandbox.ok(&["daemon", "status", "--json"])?;
+    check(status["sessions"]["closing"] == 0, || status.to_string())?;
+    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    check(exit.code() == Some(0), || format!("plain stop exit {exit}"))?;
+    drop(daemon);
+    Ok(())
+}
+
 /// Design §4 steps 4–5, §6.8 [r4.6, r5.9], the force variant (S5 owns the
 /// latch variant): a close waits in its bounded absence check, its
 /// session's group unproven (the anchor held at
@@ -2170,6 +2254,254 @@ fn s1_cancel_wait_across_force_handoff() -> TestResult {
     check(status.code() == Some(0), || {
         format!("force exit {status}: {}", sandbox.trace())
     })?;
+    drop(daemon);
+    sandbox.disarm(point)?;
+    Ok(())
+}
+
+/// Design §4 steps 4–5, §7.4 [r4.6, r5.9], the latch variant of
+/// `s1_close_waiter_resolves_on_force_and_latch` (carried from S3 [s3.8]):
+/// a close waits in its bounded absence check (the anchor held at
+/// `host.anchor.before_eof_cleanup`) and a second close subscribes to the
+/// same attempt. Another session's receipt then latches Store failure (its
+/// reply is lost, `store.commit.reply_lost`): the absence check ends on the
+/// force watch, and both waiters reply `store_error`. No waiter is left:
+/// the daemon exits 4 once the group is gone.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_close_waiter_resolves_on_latch() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "slow",
+        1,
+        vec![json!({"action":"report_pids"}), accepted(1)],
+    ))?;
+    sandbox.count("store.commit.reply_lost")?;
+    let mut daemon = sandbox.start()?;
+    let arm_intent = "host.anchor.after_arm_intent_commit";
+    let eof_cleanup = "host.anchor.before_eof_cleanup";
+    let subscribe = "core.close.before_subscribe";
+    sandbox.arm(arm_intent, 1, "pause")?;
+    sandbox.arm(eof_cleanup, 1, "pause")?;
+    let (session, handle) = sandbox.spawn("slow", &[])?;
+    sandbox.ack(&daemon, arm_intent, 1, "pause")?;
+    sandbox.ok(&["cancel", &session, "--handle", &handle, "--json"])?;
+    sandbox.resume_point(arm_intent, 1)?;
+    let envelope = sandbox.wait(&format!("{session}/1"))?;
+    check(envelope["cancel"]["cleanup"] == "uncertain", || {
+        format!("the group was proved absent: {envelope}")
+    })?;
+    sandbox.arm(subscribe, 2, "pause")?;
+    let close = [
+        "close",
+        &session,
+        "--deadline-ms",
+        "30000",
+        "--handle",
+        &handle,
+        "--json",
+    ];
+    let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
+        let first = scope.spawn(|| {
+            sandbox
+                .refused(&close, "store_error")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.await_row(
+            &format!("SELECT admission FROM sessions WHERE id='{session}'"),
+            "closing",
+        )?;
+        let second = scope.spawn(|| {
+            sandbox
+                .refused(&close, "store_error")
+                .map_err(|error| error.to_string())
+        });
+        sandbox.ack(&daemon, subscribe, 2, "pause")?;
+        sandbox.resume_point(subscribe, 2)?;
+        // The Store's one worker serves this read after the `Closing`
+        // commit, whose reply hit precedes it: the count is settled.
+        sandbox.events(&session)?;
+        let lost = sandbox.next_hit("store.commit.reply_lost")?;
+        sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+        sandbox.refused(
+            &[
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "latch",
+                "--background",
+                "--json",
+            ],
+            "store_error",
+        )?;
+        sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+        let first = first.join().map_err(|_| "first close panicked")??;
+        let second = second.join().map_err(|_| "second close panicked")??;
+        Ok((first, second))
+    })?;
+    check(
+        first["data"]["kind"] == "store_error" && second["data"]["kind"] == "store_error",
+        || format!("close replies: {first} {second}"),
+    )?;
+    sandbox.process_ack(eof_cleanup, 1, "pause")?;
+    sandbox.resume_point(eof_cleanup, 1)?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(4), || {
+        format!("latched exit {status}: {}", sandbox.trace())
+    })?;
+    drop(daemon);
+    sandbox.disarm(eof_cleanup)?;
+    sandbox.disarm(subscribe)?;
+    Ok(())
+}
+
+/// Design §3.3 "Drop without an acknowledgement", §3.4 [r1.4, r3.4, r4.9],
+/// the variant of `s1_cancel_wait_across_force_handoff` with an
+/// unacknowledged order (carried from S3 [s3.8]): a `cancel --wait` is
+/// admitted (held at `core.cancel.admitted`, past step 3) before
+/// `daemon stop --force` is accepted. The forced turn settles (its run loop
+/// held at `core.run.settling`), so the cancel sends no order and waits for
+/// the drop (`core.cancel.settling`). Final shutdown is held at
+/// `core.shutdown.before_forced_terminal` and the waiter has not replied;
+/// released, it replies the committed forced terminal with
+/// `already_terminal: true`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_cancel_wait_across_force_handoff_unacknowledged() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("hang", &[])?;
+    sandbox.wait_for_event(&session, "turn.started")?;
+    let admitted = "core.cancel.admitted";
+    let run_settling = "core.run.settling";
+    let settling = "core.cancel.settling";
+    let terminal = "core.shutdown.before_forced_terminal";
+    sandbox.arm(admitted, 1, "pause")?;
+    sandbox.arm(run_settling, 1, "pause")?;
+    sandbox.arm(settling, 1, "fail_io")?;
+    sandbox.arm(terminal, 1, "pause")?;
+    let reply = thread::scope(|scope| -> TestResult<Value> {
+        let waiter = scope.spawn(|| {
+            sandbox
+                .ok(&[
+                    "cancel",
+                    &session,
+                    "--force-after",
+                    "60000",
+                    "--wait",
+                    "--handle",
+                    &handle,
+                    "--json",
+                ])
+                .map_err(|error| error.to_string())
+        });
+        sandbox.ack(&daemon, admitted, 1, "pause")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.ack(&daemon, run_settling, 1, "pause")?;
+        sandbox.resume_point(admitted, 1)?;
+        sandbox.ack(&daemon, settling, 1, "fail_io")?;
+        sandbox.resume_point(run_settling, 1)?;
+        sandbox.ack(&daemon, terminal, 1, "pause")?;
+        check(!waiter.is_finished(), || {
+            "the waiter replied before the forced terminal".to_owned()
+        })?;
+        sandbox.resume_point(terminal, 1)?;
+        Ok(waiter.join().map_err(|_| "waiter panicked")??)
+    })?;
+    check(
+        reply["state"] == "cancelled"
+            && reply["already_terminal"] == true
+            && reply["cancel"]["outcome"] == "forced",
+        || format!("waiter reply: {reply}"),
+    )?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(0), || {
+        format!("force exit {status}: {}", sandbox.trace())
+    })?;
+    drop(daemon);
+    for point in [admitted, run_settling, settling, terminal] {
+        sandbox.disarm(point)?;
+    }
+    Ok(())
+}
+
+/// Design §3.4, §7.2 row 15 [r3.4, r3.11], variant of
+/// `s1_cancel_wait_across_force_handoff` whose forced terminal never
+/// commits (carried from S3 [s3.8]): the acknowledged `cancel --wait`
+/// waits through the handoff; final shutdown's forced terminal is not
+/// committed (`store.commit.terminal`, `fail_io`: no latch). Once final
+/// shutdown finalized, the waiter replies as `wait` does: `store_error`
+/// for the turn recorded unpersisted, with its durable state. The exit is 4
+/// and the summary counts one uncommitted turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_cancel_wait_across_force_handoff_terminal_not_committed() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "hang",
+        1,
+        vec![accepted(1), json!({"action":"hang"})],
+    ))?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("hang", &[])?;
+    sandbox.wait_for_event(&session, "turn.started")?;
+    let point = "core.shutdown.before_forced_terminal";
+    sandbox.arm(point, 1, "pause")?;
+    let error = thread::scope(|scope| -> TestResult<Value> {
+        let waiter = scope.spawn(|| {
+            sandbox
+                .refused(
+                    &[
+                        "cancel",
+                        &session,
+                        "--force-after",
+                        "60000",
+                        "--wait",
+                        "--handle",
+                        &handle,
+                        "--json",
+                    ],
+                    "store_error",
+                )
+                .map_err(|error| error.to_string())
+        });
+        sandbox.wait_for_event(&session, "cancel.requested")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.ack(&daemon, point, 1, "pause")?;
+        check(!waiter.is_finished(), || {
+            "the waiter replied before the forced terminal".to_owned()
+        })?;
+        // The forced terminal is the first terminal commit.
+        sandbox.arm("store.commit.terminal", 1, "fail_io")?;
+        sandbox.resume_point(point, 1)?;
+        sandbox.ack(&daemon, "store.commit.terminal", 1, "fail_io")?;
+        Ok(waiter.join().map_err(|_| "waiter panicked")??)
+    })?;
+    check(
+        error["data"]["durable_state"] == "running" && error["data"]["terminal_persisted"] == false,
+        || format!("waiter reply: {error}"),
+    )?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    check(status.code() == Some(4), || {
+        format!("exit {status}: {}", sandbox.trace())
+    })?;
+    let summary = sandbox
+        .trace()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|line| line.get("daemon_shutdown").cloned())
+        .ok_or("no shutdown summary")?;
+    check(
+        summary["uncommitted_turns"] == 1 && summary["store_failed"] == false,
+        || format!("summary: {summary}"),
+    )?;
     drop(daemon);
     sandbox.disarm(point)?;
     Ok(())

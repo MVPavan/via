@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, OnceLock, PoisonError,
+        Arc, Mutex as StdMutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -19,6 +19,7 @@ use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
 use via_store::{Store, StoreClient, StoreLock};
 
+mod batch;
 mod close;
 mod control;
 mod drive;
@@ -29,6 +30,7 @@ mod read;
 mod receipt;
 mod recovery;
 mod reprobe;
+mod resolve;
 mod slots;
 mod status;
 mod stop;
@@ -36,6 +38,7 @@ mod terminal;
 #[cfg(test)]
 mod tests;
 
+pub use batch::FailureBatches;
 use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
@@ -61,14 +64,14 @@ pub struct Engine {
     adapter: AdapterRuntime,
     active: AtomicUsize,
     admission: tokio::sync::Mutex<()>,
-    /// Accepted `daemon/stop` mode; set under `admission`, never cleared.
-    stop: StdMutex<Option<StopMode>>,
-    /// Tells running drives to force-close their execution (C1 §3.14 `force`).
-    force: watch::Sender<bool>,
-    /// When the force stop was accepted: every forced turn's `requested_at`.
-    force_requested_at: OnceLock<String>,
+    /// The stop mode, the force watch and the latch's phase one with the
+    /// failure record, shared with Store's read-corruption observer.
+    signal: Arc<latch::Signal>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
+    /// Running turns whose terminal write failed after the run loop ended,
+    /// kept for final shutdown's failure-resolution batch (design §7.4).
+    affected: StdMutex<Vec<batch::AffectedTurn>>,
     /// Receipted turns with no terminal known to have committed; a turn whose
     /// terminal could not be made durable reads as `store_error`.
     unresolved: Unresolved,
@@ -82,9 +85,6 @@ pub struct Engine {
     /// Phase two of the latch, set under `admission` after `failure_pending`
     /// (runtime §7): the latch is ordered after every receipt inside it.
     store_failed: AtomicBool,
-    /// Phase one of the latch: a failed or uncertain write was observed; set
-    /// under the `stop` mutex before the observer awaits anything.
-    failure_pending: AtomicBool,
     /// Sessions with dispatch state when force was accepted, for final
     /// shutdown's closure pass.
     force_sessions: StdMutex<Option<Vec<SessionId>>>,
@@ -174,6 +174,9 @@ struct ForcedTurn {
     requested_at: String,
     /// Route's force cleanup could not record every vendor byte.
     raw_incomplete: bool,
+    /// Its `raw_log.incomplete` was dropped after the turn's first failure
+    /// and is owed to the failure-resolution batch (design §7.4).
+    raw_owed: bool,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
     /// Route's own Host close: its stop found the vendor live, and whether it
@@ -193,6 +196,7 @@ struct RouteClose {
 
 /// Durable facts of a turn about to take its terminal: its queue entry and,
 /// once committed, its submission.
+#[derive(Clone)]
 struct Started {
     session: SessionId,
     turn: TurnNumber,
@@ -267,6 +271,12 @@ impl Engine {
             None => Store::open(state),
         }
         .map_err(|error| error.to_string())?;
+        // Design §7.1 (T3-S5 round 2, decision 11): SQLite corruption on any
+        // read reaches the failure hook at Store's read reply, before any
+        // read of recovery or of the Engine.
+        let signal = Arc::new(latch::Signal::new());
+        let observer = Arc::clone(&signal);
+        owner.on_read_corruption(move || observer.read_corrupt());
         let store = owner.client();
         let adapter = AdapterRuntime::new(
             AdapterRuntimeConfig {
@@ -287,16 +297,14 @@ impl Engine {
             adapter,
             active: AtomicUsize::new(0),
             admission: tokio::sync::Mutex::new(()),
-            stop: StdMutex::new(None),
-            force: watch::Sender::new(false),
-            force_requested_at: OnceLock::new(),
+            signal,
             forced: StdMutex::new(Vec::new()),
+            affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
             finalized: AtomicBool::new(false),
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
             store_failed: AtomicBool::new(false),
-            failure_pending: AtomicBool::new(false),
             force_sessions: StdMutex::new(None),
             read_retries_until: watch::Sender::new(None),
             starts,
@@ -411,6 +419,7 @@ impl Engine {
 }
 
 /// Committed acceptance facts the envelope reports.
+#[derive(Clone)]
 struct Accepted {
     at: String,
     raw_ref: RawRef,
@@ -418,7 +427,10 @@ struct Accepted {
 }
 
 /// Durable progress of a running turn: the session's shared event head and the
-/// bounding raw spans of every event committed so far.
+/// bounding raw spans of every event committed so far. A clone is kept
+/// for the failure-resolution batch of a turn whose terminal failed
+/// (design §7.4).
+#[derive(Clone)]
 struct TurnRecord {
     session: SessionId,
     turn: TurnNumber,
@@ -441,6 +453,7 @@ struct FailureNote {
 }
 
 /// Core's terminal decision from adapter evidence (C1 §5, §8.2).
+#[derive(Clone)]
 struct Terminal {
     state: &'static str,
     failure: Option<Failure>,

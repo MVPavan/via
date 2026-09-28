@@ -438,3 +438,83 @@ fn raw_seams_fail_as_raw_io() {
         }
     });
 }
+
+/// T3-S5 round 2, decision 11 (design §7.1): every read command, from the
+/// Core client or Host's journal, reports SQLite corruption to the
+/// registered observer before its caller receives the reply. Each read
+/// meets its own `store.read.corrupt.<command>` seam once.
+#[test]
+fn every_read_reports_corruption_before_its_reply() {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    type Read<'a> = Pin<Box<dyn Future<Output = bool> + 'a>>;
+    let seams = Seams::new();
+    let store = Store::open(seams.state()).unwrap();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&observed);
+    assert!(store.on_read_corruption(move || {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }));
+    assert!(!store.on_read_corruption(|| {}), "the first observer stays");
+    let client = store.client();
+    let (_, journal) = store.runtime_resources().into_wire_parts();
+    let (s, t) = (session(), turn());
+    let corrupt = |error: StoreError| matches!(error, StoreError::Corrupt(_));
+    // Each future reads once when awaited: true when the reply is Corrupt.
+    macro_rules! read {
+        ($point:literal, $read:expr) => {
+            (
+                $point,
+                Box::pin(async { $read.await.is_err_and(corrupt) }) as Read<'_>,
+            )
+        };
+    }
+    let reads = vec![
+        read!("spawn_key", client.spawn_key("k")),
+        read!("operation", client.operation(&s, "k")),
+        read!("keyed_operation", client.keyed_operation(&s, "k")),
+        read!("snapshot", client.session_snapshot(&s)),
+        read!("queued_turn", client.queued_turn(&s, t)),
+        read!("predecessors", client.predecessors(&s, t)),
+        read!("next_seq", client.next_seq(&s)),
+        read!("result", client.result(&s, t)),
+        read!("close_result", client.session_close_result(&s)),
+        read!("closing_sessions", client.closing_sessions_page(None, 8)),
+        read!("terminated", client.terminated(vec![(s.clone(), t)])),
+        read!("events", client.events(&s, 1, 8)),
+        read!("logs", client.logs(&s)),
+        read!("authenticate", client.authenticate(&s, &[7_u8; 32])),
+        read!("unfinished", client.unfinished_turns()),
+        read!("anchor_owners", client.anchor_owners_page(None, 8)),
+        read!("unproven_anchors", client.unproven_anchors_up_to(None, 8)),
+        read!("anchor_cohort", client.anchor_cohort()),
+        read!("queued_turns", client.queued_turns_page(None, 8)),
+        (
+            "anchor_records",
+            Box::pin(async {
+                let read = journal.list_anchor_records_page(None, 8).await;
+                read.is_err_and(|kind| kind == via_store::StoreFailureKind::Corrupt)
+            }) as Read<'_>,
+        ),
+    ];
+    assert_eq!(reads.len(), 20, "one read per read command");
+    seams.runtime.block_on(async {
+        for (expected, (point, read)) in (1..).zip(reads) {
+            let seam = format!("store.read.corrupt.{point}");
+            seams.arm(&seam, 1, "fail_io", false);
+            assert!(read.await, "{point}: the reply is not Corrupt");
+            assert!(seams.acked(&seam, 1), "{point}: the seam was not reached");
+            assert_eq!(
+                observed.load(Ordering::Acquire),
+                expected,
+                "{point}: the observer did not run once, before the reply"
+            );
+        }
+    });
+}

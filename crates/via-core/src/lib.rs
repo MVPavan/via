@@ -81,7 +81,8 @@ mod api;
 mod engine;
 
 pub use engine::{
-    Connections, DaemonCounts, Engine, EngineShutdown, FinalEntry, Handoff, Receipted, StopMode,
+    Connections, DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff,
+    Receipted, StopMode,
 };
 
 /// Test builds only: the named failpoint controller (runtime-contracts §11),

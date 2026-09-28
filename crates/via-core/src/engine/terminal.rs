@@ -216,10 +216,17 @@ fn stopped(
     requested: Option<CancelCause>,
 ) -> Disposed {
     // Design §2 [r1.8]: quiescent only with Host's absence proof, or with
-    // no anchor intent at all (an order set before `execute`).
+    // no anchor intent at all (an order set before `execute`, or an anchor
+    // intent that did not commit, §7.2 row 3).
     let quiescent = match route.cleanup {
         Some(cleanup) => cleanup == WireCleanup::Quiescent,
-        None => !route.launched && matches!(route.cause, RouteError::Stopped { .. }),
+        None => {
+            !route.launched
+                && matches!(
+                    route.cause,
+                    RouteError::Stopped { .. } | RouteError::Store { .. }
+                )
+        }
     };
     let (outcome, cleanup) = stop_outcome(quiescent, route.forced);
     let by_order = match route.cause {
