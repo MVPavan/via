@@ -2446,3 +2446,27 @@ fn after_a_latch_only_unjoined_sessions_count_by_their_durable_state() {
         assert_eq!(report.unclosed_sessions, 1, "{report:?}");
     });
 }
+
+/// T3-S5 round 4, decision 16 (design §6.8): without a latch, an unjoined
+/// force session is also counted by its durable state. A durably closed one
+/// is not counted; an open one is. Neither gets a closure write.
+#[test]
+fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
+    let Some(root) = child("without_a_latch_unjoined_sessions_count_by_their_durable_state") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closed = durably_closed_session(&engine).await;
+        let open_unjoined = new_session(&engine).await;
+        super::lock(&engine.force_sessions).replace(vec![closed.clone(), open_unjoined.clone()]);
+        let _closed_dispatcher = engine.dispatching(&closed);
+        let _open_dispatcher = engine.dispatching(&open_unjoined);
+        let report = shutdown(&engine).await;
+        assert!(!report.store_failed, "{report:?}");
+        assert_eq!(report.unjoined_dispatchers, 2, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+        let types = event_types(&engine, &open_unjoined).await;
+        assert!(!types.contains(&"session.closed".to_owned()), "{types:?}");
+    });
+}

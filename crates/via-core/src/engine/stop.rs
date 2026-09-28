@@ -479,8 +479,8 @@ impl Engine {
     /// one counts as unclosed (T3-S5 round 2, decision 12). A session
     /// already closed in-path is read as closed and never closed twice. A
     /// session in `unjoined`, whose dispatcher still owns it, is not closed:
-    /// it counts as unclosed, or after a Store failure by the same read
-    /// (round 3, decision 14).
+    /// it is counted by the same read, with or without a Store failure
+    /// (round 3, decision 14; round 4, decision 16).
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
         let mut unclosed = 0;
@@ -504,11 +504,7 @@ impl Engine {
                 unclosed += 1;
             }
         }
-        let skipped = if self.store_failed() {
-            self.durably_open(&unvisited).await
-        } else {
-            unvisited.len()
-        };
+        let skipped = self.durably_open(&unvisited).await;
         lock(&self.force_sessions).take();
         unclosed + skipped
     }
