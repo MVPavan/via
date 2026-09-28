@@ -1302,7 +1302,10 @@ fn failed_on_corrupt_row(paths: &Paths, session: &str, n: u32) -> Result<(), Sce
 /// that is present but unparseable fails that turn `failed(store)` through
 /// `commit_submit_failed`, without agent I/O. Turn 2's `effective` is not
 /// JSON (Store cannot read the row); turn 3's is JSON Core cannot parse.
-/// The restarted daemon admits, and turn 4 runs.
+/// The restarted daemon admits, and turn 4 runs. Each corrupt row reaches
+/// the failure record before admission (design §7.5; T3-S5 round 1,
+/// decision 5): `store_failure` is `corrupt_row` for turn 3, scope `turn`,
+/// count 2, while `health` stays `healthy`.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f12_corrupt_frozen_row_fails_turn_on_restart() -> TestResult {
@@ -1315,6 +1318,16 @@ fn s1_f12_corrupt_frozen_row_fails_turn_on_restart() -> TestResult {
         let _daemon = Daemon::start(paths, evidence, "final")?;
         failed_on_corrupt_row(paths, &session, 2)?;
         failed_on_corrupt_row(paths, &session, 3)?;
+        let status = paths.ok(evidence, "status", &["daemon", "status", "--json"])?;
+        let failure = &status["store_failure"];
+        check(
+            status["health"] == "healthy"
+                && failure["kind"] == "corrupt_row"
+                && failure["scope"] == "turn"
+                && failure["count"] == 2
+                && failure["affected"]["addresses"] == json!([format!("{session}/3")]),
+            || format!("the handoff's corrupt rows were not recorded: {status}"),
+        )?;
         let fourth = wait(paths, evidence, &format!("{session}/4"))?;
         check(fourth["state"] == "completed", || {
             format!("turn 4 after the corrupt rows: {fourth}")

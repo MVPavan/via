@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 
 use super::drive::{Cancelled, Commit, connection_id, queued_cancellation};
 use super::journal::Head;
+use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
@@ -255,7 +256,13 @@ impl Engine {
     /// §7.3): `turn.submitted` and `turn.ended` `failed(store)`, with
     /// `cancel: null`, in one `commit_submit_failed` transaction and without
     /// agent I/O. Any failure of the write fails startup (§7.2 row 13).
+    /// The corrupt row is recorded first, as the live rule records it, so
+    /// `store_failure` reports it once admission opens (§7.5).
     async fn fail_corrupt_turn(&self, session: &SessionId, turn: TurnNumber) -> Result<(), String> {
+        let scope = FailureScope::Turn(session, turn);
+        self.store_failure(FailureSite::CorruptRow, WriteOutcome::NotCommitted, scope)
+            .finish()
+            .await;
         // The row itself may be unreadable: its queueing comes from the
         // committed history instead.
         let queueing = self
