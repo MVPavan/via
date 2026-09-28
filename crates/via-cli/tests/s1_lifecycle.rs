@@ -972,6 +972,109 @@ fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
     sandbox.stop_auto(stop, pid)
 }
 
+/// F4, explicit stop (design §6.2 items 3 and 5, review Y item 6): `via
+/// daemon stop` from another version's CLI against an idle, Store-matched
+/// daemon sends the permitted plain stop on the mismatched connection, and
+/// never starts a replacement. A Store mismatch exits 4 and a connected
+/// client gets `admission_refused`; `--force` is not the permitted stop, so
+/// the daemon is untouched. Any replacement would hit
+/// `daemon.startup.after_lock`, armed to pause and acknowledge.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> TestResult {
+    const OTHER: &str = "0.0.0-f04-stop";
+    let sandbox = Sandbox::new(&json!({}))?;
+    let mut daemon = sandbox.start()?;
+    sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
+    let stop = |state: &Path, extra: &[&str]| -> TestResult<Captured> {
+        let mut command = sandbox.command_fp();
+        command
+            .env("VIA_TEST_CLIENT_VERSION", OTHER)
+            .env("VIA_STATE_DIR", state)
+            .args(["daemon", "stop"])
+            .args(extra)
+            .arg("--json");
+        run_command(&mut command, Duration::from_secs(40))
+    };
+    let untouched = |what: &str| -> TestResult {
+        check(sandbox.status()?["pid"] == daemon.pid(), || {
+            format!("{what}: the daemon was stopped or replaced")
+        })
+    };
+    // A Store mismatch: exit 4, and nothing is sent.
+    let elsewhere = sandbox.root.path().join("elsewhere");
+    fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
+    let captured = stop(&elsewhere, &[])?;
+    check(
+        captured.status.code() == Some(4)
+            && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
+        || {
+            format!(
+                "store mismatch: {}",
+                String::from_utf8_lossy(&captured.stderr)
+            )
+        },
+    )?;
+    untouched("store mismatch")?;
+    // `--force` is not the permitted plain stop: reported, daemon untouched.
+    let captured = stop(&sandbox.state, &["--force"])?;
+    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+    check(
+        captured.status.code() == Some(2) && error["data"]["kind"] == "version_mismatch",
+        || format!("forced stop: {} {error}", captured.status),
+    )?;
+    untouched("forced stop")?;
+    // Another client connected: the idle-only stop is refused.
+    let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    let captured = stop(&sandbox.state, &[])?;
+    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+    check(
+        captured.status.code() == Some(2)
+            && error["data"]["kind"] == "admission_refused"
+            && error["message"] == "daemon not idle",
+        || format!("busy daemon: {} {error}", captured.status),
+    )?;
+    untouched("busy daemon")?;
+    drop(connected);
+    // Idle and Store-matched. A closed connection's task ends shortly after
+    // the close; a refusal while one is still counted is retried in bound.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let captured = loop {
+        let captured = stop(&sandbox.state, &[])?;
+        let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+        if error["message"] != "daemon not idle" || Instant::now() >= deadline {
+            break captured;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let reply: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
+    check(
+        captured.status.success() && reply["stopping"] == true,
+        || {
+            format!(
+                "idle daemon: {} {reply} {}",
+                captured.status,
+                String::from_utf8_lossy(&captured.stderr)
+            )
+        },
+    )?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    let summary = daemon.summary()?;
+    check(exit.code() == Some(0) && summary["mode"] == "idle", || {
+        format!("stopped daemon: {exit} {summary}")
+    })?;
+    // The CLI has returned and the daemon is gone: no replacement was
+    // started (it would have paused and acknowledged at its lock).
+    check(
+        !sandbox.runtime.join("via.sock").exists()
+            && sandbox
+                .failpoints
+                .ack_bytes("daemon.startup.after_lock", 1)
+                .is_err(),
+        || "a replacement daemon was started".to_owned(),
+    )
+}
+
 /// F6 (design §6.4): with a lowered idle interval the daemon never exits
 /// while a client is connected or a turn runs, and exits `idle` (0) once
 /// neither holds. A client that arrives while an exiting daemon is paused

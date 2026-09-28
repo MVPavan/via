@@ -450,6 +450,12 @@ fn same_store(expected: &Path, reported: &str) -> anyhow::Result<bool> {
     )
 }
 
+/// Whether the request is a `daemon/stop` without `drain` or `force`, the
+/// only request a version-mismatched connection accepts.
+fn is_plain_stop(method: &str, params: &Value) -> bool {
+    method == "daemon/stop" && params["drain"] != true && params["force"] != true
+}
+
 pub(crate) fn request(method: &str, params: &Value, auto_start: bool) -> anyhow::Result<Value> {
     request_within(method, params, auto_start, Duration::from_secs(30))
 }
@@ -475,11 +481,18 @@ pub(crate) fn request_within(
             hello,
         } = connect(&paths, auto_start, read, &mut starter)?;
         if let Some(error) = hello.get("error") {
-            if !auto_start || restarted || error["data"]["kind"] != "version_mismatch" {
+            if restarted || error["data"]["kind"] != "version_mismatch" {
+                return Ok(hello);
+            }
+            // Only the plain stop is permitted on a mismatched connection;
+            // without auto-start, that explicit stop is the sole request
+            // that proceeds (design §6.2 item 3).
+            if !auto_start && !is_plain_stop(method, params) {
                 return Ok(hello);
             }
             // Design §6.2: a Store-matched mismatched daemon is stopped only
-            // while idle, then this binary's daemon is started once.
+            // while idle; an auto-starting request then starts this binary's
+            // daemon once, an explicit stop never starts one.
             let store_path = error["data"]["store_path"].as_str().unwrap_or_default();
             if !same_store(&paths.state.join("store.sqlite3"), store_path).unwrap_or(false) {
                 bail!("connected daemon of another version uses a different Store path");
@@ -491,7 +504,7 @@ pub(crate) fn request_within(
                 "daemon/stop",
                 &json!({"drain":false,"force":false}),
             )?;
-            if stop["result"]["stopping"] != true {
+            if stop["result"]["stopping"] != true || !auto_start {
                 return Ok(stop);
             }
             drop((writer, reader));
