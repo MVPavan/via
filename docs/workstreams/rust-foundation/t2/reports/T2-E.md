@@ -83,8 +83,10 @@ base they fail to compile rather than fail at run time.
   whatever its state. Both receipts and Store records carry the same
   `effective`.
 - `crates/via-core/src/engine/drive.rs`: submission reads the turn's frozen
-  row. An unreadable row is a Store failure, and nothing is sent. The Core
-  wall deadline and `turn.started.effective` come from that row.
+  row. A queued-row read error returns `Unread` and retries without agent
+  I/O and without latching. Malformed frozen JSON fails the turn and
+  latches Store failure, and nothing is sent. The Core wall deadline and
+  `turn.started.effective` come from that row.
  
 - `crates/via-store/src/runtime.rs` and `runtime/sql.rs`: schema v4 adds
   `turns.effective TEXT NOT NULL`, which is written once in the receipt
@@ -216,9 +218,53 @@ directly gained the new `effective` field: `via-store` tests,
   deterministic failpoint barriers for the fixed-sleep capacity checks and
   the ignored force-handoff race, and the Core idle deadline. Once the idle
   deadline exists, `deadlines.idle_ms` should be accepted.
-- `s1_params_frozen_wall_deadline_applies_to_its_turn_only` holds turn 2 for
-  a fixed 2 s. That is a lower bound, not a race: the test passes only if
-  turn 2's own 60 s deadline applies. It adds about 2 s to the suite.
-- `bound: null` is refused as `bound_unsupported` ("any bound"). If the
-  orchestrator reads null as "omitted", that is a one-line change in
-  `fake_overrides`.
+- Resolved in round 1: the fixed 2 s hold in
+  `s1_params_frozen_wall_deadline_applies_to_its_turn_only`, and
+  `bound: null` (now `invalid_params`).
+
+## Round 1
+
+The Sol high re-review (`../task2-sol-high-review-r2.md`) returned ACCEPT
+AFTER CHANGES. `origin/rust-foundation` (`d158466`) was merged first
+(`118be44`). The orchestrator's dispositions were applied, and nothing else
+changed.
+
+1. **Null for non-nullable per-turn fields** (`744df01`). C1 §1 makes only
+   members typed "or null" nullable. `effort: null`, `bound: null` and
+   `deadlines: null` are now `invalid_params`, with `data.field` naming the
+   member and `data.route: "fake"`. A present `bound` object stays
+   `bound_unsupported`, and `output_schema: null` and `max_steps: null` are
+   still accepted. The wire parse used to turn `deadlines: null` into
+   "omitted". It now keeps an explicit `null` (the `Nullable` member type in
+   `crates/via-core/src/api.rs`), so the validation refuses it; no earlier
+   parse path rejects these values. `api::tests::fake_per_turn_edge_values`
+   asserts kind, field and route for `bound: null`, a `bound` object,
+   `effort: null` and `deadlines: null`, and that `output_schema: null` and
+   `max_steps: null` are accepted. The end-to-end null-acceptance case in
+   `s1_params_unsupported_values_are_refused_by_name` no longer sends
+   `effort: null`.
+2. **`events` FK finding.** Withdrawn by the orchestrator; nothing changed.
+3. **Deadline test without a sleep** (`744df01`). While the fake holds turn
+   2 at `hold_d2`, `via wait <session>/2 --timeout-ms 2000 --json` must end
+   with `wait_timeout`. That shows turn 2 is still live 2 s after reaching
+   its gate, past turn 1's 1500 ms budget. The gate is then released, and
+   the existing completion checks run. The test has no `thread::sleep`.
+4. **Report wording.** The drive paragraph above now separates the two
+   failures: a queued-row read error is `Unread` and retries with no agent
+   I/O and no latch, while malformed frozen JSON fails the turn and latches.
+
+Deferred, as decided: the queued-row read-error versus latch distinction,
+and a restart test with a nondefault frozen value (`via-jm4.7.7`). The
+30 000 ms fake default versus C1's 3 600 000, and the remaining spawn CLI
+options, go to `via-jm4.7.8`.
+
+Gate:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass |
+| `cargo clippy … --features via-cli/test-failpoints -- -D warnings` | pass |
+| `cargo nextest run --locked --workspace` | 180 passed, 2 skipped |
+| `cargo nextest run --locked --workspace --features via-cli/test-failpoints`, 3 runs | 210 passed, 2 skipped each time (45.4 s, 43.3 s, 43.4 s) |
+| `… -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 17 passed |
