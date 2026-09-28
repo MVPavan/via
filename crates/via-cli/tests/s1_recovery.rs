@@ -1275,6 +1275,110 @@ fn s1_recovery_corrupt_row_write_failure_fails_startup() -> TestResult {
     )
 }
 
+/// Crashes a daemon while turn 1 of `hanging(prompts[0])` runs, with turns
+/// 2.. of `prompts` durably `queued` behind it, then makes turn 2's frozen
+/// row unreadable to Store. Returns the session and the crashed daemon,
+/// which the caller keeps alive (see `Daemon::kill`).
+#[cfg(feature = "test-failpoints")]
+fn crash_behind_running<'a>(
+    paths: &'a Paths,
+    evidence: &Evidence,
+    prompts: &[&str],
+) -> Result<(String, Daemon<'a>), ScenarioError> {
+    let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+    let (first, rest) = prompts.split_first().ok_or_else(|| infra("no prompts"))?;
+    let session = session_of(&spawn(paths, evidence, "spawn", first, &[])?)?;
+    paths.await_event(&session, 1, "turn.started")?;
+    for (index, prompt) in rest.iter().enumerate() {
+        resume(
+            paths,
+            evidence,
+            &format!("resume-{}", index + 2),
+            &session,
+            prompt,
+            &[],
+        )?;
+    }
+    for n in 2..=u32::try_from(prompts.len()).map_err(infra)? {
+        let (state, _) = paths.turn(&session, n)?;
+        check(state == "queued", || {
+            format!("turn {n} before the crash: {state}")
+        })?;
+    }
+    daemon.kill()?;
+    corrupt_effective(paths, &session, 2, "not json {")?;
+    Ok((session, daemon))
+}
+
+/// C1 P6 behind a corrupt row: turn `n`, queued behind the recovered
+/// `unknown` turn 1, is cancelled without launching.
+#[cfg(feature = "test-failpoints")]
+fn cancelled_behind_unknown(paths: &Paths, session: &str, n: u32) -> Result<(), ScenarioError> {
+    let (state, envelope) = paths.turn(session, n)?;
+    check(
+        state == "cancelled" && envelope["state"] == "cancelled",
+        || format!("turn {n} behind the unknown turn: {state} {envelope}"),
+    )?;
+    check(paths.anchors_of_turn(session, n)? == 0, || {
+        format!("turn {n} launched behind the unknown turn")
+    })
+}
+
+/// Design §7.3 with C1 P6: a queued turn whose row Store cannot read,
+/// behind a recovered `unknown` turn, is cancelled like the rest of the
+/// queue, so the valid turn after it is cancelled too and never runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_keeps_the_unknown_barrier() -> TestResult {
+    let fixture = json!({"scripts":[hanging("b1"), completes("b2", 2), completes("b3", 3)]});
+    scenario(
+        "s1_recovery_corrupt_barrier",
+        &fixture,
+        |paths, evidence| {
+            let (session, _crashed) = crash_behind_running(paths, evidence, &["b1", "b2", "b3"])?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            recovered_unknown(paths, &session)?;
+            cancelled_behind_unknown(paths, &session, 3)?;
+            cancelled_behind_unknown(paths, &session, 2)
+        },
+    )
+}
+
+/// The same barrier across a crash between the corrupt row's resolution
+/// and the next row's: the handoff is held at its next queued-row read
+/// (`store.read.queued_turn`, occurrence 2) and killed. The next recovery
+/// still cancels the valid turn behind the `unknown` one.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_keeps_the_unknown_barrier_across_a_restart() -> TestResult {
+    let fixture = json!({"scripts":[hanging("x1"), completes("x2", 2), completes("x3", 3)]});
+    scenario(
+        "s1_recovery_corrupt_barrier_restart",
+        &fixture,
+        |paths, evidence| {
+            let (session, _crashed) = crash_behind_running(paths, evidence, &["x1", "x2", "x3"])?;
+            let point = "store.read.queued_turn";
+            paths.failpoints.arm(point, 2, "pause").map_err(infra)?;
+            let mut interrupted = Daemon::spawn(paths, evidence, "interrupted", &[])?;
+            paths
+                .failpoints
+                .wait_ack(point, 2, "pause", interrupted.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            interrupted.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            let (second, _) = paths.turn(&session, 2)?;
+            let (third, _) = paths.turn(&session, 3)?;
+            check(second != "queued" && third == "queued", || {
+                format!("at the crash: turn 2 {second}, turn 3 {third}")
+            })?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            recovered_unknown(paths, &session)?;
+            cancelled_behind_unknown(paths, &session, 3)?;
+            cancelled_behind_unknown(paths, &session, 2)
+        },
+    )
+}
+
 // ------------------------------------------------- nondefault frozen values
 
 /// Design §11 (deferred by S2): the restart handoff and keyed replays keep a

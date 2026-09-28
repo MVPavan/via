@@ -11,7 +11,7 @@ use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{
     ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, SubmitFailedRecord,
-    TerminalRecord, UnfinishedTurn,
+    TerminalExtras, TerminalRecord, UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
@@ -21,7 +21,7 @@ use super::journal::Head;
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
-use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
+use super::{Accepted, Engine, Started, Terminal, TurnRecord, failure, journal};
 use crate::api::{
     Cancel, Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
 };
@@ -95,12 +95,17 @@ impl Engine {
     /// "Restart"): its queued turns are cancelled with cause `close`, then
     /// `Closed` commits after one bounded absence check.
     ///
-    /// Design §7.3 (O1.D8): a turn at its session's head whose frozen row is
-    /// present but unparseable fails `failed(store)` without agent I/O
-    /// through `commit_submit_failed`, and its successors are handed off as
-    /// usual. That write failing fails startup (§7.2 row 13). A corrupt turn
-    /// behind an unresolved predecessor is enqueued: the dispatcher's live
-    /// rule meets it at the head, so turns still dispatch in order.
+    /// Design §7.3 (O1.D8): a turn the handoff would enqueue, at its
+    /// session's head, whose frozen row is present but unparseable fails
+    /// `failed(store)` without agent I/O through `commit_submit_failed`, and
+    /// its successors are handed off as usual. That write failing fails
+    /// startup (§7.2 row 13). A corrupt turn behind an unresolved
+    /// predecessor, or behind an `unknown` one whose cleanup is pending, is
+    /// enqueued: the dispatcher's live rule meets it at the head, so turns
+    /// still dispatch in order. A turn the handoff cancels is cancelled even
+    /// when Store cannot read its row, so it never counts as submitted and
+    /// the `unknown` barrier (C1 P6) holds for every turn behind it, across
+    /// restarts too.
     pub async fn hand_off_queued(&self) -> Result<Handoff, String> {
         let mut handoff = Handoff::default();
         let closing = self.closing_on_disk().await?;
@@ -121,15 +126,23 @@ impl Engine {
                     .map_err(|error| format!("store_error: {error}"))?;
                 // The dispatcher's rule (§2.2): only behind an `unknown`
                 // predecessor with settled cleanup; pending cleanup waits.
-                let cancel = !predecessors.unresolved
-                    && predecessors.last_submitted.is_some_and(|envelope| {
-                        envelope["state"] == "unknown" && envelope["cancel"]["cleanup"] != "pending"
-                    });
+                let unknown = predecessors
+                    .last_submitted
+                    .as_ref()
+                    .filter(|envelope| !predecessors.unresolved && envelope["state"] == "unknown");
+                let cancel =
+                    unknown.is_some_and(|envelope| envelope["cancel"]["cleanup"] != "pending");
                 let close = closing.contains(&session);
-                if !predecessors.unresolved
-                    && self
-                        .frozen_row_corrupt(&session, turn, !(cancel || close))
-                        .await?
+                let cause = close.then(|| (CancelCause::Close, rfc3339(SystemTime::now())));
+                if cancel || close {
+                    if self.frozen_row_corrupt(&session, turn, false).await? {
+                        self.cancel_unreadable_turn(&session, turn, cause).await?;
+                        handoff.cancelled += 1;
+                        continue;
+                    }
+                } else if !predecessors.unresolved
+                    && unknown.is_none()
+                    && self.frozen_row_corrupt(&session, turn, true).await?
                 {
                     self.fail_corrupt_turn(&session, turn).await?;
                     handoff.failed += 1;
@@ -140,7 +153,6 @@ impl Engine {
                 self.active.fetch_add(1, Ordering::AcqRel);
                 self.queued.fetch_add(1, Ordering::AcqRel);
                 if cancel || close {
-                    let cause = close.then(|| (CancelCause::Close, rfc3339(SystemTime::now())));
                     if !matches!(
                         self.cancel_queued(&slot, &session, turn, false, cause)
                             .await,
@@ -192,6 +204,76 @@ impl Engine {
                 turn.get()
             )),
             Err(error) => Err(format!("store_error: {error}")),
+        }
+    }
+
+    /// Cancels a queued turn the handoff cancels (C1 P6, or its session's
+    /// close) although Store cannot read its row: the cancellation needs only
+    /// the turn's queueing, which comes from the committed history, and is
+    /// otherwise the one `drive.rs`'s `queued_cancellation` builds. The turn
+    /// is never submitted, so later turns still see the `unknown`
+    /// predecessor. A cancellation that is not certainly durable fails
+    /// startup.
+    async fn cancel_unreadable_turn(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        cause: Option<(CancelCause, String)>,
+    ) -> Result<(), String> {
+        let History {
+            queued_at,
+            queued_seq,
+            ..
+        } = self
+            .history(session, turn)
+            .await
+            .map_err(|error| format!("store_error: {}", error.kind))?;
+        let started = Started {
+            session: session.clone(),
+            turn,
+            queued_at,
+            first_seq: queued_seq,
+            submitted: None,
+        };
+        let record = TurnRecord {
+            session: session.clone(),
+            turn,
+            head: std::sync::Arc::clone(&self.slot_for(session).head),
+            accepted: None,
+            spans: Vec::new(),
+            first_failure: None,
+            uncertain: None,
+        };
+        let terminal = Terminal {
+            state: "cancelled",
+            failure: None,
+            stop_reason: "interrupted",
+            vendor_stop_reason: None,
+            final_text: String::new(),
+            exit: None,
+            raw_ref: None,
+            raw_incomplete: false,
+            warnings: Vec::new(),
+            // Design §3.2: a queued turn has no anchor intent.
+            cancel: cause.as_ref().map(|(_, requested_at)| Cancel {
+                outcome: "acknowledged",
+                cleanup: "quiescent",
+                requested_at: requested_at.clone(),
+                settled_at: rfc3339(SystemTime::now()),
+            }),
+        };
+        let extras = TerminalExtras {
+            cancel_cause: cause.map(|(cause, _)| cause),
+            raw_incomplete: None,
+        };
+        match Self::commit_turn_ended_with(&self.store, &started, record, terminal, false, extras)
+            .await
+        {
+            Ok(durable) if !durable.uncertain => Ok(()),
+            Ok(_) | Err(_) => Err(format!(
+                "store_error: queued turn {session}/{} could not be cancelled",
+                turn.get()
+            )),
         }
     }
 
