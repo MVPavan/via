@@ -5,6 +5,12 @@
 //! exit, and cleanup after daemon-first death is proved by the outer harness
 //! seam.
 
+#[cfg(feature = "test-failpoints")]
+#[path = "support/failpoints.rs"]
+mod failpoints;
+#[cfg(feature = "test-failpoints")]
+#[path = "support/hits.rs"]
+mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]
@@ -174,8 +180,18 @@ struct Daemon<'a> {
 
 impl<'a> Daemon<'a> {
     fn start(paths: &'a Paths, evidence: &Evidence) -> Result<Self, ScenarioError> {
+        Self::start_with(paths, evidence, |_| {})
+    }
+
+    /// Starts the daemon with `configure` applied to its command.
+    fn start_with(
+        paths: &'a Paths,
+        evidence: &Evidence,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Self, ScenarioError> {
         let trace = evidence.dir.join("daemon.trace");
         let mut command = paths.command();
+        configure(&mut command);
         command
             .arg("daemon")
             .stdin(Stdio::null())
@@ -1162,109 +1178,133 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
     )
 }
 
-/// W3-F Sol 1: a force accepted right after spawn receipts, while receipted
-/// turns may still be queued for daemon main and outside its drive set, still
-/// ends every receipted turn `cancelled` with truthful cancel fields and a
-/// clean exit. Several connections each pipeline a spawn and a force; the
-/// daemon's summary counts turns final shutdown took from the queue, and the
-/// scenario repeats until that queued handoff was observed (W4-H Sol 4). A
-/// first turn completes beforehand, so each run has raw evidence.
-///
-/// Ignored by default: whether the queued handoff occurs depends on the
-/// machine's scheduling (it never occurred in 3 local runs), so it cannot be a
-/// default-gate test. A deterministic version needs the `test-failpoints`
-/// controller's pause point between receipt and drive handoff (`via-jm4.7.7`).
+/// W3-F Sol 1, made deterministic with `daemon.dispatcher.before_start`
+/// (design §10): a force accepted right after spawn receipts, while a
+/// receipted turn is still queued for daemon main and outside its drive set,
+/// still ends every receipted turn `cancelled` with truthful cancel fields
+/// and a clean exit. Daemon main is paused about to start turn A's
+/// dispatcher; turn B is receipted on a connection already served, so its
+/// start waits in the channel, and a force lands on a third. Released, main
+/// starts A's dispatcher and enters final shutdown, which takes B from the
+/// queue: the summary counts one queued drive. A first turn completes
+/// beforehand, so the run has raw evidence.
+#[cfg(feature = "test-failpoints")]
 #[test]
-#[ignore = "scheduling-dependent race; deterministic version awaits test-failpoints (via-jm4.7.7)"]
 fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult {
-    let mut observed = 0;
-    // About one attempt in fifteen observes it here; 100 bound a miss near 0.1 %.
-    for attempt in 0..100 {
-        if observed > 0 && attempt >= 4 {
-            break;
-        }
-        scenario(
-            &format!("s1_daemon_stop_force_after_receipt_{attempt}"),
-            &drain_fixture(),
-            |paths, evidence| {
-                let mut daemon = Daemon::start(paths, evidence)?;
-                let (first, _, _) = start_held_turn(paths, evidence)?;
-                fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
-                wait_event(paths, &first, "turn.ended")?;
-                // Re-arm the gate: a launched raced turn holds until forced.
-                for name in ["hold.entered", "hold.release", "hold.released", "agent.pid"] {
-                    let _ = fs::remove_file(paths.sync.join(name));
-                }
-                let socket = paths.runtime.join("via.sock");
-                // Continuous spawn traffic; the force lands once one is receipted,
-                // usually while another spawn is committing its receipt.
-                let (replies_tx, replies) = std::sync::mpsc::channel();
-                let spawners: Vec<_> = (0..4)
-                    .map(|_| {
-                        let socket = socket.clone();
-                        let replies = replies_tx.clone();
-                        thread::spawn(move || pipeline(&socket, 8, false, &replies))
-                    })
-                    .collect();
-                drop(replies_tx);
-                let (force_tx, _) = std::sync::mpsc::channel();
-                let mut sessions = Vec::new();
-                let mut all = Vec::new();
-                let mut forced = None;
-                for reply in replies {
-                    if let Some(session) = reply["result"]["session_id"].as_str() {
-                        sessions.push(session.to_owned());
-                        if forced.is_none() {
-                            let socket = socket.clone();
-                            let force_tx = force_tx.clone();
-                            forced =
-                                Some(thread::spawn(move || pipeline(&socket, 0, true, &force_tx)));
-                        }
-                    }
-                    all.push(reply);
-                }
-                for spawner in spawners {
-                    spawner
-                        .join()
-                        .map_err(|_| infra("spawner panicked"))?
-                        .map_err(infra)?;
-                }
-                forced
-                    .ok_or_else(|| fail("no spawn was receipted"))?
-                    .join()
-                    .map_err(|_| infra("forcer panicked"))?
-                    .map_err(infra)?;
-                evidence
-                    .write("replies.json", Value::from(all).to_string().as_bytes())
-                    .map_err(infra)?;
-                let status = daemon
-                    .wait_exit(FINAL_SHUTDOWN)?
-                    .ok_or_else(|| fail("force stop did not exit"))?;
-                let summary = daemon.summary()?;
-                evidence
-                    .write("daemon_shutdown.json", summary.to_string().as_bytes())
-                    .map_err(infra)?;
-                check(
-                    status.code() == Some(0) && summary["disposition"] == "clean",
-                    || format!("exit {status}, summary {summary}"),
-                )?;
-                if summary["queued_drives"]
-                    .as_u64()
-                    .is_some_and(|count| count > 0)
-                {
-                    observed += 1;
-                }
-                for session in sessions {
-                    check_raced_turn(paths, &session)?;
-                }
-                Ok(())
-            },
-        )?;
+    scenario(
+        "s1_daemon_stop_force_after_receipt",
+        &drain_fixture(),
+        |paths, evidence| {
+            let root = paths
+                .state
+                .parent()
+                .ok_or_else(|| infra("the state directory has no parent"))?;
+            let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
+            let dir = root.join("failpoints");
+            let point = "daemon.dispatcher.before_start";
+            hits::count(&dir, point).map_err(infra)?;
+            let mut daemon =
+                Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
+            let (first, _, _) = start_held_turn(paths, evidence)?;
+            fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
+            wait_event(paths, &first, "turn.ended")?;
+            // Re-arm the gate: a launched raced turn holds until forced.
+            for name in ["hold.entered", "hold.release", "hold.released", "agent.pid"] {
+                let _ = fs::remove_file(paths.sync.join(name));
+            }
+            let next = hits::hits(&dir, point).map_err(infra)? + 1;
+            failpoints.arm(point, next, "pause").map_err(infra)?;
+            // Daemon main accepts no connection while paused: open all three first.
+            let socket = paths.runtime.join("via.sock");
+            let mut a = Raw::connect(&socket)?;
+            let mut b = Raw::connect(&socket)?;
+            let mut forcer = Raw::connect(&socket)?;
+            let first_raced = a.spawn()?;
+            failpoints
+                .wait_ack(point, next, "pause", daemon.child.id(), FINAL_SHUTDOWN)
+                .map_err(infra)?;
+            evidence
+                .write(
+                    "before_start.ack",
+                    &failpoints.ack_bytes(point, next).map_err(infra)?,
+                )
+                .map_err(infra)?;
+            // Main is paused: B's start waits in the channel.
+            let raced = [first_raced, b.spawn()?];
+            let stopping = forcer.request("daemon/stop", &json!({"force":true}))?;
+            check(stopping["result"]["stopping"] == true, || {
+                stopping.to_string()
+            })?;
+            failpoints.release(point, next).map_err(infra)?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("force stop did not exit"))?;
+            let summary = daemon.summary()?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                status.code() == Some(0)
+                    && summary["disposition"] == "clean"
+                    && summary["queued_drives"] == 1,
+                || format!("exit {status}, summary {summary}"),
+            )?;
+            failpoints.disarm(point).map_err(infra)?;
+            for session in raced {
+                check_raced_turn(paths, &session)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// A raw connection to the daemon that has had its `hello` served.
+#[cfg(feature = "test-failpoints")]
+struct Raw {
+    reader: BufReader<UnixStream>,
+    stream: UnixStream,
+    next: u64,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Raw {
+    fn connect(socket: &Path) -> Result<Self, ScenarioError> {
+        let stream = UnixStream::connect(socket).map_err(infra)?;
+        stream
+            .set_read_timeout(Some(FINAL_SHUTDOWN))
+            .map_err(infra)?;
+        let reader = BufReader::new(stream.try_clone().map_err(infra)?);
+        let mut raw = Self {
+            reader,
+            stream,
+            next: 0,
+        };
+        let hello = json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"force-race"});
+        let reply = raw.request("hello", &hello)?;
+        check(reply.get("result").is_some(), || reply.to_string())?;
+        Ok(raw)
     }
-    if observed == 0 {
-        return Err("no attempt observed a receipted turn queued at final shutdown".into());
+
+    fn request(&mut self, method: &str, params: &Value) -> Result<Value, ScenarioError> {
+        let id = self.next;
+        self.next += 1;
+        let mut line = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string();
+        line.push('\n');
+        self.stream.write_all(line.as_bytes()).map_err(infra)?;
+        let mut reply = String::new();
+        self.reader.read_line(&mut reply).map_err(infra)?;
+        serde_json::from_str(&reply).map_err(|error| fail(&format!("{error}: {reply:?}")))
     }
-    Ok(())
+
+    /// A held spawn's receipt; its session id.
+    fn spawn(&mut self) -> Result<String, ScenarioError> {
+        let spawn = json!({"harness":"fake","model":"fake","prompt":"hold","handle":format!("h_{}", "A".repeat(43))});
+        let reply = self.request("spawn", &spawn)?;
+        reply["result"]["session_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| fail(&format!("spawn not receipted: {reply}")))
+    }
 }
 
 /// A receipted raced turn ends `cancelled`. One the force found still queued
@@ -1273,6 +1313,7 @@ fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult 
 /// lifecycle. Host
 /// committed vendor facts only for a launched vendor, which holds at its gate,
 /// so its force must be `forced`; a turn forced before launch was `requested`.
+#[cfg(feature = "test-failpoints")]
 fn check_raced_turn(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
     let (envelope, events) = paths.committed(session)?;
     if events.iter().all(|event| event["type"] != "turn.submitted") {
@@ -1308,60 +1349,9 @@ fn check_raced_turn(paths: &Paths, session: &str) -> Result<(), ScenarioError> {
     check_forced_lifecycle(&envelope, &events, &["turn.queued", "turn.submitted"])
 }
 
-/// Pipelines `hello`, `spawns` spawn requests and, with `force`, a forced
-/// `daemon/stop` on one connection, sending every reply after `hello` to
-/// `replies` as it arrives.
-fn pipeline(
-    socket: &Path,
-    spawns: usize,
-    force: bool,
-    replies: &std::sync::mpsc::Sender<Value>,
-) -> Result<(), String> {
-    let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(FINAL_SHUTDOWN))
-        .map_err(|error| error.to_string())?;
-    let hello =
-        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"force-race"});
-    let spawn = json!({"harness":"fake","model":"fake","prompt":"hold","handle":format!("h_{}", "A".repeat(43))});
-    let mut requests = vec![("hello", hello)];
-    requests.extend((0..spawns).map(|_| ("spawn", spawn.clone())));
-    if force {
-        requests.push(("daemon/stop", json!({"force":true})));
-    }
-    let mut lines = String::new();
-    for (id, (method, params)) in requests.iter().enumerate() {
-        lines.push_str(
-            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
-        );
-        lines.push('\n');
-    }
-    (&stream)
-        .write_all(lines.as_bytes())
-        .map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(&stream);
-    for index in 0..requests.len() {
-        let mut line = String::new();
-        // Final shutdown closes the connection before unread requests.
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            break;
-        }
-        let reply: Value =
-            serde_json::from_str(&line).map_err(|error| format!("{error}: {line:?}"))?;
-        if index > 0 {
-            // The receiver may be gone once the test stopped collecting.
-            let _ = replies.send(reply);
-        }
-    }
-    Ok(())
-}
-
 /// Host's launch evidence for `session`: `None` without an anchor intent,
 /// otherwise whether Host committed the launched vendor's facts.
+#[cfg(feature = "test-failpoints")]
 fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, ScenarioError> {
     let store = rusqlite::Connection::open_with_flags(
         paths.state.join("store.sqlite3"),
