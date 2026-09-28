@@ -104,8 +104,17 @@ the historical checkpoint; its findings table is updated by this section.
   to `via-pvj.2`). Gate: 263 / 1, failpoints 351 / 1 three times, F08–F12 19, release check clean. S5 (Store failures,
   [t3/s5.md](t3/s5.md)) merged at `9efbab8` after four local fix rounds
   ([t3/s5-r1-decisions.md](t3/s5-r1-decisions.md) 1–16; Sol
-  `t3/sol-review-S5-*.md`, the last SOUND). Gate: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push. **Now: Sol
-  high on the whole of Task 3**, then close `via-jm4.7.7`. From
+  `t3/sol-review-S5-*.md`, the last SOUND). Gate: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push. Sol high reviewed the whole of Task 3
+  (`t3/sol-review-T3-{control,failure,conformance}.md`; decisions 1–10 in
+  [t3/t3-review-decisions.md](t3/t3-review-decisions.md)). Three Sonnet 5.5
+  workers fixed rows 1–9 plus the force-row race; merged at `554a18b` (X),
+  `3636b7a` (Y) and `e56efcc` (force row and decision 5), each after Sol
+  medium with no open code finding (`t3/sol-review-T3-fix-{X,Y}.md`,
+  `t3/sol-review-T3-force-row.md`). Runtime §7 clarified for the Host stop
+  bound (`08b8fab`, `1174004`). Gate at `3a6f173`: 304 / 1, failpoints
+  445 / 1 three times, F08–F12 58, release check clean. Intermittent tests
+  tracked as `via-jm4.15` and `via-jm4.16`. **Now: a Sol high re-check of the
+  fix delta**, then close `via-jm4.7.7`. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
   owner decision), compared with Opus in

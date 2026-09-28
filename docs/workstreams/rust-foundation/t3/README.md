@@ -146,5 +146,14 @@ clean, a missing row-5 order). Round 1 fixed those and every head read
 reply (decision 11), instead of site by site. Rounds 3 and 4 settled the
 failure count and the unclosed-session count (decisions 12–16). Sol's
 round-4 check was SOUND. Each round was narrower than the last. S5 merged at
-`9efbab8`. The gate on the merged tree: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push. Next: Sol high on the
-whole task, then close `via-jm4.7.7`.
+`9efbab8`. The gate on the merged tree: 286 / 1, failpoints 413 / 1 twice, then one intermittent failure of `s1_f12_host_early_stop_independent_of_store` under full-suite load (B ended `process_exited`, not the force row; 0 of 25 in isolation), fixed on `wt/t3-force-row` before push.
+
+**Whole-task review.** Sol high reviewed Task 3 in three parts
+(`sol-review-T3-{control,failure,conformance}.md`; the failure part UNSOUND on
+a resumed-paging blocker). Decisions 1–10 are in `t3-review-decisions.md`,
+whose outcome section lists the merges. Sonnet 5.5 workers fixed rows 1–9 and
+the force-row race: X (`554a18b`, 2 rounds), Y (`3636b7a`, 3 rounds), force row
+and decision 5 (`e56efcc`, 1 + 3 rounds), each Sol medium with no open code
+finding. Gate at `3a6f173`: 304 / 1, failpoints 445 / 1 three times, F08–F12
+58, release check clean. Next: a Sol high re-check of the fix delta, then
+close `via-jm4.7.7`.
