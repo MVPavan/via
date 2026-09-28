@@ -1251,13 +1251,18 @@ impl Engine {
     }
 
     /// Commits submission intent with `turn.submitted` before any agent I/O;
-    /// the test fault backend can lose its reply.
+    /// the test fault backend can fail its read or lose its reply.
     async fn submit(
         &self,
         slot: &Slot,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<Submission, SubmitFailure> {
+        #[cfg(test)]
+        if self.faults.submission_unread.swap(false, Ordering::AcqRel) {
+            // The queued-turn read failed: nothing was written.
+            return Err(SubmitFailure::Unread);
+        }
         let submitted = Self::commit_submission(&self.store, session, turn, &slot.head).await;
         #[cfg(test)]
         if submitted.is_ok()

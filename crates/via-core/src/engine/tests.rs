@@ -1108,3 +1108,284 @@ fn a_stalled_force_path_read_expires_at_the_cutoff() {
         );
     });
 }
+
+async fn cancel(engine: &Engine, session: &SessionId, n: u32) -> Result<Value, ApiError> {
+    let params =
+        serde_json::from_value(json!({"session":session.as_str(),"handle":HANDLE,"turn":n}))
+            .unwrap();
+    engine.cancel(params).await
+}
+
+async fn close(engine: &Engine, session: &SessionId, key: Option<&str>) -> Result<Value, ApiError> {
+    let mut raw = json!({"session":session.as_str(),"handle":HANDLE});
+    if let Some(key) = key {
+        raw["op_key"] = json!(key);
+    }
+    let params = serde_json::from_value(raw.clone()).unwrap();
+    engine.close(params, &raw.to_string()).await
+}
+
+/// Polls `ready` while the other futures of the test's join make progress.
+async fn until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the condition is reached");
+}
+
+/// Runs the session's dispatcher once its close order is set, so the close
+/// pass, not a dispatch decision, meets the queued turn.
+async fn dispatch_closing(engine: &Engine, session: &SessionId) {
+    until(|| {
+        engine
+            .slot(session)
+            .is_some_and(|slot| slot.close_watch().is_some())
+    })
+    .await;
+    dispatch(engine, session).await;
+}
+
+/// Design §3.1 [r1.3]: a cancel orders a `Claimed` turn; its submission read
+/// fails, so the claim rolls back to one `Cancelling{dispatcher}`
+/// cancellation. The first caller rejoins it, a second cancel subscribes to
+/// it, and exactly one terminal is written, with no submission.
+#[test]
+fn a_claim_rollback_has_one_cancellation_owner() {
+    let Some(root) = child("a_claim_rollback_has_one_cancellation_owner") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), (first, second)) = tokio::join!(dispatch(&engine, &session), async {
+            // Claimed and granted, before its submission.
+            engine.faults.granted.notified().await;
+            engine
+                .faults
+                .hold_after_grant
+                .store(false, Ordering::Release);
+            let slot = engine.slot(&session).unwrap();
+            tokio::join!(cancel(&engine, &session, 1), async {
+                // The first cancel waits on the claimed turn's order.
+                until(|| slot.watchers(turn(1)).0 == 1).await;
+                engine
+                    .faults
+                    .submission_unread
+                    .store(true, Ordering::Release);
+                engine
+                    .faults
+                    .hold_cancel_read
+                    .store(true, Ordering::Release);
+                engine.faults.release.notify_one();
+                // The rollback's dispatcher cancellation, before its read.
+                engine.faults.granted.notified().await;
+                let (second, ()) = tokio::join!(cancel(&engine, &session, 1), async {
+                    // Both callers joined the one cancellation.
+                    until(|| slot.watchers(turn(1)).1 == 2).await;
+                    engine.faults.release.notify_one();
+                });
+                second
+            })
+        });
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first["state"], "cancelled", "{first}");
+        assert_eq!(first["already_terminal"], false, "{first}");
+        assert_eq!(first, second);
+        assert_eq!(first["cancel"]["outcome"], "acknowledged", "{first}");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"]
+        );
+        let envelope = engine
+            .result(&format!("{}/1", session.as_str()))
+            .await
+            .unwrap();
+        assert!(
+            envelope["timestamps"]["submitted_at"].is_null(),
+            "{envelope}"
+        );
+    });
+}
+
+/// Design §4 step 5 [r3.1]: a second close and a keyed replay arriving while
+/// the first close is held after its absence check wait without holding
+/// `admission` (another session's `resume` commits meanwhile), and all three
+/// reply from the first close's one outcome.
+#[test]
+fn close_callers_wait_without_admission_and_share_one_outcome() {
+    let Some(root) = child("close_callers_wait_without_admission_and_share_one_outcome") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let other = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (first, (), (second, replay, ())) = tokio::join!(
+            close(&engine, &session, Some("k")),
+            dispatch_closing(&engine, &session),
+            async {
+                engine.faults.granted.notified().await;
+                tokio::join!(
+                    close(&engine, &session, None),
+                    close(&engine, &session, Some("k")),
+                    async {
+                        until(|| {
+                            engine
+                                .slot(&session)
+                                .and_then(|slot| slot.close_watch())
+                                .is_some_and(|watch| watch.receiver_count() == 3)
+                        })
+                        .await;
+                        tokio::time::timeout(Duration::from_secs(5), resume(&engine, &other, None))
+                            .await
+                            .expect("no close caller holds admission");
+                        engine.faults.release.notify_one();
+                    }
+                )
+            }
+        );
+        let first = first.unwrap();
+        assert_eq!(first["state"], "closed", "{first}");
+        assert_eq!(
+            first["cancelled_turns"],
+            json!([format!("{}/1", session.as_str())])
+        );
+        assert_eq!(second.unwrap(), first);
+        assert_eq!(replay.unwrap(), first);
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+    });
+}
+
+/// Design §4 dispatcher step 5 [r5.9, r4.6]: a latch during the close's
+/// absence check is re-checked under `admission`: no `Closed` is written,
+/// and the latch exit publishes `store_error` to the waiting caller.
+#[test]
+fn a_latch_during_the_absence_check_refuses_closed() {
+    let Some(root) = child("a_latch_during_the_absence_check_refuses_closed") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session),
+            async {
+                engine.faults.granted.notified().await;
+                // Another session's failed write.
+                let finalize = engine.latch();
+                engine.faults.release.notify_one();
+                finalize.await;
+            }
+        );
+        assert_eq!(closed.unwrap_err().kind, "store_error");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"]
+        );
+    });
+}
+
+/// Design §4 dispatcher step 5 [r5.9, r4.6]: force accepted during the
+/// close's absence check is re-checked under `admission`: no `Closed` is
+/// written, and the force exit publishes `daemon_stopping`.
+#[test]
+fn a_force_during_the_absence_check_refuses_closed() {
+    let Some(root) = child("a_force_during_the_absence_check_refuses_closed") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session),
+            async {
+                engine.faults.granted.notified().await;
+                engine.request_stop(&force()).await.unwrap();
+                engine.faults.release.notify_one();
+            }
+        );
+        assert_eq!(closed.unwrap_err().kind, "daemon_stopping");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"]
+        );
+    });
+}
+
+/// Design §4 "Restart": a session left durably `closing` by an earlier
+/// daemon is finished by the restart handoff before admission. Its queued
+/// turn is cancelled with cause `close`, and `Closed` commits with the
+/// derived result; a `resume` is then `session_closed`.
+#[test]
+fn the_restart_handoff_completes_a_closing_session() {
+    let Some(root) = child("the_restart_handoff_completes_a_closing_session") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            earlier
+                .store
+                .commit_closing(via_store::ClosingRecord {
+                    session_id: session.clone(),
+                    operation: None,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        let handoff = engine.hand_off_queued().await.unwrap();
+        assert_eq!(
+            (handoff.enqueued, handoff.cancelled, handoff.closed),
+            (0, 1, 1),
+            "{handoff:?}"
+        );
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+        let result = engine
+            .store
+            .session_close_result(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result["cancelled_turns"],
+            json!([format!("{}/1", session.as_str())]),
+            "{result}"
+        );
+        let (params, raw) = resume_raw(&session, None);
+        let refused = engine.resume(params, &raw).await.unwrap_err();
+        assert_eq!(refused.kind, "session_closed");
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+    });
+}

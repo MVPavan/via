@@ -680,6 +680,21 @@ impl Slot {
         }
     }
 
+    /// Test-only: callers waiting on `turn`'s stop acknowledgement while it
+    /// is claimed, and on its current cancellation's outcome.
+    #[cfg(test)]
+    pub(super) fn watchers(&self, turn: TurnNumber) -> (usize, usize) {
+        lock(&self.state).entry(turn).map_or((0, 0), |entry| {
+            (
+                entry
+                    .stop
+                    .as_ref()
+                    .map_or(0, |stop| stop.ack.receiver_count()),
+                entry.outcome.receiver_count(),
+            )
+        })
+    }
+
     /// The cause of a dispatcher-owned cancellation.
     pub(super) fn cause(&self, turn: TurnNumber) -> Option<(CancelCause, String)> {
         lock(&self.state)

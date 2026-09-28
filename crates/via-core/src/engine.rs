@@ -120,6 +120,8 @@ struct Faults {
     reads: AtomicUsize,
     /// The next submission commit succeeds, but its reply reports an unknown outcome.
     submission_reply_lost: AtomicBool,
+    /// The next submission's queued-turn read fails, writing nothing.
+    submission_unread: AtomicBool,
     /// This many `queued → cancelled` commits fail, writing nothing.
     cancel_fails: AtomicUsize,
     /// The next cancellation waits for `release` before its first read.
