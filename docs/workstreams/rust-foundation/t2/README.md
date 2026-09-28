@@ -12,7 +12,7 @@ Review loop: `../cloud-and-local.md` §6.
 | T2-B2 | Per-session dispatcher redesign replacing T2-B's drives; Store-failed latch (runtime §7) | Opus 5.5 high | `b2.md`, `dispatch-design.md` |
 | T2-C | Restart handoff of surviving queued turns; keyed replay after restart | Opus 5.5 high (T2-B2 session) | `c.md` |
 | T2-D | Runtime §8 active-connection slot limit (4 daemon-wide) in dispatch | Opus 5.5 high (T2-B2 session) | `d.md` |
-| T2-E | Frozen per-turn parameters; one launch per turn in F13/F14/F17/F28; version-0 Store refusal (Task 2 slice review blockers) | Opus 5.5 high (fresh session) | `e.md` |
+| T2-E | Frozen per-turn parameters; one launch per turn in F13/F14/F17/F28; version-0 Store refusal (Task 2 slice review blockers); merged `f24a91d` | Opus 5.5 high (fresh session) | `e.md` |
 
 Shared files: `via-core/src/engine/drive.rs` and Store's spawn/submission
 commit path. T2-A's hunks there are failpoint call sites only; T2-B owns
