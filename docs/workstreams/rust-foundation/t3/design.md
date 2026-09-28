@@ -687,6 +687,11 @@ Then subscribe to the slot's close watch, still under `admission`; release
 5. After `{"stopping": true}`, the CLI waits within the startup budget for
    the socket to disappear, then auto-starts its own binary. After a
    refusal, it reports and exits 2.
+6. **Explicit `via daemon stop`** (no auto-start) follows steps 3 and 4 on
+   the same connection: after the Store check it sends the permitted plain
+   stop and reports the daemon's reply. It never starts a replacement.
+   Explicit `--drain` or `--force` against a mismatched daemon still gets
+   the mismatch reply [t3r.6].
 
 Amendments A4 (C1 §1) and A13 (runtime §6.1: a Store-matched
 version-mismatched client may stop an idle daemon; on a Store mismatch
@@ -1622,6 +1627,7 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `core.close.before_subscribe` | pauses a close caller after its order check and before it subscribes to the close watch (§4 steps 2 and 5) [r6.6] |
 | `core.run.before_handoff` | the run loop, before it hands a forced turn to final shutdown [r3.3] |
 | `core.shutdown.before_forced_terminal` | final shutdown, before a forced turn's terminal commit [r3.4] |
+| `core.shutdown.evidence_stopped_live`, `core.shutdown.evidence_absent` | final shutdown, acknowledged where the forced terminal's calculation (`forced_facts`) reads the turn's reconciliation record with `forced`, or with `cleanup == Quiescent`; both before `core.shutdown.before_forced_terminal`. They report reconciliation-record facts only: cleanup proved by Route's close fires neither [t3r.7] |
 | `store.request.not_enqueued` | `NotEnqueued` (§7.1) |
 | `store.writer.lost` | `WriterLost` (§7.1) |
 | `store.sqlite.corrupt` | `Corrupt` (§7.1) |
@@ -1673,6 +1679,9 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f02_stale_socket_replaced_after_lock` (characterization) | killed daemon's socket: the new daemon locks, then replaces it |
 | `s1_f03_unsafe_runtime_dir_refused` | symlink, mode and owner variants: clear message, exit 4, nothing created |
 | `s1_f04_version_mismatch_stops_only_matching_idle_daemon` | `VIA_TEST_CLIENT_VERSION`: idle and Store-matched gives `{"stopping": true}` and a new daemon; another client connected gives `admission_refused`; a Store mismatch gives exit 4 with the daemon untouched [r1.14] |
+| `s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only` | explicit `via daemon stop` from a mismatched version: idle and Store-matched stops the daemon and starts no replacement (§6.2 step 6) [t3r.6] |
+| `s1_f02_losing_daemon_leaves_live_socket_untouched` (characterization, mutation RED) | the daemon lock is held; a losing daemon exits and the live socket's inode is unchanged. Moving replacement before the lock fails it [t3r.9] |
+| `s1_f07_force_set_includes_session_in_cancelling_state` (characterization, mutation RED) | a queued cancellation is held at its commit seam when force is accepted: that session is closed exactly once, durably (§6.3) [t3r.8] |
 | `s1_f06_idle_exit_and_late_client` | exits after the lowered idle interval; never with a client connected or work queued; a client connecting while paused at `daemon.shutdown.idle_final` gets a fresh daemon |
 | `s1_f07_stop_refused_drain_keeps_sessions_force_closes_unfinished` | plain refused while work is active; drain finishes accepted turns, closes no session, and after restart `resume` of a drained session succeeds [O2]; force closes exactly the sessions with a running, claimed, cancelling or queued turn (one of each, reached through the barriers) and leaves an idle session open and resumable [O3] |
 | `s1_drain_with_recovered_holdings_reprobes` | drain accepted while turns wait behind recovered unproven groups; the groups disappear; re-probe frees capacity, and the drain finishes [r1.15] |
@@ -1726,7 +1735,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f12_selective_queued_row_read_failure` | `store.read.queued_turn` persistent while predecessor reads succeed: the head turn is `failed(store)` at the lowered streak deadline without launch; the streak did not reset on the successful predecessor reads [r3.8] |
 | `s1_f12_latch_pipeline_orders_handoffs` | an uncertain event on turn A (`store.commit.reply_lost`) while turn B's run loop is paused at `core.run.before_handoff`. The window serves `daemon/status`. `core.shutdown.reconcile_entry` has not been acknowledged while B is unjoined, and its acknowledgement comes after B's handoff. B's group is already stopped (`host.early_stop.sent` and harness absence). After release, B's forced terminal uses reconciliation's evidence, and A's batch commits; both come before the exit (exit 4) [r3.3, r4.2, r4.9] |
 | `s1_f12_host_early_stop_independent_of_store` | turn B's dispatcher is parked at `core.commit.before_send` before sending its observation commit, so the writer stays free. The daemon latches through turn A's `store.commit.reply_lost`. Before B is released, the test asserts both `host.early_stop.sent` for B's group and the absence of B's group. After release, B ends by the force row, and the exit is 4 [r4.3, r5.7] |
-| `s1_f12_evidence_before_terminal` | force a turn while the anchor defers `begin_cleanup` and withholds the positive `stopped_live` until reconciliation's `Stop` (`host.anchor.defer_cleanup`), so the anchor stays alive and Route's close reports `uncertain`. Reconciliation supplies both facts: `stopped_live` and absence. Their delivery is acknowledged **before** the terminal commit, and the terminal is `cancelled` / `forced` with cleanup `quiescent` [r6.3]. **Variant:** all stop evidence is lost, so the terminal is `unknown`, with cleanup decided independently by the absence proof [r4.2, r5.4] |
+| `s1_f12_evidence_before_terminal` | force a turn while the anchor defers `begin_cleanup` and withholds the positive `stopped_live` until reconciliation's `Stop` (`host.anchor.defer_cleanup`), so the anchor stays alive and Route's close reports `uncertain`. Reconciliation supplies both facts: `stopped_live` and absence. Their delivery is acknowledged **before** the terminal commit, and the terminal is `cancelled` / `forced` with cleanup `quiescent` [r6.3]. **Variant:** all stop evidence is lost, so the terminal is `unknown`, with cleanup decided independently by the absence proof [r4.2, r5.4]. "Delivery acknowledged" means `core.shutdown.evidence_stopped_live` and `.evidence_absent` have fired when the terminal seam is reached; in the variant only `evidence_absent` fires, and the terminal is `unknown` / `requested` / `quiescent` (`..._lost_stop_evidence_is_unknown`) [t3r.7] |
 | `s1_close_waiter_resolves_on_force_and_latch` | a close is held at its absence check, and a second close subscribes. `daemon stop --force`: the absence check ends on the force watch, step 5's force re-check refuses `Closed`, and both waiters reply `daemon_stopping`. The variant with a latch: both reply `store_error`. No waiter is left to process exit [r4.6, r5.9] |
 | `s1_close_outcome_retained_for_late_subscriber` | two constraints hold: force is already accepted when the caller enters, and the racing publication is a force or latch exit. The caller is paused at `core.close.before_subscribe`, and the dispatcher's force (or latch) exit publishes in that window [r6.6]. The caller still receives the outcome (`wait_for(Option::is_some)`). After a force exit, a keyed replay finds no attempt in progress and is fenced [r5.8] |
 | `s1_host_early_stop_exits_on_plain_stop_and_drain` | a plain stop and a drain, with no force: exit 0, and the shutdown summary reports no pending Host task [r5.1] |
