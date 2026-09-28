@@ -126,10 +126,12 @@ fn force() -> DaemonStopParams {
     serde_json::from_value(json!({"force":true})).unwrap()
 }
 
+/// Final shutdown under the daemon's one 10 s budget, from which the
+/// design §6.8 table measures its reserves.
 async fn shutdown(engine: &Engine) -> super::EngineShutdown {
     engine
         .shutdown(Deadline::at(
-            tokio::time::Instant::now() + Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_secs(10),
         ))
         .await
 }

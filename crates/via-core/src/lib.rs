@@ -78,7 +78,14 @@ pub enum C1TurnState {
 mod api;
 mod engine;
 
-pub use engine::{Engine, EngineShutdown, Handoff, Receipted, StopMode};
+pub use engine::{
+    Connections, DaemonCounts, Engine, EngineShutdown, FinalEntry, Handoff, Receipted, StopMode,
+};
+
+/// Test builds only: the named failpoint controller (runtime-contracts §11),
+/// for the daemon's own seams in `via-cli` (design §10).
+#[cfg(feature = "test-failpoints")]
+pub use via_store::failpoint;
 
 /// Hidden executable entrypoint forwarded through the architecture layers.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

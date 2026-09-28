@@ -28,7 +28,9 @@ mod queue;
 mod read;
 mod receipt;
 mod recovery;
+mod reprobe;
 mod slots;
+mod status;
 mod stop;
 mod terminal;
 #[cfg(test)]
@@ -38,7 +40,8 @@ use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
-pub use stop::{EngineShutdown, StopMode};
+pub use status::{Connections, DaemonCounts};
+pub use stop::{EngineShutdown, FinalEntry, StopMode};
 
 /// A committed receipt and, when this request created or adopted the turn,
 /// that turn, now queued with its session's dispatcher. A replayed retry
@@ -97,12 +100,19 @@ pub struct Engine {
     /// Connection slots (design §11): a `Run` turn reserves one before its
     /// grant; at launch Host takes it for the group's life. FIFO waiters.
     slots: Arc<tokio::sync::Semaphore>,
+    /// The pool's size: `connections.limit` (design §6.6).
+    slot_limit: usize,
     /// Slots held for groups an earlier daemon left unproven (design §11).
     recovered: slots::RecoveredSlots,
     /// Sessions durably `closing`, or treated so after an uncertain
     /// `Closing` (design §4 step 7, §6.6 [r3.5]); a confirmed `Closed`
     /// removes one. Changed only under `admission`.
     closing: StdMutex<HashSet<SessionId>>,
+    /// The `final_shutdown` fence (design §6.8 [r3.2]): set once, under
+    /// `admission`, when daemon main stops accepting work; read under
+    /// `admission` by the close fence. Its watch also stops the re-probe
+    /// loop (§8).
+    final_shutdown: watch::Sender<bool>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -195,18 +205,19 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The daemon-wide connection-slot pool (design §11). Test builds only:
-/// `VIA_TEST_CONNECTION_SLOTS` lowers it.
-fn connection_slots() -> Arc<tokio::sync::Semaphore> {
+/// The daemon-wide connection-slot pool (design §11) and its size. Test
+/// builds only: `VIA_TEST_CONNECTION_SLOTS` lowers it.
+fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTION_SLOTS));
     #[cfg(feature = "test-failpoints")]
     if let Some(lowered) = std::env::var("VIA_TEST_CONNECTION_SLOTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
     {
-        slots.forget_permits(CONNECTION_SLOTS.saturating_sub(lowered));
+        let forgotten = slots.forget_permits(CONNECTION_SLOTS.saturating_sub(lowered));
+        return (slots, CONNECTION_SLOTS - forgotten);
     }
-    slots
+    (slots, CONNECTION_SLOTS)
 }
 
 impl Engine {
@@ -245,6 +256,7 @@ impl Engine {
         )
         .map_err(|error| error.to_string())?;
         let (starts, start_receiver) = mpsc::channel(start_capacity);
+        let (slots, slot_limit) = connection_slots();
         Ok(Self {
             _store_owner: owner,
             store,
@@ -266,9 +278,11 @@ impl Engine {
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
             pending_starts: StdMutex::new(HashSet::new()),
-            slots: connection_slots(),
+            slots,
+            slot_limit,
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
+            final_shutdown: watch::Sender::new(false),
             #[cfg(test)]
             faults: Faults::default(),
         })

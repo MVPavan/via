@@ -1,9 +1,6 @@
 //! `daemon/stop` admission, forced-turn settlement and final shutdown.
 
-use std::{
-    sync::atomic::Ordering,
-    time::{Duration, SystemTime},
-};
+use std::{sync::atomic::Ordering, time::SystemTime};
 
 use via_adapters::{Cleanup, StopCause};
 
@@ -11,7 +8,7 @@ use std::sync::Arc;
 
 use super::drive::FORCE_CLOSE_REASON;
 use super::journal::Head;
-use super::latch::{FailureScope, FailureSite, WriteOutcome};
+use super::latch::{FINALIZE_RESERVE, FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome};
 use super::{Admission, Engine, Terminal, TurnRecord, lock};
 use crate::api::{Cancel, Event, EventBody, FailureClass, Warning, rfc3339};
 use crate::{ApiError, DaemonStopParams, Deadline, SessionId, TurnNumber};
@@ -79,11 +76,28 @@ impl EngineShutdown {
     }
 }
 
+/// What final-shutdown entry found under `admission` (design §6.8 entry
+/// step 2). It only feeds the pipeline's start drain; daemon main never
+/// returns to serving work [r4.7].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FinalEntry {
+    /// Receipted turns not yet settled.
+    pub active: usize,
+    /// Starts that found the start channel full.
+    pub pending_starts: usize,
+    /// Starts in the start channel.
+    pub queued_starts: usize,
+}
+
 impl Engine {
     /// Accepts a C1 §3.14 `daemon/stop` and closes admission to new work.
     ///
-    /// A plain stop is refused while turns are active. A repeated request keeps
-    /// the accepted mode, except that `force` escalates a drain.
+    /// A plain stop is refused while turns are active or a session is in the
+    /// durable closing set [r3.5]. A repeated request keeps the accepted
+    /// mode, except that `force` escalates a drain. Under `admission`, the
+    /// closing set and the force set are each read and released before
+    /// `stop` is taken, which is always taken alone [r5.12]; the force set
+    /// is inserted after `stop` is released. Wakes: the force watch.
     pub async fn request_stop(&self, params: &DaemonStopParams) -> Result<StopMode, ApiError> {
         if params.drain && params.force {
             return Err(ApiError::INVALID_PARAMS);
@@ -96,13 +110,19 @@ impl Engine {
         } else {
             StopMode::Idle
         };
+        // Plain-stop check order [r5.12]: the closing set's mutex is released
+        // before `stop` is taken.
+        let closing = !self.closing_empty();
+        // The force set is collected under `sessions` and slot state, then
+        // those locks are released (design §6.3 [r5.12]).
+        let force_set = (requested == StopMode::Force).then(|| self.unfinished_sessions());
         let mode = {
             let mut stop = lock(&self.stop);
             // `active` counts orphans and turns whose commits failed, so an
             // idle stop cannot skip them.
             let mode = match *stop {
                 Some(current) if requested != StopMode::Force => current,
-                None if requested == StopMode::Idle && self.active() > 0 => {
+                None if requested == StopMode::Idle && (self.active() > 0 || closing) => {
                     return Err(ApiError::SESSIONS_ACTIVE);
                 }
                 _ => requested,
@@ -111,15 +131,186 @@ impl Engine {
             mode
         };
         // `stop` is released first: dispatchers and the reconciler wake on the watch.
-        if mode == StopMode::Force {
-            // The sessions final shutdown's closure pass closes (C1 §3.14).
-            lock(&self.force_sessions)
-                .get_or_insert_with(|| lock(&self.sessions).keys().cloned().collect());
+        if let (StopMode::Force, Some(set)) = (mode, force_set) {
+            // The sessions final shutdown's closure pass closes (C1 §3.14,
+            // O3): inserted alone, never nested with another `std` lock.
+            lock(&self.force_sessions).get_or_insert(set);
             self.force_requested_at
                 .get_or_init(|| rfc3339(SystemTime::now()));
             self.force.send_replace(true);
         }
         Ok(mode)
+    }
+
+    /// The force set (design §6.3 [O3], amendment A18): sessions whose slot
+    /// has a queue entry (`Waiting`, `Claimed` or `Cancelling`) or a running
+    /// or settling turn. A slot whose dispatcher is merely exiting with an
+    /// empty queue, or that carries only a close order, is not in it. Taken
+    /// under `admission`: `sessions`, then each slot's state, each released
+    /// before the next. `Claimed → running` moves a turn out of the queue and
+    /// into `running` in one slot-state section, so reading the queue first
+    /// never misses it.
+    fn unfinished_sessions(&self) -> Vec<SessionId> {
+        let slots: Vec<(SessionId, Arc<super::Slot>)> = lock(&self.sessions)
+            .iter()
+            .map(|(session, slot)| (session.clone(), Arc::clone(slot)))
+            .collect();
+        slots
+            .into_iter()
+            .filter(|(_, slot)| !slot.queued().is_empty() || slot.running_turn().is_some())
+            .map(|(session, _)| session)
+            .collect()
+    }
+
+    /// Daemon main stops accepting work (design §6.8 entry [r3.2, r4.7]):
+    /// at drain end, at idle expiry, at force acceptance and on the latch's
+    /// force signal [r5.11]. Under `admission` it sets the `final_shutdown`
+    /// fence and re-checks, at the same point, the active count and the
+    /// pending and queued starts, for the pipeline's start drain. From then
+    /// on new close work is refused `daemon_stopping`, while a keyed replay
+    /// of a committed close still replays. A close that committed `Closing`
+    /// before entry already requested its dispatcher start under
+    /// `admission`, so the start drain sees it. Lock: `admission`, then the
+    /// pending-start mutex alone. Wakes: the re-probe loop, on the fence's
+    /// watch.
+    pub async fn enter_final_shutdown(&self) -> FinalEntry {
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("daemon.shutdown.before_fence").await;
+        let entry = {
+            let _admission = self.admission.lock().await;
+            self.final_shutdown.send_replace(true);
+            FinalEntry {
+                active: self.active(),
+                pending_starts: lock(&self.pending_starts).len(),
+                queued_starts: self
+                    .starts
+                    .max_capacity()
+                    .saturating_sub(self.starts.capacity()),
+            }
+        };
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("daemon.shutdown.after_fence").await;
+        entry
+    }
+
+    /// Whether final shutdown was entered: the close fence reads it under
+    /// `admission` (design §4 step 4 [r3.2]).
+    pub(super) fn final_shutdown(&self) -> bool {
+        *self.final_shutdown.borrow()
+    }
+
+    /// Subscribes Host's early-stop task to the force signal, which a force
+    /// stop raises at acceptance and the latch in phase one (design §6.8
+    /// [r4.3, r5.1]). Daemon main calls it once, from within its runtime,
+    /// before it serves; Host's shutdown retires the task when force never
+    /// came.
+    pub fn watch_force(&self) {
+        self.adapter.watch_force(self.force.subscribe());
+    }
+
+    /// When final shutdown's dispatcher join (pipeline step 3) gives up, so
+    /// Host reconciliation and the finalization reserve keep their time
+    /// (design §6.8): `deadline − FINALIZE_RESERVE`. Force-path reads stop
+    /// at `deadline − 8 s` (§6.7), so a dispatcher still running here is
+    /// stalled outside Store.
+    pub fn dispatchers_by(deadline: tokio::time::Instant) -> tokio::time::Instant {
+        deadline.checked_sub(FINALIZE_RESERVE).unwrap_or(deadline)
+    }
+
+    /// Pipeline step 5 for one forced turn (design §6.8): its terminal
+    /// with Route's close evidence and reconciliation's, bounded by
+    /// `min(FINALIZE_WRITE, remaining)`. Whether it committed.
+    async fn finalize_forced(
+        &self,
+        turn: super::ForcedTurn,
+        report: &via_adapters::FakeShutdown,
+        deadline: Deadline,
+    ) -> bool {
+        // Test builds: the evidence is in, the terminal not yet committed.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.shutdown.before_forced_terminal").await;
+        let evidence = report.recovery.iter().find(|record| {
+            record.session_id == turn.started.session && record.turn == turn.started.turn
+        });
+        // C1 §7.6 force row, outcome and cleanup kept independent. Host's
+        // proof that its stop found the vendor live ends the turn `cancelled`
+        // with `forced`. Before ARM no vendor could launch: `cancelled` and
+        // `requested`, cleanup as proved (a complete journal without an
+        // anchor intent has nothing to clean). Otherwise a vendor may have
+        // run with neither stop nor terminal proved: the turn is `unknown`.
+        // Each fact holds if Route's close or recovery proved it, so a failed
+        // or late recovery never discards what Route's close proved.
+        let quiescent = turn.close.quiescent
+            || match evidence {
+                Some(record) => record.cleanup == Cleanup::Quiescent,
+                None => report.failure.is_none(),
+            };
+        let forced = turn.close.forced || evidence.is_some_and(|record| record.forced);
+        let state = if forced || !turn.launched {
+            "cancelled"
+        } else {
+            "unknown"
+        };
+        let (outcome, cleanup) = stop_outcome(quiescent, forced);
+        let commit = async {
+            let mut record = turn.record;
+            let cancel = self
+                .settle(&mut record, turn.requested_at, outcome, cleanup)
+                .await;
+            let mut terminal = Terminal {
+                state,
+                failure: None,
+                // C1 §7.6: an unconfirmed stop, like transport loss, is an error.
+                stop_reason: if state == "cancelled" {
+                    "interrupted"
+                } else {
+                    "error"
+                },
+                vendor_stop_reason: None,
+                final_text: String::new(),
+                exit: None,
+                raw_ref: None,
+                raw_incomplete: false,
+                warnings: Vec::new(),
+                cancel: Some(cancel),
+            };
+            if turn.raw_incomplete {
+                // `raw_log.incomplete` committed when the drive ended.
+                terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
+            }
+            if turn.cause == Some(StopCause::IdleDeadline) {
+                // Design §2: force took over an idle stop.
+                terminal.fail(
+                    FailureClass::DeadlineIdle,
+                    "no progress within the idle deadline",
+                );
+                terminal.stop_reason = "deadline";
+            }
+            if record.first_failure.is_some() {
+                // C1 §8.2: the durable stream already lost an event; a
+                // cancellation must not present it as a complete record.
+                terminal.fail(FailureClass::Store, "a turn event could not be recorded");
+            }
+            // C1 §3.14: close only once every other turn of the session
+            // has a durable disposition. Design §3.2: once
+            // `failure_pending` is observed no new close-bearing commit
+            // starts; Store refuses `session.closed` in the same
+            // transaction while any other turn is queued or running, which
+            // covers a turn an uncertain receipt committed unregistered.
+            let admission = self.admission.lock().await;
+            let close = !self.store_failed()
+                && !self
+                    .unresolved
+                    .others(&turn.started.session, turn.started.turn);
+            self.finish(&turn.started, record, terminal, close, Some(&admission))
+                .await
+        };
+        // Per pipeline, not per turn [r5.10]: each commit takes at most
+        // `FINALIZE_WRITE`, and one cut at the deadline is uncommitted.
+        let by = deadline
+            .instant()
+            .min(tokio::time::Instant::now() + FINALIZE_WRITE);
+        matches!(tokio::time::timeout_at(by, commit).await, Ok(Ok(())))
     }
 
     /// The accepted `daemon/stop` mode, if any; daemon main reads it on notice.
@@ -146,16 +337,23 @@ impl Engine {
         }
     }
 
-    /// Final shutdown: Host closes live controls, reconciles every anchor and
-    /// joins its tasks; then force-stopped turns commit their terminal with that
-    /// evidence, and every receipted turn is checked for a durable terminal.
-    /// Every step shares the caller's single absolute deadline.
+    /// Final shutdown's pipeline steps 4 to 6 (design §6.8 [r3.3, r4.2]),
+    /// after daemon main joined the dispatchers and collected their
+    /// handoffs: Host reconciliation over the collected turns closes live
+    /// controls, reconciles every anchor and joins Host's tasks by
+    /// `deadline − FINALIZE_RESERVE`; then exactly those forced turns commit
+    /// their terminal with that evidence, each bounded by `FINALIZE_WRITE`;
+    /// then the closure pass; and every receipted turn is checked for a
+    /// durable terminal. Every step shares the caller's absolute deadline.
     pub async fn shutdown(&self, deadline: Deadline) -> EngineShutdown {
-        // Unprovable group absence must not consume the time to commit terminals.
+        // Unprovable group absence must not consume the finalization reserve.
         let host_by = deadline
             .instant()
-            .checked_sub(FORCED_COMMIT_RESERVE)
+            .checked_sub(FINALIZE_RESERVE)
             .unwrap_or_else(tokio::time::Instant::now);
+        // Test builds: final shutdown enters Host reconciliation (step 4).
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.shutdown.reconcile_entry").await;
         // Host keeps evidence only for receipted, unresolved turns (at most
         // the unresolved cap), which include every force-stopped turn.
         let turns = self.unresolved.turns();
@@ -163,86 +361,7 @@ impl Engine {
         let forced = std::mem::take(&mut *lock(&self.forced));
         let mut uncommitted_turns = 0;
         for turn in forced {
-            let evidence = report.recovery.iter().find(|record| {
-                record.session_id == turn.started.session && record.turn == turn.started.turn
-            });
-            // C1 §7.6 force row, outcome and cleanup kept independent. Host's
-            // proof that its stop found the vendor live ends the turn `cancelled`
-            // with `forced`. Before ARM no vendor could launch: `cancelled` and
-            // `requested`, cleanup as proved (a complete journal without an
-            // anchor intent has nothing to clean). Otherwise a vendor may have
-            // run with neither stop nor terminal proved: the turn is `unknown`.
-            // Each fact holds if Route's close or recovery proved it, so a failed
-            // or late recovery never discards what Route's close proved.
-            let quiescent = turn.close.quiescent
-                || match evidence {
-                    Some(record) => record.cleanup == Cleanup::Quiescent,
-                    None => report.failure.is_none(),
-                };
-            let forced = turn.close.forced || evidence.is_some_and(|record| record.forced);
-            let state = if forced || !turn.launched {
-                "cancelled"
-            } else {
-                "unknown"
-            };
-            let (outcome, cleanup) = stop_outcome(quiescent, forced);
-            let commit = async {
-                let mut record = turn.record;
-                let cancel = self
-                    .settle(&mut record, turn.requested_at, outcome, cleanup)
-                    .await;
-                let mut terminal = Terminal {
-                    state,
-                    failure: None,
-                    // C1 §7.6: an unconfirmed stop, like transport loss, is an error.
-                    stop_reason: if state == "cancelled" {
-                        "interrupted"
-                    } else {
-                        "error"
-                    },
-                    vendor_stop_reason: None,
-                    final_text: String::new(),
-                    exit: None,
-                    raw_ref: None,
-                    raw_incomplete: false,
-                    warnings: Vec::new(),
-                    cancel: Some(cancel),
-                };
-                if turn.raw_incomplete {
-                    // `raw_log.incomplete` committed when the drive ended.
-                    terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
-                }
-                if turn.cause == Some(StopCause::IdleDeadline) {
-                    // Design §2: force took over an idle stop.
-                    terminal.fail(
-                        FailureClass::DeadlineIdle,
-                        "no progress within the idle deadline",
-                    );
-                    terminal.stop_reason = "deadline";
-                }
-                if record.first_failure.is_some() {
-                    // C1 §8.2: the durable stream already lost an event; a
-                    // cancellation must not present it as a complete record.
-                    terminal.fail(FailureClass::Store, "a turn event could not be recorded");
-                }
-                // C1 §3.14: close only once every other turn of the session
-                // has a durable disposition. Design §3.2: once
-                // `failure_pending` is observed no new close-bearing commit
-                // starts; Store refuses `session.closed` in the same
-                // transaction while any other turn is queued or running, which
-                // covers a turn an uncertain receipt committed unregistered.
-                let admission = self.admission.lock().await;
-                let close = !self.store_failed()
-                    && !self
-                        .unresolved
-                        .others(&turn.started.session, turn.started.turn);
-                self.finish(&turn.started, record, terminal, close, Some(&admission))
-                    .await
-            };
-            if !matches!(
-                tokio::time::timeout_at(deadline.instant(), commit).await,
-                Ok(Ok(()))
-            ) {
+            if !self.finalize_forced(turn, &report, deadline).await {
                 uncommitted_turns += 1;
             }
         }
@@ -378,6 +497,3 @@ pub(super) fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'st
         if quiescent { "quiescent" } else { "uncertain" },
     )
 }
-
-/// Part of the final deadline Host shutdown leaves for forced turns' terminals.
-const FORCED_COMMIT_RESERVE: Duration = Duration::from_secs(1);

@@ -6,45 +6,116 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// Connection slots held for unproven recovered groups (design §11): at most
 /// one permit per group, never more than the pool. A group's token, dropped
 /// when Host proves it absent, releases a permit only once fewer groups than
-/// permits remain.
+/// permits remain. Groups a recovery deadline left unread are counted apart,
+/// with the cursor where paging stopped, until the re-probe loop's resumed
+/// paging reads them (design §8).
 #[derive(Clone, Default)]
 pub(super) struct RecoveredSlots(Arc<Mutex<Recovered>>);
 
 #[derive(Default)]
 struct Recovered {
     permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-    groups: usize,
+    /// Unproven groups Host holds a ledger entry for.
+    identified: usize,
+    /// Unproven groups past `cursor` that no reconciliation read yet.
+    unidentified: usize,
     /// Where the startup reconciliation's paging stopped at its deadline.
     cursor: Option<String>,
 }
 
-impl RecoveredSlots {
-    pub(super) fn hold(&self, slots: &Arc<tokio::sync::Semaphore>) -> RecoveredGroup {
-        let mut recovered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        recovered.groups += 1;
-        if let Ok(permit) = Arc::clone(slots).try_acquire_owned() {
-            recovered.permits.push(permit);
+impl Recovered {
+    fn groups(&self) -> usize {
+        self.identified.saturating_add(self.unidentified)
+    }
+
+    /// Takes free permits up to one per group, then returns any beyond it.
+    fn balance(&mut self, slots: Option<&Arc<tokio::sync::Semaphore>>) {
+        while let Some(slots) = slots
+            && self.permits.len() < self.groups()
+        {
+            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+                break;
+            };
+            self.permits.push(permit);
         }
+        while self.permits.len() > self.groups() {
+            self.permits.pop();
+        }
+    }
+}
+
+/// What the re-probe loop resumes paging from (design §8): the cursor where
+/// startup paging stopped, while unread groups remain.
+pub(super) struct Unread {
+    pub(super) cursor: Option<String>,
+}
+
+/// Counts of [`RecoveredSlots`] for `daemon/status` (design §6.6).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Held {
+    /// Permits held for recovered groups.
+    pub(super) permits: usize,
+    /// Recovered groups with a Host ledger entry.
+    pub(super) identified: usize,
+    /// Recovered groups no reconciliation has read yet.
+    pub(super) unidentified: usize,
+}
+
+impl RecoveredSlots {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Recovered> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn hold(&self, slots: &Arc<tokio::sync::Semaphore>) -> RecoveredGroup {
+        let mut recovered = self.lock();
+        recovered.identified += 1;
+        recovered.balance(Some(slots));
         RecoveredGroup(self.clone())
     }
 
     /// Counts `groups` a recovery deadline left unread. They have no Host
-    /// ledger entry, so nothing releases them before the next full
-    /// reconciliation (final shutdown or restart).
+    /// ledger entry: only the re-probe loop's resumed paging (design §8), or
+    /// the next full reconciliation, releases them.
     pub(super) fn hold_unidentified(&self, slots: &Arc<tokio::sync::Semaphore>, groups: u64) {
-        let mut recovered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        recovered.groups += usize::try_from(groups).unwrap_or(usize::MAX);
-        while recovered.permits.len() < recovered.groups {
-            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
-                return;
-            };
-            recovered.permits.push(permit);
-        }
+        let mut recovered = self.lock();
+        recovered.unidentified = recovered
+            .unidentified
+            .saturating_add(usize::try_from(groups).unwrap_or(usize::MAX));
+        recovered.balance(Some(slots));
     }
 
     /// Saves where the startup reconciliation stopped paging at its deadline.
     pub(super) fn save_cursor(&self, cursor: Option<String>) {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).cursor = cursor;
+        self.lock().cursor = cursor;
+    }
+
+    /// Where resumed paging starts, while unread groups remain.
+    pub(super) fn unread(&self) -> Option<Unread> {
+        let recovered = self.lock();
+        (recovered.unidentified > 0).then(|| Unread {
+            cursor: recovered.cursor.clone(),
+        })
+    }
+
+    /// Records one page of resumed paging (design §8): paging now stops at
+    /// `cursor`, and `unidentified` unproven groups remain past it; permits
+    /// beyond the recount are released. The page's unproven anchors were
+    /// held as identified groups first, so no permit is released for them.
+    pub(super) fn resume(&self, cursor: Option<String>, unidentified: u64) {
+        let mut recovered = self.lock();
+        recovered.cursor = cursor;
+        recovered.unidentified = usize::try_from(unidentified).unwrap_or(usize::MAX);
+        recovered.balance(None);
+    }
+
+    /// The status counts (design §6.6).
+    pub(super) fn held(&self) -> Held {
+        let recovered = self.lock();
+        Held {
+            permits: recovered.permits.len(),
+            identified: recovered.identified,
+            unidentified: recovered.unidentified,
+        }
     }
 }
 
@@ -53,11 +124,9 @@ pub(super) struct RecoveredGroup(RecoveredSlots);
 
 impl Drop for RecoveredGroup {
     fn drop(&mut self) {
-        let mut recovered = (self.0).0.lock().unwrap_or_else(PoisonError::into_inner);
-        recovered.groups -= 1;
-        if recovered.permits.len() > recovered.groups {
-            recovered.permits.pop();
-        }
+        let mut recovered = self.0.lock();
+        recovered.identified = recovered.identified.saturating_sub(1);
+        recovered.balance(None);
     }
 }
 
