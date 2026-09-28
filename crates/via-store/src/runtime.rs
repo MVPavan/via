@@ -835,9 +835,18 @@ enum RawCommand {
 
 /// `<state>/store.lock`, held for the life of the [`Store`] opened under
 /// it: VIA's writer exclusion for the State directory (runtime §6.1). One
-/// daemon holds it; a writer that ignores it is unsupported.
+/// daemon holds it; a writer that ignores it is unsupported. It is bound to
+/// that directory's identity (device and inode), so it opens no other.
 pub struct StoreLock {
     _file: File,
+    state: (u64, u64),
+}
+
+/// The filesystem identity of `state`: its device and inode.
+fn directory_identity(state: &Path) -> Result<(u64, u64), StoreError> {
+    let metadata = fs::metadata(state)
+        .map_err(|error| StoreError::Open(format!("{}: {error}", state.display())))?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 impl StoreLock {
@@ -866,7 +875,10 @@ impl StoreLock {
             .open(&path)
             .map_err(|error| StoreError::Open(format!("store.lock: {error}")))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                state: directory_identity(state)?,
+            }),
             Err(fs::TryLockError::WouldBlock) => Err(StoreError::Open(
                 "store.lock is held: the State directory is in use by another VIA daemon"
                     .to_owned(),
@@ -918,8 +930,16 @@ impl Store {
     }
 
     /// [`Store::open`] under `lock`, which the Store holds until it drops.
+    /// A lock taken for another State directory is refused before the Store
+    /// is read: it excludes no writer here.
     pub fn open_locked(state: &Path, lock: StoreLock) -> Result<Self, StoreError> {
         validate_state(state)?;
+        if directory_identity(state)? != lock.state {
+            return Err(StoreError::Open(format!(
+                "store.lock was taken for another State directory than {}",
+                state.display()
+            )));
+        }
         let db = state.join("store.sqlite3");
         let created = !db.exists();
         if !created {

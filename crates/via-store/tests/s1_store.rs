@@ -13,7 +13,8 @@ use via_store::{
     AnchorIdentity, AnchorIntent, AnchorPhase, CancelCause, CloseIntent, ClosedOutcome,
     ClosedRecord, ClosingRecord, CommitOutcome, FailureResolutionRecord, GroupAbsenceRecord,
     OperationVerb, ProcessJournal, ResumeRecord, SessionId, SpawnRecord, Store, StoreClient,
-    StoreError, SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord, TurnNumber,
+    StoreError, StoreLock, SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord,
+    TurnNumber,
 };
 
 const SESSION: &str = "s_7f3k9q2mzr4c";
@@ -146,6 +147,37 @@ fn a_store_opens_only_under_store_lock() {
     assert!(error.to_string().contains("store.lock"), "{error}");
     drop(holder);
     drop(Store::open(root.path()).unwrap());
+}
+
+/// T3-S3 round 2, decision 10 (runtime §6.1): a `StoreLock` is bound to
+/// the State directory it was taken for. A guard for directory A does not
+/// open directory B, whose own `store.lock` another holder has: the
+/// mismatch is refused before B's Store is read.
+#[test]
+fn a_store_lock_opens_only_its_own_state_directory() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (a, b) = (private_dir(), private_dir());
+    drop(Store::open(b.path()).unwrap());
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(b.path().join("store.lock"))
+        .unwrap();
+    holder.try_lock().unwrap();
+    let lock = StoreLock::acquire(a.path()).unwrap();
+    let Err(error) = Store::open_locked(b.path(), lock) else {
+        panic!("a guard for another State directory opened this Store");
+    };
+    assert!(
+        error.to_string().contains("another State directory"),
+        "{error}"
+    );
+    drop(holder);
+    let lock = StoreLock::acquire(a.path()).unwrap();
+    drop(Store::open_locked(a.path(), lock).unwrap());
 }
 
 /// Design §4 and §10: `Closing` gates `resume` (a refusal, not a failure),
