@@ -47,5 +47,6 @@ Recorded on `via-jm4.7.7` from Task 2 reviews (workers do not run `bd`):
 Design review (owner, 2026-09-28): GPT-6 Astra medium and Claude Fable 5.1
 high. Round 1 on `42993bc`: `astra-review-design.md` (UNSOUND) and
 `fable-review-design.md` (SOUND WITH CHANGES); orchestrator decisions in
-`design-r1-decisions.md`. Owner decisions pending: the Store failure
-policy (runtime §7), drain closing sessions, and force's session scope; answered in `owner-decisions.md`.
+`design-r1-decisions.md`. Owner decisions on the Store failure policy
+(runtime §7), drain closing sessions and force's session scope:
+`owner-decisions.md`.
