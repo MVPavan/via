@@ -126,7 +126,7 @@ impl Engine {
         // those locks are released (design §6.3 [r5.12]).
         let force_set = (requested == StopMode::Force).then(|| self.unfinished_sessions());
         let mode = {
-            let mut stop = lock(&self.stop);
+            let mut stop = lock(&self.signal.stop);
             // `active` counts orphans and turns whose commits failed, so an
             // idle stop cannot skip them.
             let mode = match *stop {
@@ -144,9 +144,10 @@ impl Engine {
             // The sessions final shutdown's closure pass closes (C1 §3.14,
             // O3): inserted alone, never nested with another `std` lock.
             lock(&self.force_sessions).get_or_insert(set);
-            self.force_requested_at
+            self.signal
+                .force_requested_at
                 .get_or_init(|| rfc3339(SystemTime::now()));
-            self.force.send_replace(true);
+            self.signal.force.send_replace(true);
         }
         Ok(mode)
     }
@@ -186,7 +187,9 @@ impl Engine {
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("daemon.shutdown.before_fence").await;
         let entry = {
-            let _admission = self.admission.lock().await;
+            let admission = self.admission.lock().await;
+            // Phase two of a latch Store's read-corruption observer began.
+            self.finish_pending(&admission);
             self.final_shutdown.send_replace(true);
             FinalEntry {
                 active: self.active(),
@@ -214,7 +217,7 @@ impl Engine {
     /// before it serves; Host's shutdown retires the task when force never
     /// came.
     pub fn watch_force(&self) {
-        self.adapter.watch_force(self.force.subscribe());
+        self.adapter.watch_force(self.signal.force.subscribe());
     }
 
     /// When final shutdown's dispatcher join (pipeline step 3) gives up, so
@@ -370,7 +373,7 @@ impl Engine {
 
     /// The accepted `daemon/stop` mode, if any; daemon main reads it on notice.
     pub fn stop_mode(&self) -> Option<StopMode> {
-        *lock(&self.stop)
+        *lock(&self.signal.stop)
     }
 
     /// Commits `cancel.settled` for a cancel Core requested at `requested_at`
@@ -514,21 +517,10 @@ impl Engine {
         let head = self
             .slot(session)
             .map_or_else(|| Head::new(None), |slot| Arc::clone(&slot.head));
-        let guard = match head.lock(&self.store, session).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                // A failed head read writes nothing; a corrupt one latches
-                // (design §7.1, T3-S5 round 1, decision 10).
-                if WriteOutcome::of_read(&error) == WriteOutcome::Corrupt {
-                    self.store_failure(
-                        FailureSite::SessionClosed,
-                        WriteOutcome::Corrupt,
-                        FailureScope::Session(session),
-                    )
-                    .finish_held(admission);
-                }
-                return false;
-            }
+        // A failed head read writes nothing; Store's read reply already
+        // reported corruption (design §7.1, T3-S5 round 2, decision 11).
+        let Ok(guard) = head.lock(&self.store, session).await else {
+            return false;
         };
         let Ok(closed) = (Event {
             seq: guard.next(),

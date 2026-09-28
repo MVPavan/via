@@ -1859,7 +1859,7 @@ fn fail_first(root: &Path, point: &str) -> PathBuf {
 }
 
 /// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
-/// session-head read before a terminal commit (`store.sqlite.corrupt_head`)
+/// session-head read before a terminal commit (`store.read.corrupt.next_seq`)
 /// reaches the failure hook as `Corrupt`, which latches even at final
 /// shutdown's scoped forced-terminal site. While serving, the head is
 /// unknown there only after an uncertain write, which has already latched
@@ -1870,7 +1870,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
     let Some(root) = child("a_corrupt_head_read_before_a_terminal_latches") else {
         return;
     };
-    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -1908,7 +1908,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
         };
         let finished = engine.finish(&started, record, terminal, false, None).await;
         assert_eq!(finished.unwrap_err().kind, "store_error");
-        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
         assert!(engine.store_failed(), "the corrupt head read latched");
         let status = engine.store_failure_status().unwrap();
         assert_eq!(status["kind"], "corrupt_store");
@@ -1918,7 +1918,8 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
 
 /// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the force
 /// closure pass's session-head read latches, and the session counts as
-/// unclosed. The pass reads the head from Store only for a session with no
+/// unclosed. Since round 2 (decision 11) Store's read reply reports it,
+/// once. The pass reads the head from Store only for a session with no
 /// slot or an unknown head. End to end every force session keeps its slot,
 /// whose head its last write left known (an unknown one follows a latching
 /// write, which skips the pass), so the slot is removed here.
@@ -1927,7 +1928,7 @@ fn a_corrupt_head_read_in_the_closure_pass_latches() {
     let Some(root) = child("a_corrupt_head_read_in_the_closure_pass_latches") else {
         return;
     };
-    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -1935,12 +1936,13 @@ fn a_corrupt_head_read_in_the_closure_pass_latches() {
         super::lock(&engine.sessions).remove(&session);
         super::lock(&engine.force_sessions).replace(vec![session.clone()]);
         let report = shutdown(&engine).await;
-        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
         assert!(report.store_failed, "{report:?}");
         assert_eq!(report.unclosed_sessions, 1, "{report:?}");
         let status = engine.store_failure_status().unwrap();
         assert_eq!(status["kind"], "corrupt_store");
-        assert_eq!(status["affected"]["addresses"], json!([session.as_str()]));
+        // Store's read reply reported it, once (T3-S5 round 2, decision 11).
+        assert_eq!(status["count"], 1, "{status}");
         assert!(
             !event_types(&engine, &session)
                 .await
@@ -1959,7 +1961,7 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
     let Some(root) = child("a_corrupt_head_read_before_a_submit_failed_write_is_corrupt") else {
         return;
     };
-    let points = fail_first(&root, "store.sqlite.corrupt_head");
+    let points = fail_first(&root, "store.read.corrupt.next_seq");
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -1968,7 +1970,7 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
         engine
             .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
             .await;
-        assert!(points.join("store.sqlite.corrupt_head.1.ack").exists());
+        assert!(points.join("store.read.corrupt.next_seq.1.ack").exists());
         assert!(
             engine.store_failed(),
             "the resolution write's failure latched"
@@ -1978,4 +1980,231 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
         let types = event_types(&engine, &session).await;
         assert_eq!(types, ["turn.queued"], "nothing was written");
     });
+}
+
+/// In a child, activates Store's failpoints before the Engine opens and
+/// counts each of `points`: a command under another token is refused at
+/// every hit, leaving `<point>.<n>.refused`. Returns their directory.
+fn count_points(root: &Path, points: &[&str]) -> PathBuf {
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    for point in points {
+        let command = json!({"token":"counting-only-token","occurrence":1,"action":"pause"});
+        fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    }
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// Arms counted `point` to fail its next hit (`fail_io`); returns that
+/// occurrence.
+fn arm_next(dir: &Path, point: &str) -> u64 {
+    let prefix = format!("{point}.");
+    let counted = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)?
+                .strip_suffix(".refused")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    let next = counted + 1;
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":next,"action":"fail_io"});
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    next
+}
+
+/// Whether `point`'s occurrence `n` acted: its acknowledgement exists.
+fn acked(dir: &Path, point: &str, n: u64) -> bool {
+    dir.join(format!("{point}.{n}.ack")).exists()
+}
+
+/// Asserts the latch's phase one ran with `corrupt_store` (design §7.1).
+fn assert_corruption_latched(engine: &Engine) {
+    assert!(engine.store_failed(), "the corrupt read latched");
+    let status = engine.store_failure_status().unwrap();
+    assert_eq!(status["kind"], "corrupt_store", "{status}");
+    assert_eq!(status["scope"], "daemon", "{status}");
+}
+
+/// The force closure pass of one session whose only turn was cancelled,
+/// with `point` failing its next hit as SQLite corruption.
+fn closure_read_corruption(root: &Path, point: &str) {
+    let points = count_points(root, &[point]);
+    run(async {
+        let engine = open(root);
+        let session = new_session(&engine).await;
+        cancel(&engine, &session, 1).await.unwrap();
+        super::lock(&engine.force_sessions).replace(vec![session.clone()]);
+        let n = arm_next(&points, point);
+        let report = shutdown(&engine).await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+        assert!(report.store_failed, "{report:?}");
+        assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+    });
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// closure pass's snapshot read (`stop.rs` `close_forced`) latches.
+#[test]
+fn a_corrupt_snapshot_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_snapshot_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    closure_read_corruption(&root, "store.read.corrupt.snapshot");
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// closure pass's predecessor read (`stop.rs` `close_forced`) latches.
+#[test]
+fn a_corrupt_predecessors_read_in_the_closure_pass_latches() {
+    let Some(root) = child("a_corrupt_predecessors_read_in_the_closure_pass_latches") else {
+        return;
+    };
+    closure_read_corruption(&root, "store.read.corrupt.predecessors");
+}
+
+/// A turn record of `session`'s turn 1 at a known head, optionally with
+/// an uncertain event at sequence 2 to reconcile.
+fn turn_one(session: &SessionId, uncertain: bool) -> super::TurnRecord {
+    super::TurnRecord {
+        session: session.clone(),
+        turn: turn(1),
+        head: super::journal::Head::new(Some(2)),
+        accepted: None,
+        spans: Vec::new(),
+        first_failure: None,
+        uncertain: uncertain.then_some(super::journal::UncertainEvent {
+            seq: 2,
+            raw_ref: None,
+            accepted: None,
+        }),
+    }
+}
+
+/// Turn 1's `Started`, never submitted.
+fn started_one(session: &SessionId) -> super::Started {
+    super::Started {
+        session: session.clone(),
+        turn: turn(1),
+        queued_at: rfc3339(std::time::SystemTime::now()),
+        first_seq: 1,
+        submitted: None,
+    }
+}
+
+/// A `failed(store)` terminal.
+fn store_terminal() -> super::Terminal {
+    super::Terminal {
+        state: "failed",
+        failure: Some(super::failure(
+            crate::api::FailureClass::Store,
+            "a turn event could not be recorded".to_owned(),
+            None,
+        )),
+        stop_reason: "error",
+        vendor_stop_reason: None,
+        final_text: String::new(),
+        exit: None,
+        raw_ref: None,
+        raw_incomplete: false,
+        warnings: Vec::new(),
+        cancel: None,
+    }
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// terminal commit's reconcile read (`drive.rs` `commit_turn_ended_with`)
+/// latches; the caller's reply is the same `store_error`.
+#[test]
+fn a_corrupt_reconcile_read_before_a_terminal_latches() {
+    let Some(root) = child("a_corrupt_reconcile_read_before_a_terminal_latches") else {
+        return;
+    };
+    let point = "store.read.corrupt.events";
+    let points = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let n = arm_next(&points, point);
+        let finished = engine
+            .finish(
+                &started_one(&session),
+                turn_one(&session, true),
+                store_terminal(),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(finished.unwrap_err().kind, "store_error");
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+    });
+}
+
+/// Final shutdown's batch for turn 1 of a session with turn 2 queued, with
+/// `point` failing its next hit as SQLite corruption: the batch is skipped.
+fn batch_read_corruption(root: &Path, point: &str) {
+    let points = count_points(root, &[point]);
+    run(async {
+        let engine = open(root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        let affected = super::batch::AffectedTurn {
+            started: started_one(&session),
+            record: turn_one(&session, true),
+            terminal: store_terminal(),
+            raw_incomplete: false,
+        };
+        let n = arm_next(&points, point);
+        let mut batches = super::batch::FailureBatches::default();
+        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(10));
+        engine
+            .resolve_affected(affected, deadline, &mut batches)
+            .await;
+        assert!(acked(&points, point, n), "{point} #{n} was not reached");
+        assert_corruption_latched(&engine);
+        assert_eq!((batches.committed, batches.skipped), (0, 1));
+        // Phase two waits for `admission`: final shutdown's entry takes it.
+        assert!(!engine.latch_finalized(), "phase two ran without admission");
+        engine.enter_final_shutdown().await;
+        assert!(
+            engine.latch_finalized(),
+            "final shutdown's entry finished it"
+        );
+    });
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's result read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_result_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_result_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(&root, "store.read.corrupt.result");
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's reconcile read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_reconcile_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_reconcile_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(&root, "store.read.corrupt.events");
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
+/// batch's queued-row read (`batch.rs` step 1) latches.
+#[test]
+fn a_corrupt_queued_row_read_in_the_batch_latches() {
+    let Some(root) = child("a_corrupt_queued_row_read_in_the_batch_latches") else {
+        return;
+    };
+    batch_read_corruption(&root, "store.read.corrupt.queued_turn");
 }

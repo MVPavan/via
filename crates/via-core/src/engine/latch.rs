@@ -2,7 +2,10 @@
 //! read cutoff.
 
 use std::{
-    sync::atomic::Ordering,
+    sync::{
+        Mutex as StdMutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -319,38 +322,10 @@ impl Engine {
         outcome: WriteOutcome,
         scope: FailureScope<'_>,
     ) -> Latching<'_> {
-        let latches = match outcome {
-            WriteOutcome::Uncertain | WriteOutcome::Corrupt => true,
-            WriteOutcome::NotCommitted => !site.scoped(),
-        };
-        self.record_failure(site, outcome, scope, latches);
-        if latches {
-            self.fail_pending();
-        }
         Latching {
             engine: self,
-            latches,
+            latches: self.signal.report(site, outcome, scope),
         }
-    }
-
-    /// Records the latest failure (design §7.5); the latch's scope is
-    /// `daemon`.
-    fn record_failure(
-        &self,
-        site: FailureSite,
-        outcome: WriteOutcome,
-        scope: FailureScope<'_>,
-        latches: bool,
-    ) {
-        let latest = LatestFailure {
-            kind: failure_kind(site, outcome),
-            scope: if latches { "daemon" } else { site.scope() },
-            since: rfc3339(SystemTime::now()),
-            addresses: scope.addresses(),
-        };
-        let mut record = lock(&self.failures);
-        record.count = record.count.saturating_add(1);
-        record.latest = Some(latest);
     }
 
     /// `daemon/status` `health` (design §7.5): `store_failed` from the
@@ -367,7 +342,7 @@ impl Engine {
     /// until the first failure, then the latest one with the count since
     /// daemon start. It carries no prompt, payload or handle.
     pub fn store_failure_status(&self) -> Option<Value> {
-        let record = lock(&self.failures);
+        let record = lock(&self.signal.failures);
         let latest = record.latest.as_ref()?;
         let listed: Vec<&String> = latest.addresses.iter().take(AFFECTED_ADDRESSES).collect();
         Some(json!({
@@ -382,7 +357,7 @@ impl Engine {
     /// The latching failure's phase-one time (design §7.4 [r3.17]): final
     /// shutdown's deadline and diagnostic window run from it.
     pub fn failed_at(&self) -> Option<tokio::time::Instant> {
-        self.failed_at.get().copied()
+        self.signal.failed_at.get().copied()
     }
 
     /// Latches Store failure after Core's first failed or uncertain state
@@ -394,7 +369,7 @@ impl Engine {
     /// already inside it. The caller holds no slot, session or head lock.
     #[cfg(test)]
     pub(super) fn latch(&self) -> impl Future<Output = ()> + '_ {
-        self.fail_pending();
+        self.signal.fail_pending();
         async move {
             let admission = self.admission.lock().await;
             self.latch_held(&admission);
@@ -404,24 +379,18 @@ impl Engine {
     /// [`Engine::latch`] for a caller already holding `admission`: both phases
     /// at once.
     pub(super) fn latch_held(&self, _admission: &Admission<'_>) {
-        self.fail_pending();
+        self.signal.fail_pending();
         self.store_failed.store(true, Ordering::Release);
     }
 
-    /// Phase one of the latch: marks the failure pending and sends the force
-    /// signal under the `stop` mutex, which the grant takes, so running turns
-    /// take the forced path and daemon main starts final shutdown, which then
-    /// reports an unclean exit.
-    fn fail_pending(&self) {
-        let mut stop = lock(&self.stop);
-        if self.failure_pending.swap(true, Ordering::AcqRel) {
-            return;
+    /// Phase two of a latch whose phase one ran without Core awaiting it:
+    /// Store's read-corruption observer (T3-S5 round 2, decision 11). Final
+    /// shutdown's entry calls it under the `admission` it takes, after the
+    /// force watch that phase one sent woke daemon main.
+    pub(super) fn finish_pending(&self, _admission: &Admission<'_>) {
+        if self.signal.failure_pending.load(Ordering::Acquire) {
+            self.store_failed.store(true, Ordering::Release);
         }
-        *stop = Some(StopMode::Force);
-        self.failed_at.get_or_init(tokio::time::Instant::now);
-        self.force_requested_at
-            .get_or_init(|| rfc3339(SystemTime::now()));
-        self.force.send_replace(true);
     }
 
     /// Whether phase two finalized the latch under `admission`.
@@ -460,12 +429,114 @@ impl Engine {
 
     /// Whether a Store failure was observed: pending or finalized.
     pub fn store_failed(&self) -> bool {
-        self.failure_pending.load(Ordering::Acquire) || self.store_failed.load(Ordering::Acquire)
+        self.signal.failure_pending.load(Ordering::Acquire)
+            || self.store_failed.load(Ordering::Acquire)
     }
 
     /// Wakes when a force stop is accepted or Store failure latches; daemon
     /// main then starts final shutdown in the mode `stop_mode` reports.
     pub fn force_signal(&self) -> watch::Receiver<bool> {
-        self.force.subscribe()
+        self.signal.force.subscribe()
+    }
+}
+
+/// Phase one of the latch, the force signal and the failure record (design
+/// §3.2, §7.5): the state Core's failure hook changes without `admission`.
+/// The Engine holds it in an `Arc` and shares it with Store's
+/// read-corruption observer, which reports on the SQLite worker's thread
+/// (T3-S5 round 2, decision 11). Locks: the failure-record mutex, then the
+/// `stop` mutex, each taken alone and never across an `.await`; no Core
+/// thread blocks on the worker while holding either (requests `try_send`).
+/// Wakes: the force watch.
+pub(super) struct Signal {
+    /// Accepted `daemon/stop` mode; set under `admission` or by phase one,
+    /// never cleared.
+    pub(super) stop: StdMutex<Option<StopMode>>,
+    /// Tells running drives to force-close their execution (C1 §3.14 `force`).
+    pub(super) force: watch::Sender<bool>,
+    /// When the force stop was accepted: every forced turn's `requested_at`.
+    pub(super) force_requested_at: OnceLock<String>,
+    /// Phase one of the latch: a failed or uncertain write, or corruption,
+    /// was observed; set under the `stop` mutex before anything is awaited.
+    pub(super) failure_pending: AtomicBool,
+    /// The latest Store failure and the count since start (design §7.5).
+    failures: StdMutex<FailureRecord>,
+    /// Phase-one time of the latching failure (design §7.4 [r3.17]).
+    failed_at: OnceLock<tokio::time::Instant>,
+}
+
+impl Signal {
+    pub(super) fn new() -> Self {
+        Self {
+            stop: StdMutex::new(None),
+            force: watch::Sender::new(false),
+            force_requested_at: OnceLock::new(),
+            failure_pending: AtomicBool::new(false),
+            failures: StdMutex::new(FailureRecord::default()),
+            failed_at: OnceLock::new(),
+        }
+    }
+
+    /// The failure hook's body ([`Engine::store_failure`]): records the
+    /// failure and, when it latches, runs phase one. Returns whether it
+    /// latches.
+    fn report(&self, site: FailureSite, outcome: WriteOutcome, scope: FailureScope<'_>) -> bool {
+        let latches = match outcome {
+            WriteOutcome::Uncertain | WriteOutcome::Corrupt => true,
+            WriteOutcome::NotCommitted => !site.scoped(),
+        };
+        self.record_failure(site, outcome, scope, latches);
+        if latches {
+            self.fail_pending();
+        }
+        latches
+    }
+
+    /// Store's read-corruption observer (design §7.1, T3-S5 round 2,
+    /// decision 11): SQLite corruption on any read reaches the hook here,
+    /// once, before the read's caller has its reply. Phase two follows
+    /// under `admission` ([`Engine::finish_pending`]).
+    pub(super) fn read_corrupt(&self) {
+        self.report(
+            FailureSite::Read,
+            WriteOutcome::Corrupt,
+            FailureScope::Request,
+        );
+    }
+
+    /// Records the latest failure (design §7.5); the latch's scope is
+    /// `daemon`.
+    fn record_failure(
+        &self,
+        site: FailureSite,
+        outcome: WriteOutcome,
+        scope: FailureScope<'_>,
+        latches: bool,
+    ) {
+        let latest = LatestFailure {
+            kind: failure_kind(site, outcome),
+            scope: if latches { "daemon" } else { site.scope() },
+            since: rfc3339(SystemTime::now()),
+            addresses: scope.addresses(),
+        };
+        let mut record = lock(&self.failures);
+        record.count = record.count.saturating_add(1);
+        record.latest = Some(latest);
+    }
+
+    /// Phase one of the latch: marks the failure pending and sends the force
+    /// signal under the `stop` mutex, which the grant takes, so running turns
+    /// take the forced path and daemon main starts final shutdown, which then
+    /// reports an unclean exit.
+    pub(super) fn fail_pending(&self) {
+        let mut stop = lock(&self.stop);
+        if self.failure_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *stop = Some(StopMode::Force);
+        self.failed_at.get_or_init(tokio::time::Instant::now);
+        self.force_requested_at
+            .get_or_init(|| rfc3339(SystemTime::now()));
+        self.force.send_replace(true);
     }
 }

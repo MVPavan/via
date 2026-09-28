@@ -61,7 +61,7 @@ impl Engine {
     /// force watch, the final-shutdown fence's watch and Host's holdings
     /// generation.
     pub async fn reprobe(&self) {
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         let mut entered = self.final_shutdown.subscribe();
         let mut added = self.adapter.holdings_changed();
         let mut interval = FIRST_PASS;

@@ -101,7 +101,10 @@ impl Engine {
         // Step 4: the stop fence [r1.5, r3.2]: final shutdown was entered,
         // whatever the stop mode, or an idle or force stop was accepted.
         if self.final_shutdown()
-            || matches!(*lock(&self.stop), Some(StopMode::Idle | StopMode::Force))
+            || matches!(
+                *lock(&self.signal.stop),
+                Some(StopMode::Idle | StopMode::Force)
+            )
         {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -233,7 +236,7 @@ impl Engine {
     ) -> Option<Step> {
         let task = slot.close_task()?;
         let cause = (CancelCause::Close, task.requested_at.clone());
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         // Steps 1–2: cancel every `Waiting` turn FIFO with cause `close`;
         // wait for request-owned cancellations. Step 3: a running turn is
         // inline, so none runs here.
@@ -279,7 +282,7 @@ impl Engine {
         // Step 5: under `admission`, force is re-checked [r5.9]; none starts
         // once `failure_pending` is observed [O1.D12].
         let admission = self.admission.lock().await;
-        if *lock(&self.stop) == Some(StopMode::Force) || self.store_failed() {
+        if *lock(&self.signal.stop) == Some(StopMode::Force) || self.store_failed() {
             return Some(Step::Next);
         }
         match self.commit_closed(slot, session, task.operation).await {

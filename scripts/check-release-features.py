@@ -92,7 +92,27 @@ POINTS = [
     "core.head.contended",
     "core.commit.before_send",
     "core.cancel.admitted",
-    "store.sqlite.corrupt_head",
+    # Task 3 S5 round 2 (design §7.1, §10): corruption on one read command.
+    "store.read.corrupt.spawn_key",
+    "store.read.corrupt.operation",
+    "store.read.corrupt.keyed_operation",
+    "store.read.corrupt.snapshot",
+    "store.read.corrupt.queued_turn",
+    "store.read.corrupt.predecessors",
+    "store.read.corrupt.next_seq",
+    "store.read.corrupt.result",
+    "store.read.corrupt.close_result",
+    "store.read.corrupt.closing_sessions",
+    "store.read.corrupt.terminated",
+    "store.read.corrupt.events",
+    "store.read.corrupt.logs",
+    "store.read.corrupt.authenticate",
+    "store.read.corrupt.unfinished",
+    "store.read.corrupt.anchor_owners",
+    "store.read.corrupt.unproven_anchors",
+    "store.read.corrupt.anchor_cohort",
+    "store.read.corrupt.queued_turns",
+    "store.read.corrupt.anchor_records",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

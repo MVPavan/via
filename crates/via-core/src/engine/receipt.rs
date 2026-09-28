@@ -89,7 +89,7 @@ impl Engine {
             }
             None => None,
         };
-        if lock(&self.stop).is_some() {
+        if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
         // Bounds the turns retained for their `store_error` reads.
@@ -217,7 +217,7 @@ impl Engine {
         if snapshot.closed || snapshot.closing || lock(&self.closing).contains(&session) {
             return Err(ApiError::SESSION_CLOSED);
         }
-        if lock(&self.stop).is_some() {
+        if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
         journal::admission(&self.store, &self.unresolved).await?;
@@ -267,17 +267,10 @@ impl Engine {
             warnings: RoutePlan::fake().warnings(),
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
-        let head = match slot.head.lock(&self.store, &session).await {
-            Ok(head) => head,
-            Err(error) => {
-                // Nothing was written; SQLite corruption latches (§7.1).
-                let outcome = WriteOutcome::of_read(&error);
-                if outcome == WriteOutcome::Corrupt {
-                    self.store_failure(FailureSite::Receipt, outcome, FailureScope::Request)
-                        .finish_held(admission);
-                }
-                return Err(ApiError::STORE);
-            }
+        // Nothing was written; Store's read reply already reported SQLite
+        // corruption (design §7.1, T3-S5 round 2, decision 11).
+        let Ok(head) = slot.head.lock(&self.store, &session).await else {
+            return Err(ApiError::STORE);
         };
         let at = rfc3339(SystemTime::now());
         let event = Event {

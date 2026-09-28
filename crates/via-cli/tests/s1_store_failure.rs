@@ -1927,7 +1927,7 @@ fn s1_f12_sqlite_corruption_latches() -> TestResult {
 /// session-head read that a receipt (`resume`) or `Closed` (`close`) takes
 /// latches, rather than being a plain or scoped failure. A restarted
 /// daemon keeps no head for an idle session, so the verb's commit reads it
-/// (`store.sqlite.corrupt_head`); the request replies `store_error`,
+/// (`store.read.corrupt.next_seq`); the request replies `store_error`,
 /// `store_failure` is `corrupt_store` with scope `daemon`, and the exit is 4.
 #[test]
 fn s1_f12_corrupt_head_read_latches() -> TestResult {
@@ -1945,7 +1945,7 @@ fn corrupt_head_read(verb: &str) -> TestResult {
     check(first["state"] == "completed", || format!("turn 1: {first}"))?;
     daemon.stop_clean()?;
     let daemon = sandbox.start()?;
-    let point = "store.sqlite.corrupt_head";
+    let point = "store.read.corrupt.next_seq";
     sandbox.arm(point, 1, "fail_io")?;
     let args: Vec<&str> = if verb == "resume" {
         vec![
@@ -1969,12 +1969,12 @@ fn corrupt_head_read(verb: &str) -> TestResult {
 /// session-head read of final shutdown's failure-resolution batch is
 /// reported as corruption. A lost event reply (`store.commit.reply_lost`)
 /// latches and leaves the head unknown, so the batch reads it
-/// (`store.sqlite.corrupt_head`): the batch is skipped, nothing more is
+/// (`store.read.corrupt.next_seq`): the batch is skipped, nothing more is
 /// written, and the latest `store_failure`, served in the diagnostic
 /// window, is `corrupt_store`.
 #[test]
 fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
-    let point = "store.sqlite.corrupt_head";
+    let point = "store.read.corrupt.next_seq";
     let sandbox = Sandbox::new(&script(
         "first",
         1,
@@ -2002,9 +2002,10 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
     sandbox.release("accepted")?;
     sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
     sandbox.ack(&daemon, point, next, "fail_io")?;
-    // The latch, then the batch's failure.
+    // The latch, the head read's corruption at Store's read reply (T3-S5
+    // round 2, decision 11), then the batch's own failed write.
     wait_until("the batch's failure", Duration::from_secs(4), || {
-        store_failure(&sandbox).is_ok_and(|failure| failure["count"] == 2)
+        store_failure(&sandbox).is_ok_and(|failure| failure["count"] == 3)
     })?;
     let failure = store_failure(&sandbox)?;
     check(
@@ -2021,6 +2022,40 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
          (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
     ))?;
     check(states == "running,queued", || format!("turns: {states}"))
+}
+
+/// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the force
+/// closure pass's snapshot read (`store.read.corrupt.snapshot`) is reported
+/// at Store's read reply and latches: the session counts in
+/// `unclosed_sessions`, `store_failed` is true, and the exit is 4.
+#[test]
+fn s1_f12_force_closure_corrupt_snapshot_read_latches() -> TestResult {
+    let point = "store.read.corrupt.snapshot";
+    let sandbox = Sandbox::new(&completes("first", 1))?;
+    sandbox.count(point)?;
+    let mut daemon = sandbox.start()?;
+    sandbox.arm("core.run.settling", 1, "pause")?;
+    let (session, _) = sandbox.spawn("first")?;
+    // The turn's execution ended; its terminal commits after force, so the
+    // closure pass reads the session alone.
+    sandbox.ack(&daemon, "core.run.settling", 1, "pause")?;
+    let next = sandbox.next_hit(point)?;
+    sandbox.arm(point, next, "fail_io")?;
+    sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+    sandbox.resume_point("core.run.settling", 1)?;
+    sandbox.ack(&daemon, point, next, "fail_io")?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let summary = daemon.summary()?;
+    check(
+        status.code() == Some(4)
+            && summary["unclosed_sessions"] == 1
+            && summary["store_failed"] == true,
+        || format!("unexpected exit {status}: {summary}"),
+    )?;
+    let state: String =
+        sandbox.query(&format!("SELECT state FROM sessions WHERE id='{session}'"))?;
+    check(state != "closed", || format!("session is {state}"))?;
+    sandbox.verify_anchors()
 }
 
 // -------------------------------------------------------- latch path (§7.4)

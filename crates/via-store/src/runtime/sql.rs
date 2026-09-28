@@ -5,13 +5,13 @@ use super::{
     CommitOutcome, Connection, ConnectionId, Duration, EventRecord, FAILURE_BATCH_CANCELLATIONS,
     FailureResolutionRecord, KeyedOperation, MetadataExt, OperationRecord, OperationVerb,
     OptionalExtension, Path, Predecessors, QueuedTurn, RAW_UNIT_LIMIT, RawRef, RawStream,
-    ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId, SessionSnapshot,
-    SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    SubmitFailedRecord, TerminalExtras, TerminalRecord, TransactionBehavior, TurnNumber,
-    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
-    commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
-    oneshot, params, read_anchor_cohort, read_anchor_owners, read_anchor_records, read_raw_ref,
-    validate_raw_ref,
+    ReadCorruption, ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId,
+    SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey,
+    SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord, TransactionBehavior,
+    TurnNumber, UnfinishedTurn, Value, check_schema_version, commit_anchor_identified,
+    commit_anchor_intent, commit_arm_intent, commit_group_absence, commit_vendor_facts,
+    count_unproven_anchors, fs, oneshot, params, read_anchor_cohort, read_anchor_owners,
+    read_anchor_records, read_raw_ref, validate_raw_ref,
 };
 
 /// Classifies a SQLite error before `COMMIT`: corruption is `Corrupt`, which
@@ -189,7 +189,12 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
     Ok(())
 }
 
-pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver<Command>) {
+pub(super) fn writer_loop(
+    mut conn: Connection,
+    root: &Path,
+    receiver: &Receiver<Command>,
+    corruption: &ReadCorruption,
+) {
     let mut commits = 0_u32;
     while let Ok(command) = receiver.recv() {
         if matches!(command, Command::Shutdown) {
@@ -203,7 +208,7 @@ pub(super) fn writer_loop(mut conn: Connection, root: &Path, receiver: &Receiver
             continue;
         }
         // Reads are served first; anything else is a mutation.
-        let Some(command) = serve_read(&conn, root, command) else {
+        let Some(command) = serve_read(&conn, root, command, corruption) else {
             continue;
         };
         serve_write(&mut conn, root, command);
@@ -244,74 +249,69 @@ impl Command {
         )
     }
 
-    /// Replies `error` unserved: a journal mutation reports its outcome class.
-    #[cfg_attr(
-        not(feature = "test-failpoints"),
-        expect(dead_code, reason = "only the test-only read seams fail a request")
-    )]
-    fn fail(self, error: StoreError) {
-        match self {
-            Self::Spawn(_, _, reply) => drop(reply.send(Err(error))),
-            Self::SpawnKey(_, reply) => drop(reply.send(Err(error))),
-            Self::Resume(_, reply)
-            | Self::Submission(_, reply)
-            | Self::Acceptance(_, reply)
-            | Self::Event(_, reply)
-            | Self::Terminal(_, _, reply)
-            | Self::Closing(_, reply)
-            | Self::SubmitFailed(_, reply)
-            | Self::FailureResolution(_, reply) => drop(reply.send(Err(error))),
-            Self::Operation(_, _, reply) => drop(reply.send(Err(error))),
-            Self::KeyedOperation(_, _, reply) => drop(reply.send(Err(error))),
-            Self::Snapshot(_, reply) => drop(reply.send(Err(error))),
-            Self::QueuedTurn(_, _, reply) => drop(reply.send(Err(error))),
-            Self::NextSeq(_, reply) => drop(reply.send(Err(error))),
-            Self::UnprovenAnchors(_, _, _, reply) => drop(reply.send(Err(error))),
-            Self::AnchorCohort(reply) => drop(reply.send(Err(error))),
-            Self::Predecessors(_, _, reply) => drop(reply.send(Err(error))),
-            Self::ClosingTerminal(_, _, reply) | Self::SessionClosed(_, _, reply) => {
-                drop(reply.send(Err(error)));
-            }
-            Self::Closed(_, reply) => drop(reply.send(Err(error))),
-            Self::Result(_, _, reply) | Self::CloseResult(_, reply) => {
-                drop(reply.send(Err(error)));
-            }
-            Self::ClosingSessions(_, _, reply) => drop(reply.send(Err(error))),
-            Self::Terminated(_, reply) | Self::QueuedTurns(_, _, reply) => {
-                drop(reply.send(Err(error)));
-            }
-            Self::Events(_, _, _, reply) => drop(reply.send(Err(error))),
-            Self::Logs(_, reply) => drop(reply.send(Err(error))),
-            Self::Unfinished(reply) => drop(reply.send(Err(error))),
-            Self::AnchorOwners(_, _, _, reply) => drop(reply.send(Err(error))),
-            Self::Authenticate(_, _, reply) => drop(reply.send(Err(error))),
-            Self::AnchorIntent(_, reply) => drop(reply.send(error.journal_outcome())),
-            Self::AnchorIdentified(.., reply) | Self::ArmIntent(.., reply) => {
-                drop(reply.send(error.journal_outcome()));
-            }
-            Self::VendorFacts(.., reply) | Self::GroupAbsence(_, reply) => {
-                drop(reply.send(error.journal_outcome()));
-            }
-            Self::AnchorRecords(_, reply) => drop(reply.send(Err(error.kind()))),
-            Self::Shutdown => {}
-        }
+    /// The test-only seam that reports SQLite corruption on this read
+    /// command alone (design §10); `None` for a mutation.
+    #[cfg(feature = "test-failpoints")]
+    fn corrupt_point(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::SpawnKey(..) => "store.read.corrupt.spawn_key",
+            Self::Operation(..) => "store.read.corrupt.operation",
+            Self::KeyedOperation(..) => "store.read.corrupt.keyed_operation",
+            Self::Snapshot(..) => "store.read.corrupt.snapshot",
+            Self::QueuedTurn(..) => "store.read.corrupt.queued_turn",
+            Self::Predecessors(..) => "store.read.corrupt.predecessors",
+            Self::NextSeq(..) => "store.read.corrupt.next_seq",
+            Self::Result(..) => "store.read.corrupt.result",
+            Self::CloseResult(..) => "store.read.corrupt.close_result",
+            Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
+            Self::Terminated(..) => "store.read.corrupt.terminated",
+            Self::Events(..) => "store.read.corrupt.events",
+            Self::Logs(..) => "store.read.corrupt.logs",
+            Self::Authenticate(..) => "store.read.corrupt.authenticate",
+            Self::Unfinished(..) => "store.read.corrupt.unfinished",
+            Self::AnchorOwners(..) => "store.read.corrupt.anchor_owners",
+            Self::UnprovenAnchors(..) => "store.read.corrupt.unproven_anchors",
+            Self::AnchorCohort(..) => "store.read.corrupt.anchor_cohort",
+            Self::QueuedTurns(..) => "store.read.corrupt.queued_turns",
+            Self::AnchorRecords(..) => "store.read.corrupt.anchor_records",
+            Self::Spawn(..)
+            | Self::Resume(..)
+            | Self::Submission(..)
+            | Self::Acceptance(..)
+            | Self::Event(..)
+            | Self::Terminal(..)
+            | Self::Closing(..)
+            | Self::Closed(..)
+            | Self::SubmitFailed(..)
+            | Self::FailureResolution(..)
+            | Self::ClosingTerminal(..)
+            | Self::SessionClosed(..)
+            | Self::AnchorIntent(..)
+            | Self::AnchorIdentified(..)
+            | Self::ArmIntent(..)
+            | Self::VendorFacts(..)
+            | Self::GroupAbsence(..)
+            | Self::Shutdown => return None,
+        })
     }
 }
 
 /// Test-only seams on a read the worker dequeued (design §6.7, §7.1, §7.3):
 /// `store.read.stall` pauses the worker; `store.sqlite.corrupt` reports
-/// corruption, and `store.sqlite.corrupt_head` only on a session-head read
-/// (the next sequence); `store.read.dispatch` fails the dispatcher's head
-/// reads (predecessors, the queued row, the head's next sequence) and
-/// `store.read.queued_turn` only the queued-row read.
+/// corruption on every read, and `store.read.corrupt.<command>` only on
+/// that read command ([`Command::corrupt_point`]); `store.read.dispatch`
+/// fails the dispatcher's head reads (predecessors, the queued row, the
+/// head's next sequence) and `store.read.queued_turn` only the queued-row
+/// read.
 #[cfg(feature = "test-failpoints")]
 fn read_seams(command: &Command) -> Result<(), StoreError> {
     use crate::failpoint::hit;
     let injected = |error: std::io::Error| StoreError::Write(error.to_string());
+    let corrupt = |error: std::io::Error| StoreError::Corrupt(error.to_string());
     hit("store.read.stall").map_err(injected)?;
-    hit("store.sqlite.corrupt").map_err(|error| StoreError::Corrupt(error.to_string()))?;
-    if matches!(command, Command::NextSeq(..)) {
-        hit("store.sqlite.corrupt_head").map_err(|error| StoreError::Corrupt(error.to_string()))?;
+    hit("store.sqlite.corrupt").map_err(corrupt)?;
+    if let Some(point) = command.corrupt_point() {
+        hit(point).map_err(corrupt)?;
     }
     if matches!(
         command,
@@ -325,81 +325,77 @@ fn read_seams(command: &Command) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Serves a read command; returns any other command unserved.
-fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Command> {
+/// Serves a read command; returns any other command unserved. Every read
+/// reply, a test seam's failure included, passes [`answer`], so SQLite
+/// corruption on any read reaches the observer before the reply.
+fn serve_read(
+    conn: &Connection,
+    root: &Path,
+    command: Command,
+    corruption: &ReadCorruption,
+) -> Option<Command> {
     if !command.is_read() {
         return Some(command);
     }
+    // A seam's failure is the read's reply, through the same `answer`.
     #[cfg(feature = "test-failpoints")]
-    if let Err(error) = read_seams(&command) {
-        command.fail(error);
-        return None;
+    let seam = read_seams(&command);
+    #[cfg(not(feature = "test-failpoints"))]
+    let seam: Result<(), StoreError> = Ok(());
+    // Every reply below passes `answer`, after the seam.
+    macro_rules! reply {
+        ($reply:expr, $read:expr) => {{
+            answer(corruption, $reply, seam.and_then(|()| $read));
+        }};
     }
     match command {
-        Command::SpawnKey(key, reply) => {
-            let _ = reply.send(read_spawn_key(conn, &key));
-        }
+        Command::SpawnKey(key, reply) => reply!(reply, read_spawn_key(conn, &key)),
         Command::Operation(session, op_key, reply) => {
-            let _ = reply.send(read_operation(conn, &session, &op_key));
+            reply!(reply, read_operation(conn, &session, &op_key));
         }
         Command::KeyedOperation(session, op_key, reply) => {
-            let _ = reply.send(read_keyed_operation(conn, &session, &op_key));
+            reply!(reply, read_keyed_operation(conn, &session, &op_key));
         }
-        Command::Snapshot(session, reply) => {
-            let _ = reply.send(read_snapshot(conn, &session));
-        }
+        Command::Snapshot(session, reply) => reply!(reply, read_snapshot(conn, &session)),
         Command::QueuedTurn(session, turn, reply) => {
-            let _ = reply.send(read_queued_turn(conn, &session, turn));
+            reply!(reply, read_queued_turn(conn, &session, turn));
         }
         Command::Predecessors(session, turn, reply) => {
-            let _ = reply.send(read_predecessors(conn, &session, turn));
+            reply!(reply, read_predecessors(conn, &session, turn));
         }
-        Command::NextSeq(session, reply) => {
-            let _ = reply.send(read_next_seq(conn, &session));
-        }
-        Command::Result(session, turn, reply) => {
-            let _ = reply.send(read_result(conn, &session, turn));
-        }
-        Command::CloseResult(session, reply) => {
-            let _ = reply.send(read_close_result(conn, &session));
-        }
+        Command::NextSeq(session, reply) => reply!(reply, read_next_seq(conn, &session)),
+        Command::Result(session, turn, reply) => reply!(reply, read_result(conn, &session, turn)),
+        Command::CloseResult(session, reply) => reply!(reply, read_close_result(conn, &session)),
         Command::ClosingSessions(after, limit, reply) => {
-            let _ = reply.send(read_closing_sessions(conn, after.as_ref(), limit));
+            reply!(reply, read_closing_sessions(conn, after.as_ref(), limit));
         }
-        Command::Terminated(turns, reply) => {
-            let _ = reply.send(read_terminated(conn, turns));
-        }
+        Command::Terminated(turns, reply) => reply!(reply, read_terminated(conn, turns)),
         Command::Events(session, from, limit, reply) => {
-            let _ = reply.send(read_events(conn, &session, from, limit));
+            reply!(reply, read_events(conn, &session, from, limit));
         }
-        Command::Logs(session, reply) => {
-            let _ = reply.send(read_logs(conn, root, &session));
-        }
+        Command::Logs(session, reply) => reply!(reply, read_logs(conn, root, &session)),
         Command::Authenticate(session, hash, reply) => {
-            let _ = reply.send(authenticate(conn, &session, &hash));
+            reply!(reply, authenticate(conn, &session, &hash));
         }
-        Command::Unfinished(reply) => {
-            let _ = reply.send(read_unfinished(conn));
-        }
-        Command::AnchorOwners(after, limit, cohort, reply) => {
-            let _ = reply.send(read_anchor_owners(conn, after.as_deref(), limit, cohort));
-        }
-        Command::UnprovenAnchors(after, limit, cohort, reply) => {
-            let _ = reply.send(count_unproven_anchors(
-                conn,
-                after.as_deref(),
-                limit,
-                cohort,
-            ));
-        }
-        Command::AnchorCohort(reply) => {
-            let _ = reply.send(read_anchor_cohort(conn));
-        }
+        Command::Unfinished(reply) => reply!(reply, read_unfinished(conn)),
+        Command::AnchorOwners(after, limit, cohort, reply) => reply!(
+            reply,
+            read_anchor_owners(conn, after.as_deref(), limit, cohort)
+        ),
+        Command::UnprovenAnchors(after, limit, cohort, reply) => reply!(
+            reply,
+            count_unproven_anchors(conn, after.as_deref(), limit, cohort)
+        ),
+        Command::AnchorCohort(reply) => reply!(reply, read_anchor_cohort(conn)),
         Command::QueuedTurns(after, limit, reply) => {
-            let _ = reply.send(read_queued_turns(conn, after.as_ref(), limit));
+            reply!(reply, read_queued_turns(conn, after.as_ref(), limit));
         }
         Command::AnchorRecords(query, reply) => {
-            let _ = reply.send(read_anchor_records(conn, &query).map_err(|error| error.kind()));
+            let records = seam.and_then(|()| read_anchor_records(conn, &query));
+            if matches!(records, Err(StoreError::Corrupt(_))) {
+                corruption.report();
+            }
+            let _ = reply.send(records.map_err(|error| error.kind()));
         }
         // `is_read` returned every other command above.
         command @ (Command::Spawn(..)
@@ -422,6 +418,19 @@ fn serve_read(conn: &Connection, root: &Path, command: Command) -> Option<Comman
         | Command::Shutdown) => return Some(command),
     }
     None
+}
+
+/// Sends a read reply; SQLite corruption reaches the observer first
+/// (design §7.1).
+fn answer<T>(
+    corruption: &ReadCorruption,
+    reply: oneshot::Sender<Result<T, StoreError>>,
+    result: Result<T, StoreError>,
+) {
+    if matches!(result, Err(StoreError::Corrupt(_))) {
+        corruption.report();
+    }
+    let _ = reply.send(result);
 }
 
 /// Serves one mutation command.

@@ -24,7 +24,7 @@ use super::queue::Slot;
 use super::terminal::terminal_envelope;
 use super::{Engine, FailureNote, Terminal, TurnRecord, failure};
 use crate::api::{Event, EventBody, FailureClass, Timestamps, rfc3339};
-use crate::{ApiError, SessionId, TurnNumber};
+use crate::{SessionId, TurnNumber};
 
 /// The failure message of a turn whose frozen row cannot be parsed.
 pub(super) const CORRUPT_ROW: &str = "a frozen value of the queued turn could not be read";
@@ -155,22 +155,6 @@ impl fmt::Display for SubmitFailed {
 }
 
 impl Engine {
-    /// A Store read failed (design §7.3): SQLite-level corruption latches
-    /// (§7.1); any other read failure is the caller's plain `store_error`
-    /// and never latches. The caller holds no lock.
-    pub(super) async fn read_error(&self, error: &StoreError) -> ApiError {
-        if matches!(error, StoreError::Corrupt(_)) {
-            self.store_failure(
-                FailureSite::Read,
-                WriteOutcome::Corrupt,
-                FailureScope::Request,
-            )
-            .finish()
-            .await;
-        }
-        ApiError::STORE
-    }
-
     /// The dispatcher's step after `submit` failed for its claimed head
     /// `turn` (design §7.2 row 2, §7.3). A read that failed rolls the claim
     /// back into the read streak; an uncertain submission or SQLite

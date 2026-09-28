@@ -6,7 +6,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        Arc, OnceLock,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -639,12 +642,36 @@ pub struct AnchorRecord {
     pub absence: Option<GroupAbsenceRecord>,
 }
 
+/// The observer a Store calls on SQLite corruption on a read (design
+/// §7.1), registered once by its owner. Store names no caller type: the
+/// observer is a plain callback.
+type ReadObserver = Box<dyn Fn() + Send + Sync>;
+
+/// Where the SQLite worker finds the read-corruption observer; unset until
+/// the owner registers one, then fixed.
+#[derive(Clone, Default)]
+pub(crate) struct ReadCorruption(Arc<OnceLock<ReadObserver>>);
+
+impl ReadCorruption {
+    /// Runs the registered observer, if any, on the worker's thread. The
+    /// worker calls it before it sends a read reply carrying
+    /// [`StoreError::Corrupt`], so the caller receives the reply only after
+    /// the observer returned.
+    pub(crate) fn report(&self) {
+        if let Some(observer) = self.0.get() {
+            observer();
+        }
+    }
+}
+
 /// Owns the single SQLite writer and the independent raw worker.
 pub struct Store {
     client: StoreClient,
     raw_sender: SyncSender<RawCommand>,
     writer_join: Option<JoinHandle<()>>,
     raw_join: Option<JoinHandle<()>>,
+    /// Read by the SQLite worker; set once by [`Store::on_read_corruption`].
+    read_corruption: ReadCorruption,
     /// Released after `Drop` joined the workers: the last field.
     _lock: StoreLock,
 }
@@ -994,9 +1021,11 @@ impl Store {
         let (sender, receiver) = mpsc::sync_channel(128);
         let (raw_sender, raw_receiver) = mpsc::sync_channel(64);
         let writer_root = state.to_path_buf();
+        let read_corruption = ReadCorruption::default();
+        let observer = read_corruption.clone();
         let writer_join = thread::Builder::new()
             .name("via-store-sqlite".to_owned())
-            .spawn(move || writer_loop(conn, &writer_root, &receiver))
+            .spawn(move || writer_loop(conn, &writer_root, &receiver, &observer))
             .map_err(|error| StoreError::Open(error.to_string()))?;
         let raw_join = thread::Builder::new()
             .name("via-store-raw".to_owned())
@@ -1007,8 +1036,18 @@ impl Store {
             raw_sender,
             writer_join: Some(writer_join),
             raw_join: Some(raw_join),
+            read_corruption,
             _lock: lock,
         })
+    }
+
+    /// Registers the observer of SQLite corruption on any read (design
+    /// §7.1): the SQLite worker calls it on its own thread before it sends a
+    /// read reply carrying [`StoreError::Corrupt`], whichever client made the
+    /// read. It must not block on this Store. Returns false, keeping the
+    /// first, when one is already registered.
+    pub fn on_read_corruption(&self, observer: impl Fn() + Send + Sync + 'static) -> bool {
+        self.read_corruption.0.set(Box::new(observer)).is_ok()
     }
 
     /// Returns a bounded, cloneable client for Core lifecycle operations.

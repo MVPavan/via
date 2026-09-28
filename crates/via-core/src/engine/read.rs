@@ -25,24 +25,21 @@ impl Engine {
 
     /// The session's highest turn number; `session_not_found` without one.
     async fn turns(&self, session: &SessionId) -> Result<u32, ApiError> {
-        let snapshot = match self.store.session_snapshot(session).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Err(self.read_error(&error).await),
+        let Ok(snapshot) = self.store.session_snapshot(session).await else {
+            return Err(ApiError::STORE);
         };
         Ok(snapshot.ok_or(ApiError::SESSION_NOT_FOUND)?.turns)
     }
 
-    /// The turn's durable result as `journal::read_result` reads it; SQLite
-    /// corruption on the read latches (design §7.3). No lock is held.
+    /// The turn's durable result as `journal::read_result` reads it; Store's
+    /// read reply latches on SQLite corruption (design §7.1). No lock is
+    /// held.
     pub(super) async fn read_result(
         &self,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<Option<Value>, ApiError> {
         let read = self.store.result(session, turn).await;
-        if let Err(error) = &read {
-            self.read_error(error).await;
-        }
         journal::settled_result(&self.unresolved, session, turn, read)
     }
 
@@ -128,9 +125,8 @@ impl Engine {
     /// Reads the first bounded page of durable canonical events.
     pub async fn events(&self, session: &str) -> Result<Value, ApiError> {
         let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        let events = match self.store.events(&id, 1, 1000).await {
-            Ok(events) => events,
-            Err(error) => return Err(self.read_error(&error).await),
+        let Ok(events) = self.store.events(&id, 1, 1000).await else {
+            return Err(ApiError::STORE);
         };
         let next_after = events.last().map_or(0, |event| event.seq);
         Ok(
@@ -143,7 +139,7 @@ impl Engine {
         let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
         match self.store.logs(&id).await {
             Ok(logs) => Ok(logs),
-            Err(error) => Err(self.read_error(&error).await),
+            Err(_) => Err(ApiError::STORE),
         }
     }
 }

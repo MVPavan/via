@@ -201,7 +201,7 @@ impl Engine {
         slot.live();
         // Held until this future ends or is dropped (design §6.8 step 3).
         let _dispatching = self.dispatching(&session);
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         let mut backoff = Backoff::new();
         let mut streak = ReadStreak::new();
         let mut refused = false;
@@ -335,7 +335,7 @@ impl Engine {
     /// or Store failure latched. `request_stop` accepts force under the same
     /// mutex, so a turn still queued when force is accepted is never submitted.
     pub(super) fn grant(&self) -> bool {
-        *lock(&self.stop) != Some(StopMode::Force) && !self.store_failed()
+        *lock(&self.signal.stop) != Some(StopMode::Force) && !self.store_failed()
     }
 
     /// Claims, grants, submits and runs the queue head (design §3.1). It
@@ -408,7 +408,7 @@ impl Engine {
         if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
             return Some(permit);
         }
-        let mut force = self.force.subscribe();
+        let mut force = self.signal.force.subscribe();
         let acquire = Arc::clone(&self.slots).acquire_owned();
         tokio::pin!(acquire);
         // One poll registers the waiter in the semaphore's FIFO queue.
@@ -534,18 +534,14 @@ impl Engine {
     /// C1 P6/§7.3 from durable state. While any earlier turn is unresolved
     /// (queued, including an orphan awaiting reconciliation, or running, or
     /// with no durable terminal) the turn waits. A read Store cannot answer
-    /// is `Unread`, for the read streak (design §7.3); SQLite corruption on
-    /// it latches. Otherwise the latest submitted earlier turn decides: cleanup
+    /// is `Unread`, for the read streak (design §7.3); Store's read reply
+    /// already latched on SQLite corruption (§7.1). Otherwise the latest submitted earlier turn decides: cleanup
     /// `pending` waits (C1 §7.3 dispatches only after cleanup settles), durably
     /// `unknown` cancels (P6), anything else runs. Turns cancelled while
     /// queued never ran and are passed over.
     async fn decide(&self, session: &SessionId, turn: TurnNumber) -> Decision {
-        let predecessors = match self.predecessors(session, turn).await {
-            Ok(predecessors) => predecessors,
-            Err(error) => {
-                self.read_error(&error).await;
-                return Decision::Unread;
-            }
+        let Ok(predecessors) = self.predecessors(session, turn).await else {
+            return Decision::Unread;
         };
         if predecessors.unresolved {
             return Decision::Wait;
@@ -862,18 +858,12 @@ impl Engine {
             queued = reads => queued,
             () = self.read_cutoff() => return Cancelled::Expired,
         };
-        let queued = match queued {
-            Ok(queued) => queued,
-            Err(error) => {
-                if let Some(error) = error {
-                    self.read_error(&error).await;
-                }
-                if owner == Owner::Dispatcher {
-                    // Design §7.3 [r1.13]: joined callers get `store_error`.
-                    slot.read_failed(turn);
-                }
-                return Cancelled::Unread;
+        let Ok(queued) = queued else {
+            if owner == Owner::Dispatcher {
+                // Design §7.3 [r1.13]: joined callers get `store_error`.
+                slot.read_failed(turn);
             }
+            return Cancelled::Unread;
         };
         let (started, record, terminal, extras) =
             queued_cancellation(slot, session, turn, queued, cause);
@@ -1194,11 +1184,15 @@ impl Engine {
         mut extras: TerminalExtras,
         mode: Commit,
     ) -> Result<Durable, Unended> {
+        // A failed read writes nothing; a corrupt one latches (design §7.1),
+        // and the hook sees it as this write's outcome.
         journal::reconcile(journal, &mut record)
             .await
-            .map_err(|_| ApiError::STORE)?;
+            .map_err(|error| Unended {
+                error: ApiError::STORE,
+                outcome: WriteOutcome::of_read(&error),
+            })?;
         let shared = Arc::clone(&record.head);
-        // A corrupt head read writes nothing, yet latches (design §7.1).
         let head = shared
             .lock(journal, &started.session)
             .await
@@ -1285,7 +1279,7 @@ impl Engine {
             prompt,
             observed_tx,
             deadline,
-            self.force.subscribe(),
+            self.signal.force.subscribe(),
             stop,
             capacity,
         ));
@@ -1328,6 +1322,7 @@ impl Engine {
                         {
                             Driven::Forced(Forced {
                                 requested_at: self
+                                    .signal
                                     .force_requested_at
                                     .get()
                                     .cloned()
@@ -1547,9 +1542,6 @@ impl Engine {
             Ok(Some(queued)) => queued,
             // Store could not parse the row's frozen values (design §7.3).
             Err(StoreError::CorruptEvidence) => return Err(SubmitFailure::Corrupt(None)),
-            Err(error @ StoreError::Corrupt(_)) => {
-                return Err(SubmitFailure::Failed(WriteOutcome::of(&error)));
-            }
             Ok(None) | Err(_) => return Err(SubmitFailure::Unread),
         };
         let queueing = || Queueing::from(&queued);
@@ -1568,12 +1560,8 @@ impl Engine {
         {
             return Err(SubmitFailure::Unread);
         }
-        let head = match head.lock(journal, session).await {
-            Ok(head) => head,
-            Err(error @ StoreError::Corrupt(_)) => {
-                return Err(SubmitFailure::Failed(WriteOutcome::of(&error)));
-            }
-            Err(_) => return Err(SubmitFailure::Unread),
+        let Ok(head) = head.lock(journal, session).await else {
+            return Err(SubmitFailure::Unread);
         };
         let event = Event {
             seq: head.next(),

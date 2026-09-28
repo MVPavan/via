@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, OnceLock, PoisonError,
+        Arc, Mutex as StdMutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -64,12 +64,9 @@ pub struct Engine {
     adapter: AdapterRuntime,
     active: AtomicUsize,
     admission: tokio::sync::Mutex<()>,
-    /// Accepted `daemon/stop` mode; set under `admission`, never cleared.
-    stop: StdMutex<Option<StopMode>>,
-    /// Tells running drives to force-close their execution (C1 §3.14 `force`).
-    force: watch::Sender<bool>,
-    /// When the force stop was accepted: every forced turn's `requested_at`.
-    force_requested_at: OnceLock<String>,
+    /// The stop mode, the force watch and the latch's phase one with the
+    /// failure record, shared with Store's read-corruption observer.
+    signal: Arc<latch::Signal>,
     /// Force-stopped turns awaiting Host cleanup evidence in final shutdown.
     forced: StdMutex<Vec<ForcedTurn>>,
     /// Running turns whose terminal write failed after the run loop ended,
@@ -88,9 +85,6 @@ pub struct Engine {
     /// Phase two of the latch, set under `admission` after `failure_pending`
     /// (runtime §7): the latch is ordered after every receipt inside it.
     store_failed: AtomicBool,
-    /// Phase one of the latch: a failed or uncertain write was observed; set
-    /// under the `stop` mutex before the observer awaits anything.
-    failure_pending: AtomicBool,
     /// Sessions with dispatch state when force was accepted, for final
     /// shutdown's closure pass.
     force_sessions: StdMutex<Option<Vec<SessionId>>>,
@@ -123,10 +117,6 @@ pub struct Engine {
     /// removed when its future ends or is dropped (design §6.8 step 3).
     /// Final shutdown settles nothing of a session still here.
     dispatching: StdMutex<HashSet<SessionId>>,
-    /// The latest Store failure and the count since start (design §7.5).
-    failures: StdMutex<latch::FailureRecord>,
-    /// Phase-one time of the latching failure (design §7.4 [r3.17]).
-    failed_at: OnceLock<tokio::time::Instant>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -281,6 +271,12 @@ impl Engine {
             None => Store::open(state),
         }
         .map_err(|error| error.to_string())?;
+        // Design §7.1 (T3-S5 round 2, decision 11): SQLite corruption on any
+        // read reaches the failure hook at Store's read reply, before any
+        // read of recovery or of the Engine.
+        let signal = Arc::new(latch::Signal::new());
+        let observer = Arc::clone(&signal);
+        owner.on_read_corruption(move || observer.read_corrupt());
         let store = owner.client();
         let adapter = AdapterRuntime::new(
             AdapterRuntimeConfig {
@@ -301,9 +297,7 @@ impl Engine {
             adapter,
             active: AtomicUsize::new(0),
             admission: tokio::sync::Mutex::new(()),
-            stop: StdMutex::new(None),
-            force: watch::Sender::new(false),
-            force_requested_at: OnceLock::new(),
+            signal,
             forced: StdMutex::new(Vec::new()),
             affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
@@ -311,7 +305,6 @@ impl Engine {
             sessions: StdMutex::new(HashMap::new()),
             queued: AtomicUsize::new(0),
             store_failed: AtomicBool::new(false),
-            failure_pending: AtomicBool::new(false),
             force_sessions: StdMutex::new(None),
             read_retries_until: watch::Sender::new(None),
             starts,
@@ -323,8 +316,6 @@ impl Engine {
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),
             dispatching: StdMutex::new(HashSet::new()),
-            failures: StdMutex::new(latch::FailureRecord::default()),
-            failed_at: OnceLock::new(),
             #[cfg(test)]
             faults: Faults::default(),
         })

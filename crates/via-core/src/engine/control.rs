@@ -48,7 +48,7 @@ impl Engine {
         if let Some(envelope) = self.read_result(&session, turn).await? {
             return Ok(reply(&address, &envelope, true));
         }
-        if *lock(&self.stop) == Some(StopMode::Force) {
+        if *lock(&self.signal.stop) == Some(StopMode::Force) {
             return Err(ApiError::DAEMON_STOPPING);
         }
         // Past step 3: a force accepted from here finds this cancel admitted
