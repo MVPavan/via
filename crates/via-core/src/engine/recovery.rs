@@ -4,12 +4,14 @@
 //! uncertain cleanup. Nothing is resent: the prompt may have reached the
 //! vendor, and process exit proves neither non-submission nor inaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use via_adapters::FakeRecovery;
-use via_store::{ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, TerminalRecord, UnfinishedTurn};
+use via_store::{
+    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, TerminalRecord, UnfinishedTurn,
+};
 
 use std::sync::atomic::Ordering;
 
@@ -19,8 +21,8 @@ use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Event, EventBody, FailureClass, RawSpan, Timestamps, rfc3339};
-use crate::{ApiError, Cleanup, Deadline, RawRef, SessionId, TurnNumber};
+use crate::api::{Cancel, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339};
+use crate::{ApiError, Cleanup, ConnectionId, Deadline, RawRef, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
 const PAGE: u32 = 1000;
@@ -229,6 +231,11 @@ impl Engine {
     /// Commits `cancel.requested`, `cancel.settled` with Host's cleanup and
     /// `turn.ended` (`unknown`) after every event the crashed daemon
     /// committed, citing the raw spans those events reference.
+    ///
+    /// Design §9: a turn with a committed anchor at `arm_intent` had a
+    /// connection the crashed daemon never sealed, so `raw_log.incomplete`
+    /// commits first and the envelope carries `raw_log_incomplete`. An
+    /// earlier recovery attempt's `raw_log.incomplete` is kept.
     async fn recover_turn(
         &self,
         unfinished: UnfinishedTurn,
@@ -246,6 +253,7 @@ impl Engine {
             queued_seq,
             started,
             spans,
+            raw_logged,
         } = self.history(&session, turn).await?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
@@ -259,6 +267,9 @@ impl Engine {
             first_failure: None,
             uncertain: None,
         };
+        let raw_incomplete = self
+            .record_raw_incomplete(&mut record, reconciled, raw_logged)
+            .await?;
         let cancel = self.settle_recovered(&mut record, reconciled).await?;
         let head = head
             .lock(&self.store, &session)
@@ -266,24 +277,7 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         let seq = head.next();
         let ended_at = rfc3339(SystemTime::now());
-        let terminal = Terminal {
-            state: "unknown",
-            // C1 §8.2: Core's restart class; the state stays `unknown` (§7.5).
-            failure: Some(failure(
-                FailureClass::DaemonRestart,
-                "the daemon restarted before the turn ended".to_owned(),
-                None,
-            )),
-            // C1 §7.6: an unconfirmed outcome, like transport loss, is an error.
-            stop_reason: "error",
-            vendor_stop_reason: None,
-            final_text: String::new(),
-            exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
-            warnings: Vec::new(),
-            cancel: Some(cancel.clone()),
-        };
+        let terminal = recovered_terminal(cancel.clone(), raw_incomplete);
         let event = Event {
             seq,
             session_id: &session,
@@ -340,6 +334,26 @@ impl Engine {
         }
     }
 
+    /// Design §9: commits `raw_log.incomplete` for a turn whose raw log may be
+    /// incomplete, unless an earlier recovery attempt did; returns whether it
+    /// may be incomplete. A failed commit is the record's first failure,
+    /// which fails startup once the settlement is written.
+    async fn record_raw_incomplete(
+        &self,
+        record: &mut TurnRecord,
+        reconciled: &Reconciled,
+        raw_logged: bool,
+    ) -> Result<bool, ApiError> {
+        let raw_incomplete = reconciled.raw_incomplete(&record.session, record.turn);
+        if raw_incomplete && !raw_logged {
+            let connection_id =
+                recovered_connection(&record.session, record.turn).map_err(|_| ApiError::STORE)?;
+            self.commit_event(record, EventBody::RawLogIncomplete { connection_id }, None)
+                .await;
+        }
+        Ok(raw_incomplete)
+    }
+
     /// Records the recovery stop of the turn's orphaned execution (C1 §7.5):
     /// `forced` only when Host's stop found its vendor live; cleanup
     /// `quiescent` only when Host proved every owned group absent, or when no
@@ -370,6 +384,7 @@ impl Engine {
         let mut queued_seq = None;
         let mut started = None;
         let mut spans = Vec::new();
+        let mut raw_logged = false;
         loop {
             let page = self
                 .store
@@ -394,6 +409,7 @@ impl Engine {
                     Some("turn.started") => {
                         started = at.map(str::to_owned).zip(stored.raw_ref.clone());
                     }
+                    Some("raw_log.incomplete") => raw_logged = true,
                     _ => {}
                 }
             }
@@ -407,7 +423,53 @@ impl Engine {
             queued_seq: queued_seq.ok_or(ApiError::STORE)?,
             started,
             spans,
+            raw_logged,
         })
+    }
+}
+
+/// The turn's connection, named as `drive.rs`'s `connection_id` names it
+/// when it launches the turn: one private connection per turn, and turn 1
+/// keeps the session's own name. The copy exists because that helper is
+/// private to `drive.rs` (S4 owns only this file); `s1_f09_` checks the two
+/// agree.
+fn recovered_connection(
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<ConnectionId, <ConnectionId as TryFrom<&str>>::Error> {
+    let suffix = session.as_str().trim_start_matches("s_");
+    let connection = match turn.get() {
+        1 => format!("c_{suffix}"),
+        n => format!("c_{suffix}t{n}"),
+    };
+    ConnectionId::try_from(connection.as_str())
+}
+
+/// A recovered turn's terminal: `unknown` with Core's restart class, the
+/// recovery settlement, and the `raw_log_incomplete` warning when its raw
+/// log may be incomplete (design §9).
+fn recovered_terminal(cancel: Cancel, raw_incomplete: bool) -> Terminal {
+    Terminal {
+        state: "unknown",
+        // C1 §8.2: Core's restart class; the state stays `unknown` (§7.5).
+        failure: Some(failure(
+            FailureClass::DaemonRestart,
+            "the daemon restarted before the turn ended".to_owned(),
+            None,
+        )),
+        // C1 §7.6: an unconfirmed outcome, like transport loss, is an error.
+        stop_reason: "error",
+        vendor_stop_reason: None,
+        final_text: String::new(),
+        exit: None,
+        raw_ref: None,
+        raw_incomplete,
+        warnings: if raw_incomplete {
+            vec![Warning::RAW_LOG_INCOMPLETE]
+        } else {
+            Vec::new()
+        },
+        cancel: Some(cancel),
     }
 }
 
@@ -436,6 +498,8 @@ struct History {
     /// `turn.started` time and raw span, when acceptance's event committed.
     started: Option<(String, RawRef)>,
     spans: Vec<RawSpan>,
+    /// The turn already has a durable `raw_log.incomplete`.
+    raw_logged: bool,
 }
 
 /// Host's cleanup evidence for running turns, checked against every
@@ -444,6 +508,9 @@ struct History {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
+    /// Running turns with a committed anchor at `arm_intent`, or whose
+    /// anchor phase is unreadable (design §9).
+    armed: HashSet<(SessionId, TurnNumber)>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
     /// The deadline stopped paging before the whole inventory was read.
@@ -464,6 +531,14 @@ impl Reconciled {
             }
             if !owner.turn_running {
                 continue;
+            }
+            // An unreadable phase may have been `arm_intent`: a raw log is
+            // never claimed complete on missing evidence.
+            if owner
+                .phase
+                .is_none_or(|phase| phase == AnchorPhase::ArmIntent)
+            {
+                self.armed.insert((owner.session_id.clone(), owner.turn));
             }
             let entry = self
                 .turns
@@ -490,19 +565,44 @@ impl Reconciled {
             .unwrap_or((true, false));
         (quiescent && !self.incomplete, forced)
     }
+
+    /// Whether the turn's raw log may be incomplete (design §9): it has a
+    /// committed anchor at `arm_intent`, so the vendor may have written to a
+    /// connection the crashed daemon never sealed. An incomplete inventory
+    /// cannot show that an unread anchor was not armed.
+    fn raw_incomplete(&self, session: &SessionId, turn: TurnNumber) -> bool {
+        self.incomplete || self.armed.contains(&(session.clone(), turn))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchorOwner, Cleanup, FakeRecovery, Reconciled, SessionId, TurnNumber};
+    use super::{
+        AnchorOwner, AnchorPhase, Cleanup, FakeRecovery, Reconciled, SessionId, TurnNumber,
+        recovered_connection,
+    };
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
+        at_phase(
+            anchor_id,
+            session,
+            turn_running,
+            Some(AnchorPhase::ArmIntent),
+        )
+    }
+
+    fn at_phase(
+        anchor_id: &str,
+        session: &SessionId,
+        turn_running: bool,
+        phase: Option<AnchorPhase>,
+    ) -> AnchorOwner {
         AnchorOwner {
             anchor_id: anchor_id.to_owned(),
             session_id: session.clone(),
             turn: TurnNumber::try_from(1).expect("turn"),
             turn_running,
-            phase: Some(via_store::AnchorPhase::ArmIntent),
+            phase,
         }
     }
 
@@ -582,5 +682,61 @@ mod tests {
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
         assert_eq!(reconciled.cleanup(&other, turn), (true, false));
         assert_eq!(reconciled.turns.len(), 2);
+    }
+
+    /// Design §9: only a committed anchor at `arm_intent` (or one whose phase
+    /// is unreadable) marks a recovered turn's raw log incomplete; a pre-ARM
+    /// anchor, no anchor, or an armed anchor of an ended turn does not.
+    #[test]
+    fn raw_incompleteness_follows_the_armed_anchor_phase() {
+        let session =
+            |n: u8| SessionId::try_from(format!("s_00000000000{n}").as_str()).expect("session");
+        let turn = TurnNumber::try_from(1).expect("turn");
+        let mut reconciled = Reconciled::default();
+        let owners = [
+            at_phase("a", &session(1), true, Some(AnchorPhase::ArmIntent)),
+            at_phase("b", &session(2), true, Some(AnchorPhase::Identified)),
+            at_phase("c", &session(3), true, Some(AnchorPhase::Intent)),
+            at_phase("d", &session(4), true, None),
+            at_phase("e", &session(5), false, Some(AnchorPhase::ArmIntent)),
+            at_phase("f", &session(6), true, Some(AnchorPhase::Intent)),
+            at_phase("g", &session(6), true, Some(AnchorPhase::ArmIntent)),
+        ];
+        reconciled.add(&owners, &[]);
+        let marked: Vec<u8> = (1..=7)
+            .filter(|n| reconciled.raw_incomplete(&session(*n), turn))
+            .collect();
+        assert_eq!(marked, [1, 4, 6]);
+    }
+
+    /// An inventory the deadline cut short cannot show that an unread anchor
+    /// was never armed.
+    #[test]
+    fn an_incomplete_inventory_never_claims_a_complete_raw_log() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let turn = TurnNumber::try_from(1).expect("turn");
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[at_phase("a1", &session, true, Some(AnchorPhase::Intent))],
+            &[],
+        );
+        assert!(!reconciled.raw_incomplete(&session, turn));
+        reconciled.incomplete = true;
+        assert!(reconciled.raw_incomplete(&session, turn));
+    }
+
+    /// The recovered connection is the one the turn launched on: turn 1 keeps
+    /// the session's name, later turns add their number.
+    #[test]
+    fn the_recovered_connection_is_the_turns_own() {
+        let session = SessionId::try_from("s_0123456789ab").expect("session");
+        let name = |n: u32| {
+            recovered_connection(&session, TurnNumber::try_from(n).expect("turn"))
+                .expect("connection")
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(name(1), "c_0123456789ab");
+        assert_eq!(name(12), "c_0123456789abt12");
     }
 }
