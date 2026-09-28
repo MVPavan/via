@@ -221,7 +221,7 @@ fn build(
         for (turn, row) in queued {
             seq += 1;
             let (started, record, terminal, _) =
-                queued_cancellation(slot, session, turn, row, None);
+                queued_cancellation(slot, session, turn, (&row).into(), None);
             cancellations.push(ended_record(&started, record, terminal, seq).ok()?);
         }
     }

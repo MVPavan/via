@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use via_adapters::{RouteError, StoreFailure};
-use via_store::{StoreClient, StoreError, SubmitFailedRecord};
+use via_store::{QueuedTurn, StoreClient, StoreError, SubmitFailedRecord};
 
 use super::drive::Step;
 use super::journal::Head;
@@ -33,6 +33,15 @@ pub(super) const SUBMISSION_FAILED: &str = "the turn's submission could not be r
 pub(super) struct Queueing {
     pub(super) queued_at: String,
     pub(super) queued_seq: u64,
+}
+
+impl From<&QueuedTurn> for Queueing {
+    fn from(queued: &QueuedTurn) -> Self {
+        Self {
+            queued_at: queued.queued_at.clone(),
+            queued_seq: queued.queued_seq,
+        }
+    }
 }
 
 /// Why the resolution write did not commit.

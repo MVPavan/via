@@ -844,7 +844,7 @@ impl Engine {
             let queued = self.store.queued_turn(session, turn).await.ok().flatten()?;
             // Settle an unknown head now, so the commit below reads nothing.
             slot.head.lock(&self.store, session).await.ok()?;
-            Some(queued)
+            Some(Queueing::from(&queued))
         };
         let queued = tokio::select! {
             biased;
@@ -1473,10 +1473,7 @@ impl Engine {
         let Ok(Some(queued)) = journal.queued_turn(session, turn).await else {
             return Err(SubmitFailure::Unread);
         };
-        let queueing = || Queueing {
-            queued_at: queued.queued_at.clone(),
-            queued_seq: queued.queued_seq,
-        };
+        let queueing = || Queueing::from(&queued);
         // A frozen row Core cannot read fails the turn: nothing is sent.
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
             return Err(SubmitFailure::Corrupt(queueing()));
@@ -1731,7 +1728,7 @@ pub(super) fn queued_cancellation(
     slot: &Slot,
     session: &SessionId,
     turn: TurnNumber,
-    queued: QueuedTurn,
+    queued: Queueing,
     cause: Option<(CancelCause, String)>,
 ) -> (Started, TurnRecord, Terminal, TerminalExtras) {
     let started = Started {

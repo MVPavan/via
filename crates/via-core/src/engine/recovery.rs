@@ -10,23 +10,23 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use via_adapters::FakeRecovery;
 use via_store::{
-    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, TerminalExtras,
-    TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AnchorOwner, AnchorPhase, CancelCause, StoreError, TerminalRecord,
+    UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
 
-use super::drive::{Cancelled, Commit};
+use super::drive::{Cancelled, Commit, connection_id, queued_cancellation};
 use super::journal::Head;
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
-use super::{Accepted, Engine, Started, Terminal, TurnRecord, failure, journal};
+use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
 use crate::api::{
     Cancel, Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
 };
-use crate::{ApiError, Cleanup, ConnectionId, Deadline, RawRef, SessionId, TurnNumber};
+use crate::{ApiError, Cleanup, Deadline, RawRef, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
 const PAGE: u32 = 1000;
@@ -225,52 +225,13 @@ impl Engine {
         turn: TurnNumber,
         cause: Option<(CancelCause, String)>,
     ) -> Result<(), String> {
-        let History {
-            queued_at,
-            queued_seq,
-            ..
-        } = self
-            .history(session, turn)
+        let queueing = self
+            .queueing(session, turn)
             .await
             .map_err(|error| format!("store_error: {}", error.kind))?;
-        let started = Started {
-            session: session.clone(),
-            turn,
-            queued_at,
-            first_seq: queued_seq,
-            submitted: None,
-        };
-        let record = TurnRecord {
-            session: session.clone(),
-            turn,
-            head: std::sync::Arc::clone(&self.slot_for(session).head),
-            accepted: None,
-            spans: Vec::new(),
-            first_failure: None,
-            uncertain: None,
-        };
-        let terminal = Terminal {
-            state: "cancelled",
-            failure: None,
-            stop_reason: "interrupted",
-            vendor_stop_reason: None,
-            final_text: String::new(),
-            exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
-            warnings: Vec::new(),
-            // Design §3.2: a queued turn has no anchor intent.
-            cancel: cause.as_ref().map(|(_, requested_at)| Cancel {
-                outcome: "acknowledged",
-                cleanup: "quiescent",
-                requested_at: requested_at.clone(),
-                settled_at: rfc3339(SystemTime::now()),
-            }),
-        };
-        let extras = TerminalExtras {
-            cancel_cause: cause.map(|(cause, _)| cause),
-            raw_incomplete: None,
-        };
+        let slot = self.slot_for(session);
+        let (started, record, terminal, extras) =
+            queued_cancellation(&slot, session, turn, queueing, cause);
         match Self::commit_turn_ended_with(
             &self.store,
             &started,
@@ -295,19 +256,13 @@ impl Engine {
     /// `cancel: null`, in one `commit_submit_failed` transaction and without
     /// agent I/O. Any failure of the write fails startup (§7.2 row 13).
     async fn fail_corrupt_turn(&self, session: &SessionId, turn: TurnNumber) -> Result<(), String> {
-        let store_error = |error: ApiError| format!("store_error: {}", error.kind);
         // The row itself may be unreadable: its queueing comes from the
         // committed history instead.
-        let History {
-            queued_at,
-            queued_seq,
-            ..
-        } = self.history(session, turn).await.map_err(store_error)?;
+        let queueing = self
+            .queueing(session, turn)
+            .await
+            .map_err(|error| format!("store_error: {}", error.kind))?;
         let slot = self.slot_for(session);
-        let queueing = Queueing {
-            queued_at,
-            queued_seq,
-        };
         resolve::commit_submit_failed(
             &self.store,
             &slot.head,
@@ -317,6 +272,26 @@ impl Engine {
         )
         .await
         .map_err(|error| format!("store_error: {error}"))
+    }
+
+    /// The committed queueing of `turn` (its `turn.queued` time and
+    /// sequence), read from the session's history, for a row Store cannot
+    /// read (design §7.3): shared by the restart handoff and the live
+    /// dispatcher.
+    pub(super) async fn queueing(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Queueing, ApiError> {
+        let History {
+            queued_at,
+            queued_seq,
+            ..
+        } = self.history(session, turn).await?;
+        Ok(Queueing {
+            queued_at,
+            queued_seq,
+        })
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -527,7 +502,7 @@ impl Engine {
         let raw_incomplete = reconciled.raw_incomplete(&record.session, record.turn);
         if raw_incomplete && !raw_logged {
             let connection_id =
-                recovered_connection(&record.session, record.turn).map_err(|_| ApiError::STORE)?;
+                connection_id(&record.session, record.turn).map_err(|_| ApiError::STORE)?;
             self.commit_event(record, EventBody::RawLogIncomplete { connection_id }, None)
                 .await;
         }
@@ -641,23 +616,6 @@ impl Engine {
             raw_logged,
         })
     }
-}
-
-/// The turn's connection, named as `drive.rs`'s `connection_id` names it
-/// when it launches the turn: one private connection per turn, and turn 1
-/// keeps the session's own name. The copy exists because that helper is
-/// private to `drive.rs` (S4 owns only this file); `s1_f09_` checks the two
-/// agree.
-fn recovered_connection(
-    session: &SessionId,
-    turn: TurnNumber,
-) -> Result<ConnectionId, <ConnectionId as TryFrom<&str>>::Error> {
-    let suffix = session.as_str().trim_start_matches("s_");
-    let connection = match turn.get() {
-        1 => format!("c_{suffix}"),
-        n => format!("c_{suffix}t{n}"),
-    };
-    ConnectionId::try_from(connection.as_str())
 }
 
 /// A recovered turn's terminal: `unknown` with Core's restart class, the
@@ -828,7 +786,7 @@ impl Reconciled {
 mod tests {
     use super::{
         AnchorOwner, AnchorPhase, Cleanup, DurableSettlement, FakeRecovery, Reconciled, SessionId,
-        TurnNumber, recovered_connection,
+        TurnNumber, connection_id,
     };
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
@@ -980,7 +938,7 @@ mod tests {
     fn the_recovered_connection_is_the_turns_own() {
         let session = SessionId::try_from("s_0123456789ab").expect("session");
         let name = |n: u32| {
-            recovered_connection(&session, TurnNumber::try_from(n).expect("turn"))
+            connection_id(&session, TurnNumber::try_from(n).expect("turn"))
                 .expect("connection")
                 .as_str()
                 .to_owned()
