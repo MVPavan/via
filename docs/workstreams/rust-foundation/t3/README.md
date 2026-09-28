@@ -61,3 +61,8 @@ design round 3.
 Round 3 on `4531dd0`: `astra-review-design-r3.md` (UNSOUND, no blocker)
 and `fable-review-design-r3.md` (SOUND WITH CHANGES); decisions in
 `design-r4-decisions.md`.
+
+Round 4 on `1a814d6`: `astra-review-design-r4.md` (UNSOUND, no blocker)
+and `fable-review-design-r4.md` (SOUND WITH CHANGES, one blocker in S1's
+early-stop lifetime); decisions in `design-r5-decisions.md`, with 1–7 sent
+to S1 directly.
