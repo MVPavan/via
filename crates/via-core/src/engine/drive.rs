@@ -791,13 +791,14 @@ impl Engine {
     }
 
     /// `cancel_queued`'s reads: the turn's queueing, then the settled
-    /// session head. A failed read carries its Store error, if it has one.
+    /// session head; `None` when one fails. Store's read reply reports a
+    /// corrupt one (design §7.1).
     async fn cancel_reads(
         &self,
         slot: &Slot,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Queueing, Option<StoreError>> {
+    ) -> Option<Queueing> {
         #[cfg(test)]
         self.hold(&self.faults.hold_cancel_read).await;
         #[cfg(feature = "test-failpoints")]
@@ -805,7 +806,7 @@ impl Engine {
             .await
             .is_err()
         {
-            return Err(None);
+            return None;
         }
         #[cfg(test)]
         if self
@@ -816,21 +817,18 @@ impl Engine {
             })
             .is_ok()
         {
-            return Err(None);
+            return None;
         }
         let queued = match self.store.queued_turn(session, turn).await {
             Ok(Some(queued)) => Queueing::from(&queued),
             // Design §7.3 [s4.8]: a row Store cannot parse is cancelled
             // from its committed `turn.queued`, never submitted.
-            Err(StoreError::CorruptEvidence) => {
-                self.queueing(session, turn).await.map_err(|_| None)?
-            }
-            Ok(None) => return Err(None),
-            Err(error) => return Err(Some(error)),
+            Err(StoreError::CorruptEvidence) => self.queueing(session, turn).await.ok()?,
+            Ok(None) | Err(_) => return None,
         };
         // Settle an unknown head now, so the commit below reads nothing.
-        slot.head.lock(&self.store, session).await.map_err(Some)?;
-        Ok(queued)
+        slot.head.lock(&self.store, session).await.ok()?;
+        Some(queued)
     }
 
     /// Commits a never-submitted turn `queued → cancelled` (C1 §7.2), behind
@@ -859,7 +857,7 @@ impl Engine {
             queued = reads => queued,
             () = self.read_cutoff() => return Cancelled::Expired,
         };
-        let Ok(queued) = queued else {
+        let Some(queued) = queued else {
             if owner == Owner::Dispatcher {
                 // Design §7.3 [r1.13]: joined callers get `store_error`.
                 slot.read_failed(turn);

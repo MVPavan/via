@@ -209,6 +209,14 @@ impl Sandbox {
     /// Starts a daemon directly, with the failpoint controller, and waits
     /// until it answers; readiness never auto-starts another daemon.
     fn start(&self) -> TestResult<Daemon<'_>> {
+        let mut daemon = self.launch()?;
+        daemon.ready()?;
+        Ok(daemon)
+    }
+
+    /// Starts a daemon directly, with the failpoint controller, without
+    /// waiting for it to answer.
+    fn launch(&self) -> TestResult<Daemon<'_>> {
         let run = self.runs.get() + 1;
         self.runs.set(run);
         let trace = self.root.path().join(format!("daemon-{run}.trace"));
@@ -219,13 +227,11 @@ impl Sandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(&trace)?);
-        let mut daemon = Daemon {
+        Ok(Daemon {
             child: command.spawn()?,
             sandbox: self,
             trace,
-        };
-        daemon.ready()?;
-        Ok(daemon)
+        })
     }
 
     /// `daemon/status` over a direct connection: never auto-starts.
@@ -2029,6 +2035,42 @@ fn s1_f12_batch_corrupt_head_read_is_corrupt() -> TestResult {
          (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
     ))?;
     check(states == "running,queued", || format!("turns: {states}"))
+}
+
+/// T3-S5 round 3, decision 15 (design §6.1, §7.1): SQLite corruption on a
+/// startup recovery read (`store.read.corrupt.unfinished`) fails startup
+/// before anything is served. The daemon exits 4, its bound socket is
+/// unlinked, and `daemon.lock` and `store.lock` are both released; a
+/// later start without the fault serves.
+#[test]
+fn s1_f12_startup_recovery_corrupt_read_fails_startup() -> TestResult {
+    let point = "store.read.corrupt.unfinished";
+    let sandbox = Sandbox::new(&completes("first", 1))?;
+    sandbox.arm(point, 1, "fail_io")?;
+    let mut daemon = sandbox.launch()?;
+    sandbox.ack(&daemon, point, 1, "fail_io")?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let trace = daemon.trace();
+    check(
+        status.code() == Some(4) && trace.contains("store_error"),
+        || format!("startup did not fail with the Store failure ({status}): {trace}"),
+    )?;
+    let socket = sandbox.runtime.join("via.sock");
+    check(!socket.exists(), || {
+        format!("the failed startup left {}", socket.display())
+    })?;
+    for lock in [
+        sandbox.runtime.join("daemon.lock"),
+        sandbox.state.join("store.lock"),
+    ] {
+        let file = File::open(&lock)?;
+        check(file.try_lock().is_ok(), || {
+            format!("{} is still held", lock.display())
+        })?;
+    }
+    drop(daemon);
+    sandbox.disarm(point)?;
+    sandbox.start()?.stop_clean()
 }
 
 /// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the force
