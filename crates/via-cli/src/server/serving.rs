@@ -170,17 +170,7 @@ impl Main {
         accepted: std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
         client: &Client,
     ) {
-        let Ok((stream, _)) = accepted else {
-            // A failed accept drops that connection only; serving continues.
-            return;
-        };
-        match stream.peer_cred() {
-            Ok(peer) if peer.uid() == rustix::process::geteuid().as_raw() => {
-                self.clients.spawn(handle_client(stream, client.clone()));
-            }
-            // Another user's peer, or an unreadable credential: closed unserved.
-            Ok(_) | Err(_) => {}
-        }
+        admit(&mut self.clients, accepted, client);
     }
 
     /// Collects client tasks that already ended, so the idle predicate
@@ -247,6 +237,26 @@ impl Main {
             self.engine.request_stop(&plain_stop()).await,
             Ok(StopMode::Idle)
         )
+    }
+}
+
+/// Admits one accepted connection whose peer is this user into `clients`:
+/// daemon main's serving and final shutdown's diagnostic window (§7.4).
+pub(super) fn admit(
+    clients: &mut JoinSet<anyhow::Result<()>>,
+    accepted: std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
+    client: &Client,
+) {
+    let Ok((stream, _)) = accepted else {
+        // A failed accept drops that connection only; serving continues.
+        return;
+    };
+    match stream.peer_cred() {
+        Ok(peer) if peer.uid() == rustix::process::geteuid().as_raw() => {
+            clients.spawn(handle_client(stream, client.clone()));
+        }
+        // Another user's peer, or an unreadable credential: closed unserved.
+        Ok(_) | Err(_) => {}
     }
 }
 

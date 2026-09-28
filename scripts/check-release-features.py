@@ -90,6 +90,7 @@ POINTS = [
     # Task 3 S5 (design §7.2, §10): same-sequence retry seams.
     "core.retry.before",
     "core.head.contended",
+    "core.commit.before_send",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

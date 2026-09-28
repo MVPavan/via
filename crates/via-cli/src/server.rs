@@ -22,7 +22,7 @@ mod serving;
 mod shutdown;
 
 use serving::{IDLE_STOP_REQUESTS, IdleStop, Main};
-use shutdown::final_shutdown;
+use shutdown::{Window, final_shutdown};
 
 pub(crate) fn validate_dir(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -194,10 +194,22 @@ async fn serve_bound(
         failed: 0,
     };
     let exit = main.serve(&listener, &client).await;
-    drop(client);
-    drop(listener);
-    // Best effort: a stale socket refuses connections and the next daemon replaces it.
-    let _ = fs::remove_file(socket);
+    // Design §7.4: after a latch that preceded final shutdown, the listener
+    // keeps serving through the diagnostic window, which final shutdown
+    // closes. Otherwise serving ends here.
+    let window = if exit.entered && main.engine.failed_at().is_some() {
+        Some(Window {
+            listener,
+            client,
+            socket: socket.to_path_buf(),
+        })
+    } else {
+        drop(client);
+        drop(listener);
+        // Best effort: a stale socket refuses connections and the next daemon replaces it.
+        let _ = fs::remove_file(socket);
+        None
+    };
     let Main {
         engine,
         starts,
@@ -219,7 +231,7 @@ async fn serve_bound(
         closing,
         failed,
     };
-    Ok(final_shutdown(engine, joins, exit.mode).await)
+    Ok(final_shutdown(engine, joins, exit.mode, window).await)
 }
 
 /// Opens the Engine off the Tokio workers and commits crash recovery before

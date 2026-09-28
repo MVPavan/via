@@ -1236,8 +1236,9 @@ fn s1_f12_terminal_retry_once() -> TestResult {
 
 /// Design §7.2 escalation: with `store.commit.fail_persistent` armed at a
 /// turn event, the event is not committed and the resolution write fails
-/// too, so the daemon latches and exits 4. The same for a natural terminal
-/// whose one retry fails.
+/// too, so the daemon latches: `health: store_failed`, `store_failure`
+/// scope `daemon`, and exit 4. The same for a natural terminal whose one
+/// retry fails.
 #[test]
 fn s1_f12_escalation_latches() -> TestResult {
     for at_terminal in [false, true] {
@@ -1273,6 +1274,17 @@ fn s1_f12_escalation_latches() -> TestResult {
             sandbox.release("accepted")?;
         }
         sandbox.ack(&daemon, "store.commit.fail_persistent", next + 1, "fail_io")?;
+        // Design §7.5, served in the diagnostic window (§7.4).
+        wait_until("the latch", Duration::from_secs(5), || {
+            sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+        })?;
+        let failure = store_failure(&sandbox)?;
+        check(
+            failure["scope"] == "daemon" && failure["kind"] == "commit_failed",
+            || format!("at_terminal {at_terminal}: {failure}"),
+        )?;
         daemon.latched_exit()?;
         let state: String = sandbox.query(&format!(
             "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
@@ -1904,5 +1916,281 @@ fn s1_f12_sqlite_corruption_latches() -> TestResult {
     daemon.latched_exit()?;
     check(sandbox.anchors(&session, 1)? == 0, || {
         "turn 1 launched after the corruption".to_owned()
+    })
+}
+
+// -------------------------------------------------------- latch path (§7.4)
+
+/// Slack for the harness's own polling and process exit when it checks a
+/// daemon bound against its own clock.
+const SLACK: Duration = Duration::from_millis(500);
+
+/// The vendor pid the fake reported (`report_pids`).
+fn vendor_pid(sandbox: &Sandbox) -> TestResult<u32> {
+    sandbox.await_file("agent.pid")?;
+    Ok(fs::read_to_string(sandbox.sync.join("agent.pid"))?
+        .trim()
+        .parse()?)
+}
+
+/// A turn that reports its pids, is accepted and holds at gate `prompt`.
+fn reported(prompt: &str) -> Value {
+    script(
+        prompt,
+        1,
+        vec![
+            json!({"action":"report_pids"}),
+            accepted(1),
+            gate(prompt),
+            text("observed"),
+            terminal(1),
+        ],
+    )
+}
+
+/// Design §7.4 [O1.D5, r3.17]: a latch (a receipt whose reply is lost,
+/// `store.commit.reply_lost`) keeps the daemon serving through the diagnostic
+/// window: `daemon/status` reports `store_failed` with scope `daemon`, a
+/// mutation gets `store_error` and `daemon/stop` `{"stopping": true}`. The
+/// running group is gone within 3 s of the latch (Host's early stop). New
+/// connections are refused from `failed_at + 5 s`, and the daemon exits 4
+/// by `failed_at + 10 s`. The latch lies between `before` and `after`,
+/// the harness's clock readings around the failing request.
+#[test]
+fn s1_f12_latch_window_bound_and_host_stop() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[reported("other"), completes("lost", 1)]))?;
+    sandbox.count("store.commit.reply_lost")?;
+    let mut daemon = sandbox.start()?;
+    let (other, _) = sandbox.spawn("other")?;
+    sandbox.await_file("other.entered")?;
+    sandbox.await_accepted(&other, 1)?;
+    // The Store's one worker serves this read after the acceptance commit,
+    // whose reply (and its hit) precedes it: the count below is settled.
+    sandbox.events(&other)?;
+    let vendor = vendor_pid(&sandbox)?;
+    let next = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", next, "fail_io")?;
+    let before = Instant::now();
+    sandbox.refused(&spawn_args("lost", &[]), "store_error")?;
+    let after = Instant::now();
+    sandbox.ack(&daemon, "store.commit.reply_lost", next, "fail_io")?;
+    // Inside the window: reads are served, mutations refused.
+    let status = sandbox.status()?;
+    check(
+        status["health"] == "store_failed"
+            && status["store_failure"]["scope"] == "daemon"
+            && status["store_failure"]["kind"] == "commit_uncertain",
+        || format!("the window's status: {status}"),
+    )?;
+    sandbox.refused(&spawn_args("late", &[]), "store_error")?;
+    let stop = sandbox.ok(&["daemon", "stop", "--json"])?;
+    check(stop["stopping"] == true, || format!("daemon/stop: {stop}"))?;
+    // Host's early stop: the running group is gone within 3 s.
+    let stopped_by = after + Duration::from_secs(3) + SLACK;
+    wait_until(
+        "the running group is gone",
+        stopped_by.saturating_duration_since(Instant::now()),
+        || !process_live(vendor),
+    )?;
+    // The window ends at failed_at + 5 s: new connections are refused.
+    let socket = sandbox.runtime.join("via.sock");
+    wait_until("the window closes", Duration::from_secs(10), || {
+        UnixStream::connect(&socket).is_err()
+    })?;
+    let closed = Instant::now();
+    check(
+        closed >= before + Duration::from_secs(5)
+            && closed <= after + Duration::from_secs(5) + SLACK,
+        || {
+            format!(
+                "the window closed {:?} after the latch request",
+                closed - before
+            )
+        },
+    )?;
+    let status = daemon.exit(Duration::from_secs(10))?;
+    let exited = Instant::now();
+    check(
+        status.code() == Some(4) && exited <= after + Duration::from_secs(10) + SLACK,
+        || {
+            format!(
+                "exit {status} {:?} after the latch request",
+                exited - before
+            )
+        },
+    )?;
+    let summary = daemon.summary()?;
+    check(summary["store_failed"] == true, || {
+        format!("summary: {summary}")
+    })?;
+    let state: String = sandbox.query(&format!(
+        "SELECT state FROM turns WHERE session_id='{other}' AND number=1"
+    ))?;
+    check(state == "cancelled", || {
+        format!("the running turn ended {state}")
+    })?;
+    sandbox.verify_anchors()
+}
+
+/// Design §7.4 [O1.D13]: after the latch, `cancel` (of a running and of a
+/// queued turn) and `close` return `store_error`, served in the window,
+/// and the latch's force stop performs the cleanup: the running turn ends
+/// by the force row and its group is proved absent. After the latch the
+/// force path writes no queued cancellation, so the queued turn stays
+/// `queued`, never submitted, for the restart handoff (§7.4).
+#[test]
+fn s1_f12_latch_cancel_and_close_return_store_error() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[held("other", 1), completes("lost", 1)]))?;
+    sandbox.count("store.commit.reply_lost")?;
+    let daemon = sandbox.start()?;
+    let (other, handle) = sandbox.spawn("other")?;
+    sandbox.await_file("other.entered")?;
+    sandbox.await_accepted(&other, 1)?;
+    sandbox.resume(&other, &handle, "queued")?;
+    let next = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", next, "fail_io")?;
+    sandbox.refused(&spawn_args("lost", &[]), "store_error")?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", next, "fail_io")?;
+    for turn in ["1", "2"] {
+        sandbox.refused(
+            &[
+                "cancel", &other, "--turn", turn, "--handle", &handle, "--json",
+            ],
+            "store_error",
+        )?;
+    }
+    sandbox.refused(
+        &["close", &other, "--handle", &handle, "--json"],
+        "store_error",
+    )?;
+    daemon.latched_exit()?;
+    let states: String = sandbox.query(&format!(
+        "SELECT group_concat(state, ',') FROM
+         (SELECT state FROM turns WHERE session_id='{other}' ORDER BY number)"
+    ))?;
+    check(states == "cancelled,queued", || {
+        format!("the force stop left {states}")
+    })?;
+    let submitted: i64 = sandbox.query(&format!(
+        "SELECT count(*) FROM turns WHERE session_id='{other}' AND number=2
+         AND submitted_at IS NOT NULL"
+    ))?;
+    check(submitted == 0, || {
+        "the queued turn was submitted".to_owned()
+    })
+}
+
+/// Design §7.4 [O1.D4]: an uncertain event (`store.commit.reply_lost`) on a
+/// turn with queued successors latches; final shutdown's batch commits the
+/// turn `failed(store)` and cancels the queued turns (`cancel: null`) in
+/// one transaction: `failure_batches: {committed: 1, skipped: 0}`. With
+/// every later commit failing (`store.commit.fail_persistent`), the batch
+/// is skipped and nothing retries it: `skipped: 1`, the turns keep their
+/// states. (Characterization of the batch built in 5c4eef9.)
+#[test]
+fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
+    for skipped in [false, true] {
+        let sandbox = Sandbox::new(&script(
+            "first",
+            1,
+            vec![
+                accepted(1),
+                gate("accepted"),
+                text("lost"),
+                gate("first"),
+                terminal(1),
+            ],
+        ))?;
+        sandbox.count("store.commit.reply_lost")?;
+        sandbox.count("store.commit.fail_persistent")?;
+        let daemon = sandbox.start()?;
+        let (session, handle) = sandbox.spawn("first")?;
+        sandbox.await_file("accepted.entered")?;
+        sandbox.await_accepted(&session, 1)?;
+        sandbox.resume(&session, &handle, "second")?;
+        sandbox.resume(&session, &handle, "third")?;
+        let lost = sandbox.next_hit("store.commit.reply_lost")?;
+        sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+        if skipped {
+            // The event itself commits; every later commit fails.
+            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
+            sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
+        }
+        sandbox.release("accepted")?;
+        sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+        let summary = daemon.latched_exit()?;
+        let expected = json!({"committed": u8::from(!skipped), "skipped": u8::from(skipped)});
+        check(summary["failure_batches"] == expected, || {
+            format!("skipped {skipped}: {summary}")
+        })?;
+        let states: String = sandbox.query(&format!(
+            "SELECT group_concat(state, ',') FROM
+             (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
+        ))?;
+        let want = if skipped {
+            "running,queued,queued"
+        } else {
+            "failed,cancelled,cancelled"
+        };
+        check(states == want, || format!("skipped {skipped}: {states}"))?;
+        if !skipped {
+            let envelope: String = sandbox.query(&format!(
+                "SELECT envelope FROM turns WHERE session_id='{session}' AND number=1"
+            ))?;
+            let envelope: Value = serde_json::from_str(&envelope)?;
+            check(envelope["failure"]["class"] == "store", || {
+                format!("turn 1: {envelope}")
+            })?;
+            let cancels: i64 = sandbox.query(&format!(
+                "SELECT count(*) FROM turns WHERE session_id='{session}' AND number>1
+                 AND json_extract(envelope,'$.cancel') IS NULL"
+            ))?;
+            check(cancels == 2, || {
+                "a batch cancellation has a cancel".to_owned()
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Design §6.8, §7.4 [r4.3, r5.7]: Host's early stop is independent of
+/// Core, the dispatchers and Store. Turn B's dispatcher is parked at
+/// `core.commit.before_send` before sending its observation commit, so the
+/// writer stays free; the daemon latches through turn A's receipt, whose
+/// reply is lost (`store.commit.reply_lost`). Before B is released,
+/// `host.early_stop.sent` is acknowledged for B's group (the only live
+/// one) and the group is gone. After release B ends by the force row, and
+/// the exit is 4.
+#[test]
+fn s1_f12_host_early_stop_independent_of_store() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[reported("b"), completes("a", 1)]))?;
+    sandbox.count("core.commit.before_send")?;
+    sandbox.count("store.commit.reply_lost")?;
+    let daemon = sandbox.start()?;
+    let (b, _) = sandbox.spawn("b")?;
+    sandbox.await_file("b.entered")?;
+    sandbox.await_accepted(&b, 1)?;
+    let vendor = vendor_pid(&sandbox)?;
+    let send = sandbox.next_hit("core.commit.before_send")?;
+    sandbox.arm("core.commit.before_send", send, "pause")?;
+    sandbox.release("b")?;
+    sandbox.ack(&daemon, "core.commit.before_send", send, "pause")?;
+    sandbox.arm("host.early_stop.sent", 1, "fail_io")?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    sandbox.refused(&spawn_args("a", &[]), "store_error")?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    sandbox.ack(&daemon, "host.early_stop.sent", 1, "fail_io")?;
+    wait_until("B's group is gone", Duration::from_secs(3), || {
+        !process_live(vendor)
+    })?;
+    sandbox.resume_point("core.commit.before_send", send)?;
+    daemon.latched_exit()?;
+    let envelope: String = sandbox.query(&format!(
+        "SELECT envelope FROM turns WHERE session_id='{b}' AND number=1"
+    ))?;
+    let envelope: Value = serde_json::from_str(&envelope)?;
+    check(envelope["cancel"]["outcome"] == "forced", || {
+        format!("B did not end by the force row: {envelope}")
     })
 }

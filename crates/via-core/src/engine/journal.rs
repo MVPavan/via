@@ -401,6 +401,10 @@ pub(super) async fn commit_event_at(
         record.first_failure = failed(WriteOutcome::NotCommitted);
         return;
     };
+    // Test builds: the event is about to be sent to the Store writer, which
+    // stays free while this pauses (design §10 [r5.7]).
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_store::failpoint::hit_async("core.commit.before_send").await;
     let committed = journal
         .commit_event(EventRecord {
             session_id: record.session.clone(),
