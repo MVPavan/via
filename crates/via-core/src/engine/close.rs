@@ -241,7 +241,7 @@ impl Engine {
         // wait for request-owned cancellations. Step 3: a running turn is
         // inline, so none runs here.
         loop {
-            if *force.borrow() {
+            if force.borrow().is_some() {
                 return Some(Step::Next);
             }
             match slot.sweep(Some(&cause)) {
@@ -249,7 +249,7 @@ impl Engine {
                 Sweep::Wait => {
                     tokio::select! {
                         () = slot.woken() => {}
-                        _ = force.wait_for(|forced| *forced) => {}
+                        _ = force.wait_for(Option::is_some) => {}
                     }
                 }
                 Sweep::Cancel(turn, cause) => {
@@ -274,7 +274,7 @@ impl Engine {
             .min(tokio::time::Instant::now() + CLOSE_ALLOWANCE);
         tokio::select! {
             biased;
-            _ = force.wait_for(|forced| *forced) => return Some(Step::Next),
+            _ = force.wait_for(Option::is_some) => return Some(Step::Next),
             // The hook has recorded a failed proof write, and `Closed`
             // derives its cleanup from the durable proofs.
             _ = self.absence_check(session, bound) => {}

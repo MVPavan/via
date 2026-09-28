@@ -2815,3 +2815,55 @@ fn s1_f12_host_early_stop_independent_of_store() -> TestResult {
         format!("B did not end by the force row: {envelope}")
     })
 }
+
+/// A turn that is accepted, emits its terminal and exits 1. Host records a
+/// failing exit, which Route would report as the vendor's own.
+fn exits_failing(prompt: &str) -> Value {
+    script(
+        prompt,
+        1,
+        vec![
+            accepted(1),
+            text("observed"),
+            terminal(1),
+            json!({"action":"exit","code":1}),
+        ],
+    )
+}
+
+/// Design §6.8 pipeline step 5 [S3]: a vendor exit Route observes under the
+/// daemon force is the force row (`ForceStopped`), never `process_exited`.
+/// With Host's early stop wired the vendor's end may come from the force
+/// itself, and Route may consume the recorded exit after the force is set.
+/// This is the window behind the intermittent failure of
+/// `s1_f12_host_early_stop_independent_of_store`, made deterministic: Wire is
+/// paused at `wire.exit.observed`, the exit recorded and not yet returned to
+/// Route, while the force is raised. The receipt of `daemon stop --force` is
+/// sent after the force is set, so Route reads it once released. B then ends
+/// by Core's forced terminal: no failure and no exit, a settled cancel. The
+/// vendor is gone before the force, so Host's early stop finds nothing live
+/// and the outcome is `requested`, not `forced`; the F12 test pins `forced`.
+#[test]
+fn s1_f12_exit_observed_under_force_is_the_force_row() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[exits_failing("b")]))?;
+    sandbox.count("wire.exit.observed")?;
+    let mut daemon = sandbox.start()?;
+    let observed = sandbox.next_hit("wire.exit.observed")?;
+    sandbox.arm("wire.exit.observed", observed, "pause")?;
+    let (b, _) = sandbox.spawn("b")?;
+    sandbox.ack(&daemon, "wire.exit.observed", observed, "pause")?;
+    let stop = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+    check(stop["stopping"] == true, || format!("force stop: {stop}"))?;
+    sandbox.resume_point("wire.exit.observed", observed)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let envelope: String = sandbox.query(&format!(
+        "SELECT envelope FROM turns WHERE session_id='{b}' AND number=1"
+    ))?;
+    let envelope: Value = serde_json::from_str(&envelope)?;
+    check(
+        envelope["failure"].is_null()
+            && envelope["exit"].is_null()
+            && envelope["cancel"]["settled_at"].is_string(),
+        || format!("B did not end by the force row (daemon {status}): {envelope}"),
+    )
+}

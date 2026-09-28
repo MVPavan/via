@@ -69,7 +69,7 @@ impl Engine {
         loop {
             tokio::select! {
                 biased;
-                _ = force.wait_for(|forced| *forced) => return,
+                _ = force.wait_for(Option::is_some) => return,
                 _ = entered.wait_for(|entered| *entered) => return,
                 // A closed generation disables this arm; the timer goes on.
                 Ok(()) = added.changed() => {

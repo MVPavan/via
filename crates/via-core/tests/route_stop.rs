@@ -162,7 +162,7 @@ impl Child {
     ) -> Outcome {
         let (sender, mut receiver) = mpsc::channel(4);
         let deadline = Deadline::at(tokio::time::Instant::now() + turn);
-        let (_force, force) = watch::channel(false);
+        let (_force, force) = watch::channel(None);
         let (order, orders) = stop;
         self.runtime.block_on(async {
             let execute = self.adapter.execute(

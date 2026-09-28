@@ -656,7 +656,7 @@ fn early_stop_stops_live_groups_on_the_force_signal() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("host.early_stop.sent", "fail_io");
         let acquired = host
@@ -665,7 +665,7 @@ fn early_stop_stops_live_groups_on_the_force_signal() {
             .unwrap();
         let pgid = acquired.control.identity().pgid;
         assert_eq!(host.pending_cleanup(), 1);
-        force.send_replace(true);
+        force.send_replace(Some(tokio::time::Instant::now()));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.sent"))
@@ -700,7 +700,7 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("store.journal.anchor_intent", "pause");
         fixture.arm("host.early_stop.snapshot", "fail_io");
@@ -722,7 +722,7 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
                 .acked("store.journal.anchor_intent"))
             .await
         );
-        force.send_replace(true);
+        force.send_replace(Some(tokio::time::Instant::now()));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -749,12 +749,14 @@ fn a_control_registered_after_the_early_stop_snapshot_is_stopped_at_once() {
 /// held acquisition's next step, so that a fresh 3 s cleanup would outlast
 /// the early stop's deadline. It only creates elapsed time; every ordering
 /// is witnessed by an acknowledgement.
-const LATE_STEP: Duration = Duration::from_millis(1_500);
+const LATE_STEP: Duration = Duration::from_millis(2_000);
 
 /// The early stop's deadline is the force signal plus 3 s (design §6.8).
-/// This margin covers scheduling only; a fresh 3 s would exceed it by
-/// `LATE_STEP`.
-const EARLY_STOP_BOUND: Duration = Duration::from_millis(3_500);
+/// A second of margin over it covers scheduling only; a fresh 3 s from
+/// `LATE_STEP` after the force would exceed the bound by a second too. The
+/// deadline value itself is asserted without a clock in `host.rs`'s unit
+/// tests.
+const EARLY_STOP_BOUND: Duration = Duration::from_millis(4_000);
 
 /// S1 round-2 decision 8: a control registered after the early stop's
 /// snapshot is dropped (EOF), and its cleanup runs under the early stop's
@@ -767,7 +769,7 @@ fn a_late_registered_control_is_cleaned_up_under_the_early_stop_deadline() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("store.journal.anchor_intent", "pause");
         fixture.arm("host.early_stop.snapshot", "fail_io");
@@ -789,7 +791,7 @@ fn a_late_registered_control_is_cleaned_up_under_the_early_stop_deadline() {
             .await
         );
         let forced_at = tokio::time::Instant::now();
-        force.send_replace(true);
+        force.send_replace(Some(forced_at));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -815,6 +817,73 @@ fn a_late_registered_control_is_cleaned_up_under_the_early_stop_deadline() {
     });
 }
 
+/// Design §6.8, Sol review of Task 3: the early stop's deadline is the
+/// instant the force was raised plus 3 s, never a fresh 3 s from when Host's
+/// task runs. The force instant is `LATE_STEP` older than the moment the task
+/// sees it, as if the task had been delayed that long; a control registered
+/// after its snapshot is cleaned up under the force's deadline, so its
+/// failure returns within the bound measured from the force instant. The
+/// anchor holds its EOF exit, so the cleanup runs to that deadline.
+///
+/// The acquisition is held at `store.journal.anchor_intent`, before its
+/// anchor exists, so it registers after the snapshot; the identified commit,
+/// which follows registration and precedes the ARM gate, is never reached,
+/// which witnesses that registration, not the gate, took the deadline
+/// (Sol review round 2, D5-4). The deadline value itself is asserted
+/// without a clock by the ledger unit tests in `host.rs`.
+#[test]
+fn a_force_older_than_the_early_stop_task_bounds_a_late_registered_cleanup() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(None);
+        host.watch_force(signal);
+        fixture.arm("store.journal.anchor_intent", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                host.acquire_retaining(spec, within(10), &LaunchPipes::default(), &never())
+                    .await
+                    .err()
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("store.journal.anchor_intent"))
+            .await
+        );
+        let forced_at = tokio::time::Instant::now() - LATE_STEP;
+        force.send_replace(Some(forced_at));
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        fixture.release("store.journal.anchor_intent");
+        let failure = acquiring.await.unwrap().unwrap();
+        let elapsed = forced_at.elapsed();
+        assert!(fixture.acked("host.anchor.before_eof_cleanup"));
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < EARLY_STOP_BOUND,
+            "cleanup returned {elapsed:?} after the force instant"
+        );
+        assert!(
+            !fixture.acked("store.journal.identified"),
+            "the acquisition passed registration"
+        );
+    });
+}
+
 /// S1 round-3 decision 11: the caller's stop check (here the daemon force
 /// signal, as Route's gate reads it) is set together with the ledger's
 /// `stopping`. The caller's check refuses ARM first, and the cleanup still
@@ -826,7 +895,7 @@ fn a_caller_stop_under_the_early_stop_keeps_its_deadline() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         let caller = signal.clone();
         host.watch_force(signal);
         fixture.arm("host.anchor.after_arm_intent_commit", "pause");
@@ -837,7 +906,7 @@ fn a_caller_stop_under_the_early_stop_keeps_its_deadline() {
             let spec = fixture.spec("/bin/cat", &[]);
             async move {
                 let launch = LaunchPipes::default();
-                let stopped = move || *caller.borrow();
+                let stopped = move || caller.borrow().is_some();
                 let failure = host
                     .acquire_retaining(spec, within(10), &launch, &stopped)
                     .await
@@ -851,7 +920,7 @@ fn a_caller_stop_under_the_early_stop_keeps_its_deadline() {
             .await
         );
         let forced_at = tokio::time::Instant::now();
-        force.send_replace(true);
+        force.send_replace(Some(forced_at));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -887,7 +956,7 @@ fn an_owner_stop_after_the_snapshot_keeps_the_early_stop_deadline() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("host.anchor.arm_received", "pause");
         fixture.arm("host.early_stop.snapshot", "fail_io");
@@ -910,7 +979,7 @@ fn an_owner_stop_after_the_snapshot_keeps_the_early_stop_deadline() {
             .await
         );
         let forced_at = tokio::time::Instant::now();
-        force.send_replace(true);
+        force.send_replace(Some(forced_at));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -946,13 +1015,273 @@ fn an_owner_stop_after_the_snapshot_keeps_the_early_stop_deadline() {
     });
 }
 
+/// Sol review of Task 3 round 2, D5-2: the early-stop task is woken by the
+/// force but held at `host.early_stop.woken`, so it has taken no snapshot
+/// and set no `stopping`, as when a blocked runtime delays it. A control
+/// that registers now reads the force in its own ledger section and is
+/// stopped at once: the identified commit, after registration, is never
+/// reached.
+#[test]
+fn a_control_registering_before_the_delayed_early_stop_task_runs_is_stopped_at_once() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(None);
+        host.watch_force(signal);
+        fixture.arm("host.early_stop.woken", "pause");
+        fixture.arm("store.journal.anchor_intent", "pause");
+        fixture.arm("store.journal.identified", "fail_io");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(6), &launch, &never())
+                    .await
+                    .err();
+                (failure, launch.take().is_some())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("store.journal.anchor_intent"))
+            .await
+        );
+        force.send_replace(Some(tokio::time::Instant::now()));
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.woken"))
+            .await
+        );
+        fixture.release("store.journal.anchor_intent");
+        let (failure, launched) = acquiring.await.unwrap();
+        let failure = failure.expect("registration refused the launch");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(!launched);
+        assert!(
+            !fixture.acked("store.journal.identified"),
+            "the acquisition passed registration"
+        );
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{failure:?}"
+        );
+        fixture.release("host.early_stop.woken");
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!(report.pending_tasks, 0, "{report:?}");
+    });
+}
+
+/// Sol review of Task 3 round 2, D5-2: the same delayed task, and the
+/// acquisition is held after its ARM intent committed, before the ARM gate.
+/// The force is raised while it waits. The gate reads the force in its own
+/// ledger section and refuses, though the task has set no `stopping`: the
+/// anchor never receives ARM, and no `Stop` frame goes to a pre-ARM anchor.
+#[test]
+fn the_arm_gate_refuses_after_the_force_though_the_early_stop_task_is_delayed() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(None);
+        host.watch_force(signal);
+        fixture.arm("host.early_stop.woken", "pause");
+        fixture.arm("host.anchor.after_arm_intent_commit", "pause");
+        fixture.arm("host.anchor.arm_received", "pause");
+        fixture.arm("host.anchor.stop_received", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(6), &launch, &never())
+                    .await
+                    .err();
+                (failure, launch.take().is_some())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.after_arm_intent_commit"))
+            .await
+        );
+        force.send_replace(Some(tokio::time::Instant::now()));
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.woken"))
+            .await
+        );
+        fixture.release("host.anchor.after_arm_intent_commit");
+        let (failure, launched) = acquiring.await.unwrap();
+        let failure = failure.expect("the ARM gate refused the launch");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(!launched, "ARM was sent: the pipes are Host's");
+        assert!(!fixture.acked("host.anchor.arm_received"), "ARM was sent");
+        assert!(
+            !fixture.acked("host.anchor.stop_received"),
+            "a pre-ARM anchor received Stop"
+        );
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{failure:?}"
+        );
+        fixture.release("host.early_stop.woken");
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!(report.pending_tasks, 0, "{report:?}");
+    });
+}
+
+/// Sol review of Task 3 round 2, D5-2, the `Spawned` path with a delayed
+/// task: the force is raised while ARM is in flight (the anchor holds ARM at
+/// `host.anchor.arm_received`) and the task is held at
+/// `host.early_stop.woken`, so no `stopping` is set when the vendor spawns.
+/// The owner's `Armed` marking reads the force, and the owner sends `Stop`
+/// itself: the vendor is stopped live, its forced evidence is kept, and
+/// absence is proved.
+#[test]
+fn a_vendor_spawned_under_a_delayed_early_stop_task_is_stopped_by_its_owner() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(None);
+        host.watch_force(signal);
+        fixture.arm("host.early_stop.woken", "pause");
+        fixture.arm("host.anchor.arm_received", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(10), &launch, &never())
+                    .await
+                    .err();
+                (failure, launch.take())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.arm_received"))
+            .await
+        );
+        force.send_replace(Some(tokio::time::Instant::now()));
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.woken"))
+            .await
+        );
+        fixture.release("host.anchor.arm_received");
+        let (failure, pipes) = acquiring.await.unwrap();
+        let failure = failure.expect("the owner stopped the spawned vendor");
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(failure.forced, "the anchor stopped a live vendor");
+        assert!(pipes.is_some(), "ARM was sent: the pipes are ours");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{failure:?}"
+        );
+        fixture.release("host.early_stop.woken");
+        drop(pipes);
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!(report.pending_tasks, 0, "{report:?}");
+    });
+}
+
+/// Sol review of Task 3 round 2, D5-3: the force is 10 s old, so the
+/// deadline passed 7 s ago before the owner's `Armed` marking saw it. The
+/// owner still writes its one `Stop` (the anchor acknowledges receiving it
+/// at `host.anchor.stop_received` and holds its reply), waits for no reply
+/// past the deadline, and so records no forced evidence. Cleanup is
+/// unproven at the passed deadline, `Uncertain`, and step 4's proof follows
+/// once the anchor's cleanup runs.
+#[test]
+fn a_stop_after_its_deadline_is_still_sent_and_leaves_absence_to_reconciliation() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let (force, signal) = tokio::sync::watch::channel(None);
+        host.watch_force(signal);
+        fixture.arm("host.anchor.arm_received", "pause");
+        fixture.arm("host.early_stop.snapshot", "fail_io");
+        fixture.arm("host.anchor.stop_received", "pause");
+        let acquiring = tokio::spawn({
+            let host = host.clone();
+            let spec = fixture.spec("/bin/cat", &[]);
+            async move {
+                let launch = LaunchPipes::default();
+                let failure = host
+                    .acquire_retaining(spec, within(10), &launch, &never())
+                    .await
+                    .err();
+                (failure, launch.take())
+            }
+        });
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.arm_received"))
+            .await
+        );
+        force.send_replace(Some(tokio::time::Instant::now() - Duration::from_secs(10)));
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.early_stop.snapshot"))
+            .await
+        );
+        fixture.release("host.anchor.arm_received");
+        let (failure, pipes) = acquiring.await.unwrap();
+        let failure = failure.expect("the owner stopped the spawned vendor");
+        assert!(
+            eventually(Duration::from_secs(3), || fixture
+                .acked("host.anchor.stop_received"))
+            .await,
+            "no Stop was sent past the deadline"
+        );
+        assert!(matches!(failure.error, HostError::Stopped), "{failure:?}");
+        assert!(!failure.forced, "forced evidence without a reply");
+        assert!(pipes.is_some(), "ARM was sent: the pipes are ours");
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        fixture.release("host.anchor.stop_received");
+        drop(pipes);
+        let recovered = eventually_recovered(&host).await;
+        assert!(
+            matches!(recovered, Some(CleanupEvidence::GroupAbsent(_))),
+            "{recovered:?}"
+        );
+    });
+}
+
+/// Step 4's proof for the single group a test left: recovery is retried
+/// until the anchor's own cleanup has run.
+async fn eventually_recovered(host: &Host) -> Option<CleanupEvidence> {
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = host
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(3))
+            .await
+            .unwrap();
+        if let Some(recovered) = page.into_iter().next()
+            && matches!(recovered.cleanup, CleanupEvidence::GroupAbsent(_))
+        {
+            return Some(recovered.cleanup);
+        }
+        if tokio::time::Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Design §6.8: an untriggered early-stop task never holds up shutdown.
 #[test]
 fn an_untriggered_early_stop_task_is_joined_by_shutdown() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (_force, signal) = tokio::sync::watch::channel(false);
+        let (_force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         // Design §6.8 [r6.2]: the task itself is not pending cleanup.
         assert_eq!(host.pending_cleanup(), 0);
@@ -1003,7 +1332,7 @@ fn arm_completing_after_the_snapshot_is_stopped_by_its_owner() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("host.anchor.arm_received", "pause");
         fixture.arm("host.early_stop.snapshot", "pause");
@@ -1025,7 +1354,7 @@ fn arm_completing_after_the_snapshot_is_stopped_by_its_owner() {
                 .acked("host.anchor.arm_received"))
             .await
         );
-        force.send_replace(true);
+        force.send_replace(Some(tokio::time::Instant::now()));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -1053,7 +1382,7 @@ fn a_pre_arm_acquisition_is_refused_at_the_gate_without_a_stop_frame() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         fixture.arm("host.anchor.after_arm_intent_commit", "pause");
         fixture.arm("host.early_stop.snapshot", "fail_io");
@@ -1075,7 +1404,7 @@ fn a_pre_arm_acquisition_is_refused_at_the_gate_without_a_stop_frame() {
                 .acked("host.anchor.after_arm_intent_commit"))
             .await
         );
-        force.send_replace(true);
+        force.send_replace(Some(tokio::time::Instant::now()));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.snapshot"))
@@ -1153,7 +1482,7 @@ fn early_stops_are_concurrent() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let (force, signal) = tokio::sync::watch::channel(false);
+        let (force, signal) = tokio::sync::watch::channel(None);
         host.watch_force(signal);
         let busy = host
             .acquire(fixture.spec("/bin/cat", &[]), within(4))
@@ -1180,7 +1509,7 @@ fn early_stops_are_concurrent() {
         );
         // Only the held anchor pauses; the other one's Stop proceeds.
         fixture.disarm("host.anchor.stop_received");
-        force.send_replace(true);
+        force.send_replace(Some(tokio::time::Instant::now()));
         assert!(
             eventually(Duration::from_secs(3), || fixture
                 .acked("host.early_stop.sent"))

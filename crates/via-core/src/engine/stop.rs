@@ -147,7 +147,7 @@ impl Engine {
             self.signal
                 .force_requested_at
                 .get_or_init(|| rfc3339(SystemTime::now()));
-            self.signal.force.send_replace(true);
+            self.signal.raise_force();
         }
         Ok(mode)
     }
@@ -213,9 +213,10 @@ impl Engine {
 
     /// Subscribes Host's early-stop task to the force signal, which a force
     /// stop raises at acceptance and the latch in phase one (design §6.8
-    /// [r4.3, r5.1]). Daemon main calls it once, from within its runtime,
-    /// before it serves; Host's shutdown retires the task when force never
-    /// came.
+    /// [r4.3, r5.1]), carrying the instant it was raised so Host's 3 s
+    /// bound runs from the force. Daemon main calls it once, from within
+    /// its runtime, before it serves; Host's shutdown retires the task when
+    /// force never came.
     pub fn watch_force(&self) {
         self.adapter.watch_force(self.signal.force.subscribe());
     }

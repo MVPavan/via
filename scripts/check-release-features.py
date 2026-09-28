@@ -67,6 +67,7 @@ POINTS = [
     "host.anchor.defer_cleanup",
     "host.anchor.stop_received",
     "host.anchor.arm_received",
+    "host.early_stop.woken",
     "host.early_stop.snapshot",
     "host.early_stop.sent",
     # Task 3 S2 (design §10): turn-control seams.
@@ -116,6 +117,8 @@ POINTS = [
     "store.read.corrupt.anchor_cohort",
     "store.read.corrupt.queued_turns",
     "store.read.corrupt.anchor_records",
+    # Task 3 force row (design §6.8, §10): a recorded exit not yet returned.
+    "wire.exit.observed",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

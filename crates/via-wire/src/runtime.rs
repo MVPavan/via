@@ -39,7 +39,7 @@ pub enum RawEvidence {
 pub struct WireSignals {
     /// The daemon force watch: once set, every wait on the vendor ends with
     /// [`WireError::Cancelled`].
-    pub force: watch::Receiver<bool>,
+    pub force: watch::Receiver<Option<tokio::time::Instant>>,
     /// Route's wake: each change ends the current wait on the vendor once
     /// with [`WireError::Woken`], before any byte is read, so Route can act on
     /// its turn's stop order without losing bytes.
@@ -140,9 +140,10 @@ impl WireRuntime {
         self.host.pending_cleanup()
     }
 
-    /// Subscribes Host's early stop to the daemon force signal (design §6.8).
-    pub fn watch_force(&self, force: watch::Receiver<bool>) {
-        self.host.watch_force(force);
+    /// Subscribes Host's early stop to the daemon force signal (design §6.8),
+    /// which carries the instant the force was raised.
+    pub fn watch_force(&self, forced: watch::Receiver<Option<tokio::time::Instant>>) {
+        self.host.watch_force(forced);
     }
 
     /// Reconciles one page of up to `limit` committed anchors after the
@@ -296,7 +297,7 @@ pub struct WireConnection {
     control: ProcessControl,
     exits: ExitReceiver,
     /// Caller's cancel signal; checked only where waiting loses no bytes.
-    cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<Option<tokio::time::Instant>>,
     /// Route's wake, likewise checked only where waiting loses no bytes.
     wake: watch::Receiver<u64>,
 }
@@ -580,7 +581,16 @@ impl WireConnection {
     /// Observes Host-confirmed vendor exit without treating a terminal frame as exit proof.
     pub async fn wait_exit(&mut self, deadline: Deadline) -> Result<super::ExitReport, WireError> {
         loop {
-            if let Some(exit) = *self.exits.borrow() {
+            // Copied out so no watch guard is held across the test seam's await.
+            let recorded = *self.exits.borrow();
+            if let Some(exit) = recorded {
+                // A recorded exit is returned without consulting `cancel`: the
+                // caller must read the daemon force after it (design §6.8).
+                // Test builds pause here, exit recorded and not yet returned.
+                #[cfg(feature = "test-failpoints")]
+                via_store::failpoint::hit_async("wire.exit.observed")
+                    .await
+                    .map_err(WireError::Io)?;
                 return Ok(exit);
             }
             let changed = tokio::select! {
@@ -694,8 +704,8 @@ async fn woken(wake: &mut watch::Receiver<u64>) {
 }
 
 /// Resolves once `cancel` is set; never when its sender is gone unset.
-async fn cancelled(cancel: &mut watch::Receiver<bool>) {
-    if cancel.wait_for(|cancel| *cancel).await.is_err() {
+async fn cancelled(cancel: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    if cancel.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
 }

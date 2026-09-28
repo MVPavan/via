@@ -123,7 +123,7 @@ impl Main {
                     engine.retry_starts();
                 }
                 () = self.stop.notified(), if serving => {}
-                _ = forced.wait_for(|forced| *forced),
+                _ = forced.wait_for(Option::is_some),
                     if serving && stopping != Some(StopMode::Force) => {}
                 Some(request) = self.idle_requests.recv() => self.idle_stop(request).await,
                 Some(result) = self.clients.join_next(), if !self.clients.is_empty() => {
