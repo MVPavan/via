@@ -11,7 +11,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, timeout_at},
 };
-use via_core::{Deadline, Engine, StopMode};
+use via_core::{ApiError, Deadline, Engine, StopMode};
 
 use super::{Joins, drive_joined, spawn_dispatcher};
 
@@ -81,18 +81,14 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
     // Step 3: force-stopped drives return after Route's bounded force
     // cleanup and hand their turns to Host reconciliation (step 4), which
     // keeps its time; their terminals commit there.
-    let joined = timeout_at(Engine::dispatchers_by(deadline), async {
-        while let Some(result) = drives.join_next().await {
-            if !drive_joined(result) {
-                failed_joins += 1;
-            }
-        }
-    })
+    let (pending, failed) = join_dispatchers(
+        &mut drives,
+        Engine::dispatchers_by(deadline),
+        Engine::aborted_by(deadline),
+    )
     .await;
-    if joined.is_err() {
-        pending_joins = drives.len();
-        drives.abort_all();
-    }
+    pending_joins += pending;
+    failed_joins += failed;
     let report = timeout_at(deadline, engine.shutdown(Deadline::at(deadline))).await;
     // Every final record is committed: pending reads deliver, then clients close.
     let clients_by = deadline.checked_sub(STORE_RESERVE).unwrap_or(started);
@@ -124,12 +120,41 @@ pub(super) async fn final_shutdown(engine: Arc<Engine>, joins: Joins, mode: Stop
         "store_failed":host.map(|host| host.store_failed),
         "unstarted_dispatchers":host.map(|host| host.unstarted_dispatchers),
         "unclosed_sessions":host.map(|host| host.unclosed_sessions),
+        "unjoined_dispatchers":host.map(|host| host.unjoined_dispatchers),
         "store":store,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
     // Best-effort bounded diagnostic; the exit status is the authoritative result.
     let _ = writeln!(io::stderr().lock(), "{summary}");
     if clean { 0 } else { 4 }
+}
+
+/// Pipeline step 3 (design §6.8): joins the dispatchers until `abort_at`,
+/// then aborts the rest and joins them until `aborted_by`, where Host
+/// reconciliation begins. An abort takes effect only when the task is next
+/// polled, so a dispatcher still running a synchronous section keeps its
+/// turn until it is joined; one still unjoined at `aborted_by` is pending,
+/// and final shutdown settles none of its session's turns. Returns
+/// `(pending, failed)`; an abort's own cancellation is not a failure.
+async fn join_dispatchers(
+    drives: &mut JoinSet<Result<(), ApiError>>,
+    abort_at: Instant,
+    aborted_by: Instant,
+) -> (usize, usize) {
+    let mut failed = 0;
+    let mut join = async |drives: &mut JoinSet<Result<(), ApiError>>| {
+        while let Some(result) = drives.join_next().await {
+            let cancelled = matches!(&result, Err(error) if error.is_cancelled());
+            if !cancelled && !drive_joined(result) {
+                failed += 1;
+            }
+        }
+    };
+    if timeout_at(abort_at, join(drives)).await.is_err() {
+        drives.abort_all();
+        let _ = timeout_at(aborted_by, join(drives)).await;
+    }
+    (drives.len(), failed)
 }
 
 /// Joins client tasks until `clients_by`, then aborts the rest and awaits
@@ -183,6 +208,52 @@ async fn drop_blocking<T: Send + 'static>(value: T, deadline: Instant) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T3-S3 round 1, decision 2 (design §6.8 step 3): a dispatcher that
+    /// does not return by `abort_at` is aborted and then joined, so Host
+    /// reconciliation never starts while it runs. One that reaches an abort
+    /// point in time is joined; one still running at `aborted_by` is pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_dispatchers_are_joined_before_reconciliation() {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut drives = JoinSet::new();
+        let flag = Arc::clone(&running);
+        drives.spawn(async move {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            // Blocks its worker: the abort takes effect once this returns.
+            std::thread::sleep(Duration::from_millis(400));
+            tokio::task::yield_now().await;
+            flag.store(false, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        while !running.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let now = Instant::now();
+        let joined = join_dispatchers(
+            &mut drives,
+            now + Duration::from_millis(50),
+            now + Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(joined, (0, 0), "the aborted dispatcher was joined");
+        assert!(drives.is_empty());
+
+        let mut stuck = JoinSet::new();
+        stuck.spawn(async {
+            std::thread::sleep(Duration::from_millis(1_500));
+            Ok(())
+        });
+        tokio::task::yield_now().await;
+        let now = Instant::now();
+        let joined = join_dispatchers(
+            &mut stuck,
+            now + Duration::from_millis(50),
+            now + Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(joined, (1, 0), "still running at the bound: pending");
+    }
 
     /// W3-F Sol 4: a client task that does not reach an abort point promptly
     /// cannot hold daemon main past the final deadline; it is counted pending

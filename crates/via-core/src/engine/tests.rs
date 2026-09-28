@@ -1522,6 +1522,51 @@ fn the_force_set_reads_a_slot_in_one_section() {
     });
 }
 
+/// T3-S3 round 1, decision 2 (design §6.8 step 3): a dispatcher that has
+/// not joined still owns its session. Turn 1 was handed to final shutdown,
+/// and the dispatcher is held in turn 2's force-path cancellation read when
+/// final shutdown settles: nothing of that session is settled, neither turn
+/// 1's forced terminal nor the closure; both stay for restart recovery, and
+/// the shutdown is not clean.
+#[test]
+fn final_settlement_skips_a_session_whose_dispatcher_has_not_joined() {
+    let Some(root) = child("final_settlement_skips_a_session_whose_dispatcher_has_not_joined")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        resume(&engine, &session, None).await;
+        engine
+            .faults
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine
+                .faults
+                .hold_cancel_read
+                .store(true, Ordering::Release);
+            engine.faults.release.notify_one();
+            // Turn 1 was handed off; the dispatcher holds turn 2's read.
+            engine.faults.granted.notified().await;
+            assert_eq!(super::lock(&engine.forced).len(), 1, "turn 1 handed off");
+            let report = shutdown(&engine).await;
+            assert!(!report.is_clean(), "{report:?}");
+            assert_eq!(report.unclosed_sessions, 1, "{report:?}");
+            assert_eq!(report.unresolved_turns, 2, "{report:?}");
+            let types = event_types(&engine, &session).await;
+            assert!(
+                !types.iter().any(|kind| kind == "turn.ended"),
+                "final shutdown settled a turn its dispatcher still owns: {types:?}"
+            );
+            engine.faults.release.notify_one();
+        });
+    });
+}
+
 /// Design §6.8 entry [r3.2]: under a drain, `close` still works until
 /// daemon main enters final shutdown; from entry on, new close work is
 /// `daemon_stopping`, and a keyed replay of a committed close replays.

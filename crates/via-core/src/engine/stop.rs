@@ -1,6 +1,6 @@
 //! `daemon/stop` admission, forced-turn settlement and final shutdown.
 
-use std::{sync::atomic::Ordering, time::SystemTime};
+use std::{collections::HashSet, sync::atomic::Ordering, time::SystemTime};
 
 use via_adapters::{Cleanup, StopCause};
 
@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use super::drive::FORCE_CLOSE_REASON;
 use super::journal::Head;
-use super::latch::{FINALIZE_RESERVE, FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome};
+use super::latch::{
+    ABORTED_JOIN, FINALIZE_RESERVE, FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome,
+};
 use super::{Admission, Engine, Terminal, TurnRecord, lock};
 use crate::api::{Cancel, Event, EventBody, FailureClass, Warning, rfc3339};
 use crate::{ApiError, DaemonStopParams, Deadline, SessionId, TurnNumber};
@@ -59,6 +61,9 @@ pub struct EngineShutdown {
     /// Sessions a force stop found with dispatch state that could not be
     /// closed durably (C1 §3.14).
     pub unclosed_sessions: usize,
+    /// Dispatchers that had not joined when final shutdown settled: their
+    /// sessions' turns were left to restart recovery (design §6.8 step 3).
+    pub unjoined_dispatchers: usize,
 }
 
 impl EngineShutdown {
@@ -73,6 +78,7 @@ impl EngineShutdown {
             && !self.store_failed
             && self.unstarted_dispatchers == 0
             && self.unclosed_sessions == 0
+            && self.unjoined_dispatchers == 0
     }
 }
 
@@ -214,7 +220,26 @@ impl Engine {
     /// at `deadline − 8 s` (§6.7), so a dispatcher still running here is
     /// stalled outside Store.
     pub fn dispatchers_by(deadline: tokio::time::Instant) -> tokio::time::Instant {
+        Self::aborted_by(deadline)
+            .checked_sub(ABORTED_JOIN)
+            .unwrap_or(deadline)
+    }
+
+    /// When final shutdown stops waiting for the dispatchers it aborted at
+    /// [`Engine::dispatchers_by`]: `deadline − FINALIZE_RESERVE`, where Host
+    /// reconciliation begins. A dispatcher still unjoined then keeps its
+    /// session: [`Engine::shutdown`] settles none of its turns.
+    pub fn aborted_by(deadline: tokio::time::Instant) -> tokio::time::Instant {
         deadline.checked_sub(FINALIZE_RESERVE).unwrap_or(deadline)
+    }
+
+    /// Marks `session`'s dispatcher running until the returned guard drops.
+    pub(super) fn dispatching(&self, session: &SessionId) -> Dispatching<'_> {
+        lock(&self.dispatching).insert(session.clone());
+        Dispatching {
+            engine: self,
+            session: session.clone(),
+        }
     }
 
     /// Pipeline step 5 for one forced turn (design §6.8): its terminal
@@ -358,15 +383,22 @@ impl Engine {
         // the unresolved cap), which include every force-stopped turn.
         let turns = self.unresolved.turns();
         let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
+        // A dispatcher that has not joined still owns its session: none of
+        // its turns is settled here, and they stay unresolved for restart
+        // recovery (design §6.8 step 3).
+        let unjoined = lock(&self.dispatching).clone();
         let forced = std::mem::take(&mut *lock(&self.forced));
         let mut uncommitted_turns = 0;
         for turn in forced {
+            if unjoined.contains(&turn.started.session) {
+                continue;
+            }
             if !self.finalize_forced(turn, &report, deadline).await {
                 uncommitted_turns += 1;
             }
         }
         let unclosed_sessions =
-            tokio::time::timeout_at(deadline.instant(), self.close_forced_sessions())
+            tokio::time::timeout_at(deadline.instant(), self.close_forced_sessions(&unjoined))
                 .await
                 .unwrap_or_else(|_| lock(&self.force_sessions).as_ref().map_or(1, Vec::len));
         let unresolved_turns = self.unresolved_turns(deadline).await;
@@ -386,6 +418,7 @@ impl Engine {
             store_failed: self.store_failed(),
             unstarted_dispatchers,
             unclosed_sessions,
+            unjoined_dispatchers: unjoined.len(),
         }
     }
 
@@ -395,11 +428,16 @@ impl Engine {
     /// (`daemon_stop_force`) once every turn has a durable disposition.
     /// Returns how many could not be closed. Skipped after a Store failure,
     /// whose exit is already incomplete; a session already closed in-path is
-    /// read as closed and never closed twice.
-    async fn close_forced_sessions(&self) -> usize {
+    /// read as closed and never closed twice. A session in `unjoined`, whose
+    /// dispatcher still owns it, is not closed.
+    async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
         let mut unclosed = 0;
         for session in sessions {
+            if unjoined.contains(&session) {
+                unclosed += 1;
+                continue;
+            }
             let admission = self.admission.lock().await;
             if self.store_failed() {
                 return 0;
@@ -496,4 +534,18 @@ pub(super) fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'st
         if forced { "forced" } else { "requested" },
         if quiescent { "quiescent" } else { "uncertain" },
     )
+}
+
+/// A running dispatcher's claim on its session (design §6.8 step 3),
+/// released when the dispatcher's future ends or is dropped, as an abort
+/// does once the task is next polled.
+pub(super) struct Dispatching<'a> {
+    engine: &'a Engine,
+    session: SessionId,
+}
+
+impl Drop for Dispatching<'_> {
+    fn drop(&mut self) {
+        lock(&self.engine.dispatching).remove(&self.session);
+    }
 }

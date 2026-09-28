@@ -23,6 +23,8 @@ use crate::{SessionId, TurnNumber};
 /// | Budget | Ends at |
 /// |---|---|
 /// | force-path read cutoff (§6.7) | `deadline − (FINALIZE_RESERVE + 3 s)` |
+/// | dispatcher joins, then abort (step 3) | `deadline − (FINALIZE_RESERVE + ABORTED_JOIN)` |
+/// | aborted dispatchers' joins (step 3) | `deadline − FINALIZE_RESERVE` |
 /// | Host reconciliation (pipeline step 4) | `deadline − FINALIZE_RESERVE` |
 /// | each step 5 write | `min(now + FINALIZE_WRITE, deadline)` |
 /// | client joins, then the Store join | `deadline − 2 s`, then `deadline` |
@@ -30,6 +32,11 @@ use crate::{SessionId, TurnNumber};
 /// `FINALIZE_RESERVE` covers 2 s for §7.4's re-read, 2 s for the batch or a
 /// forced terminal and 1 s for the closure pass.
 pub(super) const FINALIZE_RESERVE: Duration = Duration::from_secs(5);
+
+/// Pipeline step 3's wait for the dispatchers it aborted, before Host
+/// reconciliation begins (design §6.8): an abort takes effect when the task
+/// is next polled, so a dispatcher is joined, not only cancelled.
+pub(super) const ABORTED_JOIN: Duration = Duration::from_secs(1);
 
 /// Bound of each finalization write in pipeline step 5 (design §6.8).
 pub(super) const FINALIZE_WRITE: Duration = Duration::from_secs(2);

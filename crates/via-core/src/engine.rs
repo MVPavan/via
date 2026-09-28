@@ -113,6 +113,10 @@ pub struct Engine {
     /// `admission` by the close fence. Its watch also stops the re-probe
     /// loop (§8).
     final_shutdown: watch::Sender<bool>,
+    /// Sessions whose dispatcher is running: inserted when it starts,
+    /// removed when its future ends or is dropped (design §6.8 step 3).
+    /// Final shutdown settles nothing of a session still here.
+    dispatching: StdMutex<HashSet<SessionId>>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -283,6 +287,7 @@ impl Engine {
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),
+            dispatching: StdMutex::new(HashSet::new()),
             #[cfg(test)]
             faults: Faults::default(),
         })
