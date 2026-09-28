@@ -4,7 +4,7 @@ use super::{
     AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorQuery,
     AnchorRecord, Connection, GroupAbsenceRecord, PathBuf, SessionId, StoreError,
     TransactionBehavior, TurnNumber, params,
-    sql::{before_commit, sql_error},
+    sql::{before_commit, commit, sql_error},
 };
 
 pub(super) fn commit_anchor_intent(
@@ -34,8 +34,7 @@ pub(super) fn commit_anchor_intent(
             intent.owner_session.as_str(),intent.owner_turn.get(),intent.uid,intent.boot_id,intent.pid_namespace],
     ).map_err(sql_error)?;
     before_commit!("store.journal.anchor_intent");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     Ok(AnchorIntentReceipt { record_version: 1 })
 }
 
@@ -63,8 +62,7 @@ pub(super) fn commit_anchor_identified(
         return Err(StoreError::Constraint("anchor identity/version mismatch"));
     }
     before_commit!("store.journal.identified");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     version
         .checked_add(1)
         .ok_or(StoreError::Constraint("anchor version overflow"))
@@ -98,8 +96,7 @@ pub(super) fn commit_arm_intent(
         ));
     }
     before_commit!("store.journal.arm_intent");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     version
         .checked_add(1)
         .ok_or(StoreError::Constraint("anchor version overflow"))
@@ -125,8 +122,7 @@ pub(super) fn commit_vendor_facts(
         return Err(StoreError::Constraint("vendor facts require ARM intent"));
     }
     before_commit!("store.journal.vendor_facts");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 /// Records a group absence proof. Without an identity the anchor must
@@ -196,8 +192,7 @@ pub(super) fn commit_group_absence(
         return Err(StoreError::Constraint("group absence identity mismatch"));
     }
     before_commit!("store.journal.absence");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 /// One page of anchor records in `anchor_id` order after `after`.

@@ -432,6 +432,87 @@ fn failure_resolution_batch_is_one_bounded_transaction() {
     });
 }
 
+/// S1 round-1 decision 2: the batch is refused, writing nothing, when its
+/// primary turn is not running. A queued turn given a `cancelled` terminal
+/// is not a failure resolution.
+#[test]
+fn failure_resolution_refuses_a_primary_turn_that_is_not_running() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        spawn(&client, SESSION).await;
+        resume(&client, 2, 2).await.unwrap();
+        let refused = client
+            .commit_failure_resolution(FailureResolutionRecord {
+                terminal: ended(1, 3, "cancelled"),
+                raw_incomplete: None,
+                cancellations: vec![ended(2, 4, "cancelled")],
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(StoreError::Refused(
+                    "a failure batch resolves a running turn"
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(client.next_seq(&session()).await.unwrap(), Some(3));
+        assert!(client.result(&session(), turn(1)).await.unwrap().is_none());
+    });
+}
+
+/// S1 round-1 decision 2: the batch is refused, writing nothing, unless its
+/// cancellations are exactly the session's queued turns (design §7.4): a
+/// batch that leaves a queued turn behind is refused.
+#[test]
+fn failure_resolution_refuses_a_partial_cancellation_set() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        spawn(&client, SESSION).await;
+        client
+            .commit_submission(SubmissionRecord {
+                session_id: session(),
+                turn: turn(1),
+                event: event("turn.submitted", 2),
+            })
+            .await
+            .unwrap();
+        resume(&client, 2, 3).await.unwrap();
+        resume(&client, 3, 4).await.unwrap();
+        let refused = client
+            .commit_failure_resolution(FailureResolutionRecord {
+                terminal: ended(1, 5, "failed"),
+                raw_incomplete: None,
+                cancellations: vec![ended(2, 6, "cancelled")],
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(StoreError::Refused(
+                    "a failure batch cancels exactly its session's queued turns"
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(client.next_seq(&session()).await.unwrap(), Some(5));
+        for number in 1..=3 {
+            assert!(
+                client
+                    .result(&session(), turn(number))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    });
+}
+
 fn intent(anchor_id: &str) -> AnchorIntent {
     AnchorIntent {
         anchor_id: anchor_id.to_owned(),

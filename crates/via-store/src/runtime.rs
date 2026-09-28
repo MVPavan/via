@@ -1464,7 +1464,8 @@ use sql::{configure, validate_regular, validate_state, writer_loop};
 mod tests {
     use super::{
         CommitOutcome, ConnectionId, ProcessJournal, RawCommand, RawStream, RawWriter, SessionId,
-        StoreClient, StoreError, StoreFailureKind, mpsc, sql::sql_error,
+        StoreClient, StoreError, StoreFailureKind, mpsc,
+        sql::{commit, commit_error, sql_error},
     };
 
     fn session() -> SessionId {
@@ -1582,5 +1583,43 @@ mod tests {
             full.journal_outcome::<()>(),
             CommitOutcome::NotCommitted(StoreFailureKind::Write)
         ));
+    }
+
+    /// Design §7.1 [O1.D8], S1 round-1 decision 1: a `COMMIT` step that
+    /// reports `SQLITE_CORRUPT` or `SQLITE_NOTADB` is `Corrupt`; any other
+    /// commit failure stays `Uncertain`. Either latches. Every commit site
+    /// goes through `commit`, which a real failing `COMMIT` (a deferred
+    /// foreign key) exercises here.
+    #[test]
+    fn commit_failures_are_uncertain_unless_sqlite_reports_corruption() {
+        let failure = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let error = commit_error(failure(code));
+            assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+            assert!(matches!(
+                error.journal_outcome::<()>(),
+                CommitOutcome::Uncertain(StoreFailureKind::Corrupt)
+            ));
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_BUSY,
+        ] {
+            let error = commit_error(failure(code));
+            assert!(matches!(error, StoreError::Uncertain(_)), "{error:?}");
+        }
+        let mut conn = rusqlite::Connection::open_in_memory().expect("memory database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .expect("schema");
+        let tx = conn.transaction().expect("transaction");
+        tx.execute("INSERT INTO child VALUES (1)", [])
+            .expect("deferred until COMMIT");
+        let error = commit(tx).expect_err("the deferred foreign key fails COMMIT");
+        assert!(matches!(error, StoreError::Uncertain(_)), "{error:?}");
     }
 }

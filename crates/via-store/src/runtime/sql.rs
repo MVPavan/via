@@ -28,6 +28,28 @@ pub(super) fn sql_error(error: rusqlite::Error) -> StoreError {
     }
 }
 
+/// Classifies a failed `COMMIT` step (design §7.1): corruption is `Corrupt`,
+/// which always latches; any other failure leaves the outcome unknown, so it
+/// is `Uncertain`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the map_err adapter receives the error by value"
+)]
+pub(super) fn commit_error(error: rusqlite::Error) -> StoreError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) => {
+            StoreError::Corrupt(error.to_string())
+        }
+        _ => StoreError::Uncertain(error.to_string()),
+    }
+}
+
+/// Commits `tx`; every Store transaction commits through here, so every
+/// commit site classifies a failure alike ([`commit_error`]).
+pub(super) fn commit(tx: rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.commit().map_err(commit_error)
+}
+
 /// Test-only seams inside a transaction, just before `COMMIT` (design §10):
 /// a `fail_io` at `point` or at `store.commit.fail_persistent` rolls the
 /// transaction back, so the write is not committed; a pause holds the writer.
@@ -161,8 +183,7 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
              PRAGMA user_version=5;",
         )
         .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.commit()
-            .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+        commit(tx)?;
     }
     Ok(())
 }
@@ -557,8 +578,7 @@ fn commit_spawn(
     crate::failpoint::hit("store.spawn.before_commit")
         .map_err(|error| StoreError::Write(error.to_string()))?;
     before_commit!("store.commit.receipt");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     // Committed but unacknowledged: all rows survive together.
     #[cfg(feature = "test-failpoints")]
     crate::failpoint::hit("store.spawn.after_commit")
@@ -656,8 +676,7 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
     )
     .map_err(sql_error)?;
     before_commit!("store.commit.receipt");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 fn read_operation(
@@ -860,8 +879,7 @@ fn commit_submission(conn: &mut Connection, record: &SubmissionRecord) -> Result
     }
     insert_event(&tx, session, &record.event, None)?;
     before_commit!("store.commit.submission");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 fn commit_acceptance(
@@ -905,8 +923,7 @@ fn commit_acceptance(
     .map_err(sql_error)?;
     insert_event(&tx, session, &record.event, Some(&record.raw_ref))?;
     before_commit!("store.commit.event");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 fn event_at(event: &Value) -> Result<&str, StoreError> {
@@ -1000,8 +1017,7 @@ fn commit_event(
         record.raw_ref.as_ref(),
     )?;
     before_commit!("store.commit.event");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 /// Commits `session.closed` alone once every turn of the session has a
@@ -1033,8 +1049,7 @@ fn commit_session_closed(
     )
     .map_err(sql_error)?;
     before_commit!("store.commit.session_closed");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     Ok(true)
 }
 
@@ -1064,8 +1079,7 @@ fn commit_terminal(
     } else {
         "store.commit.terminal"
     });
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     Ok(closed)
 }
 
@@ -1135,13 +1149,14 @@ fn insert_terminal(
     // alone and the close is reported as not written.
     let closed = match closed {
         Some(closed) => {
-            // Design §10 [r3.6]: the rider seam fails the combined
-            // transaction after the terminal insert.
-            before_commit!("store.commit.rider");
             if unfinished_turns(tx, &record.session_id)? {
                 false
             } else {
                 insert_event(tx, &record.session_id, closed, None)?;
+                // Design §10 [r3.6]: the rider seam fails the combined
+                // transaction after the terminal and the close are inserted,
+                // before `COMMIT`; a terminal committing alone never reaches it.
+                before_commit!("store.commit.rider");
                 true
             }
         }
@@ -1201,8 +1216,7 @@ fn commit_closing(conn: &mut Connection, record: &ClosingRecord) -> Result<(), S
         .map_err(sql_error)?;
     }
     before_commit!("store.commit.closing");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 /// Design §4 dispatcher step 5: `Closed` with the close result derived in
@@ -1259,8 +1273,7 @@ fn commit_closed(
         }
     }
     before_commit!("store.commit.closed");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))?;
+    commit(tx)?;
     Ok(ClosedOutcome::Closed(result))
 }
 
@@ -1366,8 +1379,7 @@ fn commit_submit_failed(
     insert_event(&tx, session, &record.ended, None)?;
     update_session_state(&tx, session, false)?;
     before_commit!("store.commit.terminal");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
 }
 
 /// Design §7.4: one running turn's terminal, then its session's queued
@@ -1389,16 +1401,36 @@ fn commit_failure_resolution(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
+    // Both checks read the durable turns before any write: a refused batch
+    // writes nothing and never leaves queued work behind.
+    if turn_state(&tx, session, record.terminal.turn)?.as_deref() != Some("running") {
+        return Err(StoreError::Refused(
+            "a failure batch resolves a running turn",
+        ));
+    }
+    let mut cancelled: Vec<u32> = record
+        .cancellations
+        .iter()
+        .map(|cancellation| cancellation.turn.get())
+        .collect();
+    cancelled.sort_unstable();
+    if record
+        .cancellations
+        .iter()
+        .any(|cancellation| cancellation.session_id != *session)
+        || cancelled != queued_turn_numbers(&tx, session)?
+    {
+        return Err(StoreError::Refused(
+            "a failure batch cancels exactly its session's queued turns",
+        ));
+    }
     let extras = TerminalExtras {
         cancel_cause: None,
         raw_incomplete: record.raw_incomplete.clone(),
     };
     insert_terminal(&tx, &record.terminal, &extras, None)?;
     for cancellation in &record.cancellations {
-        if cancellation.session_id != *session
-            || cancellation.envelope.get("state").and_then(Value::as_str) != Some("cancelled")
-            || turn_state(&tx, session, cancellation.turn)?.as_deref() != Some("queued")
-        {
+        if cancellation.envelope.get("state").and_then(Value::as_str) != Some("cancelled") {
             return Err(StoreError::Constraint(
                 "a failure batch cancels only its session's queued turns",
             ));
@@ -1406,8 +1438,22 @@ fn commit_failure_resolution(
         insert_terminal(&tx, cancellation, &TerminalExtras::default(), None)?;
     }
     before_commit!("store.commit.terminal");
-    tx.commit()
-        .map_err(|error| StoreError::Uncertain(error.to_string()))
+    commit(tx)
+}
+
+/// The session's queued turn numbers, ascending.
+fn queued_turn_numbers(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+) -> Result<Vec<u32>, StoreError> {
+    let mut statement = tx
+        .prepare("SELECT number FROM turns WHERE session_id=?1 AND state='queued' ORDER BY number")
+        .map_err(sql_error)?;
+    statement
+        .query_map([session.as_str()], |row| row.get(0))
+        .map_err(sql_error)?
+        .collect::<Result<Vec<u32>, _>>()
+        .map_err(sql_error)
 }
 
 /// Whether any turn of the session is queued or running.

@@ -12,8 +12,9 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use via_store::{
-    AnchorIntent, CommitOutcome, ConnectionId, EventRecord, RawStream, SessionId, SpawnRecord,
-    Store, StoreClient, StoreError, SubmissionRecord, TerminalRecord, TurnNumber, failpoint,
+    AnchorIntent, CommitOutcome, ConnectionId, EventRecord, RawStream, ResumeRecord, SessionId,
+    SpawnRecord, Store, StoreClient, StoreError, SubmissionRecord, TerminalRecord, TurnNumber,
+    failpoint,
 };
 
 const TOKEN: &str = "s1-store-seams-token-0123";
@@ -237,6 +238,58 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
                 .await
                 .unwrap()
         );
+    });
+}
+
+/// S1 round-1 decision 3: `store.commit.rider` fires only on the branch
+/// that writes `session.closed`. Another queued turn prevents the rider, so
+/// the seam is never reached and the cancellation commits alone.
+#[test]
+fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
+    let seams = Seams::new();
+    let store = Store::open(seams.state()).unwrap();
+    let client = store.client();
+    seams.runtime.block_on(async {
+        client
+            .commit_spawn(SpawnRecord {
+                session_id: session(),
+                handle_hash: [7_u8; 32],
+                receipt: json!({"state":"queued"}),
+                params: json!({"harness":"fake"}),
+                prompt: "p".to_owned(),
+                effective: json!({"deadlines":{"wall_ms":1}}),
+                initial_event: event("turn.queued", 1),
+            })
+            .await
+            .unwrap();
+        client
+            .commit_resume(ResumeRecord {
+                session_id: session(),
+                turn: TurnNumber::try_from(2).unwrap(),
+                prompt: "p".to_owned(),
+                effective: json!({"deadlines":{"wall_ms":1}}),
+                event: event("turn.queued", 2),
+                operation: None,
+            })
+            .await
+            .unwrap();
+        seams.arm("store.commit.rider", 1, "fail_io", false);
+        let closed = client
+            .commit_closing_terminal(
+                TerminalRecord {
+                    session_id: session(),
+                    turn: turn(),
+                    envelope: json!({"state":"cancelled"}),
+                    event: event("turn.ended", 3),
+                    raw_ref: None,
+                },
+                event("session.closed", 4),
+            )
+            .await;
+        assert!(matches!(closed, Ok(false)), "{closed:?}");
+        assert!(!seams.acked("store.commit.rider", 1));
+        assert!(client.result(&session(), turn()).await.unwrap().is_some());
+        assert_eq!(client.next_seq(&session()).await.unwrap(), Some(4));
     });
 }
 
