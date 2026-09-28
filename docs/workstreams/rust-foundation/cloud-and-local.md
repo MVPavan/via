@@ -1,6 +1,8 @@
 # Cloud and local split (draft for owner decision)
 
-Status: decided by the owner, 2026-09-27 (§5). Facts checked against
+Status: decided by the owner, 2026-09-27 (§5). **Superseded for dispatch
+by §7 (owner, 2026-09-28): no new cloud sessions; Claude workers are local
+subagents.** Facts checked against
 official docs on that date; items marked **unverified** need the cloud probe
 before we rely on them.
 
@@ -159,3 +161,28 @@ Coordination rules (proposed):
 - The owner delegates routine orchestration decisions (scoping, deferring
   findings to planned tasks, fix guidance, escalation); the orchestrator
   decides on evidence and reports what it decided.
+
+## 7. Local workers (owner, 2026-09-28)
+
+The owner stopped new cloud dispatch. Cloud sessions already running (T3-S1,
+the final T3-0 design edit) finish, and their branches are fetched and
+continued locally; nothing new is sent to the cloud.
+
+- **Claude workers are subagents of the local orchestrator session**
+  (Agent tool, `isolation: "worktree"`), one per task, with the brief path
+  in the dispatch. `implementer` is Opus 5.5 medium; `implementer-high` is
+  Opus 5.5 high (ownership, concurrency, lifecycle, recovery). Fix rounds
+  continue the same subagent (SendMessage), so the author-session rule of §6
+  holds and its reply is readable. A worker commits on its worktree branch
+  and never pushes; the orchestrator merges locally, runs the gate, and
+  pushes `rust-foundation` as before.
+- **Reviews:** GPT-6 Sol and Astra stay on local `codex exec` in tmux
+  windows of session `via`. Fable 5.1 high reviews use the `fable-reviewer`
+  subagent.
+- **Capacity:** at most two workers compile and run the gate at once
+  (32 cores, 30 GB RAM).
+- **Limit:** subagents run inside the orchestrator process. If that session
+  ends, running workers stop; their worktree branches keep committed work,
+  and the next session resumes from the handoff. New agent definitions load
+  only when a session starts.
+

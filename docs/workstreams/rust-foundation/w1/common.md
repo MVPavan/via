@@ -37,8 +37,9 @@ merges your branch; you never merge. This repository is public.
 
 ## Git and reporting
 
-- Work on the branch this session was given; commit with clear messages;
-  push only that branch. Never push to `rust-foundation` or `main`.
+- Work on the branch this session was given; commit with clear messages.
+  A local worker (subagent in a worktree) never pushes; a cloud session
+  pushes only its own branch. Never push to `rust-foundation` or `main`.
 - Do not run `bd`. Do not edit `.beads/`. Do not edit other workers' paths.
 - Write `docs/workstreams/rust-foundation/w1/reports/<your task id>.md`:
   per finding the failure mode, the regression (and its failing output
