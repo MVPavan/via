@@ -2583,6 +2583,97 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
     Ok(())
 }
 
+/// Design §7.4 [O1.D4, r3.17], runtime contracts §7: the failure batch's
+/// write gets no reply (`store.commit.terminal` paused on the batch's own
+/// hit, the writer held before it commits). The batch gives up at its own
+/// bound and is skipped, once and never retried; no terminal is invented
+/// for the turn or its queued successors, which keep `running` and
+/// `queued`; and final shutdown ends by the latch deadline (`failed_at +
+/// 10 s`), abandoning the stalled Store join to process exit: exit 4. A
+/// batch that waited past its bound would leave the pipeline to the
+/// deadline instead (`failure_batches: null`).
+#[test]
+fn s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![
+            accepted(1),
+            gate("accepted"),
+            text("lost"),
+            gate("first"),
+            terminal(1),
+        ],
+    ))?;
+    sandbox.count("store.commit.reply_lost")?;
+    sandbox.count("store.commit.terminal")?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    sandbox.resume(&session, &handle, "second")?;
+    sandbox.resume(&session, &handle, "third")?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    // No terminal commits before the batch's: the turn is running until
+    // final shutdown forces it.
+    let batch = sandbox.next_hit("store.commit.terminal")?;
+    sandbox.arm("store.commit.terminal", batch, "pause")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    let latched = Instant::now();
+    // The batch reached its write; its reply never comes.
+    sandbox.ack(&daemon, "store.commit.terminal", batch, "pause")?;
+    let exit = daemon.exit(Duration::from_secs(25))?;
+    let took = latched.elapsed();
+    let summary = daemon.summary()?;
+    check(
+        exit.code() == Some(4) && summary["store_failed"] == true,
+        || format!("expected the latch's exit 4, got {exit}: {summary}"),
+    )?;
+    // The latch deadline is `failed_at + 10 s`, and `failed_at` is at or
+    // after the acknowledged hit; the margin covers process start-up and
+    // exit.
+    check(took < Duration::from_secs(12), || {
+        format!("the daemon exited {took:?} after the latch: {summary}")
+    })?;
+    check(
+        summary["elapsed_ms"].as_u64().is_some_and(|ms| ms < 10_500),
+        || format!("final shutdown outlived its deadline: {summary}"),
+    )?;
+    check(
+        summary["failure_batches"] == json!({"committed": 0, "skipped": 1}),
+        || format!("unexpected summary: {summary}"),
+    )?;
+    check(summary["store"] == "join_timed_out", || {
+        format!("the stalled Store join was not abandoned: {summary}")
+    })?;
+    // The turn and its two queued successors stay unresolved.
+    check(summary["unresolved_turns"] == 3, || {
+        format!("unexpected unresolved turns: {summary}")
+    })?;
+    check(summary["host_failure"].is_null(), || {
+        format!("Host reconciliation failed: {summary}")
+    })?;
+    sandbox.verify_anchors()?;
+    let turns: String = sandbox.query(&format!(
+        "SELECT group_concat(state, ',') FROM
+         (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
+    ))?;
+    check(turns == "running,queued,queued", || {
+        format!("turns: {turns}")
+    })?;
+    let invented: i64 = sandbox.query(&format!(
+        "SELECT (SELECT count(*) FROM turns WHERE session_id='{session}'
+                 AND envelope IS NOT NULL)
+              + (SELECT count(*) FROM events WHERE session_id='{session}'
+                 AND json_extract(event,'$.type') IN ('turn.ended','raw_log.incomplete'))"
+    ))?;
+    check(invented == 0, || {
+        format!("{invented} terminal records were invented")
+    })
+}
+
 /// Design §6.8 steps 3–6, §7.4 [r3.3, r4.2, r4.9], carried from S2:
 /// an uncertain event on turn A (its reply is lost,
 /// `store.commit.reply_lost`) latches while turn B runs, and both run loops
