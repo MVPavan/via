@@ -1,0 +1,15 @@
+GPT-6 Sol medium review of T3-S1 (store part) at `8d2a7b6`; line references are to that commit.
+
+**Verdict: SOUND WITH CHANGES.** The Store writes I inspected use SQLite transactions, and `insert_event` enforces dense sequence numbers within those transactions. I found three issues to fix before merging the Store part.
+
+| Rank | Finding | Concrete fix |
+|---|---|---|
+| **Major** | Commit errors are always mapped to `Uncertain`, including `SQLITE_CORRUPT` and `SQLITE_NOTADB`. This violates the required `Corrupt` classification for a SQLite write failure. Representative site: `crates/via-store/src/runtime/sql.rs:1262–1263`; the same mapping appears at the other commit sites. | Classify those two SQLite codes as `Corrupt` at every commit site; retain `Uncertain` for other commit errors. |
+| **Major** | `commit_failure_resolution` checks that supplied cancellations belong to queued turns, but does not require **every** queued turn in the session to be supplied. It also does not require its primary terminal to belong to a running turn. A successful batch can therefore leave queued work behind, contrary to design §7.4. `crates/via-store/src/runtime/sql.rs:1392–1407`. | Within the transaction, verify the primary turn is running and the cancellation set exactly matches the session’s queued turns before writing. |
+| **Minor** | `store.commit.rider` fires whenever a close event was requested, before checking whether unfinished turns prevent that event from being written. It can fail a cancellation-only transaction while claiming to test the combined cancellation and close rider. `crates/via-store/src/runtime/sql.rs:1136–1146`. | Trigger the seam only on the branch that inserts `session.closed`, after the terminal insert and before commit. Add a test with another unfinished turn. |
+
+**Operation and error assessment.** Schema v5 has the specified columns and checks, and the v4 refusal is present. `commit_closing`, `commit_closed`, `commit_terminal_with`, `commit_submit_failed`, the anchor absence proof, and the keyed close result write are transactional. `commit_closed` refuses unfinished turns and derives `cancelled_turns` and cleanup from durable rows in its transaction. The writer’s `Full` path alone reports `NotEnqueued`; disconnected queues and dropped replies report `WriterLost`. Raw queue `Full` and raw I/O report `Raw`. I found no path that reports `NotEnqueued` after enqueueing a request.
+
+The F12 write seams I inspected are inside transactions before `COMMIT`, apart from the rider placement above. Their code is feature gated, and the rollback test checks sequence reuse. The worker report’s “failure-first” evidence for new Store APIs is a baseline **compile failure**, which establishes the APIs were absent but does not independently prove each behavioral test fails against a faulty implementation.
+
+**Limits:** This was source review of the specified refs and diff. I did not run `bd`, `cargo`, tests, or the release binary, and I did not review the Host, Wire, Route, or Core implementation. The pre-existing modified Beads files were untouched.
