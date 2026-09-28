@@ -1344,6 +1344,73 @@ fn s1_f07_stop_refused_drain_keeps_sessions_force_closes_unfinished() -> TestRes
     daemon.finish()
 }
 
+/// F7's `Cancelling` state (design §6.3, review Y item 8): a session whose
+/// only unfinished turn is a queued turn being cancelled is in the force
+/// set. The queued turn is held while a `cancel` request owns it
+/// (`Cancelling{request}`), its commit paused at `store.commit.cancel`, and
+/// a force is accepted on a connection taken before daemon main pauses at
+/// `daemon.dispatcher.before_start`. Once the cancel has committed and daemon
+/// main resumes, final shutdown closes the session exactly once,
+/// `daemon_stop_force`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f07_force_set_includes_session_in_cancelling_state() -> TestResult {
+    let start = "daemon.dispatcher.before_start";
+    let commit = "store.commit.cancel";
+    let sandbox = Sandbox::new(&completes("queued", 1))?;
+    let mut daemon = sandbox.start()?;
+    // Both connections are accepted before daemon main pauses: it accepts
+    // no other, and one carries the force, the other the cancel.
+    let (mut forcer, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    let (mut canceller, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+    sandbox.arm(start, 1, "pause")?;
+    let (session, handle) = sandbox.spawn("queued")?;
+    sandbox.ack(&daemon, start, 1, "pause")?;
+    // The turn is `Waiting` with no dispatcher: the cancel takes it
+    // (`Cancelling{request}`) and parks at its commit.
+    sandbox.arm(commit, 1, "pause")?;
+    let params = json!({"session":session,"handle":handle});
+    let cancel = thread::spawn(move || {
+        canceller
+            .call("cancel", &params)
+            .map_err(|error| error.to_string())
+    });
+    sandbox.ack(&daemon, commit, 1, "pause")?;
+    let stop = forcer.call("daemon/stop", &json!({"force":true}))?;
+    check(stop["result"]["stopping"] == true, || stop.to_string())?;
+    // The cancellation commits; only then does daemon main run final shutdown.
+    sandbox.resume_point(commit, 1)?;
+    let reply = cancel.join().map_err(|_| "the cancel thread panicked")??;
+    check(
+        reply["result"]["state"] == "cancelled" && reply["result"]["already_terminal"] == false,
+        || format!("cancel: {reply}"),
+    )?;
+    sandbox.resume_point(start, 1)?;
+    let status = daemon.exit(Duration::from_secs(15))?;
+    let summary = daemon.summary()?;
+    check(status.code() == Some(0), || {
+        format!("force exit: {status} {summary}")
+    })?;
+    drop(forcer);
+    drop(daemon);
+    let closed: i64 = sandbox.query(&format!(
+        "SELECT count(*) FROM events WHERE session_id='{session}'
+         AND json_extract(event,'$.type')='session.closed'"
+    ))?;
+    let reason = sandbox.closed_reason(&session)?;
+    check(
+        closed == 1 && reason.as_deref() == Some("daemon_stop_force"),
+        || format!("{closed} closures, reason {reason:?}"),
+    )?;
+    let turn: String = sandbox.query(&format!(
+        "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+    ))?;
+    check(turn == "cancelled", || format!("turn state {turn}"))?;
+    sandbox.disarm(start)?;
+    sandbox.disarm(commit)?;
+    sandbox.verify_anchors()
+}
+
 /// Design §8, §6.6: a group whose close was uncertain holds its connection
 /// slot, which `daemon/status` reports in `connections.held_unproven`; once
 /// the group is gone, the re-probe loop proves it absent and the slot
