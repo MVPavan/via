@@ -395,7 +395,8 @@ impl std::error::Error for AcquireFailure {}
 /// One re-probe pass over held groups (design §8).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReprobeReport {
-    /// Held groups without a live control, as the pass found them.
+    /// Held groups without a live control, as the pass found them; with a
+    /// session filter, only that session's (see [`Host::reprobe_held`]).
     pub held: usize,
     /// Groups proved absent and released by this pass.
     pub proved: usize,
@@ -807,6 +808,11 @@ impl Host {
     /// commit that is not committed keeps the token for the next pass; an
     /// uncertain one is returned, and latches. Nothing is read while
     /// nothing is held; a group with no identity keeps its token.
+    ///
+    /// `held` counts every eligible group for `None`. With `owner`, it counts
+    /// the owner's groups this pass examined, plus every group left
+    /// unexamined when the pass ended before its pages did, so a caller
+    /// never takes an unread group of the owner for proved [T3-S2 r1.3].
     pub async fn reprobe_held(
         &self,
         deadline: Deadline,
@@ -825,6 +831,10 @@ impl Host {
             held: remaining.len(),
             ..ReprobeReport::default()
         };
+        // With a filter: the owner's eligible groups found in its pages, and
+        // whether the pages were read to the end (or nothing is left).
+        let mut examined = 0;
+        let mut complete = remaining.is_empty();
         let mut after = None;
         while !remaining.is_empty() && Instant::now() < deadline.instant() {
             let page = timeout_at(
@@ -844,15 +854,24 @@ impl Host {
                 let Some(memory) = remaining.remove(&record.intent.anchor_id) else {
                     continue;
                 };
+                examined += 1;
                 match self.reprobe_one(record, memory, deadline).await? {
                     Reprobed::Proved => report.proved += 1,
                     Reprobed::NotCommitted => report.not_committed += 1,
                     Reprobed::Held => {}
                 }
             }
-            if !full {
+            if !full || remaining.is_empty() {
+                complete = true;
                 break;
             }
+        }
+        if owner.is_some() {
+            report.held = if complete {
+                examined
+            } else {
+                examined + remaining.len()
+            };
         }
         Ok(report)
     }
