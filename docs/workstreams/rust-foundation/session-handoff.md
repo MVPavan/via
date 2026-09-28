@@ -116,7 +116,10 @@ the historical checkpoint; its findings table is updated by this section.
   tracked as `via-jm4.15` and `via-jm4.16`. A Sol high re-check of the fix
   delta accepted Task 3 after the runtime §7 Host bound was recorded as
   amendment A23 (`t3/sol-review-T3-recheck.md`, five rounds). **Task 3
-  (`via-jm4.7.7`) is closed.** Next: Task 4 (`.7.8`) on Sonnet workers. From
+  (`via-jm4.7.7`) is closed.** Now Task 4 (`.7.8`, claimed): design-first T4-0
+  ([t4/t0.md](t4/t0.md)) by `implementer-sonnet-xhigh` in worktree
+  `via-wt/t4-0` (branch `wt/t4-0`); then Astra high and Sol high design
+  reviews, then implementation slices. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
   owner decision), compared with Opus in
