@@ -85,9 +85,16 @@ the historical checkpoint; its findings table is updated by this section.
   final after round 6 and merged at `68aa7b6` ([t3/design.md](t3/design.md)).
   S0 (file split) merged at `08fffce`. S1 (Store/Host/Wire/Route
   primitives, [t3/s1.md](t3/s1.md), last cloud worker) delivered on
-  `claude/t3-s1-task-execution-60rojp` at `8d2a7b6`; two Sol medium reviews
-  (Store; Host/Wire/Route) and a local gate with repeated failpoint runs are
-  running. **From 2026-09-28 no new cloud work: Claude workers are local
+  `claude/t3-s1-task-execution-60rojp` at `8d2a7b6`. Sol medium: Store
+  SOUND WITH CHANGES, Host/Wire/Route UNSOUND (the interrupt write drops a
+  raw Store failure) (`t3/sol-review-S1-*.md`). Local gate clean (207 / 2
+  three times, failpoints 253 / 2 five times, F08–F12 17). Round-1
+  decisions [t3/s1-r1-decisions.md](t3/s1-r1-decisions.md); a local
+  `implementer-high` subagent is fixing them in worktree `../via-wt/t3-s1`
+  (branch `wt/t3-s1`, not pushed). If the session died, inspect that
+  branch and re-dispatch from its last commit. Next: Sol medium re-review
+  in tmux, then merge, gate and push, then the design and contract edits
+  listed in `t3/reports/T3-S1.md`. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). Then S2
   (turn control), S3 (lifecycle) → S5 (F12), S4 (recovery) per design §13. Then Task 4 (`.7.8`), final critique

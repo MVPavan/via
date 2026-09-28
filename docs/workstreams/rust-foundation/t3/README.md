@@ -12,7 +12,7 @@ orchestrator dispatches implementation slices on disjoint files.
 |---|---|---|---|
 | T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 | T3-S0 | Split `engine.rs` and `server.rs` by responsibility; moves only; merged `08fffce` (Sol medium SOUND, `sol-review-S0.md`) | Opus 5.5 medium (`session_01XipfAFqC6UPvZFDzGPoYph`) | `s0.md` |
-| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`) | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`) | `s1.md` |
+| T3-S1 | Lower-layer primitives: Store schema v5 and F12 ops, Host early stop and re-probe, Wire/Route/Adapter stop orders (design §13 S1 at `1a814d6`); round 1 fixes in local worktree branch `wt/t3-s1` | Opus 5.5 high (`session_01YVUZbU8b2HpcRwvyHqKvSB`); round 1: local `implementer-high` subagent | `s1.md`, `s1-r1-decisions.md` |
 
 ## Carried into Task 3
 
@@ -72,3 +72,9 @@ Round 5 on `bf27db6` (final narrow pass): `astra-review-design-r5.md` and
 final decisions in `design-r6-decisions.md` (1–5 sent to S1 directly).
 The design is final after round 6; later findings go to slice code
 reviews.
+
+S1 review on `8d2a7b6` (GPT-6 Sol medium, in two parts):
+`sol-review-S1-store.md` (SOUND WITH CHANGES) and `sol-review-S1-host.md`
+(UNSOUND: the interrupt write discards a raw Store failure). The local
+gate at `8d2a7b6` was clean: default tests 207/2 three times, failpoint
+tests 253/2 five times, F08–F12 17. Decisions are in `s1-r1-decisions.md`.
