@@ -107,6 +107,11 @@ impl Engine {
         // An uncertain pass latches (scope `daemon`); a not-committed proof
         // is recorded against its owner session.
         self.proof_failures(&pass, FailureScope::Request).await;
+        // A pending latch ends the pass: final shutdown's reconciliation
+        // takes over, and no page is read for it.
+        if self.store_failed() {
+            return;
+        }
         if let Some(unread) = self.recovered.unread()
             && let Some(cohort) = unread.cohort
         {
@@ -115,17 +120,18 @@ impl Engine {
     }
 
     /// Design §7.2 row 12 [O1.D10]: reports a pass's absence proofs whose
-    /// commit failed to the failure hook. One that did not commit is scoped:
-    /// its token stays held and the next pass retries it. One whose commit
-    /// may have committed latches. A pass that failed otherwise keeps every
-    /// token and reports nothing. A not-committed proof is recorded against
-    /// its owner session; `scope` covers an uncertain pass, which has no
-    /// owner. The caller holds no lock.
+    /// commit failed to the failure hook, and returns the worst outcome
+    /// reported. One that did not commit is scoped: its token stays held and
+    /// the next pass retries it. One whose commit may have committed
+    /// latches. A pass that failed otherwise keeps every token and reports
+    /// nothing. A not-committed proof is recorded against its owner session;
+    /// `scope` covers an uncertain pass, which has no owner. The caller
+    /// holds no lock.
     pub(super) async fn proof_failures(
         &self,
         pass: &Result<ReprobeReport, AdapterError>,
         scope: FailureScope<'_>,
-    ) {
+    ) -> Option<WriteOutcome> {
         match pass {
             Ok(report) => {
                 for owner in &report.not_committed {
@@ -134,14 +140,29 @@ impl Engine {
                         .finish()
                         .await;
                 }
+                (!report.not_committed.is_empty()).then_some(WriteOutcome::NotCommitted)
             }
-            Err(error) if error.journal_uncertain() => {
-                self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
-                    .finish()
-                    .await;
-            }
-            Err(_) => {}
+            Err(error) => self.proof_error(error, scope).await,
         }
+    }
+
+    /// Design §7.2 row 12 [O1.D10]: reports the error of a re-probe pass or
+    /// of a resumed-paging page to the failure hook. An absence proof whose
+    /// commit may have committed but did not answer latches, whichever call
+    /// carried it, and is returned. Any other error keeps every token and
+    /// reports nothing: the next pass retries. The caller holds no lock.
+    async fn proof_error(
+        &self,
+        error: &AdapterError,
+        scope: FailureScope<'_>,
+    ) -> Option<WriteOutcome> {
+        if !error.journal_uncertain() {
+            return None;
+        }
+        self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
+            .finish()
+            .await;
+        Some(WriteOutcome::Uncertain)
     }
 
     /// Reads one page of the anchors startup reconciliation left unread
@@ -155,7 +176,8 @@ impl Engine {
     /// no anchor of this daemon: paging progresses while its groups run.
     async fn resume_paging(&self, after: Option<String>, cohort: AnchorCohort, deadline: Deadline) {
         // A failed read or reconciliation leaves the page unread: the next
-        // pass retries it from the same cursor.
+        // pass retries it from the same cursor. A page whose absence-proof
+        // commit was uncertain latches first: it may have committed.
         let Ok(owners) = self
             .store
             .cohort_owners_page(after.clone(), ANCHOR_PAGE_LIMIT, cohort)
@@ -163,12 +185,16 @@ impl Engine {
         else {
             return;
         };
-        let Ok(reports) = self
+        let reports = match self
             .adapter
             .recover_cohort_page(after, ANCHOR_PAGE_LIMIT, cohort, deadline)
             .await
-        else {
-            return;
+        {
+            Ok(reports) => reports,
+            Err(error) => {
+                self.proof_error(&error, FailureScope::Request).await;
+                return;
+            }
         };
         self.hold_unread(&owners, &reports);
         let end = owners.len() < ANCHOR_PAGE_LIMIT as usize;

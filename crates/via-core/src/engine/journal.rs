@@ -439,19 +439,23 @@ pub(super) async fn commit_event_at(
 /// advances `record` exactly as a confirmed commit would; an absent one leaves
 /// it. Another writer of the session may have taken the sequence since, so
 /// only an event of this turn at that sequence is its own.
+///
+/// Returns whether the durable event is the turn's `raw_log.incomplete`
+/// (design §7.2 row 6): a write that owes that event, because its own commit
+/// failed, writes it only when this read-back did not find it.
 pub(super) async fn reconcile(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let Some(uncertain) = record.uncertain.take() else {
-        return Ok(());
+        return Ok(false);
     };
     let head = journal.events(&record.session, uncertain.seq, 1).await?;
     let own_turn = json!(record.turn.get());
     match head.first() {
-        None => Ok(()),
+        None => Ok(false),
         Some(event) if event.seq != uncertain.seq || event.event.get("turn") != Some(&own_turn) => {
-            Ok(())
+            Ok(false)
         }
         Some(event) if event.raw_ref == uncertain.raw_ref => {
             if let Some(reference) = &uncertain.raw_ref {
@@ -460,7 +464,7 @@ pub(super) async fn reconcile(
             if uncertain.accepted.is_some() {
                 record.accepted = uncertain.accepted;
             }
-            Ok(())
+            Ok(event.event.get("type").and_then(Value::as_str) == Some("raw_log.incomplete"))
         }
         // Core is the running turn's only writer; another event of it there is not its own.
         Some(_) => Err(StoreError::CorruptEvidence),

@@ -7,6 +7,8 @@
 //! process exit; a sleep only lets time pass, never orders two events.
 #![cfg(feature = "test-failpoints")]
 
+#[path = "support/anchors.rs"]
+mod anchors;
 #[path = "support/failpoints.rs"]
 mod failpoints;
 #[path = "support/hits.rs"]
@@ -1676,6 +1678,131 @@ fn s1_f12_raw_failure_records_incomplete() -> TestResult {
     scoped_end(daemon, &other)
 }
 
+/// How the turn whose `raw_log.incomplete` reply was lost ends.
+#[derive(Clone, Copy, Debug)]
+enum RawEnd {
+    /// The turn's own terminal commits, after the read-back finds the event.
+    Terminal,
+    /// The terminal's first attempt fails, so final shutdown's batch
+    /// commits it.
+    Batch,
+    /// Every later commit fails: the batch is skipped and the turn stays
+    /// running until restart recovery ends it.
+    Restart,
+}
+
+/// Design §7.2 row 6, §7.4 and §9: a protocol failure ends a turn whose raw
+/// log lost the connection's last bytes (the drain's append fails, and
+/// Route's cause stays the protocol failure), so Core commits
+/// `raw_log.incomplete` itself; that commit succeeds but its reply is lost
+/// (`store.commit.reply_lost`) and the daemon latches. The turn's stream
+/// then has exactly one `raw_log.incomplete`, at a dense sequence,
+/// whichever path ends the turn (the terminal, the failure batch, or
+/// restart recovery), and a restart adds none.
+#[test]
+fn s1_f12_raw_incomplete_reply_lost_is_written_once() -> TestResult {
+    for end in [RawEnd::Terminal, RawEnd::Batch, RawEnd::Restart] {
+        raw_incomplete_reply_lost(end)?;
+    }
+    Ok(())
+}
+
+fn raw_incomplete_reply_lost(end: RawEnd) -> TestResult {
+    // A second acceptance is a protocol failure once its own frame is
+    // recorded; the line behind it, written together, is only in Wire's
+    // buffer, so the failure drain records it.
+    let duplicate = json!({"action":"emit_raw","text":
+        "{\"type\":\"accepted\",\"id\":1,\"vendor_turn_id\":\"fake-turn-1\"}\ntail-after-duplicate\n"});
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![accepted(1), gate("first"), duplicate, terminal(1)],
+    ))?;
+    for point in [
+        "raw.append.fail",
+        "store.commit.event",
+        "store.commit.reply_lost",
+        "store.commit.terminal",
+        "store.commit.fail_persistent",
+    ] {
+        sandbox.count(point)?;
+    }
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    // The duplicate frame's append succeeds; the tail's is the next.
+    let append = sandbox.next_hit("raw.append.fail")? + 1;
+    sandbox.arm("raw.append.fail", append, "fail_io")?;
+    // The turn's first event after acceptance is `raw_log.incomplete`; the
+    // writer is held before it, so the next commit is that event's.
+    let event = sandbox.next_hit("store.commit.event")?;
+    sandbox.arm("store.commit.event", event, "pause")?;
+    sandbox.release("first")?;
+    sandbox.ack(&daemon, "raw.append.fail", append, "fail_io")?;
+    sandbox.ack(&daemon, "store.commit.event", event, "pause")?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    match end {
+        RawEnd::Terminal => {}
+        RawEnd::Batch => {
+            let first = sandbox.next_hit("store.commit.terminal")?;
+            sandbox.arm("store.commit.terminal", first, "fail_io")?;
+        }
+        RawEnd::Restart => {
+            // The event itself commits; every later commit fails.
+            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
+            sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
+        }
+    }
+    sandbox.resume_point("store.commit.event", event)?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    let summary = daemon.latched_exit()?;
+    let batches = match end {
+        RawEnd::Terminal | RawEnd::Restart => {
+            json!({"committed": 0, "skipped": u8::from(matches!(end, RawEnd::Restart))})
+        }
+        RawEnd::Batch => json!({"committed": 1, "skipped": 0}),
+    };
+    check(summary["failure_batches"] == batches, || {
+        format!("{end:?}: {summary}")
+    })?;
+    // Stopped with this daemon's failpoints, so a restart runs clean.
+    for point in [
+        "raw.append.fail",
+        "store.commit.event",
+        "store.commit.reply_lost",
+        "store.commit.terminal",
+        "store.commit.fail_persistent",
+    ] {
+        let _ = sandbox.disarm(point);
+    }
+    let once = |events: &[Value], when: &str| -> TestResult {
+        dense(events)?;
+        let logged = event_types(events, 1)
+            .iter()
+            .filter(|kind| *kind == "raw_log.incomplete")
+            .count();
+        check(logged == 1, || {
+            let kinds = event_types(events, 1);
+            format!("{end:?} {when}: {logged} raw_log.incomplete in {kinds:?}")
+        })
+    };
+    let daemon = sandbox.start()?;
+    let events = sandbox.events(&session)?;
+    once(&events, "after restart")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    let warned = first["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|w| w["code"] == "raw_log_incomplete"));
+    check(warned, || format!("{end:?}: unexpected turn 1: {first}"))?;
+    // A second restart adds nothing.
+    daemon.stop_clean()?;
+    let daemon = sandbox.start()?;
+    once(&sandbox.events(&session)?, "after a second restart")?;
+    daemon.stop_clean()
+}
+
 // ------------------------------------------------ re-probe proofs (rows 4, 12)
 
 /// Design §7.2 rows 4 and 12 [s1.6]: an anchor identified write that is
@@ -1776,6 +1903,121 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
         )?;
     }
     daemon.stop_clean()
+}
+
+/// Restarts a stopped daemon over 300 proven synthetic anchors and one
+/// unread one, `1-unread`, whose group (a pid above any `pid_max`) is absent
+/// but not yet proved, all owned by `owner`'s turn 1. Startup reconciliation
+/// stops at its deadline at a page boundary before `1-unread`, so it counts
+/// it unread and the re-probe loop's resumed paging reads it (design §8).
+fn restart_with_unread<'a>(sandbox: &'a Sandbox, owner: &str) -> TestResult<Daemon<'a>> {
+    let store = sandbox.state.join("store.sqlite3");
+    anchors::insert_proven_absent(&store, owner, "0-synthetic", 300)?;
+    let unread = rusqlite::Connection::open(&store)?.execute(
+        "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
+         SELECT '1-unread','g1-unread',a.marker,'/nonexistent',?1,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,4195000,4195000,1,NULL
+         FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
+        [owner],
+    )?;
+    check(unread == 1, || "no real anchor to copy".to_owned())?;
+    let boundary = "core.recovery.page_boundary";
+    sandbox.arm(boundary, 1, "pause")?;
+    let mut daemon = sandbox.launch()?;
+    sandbox.ack(&daemon, boundary, 1, "pause")?;
+    // Recovery's deadline began before the acknowledgement: time only has to
+    // pass until it has, so paging stops with the unread anchor counted.
+    thread::sleep(Duration::from_millis(5_200));
+    sandbox.resume_point(boundary, 1)?;
+    daemon.ready()?;
+    sandbox.disarm(boundary)?;
+    Ok(daemon)
+}
+
+/// Removes the synthetic anchors of [`restart_with_unread`] from a stopped
+/// daemon's Store, then checks every real one is proved absent.
+fn remove_synthetic_anchors(sandbox: &Sandbox) -> TestResult {
+    let store = sandbox.state.join("store.sqlite3");
+    anchors::delete_synthetic(&store, "0-synthetic")?;
+    anchors::delete_synthetic(&store, "1-unread")?;
+    sandbox.verify_anchors()
+}
+
+/// Seeds one completed session, stops the daemon, and restarts it with an
+/// unread anchor (see [`restart_with_unread`]) after `arm` armed the seams.
+fn resumed_paging_daemon(
+    sandbox: &Sandbox,
+    arm: impl FnOnce(&Sandbox) -> TestResult,
+) -> TestResult<Daemon<'_>> {
+    let daemon = sandbox.start()?;
+    let (seed, _) = sandbox.spawn("seed")?;
+    sandbox.wait(&format!("{seed}/1"))?;
+    daemon.stop_clean()?;
+    arm(sandbox)?;
+    restart_with_unread(sandbox, &seed)
+}
+
+/// Design §7.2 row 12 [O1.D10], resumed paging (design §8 step 2): the
+/// absence-proof commit of an anchor read by resumed paging may have
+/// committed but did not answer within the pass bound. That uncertain
+/// outcome latches like a re-probe proof's does, instead of leaving the page
+/// unread for another pass. `1-unread`'s proof commit is held past the
+/// pass's 3 s bound.
+#[test]
+fn s1_f12_resumed_paging_uncertain_proof_latches() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("seed", 1)]))?;
+    let proof = "store.journal.absence";
+    let mut daemon = resumed_paging_daemon(&sandbox, |sandbox| sandbox.arm(proof, 1, "pause"))?;
+    sandbox.ack(&daemon, proof, 1, "pause")?;
+    wait_until("the daemon latches", Duration::from_secs(20), || {
+        !sandbox.runtime.join("via.sock").exists()
+            || sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+    })?;
+    sandbox.resume_point(proof, 1)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let summary = daemon.summary()?;
+    check(
+        status.code() == Some(4) && summary["store_failed"] == true,
+        || format!("expected the latch's exit 4, got {status}: {summary}"),
+    )?;
+    drop(daemon);
+    remove_synthetic_anchors(&sandbox)
+}
+
+/// Design §7.2 row 12, resumed paging: an absence-proof commit that did not
+/// commit (its `host.recovery.absence_commit` seam fails once) leaves the
+/// page unread and the slot held; the next pass reads it again and proves
+/// the anchor. Nothing latches.
+#[test]
+fn s1_f12_resumed_paging_unproved_page_is_retried() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("seed", 1)]))?;
+    let proof = "host.recovery.absence_commit";
+    let mut daemon = resumed_paging_daemon(&sandbox, |sandbox| sandbox.arm(proof, 1, "fail_io"))?;
+    sandbox.ack(&daemon, proof, 1, "fail_io")?;
+    wait_until(
+        "the retried page proves the anchor",
+        Duration::from_secs(30),
+        || {
+            sandbox
+                .query::<i64>(
+                    "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
+                )
+                .is_ok_and(|proved| proved == 1)
+        },
+    )?;
+    let status = sandbox.status()?;
+    check(
+        status["health"] == "healthy" && status["connections"]["held_unproven"] == 0,
+        || format!("the retry latched or kept the slot: {status}"),
+    )?;
+    sandbox.ok(&["daemon", "stop", "--json"])?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    check(exit.code() == Some(0), || {
+        format!("a plain stop exited {exit}: {}", daemon.trace())
+    })?;
+    drop(daemon);
+    remove_synthetic_anchors(&sandbox)
 }
 
 // ------------------------------------------- reads and corruption (§7.3)
@@ -2301,7 +2543,7 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
         sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
         if skipped {
             // The event itself commits; every later commit fails.
-            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
+            let later = sandbox.next_hit("store.commit.fail_persistent")? + 2;
             sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
         }
         sandbox.release("accepted")?;
@@ -2339,6 +2581,90 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
         }
     }
     Ok(())
+}
+
+/// Design §7.4 [O1.D4, r3.17], runtime contracts §7: the failure batch's
+/// write gets no reply (`store.commit.terminal` paused on the batch's own
+/// hit, the writer held before it commits). The batch gives up at its own
+/// bound and is skipped, once and never retried; no terminal is invented
+/// for the turn or its queued successors, which keep `running` and
+/// `queued`; and final shutdown completes its report, abandoning the
+/// stalled Store join to process exit: exit 4. A batch that waited past its
+/// bound would leave the pipeline to the latch deadline instead
+/// (`failure_batches: null`, and a `host_failure`).
+#[test]
+fn s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline() -> TestResult {
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![
+            accepted(1),
+            gate("accepted"),
+            text("lost"),
+            gate("first"),
+            terminal(1),
+        ],
+    ))?;
+    sandbox.count("store.commit.reply_lost")?;
+    sandbox.count("store.commit.terminal")?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("accepted.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    sandbox.resume(&session, &handle, "second")?;
+    sandbox.resume(&session, &handle, "third")?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    // No terminal commits before the batch's: the turn is running until
+    // final shutdown forces it.
+    let batch = sandbox.next_hit("store.commit.terminal")?;
+    sandbox.arm("store.commit.terminal", batch, "pause")?;
+    sandbox.release("accepted")?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    // The batch reached its write; its reply never comes.
+    sandbox.ack(&daemon, "store.commit.terminal", batch, "pause")?;
+    // The watchdog is generous and asserts no duration: on a loaded machine
+    // the deadline (`failed_at + 10 s`) may pass before shutdown returns,
+    // and only the outcome is the contract. A batch that waited past its
+    // own bound leaves the pipeline to that deadline, and shows below as
+    // `failure_batches: null` and a `host_failure`.
+    let exit = daemon.exit(Duration::from_secs(90))?;
+    let summary = daemon.summary()?;
+    check(
+        exit.code() == Some(4) && summary["store_failed"] == true,
+        || format!("expected the latch's exit 4, got {exit}: {summary}"),
+    )?;
+    check(
+        summary["failure_batches"] == json!({"committed": 0, "skipped": 1}),
+        || format!("unexpected summary: {summary}"),
+    )?;
+    check(summary["store"] == "join_timed_out", || {
+        format!("the stalled Store join was not abandoned: {summary}")
+    })?;
+    // The turn and its two queued successors stay unresolved.
+    check(summary["unresolved_turns"] == 3, || {
+        format!("unexpected unresolved turns: {summary}")
+    })?;
+    check(summary["host_failure"].is_null(), || {
+        format!("Host reconciliation failed: {summary}")
+    })?;
+    sandbox.verify_anchors()?;
+    let turns: String = sandbox.query(&format!(
+        "SELECT group_concat(state, ',') FROM
+         (SELECT state FROM turns WHERE session_id='{session}' ORDER BY number)"
+    ))?;
+    check(turns == "running,queued,queued", || {
+        format!("turns: {turns}")
+    })?;
+    let invented: i64 = sandbox.query(&format!(
+        "SELECT (SELECT count(*) FROM turns WHERE session_id='{session}'
+                 AND envelope IS NOT NULL)
+              + (SELECT count(*) FROM events WHERE session_id='{session}'
+                 AND json_extract(event,'$.type') IN ('turn.ended','raw_log.incomplete'))"
+    ))?;
+    check(invented == 0, || {
+        format!("{invented} terminal records were invented")
+    })
 }
 
 /// Design §6.8 steps 3–6, §7.4 [r3.3, r4.2, r4.9], carried from S2:

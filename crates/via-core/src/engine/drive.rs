@@ -85,8 +85,9 @@ enum Decision {
 
 /// How a terminal commits (design §7.2): retried once at the same sequence
 /// (rows 7 and 9), and with the `raw_log.incomplete` the turn's first
-/// failure dropped, sequenced just before `turn.ended` in the same
-/// transaction (row 6).
+/// failure dropped or left uncertain, sequenced just before `turn.ended` in
+/// the same transaction (row 6), unless the terminal's durable read-back
+/// finds the turn already has it.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Commit {
     pub(super) retry: bool,
@@ -1185,7 +1186,7 @@ impl Engine {
     ) -> Result<Durable, Unended> {
         // A failed read writes nothing; a corrupt one latches (design §7.1),
         // and the hook sees it as this write's outcome.
-        journal::reconcile(journal, &mut record)
+        let logged = journal::reconcile(journal, &mut record)
             .await
             .map_err(|error| Unended {
                 error: ApiError::STORE,
@@ -1201,7 +1202,9 @@ impl Engine {
             })?;
         let first = head.next();
         let mut seq = first;
-        if mode.raw_owed {
+        // The read-back decides: an uncertain `raw_log.incomplete` that
+        // committed is not written again.
+        if mode.raw_owed && !logged {
             let connection_id =
                 connection_id(&started.session, started.turn).map_err(|_| ApiError::STORE)?;
             let incomplete = Event {

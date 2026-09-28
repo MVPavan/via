@@ -18,7 +18,7 @@ use super::latch::{FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome};
 use super::queue::Slot;
 use super::{Engine, Started, Terminal, TurnRecord, lock};
 use crate::api::{Event, EventBody, FailureClass, rfc3339};
-use crate::{Deadline, TurnNumber};
+use crate::{Deadline, SessionId, TurnNumber};
 
 /// Bound of the batch's re-read of the turn and its session's queued rows.
 const BATCH_READ: Duration = Duration::from_secs(2);
@@ -33,7 +33,8 @@ pub(super) struct AffectedTurn {
     pub(super) started: Started,
     pub(super) record: TurnRecord,
     pub(super) terminal: Terminal,
-    /// Its `raw_log.incomplete` is owed: the turn's first failure dropped it.
+    /// Its `raw_log.incomplete` is owed: the turn's first failure dropped it or
+    /// left it uncertain. The batch's read-back may find it durable.
     pub(super) raw_incomplete: bool,
 }
 
@@ -69,6 +70,31 @@ impl Engine {
         std::mem::take(&mut *lock(&self.affected))
     }
 
+    /// Step 1 of the batch (design §7.4): `None` when a read failed,
+    /// `Some(None)` when the turn already has a result, otherwise the rows of
+    /// its session's queued turns and whether its owed `raw_log.incomplete`
+    /// is already durable: an uncertain one that committed is not written
+    /// again. The caller bounds the reads.
+    async fn batch_reads(
+        &self,
+        session: &SessionId,
+        number: TurnNumber,
+        record: &mut TurnRecord,
+        queued: &[TurnNumber],
+    ) -> Option<Option<(Vec<(TurnNumber, QueuedTurn)>, bool)>> {
+        if self.store.result(session, number).await.ok()?.is_some() {
+            return Some(None);
+        }
+        let logged = journal::reconcile(&self.store, record).await.ok()?;
+        let mut rows = Vec::with_capacity(queued.len());
+        for turn in queued {
+            if let Some(row) = self.store.queued_turn(session, *turn).await.ok()? {
+                rows.push((*turn, row));
+            }
+        }
+        Some(Some((rows, logged)))
+    }
+
     /// Resolves one affected turn (design §7.4 steps 1 to 3), each step
     /// bounded by 2 s and by `deadline`. The caller holds no lock.
     pub(super) async fn resolve_affected(
@@ -91,23 +117,12 @@ impl Engine {
             .instant()
             .min(tokio::time::Instant::now() + BATCH_READ);
         // Step 1: the earlier outcome first; a read that fails skips the batch.
-        let reads = async {
-            if self.store.result(session, number).await.ok()?.is_some() {
-                return Some(None);
-            }
-            journal::reconcile(&self.store, &mut record).await.ok()?;
-            let mut rows = Vec::with_capacity(queued.len());
-            for turn in &queued {
-                if let Some(row) = self.store.queued_turn(session, *turn).await.ok()? {
-                    rows.push((*turn, row));
-                }
-            }
-            Some(Some(rows))
-        };
-        let (turns, rows): (Vec<TurnNumber>, Vec<QueuedTurn>) =
+        let reads = self.batch_reads(session, number, &mut record, &queued);
+        let (turns, rows, logged): (Vec<TurnNumber>, Vec<QueuedTurn>, bool) =
             match tokio::time::timeout_at(read_by, reads).await {
-                Ok(Some(Some(rows))) if rows.len() <= FAILURE_BATCH_CANCELLATIONS => {
-                    rows.into_iter().unzip()
+                Ok(Some(Some((rows, logged)))) if rows.len() <= FAILURE_BATCH_CANCELLATIONS => {
+                    let (turns, rows) = rows.into_iter().unzip();
+                    (turns, rows, logged)
                 }
                 Ok(Some(None)) => {
                     // A terminal that persisted is kept; no batch is issued.
@@ -134,7 +149,7 @@ impl Engine {
             started: started.clone(),
             record,
             terminal,
-            raw_incomplete,
+            raw_incomplete: raw_incomplete && !logged,
         };
         let write = async {
             // A failed head read writes nothing; a corrupt one is reported
