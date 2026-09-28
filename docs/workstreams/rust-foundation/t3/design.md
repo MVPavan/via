@@ -12,7 +12,8 @@ are in `s2-r1-decisions.md` (`[s2.1]`) and `reports/T3-S2.md` (`[S2]`), S3's in
 `s3-r1-decisions.md` (`[s3.1]`) and `reports/T3-S3.md` (`[S3]`), S4's
 in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`), and
 S5's in `s5-r1-decisions.md` (`[s5.1]`) and `reports/T3-S5.md` (`[S5]`).
-The whole-task review's decisions are in `t3-review-decisions.md` (`[t3r.1]`).
+The whole-task review's decisions are in `t3-review-decisions.md` (`[t3r.1]`),
+and the force-row fix in `reports/T3-force-row.md` (`[T3-FR]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -148,7 +149,10 @@ A **stop order** asks a submitted turn to stop:
 - `requested_at`: wall time;
 - `force_at` and `close_by`: absolute monotonic instants.
 
-Daemon force keeps the shared force watch. A stop order is per turn.
+Daemon force keeps the shared force watch. It carries the monotonic instant
+of the first raise (`Signal::raise_force`, the one production writer; the
+first raise wins), and "forced" is that value's presence [t3r.5]. A stop
+order is per turn.
 
 **Deadline origin** [r1.11]. The wall deadline and the idle deadline are
 both computed from the submission clock. That clock is taken immediately
@@ -882,7 +886,10 @@ policy.
    reconciliation's evidence each count (runtime §6.2) [r4.2]. With the
    early stop wired, Host may end the vendor before Route sees the force;
    a vendor exit Route observes under the daemon force is the force row
-   (`ForceStopped`), not `process_exited` [S3];
+   (`ForceStopped`), not `process_exited` [S3]. Route's `finalize` reads
+   the force after a recorded exit, as the pre-terminal EOF path already
+   did, so an exit Wire recorded before Route saw the force still takes the
+   force row [T3-FR];
 6. the closure pass.
 
 **Shutdown budgets** [r4.2, r5.10]. This is the one table of final-shutdown
@@ -921,7 +928,16 @@ a Store operation, a session head, or `admission`.
   alone), it sets the ledger's sticky `stopping` flag and snapshots the live
   controls.
   - It sends `Stop` to all of the snapshot's **`armed`** entries
-    **concurrently**, each bounded at `now + 3 s` [r5.3, r6.1].
+    **concurrently**, each bounded at the force instant `+ 3 s`, never at
+    a fresh `now + 3 s` [r5.3, r6.1, t3r.5].
+  - **`Stop` delivery** (runtime §7) [t3r.5]. A `Stop` is always written
+    once, even when the deadline has already passed; only the wait for its
+    reply is bounded by the deadline. A reply read at or after the deadline
+    records no `StopFacts.forced`, and the cleanup stays `uncertain` for
+    step 4. The control lock and the write are not deadline-bounded: an
+    anchor socket the kernel will not accept bytes on is a stated limit,
+    and shutdown's bounded join still ends the task. Route's own close
+    keeps its own deadline and its truthful `stopped_live`.
   - It sends no `Stop` to a pre-ARM anchor. The anchor's pre-ARM loop
     treats `Stop` as an invalid control and exits 1 [r6.1].
   - It polls no Core code, dispatcher or Route, and it takes no Core lock.
@@ -931,6 +947,15 @@ a Store operation, a session head, or `admission`.
     mutex.
   - A control registered after the snapshot sees `stopping`. It is handled
     by its phase, as below, under the original force deadline.
+  - **`stopping` is derived from the force** [t3r.5]. Registration, the ARM
+    gate and the `Spawned` marking each read the force value (a
+    non-blocking watch `borrow()`) inside their ledger-mutex section. The
+    first section to see it set, whether one of these or the task's
+    snapshot, sets the sticky `stopping` with deadline force instant
+    `+ 3 s` and fixes the entries `armed` at that moment for the task. A
+    delayed task therefore cannot let an ARM pass after the force. Lock
+    order: the ledger mutex, then the watch's value lock, one way;
+    `raise_force` takes nothing else.
 - **Ledger phases** [r6.1]. Each ledger entry has a phase: `verified`,
   `arming` or `armed`. Every phase change is made under the ledger mutex.
   - **ARM gate.** The owner's ARM gate reads `stopping` under the ledger
@@ -954,8 +979,9 @@ a Store operation, a session head, or `admission`.
     with no early stop, keeps the fresh 3 s.
   - **Interactions.** Each phase change is one short ledger-mutex section,
     taken alone. No new wakes. Every entry is covered by exactly one of
-    three: the early stop (`armed` at snapshot time), the owner's own
-    `Stop` (armed after the snapshot), or the ARM gate refusal (pre-ARM).
+    three: the early stop (`armed` when `stopping` was first set), the
+    owner's own `Stop` (`arming` then, armed later), or the ARM gate or
+    registration refusal (`verified`, or registered later) [t3r.5].
     So no live vendor is missed, and no pre-ARM anchor ever gets a `Stop`.
 - **Single owner of each control.** Host's per-anchor control owner is the
   only writer to an anchor control. Route's own stop requests (§2 rules 2
@@ -1627,6 +1653,8 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `core.close.before_subscribe` | pauses a close caller after its order check and before it subscribes to the close watch (§4 steps 2 and 5) [r6.6] |
 | `core.run.before_handoff` | the run loop, before it hands a forced turn to final shutdown [r3.3] |
 | `core.shutdown.before_forced_terminal` | final shutdown, before a forced turn's terminal commit [r3.4] |
+| `wire.exit.observed` | Wire's `wait_exit` has recorded the vendor exit and not yet returned it to Route [T3-FR] |
+| `host.early_stop.woken` | Host's early-stop task has seen the force, before it sets `stopping` (delayed-task tests) [t3r.5] |
 | `core.shutdown.evidence_stopped_live`, `core.shutdown.evidence_absent` | final shutdown, acknowledged where the forced terminal's calculation (`forced_facts`) reads the turn's reconciliation record with `forced`, or with `cleanup == Quiescent`; both before `core.shutdown.before_forced_terminal`. They report reconciliation-record facts only: cleanup proved by Route's close fires neither [t3r.7] |
 | `store.request.not_enqueued` | `NotEnqueued` (§7.1) |
 | `store.writer.lost` | `WriterLost` (§7.1) |
@@ -1747,6 +1775,9 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f12_status_reports_latest_failure` | `store_failure` shape after two scoped failures (`count: 2`, latest scope and addresses); an artifact scan finds no prompt, payload or handle (§7.5) |
 | `s1_f12_latch_window_bound_and_host_stop` | `store.commit.reply_lost`: `daemon/status` shows `store_failed` inside the window; new connections are refused after `failed_at + 5 s`; exit 4 by `failed_at + 10 s`; the running group is gone within 3 s of the latch (harness timestamps against the failpoint ack) (§7.4) |
 | `s1_f12_latch_batch_commits_or_is_skipped` | uncertain event on a turn with queued successors: the batch commits `failed(store)` and the cancellations. With `store.commit.fail_persistent` also armed: skipped within 2 s, `failure_batches.skipped: 1` (§7.4) |
+| `s1_f12_exit_observed_under_force_is_the_force_row` | the vendor's exit is paused at `wire.exit.observed`; `daemon stop --force` is accepted; after release the turn is the force row, not `failed(process_exited)` [T3-FR] |
+| Host early stop, delayed task (`s1_host`: `a_force_older_than_the_early_stop_task_bounds_a_late_registered_cleanup`, `a_control_registering_before_the_delayed_early_stop_task_runs_is_stopped_at_once`, `the_arm_gate_refuses_after_the_force_though_the_early_stop_task_is_delayed`) | the task is held at `host.early_stop.woken`: late registration gets the force instant's deadline, and no ARM passes after the force [t3r.5] |
+| Host unit (`stopping_is_the_force_instant_plus_three_seconds_in_every_section`, the ARM-gate and ownership tests, `a_stop_past_its_deadline_*`, `a_ready_reply_after_the_deadline_records_no_forced_evidence`) | `stopping` is exactly force instant + 3 s in every section; a `Stop` past its deadline is still written; a reply read at or after the deadline records no forced evidence [t3r.5] |
 | `s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline` | the batch's Store reply is stalled: one skipped batch, no invented terminal, the turns stay `running`/`queued`, exit 4 within the latch deadline (§7.4) [t3r.4] |
 | `a_failed_proof_before_a_page_read_failure_fails_the_restart_close` (engine) | a failed absence-proof write on page 1, then a page-read error on page 2: restart close fails startup and commits no `session.closed` [t3r.2] |
 | `s1_f12_latch_cancel_and_close_return_store_error` | after the latch, `cancel` and `close` return `store_error`, and the force stop cleans up (§7.4, O1.D13) |

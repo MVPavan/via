@@ -26,8 +26,21 @@ whether the design had to be reinterpreted.
 | Slice | Agent | Size (prod) | Fix rounds | First-review important findings | Rule breaches | Notes |
 |---|---|---|---|---|---|---|
 | T3 review X (decisions 1–4) | `implementer-sonnet-xhigh` | ~250 lines prod (Core reprobe, close, drive, batch, journal; Host re-probe) | 2 | 1 important (Host discarded a failed proof before a later error), 1 minor (clock-bound test) | none; kept the dispatch trailer against a harness reminder | removed an outer timeout on its own judgement and Sol confirmed it; round 2 picked the simpler of two fixes with callers checked |
+| T3 review Y (decisions 6–9) | `implementer-sonnet` | ~20 lines prod (CLI client) + ~40 test-seam lines (Core stop) | 3 | 1 major (§11 ordering proof used Host proxies); round 2 had 1 important (the seam re-read a record rather than the terminal's input) | 2 commits used a harness trailer instead of the dispatch trailer; an intermittent failure reported without its log | the CLI fix and the characterization tests were right the first time; the proof-quality items needed two more rounds |
+| T3 force-row + decision 5 | `implementer-sonnet-xhigh` | ~40 lines (Route, Wire seam) + ~300 (force watch type across 5 crates, Host ledger, stop delivery) | force row 1; decision 5 3 | force row: none (design-doc minor only). Decision 5 round 1 UNSOUND: 2 important (a second force watch published out of order; delayed-watcher window left open). Round 2: 1 important (a late reply counted as evidence), plus a spec gap | round 1: 2 commits with a deliberately failing tree; none after the correction | strong diagnosis (deterministic seam, 30/30 RED, 0/1200 after); its first decision-5 design picked the narrow carrier over the owning one, and needed the orchestrator's design calls; it caught its own non-exercising test draft |
 
-Interim (not yet merged):
+## Early read (2026-09-28, three Sonnet workers on the Task 3 review)
 
-- T3 review Y (`implementer-sonnet`, decisions 6–9): round 1 used Host-hit proxies for the §11 ordering proof (major). Round 2's seam re-read a record instead of observing the terminal's input (important). In round 3. Rule breaches: two commits carried a harness trailer instead of the dispatch trailer; one intermittent failure reported without its log.
-- T3 force-row (`implementer-sonnet-xhigh`): found and fixed the Route finalize race with a deterministic seam (30/30 RED, 0/1200 after), and the Sol review found no code problems. Rule breach: two commits with a deliberately failing tree. Its decision 5 round 1 was UNSOUND: it added a second force watch published out of order with the bool, and did not close the delayed-watcher window. In round 2.
+- Diagnosis and bounded fixes: comparable to Opus. X and the force-row
+  diagnosis converged quickly, with failure-first evidence of the same
+  quality as Opus's slices.
+- Design judgement under an open brief: weaker. Decision 5's first attempt
+  chose the least-disruptive carrier (a second watch) over the owning one and
+  left the core window open; Y's ordering proof needed two further rounds to
+  observe the right values. Opus's slices also needed 2–4 rounds, but its
+  first rounds rarely came back UNSOUND on the core mechanism (T3-S5 once).
+- Rule adherence: mixed. Failing-tree commits and a harness-trailer switch
+  each happened once and did not recur after correction.
+- Working hypothesis: Sonnet xhigh suits bounded fixes with the design
+  settled in the brief; state the owning mechanism explicitly when the
+  design leaves a choice open. Keep observing on Task 4.
