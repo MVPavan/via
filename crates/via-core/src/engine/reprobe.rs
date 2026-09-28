@@ -107,6 +107,11 @@ impl Engine {
         // An uncertain pass latches (scope `daemon`); a not-committed proof
         // is recorded against its owner session.
         self.proof_failures(&pass, FailureScope::Request).await;
+        // A pending latch ends the pass: final shutdown's reconciliation
+        // takes over, and no page is read for it.
+        if self.store_failed() {
+            return;
+        }
         if let Some(unread) = self.recovered.unread()
             && let Some(cohort) = unread.cohort
         {
@@ -135,12 +140,20 @@ impl Engine {
                         .await;
                 }
             }
-            Err(error) if error.journal_uncertain() => {
-                self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
-                    .finish()
-                    .await;
-            }
-            Err(_) => {}
+            Err(error) => self.proof_error(error, scope).await,
+        }
+    }
+
+    /// Design §7.2 row 12 [O1.D10]: reports the error of a re-probe pass or
+    /// of a resumed-paging page to the failure hook. An absence proof whose
+    /// commit may have committed but did not answer latches, whichever call
+    /// carried it. Any other error keeps every token and reports nothing:
+    /// the next pass retries. The caller holds no lock.
+    async fn proof_error(&self, error: &AdapterError, scope: FailureScope<'_>) {
+        if error.journal_uncertain() {
+            self.store_failure(FailureSite::Absence, WriteOutcome::Uncertain, scope)
+                .finish()
+                .await;
         }
     }
 
@@ -155,7 +168,8 @@ impl Engine {
     /// no anchor of this daemon: paging progresses while its groups run.
     async fn resume_paging(&self, after: Option<String>, cohort: AnchorCohort, deadline: Deadline) {
         // A failed read or reconciliation leaves the page unread: the next
-        // pass retries it from the same cursor.
+        // pass retries it from the same cursor. A page whose absence-proof
+        // commit was uncertain latches first: it may have committed.
         let Ok(owners) = self
             .store
             .cohort_owners_page(after.clone(), ANCHOR_PAGE_LIMIT, cohort)
@@ -163,12 +177,16 @@ impl Engine {
         else {
             return;
         };
-        let Ok(reports) = self
+        let reports = match self
             .adapter
             .recover_cohort_page(after, ANCHOR_PAGE_LIMIT, cohort, deadline)
             .await
-        else {
-            return;
+        {
+            Ok(reports) => reports,
+            Err(error) => {
+                self.proof_error(&error, FailureScope::Request).await;
+                return;
+            }
         };
         self.hold_unread(&owners, &reports);
         let end = owners.len() < ANCHOR_PAGE_LIMIT as usize;

@@ -7,6 +7,8 @@
 //! process exit; a sleep only lets time pass, never orders two events.
 #![cfg(feature = "test-failpoints")]
 
+#[path = "support/anchors.rs"]
+mod anchors;
 #[path = "support/failpoints.rs"]
 mod failpoints;
 #[path = "support/hits.rs"]
@@ -1776,6 +1778,121 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
         )?;
     }
     daemon.stop_clean()
+}
+
+/// Restarts a stopped daemon over 300 proven synthetic anchors and one
+/// unread one, `1-unread`, whose group (a pid above any `pid_max`) is absent
+/// but not yet proved, all owned by `owner`'s turn 1. Startup reconciliation
+/// stops at its deadline at a page boundary before `1-unread`, so it counts
+/// it unread and the re-probe loop's resumed paging reads it (design §8).
+fn restart_with_unread<'a>(sandbox: &'a Sandbox, owner: &str) -> TestResult<Daemon<'a>> {
+    let store = sandbox.state.join("store.sqlite3");
+    anchors::insert_proven_absent(&store, owner, "0-synthetic", 300)?;
+    let unread = rusqlite::Connection::open(&store)?.execute(
+        "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version,pid,pgid,start_ticks,absence_time)
+         SELECT '1-unread','g1-unread',a.marker,'/nonexistent',?1,1,a.uid,a.boot_id,a.pid_namespace,'arm_intent',1,4195000,4195000,1,NULL
+         FROM anchors a WHERE a.pid IS NOT NULL LIMIT 1",
+        [owner],
+    )?;
+    check(unread == 1, || "no real anchor to copy".to_owned())?;
+    let boundary = "core.recovery.page_boundary";
+    sandbox.arm(boundary, 1, "pause")?;
+    let mut daemon = sandbox.launch()?;
+    sandbox.ack(&daemon, boundary, 1, "pause")?;
+    // Recovery's deadline began before the acknowledgement: time only has to
+    // pass until it has, so paging stops with the unread anchor counted.
+    thread::sleep(Duration::from_millis(5_200));
+    sandbox.resume_point(boundary, 1)?;
+    daemon.ready()?;
+    sandbox.disarm(boundary)?;
+    Ok(daemon)
+}
+
+/// Removes the synthetic anchors of [`restart_with_unread`] from a stopped
+/// daemon's Store, then checks every real one is proved absent.
+fn remove_synthetic_anchors(sandbox: &Sandbox) -> TestResult {
+    let store = sandbox.state.join("store.sqlite3");
+    anchors::delete_synthetic(&store, "0-synthetic")?;
+    anchors::delete_synthetic(&store, "1-unread")?;
+    sandbox.verify_anchors()
+}
+
+/// Seeds one completed session, stops the daemon, and restarts it with an
+/// unread anchor (see [`restart_with_unread`]) after `arm` armed the seams.
+fn resumed_paging_daemon(
+    sandbox: &Sandbox,
+    arm: impl FnOnce(&Sandbox) -> TestResult,
+) -> TestResult<Daemon<'_>> {
+    let daemon = sandbox.start()?;
+    let (seed, _) = sandbox.spawn("seed")?;
+    sandbox.wait(&format!("{seed}/1"))?;
+    daemon.stop_clean()?;
+    arm(sandbox)?;
+    restart_with_unread(sandbox, &seed)
+}
+
+/// Design §7.2 row 12 [O1.D10], resumed paging (design §8 step 2): the
+/// absence-proof commit of an anchor read by resumed paging may have
+/// committed but did not answer within the pass bound. That uncertain
+/// outcome latches like a re-probe proof's does, instead of leaving the page
+/// unread for another pass. `1-unread`'s proof commit is held past the
+/// pass's 3 s bound.
+#[test]
+fn s1_f12_resumed_paging_uncertain_proof_latches() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("seed", 1)]))?;
+    let proof = "store.journal.absence";
+    let mut daemon = resumed_paging_daemon(&sandbox, |sandbox| sandbox.arm(proof, 1, "pause"))?;
+    sandbox.ack(&daemon, proof, 1, "pause")?;
+    wait_until("the daemon latches", Duration::from_secs(20), || {
+        !sandbox.runtime.join("via.sock").exists()
+            || sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+    })?;
+    sandbox.resume_point(proof, 1)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    let summary = daemon.summary()?;
+    check(
+        status.code() == Some(4) && summary["store_failed"] == true,
+        || format!("expected the latch's exit 4, got {status}: {summary}"),
+    )?;
+    drop(daemon);
+    remove_synthetic_anchors(&sandbox)
+}
+
+/// Design §7.2 row 12, resumed paging: an absence-proof commit that did not
+/// commit (its `host.recovery.absence_commit` seam fails once) leaves the
+/// page unread and the slot held; the next pass reads it again and proves
+/// the anchor. Nothing latches.
+#[test]
+fn s1_f12_resumed_paging_unproved_page_is_retried() -> TestResult {
+    let sandbox = Sandbox::new(&scripts(&[completes("seed", 1)]))?;
+    let proof = "host.recovery.absence_commit";
+    let mut daemon = resumed_paging_daemon(&sandbox, |sandbox| sandbox.arm(proof, 1, "fail_io"))?;
+    sandbox.ack(&daemon, proof, 1, "fail_io")?;
+    wait_until(
+        "the retried page proves the anchor",
+        Duration::from_secs(30),
+        || {
+            sandbox
+                .query::<i64>(
+                    "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
+                )
+                .is_ok_and(|proved| proved == 1)
+        },
+    )?;
+    let status = sandbox.status()?;
+    check(
+        status["health"] == "healthy" && status["connections"]["held_unproven"] == 0,
+        || format!("the retry latched or kept the slot: {status}"),
+    )?;
+    sandbox.ok(&["daemon", "stop", "--json"])?;
+    let exit = daemon.exit(Duration::from_secs(15))?;
+    check(exit.code() == Some(0), || {
+        format!("a plain stop exited {exit}: {}", daemon.trace())
+    })?;
+    drop(daemon);
+    remove_synthetic_anchors(&sandbox)
 }
 
 // ------------------------------------------- reads and corruption (§7.3)
