@@ -88,7 +88,7 @@ pub(super) fn validate_state(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn current_uid() -> Result<u32, StoreError> {
+pub(super) fn current_uid() -> Result<u32, StoreError> {
     // Linux S1 reads its own kernel process metadata; no vendor environment is inspected.
     let status = fs::read_to_string("/proc/self/status")
         .map_err(|error| StoreError::Open(error.to_string()))?;

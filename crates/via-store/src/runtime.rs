@@ -53,6 +53,7 @@ pub enum StoreError {
     /// The State directory or database cannot be opened safely.
     #[error("Store open failed: {0}")]
     Open(String),
+
     /// A mutation failed before a positive commit receipt.
     #[error("Store write failed: {0}")]
     Write(String),
@@ -636,6 +637,8 @@ pub struct Store {
     raw_sender: SyncSender<RawCommand>,
     writer_join: Option<JoinHandle<()>>,
     raw_join: Option<JoinHandle<()>>,
+    /// Released after `Drop` joined the workers: the last field.
+    _lock: StoreLock,
 }
 
 /// Releases a stalled raw worker when dropped.
@@ -818,12 +821,62 @@ enum RawCommand {
     Shutdown,
 }
 
+/// `<state>/store.lock`, held for the life of the [`Store`] opened under
+/// it: VIA's writer exclusion for the State directory (runtime §6.1). One
+/// daemon holds it; a writer that ignores it is unsupported.
+pub struct StoreLock {
+    _file: File,
+}
+
+impl StoreLock {
+    /// Takes `<state>/store.lock` without waiting; [`StoreError::Open`]
+    /// when another holder has it (the State directory is in use by another
+    /// VIA daemon) or the lock file is unsafe.
+    pub fn acquire(state: &Path) -> Result<Self, StoreError> {
+        let path = state.join("store.lock");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.file_type().is_file()
+                || metadata.uid() != current_uid()?
+                || metadata.mode() & 0o777 != 0o600)
+        {
+            return Err(StoreError::Open(format!(
+                "unsafe VIA lock file: {}",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(&path)
+            .map_err(|error| StoreError::Open(format!("store.lock: {error}")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(StoreError::Open(
+                "store.lock is held: the State directory is in use by another VIA daemon"
+                    .to_owned(),
+            )),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(StoreError::Open(format!("store.lock: {error}")))
+            }
+        }
+    }
+}
+
 /// The read-only connection that checks an existing Store before any
-/// mutation (runtime §6, F11). With no `-wal` file every committed page is
-/// in the main file, and the caller holds `store.lock`, so it is read as
-/// immutable: a refused Store gets no `-wal` or `-shm` sidecar. A `-wal`
-/// left by a crash is read through normally.
-fn probe(db: &Path) -> rusqlite::Result<Connection> {
+/// mutation (runtime §6, F11). It runs only under `lock`, so no VIA writer
+/// can change the file meanwhile. With no `-wal` file every committed page
+/// is in the main file, so it is read as immutable: a refused Store gets no
+/// `-wal` or `-shm` sidecar. A `-wal` left by a crash is read through an
+/// ordinary read-only connection, since `immutable` ignores the WAL
+/// (sqlite.org/uri.html) and no read-only open reads a WAL without its
+/// wal-index (sqlite.org/wal.html, "Read-Only Databases"). Limit: when the
+/// `-shm` is missing, SQLite creates it in the State directory, even for a
+/// Store it then refuses.
+fn probe(db: &Path, _lock: &StoreLock) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
@@ -844,15 +897,23 @@ fn probe(db: &Path) -> rusqlite::Result<Connection> {
 }
 
 impl Store {
-    /// Opens `<state>/store.sqlite3`, refusing an unsafe, older or newer
-    /// Store before mutation. Only a file this call creates is initialized.
+    /// Opens `<state>/store.sqlite3` under a [`StoreLock`] it takes first,
+    /// refusing an unsafe, older or newer Store before mutation. Only a file
+    /// this call creates is initialized.
     pub fn open(state: &Path) -> Result<Self, StoreError> {
+        validate_state(state)?;
+        Self::open_locked(state, StoreLock::acquire(state)?)
+    }
+
+    /// [`Store::open`] under `lock`, which the Store holds until it drops.
+    pub fn open_locked(state: &Path, lock: StoreLock) -> Result<Self, StoreError> {
         validate_state(state)?;
         let db = state.join("store.sqlite3");
         let created = !db.exists();
         if !created {
             validate_regular(&db)?;
-            let readonly = probe(&db).map_err(|error| StoreError::Open(error.to_string()))?;
+            let readonly =
+                probe(&db, &lock).map_err(|error| StoreError::Open(error.to_string()))?;
             let version: i64 = readonly
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -914,6 +975,7 @@ impl Store {
             raw_sender,
             writer_join: Some(writer_join),
             raw_join: Some(raw_join),
+            _lock: lock,
         })
     }
 
@@ -1479,7 +1541,7 @@ use anchor::{
     commit_vendor_facts, count_unproven_anchors, read_anchor_owners, read_anchor_records,
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
-use sql::{configure, validate_regular, validate_state, writer_loop};
+use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};
 
 #[cfg(test)]
 mod tests {

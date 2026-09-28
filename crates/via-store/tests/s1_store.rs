@@ -122,6 +122,32 @@ fn fresh_store_is_v5_and_a_v4_store_is_refused() {
     assert_eq!(fs::read(&db).unwrap(), before);
 }
 
+/// T3-S3 round 1, decision 5 (runtime §6.1): a Store is opened, and an
+/// existing file probed, only under `store.lock`, the writer exclusion the
+/// probe relies on. While another holder has the lock, `open` is refused
+/// before the file is read.
+#[test]
+fn a_store_opens_only_under_store_lock() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = private_dir();
+    drop(Store::open(root.path()).unwrap());
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.path().join("store.lock"))
+        .unwrap();
+    holder.try_lock().unwrap();
+    let Err(error) = Store::open(root.path()) else {
+        panic!("a Store opened while another holder had store.lock");
+    };
+    assert!(error.to_string().contains("store.lock"), "{error}");
+    drop(holder);
+    drop(Store::open(root.path()).unwrap());
+}
+
 /// Design §4 and §10: `Closing` gates `resume` (a refusal, not a failure),
 /// the close's cancellations record `cancel_cause = 'close'`, and `Closed`
 /// derives `cancelled_turns` and `cleanup` from durable rows, storing the

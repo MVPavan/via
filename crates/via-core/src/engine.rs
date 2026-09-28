@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 use crate::api::{Cancel, Exit, Failure, FailureClass, RawSpan, Warning};
 use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
-use via_store::{Store, StoreClient};
+use via_store::{Store, StoreClient, StoreLock};
 
 mod close;
 mod control;
@@ -232,21 +232,39 @@ impl Engine {
         fake: FakeConfig,
         binary: PathBuf,
     ) -> Result<Self, String> {
-        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT)
+        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT, None)
     }
 
-    /// `open` with the dispatcher-start channel's capacity; unit tests lower it.
+    /// [`Engine::open`] under `lock`, the `store.lock` daemon main took
+    /// before any State mutation (runtime §6.1); the Store holds it.
+    pub fn open_locked(
+        state: &Path,
+        runtime: &Path,
+        fake: FakeConfig,
+        binary: PathBuf,
+        lock: StoreLock,
+    ) -> Result<Self, String> {
+        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT, Some(lock))
+    }
+
+    /// `open` with the dispatcher-start channel's capacity, which unit tests
+    /// lower, and the `store.lock` already taken, if any.
     fn open_with(
         state: &Path,
         runtime: &Path,
         fake: FakeConfig,
         binary: PathBuf,
         start_capacity: usize,
+        lock: Option<StoreLock>,
     ) -> Result<Self, String> {
         // Test builds only: the named failpoints activate before any Store write.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::activate_from_environment()?;
-        let owner = Store::open(state).map_err(|error| error.to_string())?;
+        let owner = match lock {
+            Some(lock) => Store::open_locked(state, lock),
+            None => Store::open(state),
+        }
+        .map_err(|error| error.to_string())?;
         let store = owner.client();
         let adapter = AdapterRuntime::new(
             AdapterRuntimeConfig {

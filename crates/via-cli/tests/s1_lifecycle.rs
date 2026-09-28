@@ -715,6 +715,70 @@ fn s1_f11_newer_or_corrupt_store_refused_untouched() -> TestResult {
     Ok(())
 }
 
+/// F11 with a WAL left beside the Store and no `-shm` (T3-S3 round 1,
+/// decision 5): the newer schema version is committed only in the WAL, so
+/// the refusal is correct only if the probe reads the WAL. The daemon exits
+/// 4 as for a newer Store, and the Store and WAL bytes are unchanged.
+/// SQLite reads a WAL only through a wal-index: the probe's documented
+/// limit is the `-shm` it creates, the one file allowed to appear.
+#[test]
+fn s1_f11_newer_store_in_a_wal_without_shm_refused() -> TestResult {
+    let sandbox = Sandbox::new(&completes("seed", 1))?;
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("seed")?;
+    sandbox.wait(&format!("{session}/1"))?;
+    daemon.finish()?;
+    let store = sandbox.state.join("store.sqlite3");
+    let wal = sandbox.state.join("store.sqlite3-wal");
+    let shm = sandbox.state.join("store.sqlite3-shm");
+    // Everything in the main file, and no sidecar: the last connection's
+    // close removes both.
+    rusqlite::Connection::open(&store)?.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    check(!wal.exists() && !shm.exists(), || {
+        "sidecars left after a checkpoint".to_owned()
+    })?;
+    // The newer version is written to a copy, whose WAL is taken while its
+    // connection is still open, so nothing is checkpointed into the file.
+    let scratch = sandbox.root.path().join("wal-copy");
+    fs::DirBuilder::new().mode(0o700).create(&scratch)?;
+    let copy = scratch.join("store.sqlite3");
+    fs::copy(&store, &copy)?;
+    let writer = rusqlite::Connection::open(&copy)?;
+    writer.pragma_update(None, "wal_autocheckpoint", 0)?;
+    writer.pragma_update(None, "user_version", 99)?;
+    fs::copy(scratch.join("store.sqlite3-wal"), &wal)?;
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))?;
+    drop(writer);
+    let main: i64 = rusqlite::Connection::open_with_flags(
+        format!("file:{}?immutable=1", store.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?
+    .pragma_query_value(None, "user_version", |row| row.get(0))?;
+    check(main == 5, || format!("the main file says v{main}"))?;
+    let before = snapshot(&sandbox.state)?;
+    let mut command = sandbox.command();
+    command.arg("daemon");
+    let captured = run_command(&mut command, Duration::from_secs(30))?;
+    let stderr = String::from_utf8_lossy(&captured.stderr);
+    check(
+        captured.status.code() == Some(4) && stderr.contains("newer Store schema"),
+        || format!("exit {} stderr {stderr}", captured.status),
+    )?;
+    let mut after = snapshot(&sandbox.state)?;
+    after.remove(&shm);
+    check(after == before, || {
+        let changed: Vec<_> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        format!("the State directory changed: {changed:?}")
+    })?;
+    check(!sandbox.runtime.join("via.sock").exists(), || {
+        "the socket was left behind".to_owned()
+    })
+}
+
 /// F29 (design §6.5): Ctrl-C on a foreground `spawn` that auto-started its
 /// daemon. The receipt line is printed; SIGINT to the CLI's process group
 /// exits it 130 with nothing more written; the daemon, in its own process

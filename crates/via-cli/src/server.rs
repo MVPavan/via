@@ -15,7 +15,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use via_core::{ApiError, Engine, FakeConfig, SessionId};
+use via_core::{ApiError, Engine, FakeConfig, SessionId, StoreLock};
 
 mod dispatch;
 mod serving;
@@ -124,13 +124,10 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     via_core::failpoint::hit_async("daemon.startup.after_lock").await?;
     // A `store.lock` held by another daemon is a configuration error: the
     // same State under two runtime roots (runtime §6.1).
-    let _store_lock = match lock(&paths.state.join("store.lock")) {
-        Ok(file) => file,
-        Err(LockFailure::Contended) => {
-            bail!("store lock: the State directory is in use by another VIA daemon")
-        }
-        Err(LockFailure::Failed(error)) => return Err(error.context("store lock")),
-    };
+    // Held by the Store from `open_locked` on, which probes an existing
+    // Store only under it.
+    let store_lock =
+        StoreLock::acquire(&paths.state).map_err(|error| anyhow::anyhow!("store lock: {error}"))?;
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.state.join("raw"))?;
     ensure_dir(&paths.runtime.join("anchors"))?;
@@ -145,7 +142,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
-    let served = serve_bound(listener, &socket, &paths).await;
+    let served = serve_bound(listener, &socket, &paths, store_lock).await;
     if served.is_err() {
         // A failure after bind unlinks the socket before the locks are
         // released (design §6.1). Best effort: a stale socket refuses
@@ -161,10 +158,11 @@ async fn serve_bound(
     listener: UnixListener,
     socket: &Path,
     paths: &super::client::Paths,
+    store_lock: StoreLock,
 ) -> anyhow::Result<i32> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let engine = open_engine(paths).await?;
+    let engine = open_engine(paths, store_lock).await?;
     // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
     let starts = engine
         .take_starts()
@@ -226,15 +224,20 @@ async fn serve_bound(
 
 /// Opens the Engine off the Tokio workers and commits crash recovery before
 /// the first request is accepted (C1 §7.5).
-async fn open_engine(paths: &super::client::Paths) -> anyhow::Result<Arc<Engine>> {
+async fn open_engine(
+    paths: &super::client::Paths,
+    store_lock: StoreLock,
+) -> anyhow::Result<Arc<Engine>> {
     let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
     let state = paths.state.clone();
     let runtime = paths.runtime.clone();
     let binary = std::env::current_exe()?;
     let engine = Arc::new(
-        tokio::task::spawn_blocking(move || Engine::open(&state, &runtime, fake, binary))
-            .await?
-            .map_err(anyhow::Error::msg)?,
+        tokio::task::spawn_blocking(move || {
+            Engine::open_locked(&state, &runtime, fake, binary, store_lock)
+        })
+        .await?
+        .map_err(anyhow::Error::msg)?,
     );
     let recovered = engine
         .recover()

@@ -231,8 +231,8 @@ pub use runtime::{
     GroupAbsenceRecord, KeyedOperation, OperationRecord, OperationVerb, Predecessors,
     ProcessJournal, QueuedTurn, RawFactory, RawStream, RawWriter, ReceiptRecord, ResumeRecord,
     RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord, Store,
-    StoreClient, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
-    TerminalExtras, TerminalRecord, UnfinishedTurn,
+    StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalExtras, TerminalRecord, UnfinishedTurn,
 };
 
 #[cfg(feature = "test-failpoints")]

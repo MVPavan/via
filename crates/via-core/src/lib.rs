@@ -5,7 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use via_adapters::FakeConfig;
 pub use via_adapters::{AcceptanceToken, CancelOutcome, Cleanup, StartOutcome};
-pub use via_store::{CommitOutcome, ConnectionId, Deadline, RawRef, SessionId, TurnNumber};
+pub use via_store::{
+    CommitOutcome, ConnectionId, Deadline, RawRef, SessionId, StoreLock, TurnNumber,
+};
 
 /// Strict parameters for C1's mandatory first `hello` request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

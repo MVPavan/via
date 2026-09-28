@@ -78,6 +78,7 @@ fn open_with(root: &Path, start_capacity: usize) -> Engine {
         FakeConfig::from_environment().unwrap(),
         root.join("absent-anchor"),
         start_capacity,
+        None,
     )
     .unwrap()
 }
