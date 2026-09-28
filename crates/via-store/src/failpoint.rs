@@ -13,6 +13,11 @@
 //! point continues once `<dir>/<point>.<occurrence>.release` exists; the
 //! harness may kill the daemon instead. A command with the wrong token or an
 //! invalid shape is ignored and leaves `<dir>/<point>.<occurrence>.refused`.
+//! `fail_io` may add `"persist": true`: every hit from the armed occurrence
+//! on then fails (design §10), each acknowledged under its own occurrence.
+//!
+//! A process VIA spawns without its environment, such as Host's anchor, is
+//! activated with the daemon's directory and token through [`activate`].
 
 use std::{
     collections::HashMap,
@@ -59,6 +64,9 @@ struct Command {
     token: String,
     occurrence: u64,
     action: Action,
+    /// With `fail_io` only: fail every hit from `occurrence` on.
+    #[serde(default)]
+    persist: bool,
 }
 
 struct Controller {
@@ -92,6 +100,23 @@ pub fn activate_from_environment() -> Result<(), String> {
     // A concurrent first call read the same process environment.
     let _ = CONTROLLER.set(controller);
     Ok(())
+}
+
+/// Activates the controller with an explicit directory and token, as the
+/// daemon's own environment would; later calls keep the first result.
+pub fn activate(dir: &Path, token: &str) -> Result<(), String> {
+    if CONTROLLER.get().is_some() {
+        return Ok(());
+    }
+    let controller = Controller::new(dir.to_path_buf(), token.to_owned())?;
+    let _ = CONTROLLER.set(Some(controller));
+    Ok(())
+}
+
+/// The active controller's directory and token, to hand to a process this
+/// one spawns without its environment; `None` when inactive.
+pub fn activation() -> Option<(PathBuf, String)> {
+    controller().map(|controller| (controller.dir.clone(), controller.token.clone()))
 }
 
 impl Controller {
@@ -135,7 +160,12 @@ impl Controller {
             return Ok(None);
         };
         let command = match serde_json::from_slice::<Command>(&bytes) {
-            Ok(command) if command.token == self.token => command,
+            Ok(command)
+                if command.token == self.token
+                    && (!command.persist || command.action == Action::FailIo) =>
+            {
+                command
+            }
             // Never echo the command or its token.
             _ => {
                 // Nothing acts on a refused command, so a lost marker is harmless.
@@ -143,7 +173,12 @@ impl Controller {
                 return Ok(None);
             }
         };
-        if command.occurrence != occurrence {
+        let armed = if command.persist {
+            occurrence >= command.occurrence
+        } else {
+            occurrence == command.occurrence
+        };
+        if !armed {
             return Ok(None);
         }
         let ack = serde_json::json!({
@@ -279,6 +314,33 @@ mod tests {
         let ack = std::fs::read_to_string(dir.path().join("p.point.2.ack")).expect("ack");
         assert!(!ack.contains(TOKEN));
         assert_eq!(controller.enter("p.point").expect("enter"), None);
+    }
+
+    #[test]
+    fn a_persistent_fail_io_acts_on_every_hit_from_its_occurrence() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let command =
+            format!(r#"{{"token":"{TOKEN}","occurrence":2,"action":"fail_io","persist":true}}"#);
+        std::fs::write(dir.path().join("p.point.json"), command).expect("arm");
+        assert_eq!(controller.enter("p.point").expect("enter"), None);
+        for occurrence in 2..5 {
+            assert_eq!(
+                controller.enter("p.point").expect("enter"),
+                Some((occurrence, Action::FailIo))
+            );
+            assert!(
+                dir.path()
+                    .join(format!("p.point.{occurrence}.ack"))
+                    .exists()
+            );
+        }
+        // Persistence is for `fail_io` only; a persistent pause is refused.
+        let pause =
+            format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause","persist":true}}"#);
+        std::fs::write(dir.path().join("q.point.json"), pause).expect("arm");
+        assert_eq!(controller.enter("q.point").expect("enter"), None);
+        assert!(dir.path().join("q.point.1.refused").exists());
     }
 
     #[test]

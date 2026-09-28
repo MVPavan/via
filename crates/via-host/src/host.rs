@@ -1159,6 +1159,7 @@ async fn wait_absence(
                     pid_namespace: identity.pid_namespace.clone(),
                     pgid: identity.pgid,
                     observed_at: proof.observed_at().to_owned(),
+                    identity: None,
                 };
                 // Proof observed too late to record is unproven, not a Store failure.
                 if Instant::now() >= deadline.instant() {

@@ -6,6 +6,16 @@ use super::{
     Seek, SeekFrom, Sha256, StoreError, Write, fs, validate_regular,
 };
 
+/// Every raw I/O failure (open, append, sync or index) is `Raw`: it fails
+/// the connection and its turn, never the daemon (design §7.1 [r4.5]).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the map_err adapter receives the error by value"
+)]
+fn raw_error(error: std::io::Error) -> StoreError {
+    StoreError::Raw(error.to_string())
+}
+
 struct RawFiles {
     payload: File,
     index: File,
@@ -35,7 +45,7 @@ pub(super) fn raw_loop(dir: &Path, receiver: &Receiver<RawCommand>) {
                     }
                     let file = files
                         .get_mut(connection_id.as_str())
-                        .ok_or(StoreError::Unavailable)?;
+                        .ok_or(StoreError::CorruptEvidence)?;
                     append_raw(file, connection_id.clone(), stream, &bytes)
                 })();
                 if result.is_err() {
@@ -85,21 +95,12 @@ fn open_raw_files(dir: &Path, id: &ConnectionId) -> Result<RawFiles, StoreError>
         .open(&idx_path)
         .map_err(|error| StoreError::Raw(error.to_string()))?;
     let mut header = [0_u8; RAW_MAGIC.len()];
-    if index
-        .metadata()
-        .map_err(|error| StoreError::Write(error.to_string()))?
-        .len()
-        == 0
-    {
-        index
-            .write_all(RAW_MAGIC)
-            .map_err(|error| StoreError::Write(error.to_string()))?;
-        index
-            .sync_data()
-            .map_err(|error| StoreError::Write(error.to_string()))?;
+    if index.metadata().map_err(raw_error)?.len() == 0 {
+        index.write_all(RAW_MAGIC).map_err(raw_error)?;
+        index.sync_data().map_err(raw_error)?;
         File::open(dir)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| StoreError::Write(error.to_string()))?;
+            .map_err(raw_error)?;
     } else {
         index
             .read_exact(&mut header)
@@ -108,10 +109,7 @@ fn open_raw_files(dir: &Path, id: &ConnectionId) -> Result<RawFiles, StoreError>
             return Err(StoreError::CorruptEvidence);
         }
     }
-    let offset = payload
-        .metadata()
-        .map_err(|error| StoreError::Write(error.to_string()))?
-        .len();
+    let offset = payload.metadata().map_err(raw_error)?.len();
     Ok(RawFiles {
         payload,
         index,
@@ -129,35 +127,22 @@ fn append_raw(
     let len =
         u32::try_from(bytes.len()).map_err(|_| StoreError::Constraint("raw unit too large"))?;
     let reference = RawRef::new(id, offset, len).map_err(StoreError::Constraint)?;
-    files
-        .payload
-        .seek(SeekFrom::End(0))
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    files
-        .payload
-        .write_all(bytes)
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    files
-        .payload
-        .sync_data()
-        .map_err(|error| StoreError::Write(error.to_string()))?;
+    // Test-only runtime §11 seams: an append or sync I/O failure (§7.2 row 6).
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("raw.append.fail").map_err(raw_error)?;
+    files.payload.seek(SeekFrom::End(0)).map_err(raw_error)?;
+    files.payload.write_all(bytes).map_err(raw_error)?;
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("raw.sync.fail_persistent").map_err(raw_error)?;
+    files.payload.sync_data().map_err(raw_error)?;
     let mut entry = [0_u8; INDEX_ENTRY_LEN];
     entry[0] = stream.code();
     entry[1..9].copy_from_slice(&offset.to_le_bytes());
     entry[9..13].copy_from_slice(&len.to_le_bytes());
     entry[13..45].copy_from_slice(&Sha256::digest(bytes));
-    files
-        .index
-        .seek(SeekFrom::End(0))
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    files
-        .index
-        .write_all(&entry)
-        .map_err(|error| StoreError::Write(error.to_string()))?;
-    files
-        .index
-        .sync_data()
-        .map_err(|error| StoreError::Write(error.to_string()))?;
+    files.index.seek(SeekFrom::End(0)).map_err(raw_error)?;
+    files.index.write_all(&entry).map_err(raw_error)?;
+    files.index.sync_data().map_err(raw_error)?;
     files.offset = reference.end_offset();
     Ok(DurableRaw(reference))
 }

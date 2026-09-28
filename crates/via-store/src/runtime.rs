@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use crate::{CommitOutcome, ConnectionId, RawRef, SessionId, StoreFailureKind, TurnNumber};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Most queued turns one session holds, enforced inside the receipt
 /// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
@@ -44,6 +44,10 @@ const INDEX_ENTRY_LEN: usize = 45;
 const RAW_UNIT_LIMIT: usize = 1_048_576;
 
 /// Storage or evidence failure, with no caller handle or vendor payload.
+///
+/// Design §7.1: `Write`, `Constraint`, `Raw`, `NotEnqueued` and `Refused` were
+/// not committed; `Uncertain` and `WriterLost` may have committed; `Corrupt`
+/// is SQLite-level corruption, which always latches.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The State directory or database cannot be opened safely.
@@ -64,20 +68,60 @@ pub enum StoreError {
     /// A referenced raw span is absent or corrupt.
     #[error("raw evidence is missing or corrupt")]
     CorruptEvidence,
-    /// The bounded Store request queue is full or closed.
-    #[error("Store writer unavailable")]
-    Unavailable,
+    /// The request never reached the SQLite writer: its bounded queue was
+    /// full. Nothing was written.
+    #[error("Store request not enqueued: the writer queue is full")]
+    NotEnqueued,
+    /// The SQLite writer or raw thread is gone: its queue is disconnected or
+    /// it dropped the reply. The request may have committed.
+    #[error("Store writer lost")]
+    WriterLost,
+    /// SQLite reported a corrupt database (`SQLITE_CORRUPT`, `SQLITE_NOTADB`).
+    #[error("Store is corrupt: {0}")]
+    Corrupt(String),
+    /// A Store-defined refusal, such as `resume` of a closing session:
+    /// nothing was written, and it is not a Store failure.
+    #[error("Store refused: {0}")]
+    Refused(&'static str),
 }
 
 impl StoreError {
     fn kind(&self) -> StoreFailureKind {
         match self {
             Self::Open(_) => StoreFailureKind::Open,
-            Self::Write(_) | Self::Constraint(_) => StoreFailureKind::Write,
+            Self::Write(_) | Self::Constraint(_) | Self::Refused(_) => StoreFailureKind::Write,
             Self::Raw(_) => StoreFailureKind::Raw,
-            Self::Uncertain(_) | Self::Unavailable => StoreFailureKind::UncertainCommit,
+            Self::Uncertain(_) | Self::WriterLost => StoreFailureKind::UncertainCommit,
             Self::CorruptEvidence => StoreFailureKind::CorruptEvidence,
+            Self::NotEnqueued => StoreFailureKind::Quota,
+            Self::Corrupt(_) => StoreFailureKind::Corrupt,
         }
+    }
+
+    /// A journal write's outcome: a write that may have committed, or hit
+    /// SQLite corruption, is uncertain, so it latches (design §7.1).
+    fn journal_outcome<T>(self) -> CommitOutcome<T> {
+        match self {
+            Self::Uncertain(_) | Self::WriterLost | Self::Corrupt(_) => {
+                CommitOutcome::Uncertain(self.kind())
+            }
+            Self::Open(_)
+            | Self::Write(_)
+            | Self::Raw(_)
+            | Self::Constraint(_)
+            | Self::CorruptEvidence
+            | Self::NotEnqueued
+            | Self::Refused(_) => CommitOutcome::NotCommitted(self.kind()),
+        }
+    }
+}
+
+/// Maps a failed `try_send` to the SQLite writer: a full queue never
+/// enqueued the request, a disconnected one lost its writer (design §7.1).
+fn enqueue_error<T>(error: &TrySendError<T>) -> StoreError {
+    match error {
+        TrySendError::Full(_) => StoreError::NotEnqueued,
+        TrySendError::Disconnected(_) => StoreError::WriterLost,
     }
 }
 
@@ -155,6 +199,8 @@ pub struct ResumeRecord {
 pub struct SessionSnapshot {
     /// The session no longer admits turns.
     pub closed: bool,
+    /// The session is durably `closing` (design §4): `resume` is refused.
+    pub closing: bool,
     /// Highest turn number.
     pub turns: u32,
     /// Queued turns of the session, without submission intent.
@@ -234,6 +280,123 @@ pub struct TerminalRecord {
     pub raw_ref: Option<RawRef>,
 }
 
+/// Who cancelled a turn: a caller `cancel` or a `close` (design §4, §10).
+/// Recorded in the cancelling transaction; `close` rows derive a close's
+/// `cancelled_turns`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelCause {
+    /// A caller `cancel`.
+    Cancel,
+    /// A session `close`.
+    Close,
+}
+
+impl CancelCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Close => "close",
+        }
+    }
+}
+
+/// Facts a terminal commits in its own transaction (design §7.2 row 6, §10).
+#[derive(Default)]
+pub struct TerminalExtras {
+    /// The turn's `cancel_cause`, when a caller cancel or a close ended it.
+    pub cancel_cause: Option<CancelCause>,
+    /// A `raw_log.incomplete` event sequenced just before `turn.ended`.
+    pub raw_incomplete: Option<Value>,
+}
+
+/// A keyed close's `op_key` and exact retry identity (C1 §3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseIntent {
+    /// Caller key, unique per session.
+    pub op_key: String,
+    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
+    pub identity: Vec<u8>,
+}
+
+/// The `Closing` commit: the session's `closing` gate and, when keyed, the
+/// close's intent row, in one transaction (design §4 step 6).
+pub struct ClosingRecord {
+    /// Session to close.
+    pub session_id: SessionId,
+    /// Intent row of a keyed close.
+    pub operation: Option<CloseIntent>,
+}
+
+/// The `Closed` commit (design §4 dispatcher step 5).
+#[derive(Clone)]
+pub struct ClosedRecord {
+    /// Durably `closing` session.
+    pub session_id: SessionId,
+    /// Core's `session.closed {reason: "close"}` event at the next sequence.
+    pub event: Value,
+    /// The keyed close whose result this commit records.
+    pub operation: Option<CloseIntent>,
+}
+
+/// Whether `Closed` committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClosedOutcome {
+    /// Committed, with the close result derived in the transaction.
+    Closed(Value),
+    /// Refused, not failed: a turn of the session is queued or running.
+    Unfinished,
+}
+
+/// Which mutation a keyed operation row belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationVerb {
+    /// A keyed `resume`.
+    Resume,
+    /// A keyed `close`.
+    Close,
+}
+
+/// A keyed operation row: a close's may have no result yet (design §4).
+pub struct KeyedOperation {
+    /// The keyed mutation.
+    pub verb: OperationVerb,
+    /// Exact retry-identity bytes.
+    pub identity: Vec<u8>,
+    /// Committed result; `None` while a close is in progress.
+    pub result: Option<Value>,
+}
+
+/// A queued turn failed without agent I/O (design §7.2 row 2, §7.3):
+/// `turn.submitted` and `turn.ended` in one transaction.
+pub struct SubmitFailedRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// The queued turn.
+    pub turn: TurnNumber,
+    /// Canonical `turn.submitted` at the session's next sequence; its `at`
+    /// becomes `submitted_at`.
+    pub submitted: Value,
+    /// Canonical `turn.ended` right after it.
+    pub ended: Value,
+    /// The `failed` terminal envelope.
+    pub envelope: Value,
+}
+
+/// Most queued cancellations one latch batch carries (design §7.4).
+pub const FAILURE_BATCH_CANCELLATIONS: usize = 8;
+
+/// The latch's failure-resolution batch (design §7.4): one running turn's
+/// terminal and its session's queued cancellations, in one transaction.
+pub struct FailureResolutionRecord {
+    /// The affected running turn's terminal.
+    pub terminal: TerminalRecord,
+    /// Its `raw_log.incomplete` event, sequenced before the terminal.
+    pub raw_incomplete: Option<Value>,
+    /// At most [`FAILURE_BATCH_CANCELLATIONS`] `queued → cancelled` records
+    /// of the same session, sequenced after the terminal.
+    pub cancellations: Vec<TerminalRecord>,
+}
+
 /// A turn with durable submission intent and no terminal, as a crashed daemon
 /// left it; recovery resolves it before admission.
 pub struct UnfinishedTurn {
@@ -257,6 +420,9 @@ pub struct AnchorOwner {
     pub turn: TurnNumber,
     /// The owning turn is still `running`: recovery resolves it.
     pub turn_running: bool,
+    /// The anchor's last committed launch phase (design §9); `None` when the
+    /// stored phase is unreadable, which Host reconciliation then reports.
+    pub phase: Option<AnchorPhase>,
 }
 
 /// Largest anchor page one read returns; callers page with a cursor.
@@ -294,6 +460,7 @@ impl RawStream {
 }
 
 /// A raw span whose payload and index were both synced before release.
+#[derive(Debug)]
 pub struct DurableRaw(RawRef);
 
 impl DurableRaw {
@@ -346,8 +513,13 @@ impl RawWriter {
                 bytes,
                 reply,
             })
-            .map_err(|_| StoreError::Unavailable)?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+            .map_err(|error| match error {
+                // Design §7.1 [r4.5]: a full raw queue fails the connection
+                // (§7.2 row 6); a gone raw thread is uncertain and latches.
+                TrySendError::Full(_) => StoreError::Raw("raw queue full".to_owned()),
+                TrySendError::Disconnected(_) => StoreError::WriterLost,
+            })?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 }
 
@@ -436,6 +608,10 @@ pub struct GroupAbsenceRecord {
     pub pgid: u32,
     /// Observation timestamp for evidence.
     pub observed_at: String,
+    /// The full identity Host verified and probed with. An anchor still at
+    /// `intent` phase records it with the proof (design §7.2 row 4); for a
+    /// later phase it must equal the committed identity.
+    pub identity: Option<AnchorIdentity>,
 }
 
 /// Durable anchor snapshot used by Host recovery.
@@ -527,7 +703,35 @@ enum Command {
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
-    Terminal(TerminalRecord, oneshot::Sender<Result<(), StoreError>>),
+    Terminal(
+        TerminalRecord,
+        TerminalExtras,
+        oneshot::Sender<Result<(), StoreError>>,
+    ),
+    Closing(ClosingRecord, oneshot::Sender<Result<(), StoreError>>),
+    Closed(
+        ClosedRecord,
+        oneshot::Sender<Result<ClosedOutcome, StoreError>>,
+    ),
+    CloseResult(
+        SessionId,
+        oneshot::Sender<Result<Option<Value>, StoreError>>,
+    ),
+    ClosingSessions(
+        Option<SessionId>,
+        u32,
+        oneshot::Sender<Result<Vec<SessionId>, StoreError>>,
+    ),
+    KeyedOperation(
+        SessionId,
+        String,
+        oneshot::Sender<Result<Option<KeyedOperation>, StoreError>>,
+    ),
+    SubmitFailed(SubmitFailedRecord, oneshot::Sender<Result<(), StoreError>>),
+    FailureResolution(
+        FailureResolutionRecord,
+        oneshot::Sender<Result<(), StoreError>>,
+    ),
     ClosingTerminal(
         TerminalRecord,
         Value,
@@ -586,11 +790,19 @@ enum Command {
     VendorFacts(String, String, u32, oneshot::Sender<CommitOutcome<()>>),
     GroupAbsence(GroupAbsenceRecord, oneshot::Sender<CommitOutcome<()>>),
     AnchorRecords(
-        Option<String>,
-        u32,
+        AnchorQuery,
         oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>,
     ),
     Shutdown,
+}
+
+/// One page of anchor records: after `after`, at most `limit`, optionally
+/// only unproven ones and only one owner session's.
+struct AnchorQuery {
+    after: Option<String>,
+    limit: u32,
+    unproven: bool,
+    owner: Option<SessionId>,
 }
 
 enum RawCommand {
@@ -741,14 +953,14 @@ impl StoreClient {
     ) -> Result<ReceiptRecord, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Spawn(record, key, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads a committed spawn key.
     pub async fn spawn_key(&self, key: &str) -> Result<Option<StoredSpawnKey>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::SpawnKey(key.to_owned(), reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Atomically commits a queued turn, its `turn.queued` event and any
@@ -756,7 +968,7 @@ impl StoreClient {
     pub async fn commit_resume(&self, record: ResumeRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Resume(record, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads a session's committed `op_key` result.
@@ -771,7 +983,7 @@ impl StoreClient {
             op_key.to_owned(),
             reply,
         ))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads the facts Core decides a new turn from; `None` for no such session.
@@ -781,7 +993,7 @@ impl StoreClient {
     ) -> Result<Option<SessionSnapshot>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Snapshot(session_id.clone(), reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads a turn's prompt and `turn.queued` facts while it is still queued.
@@ -792,7 +1004,7 @@ impl StoreClient {
     ) -> Result<Option<QueuedTurn>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::QueuedTurn(session_id.clone(), turn, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads the durable state of the turns before `turn`.
@@ -803,21 +1015,21 @@ impl StoreClient {
     ) -> Result<Predecessors, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Predecessors(session_id.clone(), turn, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads the session's durable next event sequence.
     pub async fn next_seq(&self, session_id: &SessionId) -> Result<Option<u64>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::NextSeq(session_id.clone(), reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Commits submission intent before any agent I/O is authorized.
     pub async fn commit_submission(&self, record: SubmissionRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Submission(record, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Commits acceptance with a synced raw span and one vendor correlation.
@@ -829,21 +1041,123 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::Acceptance(record, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Commits one event at the next sequence of a turn that is still running.
     pub async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Event(record, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Atomically commits a terminal envelope and final event.
     pub async fn commit_terminal(&self, record: TerminalRecord) -> Result<(), StoreError> {
+        self.commit_terminal_with(record, TerminalExtras::default())
+            .await
+    }
+
+    /// [`Self::commit_terminal`] that also records the turn's `cancel_cause`
+    /// and a `raw_log.incomplete` event before `turn.ended`, in the same
+    /// transaction (design §7.2 row 6, §10).
+    pub async fn commit_terminal_with(
+        &self,
+        record: TerminalRecord,
+        extras: TerminalExtras,
+    ) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Terminal(record, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        self.send(Command::Terminal(record, extras, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits `Closing`: the session's `closing` gate and a keyed close's
+    /// intent row, in one transaction. A closed session is refused
+    /// ([`StoreError::Refused`]); a session already closing only gains the
+    /// intent row.
+    pub async fn commit_closing(&self, record: ClosingRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Closing(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits `Closed` for a durably `closing` session: `session.closed`,
+    /// the closed state and the close result, derived in the transaction
+    /// from the turns with `cancel_cause = 'close'` and the session's
+    /// unproven groups, plus a keyed close's result. Refused, not failed,
+    /// while a turn of the session is queued or running.
+    pub async fn commit_closed(&self, record: ClosedRecord) -> Result<ClosedOutcome, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Closed(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads a closed session's close result: the stored one, or for a
+    /// session closed another way the result derived the same way. `None`
+    /// while the session is not closed.
+    pub async fn session_close_result(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Value>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::CloseResult(session_id.clone(), reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads one page of up to `limit` (1 to 256) durably `closing`, not yet
+    /// closed sessions in id order after `after`, for restart (design §4).
+    pub async fn closing_sessions_page(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<SessionId>, StoreError> {
+        if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
+            return Err(StoreError::Constraint(
+                "closing page limit must be 1 to 256",
+            ));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ClosingSessions(after, limit, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads a keyed operation row of either verb, including a close still
+    /// in progress. [`Self::operation`] reports such a row's result as `null`.
+    pub async fn keyed_operation(
+        &self,
+        session_id: &SessionId,
+        op_key: &str,
+    ) -> Result<Option<KeyedOperation>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::KeyedOperation(
+            session_id.clone(),
+            op_key.to_owned(),
+            reply,
+        ))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Fails a queued turn without agent I/O: `turn.submitted` and a `failed`
+    /// `turn.ended` in one transaction (design §7.2 row 2, §7.3).
+    pub async fn commit_submit_failed(&self, record: SubmitFailedRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SubmitFailed(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits the latch's failure-resolution batch in one transaction
+    /// (design §7.4).
+    pub async fn commit_failure_resolution(
+        &self,
+        record: FailureResolutionRecord,
+    ) -> Result<(), StoreError> {
+        if record.cancellations.len() > FAILURE_BATCH_CANCELLATIONS {
+            return Err(StoreError::Constraint(
+                "a failure batch carries at most 8 cancellations",
+            ));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::FailureResolution(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Atomically commits a terminal envelope and final event, then the
@@ -857,7 +1171,7 @@ impl StoreClient {
     ) -> Result<bool, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::ClosingTerminal(record, closed, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Commits a session's `session.closed` event alone and marks it closed;
@@ -870,7 +1184,7 @@ impl StoreClient {
     ) -> Result<bool, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::SessionClosed(session_id.clone(), closed, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads a durable terminal envelope, if one has committed.
@@ -881,7 +1195,7 @@ impl StoreClient {
     ) -> Result<Option<Value>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Result(session_id.clone(), turn, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Returns those of at most 1000 `turns` whose terminal envelope has
@@ -895,7 +1209,7 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::Terminated(turns, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads at most one bounded page of durable events.
@@ -910,14 +1224,14 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::Events(session_id.clone(), from_seq, limit, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Returns at most 1000 turns that have submission intent but no terminal.
     pub async fn unfinished_turns(&self) -> Result<Vec<UnfinishedTurn>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Unfinished(reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) committed anchors
@@ -933,7 +1247,7 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::AnchorOwners(after, limit, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Counts committed anchors after the `after` anchor id with no recorded
@@ -949,7 +1263,7 @@ impl StoreClient {
     ) -> Result<u64, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::UnprovenAnchors(after, limit, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads one page of up to `limit` (1 to 256) durable `queued` turns in
@@ -964,14 +1278,14 @@ impl StoreClient {
         }
         let (reply, receive) = oneshot::channel();
         self.send(Command::QueuedTurns(after, limit, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Reads committed raw excerpts for one session in event order.
     pub async fn logs(&self, session_id: &SessionId) -> Result<Value, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Logs(session_id.clone(), reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     /// Compares a Core-computed SHA-256 hash without receiving the plaintext handle.
@@ -982,14 +1296,24 @@ impl StoreClient {
     ) -> Result<bool, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Authenticate(session_id.clone(), *hash, reply))?;
-        receive.await.map_err(|_| StoreError::Unavailable)?
+        receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
     fn send(&self, command: Command) -> Result<(), StoreError> {
-        self.sender.try_send(command).map_err(|error| match error {
-            TrySendError::Full(_) | TrySendError::Disconnected(_) => StoreError::Unavailable,
-        })
+        send_command(&self.sender, command)
     }
+}
+
+/// Enqueues one request for the SQLite writer. The test-only
+/// `store.request.not_enqueued` point reports a full queue.
+fn send_command(sender: &SyncSender<Command>, command: Command) -> Result<(), StoreError> {
+    #[cfg(feature = "test-failpoints")]
+    if crate::failpoint::hit("store.request.not_enqueued").is_err() {
+        return Err(StoreError::NotEnqueued);
+    }
+    sender
+        .try_send(command)
+        .map_err(|error| enqueue_error(&error))
 }
 
 impl ProcessJournal {
@@ -999,12 +1323,8 @@ impl ProcessJournal {
         intent: AnchorIntent,
     ) -> CommitOutcome<AnchorIntentReceipt> {
         let (reply, receive) = oneshot::channel();
-        match self.send(Command::AnchorIntent(intent, reply)) {
-            Ok(()) => receive
-                .await
-                .unwrap_or(CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)),
-            Err(error) => CommitOutcome::NotCommitted(error.kind()),
-        }
+        self.commit(Command::AnchorIntent(intent, reply), receive)
+            .await
     }
 
     /// Commits full anchor identity with generation and version checks.
@@ -1016,18 +1336,14 @@ impl ProcessJournal {
         identity: AnchorIdentity,
     ) -> CommitOutcome<u64> {
         let (reply, receive) = oneshot::channel();
-        match self.send(Command::AnchorIdentified(
+        let command = Command::AnchorIdentified(
             anchor_id.to_owned(),
             generation.to_owned(),
             expected_version,
             identity,
             reply,
-        )) {
-            Ok(()) => receive
-                .await
-                .unwrap_or(CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)),
-            Err(error) => CommitOutcome::NotCommitted(error.kind()),
-        }
+        );
+        self.commit(command, receive).await
     }
 
     /// Atomically records the irreversible ARM authorization before Host sends ARM once.
@@ -1038,17 +1354,13 @@ impl ProcessJournal {
         expected_version: u64,
     ) -> CommitOutcome<u64> {
         let (reply, receive) = oneshot::channel();
-        match self.send(Command::ArmIntent(
+        let command = Command::ArmIntent(
             anchor_id.to_owned(),
             generation.to_owned(),
             expected_version,
             reply,
-        )) {
-            Ok(()) => receive
-                .await
-                .unwrap_or(CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)),
-            Err(error) => CommitOutcome::NotCommitted(error.kind()),
-        }
+        );
+        self.commit(command, receive).await
     }
 
     /// Records vendor child facts as evidence, never as signalling authority.
@@ -1059,28 +1371,17 @@ impl ProcessJournal {
         pid: u32,
     ) -> CommitOutcome<()> {
         let (reply, receive) = oneshot::channel();
-        match self.send(Command::VendorFacts(
-            anchor_id.to_owned(),
-            generation.to_owned(),
-            pid,
-            reply,
-        )) {
-            Ok(()) => receive
-                .await
-                .unwrap_or(CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)),
-            Err(error) => CommitOutcome::NotCommitted(error.kind()),
-        }
+        let command = Command::VendorFacts(anchor_id.to_owned(), generation.to_owned(), pid, reply);
+        self.commit(command, receive).await
     }
 
-    /// Stores a positively verified, non-signalling group absence proof.
+    /// Stores a positively verified, non-signalling group absence proof. An
+    /// anchor still at `intent` phase needs the proof's full identity, which
+    /// commits with it (design §7.2 row 4).
     pub async fn commit_group_absence(&self, proof: GroupAbsenceRecord) -> CommitOutcome<()> {
         let (reply, receive) = oneshot::channel();
-        match self.send(Command::GroupAbsence(proof, reply)) {
-            Ok(()) => receive
-                .await
-                .unwrap_or(CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)),
-            Err(error) => CommitOutcome::NotCommitted(error.kind()),
-        }
+        self.commit(Command::GroupAbsence(proof, reply), receive)
+            .await
     }
 
     /// Returns up to `limit` (at most `ANCHOR_PAGE_LIMIT`) anchor records
@@ -1090,11 +1391,38 @@ impl ProcessJournal {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        self.records_page(after, limit, false, None).await
+    }
+
+    /// [`Self::list_anchor_records_page`] of the anchors with no absence
+    /// proof, optionally only those owned by `owner` (design §8, §10).
+    pub async fn unproven_anchor_records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        owner: Option<SessionId>,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
+        self.records_page(after, limit, true, owner).await
+    }
+
+    async fn records_page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+        unproven: bool,
+        owner: Option<SessionId>,
+    ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
         if limit == 0 || limit > ANCHOR_PAGE_LIMIT {
             return Err(StoreFailureKind::Write);
         }
         let (reply, receive) = oneshot::channel();
-        self.send(Command::AnchorRecords(after, limit, reply))
+        let query = AnchorQuery {
+            after,
+            limit,
+            unproven,
+            owner,
+        };
+        self.send(Command::AnchorRecords(query, reply))
             .map_err(|error| error.kind())?;
         receive
             .await
@@ -1102,9 +1430,22 @@ impl ProcessJournal {
     }
 
     fn send(&self, command: Command) -> Result<(), StoreError> {
-        self.sender.try_send(command).map_err(|error| match error {
-            TrySendError::Full(_) | TrySendError::Disconnected(_) => StoreError::Unavailable,
-        })
+        send_command(&self.sender, command)
+    }
+
+    /// Enqueues a journal mutation and awaits its outcome. A request never
+    /// enqueued did not commit; a lost writer or reply is uncertain.
+    async fn commit<T>(
+        &self,
+        command: Command,
+        receive: oneshot::Receiver<CommitOutcome<T>>,
+    ) -> CommitOutcome<T> {
+        match self.send(command) {
+            Ok(()) => receive
+                .await
+                .unwrap_or_else(|_| StoreError::WriterLost.journal_outcome()),
+            Err(error) => error.journal_outcome(),
+        }
     }
 }
 
@@ -1118,3 +1459,128 @@ use anchor::{
 };
 use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, validate_regular, validate_state, writer_loop};
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CommitOutcome, ConnectionId, ProcessJournal, RawCommand, RawStream, RawWriter, SessionId,
+        StoreClient, StoreError, StoreFailureKind, mpsc, sql::sql_error,
+    };
+
+    fn session() -> SessionId {
+        SessionId::try_from("s_7f3k9q2mzr4c").expect("session")
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Design §7.1 [r3.9, r4.5]: a full writer queue never enqueued the
+    /// request; a disconnected queue or a dropped reply lost the writer.
+    #[test]
+    fn writer_queue_failures_split_into_not_enqueued_and_writer_lost() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let client = StoreClient { sender };
+        let journal = ProcessJournal {
+            sender: client.sender.clone(),
+        };
+        runtime().block_on(async {
+            // One request fills the queue; the reply of the queued one is kept.
+            let queued = tokio::spawn({
+                let client = client.clone();
+                async move { client.next_seq(&session()).await }
+            });
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                client.next_seq(&session()).await,
+                Err(StoreError::NotEnqueued)
+            ));
+            assert!(matches!(
+                journal.commit_vendor_facts("a", "g", 2).await,
+                CommitOutcome::NotCommitted(StoreFailureKind::Quota)
+            ));
+            // The worker takes the request and drops its reply unserved.
+            drop(receiver.recv().expect("queued request"));
+            assert!(matches!(
+                queued.await.expect("join"),
+                Err(StoreError::WriterLost)
+            ));
+            let journal_reply = tokio::spawn({
+                let journal = journal.clone();
+                async move { journal.commit_vendor_facts("a", "g", 2).await }
+            });
+            tokio::task::yield_now().await;
+            drop(receiver.recv().expect("journal request"));
+            assert!(matches!(
+                journal_reply.await.expect("join"),
+                CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)
+            ));
+            drop(receiver);
+            assert!(matches!(
+                client.next_seq(&session()).await,
+                Err(StoreError::WriterLost)
+            ));
+            assert!(matches!(
+                journal.commit_vendor_facts("a", "g", 2).await,
+                CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)
+            ));
+        });
+    }
+
+    /// Design §7.1 [r4.5]: a full raw queue fails the connection (`Raw`,
+    /// row 6); a disconnected raw thread or a dropped raw reply is
+    /// `WriterLost`, which latches.
+    #[test]
+    fn raw_queue_failures_split_into_raw_and_writer_lost() {
+        let (sender, receiver) = mpsc::sync_channel::<RawCommand>(1);
+        let writer = RawWriter {
+            connection_id: ConnectionId::try_from("c_one").expect("connection"),
+            sender,
+        };
+        runtime().block_on(async {
+            let queued = tokio::spawn({
+                let writer = writer.clone();
+                async move { writer.append(RawStream::Stdout, b"a".to_vec()).await }
+            });
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                writer.append(RawStream::Stdout, b"b".to_vec()).await,
+                Err(StoreError::Raw(_))
+            ));
+            drop(receiver.recv().expect("queued append"));
+            assert!(matches!(
+                queued.await.expect("join"),
+                Err(StoreError::WriterLost)
+            ));
+            drop(receiver);
+            assert!(matches!(
+                writer.append(RawStream::Stdout, b"c".to_vec()).await,
+                Err(StoreError::WriterLost)
+            ));
+        });
+    }
+
+    /// Design §7.1 [O1.D8]: `SQLITE_CORRUPT` and `SQLITE_NOTADB` are
+    /// `Corrupt`; any other SQLite failure before `COMMIT` is `Write`, and a
+    /// journal write that met corruption is uncertain, so it latches.
+    #[test]
+    fn sqlite_corruption_is_classified_corrupt() {
+        let failure = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let error = sql_error(failure(code));
+            assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+            assert!(matches!(
+                error.journal_outcome::<()>(),
+                CommitOutcome::Uncertain(StoreFailureKind::Corrupt)
+            ));
+        }
+        let full = sql_error(failure(rusqlite::ffi::SQLITE_FULL));
+        assert!(matches!(full, StoreError::Write(_)), "{full:?}");
+        assert!(matches!(
+            full.journal_outcome::<()>(),
+            CommitOutcome::NotCommitted(StoreFailureKind::Write)
+        ));
+    }
+}

@@ -83,7 +83,7 @@ impl TurnJournal for FaultJournal {
         limit: u32,
     ) -> Result<Vec<StoredEvent>, StoreError> {
         if self.head_unreadable {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::WriterLost);
         }
         self.store.events(session, from_seq, limit).await
     }
@@ -116,7 +116,7 @@ impl TurnJournal for FaultJournal {
 
     async fn next_seq(&self, session: &SessionId) -> Result<Option<u64>, StoreError> {
         if self.head_unreadable {
-            return Err(StoreError::Unavailable);
+            return Err(StoreError::WriterLost);
         }
         self.store.next_seq(session).await
     }

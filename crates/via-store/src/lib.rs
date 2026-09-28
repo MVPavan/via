@@ -205,6 +205,8 @@ pub enum StoreFailureKind {
     CorruptEvidence,
     /// The bounded request quota was exhausted.
     Quota,
+    /// SQLite reported a corrupt database.
+    Corrupt,
 }
 
 /// Whether a requested mutation has a positive commit receipt.
@@ -224,11 +226,13 @@ mod runtime;
 
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorIntentReceipt,
-    AnchorOwner, AnchorPhase, AnchorRecord, DurableRaw, EventRecord, GroupAbsenceRecord,
-    OperationRecord, Predecessors, ProcessJournal, QueuedTurn, RawFactory, RawStream, RawWriter,
-    ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey,
-    SpawnRecord, Store, StoreClient, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    TerminalRecord, UnfinishedTurn,
+    AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent, ClosedOutcome, ClosedRecord,
+    ClosingRecord, DurableRaw, EventRecord, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord,
+    GroupAbsenceRecord, KeyedOperation, OperationRecord, OperationVerb, Predecessors,
+    ProcessJournal, QueuedTurn, RawFactory, RawStream, RawWriter, ReceiptRecord, ResumeRecord,
+    RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord, Store,
+    StoreClient, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
+    TerminalExtras, TerminalRecord, UnfinishedTurn,
 };
 
 #[cfg(feature = "test-failpoints")]

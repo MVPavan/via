@@ -326,7 +326,7 @@ impl Engine {
                 })
                 .is_ok()
             {
-                return Err(via_store::StoreError::Unavailable);
+                return Err(via_store::StoreError::WriterLost);
             }
         }
         self.store.predecessors(session, turn).await
