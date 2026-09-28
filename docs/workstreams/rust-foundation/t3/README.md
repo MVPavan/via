@@ -90,3 +90,10 @@ Sol round-3 check SOUND (`sol-review-S1-r3.md`). S1 merged at `4a1c11c`.
 The gate on the merged tree: 213 / 2, failpoints 264 / 2 three times,
 F08–F12 17, release check clean. The design edits S1 needed are in
 `8eb4ed0` (tags `[s1.N]`, `[S1]`, amendment A20).
+
+S2 delivered on local `wt/t3-s2` at `bc34ee2` (report `reports/T3-S2.md`;
+gate 231 / 2, failpoints 293 / 2 three times, F08–F12 17). Sol medium, in
+two parts: `sol-review-S2-core.md` and `sol-review-S2-close.md`, both SOUND
+WITH CHANGES with no blocker. Round-1 decisions are in
+`s2-r1-decisions.md`: the idle timer disarms under an existing order, F19
+bounds the idle order, and the held count follows the session filter.

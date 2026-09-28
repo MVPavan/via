@@ -92,9 +92,13 @@ the historical checkpoint; its findings table is updated by this section.
   failpoints 264 / 2 three times, F08–F12 17, release check clean. **Now
   S2** (turn control, [t3/s2.md](t3/s2.md)): a local `implementer-high`
   subagent in worktree `../via-wt/t3-s2`, on branch `wt/t3-s2`, which is
-  not pushed. If the session died, inspect that branch and re-dispatch
-  from its last commit with the same brief. Then comes Sol medium review
-  in tmux, then merge, then S3 → S5 with S4 in parallel. **From 2026-09-28 no new cloud work: Claude workers are local
+  not pushed. It delivered at `bc34ee2`. The Sol medium reviews
+  (`t3/sol-review-S2-{core,close}.md`) are SOUND WITH CHANGES, and round 1
+  ([t3/s2-r1-decisions.md](t3/s2-r1-decisions.md)) is with the same
+  worker. If the session died, inspect that branch past `bc34ee2` and
+  re-dispatch whatever of the decisions is missing. Then comes a narrow
+  Sol check, then merge, the gate and push, then the design and contract
+  edits S2 listed, then S3 → S5 with S4 in parallel. **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session
