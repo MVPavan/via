@@ -1,0 +1,12 @@
+GPT-6 Sol medium review of T3-S2 (core part) at `bc34ee2` on local `wt/t3-s2`.
+
+**Verdict: SOUND WITH CHANGES** for the assigned turn-control scope at `bc34ee2`.
+
+| Rank | Finding | Concrete fix |
+|---|---|---|
+| **Major** | An idle timer can issue an idle order after cancel or close has already attached an order. If the run loop is busy committing an observation when `idle_at` passes, both the order and timer arms can be ready; the timer arm at `crates/via-core/src/engine/drive.rs:1128` can win. `TurnStop::attach` then retains the caller’s cause but may shorten its `force_at` (`engine/queue.rs:113–130`). Design §5 requires the idle timer to disarm once *any* order exists. | Before issuing the idle order, check the current stop watch under the slot transition; disarm the timer when an order is present. Add a controlled interleaving test. |
+| **Minor** | F19’s clock-step fallback checks spawn-to-**terminal** time up to 4 seconds (`crates/via-cli/tests/s1_turn_control.rs:809–818`). Under a wall-clock step, an idle order issued well after its 2-second deadline could still pass if the terminal arrives within 4 seconds. The reported clock step explains the intermittent failure, but this fallback is weaker evidence for timely ordering. | Record a monotonic test observation of `cancel.requested` and bound that event, rather than terminal completion, when the clocks diverge. |
+
+**Answers to the requested checks:** The queued, claimed, running, settling, and terminal cancel paths follow the single-owner and joined-caller rules on inspection; I found no additional lost wake, lock-order inversion, or double owner. Stop cause and `requested_at` are carried through normal disposition and force handoff, and the S1 `Stopped` compile allowance is replaced by `dispose`. Production wall and idle deadlines use monotonic `Instant`; acceptance, assistant text, and tool start/end reset idle as design §5 specifies. The `first_failure` migration covers the identified consumers, and the `(site, outcome, scope)` hook still latches every reported failure. The tests use sleeps to let time pass, with ordering witnessed by state or failpoint acknowledgements; the F19 fallback has the limitation above.
+
+I inspected the specified refs, contracts, worker report, implementation, and relevant tests. I did **not** run `bd`, `cargo`, or tests, edit files, or check out a ref. The worker’s reported gate results were reviewed as a report, not independently reproduced. Close and closing were outside my assigned review.

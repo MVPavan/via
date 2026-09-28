@@ -1,0 +1,14 @@
+GPT-6 Sol medium review of T3-S2 (close part) at `bc34ee2` on local `wt/t3-s2`.
+
+**Verdict: SOUND WITH CHANGES.** I found one minor cross-session delay in the absence check. I found no blocker or major defect in the reviewed close paths.
+
+- **Minor — unrelated held groups can delay a close.** At `bc34ee2`, `crates/via-host/src/host.rs:815–826` counts held groups daemon-wide, while its reprobe query applies the session filter. `crates/via-core/src/engine/close.rs:332` therefore may keep retrying until the close’s bound when only another session has a held group. Make `ReprobeReport.held` count the groups eligible for the supplied session filter, preserving daemon-wide behavior for `None`, and test both cases. This is a localized fix, but it needs a test to guard against ending the check before all of the session’s groups are examined. **The foreign group does not by itself make the close result `uncertain`:** `crates/via-store/src/runtime/sql.rs:1298–1309` derives cleanup from the closing session’s anchors. That part of report choice 4 overstates the effect.
+
+On the other requested points:
+
+1. **Close and closing:** The admission gate, claim handling, close watch, keyed replay, second-refusal response, and force rechecks follow §4 in the paths inspected. The sender survives the order check through subscription; `wait_for(Option::is_some)` reads an already published outcome. Force and latch exits publish and clear the order before `slot.stop()`. I found no lost wake, deadlock, or §1 lock-order violation in these paths.
+2. **Restart:** Recovery cancels queued turns of durably closing sessions with cause `close`, then attempts `Closed` before admission. The close result is derived from durable rows. A failed completion fails startup, as required.
+3. **CLI:** The `cancel` and `close` arguments and dispatch arms match the requested C1 verbs; the fake route advertises both as native.
+4. **Tests:** The adapted tests give useful S2 evidence, including failure-first mutation results reported by the worker. The sleeps I inspected create elapsed time or poll for a condition; they are not fixed sleeps used to assert ordering. The force late-subscriber variant and `final_shutdown` fence are legitimate S3 deferrals because they depend on S3’s serving window and shutdown entry.
+
+I inspected the named contracts, report, relevant files at `bc34ee2`, and scoped Git diffs. I did **not** run `bd`, Cargo, tests, or the release script; the worker’s gate results remain report evidence rather than independently verified results. I did not review the separately assigned cancel, stop-order, idle-deadline, or failure-migration behavior. No files, refs, or checkout state were changed.
