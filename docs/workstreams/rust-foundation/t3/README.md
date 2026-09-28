@@ -10,7 +10,7 @@ orchestrator dispatches implementation slices on disjoint files.
 
 | Task | Scope | Model | Brief |
 |---|---|---|---|
-| T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (fresh session) | `t0.md` |
+| T3-0 | Gap inventory, normative design note, slice plan; no production code | Opus 5.5 high (`session_01JvsKhcyrWwPXLVcSKKEB1J`) | `t0.md` |
 
 ## Carried into Task 3
 
