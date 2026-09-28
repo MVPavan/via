@@ -1469,6 +1469,172 @@ fn s1_recovery_corrupt_row_keeps_the_unknown_barrier_across_a_restart() -> TestR
     )
 }
 
+/// The failure message of a turn failed on its corrupt frozen row (design
+/// §7.3), as opposed to the read streak's.
+#[cfg(feature = "test-failpoints")]
+const CORRUPT_ROW: &str = "a frozen value of the queued turn could not be read";
+
+/// Design §7.3, live half (carried from S4 [s4.3, s4.8]): the handoff
+/// enqueues a corrupt row behind an unresolved predecessor, and the
+/// dispatcher's live rule fails it at the head. Turn 2 is valid and still
+/// queued at the crash; turn 3's `effective` is not JSON (Store cannot read
+/// the row), and turn 4's is JSON Core cannot parse. After the restart
+/// turn 2 runs, turns 3 and 4 fail `failed(store)` without launch, each
+/// with the corrupt-row message, and turn 5 runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_f12_live_corrupt_row_fails_at_the_head() -> TestResult {
+    let fixture = json!({"scripts":[
+        completes("l1", 1), completes("l2", 2), completes("l5", 5)
+    ]});
+    scenario("s1_f12_live_corrupt_row", &fixture, |paths, evidence| {
+        let (session, _) =
+            crash_with_queued_turns(paths, evidence, &["l1", "l2", "l3", "l4", "l5"], &[], &[])?;
+        corrupt_effective(paths, &session, 3, "not json {")?;
+        corrupt_effective(paths, &session, 4, r#"{"deadlines":"unparseable"}"#)?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        let fifth = wait(paths, evidence, &format!("{session}/5"))?;
+        check(fifth["state"] == "completed", || {
+            format!("turn 5 after the corrupt rows: {fifth}")
+        })?;
+        for n in [3, 4] {
+            failed_on_corrupt_row(paths, &session, n)?;
+            let (_, envelope) = paths.turn(&session, n)?;
+            check(envelope["failure"]["message"] == CORRUPT_ROW, || {
+                format!("turn {n} was not failed on its row: {envelope}")
+            })?;
+        }
+        let (second, _) = paths.turn(&session, 2)?;
+        check(second == "completed", || format!("turn 2: {second}"))
+    })
+}
+
+/// Design §7.3 with C1 P6, live (carried from S4 [s4.8]): a row Store
+/// cannot read, queued behind a turn that ends `unknown` after the restart,
+/// is cancelled from its committed `turn.queued`, never submitted, so the
+/// valid turn behind it is cancelled too. Turn 2 is valid and queued at the
+/// crash, so the handoff enqueues turn 3 behind it; after the restart turn
+/// 2 runs and a cancel whose `Stop` reply is lost
+/// (`host.anchor.final_reply_lost`) ends it `unknown`. (A durable `unknown`
+/// with `pending` cleanup cannot be produced end to end; this is the
+/// reachable case of the same dispatcher path.)
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_corrupt_row_behind_a_live_unknown_is_cancelled() -> TestResult {
+    let fixture = json!({"scripts":[
+        completes("u1", 1),
+        script("u2", 2, vec![accepted(2), step("hang")]),
+    ]});
+    scenario("s1_recovery_live_unknown", &fixture, |paths, evidence| {
+        let (session, _) =
+            crash_with_queued_turns(paths, evidence, &["u1", "u2", "u3", "u4"], &[], &[])?;
+        corrupt_effective(paths, &session, 3, "not json {")?;
+        let _daemon = Daemon::start(paths, evidence, "final")?;
+        paths.await_event(&session, 2, "turn.started")?;
+        paths
+            .failpoints
+            .arm("host.anchor.final_reply_lost", 1, "fail_io")
+            .map_err(infra)?;
+        let reply = paths.ok(
+            evidence,
+            "cancel-2",
+            &[
+                "cancel",
+                &session,
+                "--turn",
+                "2",
+                "--force-after",
+                "200",
+                "--wait",
+                "--handle",
+                HANDLE,
+                "--json",
+            ],
+        )?;
+        check(reply["state"] == "unknown", || {
+            format!("turn 2 did not end unknown: {reply}")
+        })?;
+        for n in [3, 4] {
+            let envelope = wait(paths, evidence, &format!("{session}/{n}"))?;
+            check(envelope["timestamps"]["submitted_at"].is_null(), || {
+                format!("turn {n} was submitted: {envelope}")
+            })?;
+            cancelled_behind_unknown(paths, &session, n)?;
+        }
+        Ok(())
+    })
+}
+
+/// Design §7.3 [s4.8] (characterization: S4 built the handoff path): a row
+/// Store cannot read, in a session whose close was durable at the crash, is
+/// cancelled at restart with the close's cause from its committed
+/// `turn.queued`, and the restart completes the close. The close's first
+/// queued cancellation crashes the daemon (`store.commit.cancel`), so turns
+/// 2 and 3 are still queued behind the running turn 1.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_recovery_unreadable_row_in_a_closing_session_is_cancelled() -> TestResult {
+    let fixture = json!({"scripts":[hanging("c1")]});
+    scenario(
+        "s1_recovery_closing_unreadable",
+        &fixture,
+        |paths, evidence| {
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let session = session_of(&spawn(paths, evidence, "spawn", "c1", &[])?)?;
+            paths.await_event(&session, 1, "turn.started")?;
+            resume(paths, evidence, "resume-2", &session, "c2", &[])?;
+            resume(paths, evidence, "resume-3", &session, "c3", &[])?;
+            let point = "store.commit.cancel";
+            paths.failpoints.arm(point, 1, "crash").map_err(infra)?;
+            let close = paths.run(
+                evidence,
+                "close",
+                &["close", &session, "--handle", HANDLE, "--json"],
+            )?;
+            check(!close.status.success(), || {
+                "the close survived the crash".to_owned()
+            })?;
+            paths
+                .failpoints
+                .wait_ack(point, 1, "crash", daemon.child.id(), ACK_WAIT)
+                .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
+            daemon.kill()?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            for n in [2, 3] {
+                let (state, _) = paths.turn(&session, n)?;
+                check(state == "queued", || {
+                    format!("turn {n} before the restart: {state}")
+                })?;
+            }
+            corrupt_effective(paths, &session, 2, "not json {")?;
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            for n in [2, 3] {
+                cancelled_behind_unknown(paths, &session, n)?;
+                let cause: Option<String> = paths
+                    .store()?
+                    .query_row(
+                        "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=?2",
+                        rusqlite::params![session, n],
+                        |row| row.get(0),
+                    )
+                    .map_err(infra)?;
+                check(cause.as_deref() == Some("close"), || {
+                    format!("turn {n} cancel cause: {cause:?}")
+                })?;
+            }
+            let closed = paths
+                .events(&session)?
+                .iter()
+                .any(|(event, _)| event["type"] == "session.closed");
+            check(closed, || {
+                "the restart did not close the session".to_owned()
+            })?;
+            drop(daemon);
+            Ok(())
+        },
+    )
+}
+
 // ------------------------------------------------- nondefault frozen values
 
 /// Design §11 (deferred by S2): the restart handoff and keyed replays keep a

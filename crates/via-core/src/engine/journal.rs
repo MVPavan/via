@@ -590,13 +590,28 @@ pub(super) fn outcome_of(error: &ApiError) -> WriteOutcome {
 /// Reads a durable terminal result as is; a turn whose terminal could not be
 /// made durable is C1 `store_error` with its last committed state, never a turn
 /// that looks still running.
+#[cfg(test)]
 pub(super) async fn read_result(
     journal: &impl TurnJournal,
     unresolved: &Unresolved,
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<Value>, ApiError> {
-    match journal.result(session, turn).await {
+    let read = journal.result(session, turn).await;
+    settled_result(unresolved, session, turn, read)
+}
+
+/// The result `read`, already made (the caller classifies its Store error
+/// first, design §7.3): a durable result settles the turn; a turn whose
+/// terminal could not be made durable is `store_error` with its last
+/// committed state.
+pub(super) fn settled_result(
+    unresolved: &Unresolved,
+    session: &SessionId,
+    turn: TurnNumber,
+    read: Result<Option<Value>, StoreError>,
+) -> Result<Option<Value>, ApiError> {
+    match read {
         Ok(Some(result)) => {
             unresolved.settle(session, turn);
             Ok(Some(result))

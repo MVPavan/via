@@ -1749,3 +1749,160 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
     }
     daemon.stop_clean()
 }
+
+// ------------------------------------------- reads and corruption (§7.3)
+
+/// The lowered read-failure streak (design §11: `VIA_TEST_READ_FAILURE_MS`).
+const READ_STREAK_MS: &str = "1000";
+
+/// The failure message of a turn failed by the read streak.
+const READ_FAILED: &str = "the turn's queued state could not be read";
+
+/// Design §7.3 [r3.8]: the dispatcher cannot complete its head's read
+/// sequence (persistent `store.read.dispatch`). After the lowered streak it
+/// fails the head turn `failed(store)` through row 2's resolution write,
+/// without launch; a drain issued while it retries still finishes, exit 0.
+/// With the resolution write also failing (`commit_submit_failed` hits
+/// `store.commit.terminal`), the daemon latches (escalation).
+#[test]
+fn s1_f12_dispatcher_reads_fail_then_turn_fails() -> TestResult {
+    dispatcher_reads_fail("store.read.dispatch", false)?;
+    dispatcher_reads_fail("store.read.dispatch", true)
+}
+
+/// Design §7.3 [r3.8]: only the queued-row read fails (persistent
+/// `store.read.queued_turn`) while the predecessor reads succeed. The
+/// streak does not reset on those successful reads: the head turn still
+/// fails at the lowered deadline, without launch.
+#[test]
+fn s1_f12_selective_queued_row_read_failure() -> TestResult {
+    dispatcher_reads_fail("store.read.queued_turn", false)
+}
+
+/// Turn 1 of a new session meets persistent `point` failures once its
+/// dispatcher starts (held at `daemon.dispatcher.before_start` while the
+/// failure is armed); a second session's running turn is unaffected.
+fn dispatcher_reads_fail(point: &str, resolution_fails: bool) -> TestResult {
+    let mut sandbox = Sandbox::new(&scripts(&[held("other", 1)]))?;
+    sandbox
+        .env
+        .push(("VIA_TEST_READ_FAILURE_MS", READ_STREAK_MS.to_owned()));
+    sandbox.count(point)?;
+    if point != "store.read.dispatch" {
+        sandbox.count("store.read.dispatch")?;
+    }
+    let mut daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let start = "daemon.dispatcher.before_start";
+    // The second session's dispatcher start is the second hit.
+    sandbox.arm(start, 2, "pause")?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, start, 2, "pause")?;
+    let first_failure = sandbox.next_hit(point)?;
+    let reads_before = sandbox.next_hit("store.read.dispatch")?;
+    sandbox.arm(point, first_failure, "fail_io_persist")?;
+    if resolution_fails {
+        // Nothing has committed a terminal yet: the resolution write is first.
+        sandbox.arm("store.commit.terminal", 1, "fail_io_persist")?;
+    }
+    sandbox.resume_point(start, 2)?;
+    sandbox.ack(&daemon, point, first_failure, "fail_io")?;
+    if resolution_fails {
+        sandbox.ack(&daemon, "store.commit.terminal", 1, "fail_io")?;
+        sandbox.disarm(point)?;
+        sandbox.disarm("store.commit.terminal")?;
+        daemon.latched_exit()?;
+        let state: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        check(state != "failed", || {
+            "the failed resolution write was recorded".to_owned()
+        })?;
+        return check(sandbox.anchors(&session, 1)? == 0, || {
+            "turn 1 launched".to_owned()
+        });
+    }
+    // Issued while the dispatcher retries: the streak bounds the drain.
+    sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    check(
+        first["state"] == "failed"
+            && first["failure"]["class"] == "store"
+            && first["failure"]["message"] == READ_FAILED
+            && first["timestamps"]["submitted_at"].is_string()
+            && first["cancel"].is_null(),
+        || format!("unexpected turn 1: {first}"),
+    )?;
+    check(sandbox.anchors(&session, 1)? == 0, || {
+        "turn 1 launched".to_owned()
+    })?;
+    let events = sandbox.events(&session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 1) == ["turn.queued", "turn.submitted", "turn.ended"],
+        || format!("turn 1 events: {events:?}"),
+    )?;
+    if point != "store.read.dispatch" {
+        // Each retry read the predecessors successfully first.
+        let reads = sandbox.next_hit("store.read.dispatch")? - reads_before;
+        check(reads >= 4, || {
+            format!("only {reads} dispatch reads during the streak")
+        })?;
+    }
+    let status = sandbox.status()?;
+    let failure = store_failure(&sandbox)?;
+    check(
+        status["health"] == "healthy"
+            && failure["kind"] == "read_failed"
+            && failure["scope"] == "turn"
+            && failure["affected"]["addresses"] == json!([format!("{session}/1")]),
+        || format!("unexpected status: {status}"),
+    )?;
+    sandbox.disarm(point)?;
+    sandbox.release("other")?;
+    let envelope = sandbox.wait(&format!("{other}/1"))?;
+    check(envelope["state"] == "completed", || {
+        format!("the second session's turn was affected: {envelope}")
+    })?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    check(status.code() == Some(0), || {
+        format!("the drain exited {status}: {}", daemon.trace())
+    })?;
+    sandbox.verify_anchors()
+}
+
+/// Design §7.1, §7.3: SQLite-level corruption on a read latches (exit 4),
+/// unlike any other read failure. A request's read (`events`) replies
+/// `store_error`; in the second run the dispatcher's predecessor read
+/// meets it, and the queued turn never launches.
+#[test]
+fn s1_f12_sqlite_corruption_latches() -> TestResult {
+    let point = "store.sqlite.corrupt";
+    // A request's read.
+    let sandbox = Sandbox::new(&scripts(&[completes("first", 1)]))?;
+    sandbox.count(point)?;
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.wait(&format!("{session}/1"))?;
+    let next = sandbox.next_hit(point)?;
+    sandbox.arm(point, next, "fail_io")?;
+    sandbox.refused(&["events", &session, "--json"], "store_error")?;
+    sandbox.ack(&daemon, point, next, "fail_io")?;
+    daemon.latched_exit()?;
+    // The dispatcher's read.
+    let sandbox = Sandbox::new(&scripts(&[completes("first", 1)]))?;
+    sandbox.count(point)?;
+    let daemon = sandbox.start()?;
+    let start = "daemon.dispatcher.before_start";
+    sandbox.arm(start, 1, "pause")?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.ack(&daemon, start, 1, "pause")?;
+    let next = sandbox.next_hit(point)?;
+    sandbox.arm(point, next, "fail_io")?;
+    sandbox.resume_point(start, 1)?;
+    sandbox.ack(&daemon, point, next, "fail_io")?;
+    daemon.latched_exit()?;
+    check(sandbox.anchors(&session, 1)? == 0, || {
+        "turn 1 launched after the corruption".to_owned()
+    })
+}

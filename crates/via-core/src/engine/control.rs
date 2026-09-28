@@ -10,7 +10,7 @@ use via_store::CancelCause;
 use super::drive::Cancelled;
 use super::queue::{Ack, CancelStep, Owner, QueuedOutcome, StopSpec};
 use super::stop::StopMode;
-use super::{Engine, journal, lock};
+use super::{Engine, lock};
 use crate::api::{DEFAULT_FORCE_AFTER_MS, rfc3339};
 use crate::{ApiError, CancelParams, SessionId, TurnNumber, hash_handle};
 
@@ -45,9 +45,7 @@ impl Engine {
         }
         let turn = self.cancel_target(&session, params.turn, snapshot.turns)?;
         let address = format!("{}/{}", session.as_str(), turn.get());
-        if let Some(envelope) =
-            journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-        {
+        if let Some(envelope) = self.read_result(&session, turn).await? {
             return Ok(reply(&address, &envelope, true));
         }
         if *lock(&self.stop) == Some(StopMode::Force) {

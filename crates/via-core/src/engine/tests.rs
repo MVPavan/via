@@ -1220,6 +1220,70 @@ fn a_claim_rollback_has_one_cancellation_owner() {
     });
 }
 
+/// Design §7.3 [r1.13]: callers joined to a dispatcher-owned cancellation
+/// get a plain `store_error` when its read fails; the dispatcher keeps the
+/// claim, retries on its timer and commits the cancellation.
+#[test]
+fn a_dispatcher_cancellation_read_failure_replies_store_error_to_joined_callers() {
+    let Some(root) =
+        child("a_dispatcher_cancellation_read_failure_replies_store_error_to_joined_callers")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_grant
+            .store(true, Ordering::Release);
+        let ((), (first, second)) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.granted.notified().await;
+            engine
+                .faults
+                .hold_after_grant
+                .store(false, Ordering::Release);
+            let slot = engine.slot(&session).unwrap();
+            tokio::join!(cancel(&engine, &session, 1), async {
+                until(|| slot.watchers(turn(1)).0 == 1).await;
+                engine
+                    .faults
+                    .submission_unread
+                    .store(true, Ordering::Release);
+                engine
+                    .faults
+                    .hold_cancel_read
+                    .store(true, Ordering::Release);
+                engine.faults.cancel_read_fails.store(1, Ordering::Release);
+                engine.faults.release.notify_one();
+                // The rollback's dispatcher cancellation, before its read.
+                engine.faults.granted.notified().await;
+                let (second, ()) = tokio::join!(cancel(&engine, &session, 1), async {
+                    until(|| slot.watchers(turn(1)).1 == 2).await;
+                    engine.faults.release.notify_one();
+                });
+                second
+            })
+        });
+        for reply in [first, second] {
+            let error = reply.unwrap_err();
+            assert_eq!(error.kind, "store_error");
+            assert!(error.data().get("commit_outcome").is_none(), "plain");
+        }
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended"],
+            "the retried cancellation committed"
+        );
+        let envelope = engine
+            .result(&format!("{}/1", session.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert!(!engine.store_failed(), "a read failure never latches");
+    });
+}
+
 /// Design §4 step 5 [r3.1]: a second close and a keyed replay arriving while
 /// the first close is held after its absence check wait without holding
 /// `admission` (another session's `resume` commits meanwhile), and all three

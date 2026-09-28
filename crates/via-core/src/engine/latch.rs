@@ -51,7 +51,7 @@ const HOST_STOP: Duration = Duration::from_secs(3);
 const READ_RETRY_RESERVE: Duration = FINALIZE_RESERVE.saturating_add(HOST_STOP);
 
 /// Where a Core Store write failed: one site per row of design §7.2, plus
-/// the resolution write, the dispatcher's reads (§7.3) and the latch batch
+/// the resolution write, reads and corrupt rows (§7.3) and the latch batch
 /// (§7.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FailureSite {
@@ -87,6 +87,11 @@ pub(super) enum FailureSite {
     Journal,
     /// A group-absence proof's commit (row 12).
     Absence,
+    /// A Store read (design §7.3): the dispatcher's read streak expired,
+    /// or SQLite reported corruption on a read.
+    Read,
+    /// A queued turn's frozen row is present but unparseable (§7.3).
+    CorruptRow,
 }
 
 impl FailureSite {
@@ -106,7 +111,9 @@ impl FailureSite {
             | Self::QueuedCancel
             | Self::Raw
             | Self::Journal
-            | Self::Absence => true,
+            | Self::Absence
+            | Self::Read
+            | Self::CorruptRow => true,
             // The escalation: a turn's one resolution write failed.
             Self::Resolution | Self::Batch => false,
         }
@@ -127,7 +134,9 @@ impl FailureSite {
             | Self::ForcedTerminal
             | Self::Batch
             | Self::Raw
-            | Self::Journal => "turn",
+            | Self::Journal
+            | Self::Read
+            | Self::CorruptRow => "turn",
         }
     }
 }
@@ -239,6 +248,8 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             | FailureSite::Batch => "commit_failed",
             FailureSite::Raw => "raw_failed",
             FailureSite::Journal | FailureSite::Absence => "journal_failed",
+            FailureSite::Read => "read_failed",
+            FailureSite::CorruptRow => "corrupt_row",
         },
     }
 }

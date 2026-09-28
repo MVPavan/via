@@ -93,7 +93,11 @@ POINTS = [
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
-OVERRIDES = {"VIA_TEST_CLIENT_VERSION": "0.0.0-release-check", "VIA_TEST_IDLE_EXIT_MS": "1"}
+OVERRIDES = {
+    "VIA_TEST_CLIENT_VERSION": "0.0.0-release-check",
+    "VIA_TEST_IDLE_EXIT_MS": "1",
+    "VIA_TEST_READ_FAILURE_MS": "1",
+}
 MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {
     "expected_request": {"type": "start", "id": 1, "turn": 1, "prompt": "release"},

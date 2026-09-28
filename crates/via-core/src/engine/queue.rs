@@ -687,6 +687,20 @@ impl Slot {
         self.wake();
     }
 
+    /// A dispatcher-owned cancellation's read failed (design §7.3
+    /// [r1.13]): every caller joined so far gets a plain `store_error`. The
+    /// claim is kept, and a caller joining later waits for the retry. The
+    /// slot mutex alone. No wake: the claim is unchanged.
+    pub(super) fn read_failed(&self, turn: TurnNumber) {
+        let mut state = lock(&self.state);
+        if let Some(entry) = state.entry(turn)
+            && entry.claim == Claim::Cancelling(Owner::Dispatcher)
+        {
+            entry.outcome.send_replace(Some(QueuedOutcome::ReadFailed));
+            entry.outcome = watch::Sender::new(None);
+        }
+    }
+
     /// Takes the dispatcher's next cancellation for the close pass or force
     /// (design §3.1, §4 step 1): the first `Waiting` turn becomes
     /// `Cancelling{dispatcher}` with `cause`; one already dispatcher-owned is

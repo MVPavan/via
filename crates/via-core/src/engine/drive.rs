@@ -11,14 +11,15 @@ use via_adapters::{
     RouteError, StopOrder, StopWatch, ToolStatus, WireCleanup,
 };
 use via_store::{
-    AcceptanceRecord, CancelCause, QueuedTurn, SubmissionRecord, TerminalExtras, TerminalRecord,
+    AcceptanceRecord, CancelCause, QueuedTurn, StoreError, SubmissionRecord, TerminalExtras,
+    TerminalRecord,
 };
 
 use super::batch::AffectedTurn;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
-use super::resolve::{CORRUPT_ROW, Queueing, SUBMISSION_FAILED};
+use super::resolve::{Queueing, ReadStreak};
 use super::stop::StopMode;
 use super::terminal::{dispose, terminal_envelope};
 use super::{
@@ -67,16 +68,19 @@ pub(super) enum SubmitFailure {
     /// (design §7.2).
     NotCommitted(Queueing),
     /// A frozen value of the queued row is unparseable: the turn fails with
-    /// the same write, and no Store write failed (design §7.3).
-    Corrupt(Queueing),
+    /// the same write, and no Store write failed (design §7.3). No
+    /// queueing when Store itself could not parse the row.
+    Corrupt(Option<Queueing>),
 }
 
 /// A queued turn's dispatch decision from its predecessors' durable state.
 enum Decision {
     Run,
     Cancel,
-    /// Not yet: an earlier turn is unresolved or Store could not be read.
+    /// Not yet: an earlier turn is unresolved or its cleanup pending.
     Wait,
+    /// Store could not be read: the read streak counts it (design §7.3).
+    Unread,
 }
 
 /// How a terminal commits (design §7.2): retried once at the same sequence
@@ -142,6 +146,9 @@ pub(super) enum Step {
     Next,
     /// Wait for a wake or the read-retry timer.
     Wait,
+    /// The head's read sequence failed: the read streak decides the wake
+    /// (design §7.3).
+    Unread(TurnNumber),
 }
 
 /// How a drive's execution ended.
@@ -196,6 +203,7 @@ impl Engine {
         let _dispatching = self.dispatching(&session);
         let mut force = self.force.subscribe();
         let mut backoff = Backoff::new();
+        let mut streak = ReadStreak::new();
         let mut refused = false;
         loop {
             if *force.borrow() {
@@ -220,6 +228,7 @@ impl Engine {
                     }
                     Decision::Cancel => Step::Next,
                     Decision::Wait => Step::Wait,
+                    Decision::Unread => Step::Unread(turn),
                 },
                 Front::Turn(turn, Claim::Cancelling(Owner::Dispatcher)) => {
                     self.dispatcher_cancel(&slot, &session, turn).await
@@ -228,8 +237,20 @@ impl Engine {
                 Front::Turn(_, Claim::Cancelling(Owner::Request) | Claim::Claimed) => Step::Wait,
             };
             match step {
-                Step::Next => backoff.reset(),
+                Step::Next => {
+                    backoff.reset();
+                    streak.reset();
+                }
                 Step::Wait => Self::await_wake(&slot, &mut force, backoff.next()).await,
+                Step::Unread(turn) => {
+                    let now = tokio::time::Instant::now();
+                    if let Some(delay) = streak.failed(turn, now, backoff.next()) {
+                        Self::await_wake(&slot, &mut force, delay).await;
+                    } else {
+                        backoff.reset();
+                        self.read_expired(&slot, &session, turn).await;
+                    }
+                }
             }
         }
     }
@@ -313,17 +334,14 @@ impl Engine {
     /// The dispatch grant (design §4): refused once a force stop is accepted
     /// or Store failure latched. `request_stop` accepts force under the same
     /// mutex, so a turn still queued when force is accepted is never submitted.
-    fn grant(&self) -> bool {
+    pub(super) fn grant(&self) -> bool {
         *lock(&self.stop) != Some(StopMode::Force) && !self.store_failed()
     }
 
     /// Claims, grants, submits and runs the queue head (design §3.1). It
-    /// keeps its queued count until Store confirms the submission. A
-    /// submission that did not commit, or a corrupt frozen row, fails the
-    /// turn with no vendor I/O through row 2's resolution write (design
-    /// §7.2, §7.3); an uncertain one latches Store failure and the turn
-    /// stays queued. Every other path that does not submit rolls the claim
-    /// back.
+    /// keeps its queued count until Store confirms the submission. A failed
+    /// submission is [`Engine::submit_failure`]'s (design §7.2, §7.3).
+    /// Every other path that does not submit rolls the claim back.
     async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
         // Design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
@@ -363,39 +381,9 @@ impl Engine {
         }
         let submission = match self.submit(slot, session, turn).await {
             Ok(submission) => submission,
-            Err(SubmitFailure::Unread) => {
-                slot.rollback(turn);
-                return Step::Wait;
-            }
-            Err(SubmitFailure::Failed(outcome)) => {
-                slot.rollback(turn);
-                self.store_failure(
-                    FailureSite::Submission,
-                    outcome,
-                    FailureScope::Turn(session, turn),
-                )
-                .finish()
-                .await;
-                return Step::Next;
-            }
-            Err(SubmitFailure::NotCommitted(queueing)) => {
-                // No agent I/O: the connection slot is released first.
-                drop(connection);
-                self.store_failure(
-                    FailureSite::Submission,
-                    WriteOutcome::NotCommitted,
-                    FailureScope::Turn(session, turn),
-                )
-                .finish()
-                .await;
+            Err(failure) => {
                 return self
-                    .submit_failed(slot, session, turn, queueing, SUBMISSION_FAILED)
-                    .await;
-            }
-            Err(SubmitFailure::Corrupt(queueing)) => {
-                drop(connection);
-                return self
-                    .submit_failed(slot, session, turn, queueing, CORRUPT_ROW)
+                    .submit_failure(slot, (session, turn), failure, connection)
                     .await;
             }
         };
@@ -545,14 +533,19 @@ impl Engine {
 
     /// C1 P6/§7.3 from durable state. While any earlier turn is unresolved
     /// (queued, including an orphan awaiting reconciliation, or running, or
-    /// with no durable terminal) the turn waits; so does it when Store cannot
-    /// answer. Otherwise the latest submitted earlier turn decides: cleanup
+    /// with no durable terminal) the turn waits. A read Store cannot answer
+    /// is `Unread`, for the read streak (design §7.3); SQLite corruption on
+    /// it latches. Otherwise the latest submitted earlier turn decides: cleanup
     /// `pending` waits (C1 §7.3 dispatches only after cleanup settles), durably
     /// `unknown` cancels (P6), anything else runs. Turns cancelled while
     /// queued never ran and are passed over.
     async fn decide(&self, session: &SessionId, turn: TurnNumber) -> Decision {
-        let Ok(predecessors) = self.predecessors(session, turn).await else {
-            return Decision::Wait;
+        let predecessors = match self.predecessors(session, turn).await {
+            Ok(predecessors) => predecessors,
+            Err(error) => {
+                self.read_error(&error).await;
+                return Decision::Unread;
+            }
         };
         if predecessors.unresolved {
             return Decision::Wait;
@@ -800,6 +793,49 @@ impl Engine {
         control.slot.acknowledge(control.turn, ack);
     }
 
+    /// `cancel_queued`'s reads: the turn's queueing, then the settled
+    /// session head. A failed read carries its Store error, if it has one.
+    async fn cancel_reads(
+        &self,
+        slot: &Slot,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Queueing, Option<StoreError>> {
+        #[cfg(test)]
+        self.hold(&self.faults.hold_cancel_read).await;
+        #[cfg(feature = "test-failpoints")]
+        if via_store::failpoint::hit_async("core.force.cancel_read")
+            .await
+            .is_err()
+        {
+            return Err(None);
+        }
+        #[cfg(test)]
+        if self
+            .faults
+            .cancel_read_fails
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(None);
+        }
+        let queued = match self.store.queued_turn(session, turn).await {
+            Ok(Some(queued)) => Queueing::from(&queued),
+            // Design §7.3 [s4.8]: a row Store cannot parse is cancelled
+            // from its committed `turn.queued`, never submitted.
+            Err(StoreError::CorruptEvidence) => {
+                self.queueing(session, turn).await.map_err(|_| None)?
+            }
+            Ok(None) => return Err(None),
+            Err(error) => return Err(Some(error)),
+        };
+        // Settle an unknown head now, so the commit below reads nothing.
+        slot.head.lock(&self.store, session).await.map_err(Some)?;
+        Ok(queued)
+    }
+
     /// Commits a never-submitted turn `queued → cancelled` (C1 §7.2), behind
     /// an `unknown` predecessor, under force, or for a caller `cancel` or a
     /// `close` (`cause`, with its `requested_at`); no vendor I/O happened.
@@ -820,39 +856,24 @@ impl Engine {
         cause: Option<(CancelCause, String)>,
     ) -> Cancelled {
         // Both reads run under final shutdown's read cutoff (design §2.3).
-        let reads = async {
-            #[cfg(test)]
-            self.hold(&self.faults.hold_cancel_read).await;
-            #[cfg(feature = "test-failpoints")]
-            if via_store::failpoint::hit_async("core.force.cancel_read")
-                .await
-                .is_err()
-            {
-                return None;
-            }
-            #[cfg(test)]
-            if self
-                .faults
-                .cancel_read_fails
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                    left.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return None;
-            }
-            let queued = self.store.queued_turn(session, turn).await.ok().flatten()?;
-            // Settle an unknown head now, so the commit below reads nothing.
-            slot.head.lock(&self.store, session).await.ok()?;
-            Some(Queueing::from(&queued))
-        };
+        let reads = self.cancel_reads(slot, session, turn);
         let queued = tokio::select! {
             biased;
             queued = reads => queued,
             () = self.read_cutoff() => return Cancelled::Expired,
         };
-        let Some(queued) = queued else {
-            return Cancelled::Unread;
+        let queued = match queued {
+            Ok(queued) => queued,
+            Err(error) => {
+                if let Some(error) = error {
+                    self.read_error(&error).await;
+                }
+                if owner == Owner::Dispatcher {
+                    // Design §7.3 [r1.13]: joined callers get `store_error`.
+                    slot.read_failed(turn);
+                }
+                return Cancelled::Unread;
+            }
         };
         let (started, record, terminal, extras) =
             queued_cancellation(slot, session, turn, queued, cause);
@@ -1470,13 +1491,19 @@ impl Engine {
         turn: TurnNumber,
         head: &Head,
     ) -> Result<Submission, SubmitFailure> {
-        let Ok(Some(queued)) = journal.queued_turn(session, turn).await else {
-            return Err(SubmitFailure::Unread);
+        let queued = match journal.queued_turn(session, turn).await {
+            Ok(Some(queued)) => queued,
+            // Store could not parse the row's frozen values (design §7.3).
+            Err(StoreError::CorruptEvidence) => return Err(SubmitFailure::Corrupt(None)),
+            Err(error @ StoreError::Corrupt(_)) => {
+                return Err(SubmitFailure::Failed(WriteOutcome::of(&error)));
+            }
+            Ok(None) | Err(_) => return Err(SubmitFailure::Unread),
         };
         let queueing = || Queueing::from(&queued);
         // A frozen row Core cannot read fails the turn: nothing is sent.
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
-            return Err(SubmitFailure::Corrupt(queueing()));
+            return Err(SubmitFailure::Corrupt(Some(queueing())));
         };
         // Design §2 [r1.11]: the submission clock is taken immediately
         // before the commit; both deadlines run from it.
@@ -1489,8 +1516,12 @@ impl Engine {
         {
             return Err(SubmitFailure::Unread);
         }
-        let Ok(head) = head.lock(journal, session).await else {
-            return Err(SubmitFailure::Unread);
+        let head = match head.lock(journal, session).await {
+            Ok(head) => head,
+            Err(error @ StoreError::Corrupt(_)) => {
+                return Err(SubmitFailure::Failed(WriteOutcome::of(&error)));
+            }
+            Err(_) => return Err(SubmitFailure::Unread),
         };
         let event = Event {
             seq: head.next(),
