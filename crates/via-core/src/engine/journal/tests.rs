@@ -10,14 +10,14 @@ use std::{
 use serde_json::{Value, json};
 use via_store::{
     EventRecord, QueuedTurn, RawStream, ResumeRecord, SpawnRecord, Store, StoreClient, StoreError,
-    StoredEvent, SubmissionRecord, TerminalRecord,
+    StoredEvent, SubmissionRecord, TerminalExtras, TerminalRecord,
 };
 
 use super::{
     Head, TurnJournal, UNRESOLVED_LIMIT, Unresolved, admission, commit_event, read_result,
 };
 use crate::api::{Event, EventBody, FailureClass};
-use crate::engine::drive::SubmitFailure;
+use crate::engine::drive::{Commit, SubmitFailure};
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
 use crate::{
     ApiError, ConnectionId, FakeConfig, RawRef, SessionId, SpawnParams, TurnNumber, TurnState,
@@ -339,6 +339,77 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
     assert_eq!(envelope["raw_spans"], json!([]));
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(event_types(&events)[2], (3, "turn.ended".to_owned()));
+}
+
+/// A turn whose `raw_log.incomplete` commit had the outcome `fault`, finished
+/// as `drive` does when the event is owed (design §7.2 row 6, `raw_owed`);
+/// returns the durable events.
+async fn raw_incomplete_then_finish(fault: EventFault) -> Vec<(u64, String)> {
+    let root = tempfile::tempdir().unwrap();
+    let (store, _raw_ref) = running_turn(&root).await;
+    let journal = FaultJournal {
+        store: store.client(),
+        event: fault,
+        head: HeadFault::Readable,
+        submission_fails: false,
+        delayed_results: false,
+    };
+    let mut record = record();
+    let body = EventBody::RawLogIncomplete {
+        connection_id: ConnectionId::try_from(CONNECTION).unwrap(),
+    };
+    commit_event(&journal, &mut record, body, None).await;
+    assert!(
+        record.first_failure.is_some(),
+        "the injected fault reached Core"
+    );
+    let mode = Commit {
+        retry: false,
+        raw_owed: true,
+    };
+    Engine::commit_turn_ended_with(
+        &journal,
+        &started(),
+        record,
+        store_failure(),
+        false,
+        TerminalExtras::default(),
+        mode,
+    )
+    .await
+    .unwrap();
+    event_types(&store.client().events(&session(), 1, 10).await.unwrap())
+}
+
+/// The event's commit succeeded but its reply was lost: the durable read-back
+/// finds the turn's `raw_log.incomplete`, so the terminal does not write a
+/// second one.
+#[tokio::test]
+async fn a_committed_uncertain_raw_incomplete_is_not_written_twice() {
+    assert_eq!(
+        raw_incomplete_then_finish(EventFault::CommittedThenUncertain).await,
+        [
+            (1, "turn.queued".to_owned()),
+            (2, "turn.submitted".to_owned()),
+            (3, "raw_log.incomplete".to_owned()),
+            (4, "turn.ended".to_owned()),
+        ]
+    );
+}
+
+/// The event's commit reported uncertain but left nothing durable: the
+/// read-back finds none, so the terminal writes the one it owes.
+#[tokio::test]
+async fn an_uncommitted_uncertain_raw_incomplete_is_written_by_the_terminal() {
+    assert_eq!(
+        raw_incomplete_then_finish(EventFault::UncertainNotCommitted).await,
+        [
+            (1, "turn.queued".to_owned()),
+            (2, "turn.submitted".to_owned()),
+            (3, "raw_log.incomplete".to_owned()),
+            (4, "turn.ended".to_owned()),
+        ]
+    );
 }
 
 /// Another writer of the session, such as a `resume` committing the next turn's

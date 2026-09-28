@@ -1678,6 +1678,131 @@ fn s1_f12_raw_failure_records_incomplete() -> TestResult {
     scoped_end(daemon, &other)
 }
 
+/// How the turn whose `raw_log.incomplete` reply was lost ends.
+#[derive(Clone, Copy, Debug)]
+enum RawEnd {
+    /// The turn's own terminal commits, after the read-back finds the event.
+    Terminal,
+    /// The terminal's first attempt fails, so final shutdown's batch
+    /// commits it.
+    Batch,
+    /// Every later commit fails: the batch is skipped and the turn stays
+    /// running until restart recovery ends it.
+    Restart,
+}
+
+/// Design §7.2 row 6, §7.4 and §9: a protocol failure ends a turn whose raw
+/// log lost the connection's last bytes (the drain's append fails, and
+/// Route's cause stays the protocol failure), so Core commits
+/// `raw_log.incomplete` itself; that commit succeeds but its reply is lost
+/// (`store.commit.reply_lost`) and the daemon latches. The turn's stream
+/// then has exactly one `raw_log.incomplete`, at a dense sequence,
+/// whichever path ends the turn (the terminal, the failure batch, or
+/// restart recovery), and a restart adds none.
+#[test]
+fn s1_f12_raw_incomplete_reply_lost_is_written_once() -> TestResult {
+    for end in [RawEnd::Terminal, RawEnd::Batch, RawEnd::Restart] {
+        raw_incomplete_reply_lost(end)?;
+    }
+    Ok(())
+}
+
+fn raw_incomplete_reply_lost(end: RawEnd) -> TestResult {
+    // A second acceptance is a protocol failure once its own frame is
+    // recorded; the line behind it, written together, is only in Wire's
+    // buffer, so the failure drain records it.
+    let duplicate = json!({"action":"emit_raw","text":
+        "{\"type\":\"accepted\",\"id\":1,\"vendor_turn_id\":\"fake-turn-1\"}\ntail-after-duplicate\n"});
+    let sandbox = Sandbox::new(&script(
+        "first",
+        1,
+        vec![accepted(1), gate("first"), duplicate, terminal(1)],
+    ))?;
+    for point in [
+        "raw.append.fail",
+        "store.commit.event",
+        "store.commit.reply_lost",
+        "store.commit.terminal",
+        "store.commit.fail_persistent",
+    ] {
+        sandbox.count(point)?;
+    }
+    let daemon = sandbox.start()?;
+    let (session, _) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.await_accepted(&session, 1)?;
+    // The duplicate frame's append succeeds; the tail's is the next.
+    let append = sandbox.next_hit("raw.append.fail")? + 1;
+    sandbox.arm("raw.append.fail", append, "fail_io")?;
+    // The turn's first event after acceptance is `raw_log.incomplete`; the
+    // writer is held before it, so the next commit is that event's.
+    let event = sandbox.next_hit("store.commit.event")?;
+    sandbox.arm("store.commit.event", event, "pause")?;
+    sandbox.release("first")?;
+    sandbox.ack(&daemon, "raw.append.fail", append, "fail_io")?;
+    sandbox.ack(&daemon, "store.commit.event", event, "pause")?;
+    let lost = sandbox.next_hit("store.commit.reply_lost")?;
+    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+    match end {
+        RawEnd::Terminal => {}
+        RawEnd::Batch => {
+            let first = sandbox.next_hit("store.commit.terminal")?;
+            sandbox.arm("store.commit.terminal", first, "fail_io")?;
+        }
+        RawEnd::Restart => {
+            // The event itself commits; every later commit fails.
+            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
+            sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
+        }
+    }
+    sandbox.resume_point("store.commit.event", event)?;
+    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+    let summary = daemon.latched_exit()?;
+    let batches = match end {
+        RawEnd::Terminal | RawEnd::Restart => {
+            json!({"committed": 0, "skipped": u8::from(matches!(end, RawEnd::Restart))})
+        }
+        RawEnd::Batch => json!({"committed": 1, "skipped": 0}),
+    };
+    check(summary["failure_batches"] == batches, || {
+        format!("{end:?}: {summary}")
+    })?;
+    // Stopped with this daemon's failpoints, so a restart runs clean.
+    for point in [
+        "raw.append.fail",
+        "store.commit.event",
+        "store.commit.reply_lost",
+        "store.commit.terminal",
+        "store.commit.fail_persistent",
+    ] {
+        let _ = sandbox.disarm(point);
+    }
+    let once = |events: &[Value], when: &str| -> TestResult {
+        dense(events)?;
+        let logged = event_types(events, 1)
+            .iter()
+            .filter(|kind| *kind == "raw_log.incomplete")
+            .count();
+        check(logged == 1, || {
+            let kinds = event_types(events, 1);
+            format!("{end:?} {when}: {logged} raw_log.incomplete in {kinds:?}")
+        })
+    };
+    let daemon = sandbox.start()?;
+    let events = sandbox.events(&session)?;
+    once(&events, "after restart")?;
+    let first = sandbox.wait(&format!("{session}/1"))?;
+    let warned = first["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|w| w["code"] == "raw_log_incomplete"));
+    check(warned, || format!("{end:?}: unexpected turn 1: {first}"))?;
+    // A second restart adds nothing.
+    daemon.stop_clean()?;
+    let daemon = sandbox.start()?;
+    once(&sandbox.events(&session)?, "after a second restart")?;
+    daemon.stop_clean()
+}
+
 // ------------------------------------------------ re-probe proofs (rows 4, 12)
 
 /// Design §7.2 rows 4 and 12 [s1.6]: an anchor identified write that is
@@ -2418,7 +2543,7 @@ fn s1_f12_latch_batch_commits_or_is_skipped() -> TestResult {
         sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
         if skipped {
             // The event itself commits; every later commit fails.
-            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
+            let later = sandbox.next_hit("store.commit.fail_persistent")? + 2;
             sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
         }
         sandbox.release("accepted")?;
