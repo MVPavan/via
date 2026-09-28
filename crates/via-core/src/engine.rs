@@ -8,37 +8,32 @@ use std::{
         Arc, Mutex as StdMutex, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::Instant,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::api::{
-    Cancel, Capabilities, DEFAULT_WAIT_MS, Effective, Event, EventBody, Exit, Failure,
-    FailureClass, RawSpan, Receipt, RoutePlan, TurnReceipt, Warning, retry_key, rfc3339,
-};
-use crate::{
-    ApiError, FakeConfig, RawRef, ResumeParams, SessionId, SpawnParams, SteerParams, TurnNumber,
-    WaitParams, hash_handle, parse_address, retry_identity,
-};
+use crate::api::{Cancel, Exit, Failure, FailureClass, RawSpan, Warning};
+use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
-use via_store::{
-    OperationRecord, ResumeRecord, SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient,
-    StoreError,
-};
+use via_store::{Store, StoreClient};
 
 mod drive;
 mod journal;
+mod latch;
 mod queue;
+mod read;
+mod receipt;
 mod recovery;
+mod slots;
 mod stop;
 mod terminal;
 #[cfg(test)]
 mod tests;
 
 use journal::{Head, UncertainEvent, Unresolved};
-use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
+use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
 pub use stop::{EngineShutdown, StopMode};
 
@@ -100,7 +95,7 @@ pub struct Engine {
     /// grant; at launch Host takes it for the group's life. FIFO waiters.
     slots: Arc<tokio::sync::Semaphore>,
     /// Slots held for groups an earlier daemon left unproven (design §11).
-    recovered: recovery::RecoveredSlots,
+    recovered: slots::RecoveredSlots,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -173,10 +168,6 @@ struct Started {
     /// Submission time and clock; `None` for a turn cancelled while queued.
     submitted: Option<(String, Instant)>,
 }
-
-/// Part of final shutdown's deadline that force-path read retries leave for
-/// Host cleanup (its 3 s native stop) and forced terminals.
-const READ_RETRY_RESERVE: Duration = Duration::from_secs(4);
 
 /// A held `admission` guard: receipts, stop acceptance, the Store-failed
 /// latch and every `session.closed` decision are ordered by it.
@@ -258,94 +249,10 @@ impl Engine {
             start_receiver: StdMutex::new(Some(start_receiver)),
             pending_starts: StdMutex::new(HashSet::new()),
             slots: connection_slots(),
-            recovered: recovery::RecoveredSlots::default(),
+            recovered: slots::RecoveredSlots::default(),
             #[cfg(test)]
             faults: Faults::default(),
         })
-    }
-
-    /// A receipt commit that reported failure (C1 §8.1, runtime §7): latches
-    /// Store failure and is `store_error` with `commit_outcome`, `unknown`
-    /// with `retry: same_key_only` when it may have committed. Restart
-    /// recovery settles an unknown one.
-    fn receipt_failed(&self, error: &StoreError, admission: &Admission<'_>) -> ApiError {
-        self.latch_held(admission);
-        if journal::may_have_committed(error) {
-            ApiError::RECEIPT_UNKNOWN
-        } else {
-            ApiError::RECEIPT_NOT_COMMITTED
-        }
-    }
-
-    /// Latches Store failure after Core's first failed or uncertain state
-    /// write (runtime §7), in two phases (design §3.2). Phase one runs now,
-    /// before anything is awaited: `failure_pending` and the force signal are
-    /// published under the `stop` mutex, so no grant, no pre-ARM gate and no
-    /// new receipt passes from here on. Phase two, the returned future,
-    /// finalizes the latch under `admission`, ordered after any receipt
-    /// already inside it. The caller holds no slot, session or head lock.
-    pub(super) fn latch(&self) -> impl Future<Output = ()> + '_ {
-        self.fail_pending();
-        async move {
-            let admission = self.admission.lock().await;
-            self.latch_held(&admission);
-        }
-    }
-
-    /// [`Engine::latch`] for a caller already holding `admission`: both phases
-    /// at once.
-    pub(super) fn latch_held(&self, _admission: &Admission<'_>) {
-        self.fail_pending();
-        self.store_failed.store(true, Ordering::Release);
-    }
-
-    /// Phase one of the latch: marks the failure pending and sends the force
-    /// signal under the `stop` mutex, which the grant takes, so running turns
-    /// take the forced path and daemon main starts final shutdown, which then
-    /// reports an unclean exit.
-    fn fail_pending(&self) {
-        let mut stop = lock(&self.stop);
-        if self.failure_pending.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        *stop = Some(StopMode::Force);
-        self.force_requested_at
-            .get_or_init(|| rfc3339(SystemTime::now()));
-        self.force.send_replace(true);
-    }
-
-    /// Whether phase two finalized the latch under `admission`.
-    #[cfg(test)]
-    fn latch_finalized(&self) -> bool {
-        self.store_failed.load(Ordering::Acquire)
-    }
-
-    /// Final shutdown began with this absolute deadline: force-path reads
-    /// stop retrying in time for Host cleanup and forced terminals.
-    pub fn begin_final_shutdown(&self, deadline: tokio::time::Instant) {
-        let by = deadline
-            .checked_sub(READ_RETRY_RESERVE)
-            .unwrap_or_else(tokio::time::Instant::now);
-        self.read_retries_until
-            .send_if_modified(|until| until.is_none() && until.replace(by).is_none());
-    }
-
-    /// Until when a force-path read may run or retry, once final shutdown began.
-    fn read_retries_until(&self) -> Option<tokio::time::Instant> {
-        *self.read_retries_until.borrow()
-    }
-
-    /// Resolves at the force-path read cutoff; never before final shutdown began.
-    async fn read_cutoff(&self) {
-        let mut until = self.read_retries_until.subscribe();
-        let by = match until.wait_for(Option::is_some).await {
-            Ok(by) => *by,
-            Err(_) => None,
-        };
-        match by {
-            Some(by) => tokio::time::sleep_until(by).await,
-            None => std::future::pending().await,
-        }
     }
 
     /// Test hook: once `flag` is armed, signals `granted` and waits for `release`.
@@ -355,30 +262,6 @@ impl Engine {
             self.faults.granted.notify_one();
             self.faults.release.notified().await;
         }
-    }
-
-    /// Whether a Store failure was observed: pending or finalized.
-    pub fn store_failed(&self) -> bool {
-        self.failure_pending.load(Ordering::Acquire) || self.store_failed.load(Ordering::Acquire)
-    }
-
-    /// Wakes when a force stop is accepted or Store failure latches; daemon
-    /// main then starts final shutdown in the mode `stop_mode` reports.
-    pub fn force_signal(&self) -> watch::Receiver<bool> {
-        self.force.subscribe()
-    }
-
-    /// A receipt commit's reply, lost by the test fault backend when armed.
-    #[cfg_attr(
-        not(test),
-        expect(clippy::unused_self, reason = "the fault backend exists only in tests")
-    )]
-    fn receipt_reply<T>(&self, reply: Result<T, StoreError>) -> Result<T, StoreError> {
-        #[cfg(test)]
-        if reply.is_ok() && self.faults.receipt_reply_lost.swap(false, Ordering::AcqRel) {
-            return Err(StoreError::Uncertain("injected reply loss".to_owned()));
-        }
-        reply
     }
 
     /// The dispatch slot of a session with dispatch state.
@@ -446,277 +329,6 @@ impl Engine {
         self.active.load(Ordering::Acquire)
     }
 
-    /// Commits a receipt before authorizing any process launch.
-    ///
-    /// A keyed retry is looked up before any admission check (runtime §6): the
-    /// same key, handle and byte-identical `raw_params` replay the stored
-    /// receipt, anything else under the key is `idempotency_conflict`.
-    pub async fn spawn(
-        &self,
-        params: SpawnParams,
-        raw_params: &str,
-    ) -> Result<Receipted, ApiError> {
-        let admission = self.admission.lock().await;
-        // Runtime §7: no new mutation, not even a keyed replay, after a failed write.
-        if self.store_failed() {
-            return Err(ApiError::STORE);
-        }
-        let hash = hash_handle(&params.handle)?;
-        let key = match retry_key(params.idempotency_key.as_deref())? {
-            Some(key) => {
-                let identity = retry_identity(raw_params, &hash)?;
-                if let Some(stored) = self
-                    .store
-                    .spawn_key(key)
-                    .await
-                    .map_err(|_| ApiError::STORE)?
-                {
-                    return if stored.identity == identity {
-                        Ok(Receipted {
-                            receipt: stored.receipt,
-                            enqueued: None,
-                        })
-                    } else {
-                        Err(ApiError::IDEMPOTENCY_CONFLICT)
-                    };
-                }
-                Some(SpawnKey {
-                    key: key.to_owned(),
-                    identity,
-                })
-            }
-            None => None,
-        };
-        if lock(&self.stop).is_some() {
-            return Err(ApiError::DAEMON_STOPPING);
-        }
-        // Bounds the turns retained for their `store_error` reads.
-        journal::admission(&self.store, &self.unresolved).await?;
-        if params.harness != "fake" || !self.adapter.fake_available() {
-            return Err(ApiError::HARNESS_UNAVAILABLE);
-        }
-        if params.model != "fake" || params.prompt.is_empty() {
-            return Err(ApiError::INVALID_PARAMS);
-        }
-        let effective = Effective::fake(&params.model, &params.per_turn().fake_overrides()?);
-        if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
-            return Err(ApiError::QUEUED_AT_CAPACITY);
-        }
-        let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
-        let session = crate::api::new_session_id()?;
-        let plan = RoutePlan::fake();
-        let receipt = Receipt {
-            session_id: session.clone(),
-            turn: format!("{}/{}", session.as_str(), turn.get()),
-            state: "queued",
-            warnings: plan.warnings(),
-            plan,
-            capabilities: Capabilities::fake(),
-            effective,
-        };
-        let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
-        let at = rfc3339(SystemTime::now());
-        let initial_event = Event {
-            seq: 1,
-            session_id: &session,
-            turn: Some(turn.get()),
-            late: false,
-            at: &at,
-            raw_ref: None,
-            body: EventBody::TurnQueued { queue_position: 0 },
-        }
-        .to_value()?;
-        #[cfg(test)]
-        self.hold(&self.faults.hold_receipt).await;
-        let stored = self
-            .store
-            .commit_keyed_spawn(
-                SpawnRecord {
-                    session_id: session.clone(),
-                    handle_hash: hash,
-                    receipt: receipt.clone(),
-                    params: json!({"harness":"fake","model":"fake"}),
-                    effective: receipt["effective"].clone(),
-                    prompt: params.prompt,
-                    initial_event,
-                },
-                key,
-            )
-            .await;
-        if let Err(error) = self.receipt_reply(stored) {
-            return Err(self.receipt_failed(&error, &admission));
-        }
-        let slot = Slot::new(Head::new(Some(2)));
-        lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
-        self.receipted(&session, turn, &slot);
-        Ok(Receipted {
-            receipt,
-            enqueued: Some((session, turn)),
-        })
-    }
-
-    /// C1 §3.3: authenticates, replays a keyed retry, then commits the next
-    /// turn `queued` with its `turn.queued` event before the receipt.
-    pub async fn resume(
-        &self,
-        params: ResumeParams,
-        raw_params: &str,
-    ) -> Result<Receipted, ApiError> {
-        let admission = self.admission.lock().await;
-        if self.store_failed() {
-            return Err(ApiError::STORE);
-        }
-        let hash = hash_handle(&params.handle)?;
-        let key = retry_key(params.op_key.as_deref())?;
-        if params.prompt.is_empty() {
-            return Err(ApiError::INVALID_PARAMS);
-        }
-        params.refuse_session_scope()?;
-        let overrides = params.per_turn().fake_overrides()?;
-        let session = params.session;
-        let snapshot = self
-            .store
-            .session_snapshot(&session)
-            .await
-            .map_err(|_| ApiError::STORE)?
-            .ok_or(ApiError::SESSION_NOT_FOUND)?;
-        if !self
-            .store
-            .authenticate(&session, &hash)
-            .await
-            .map_err(|_| ApiError::STORE)?
-        {
-            return Err(ApiError::INVALID_HANDLE);
-        }
-        let operation = match key {
-            Some(key) => {
-                let identity = retry_identity(raw_params, &hash)?;
-                let stored = self
-                    .store
-                    .operation(&session, key)
-                    .await
-                    .map_err(|_| ApiError::STORE)?;
-                if let Some(stored) = stored {
-                    return if stored.identity == identity {
-                        Ok(Receipted {
-                            enqueued: None,
-                            receipt: stored.result,
-                        })
-                    } else {
-                        Err(ApiError::IDEMPOTENCY_CONFLICT)
-                    };
-                }
-                Some((key.to_owned(), identity))
-            }
-            None => None,
-        };
-        if snapshot.closed {
-            return Err(ApiError::SESSION_CLOSED);
-        }
-        if lock(&self.stop).is_some() {
-            return Err(ApiError::DAEMON_STOPPING);
-        }
-        journal::admission(&self.store, &self.unresolved).await?;
-        if snapshot.queued >= SESSION_QUEUE_LIMIT {
-            return Err(ApiError::QUEUE_FULL);
-        }
-        if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
-            return Err(ApiError::QUEUED_AT_CAPACITY);
-        }
-        // C1 P5: omitted values inherit from the latest accepted turn,
-        // resolved under `admission`, which every receipt commit holds;
-        // Store's next-turn check in the same transaction confirms it.
-        let latest: Effective = snapshot
-            .latest_effective
-            .clone()
-            .and_then(|latest| serde_json::from_value(latest).ok())
-            .ok_or(ApiError::STORE)?;
-        let effective = latest.inherit(&overrides);
-        self.queue_turn(
-            session,
-            &snapshot,
-            (params.prompt, effective),
-            operation,
-            &admission,
-        )
-        .await
-    }
-
-    /// Commits the session's next turn `queued` with its frozen effective
-    /// values, its `turn.queued` event at the shared head and any `op_key`
-    /// result, then returns the turn receipt.
-    async fn queue_turn(
-        &self,
-        session: SessionId,
-        snapshot: &SessionSnapshot,
-        (prompt, effective): (String, Effective),
-        operation: Option<(String, Vec<u8>)>,
-        admission: &Admission<'_>,
-    ) -> Result<Receipted, ApiError> {
-        let turn = TurnNumber::try_from(snapshot.turns + 1).map_err(|_| ApiError::STORE)?;
-        let slot = self.slot_for(&session);
-        let receipt = TurnReceipt {
-            turn: format!("{}/{}", session.as_str(), turn.get()),
-            state: "queued",
-            queue_position: snapshot.queued,
-            effective,
-            warnings: RoutePlan::fake().warnings(),
-        };
-        let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
-        let head = slot
-            .head
-            .lock(&self.store, &session)
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        let at = rfc3339(SystemTime::now());
-        let event = Event {
-            seq: head.next(),
-            session_id: &session,
-            turn: Some(turn.get()),
-            late: false,
-            at: &at,
-            raw_ref: None,
-            body: EventBody::TurnQueued {
-                queue_position: snapshot.queued,
-            },
-        }
-        .to_value()?;
-        let committed = self
-            .store
-            .commit_resume(ResumeRecord {
-                session_id: session.clone(),
-                turn,
-                prompt,
-                effective: receipt["effective"].clone(),
-                event,
-                operation: operation.map(|(op_key, identity)| OperationRecord {
-                    op_key,
-                    identity,
-                    result: receipt.clone(),
-                }),
-            })
-            .await;
-        match self.receipt_reply(committed) {
-            Ok(()) => head.committed(1),
-            Err(error) => {
-                if journal::may_have_committed(&error) {
-                    head.lost();
-                } else {
-                    drop(head);
-                }
-                // A slot this request created holds nothing: retire it.
-                drop(slot);
-                self.retire(&session);
-                return Err(self.receipt_failed(&error, admission));
-            }
-        }
-        self.receipted(&session, turn, &slot);
-        Ok(Receipted {
-            receipt,
-            enqueued: Some((session, turn)),
-        })
-    }
-
     /// The session's dispatch slot, created when it has none. Whether a new
     /// turn may run behind earlier ones is decided from their durable state.
     fn slot_for(&self, session: &SessionId) -> Arc<Slot> {
@@ -725,123 +337,6 @@ impl Engine {
                 .entry(session.clone())
                 .or_insert_with(|| Slot::new(Head::new(None))),
         )
-    }
-
-    /// Authenticates before reporting fake's unsupported mutation capability.
-    pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
-        if self.store_failed() {
-            return Err(ApiError::STORE);
-        }
-        let hash = hash_handle(&params.handle)?;
-        if !self
-            .store
-            .authenticate(&params.session, &hash)
-            .await
-            .map_err(|_| ApiError::STORE)?
-        {
-            return Err(ApiError::INVALID_HANDLE);
-        }
-        Err(ApiError::UNSUPPORTED_VERB)
-    }
-
-    /// Resolves a C1 address; a bare session names its latest turn.
-    async fn address(&self, address: &str) -> Result<(SessionId, TurnNumber), ApiError> {
-        match parse_address(address)? {
-            (session, Some(turn)) => Ok((session, turn)),
-            (session, None) => {
-                let turns = self.turns(&session).await?;
-                Ok((
-                    session,
-                    TurnNumber::try_from(turns).map_err(|_| ApiError::TURN_NOT_FOUND)?,
-                ))
-            }
-        }
-    }
-
-    /// The session's highest turn number; `session_not_found` without one.
-    async fn turns(&self, session: &SessionId) -> Result<u32, ApiError> {
-        Ok(self
-            .store
-            .session_snapshot(session)
-            .await
-            .map_err(|_| ApiError::STORE)?
-            .ok_or(ApiError::SESSION_NOT_FOUND)?
-            .turns)
-    }
-
-    /// Refuses a turn the session never had.
-    async fn exists(&self, session: &SessionId, turn: TurnNumber) -> Result<(), ApiError> {
-        if turn.get() > self.turns(session).await? {
-            return Err(ApiError::TURN_NOT_FOUND);
-        }
-        Ok(())
-    }
-
-    /// Reads a committed terminal result without waiting.
-    pub async fn result(&self, address: &str) -> Result<Value, ApiError> {
-        let (session, turn) = self.address(address).await?;
-        if let Some(result) =
-            journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-        {
-            return Ok(result);
-        }
-        self.exists(&session, turn).await?;
-        Err(ApiError::TURN_NOT_FINISHED)
-    }
-
-    /// Waits for a durable terminal result independently of client lifetime,
-    /// at most `timeout_ms` (C1 §3.8), then `wait_timeout`.
-    ///
-    /// Once final shutdown committed its last record, a result still missing
-    /// can never commit in this daemon: the wait ends `daemon_stopping`.
-    pub async fn wait(&self, params: WaitParams) -> Result<Value, ApiError> {
-        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(ApiError::INVALID_PARAMS)?;
-        let (session, turn) = self.address(&params.address).await?;
-        let mut checked = false;
-        loop {
-            // Read before the Store: a result committed before finalization is seen.
-            let finalized = self.finalized.load(Ordering::Acquire);
-            if let Some(result) =
-                journal::read_result(&self.store, &self.unresolved, &session, turn).await?
-            {
-                return Ok(result);
-            }
-            if !checked {
-                self.exists(&session, turn).await?;
-                checked = true;
-            }
-            if finalized {
-                return Err(ApiError::DAEMON_STOPPING);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(ApiError::WAIT_TIMEOUT);
-            }
-            tokio::time::sleep_until(deadline.min(now + Duration::from_millis(20))).await;
-        }
-    }
-
-    /// Reads the first bounded page of durable canonical events.
-    pub async fn events(&self, session: &str) -> Result<Value, ApiError> {
-        let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        let events = self
-            .store
-            .events(&id, 1, 1000)
-            .await
-            .map_err(|_| ApiError::STORE)?;
-        let next_after = events.last().map_or(0, |event| event.seq);
-        Ok(
-            json!({"events":events.into_iter().map(|event| event.event).collect::<Vec<_>>(),"next_after":next_after,"more":false}),
-        )
-    }
-
-    /// Reads bounded raw excerpts referenced by committed events.
-    pub async fn logs(&self, session: &str) -> Result<Value, ApiError> {
-        let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        self.store.logs(&id).await.map_err(|_| ApiError::STORE)
     }
 }
 
