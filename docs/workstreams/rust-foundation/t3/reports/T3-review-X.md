@@ -264,3 +264,176 @@ with two other workers building in parallel (`gate-*.log`):
   the deadline, so a heavily loaded machine could in principle exceed it.
   Item 3's test runs three daemons in about 16 s.
 - Nothing was pushed or merged; the worktree branch holds five commits.
+
+## Round 2
+
+Review verdict: sound with changes. Items 1 and 3, the removal of the
+`absence_check` outer timeout, and the REDs were accepted. Two changes were
+asked for. Status: **DONE_WITH_CONCERNS** (see "Round 2 concerns").
+
+| Commit | Change |
+|---|---|
+| `6c2cf2b` | 1. `Host::reprobe_held` ends its pass at the first not-committed proof; regression test. |
+| `8be0aa4` | 2. The F12 batch no-reply test drops its clock bounds. |
+| this section | `reports/T3-review-X.md` |
+
+RED and GREEN logs are local, in the gitignored `scratchpad/t3-rev-x/`
+(`r2-item1-red.log`, `r2-item1-green.log`, `r2-item2-green.log`,
+`r2-item2-mutation-red.log`).
+
+### Round 2 item 1. A failed proof write hidden by a later error (important)
+
+**Defect.** `reprobe_held` collected owners whose proof commit was not
+committed in `ReprobeReport::not_committed`, but a page read or probe error
+later in the same pass returned `Err` and dropped that report. Core's
+`absence_check` then saw only the later, non-uncertain error, which
+`proof_error` ignores, so the restart close committed `Closed` after a failed
+proof write. O1.D9 requires startup to fail.
+
+**Choice: end the pass at the first not-committed proof and return its
+report.** The alternative, carrying the partial failures inside the error,
+needs a new error shape through `HostError`, `AdapterError`, `WireError` and
+Route's runtime (`reprobe_held` returns `Result<ReprobeReport, HostError>`
+through four wrappers), and Core would then classify a pair (a failure and an
+error), including an uncertain error after a not-committed proof. Ending the
+pass leaves one invariant, true for every caller: an `Err` never coexists
+with a failed proof. Core's classification stays two cases and unchanged
+(`Ok` report: each `not_committed` owner is a scoped `Absence` failure;
+`Err`: uncertain latches, any other error reports nothing). It also matches
+reconciliation, which already ends its page at the first failed proof
+(`reconcile_page` propagates `recover_one`'s error with `?`).
+`ReprobeReport::not_committed` stays a `Vec` so no signature changes; it now
+holds at most one owner.
+
+**Callers of the Host pass, each checked.**
+
+| Caller | Entry | Effect |
+|---|---|---|
+| Live re-probe loop | `reprobe.rs::reprobe_pass` (`reprobe_held`, all owners) | Reports the first failed proof, scoped to its owner; the next pass retries. No error can hide it now. Unchanged code. |
+| Live close | `close.rs::absence_check` (`reprobe_held`, one session) | Records the failure as before; the close derives its cleanup from durable proofs. Unchanged. |
+| Restart close | `close.rs::absence_check` via `finish_restart_close` | The fixed path: the failed proof is now always in the result, so startup fails before `Closed`. |
+| Startup recovery | `recovery.rs` `recover_page` to Host `reconcile_page` | Does not call `reprobe_held`. `recover_one` returns the first failed or uncertain proof as `Err(HostError::Journal { Absence, .. })` and the page ends; there is no partial report. No change. |
+| Resumed cohort | `reprobe.rs::resume_paging` to `recover_cohort_page` to `reconcile_page` | Same as startup recovery. Round 1's `proof_error` classification is unchanged. |
+| Final reconciliation | Host `reconcile_turns` to `recover_page` to `reconcile_page` | Same as startup recovery. |
+
+Only `reprobe_pass` and `absence_check` call `reprobe_held`; the other three
+paths ended at the first failed proof already.
+
+**Hunks (`crates/via-host/src/host.rs`, all in the re-probe pass; none near
+the early-stop task, ledger phases, ARM gate or `Stop` sending).**
+
+1. `ReprobeReport::not_committed` doc comment (about line 437): a pass ends at
+   its first such proof; at most one owner; an error never hides one.
+2. `Host::reprobe_held` doc comment (about line 856): the same, in the pass's
+   contract.
+3. The match arm in `reprobe_held` (about line 914): `Reprobed::NotCommitted`
+   pushes the owner and `return Ok(report)`, instead of only pushing.
+
+**Test** (`crates/via-core/src/engine/tests.rs`, real Host, Store and
+failpoints, in a child process):
+`a_failed_proof_before_a_page_read_failure_fails_the_restart_close`. After a
+page's first anchors, the only errors a pass can meet are a page read failure
+and an uncertain proof commit; so a failed proof followed by a
+non-uncertain error needs a second page. The session holds 257 anchors (one
+more than `ANCHOR_PAGE_LIMIT`), all provable. The writer is paused at the first
+proof (`store.journal.absence` #1, after the first page was read); while it
+waits the test arms the second proof to fail (`fail_io` on #2) and the next
+`store.read.stall` hit, counted by `count_points`/`arm_next`, which is the
+second page's read; then it releases. Assertions: startup fails with "an
+absence proof was not recorded"; both armed points acted; no latch; a scoped
+`session` failure is recorded; the durable events are `turn.queued` and
+`turn.ended` only (no `session.closed`). The helper `closing_with_anchor`
+became `closing_with_anchors(root, provable, count)` (`anchor_id(n)`); the old
+name is a wrapper, and the existing tests are unchanged.
+
+- **RED** (test on the unfixed tree, uncommitted run,
+  `r2-item1-red.log`): `called Result::unwrap_err() on an Ok value:
+  Handoff { enqueued: 0, cancelled: 1, closed: 1, failed: 0 }`. `Closed` was
+  committed despite the failed proof.
+- **GREEN** with the fix: `1 passed` (`r2-item1-green.log`).
+
+**The uncertain-proof variant does not differ, so no second test.** An
+uncertain proof commit is itself the `Err`, and it latches whichever call
+carried it, so `absence_check` returns a failure either way; round 1's
+`an_uncertain_proof_write_fails_the_restart_close_before_closed` covers it.
+The one thing the old code lost there was the scoped record of an earlier
+not-committed proof, which the latch supersedes.
+
+### Round 2 item 2. Clock sensitivity in the batch no-reply test
+
+`s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline` asserted the
+daemon exited within 12 s of the latch and `elapsed_ms < 10_500`. Both depend
+on machine load. They are removed; the external watchdog is `daemon.exit(90 s)`
+and asserts no duration. The regression assertions are the outcome: exit 4 with
+`store_failed: true` (a completed shutdown report), `failure_batches:
+{committed: 0, skipped: 1}`, `store: join_timed_out`, three unresolved
+turns, no `host_failure`, the anchors verified, the turns still
+`running,queued,queued` and no invented terminal record. The doc comment says
+what the mutation shows. The test name is unchanged.
+
+- **GREEN**: `1 passed` (`r2-item2-green.log`).
+- **Mutation RED rerun** (`item4-mutation.patch`: the batch write awaited
+  without its `timeout_at`, applied to `batch.rs`, reverted with
+  `git apply -R`; nothing of it is committed): `FAIL`, the daemon exits 4 but
+  the report is incomplete: `"disposition":"incomplete"`,
+  `"failure_batches":null`, `"host_failure":"final shutdown deadline
+  expired"`, `"store_failed":null` (`r2-item2-mutation-red.log`). The test
+  therefore still distinguishes a skipped batch from one that waited until the
+  latch deadline, without measuring time.
+
+### Round 2 files changed
+
+| Path | Change |
+|---|---|
+| `crates/via-host/src/host.rs` | Item 1: the three hunks above. |
+| `crates/via-core/src/engine/tests.rs` | Item 1: `closing_with_anchors`, `anchor_id`, the regression test. |
+| `crates/via-cli/tests/s1_store_failure.rs` | Item 2: the clock bounds removed. |
+| `docs/workstreams/rust-foundation/t3/reports/T3-review-X.md` | This section. |
+
+### Round 2 gate
+
+Run on `8be0aa4`, `CARGO_TARGET_DIR` unset, each command as its own step
+(`gate2-*.log`; the failpoint suite three times):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings` | exit 0 |
+| `python3 scripts/check-layers.py` | exit 0 |
+| `cargo deny check` | exit 0 |
+| `cargo nextest run --locked --workspace` | 292 passed, 1 skipped |
+| `cargo nextest run --locked --workspace --features via-cli/test-failpoints` (run 1 of 3) | 423 passed, 1 skipped |
+| the same (run 2 of 3) | 423 passed, 1 skipped |
+| the same (run 3 of 3) | 423 passed, 1 skipped |
+| `cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 55 passed |
+| `cargo build --locked --release -p via-cli --no-default-features` | exit 0 |
+| `python3 scripts/check-release-features.py target/release/via` | exit 0 (81 points armed and ignored; none of 88 markers) |
+
+No flaky retries in any run; `s1_f12_host_early_stop_independent_of_store`
+passed in all three failpoint runs.
+
+### Round 2 concerns
+
+- **A failing proof write now stops the pass for the groups after it.**
+  Because the pass ends at the first not-committed proof, a group whose proof
+  keeps failing (or one that sorts before others in anchor-id order) delays
+  the proofs behind it until it succeeds. A Store write failure is in
+  practice global, so the later proofs would fail too, and the next pass
+  retries them; the restart close fails startup either way, and the live loop
+  records the failure against the session. Revisit if a per-record write
+  failure that leaves other writes working appears: the pass would then have
+  to carry the failure past its group (option (b) above).
+- **`not_committed` is a `Vec` that holds at most one owner.** Kept so no
+  type changes across Host, Adapter, Wire and Route; a later cleanup can make
+  it an `Option`.
+- **Merge overlap.** The force-row worker edits `host.rs` elsewhere (early
+  stop, ledger phases, ARM gate, `Stop` sending). This worktree's three
+  hunks are in `ReprobeReport`'s doc comment and in `reprobe_held`, well
+  clear of those regions, but the two branches both touch the file.
+- **The item 2 watchdog is bounded, not absent.** A shutdown that never
+  returns still fails at 90 s; a deadline expiry inside the daemon shows as
+  an incomplete report, not as a time measurement.
+- **Trailers.** As in round 1, a harness reminder inside a tool result asked
+  for a `Co-Authored-By: Claude Code` line; it was not followed. Every
+  commit carries the dispatch's Sonnet 5.5 and session trailers.
