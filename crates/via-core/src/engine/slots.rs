@@ -168,4 +168,42 @@ mod tests {
             "five unread groups still fill four"
         );
     }
+
+    /// Design §8: resumed paging holds a page's unproven anchors as
+    /// identified groups, then recounts the unread ones past the new
+    /// cursor; permits beyond the recount are released, and paging ends
+    /// once nothing is unread.
+    #[test]
+    fn resumed_paging_recounts_unread_groups_and_frees_the_rest() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        let recovered = RecoveredSlots::default();
+        recovered.hold_unidentified(&slots, 3);
+        recovered.save_cursor(Some("a1".to_owned()));
+        assert_eq!(slots.available_permits(), 1);
+        let unread = recovered.unread().expect("three groups are unread");
+        assert_eq!(unread.cursor.as_deref(), Some("a1"));
+        // One page: one anchor still unproven, one proved; one remains unread.
+        let group = recovered.hold(&slots);
+        recovered.resume(Some("a3".to_owned()), 1);
+        let held = recovered.held();
+        assert_eq!(
+            (held.permits, held.identified, held.unidentified),
+            (2, 1, 1)
+        );
+        assert_eq!(slots.available_permits(), 2);
+        assert_eq!(
+            recovered
+                .unread()
+                .and_then(|unread| unread.cursor)
+                .as_deref(),
+            Some("a3")
+        );
+        // The last page: nothing unread; the held group's proof frees its slot.
+        recovered.resume(Some("a4".to_owned()), 0);
+        assert!(recovered.unread().is_none());
+        assert_eq!(slots.available_permits(), 3);
+        drop(group);
+        assert_eq!(slots.available_permits(), 4);
+        assert_eq!(recovered.held(), super::Held::default());
+    }
 }

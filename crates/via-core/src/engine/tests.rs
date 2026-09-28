@@ -1094,8 +1094,9 @@ fn a_stalled_force_path_read_expires_at_the_cutoff() {
             .hold_cancel_read
             .store(true, Ordering::Release);
         let started = tokio::time::Instant::now();
-        // The cutoff is 4 s before this deadline: 500 ms from now.
-        engine.begin_final_shutdown(started + Duration::from_millis(4_500));
+        // The cutoff is `FINALIZE_RESERVE + 3 s` = 8 s before this
+        // deadline (design §6.7 [r5.10]): 500 ms from now.
+        engine.begin_final_shutdown(started + Duration::from_millis(8_500));
         dispatch(&engine, &session).await;
         let elapsed = started.elapsed();
         assert!(
@@ -1423,5 +1424,145 @@ fn a_close_after_an_idle_stop_is_fenced_and_a_replay_still_replays() {
             .expect("the fence replies at once");
         assert_eq!(fenced.unwrap_err().kind, "daemon_stopping");
         assert_eq!(close(&engine, &session, Some("k")).await.unwrap(), first);
+    });
+}
+
+fn plain() -> DaemonStopParams {
+    serde_json::from_value(json!({})).unwrap()
+}
+
+/// Design §6.3 [r3.5, r5.12]: with no active turn, a plain stop is still
+/// refused while a session is in the durable closing set, which
+/// `daemon/status` reports; once `Closed` commits it is accepted.
+#[test]
+fn a_plain_stop_is_refused_while_a_session_is_closing() {
+    let Some(root) = child("a_plain_stop_is_refused_while_a_session_is_closing") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session),
+            async {
+                engine.faults.granted.notified().await;
+                assert_eq!(engine.active(), 0);
+                assert_eq!(engine.counts().closing, 1);
+                let refused = engine.request_stop(&plain()).await.unwrap_err();
+                assert_eq!(refused.message, "sessions are active");
+                assert_eq!(engine.stop_mode(), None);
+                engine.faults.release.notify_one();
+            }
+        );
+        assert_eq!(closed.unwrap()["state"], "closed");
+        assert_eq!(engine.counts().closing, 0);
+        assert_eq!(
+            engine.request_stop(&plain()).await.unwrap(),
+            super::StopMode::Idle
+        );
+    });
+}
+
+/// Design §6.3 [O3, r5.12]: the force set is the sessions with a queued,
+/// claimed, cancelling, running or settling turn. A session whose close
+/// is in progress with no turn left is not in it, and stays for its close.
+#[test]
+fn the_force_set_leaves_out_a_session_with_only_a_close_in_progress() {
+    let Some(root) = child("the_force_set_leaves_out_a_session_with_only_a_close_in_progress")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let closing = new_session(&engine).await;
+        // A queued turn no dispatcher has claimed.
+        let queued = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (closed, (), ()) = tokio::join!(
+            close(&engine, &closing, None),
+            dispatch_closing(&engine, &closing),
+            async {
+                engine.faults.granted.notified().await;
+                engine.request_stop(&force()).await.unwrap();
+                let set = super::lock(&engine.force_sessions).clone();
+                assert_eq!(set, Some(vec![queued.clone()]));
+                engine.faults.release.notify_one();
+            }
+        );
+        assert_eq!(closed.unwrap_err().kind, "daemon_stopping");
+    });
+}
+
+/// Design §6.8 entry [r3.2]: under a drain, `close` still works until
+/// daemon main enters final shutdown; from entry on, new close work is
+/// `daemon_stopping`, and a keyed replay of a committed close replays.
+#[test]
+fn final_shutdown_entry_fences_new_close_work_under_drain() {
+    let Some(root) = child("final_shutdown_entry_fences_new_close_work_under_drain") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let other = new_session(&engine).await;
+        // Launches fail here: each turn ends and leaves no active work.
+        dispatch(&engine, &other).await;
+        let drain = serde_json::from_value(json!({"drain":true})).unwrap();
+        assert_eq!(
+            engine.request_stop(&drain).await.unwrap(),
+            super::StopMode::Drain
+        );
+        let (first, ()) = tokio::join!(
+            close(&engine, &session, Some("k")),
+            dispatch_closing(&engine, &session)
+        );
+        let first = first.unwrap();
+        assert_eq!(first["state"], "closed", "{first}");
+        let entry = engine.enter_final_shutdown().await;
+        assert_eq!(entry.active, 0, "{entry:?}");
+        let fenced = tokio::time::timeout(Duration::from_secs(5), close(&engine, &other, None))
+            .await
+            .expect("the fence replies at once");
+        assert_eq!(fenced.unwrap_err().kind, "daemon_stopping");
+        assert_eq!(close(&engine, &session, Some("k")).await.unwrap(), first);
+    });
+}
+
+/// Design §8: the re-probe loop returns at final-shutdown entry and on
+/// force, so final shutdown's first step joins it at once.
+#[test]
+fn the_reprobe_loop_returns_at_entry_and_on_force() {
+    let Some(root) = child("the_reprobe_loop_returns_at_entry_and_on_force") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let ((), _) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(2), engine.reprobe())
+                    .await
+                    .expect("entry ends the loop");
+            },
+            engine.enter_final_shutdown()
+        );
+        drop(engine);
+        let forced = open(&root);
+        let stop = force();
+        let ((), _) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(2), forced.reprobe())
+                    .await
+                    .expect("force ends the loop");
+            },
+            forced.request_stop(&stop)
+        );
     });
 }
