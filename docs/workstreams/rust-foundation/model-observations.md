@@ -25,3 +25,9 @@ whether the design had to be reinterpreted.
 
 | Slice | Agent | Size (prod) | Fix rounds | First-review important findings | Rule breaches | Notes |
 |---|---|---|---|---|---|---|
+| T3 review X (decisions 1–4) | `implementer-sonnet-xhigh` | ~250 lines prod (Core reprobe, close, drive, batch, journal; Host re-probe) | 2 | 1 important (Host discarded a failed proof before a later error), 1 minor (clock-bound test) | none; kept the dispatch trailer against a harness reminder | removed an outer timeout on its own judgement and Sol confirmed it; round 2 picked the simpler of two fixes with callers checked |
+
+Interim (not yet merged):
+
+- T3 review Y (`implementer-sonnet`, decisions 6–9): round 1 used Host-hit proxies for the §11 ordering proof (major). Round 2's seam re-read a record instead of observing the terminal's input (important). In round 3. Rule breaches: two commits carried a harness trailer instead of the dispatch trailer; one intermittent failure reported without its log.
+- T3 force-row (`implementer-sonnet-xhigh`): found and fixed the Route finalize race with a deterministic seam (30/30 RED, 0/1200 after), and the Sol review found no code problems. Rule breach: two commits with a deliberately failing tree. Its decision 5 round 1 was UNSOUND: it added a second force watch published out of order with the bool, and did not close the delayed-watcher window. In round 2.
