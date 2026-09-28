@@ -818,6 +818,31 @@ enum RawCommand {
     Shutdown,
 }
 
+/// The read-only connection that checks an existing Store before any
+/// mutation (runtime §6, F11). With no `-wal` file every committed page is
+/// in the main file, and the caller holds `store.lock`, so it is read as
+/// immutable: a refused Store gets no `-wal` or `-shm` sidecar. A `-wal`
+/// left by a crash is read through normally.
+fn probe(db: &Path) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    if Path::new(&wal).exists() {
+        return Connection::open_with_flags(db, flags);
+    }
+    let mut uri = String::from("file:");
+    for character in db.to_string_lossy().chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)
+}
+
 impl Store {
     /// Opens `<state>/store.sqlite3`, refusing an unsafe, older or newer
     /// Store before mutation. Only a file this call creates is initialized.
@@ -827,11 +852,7 @@ impl Store {
         let created = !db.exists();
         if !created {
             validate_regular(&db)?;
-            let readonly = Connection::open_with_flags(
-                &db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .map_err(|error| StoreError::Open(error.to_string()))?;
+            let readonly = probe(&db).map_err(|error| StoreError::Open(error.to_string()))?;
             let version: i64 = readonly
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|error| StoreError::Open(error.to_string()))?;
