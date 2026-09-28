@@ -22,7 +22,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1468,5 +1468,42 @@ fn s1_force_cutoff_worker_stalled_read_is_never_clean() -> TestResult {
         let daemon = sandbox.start()?;
         daemon.finish()?;
     }
+    Ok(())
+}
+
+/// Design §6.1 step 5 (T3-S3 round 1, decision 4): the one 15 s startup
+/// budget bounds `hello`. A peer that accepts the connection and never
+/// answers makes the CLI give up within the budget, not after the
+/// request's 30 s read timeout, and no daemon is started over it.
+#[test]
+fn s1_silent_peer_before_hello_is_bounded_by_the_startup_budget() -> TestResult {
+    let sandbox = Sandbox::new(&completes("unused", 1))?;
+    let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+    let (accepted, held) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        // Accepts every connection and keeps it open, reading nothing.
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            if accepted.send(stream).is_err() {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut command = sandbox.command();
+    command.args(["daemon", "status", "--json"]);
+    let captured = run_command(&mut command, Duration::from_secs(25))?;
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&captured.stderr);
+    check(
+        !captured.status.success() && elapsed < Duration::from_secs(17),
+        || format!("exit {} after {elapsed:?}: {stderr}", captured.status),
+    )?;
+    check(stderr.contains("startup"), || stderr.to_string())?;
+    check(held.try_recv().is_ok(), || {
+        "the CLI never connected".to_owned()
+    })?;
+    drop(held);
+    drop(peer);
     Ok(())
 }

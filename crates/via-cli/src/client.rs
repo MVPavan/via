@@ -188,10 +188,16 @@ impl Starter {
 
     /// Fails once the startup budget is spent.
     fn check(&self) -> anyhow::Result<()> {
-        if Instant::now() >= self.deadline {
+        self.remaining().map(drop)
+    }
+
+    /// What is left of the startup budget; fails once it is spent.
+    fn remaining(&self) -> anyhow::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             bail!("daemon startup timed out");
         }
-        Ok(())
+        Ok(left)
     }
 }
 
@@ -301,8 +307,10 @@ struct Connection {
 
 /// Connects and says `hello` (design §6.1): with `auto_start`, a missing
 /// or refused socket starts a daemon, and a reset or EOF before `hello`
-/// completes is retried within the startup budget. Nothing is retried
-/// after a request other than `hello` was written.
+/// completes is retried within the startup budget. Each `hello` read is
+/// bounded by what is left of that budget, not by `read`, which bounds the
+/// requests after it. Nothing is retried after a request other than
+/// `hello` was written.
 fn connect(
     paths: &Paths,
     auto_start: bool,
@@ -328,7 +336,7 @@ fn connect(
             Err(error) => return Err(error.into()),
         };
         let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
-        stream.set_read_timeout(Some(read))?;
+        stream.set_read_timeout(Some(starter.remaining()?))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
@@ -337,6 +345,7 @@ fn connect(
         });
         match transact(&mut writer, &mut reader, 1, "hello", &params) {
             Ok(hello) => {
+                writer.set_read_timeout(Some(read))?;
                 // Ready: the pipe is dropped and later daemon writes fail silently.
                 starter.starting = None;
                 return Ok(Connection {
@@ -348,6 +357,9 @@ fn connect(
             Err(error) if auto_start && before_hello(&error) => {
                 starter.check()?;
                 thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if timed_out(&error) => {
+                bail!("daemon startup timed out: no reply to hello")
             }
             Err(error) => return Err(error),
         }
@@ -366,6 +378,16 @@ fn before_hello(error: &anyhow::Error) -> bool {
             io::ErrorKind::ConnectionReset
                 | io::ErrorKind::UnexpectedEof
                 | io::ErrorKind::BrokenPipe
+        )
+    })
+}
+
+/// Whether a read ended at its timeout (`SO_RCVTIMEO`).
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
         )
     })
 }
