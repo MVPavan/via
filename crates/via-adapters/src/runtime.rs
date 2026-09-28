@@ -206,8 +206,13 @@ impl AdapterRuntime {
 
     /// Hands Host capacity for a group it did not launch, such as one an
     /// earlier daemon left unproved (design §11).
-    pub fn hold_capacity(&self, anchor_id: String, token: via_routes::CapacityToken) {
-        self.route.hold_capacity(anchor_id, token);
+    pub fn hold_capacity(
+        &self,
+        anchor_id: String,
+        owner: SessionId,
+        token: via_routes::CapacityToken,
+    ) {
+        self.route.hold_capacity(anchor_id, owner, token);
     }
 
     /// One non-signalling re-probe pass over held groups, optionally only

@@ -209,8 +209,13 @@ impl FakeRoute {
     }
 
     /// Hands Host capacity for a group it did not launch (design §11).
-    pub fn hold_capacity(&self, anchor_id: String, token: via_wire::CapacityToken) {
-        self.wire.hold_capacity(anchor_id, token);
+    pub fn hold_capacity(
+        &self,
+        anchor_id: String,
+        owner: crate::SessionId,
+        token: via_wire::CapacityToken,
+    ) {
+        self.wire.hold_capacity(anchor_id, owner, token);
     }
 
     /// Returns one page of passive Host recovery facts without exposing a

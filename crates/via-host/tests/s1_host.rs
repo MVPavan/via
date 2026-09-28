@@ -553,8 +553,8 @@ fn an_unproven_row_four_group_keeps_its_token_until_reprobe_proves_it() {
 /// re-probe pass reports as held only that session's groups, so a close's
 /// absence check does not wait on another session's group; `None` keeps the
 /// daemon-wide count. A pass that ends before its pages did (here a spent
-/// deadline) counts every unexamined group as held, so no caller takes an
-/// unread group of the session for proved.
+/// deadline) still counts every group of the session, examined or not, and
+/// only those, so no caller takes an unread group of the session for proved.
 #[test]
 fn a_session_filtered_reprobe_counts_only_that_sessions_groups() {
     runtime().block_on(async {
@@ -589,10 +589,16 @@ fn a_session_filtered_reprobe_counts_only_that_sessions_groups() {
             .await
             .unwrap();
         assert_eq!((theirs.held, theirs.proved), (1, 0), "{theirs:?}");
-        // Spent before any page: nothing examined is never "all proved".
+        // Spent before any page: the session's two groups still count, and
+        // only they do; nothing examined is never "all proved".
         let spent = Deadline::at(tokio::time::Instant::now());
         let cut = host.reprobe_held(spent, Some(session())).await.unwrap();
-        assert!(cut.held > cut.proved, "{cut:?}");
+        assert_eq!((cut.held, cut.proved), (2, 0), "{cut:?}");
+        let cut = host
+            .reprobe_held(spent, Some(other_session()))
+            .await
+            .unwrap();
+        assert_eq!((cut.held, cut.proved), (1, 0), "{cut:?}");
         fixture.release("host.anchor.before_eof_cleanup");
         let mut proved = 0;
         for _ in 0..500 {

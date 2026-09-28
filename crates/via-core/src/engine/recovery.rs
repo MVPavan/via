@@ -217,8 +217,11 @@ impl Engine {
             });
             if !proved {
                 let token = self.recovered.hold(&self.slots);
-                self.adapter
-                    .hold_capacity(owner.anchor_id.clone(), Box::new(token));
+                self.adapter.hold_capacity(
+                    owner.anchor_id.clone(),
+                    owner.session_id.clone(),
+                    Box::new(token),
+                );
             }
         }
     }

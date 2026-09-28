@@ -113,6 +113,9 @@ struct Held {
     /// Owned for its drop, which releases the capacity.
     _token: crate::CapacityToken,
     identity: Option<(ProcessIdentity, String)>,
+    /// The session that owns the group, for a session-filtered re-probe's
+    /// count [T3-S2 r2.5].
+    owner: crate::SessionId,
 }
 
 impl Capacity {
@@ -122,12 +125,13 @@ impl Capacity {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn hold(&self, anchor_id: String, token: crate::CapacityToken) {
+    fn hold(&self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
         self.lock().held.insert(
             anchor_id,
             Held {
                 _token: token,
                 identity: None,
+                owner,
             },
         );
     }
@@ -733,10 +737,15 @@ impl Host {
     }
 
     /// Holds capacity for a group this Host did not launch, such as one an
-    /// earlier daemon left whose absence recovery did not prove; a later
-    /// absence proof for `anchor_id` releases it.
-    pub fn hold_capacity(&self, anchor_id: String, token: crate::CapacityToken) {
-        self.capacity.hold(anchor_id, token);
+    /// earlier daemon left whose absence recovery did not prove, owned by
+    /// session `owner`; a later absence proof for `anchor_id` releases it.
+    pub fn hold_capacity(
+        &self,
+        anchor_id: String,
+        owner: crate::SessionId,
+        token: crate::CapacityToken,
+    ) {
+        self.capacity.hold(anchor_id, owner, token);
     }
 
     /// Held groups with no live control: the ledger entries only a proof
@@ -809,10 +818,10 @@ impl Host {
     /// uncertain one is returned, and latches. Nothing is read while
     /// nothing is held; a group with no identity keeps its token.
     ///
-    /// `held` counts every eligible group for `None`. With `owner`, it counts
-    /// the owner's groups this pass examined, plus every group left
-    /// unexamined when the pass ended before its pages did, so a caller
-    /// never takes an unread group of the owner for proved [T3-S2 r1.3].
+    /// `held` counts every eligible group for `None`, and with `owner` only
+    /// that session's, examined or not: a pass that ends before its pages
+    /// did still counts them, so a caller never takes an unread group of the
+    /// session for proved [T3-S2 r1.3, r2.5].
     pub async fn reprobe_held(
         &self,
         deadline: Deadline,
@@ -823,7 +832,10 @@ impl Host {
             ledger
                 .held
                 .iter()
-                .filter(|(anchor_id, _)| !ledger.busy(anchor_id))
+                .filter(|(anchor_id, held)| {
+                    !ledger.busy(anchor_id)
+                        && owner.as_ref().is_none_or(|owner| *owner == held.owner)
+                })
                 .map(|(anchor_id, held)| (anchor_id.clone(), held.identity.clone()))
                 .collect()
         };
@@ -831,10 +843,6 @@ impl Host {
             held: remaining.len(),
             ..ReprobeReport::default()
         };
-        // With a filter: the owner's eligible groups found in its pages, and
-        // whether the pages were read to the end (or nothing is left).
-        let mut examined = 0;
-        let mut complete = remaining.is_empty();
         let mut after = None;
         while !remaining.is_empty() && Instant::now() < deadline.instant() {
             let page = timeout_at(
@@ -854,24 +862,15 @@ impl Host {
                 let Some(memory) = remaining.remove(&record.intent.anchor_id) else {
                     continue;
                 };
-                examined += 1;
                 match self.reprobe_one(record, memory, deadline).await? {
                     Reprobed::Proved => report.proved += 1,
                     Reprobed::NotCommitted => report.not_committed += 1,
                     Reprobed::Held => {}
                 }
             }
-            if !full || remaining.is_empty() {
-                complete = true;
+            if !full {
                 break;
             }
-        }
-        if owner.is_some() {
-            report.held = if complete {
-                examined
-            } else {
-                examined + remaining.len()
-            };
         }
         Ok(report)
     }
@@ -940,7 +939,7 @@ impl Host {
             generation: generation.clone(),
             marker: marker.clone(),
             socket_path: socket_path.clone(),
-            owner_session: owner.session_id,
+            owner_session: owner.session_id.clone(),
             owner_turn: owner.turn,
             uid: rustix::process::getuid().as_raw(),
             boot_id: linux::boot_id()?,
@@ -973,6 +972,7 @@ impl Host {
                     Held {
                         _token: token,
                         identity: None,
+                        owner: owner.session_id,
                     },
                 );
             }
