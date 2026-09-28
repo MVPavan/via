@@ -48,4 +48,4 @@ Design review (owner, 2026-09-28): GPT-6 Astra medium and Claude Fable 5.1
 high. Round 1 on `42993bc`: `astra-review-design.md` (UNSOUND) and
 `fable-review-design.md` (SOUND WITH CHANGES); orchestrator decisions in
 `design-r1-decisions.md`. Owner decisions pending: the Store failure
-policy (runtime §7), drain closing sessions, and force's session scope.
+policy (runtime §7), drain closing sessions, and force's session scope; answered in `owner-decisions.md`.
