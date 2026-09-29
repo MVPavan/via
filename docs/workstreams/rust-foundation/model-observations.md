@@ -31,6 +31,12 @@ whether the design had to be reinterpreted.
 | T4-0 design (docs only) | `implementer-sonnet-xhigh` | 1,076-line design + 169-line report | in progress | round 1 UNSOUND from both Astra high (7 blockers) and Sol high (2 blockers): control and cleanup under overload, incomplete memory accounting, reserved capacity not end to end, follower lifetime; deferred a runtime-required blob path; one false inventory inference | none | complete method and carried-item coverage and good restatement lists; weak on concurrency protocols and chose deferral or amendment where the contract required implementation |
 | Frame → message rename (via-jm4.17) | `implementer-sonnet` | 32 files: 7 docs, 25 Rust (pure rename) | 0 worker rounds; 2 orchestrator wording rounds | Sol medium: 1 important ("HTTP framing evidence" narrowed to message splitting), 1 minor (`VendorMessage` implied decoded JSON). Round 2 found 1 minor in the orchestrator's own glossary fix | none; fixed its own clippy slip before committing | correct four-way meaning mapping from the brief; full gate green first time; the misses were spec-semantics nuances in two sentences |
 
+## Opus 5.5 high, design-first (from 2026-09-29)
+
+| Step | Size | Rounds to SOUND | Pattern | Rule breaches | Notes |
+|---|---|---|---|---|---|
+| T4-0 rounds 5–15 (redesign against owner requirements) | design 1,803 → 2,295 → 1,907 lines | 11 Sol high rounds | Rounds 5–7: the exact memory and disk proofs grew each round and did not converge. After the owner approved coarse bounds (round 8), findings narrowed steadily. Round 12's seal (orchestrator's decision) caused one regression round and was withdrawn in round 14 | none | Applied every decision and reported each deviation with a reason. Its deviations were mostly safer or more exact forms (a charge kept until handoff; a single accounting point). It verified code and SQLite facts against source. The growth came from following exact-accounting decisions faithfully, not from invention |
+
 ## Early read (2026-09-28, three Sonnet workers on the Task 3 review)
 
 - Diagnosis and bounded fixes: comparable to Opus. X and the force-row

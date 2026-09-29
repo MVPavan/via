@@ -125,8 +125,18 @@ the historical checkpoint; its findings table is updated by this section.
   2026-09-29 the owner approved [t4/requirements.md](t4/requirements.md)
   (`8d557bf`): callers are programs, only lifecycle and safety events are
   durable, and a progress snapshot plus per-step rows replace the detail event
-  stream. Round 5 (Opus 5.5 high, brief `t4/design-r5-brief.md` on `wt/t4-0`)
-  redesigns against it. The loop is Sol high until SOUND, then Fable 5.1 high
+  stream. Rounds 5–15 (Opus 5.5 high on `wt/t4-0`) redesigned Task 4 against these
+  requirements, and Sol high found the design SOUND at `778752c`
+  (`t4/review-r15-sol.md`). Along the way:
+  - the owner approved coarse memory and disk bounds (round 8);
+  - thresholds became daemon config read at start (round 9, `via-jm4.7.8.1`);
+  - end-to-end measurement was deferred to `via-d9o.2.3`;
+  - the per-session and shared-server lifecycle moved to `via-4sw.3.2` and
+    `via-5lr.3.2`.
+
+  Next is the Fable 5.1 high and Astra high critical review
+  (`scratchpad/reviews/t4/critical/`), then one consolidated report for the
+  owner. The loop is Sol high until SOUND, then Fable 5.1 high
   and Astra high critical reviews, one consolidated report, then owner review
   before slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
