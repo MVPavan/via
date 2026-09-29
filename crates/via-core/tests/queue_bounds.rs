@@ -27,7 +27,7 @@ fn run_child(name: &str) {
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()
         .unwrap();
-    for part in ["state", "state/raw", "runtime", "runtime/anchors", "sync"] {
+    for part in ["state", "runtime", "runtime/anchors", "sync"] {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(root.path().join(part))

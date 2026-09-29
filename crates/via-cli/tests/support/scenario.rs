@@ -175,10 +175,10 @@ pub(crate) fn collect_available(
             .backup_store(&store)
             .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
     }
-    let raw = state.join("raw");
-    if raw.is_dir() {
+    let folders = state.join("evidence");
+    if folders.is_dir() {
         evidence
-            .copy_raw(&raw)
+            .copy_evidence(&folders)
             .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
     }
     let cleanup_path = evidence.dir.join("cleanup.json");

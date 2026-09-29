@@ -1493,7 +1493,7 @@ fn s1_f12_force_rider_rollback_retries() -> TestResult {
     Ok(())
 }
 
-// ------------------------------------- Host journal and raw evidence (3, 4, 6)
+// ------------------------------------------------ Host journal (3, 4)
 
 /// `pid` is live: neither gone nor a zombie awaiting its reaper.
 fn process_live(pid: u32) -> bool {
@@ -1613,194 +1613,6 @@ fn host_journal_failure_stops_group(point: &str) -> TestResult {
         || format!("unexpected store_failure: {failure}"),
     )?;
     scoped_end(daemon, &other)
-}
-
-/// Design §7.2 row 6 [O1.D11, r3.10]: a raw append that fails fails the
-/// connection; the group is force-closed and proved absent, and the
-/// terminal is `failed(store)` with `raw_log.incomplete` sequenced just
-/// before `turn.ended` in the same transaction, the `raw_log_incomplete`
-/// warning and the cleanup evidence.
-#[test]
-fn s1_f12_raw_failure_records_incomplete() -> TestResult {
-    let sandbox = Sandbox::new(&scripts(&[
-        held("other", 1),
-        script(
-            "first",
-            1,
-            vec![
-                accepted(1),
-                gate("accepted"),
-                text("lost"),
-                gate("first"),
-                terminal(1),
-            ],
-        ),
-    ]))?;
-    sandbox.count("raw.append.fail")?;
-    let daemon = sandbox.start()?;
-    let other = other_session(&sandbox)?;
-    let (session, _) = sandbox.spawn("first")?;
-    sandbox.await_file("accepted.entered")?;
-    sandbox.await_accepted(&session, 1)?;
-    let next = sandbox.next_hit("raw.append.fail")?;
-    sandbox.arm("raw.append.fail", next, "fail_io")?;
-    sandbox.release("accepted")?;
-    sandbox.ack(&daemon, "raw.append.fail", next, "fail_io")?;
-    let first = sandbox.wait(&format!("{session}/1"))?;
-    let warned = first["warnings"]
-        .as_array()
-        .is_some_and(|warnings| warnings.iter().any(|w| w["code"] == "raw_log_incomplete"));
-    check(
-        first["state"] == "failed"
-            && first["failure"]["class"] == "store"
-            && first["cancel"]["cleanup"] == "quiescent"
-            && warned,
-        || format!("unexpected turn 1: {first}"),
-    )?;
-    let events = sandbox.events(&session)?;
-    dense(&events)?;
-    check(
-        event_types(&events, 1)
-            == [
-                "turn.queued",
-                "turn.submitted",
-                "turn.started",
-                "raw_log.incomplete",
-                "turn.ended",
-            ],
-        || format!("turn 1 events: {events:?}"),
-    )?;
-    let failure = store_failure(&sandbox)?;
-    check(
-        failure["kind"] == "raw_failed" && failure["scope"] == "turn",
-        || format!("unexpected store_failure: {failure}"),
-    )?;
-    scoped_end(daemon, &other)
-}
-
-/// How the turn whose `raw_log.incomplete` reply was lost ends.
-#[derive(Clone, Copy, Debug)]
-enum RawEnd {
-    /// The turn's own terminal commits, after the read-back finds the event.
-    Terminal,
-    /// The terminal's first attempt fails, so final shutdown's batch
-    /// commits it.
-    Batch,
-    /// Every later commit fails: the batch is skipped and the turn stays
-    /// running until restart recovery ends it.
-    Restart,
-}
-
-/// Design §7.2 row 6, §7.4 and §9: a protocol failure ends a turn whose raw
-/// log lost the connection's last bytes (the drain's append fails, and
-/// Route's cause stays the protocol failure), so Core commits
-/// `raw_log.incomplete` itself; that commit succeeds but its reply is lost
-/// (`store.commit.reply_lost`) and the daemon latches. The turn's stream
-/// then has exactly one `raw_log.incomplete`, at a dense sequence,
-/// whichever path ends the turn (the terminal, the failure batch, or
-/// restart recovery), and a restart adds none.
-#[test]
-fn s1_f12_raw_incomplete_reply_lost_is_written_once() -> TestResult {
-    for end in [RawEnd::Terminal, RawEnd::Batch, RawEnd::Restart] {
-        raw_incomplete_reply_lost(end)?;
-    }
-    Ok(())
-}
-
-fn raw_incomplete_reply_lost(end: RawEnd) -> TestResult {
-    // A second acceptance is a protocol failure once its own message is
-    // recorded; the line behind it, written together, is only in Wire's
-    // buffer, so the failure drain records it.
-    let duplicate = json!({"action":"emit_raw","text":
-        "{\"type\":\"accepted\",\"id\":1,\"vendor_turn_id\":\"fake-turn-1\"}\ntail-after-duplicate\n"});
-    let sandbox = Sandbox::new(&script(
-        "first",
-        1,
-        vec![accepted(1), gate("first"), duplicate, terminal(1)],
-    ))?;
-    for point in [
-        "raw.append.fail",
-        "store.commit.event",
-        "store.commit.reply_lost",
-        "store.commit.terminal",
-        "store.commit.fail_persistent",
-    ] {
-        sandbox.count(point)?;
-    }
-    let daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("first")?;
-    sandbox.await_file("first.entered")?;
-    sandbox.await_accepted(&session, 1)?;
-    // The duplicate message's append succeeds; the tail's is the next.
-    let append = sandbox.next_hit("raw.append.fail")? + 1;
-    sandbox.arm("raw.append.fail", append, "fail_io")?;
-    // The turn's first event after acceptance is `raw_log.incomplete`; the
-    // writer is held before it, so the next commit is that event's.
-    let event = sandbox.next_hit("store.commit.event")?;
-    sandbox.arm("store.commit.event", event, "pause")?;
-    sandbox.release("first")?;
-    sandbox.ack(&daemon, "raw.append.fail", append, "fail_io")?;
-    sandbox.ack(&daemon, "store.commit.event", event, "pause")?;
-    let lost = sandbox.next_hit("store.commit.reply_lost")?;
-    sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
-    match end {
-        RawEnd::Terminal => {}
-        RawEnd::Batch => {
-            let first = sandbox.next_hit("store.commit.terminal")?;
-            sandbox.arm("store.commit.terminal", first, "fail_io")?;
-        }
-        RawEnd::Restart => {
-            // The event itself commits; every later commit fails.
-            let later = sandbox.next_hit("store.commit.fail_persistent")? + 1;
-            sandbox.arm("store.commit.fail_persistent", later, "fail_io_persist")?;
-        }
-    }
-    sandbox.resume_point("store.commit.event", event)?;
-    sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
-    let summary = daemon.latched_exit()?;
-    let batches = match end {
-        RawEnd::Terminal | RawEnd::Restart => {
-            json!({"committed": 0, "skipped": u8::from(matches!(end, RawEnd::Restart))})
-        }
-        RawEnd::Batch => json!({"committed": 1, "skipped": 0}),
-    };
-    check(summary["failure_batches"] == batches, || {
-        format!("{end:?}: {summary}")
-    })?;
-    // Stopped with this daemon's failpoints, so a restart runs clean.
-    for point in [
-        "raw.append.fail",
-        "store.commit.event",
-        "store.commit.reply_lost",
-        "store.commit.terminal",
-        "store.commit.fail_persistent",
-    ] {
-        let _ = sandbox.disarm(point);
-    }
-    let once = |events: &[Value], when: &str| -> TestResult {
-        dense(events)?;
-        let logged = event_types(events, 1)
-            .iter()
-            .filter(|kind| *kind == "raw_log.incomplete")
-            .count();
-        check(logged == 1, || {
-            let kinds = event_types(events, 1);
-            format!("{end:?} {when}: {logged} raw_log.incomplete in {kinds:?}")
-        })
-    };
-    let daemon = sandbox.start()?;
-    let events = sandbox.events(&session)?;
-    once(&events, "after restart")?;
-    let first = sandbox.wait(&format!("{session}/1"))?;
-    let warned = first["warnings"]
-        .as_array()
-        .is_some_and(|warnings| warnings.iter().any(|w| w["code"] == "raw_log_incomplete"));
-    check(warned, || format!("{end:?}: unexpected turn 1: {first}"))?;
-    // A second restart adds nothing.
-    daemon.stop_clean()?;
-    let daemon = sandbox.start()?;
-    once(&sandbox.events(&session)?, "after a second restart")?;
-    daemon.stop_clean()
 }
 
 // ------------------------------------------------ re-probe proofs (rows 4, 12)
@@ -2660,7 +2472,7 @@ fn s1_f12_latch_batch_no_reply_is_skipped_within_the_deadline() -> TestResult {
         "SELECT (SELECT count(*) FROM turns WHERE session_id='{session}'
                  AND envelope IS NOT NULL)
               + (SELECT count(*) FROM events WHERE session_id='{session}'
-                 AND json_extract(event,'$.type') IN ('turn.ended','raw_log.incomplete'))"
+                 AND json_extract(event,'$.type')='turn.ended')"
     ))?;
     check(invented == 0, || {
         format!("{invented} terminal records were invented")
@@ -2781,10 +2593,22 @@ fn s1_f12_latch_pipeline_orders_handoffs() -> TestResult {
 /// reply is lost (`store.commit.reply_lost`). Before B is released,
 /// `host.early_stop.sent` is acknowledged for B's group (the only live
 /// one) and the group is gone. After release B ends by the force row, and
-/// the exit is 4.
+/// the exit is 4. B's vendor holds after its observation, so its group is
+/// live until the early stop.
 #[test]
 fn s1_f12_host_early_stop_independent_of_store() -> TestResult {
-    let sandbox = Sandbox::new(&scripts(&[reported("b"), completes("a", 1)]))?;
+    let held = script(
+        "b",
+        1,
+        vec![
+            json!({"action":"report_pids"}),
+            accepted(1),
+            gate("b"),
+            text("observed"),
+            json!({"action":"hang"}),
+        ],
+    );
+    let sandbox = Sandbox::new(&scripts(&[held, completes("a", 1)]))?;
     sandbox.count("core.commit.before_send")?;
     sandbox.count("store.commit.reply_lost")?;
     let daemon = sandbox.start()?;

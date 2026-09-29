@@ -7,13 +7,13 @@ use tokio::{
 };
 
 use super::{
-    ConnectionId, Deadline, FakeMessage, FakeStart, PrivateProcessSpec, RawRef, ReprobeReport,
-    RouteError, RouteFailure, RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome,
-    StopWatch, StoreFailure, TerminalStatus, TurnNumber, WireRecovery, WireShutdown,
+    Deadline, FakeMessage, FakeStart, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure,
+    RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome, StopWatch, StoreFailure,
+    TerminalStatus, TurnNumber, WireRecovery, WireShutdown,
 };
 use via_wire::{
-    CloseMode, CloseRequest, ExitReport, HostError, RawEvidence, StoreError, WireCleanup,
-    WireConnection, WireError, WireFailure, WireRuntime, WireSignals,
+    CloseMode, CloseRequest, ExitReport, HostError, WireCleanup, WireConnection, WireError,
+    WireFailure, WireRuntime, WireSignals,
 };
 
 /// Final fake protocol evidence, including independently confirmed process exit.
@@ -26,8 +26,6 @@ pub struct FakeRouteResult {
     pub stop_reason: String,
     /// Optional vendor failure code.
     pub vendor_code: Option<String>,
-    /// Raw reference to the terminal message.
-    pub terminal_raw: RawRef,
     /// Host-confirmed vendor exit after stdin was half-closed; both fields
     /// are `None` when the wall deadline passed during finalization before
     /// an exit was confirmed.
@@ -54,15 +52,14 @@ impl FakeRoute {
     /// Sends one prompt after durable submission and awaits paired terminal and real exit.
     ///
     /// Every decoded message, including acceptance, the terminal and late observations
-    /// after it, is sent on `observations` in decode order with its synced raw span.
+    /// after it, is sent on `observations` in decode order.
     /// When that channel is full the route waits, bounded by `deadline`; a dropped
     /// receiver fails the turn as overflow. On any failure the private group is
-    /// force-closed and both pipes are drained under a separate cleanup bound.
+    /// force-closed and stdout is drained under a separate cleanup bound.
     ///
     /// `force` set fails the turn [`RouteError::ForceStopped`]: before launch
     /// nothing starts; after it, messages already read are still forwarded, then
-    /// the same cleanup records every remaining vendor byte or reports the raw
-    /// log incomplete. The daemon force overrides a stop order.
+    /// the same cleanup follows. The daemon force overrides a stop order.
     ///
     /// `stop` is the turn's stop order (design §2): set before ARM, nothing
     /// launches; after ARM but before the start message, the group is
@@ -70,13 +67,8 @@ impl FakeRoute {
     /// ends the turn normally, and at `force_at` without one the group is
     /// force-closed under `close_by`. Either stop is
     /// [`RouteError::Stopped`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each argument is a distinct input of the one turn"
-    )]
     pub async fn execute(
         &self,
-        connection_id: ConnectionId,
         process: PrivateProcessSpec,
         start: FakeStart,
         observations: mpsc::Sender<RouteMessage>,
@@ -87,9 +79,8 @@ impl FakeRoute {
         let turn = start.turn();
         let not_launched = |cause| RouteFailure {
             cause,
-            evidence: None,
+            undecoded: None,
             exit: None,
-            raw_incomplete: false,
             launched: false,
             cleanup: None,
             forced: false,
@@ -115,7 +106,6 @@ impl FakeRoute {
             gate,
         };
         let turn_run = self.run_turn(
-            connection_id,
             process,
             start,
             &observations,
@@ -130,13 +120,8 @@ impl FakeRoute {
     }
 
     /// [`Self::execute`] after its entry checks, while the waker runs.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each argument is a distinct input of the one turn"
-    )]
     async fn run_turn(
         &self,
-        connection_id: ConnectionId,
         process: PrivateProcessSpec,
         start: FakeStart,
         observations: &mpsc::Sender<RouteMessage>,
@@ -147,7 +132,7 @@ impl FakeRoute {
         let turn = start.turn();
         let mut wire = self
             .wire
-            .open_connection(connection_id, process, deadline, signals)
+            .open_connection(process, deadline, signals)
             .await
             .map_err(|error| acquire_failure(turn, &error, &force))?;
         let signals = (force, stop);
@@ -184,14 +169,14 @@ impl FakeRoute {
                 deadline: cleanup,
             })
             .await;
-        // The group is stopping; keep both tails as raw evidence. The original
-        // failure stays authoritative; the drain only reports lost bytes.
-        let raw = Box::pin(wire.drain_to_eof(cleanup)).await;
+        // The group is stopping; its stdout is read and discarded so it
+        // never blocks. The original failure stays authoritative.
+        Box::pin(wire.drain_to_eof(cleanup)).await;
         Err(RouteFailure {
             cause: failed.cause,
-            evidence: failed.evidence,
+            // The one message this turn could not decode, if any (design §7.3).
+            undecoded: wire.take_undecoded(),
             exit: failed.exit.or(report.vendor_exit),
-            raw_incomplete: raw == RawEvidence::Incomplete,
             launched: true,
             cleanup: Some(report.cleanup),
             forced: report.forced,
@@ -313,7 +298,7 @@ impl FakeRoute {
                 }
                 // EOF without a terminal: a Host-confirmed exit is
                 // `ProcessExited`. F21: after an unterminated last line
-                // (already in the raw log) the wait is bounded by the cleanup
+                // (kept in `undecoded.bin`) the wait is bounded by the cleanup
                 // allowance and anything but a confirmed exit is transport
                 // loss, never a protocol failure.
                 // Under the daemon force the exit is the force's own stop
@@ -326,7 +311,6 @@ impl FakeRoute {
                     control.after_terminal()?;
                     return Err(Failed {
                         cause: RouteError::ProcessExited { turn },
-                        evidence: None,
                         exit: Some(exit),
                         close_by: None,
                     });
@@ -334,7 +318,7 @@ impl FakeRoute {
             };
             phase
                 .advance(&message.payload, turn, control.interrupted)
-                .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
+                .map_err(Failed::from)?;
             let terminal = terminal_evidence(&message);
             forward(observations, message, turn, deadline, &mut force).await?;
             if let Some(terminal) = terminal {
@@ -388,7 +372,7 @@ impl FakeRoute {
                 Next::Message(message) => {
                     phase
                         .advance(&message.payload, turn, control.interrupted)
-                        .map_err(|cause| Failed::cited(cause, &message.raw_ref))?;
+                        .map_err(Failed::from)?;
                     forward(observations, message, turn, deadline, &mut force).await?;
                 }
                 Next::Woken => control.after_terminal()?,
@@ -462,15 +446,8 @@ impl Control {
                 "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
                 self.turn.get()
             );
-            // Not written or cut short: `force_at` still bounds the turn. A
-            // raw evidence failure fails the connection (design §7.2 row 6):
-            // the group is force-closed under `now + 3 s` and the cause keeps
-            // its Store kind, so `WriterLost` and `Uncertain` still latch.
-            if let Err(error) = wire.write_message(interrupt.as_bytes(), deadline).await
-                && let Some(cause) = interrupt_failure(self.turn, &error)
-            {
-                return Err(cause.into());
-            }
+            // Not written or cut short: `force_at` still bounds the turn.
+            let _unsent = wire.write_message(interrupt.as_bytes(), deadline).await;
         }
         Ok(())
     }
@@ -542,31 +519,19 @@ async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>) {
     }
 }
 
-/// First failure inside `drive`, before cleanup adds raw completeness.
+/// First failure inside `drive`, before cleanup.
 struct Failed {
     cause: RouteError,
-    evidence: Option<RawRef>,
     exit: Option<ExitReport>,
     /// A stop order's bound on the force close and drain.
     close_by: Option<Deadline>,
 }
 
 impl Failed {
-    /// A failure proved by one synced vendor message.
-    fn cited(cause: RouteError, evidence: &RawRef) -> Self {
-        Self {
-            cause,
-            evidence: Some(evidence.clone()),
-            exit: None,
-            close_by: None,
-        }
-    }
-
     /// A stop order forcing the turn, closed under `close_by`.
     fn stopped(turn: TurnNumber, close_by: Deadline) -> Self {
         Self {
             cause: RouteError::Stopped { turn },
-            evidence: None,
             exit: None,
             close_by: Some(close_by),
         }
@@ -577,14 +542,13 @@ impl From<RouteError> for Failed {
     fn from(cause: RouteError) -> Self {
         Self {
             cause,
-            evidence: None,
             exit: None,
             close_by: None,
         }
     }
 }
 
-/// Bounds Host cleanup and the raw drain separately from the turn deadline, which
+/// Bounds Host cleanup and the stdout drain separately from the turn deadline, which
 /// may already have elapsed when cleanup starts.
 fn cleanup_deadline() -> Deadline {
     Deadline::at(tokio::time::Instant::now() + std::time::Duration::from_secs(3))
@@ -651,7 +615,6 @@ struct TerminalEvidence {
     final_text: String,
     stop_reason: String,
     vendor_code: Option<String>,
-    raw_ref: RawRef,
 }
 
 impl TerminalEvidence {
@@ -666,7 +629,6 @@ impl TerminalEvidence {
             final_text: self.final_text,
             stop_reason: self.stop_reason,
             vendor_code: self.vendor_code,
-            terminal_raw: self.raw_ref,
             exit,
             cleanup,
             journal_uncertain,
@@ -687,7 +649,6 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
             final_text: final_text.clone(),
             stop_reason: stop_reason.clone(),
             vendor_code: vendor_code.clone(),
-            raw_ref: message.raw_ref.clone(),
         }),
         FakeMessage::Accepted { .. }
         | FakeMessage::Text { .. }
@@ -700,17 +661,18 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
 
 /// What the next read produced.
 enum Next {
-    /// One decoded vendor message with its synced raw span.
+    /// One decoded vendor message.
     Message(RouteMessage),
     /// Both pipes reached EOF.
     Eof,
-    /// Stdout ended inside a message; its bytes are in the raw log (F21).
+    /// Stdout ended inside a message; Wire kept its bytes (F21, design §7.3).
     Unterminated,
     /// Route's wake ended the wait before any byte was read.
     Woken,
 }
 
-/// Reads and decodes the next synced vendor message.
+/// Reads and decodes the next vendor message. One Route cannot decode is
+/// kept in `undecoded.bin` first (design §7.3).
 async fn next_message(
     wire: &mut WireConnection,
     turn: TurnNumber,
@@ -723,18 +685,23 @@ async fn next_message(
         Err(WireError::Message(WireFailure::UnterminatedMessage)) => return Ok(Next::Unterminated),
         Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
     };
-    let payload = FakeMessage::decode(message.bytes(), turn)
-        .map_err(|cause| Failed::cited(cause, message.raw_ref()))?;
-    Ok(Next::Message(RouteMessage {
-        payload,
-        raw_ref: message.raw_ref().clone(),
-    }))
+    match FakeMessage::decode(message.bytes(), turn) {
+        Ok(payload) => Ok(Next::Message(RouteMessage { payload })),
+        Err(cause) => {
+            let what = format!(
+                "undecodable vendor message: {} bytes",
+                message.bytes().len()
+            );
+            wire.keep_undecoded(message.bytes(), &what).await;
+            Err(Failed::from(cause))
+        }
+    }
 }
 
 /// Waits for observation capacity until the turn deadline; a consumer that neither
 /// drains nor stays attached is an overflow, never a silent drop. A force ends
-/// the wait: the unsent message's bytes are already in the raw log, and Route's
-/// force close and drain follow.
+/// the wait: the unsent message is dropped, and Route's force close and drain
+/// follow.
 async fn forward(
     observations: &mpsc::Sender<RouteMessage>,
     message: RouteMessage,
@@ -771,10 +738,9 @@ fn acquire_failure(
     error: &WireError,
     force: &watch::Receiver<Option<tokio::time::Instant>>,
 ) -> RouteFailure {
-    let (cause, launched, raw, cleanup, forced, journal_uncertain) = if let WireError::Acquire {
+    let (cause, launched, cleanup, forced, journal_uncertain) = if let WireError::Acquire {
         cause,
         launched,
-        raw,
         cleanup,
         forced,
         journal_uncertain,
@@ -783,13 +749,12 @@ fn acquire_failure(
         (
             cause.as_ref(),
             *launched,
-            *raw,
             *cleanup,
             *forced,
             *journal_uncertain,
         )
     } else {
-        (error, false, RawEvidence::Complete, None, false, false)
+        (error, false, None, false, false)
     };
     let cause = if matches!(cause, WireError::Host(HostError::Stopped)) {
         if force.borrow().is_some() {
@@ -802,9 +767,8 @@ fn acquire_failure(
     };
     RouteFailure {
         cause,
-        evidence: None,
+        undecoded: None,
         exit: None,
-        raw_incomplete: raw == RawEvidence::Incomplete,
         launched,
         cleanup,
         forced,
@@ -812,54 +776,14 @@ fn acquire_failure(
     }
 }
 
-/// Classifies a failed raw append for Core (design §7.1 [r5.5, r5.6]): raw
-/// I/O and a full raw queue are `Raw`; a lost raw thread is `WriterLost`.
-fn raw_failure(error: &StoreError) -> StoreFailure {
-    match error {
-        StoreError::WriterLost => StoreFailure::WriterLost,
-        StoreError::NotEnqueued => StoreFailure::NotEnqueued,
-        StoreError::Uncertain(_) | StoreError::Corrupt(_) => StoreFailure::Uncertain,
-        StoreError::Open(_)
-        | StoreError::Write(_)
-        | StoreError::Raw(_)
-        | StoreError::Constraint(_)
-        | StoreError::CorruptEvidence
-        | StoreError::Refused(_) => StoreFailure::Raw,
-    }
-}
-
-/// The cause a failed interrupt write ends the turn with (design §2 rule 3,
-/// §7.2 row 6). The interrupt's raw record failed: the connection fails with
-/// its classified cause. A transport failure is tolerated, because
-/// `force_at` still bounds the turn.
-fn interrupt_failure(turn: TurnNumber, error: &WireError) -> Option<RouteError> {
-    match error {
-        WireError::Raw(_)
-        | WireError::RawDeadline
-        | WireError::Message(WireFailure::RawStore | WireFailure::RawRangeMismatch) => {
-            Some(wire_cause(turn, error))
-        }
-        WireError::Host(_)
-        | WireError::Io(_)
-        | WireError::Deadline
-        | WireError::Cancelled
-        | WireError::Woken
-        | WireError::Acquire { .. }
-        | WireError::Message(
-            WireFailure::MessageTooLarge
-            | WireFailure::UnterminatedMessage
-            | WireFailure::Overflow
-            | WireFailure::Transport,
-        ) => None,
-    }
-}
-
 /// Keeps a Wire failure's cause for Core's C1 class decision.
 fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
     match error {
-        WireError::Raw(error) => RouteError::Store {
+        // Design §7.2: the folder or `stderr.log` was not created; nothing
+        // launched.
+        WireError::Evidence(_) | WireError::Host(HostError::Evidence(_)) => RouteError::Store {
             turn,
-            kind: raw_failure(error),
+            kind: StoreFailure::Evidence,
         },
         // Rows 3 and 4: a Host journal write that did not commit.
         WireError::Host(HostError::Journal { uncertain, .. }) => RouteError::Store {
@@ -871,27 +795,19 @@ fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
             },
         },
         // Every Wire call that reports a cause runs under the turn's work deadline,
-        // so an append it outlived is C1 `deadline_wall`; so is an acquisition,
+        // so a read it outlived is C1 `deadline_wall`; so is an acquisition,
         // which Host bounds by the same deadline. The failure drain runs under
-        // the cleanup deadline and reports lost bytes only, never a cause.
-        WireError::Deadline | WireError::RawDeadline | WireError::Host(HostError::Deadline) => {
-            RouteError::Deadline { turn }
-        }
+        // the cleanup deadline and never reports a cause.
+        WireError::Deadline | WireError::Host(HostError::Deadline) => RouteError::Deadline { turn },
         WireError::Cancelled => RouteError::ForceStopped { turn },
         WireError::Acquire { cause, .. } => wire_cause(turn, cause),
-        WireError::Message(WireFailure::MessageTooLarge) => {
-            protocol(turn, "fake stdout line exceeds the 1 MiB message cap")
-        }
         WireError::Message(WireFailure::UnterminatedMessage) => {
             protocol(turn, "fake stdout ended inside a message")
         }
-        WireError::Message(WireFailure::RawRangeMismatch | WireFailure::RawStore) => {
-            RouteError::Store {
-                turn,
-                kind: StoreFailure::Raw,
-            }
+        // C1 §8.2: a vendor message over 1 MiB is `overflow` too.
+        WireError::Message(WireFailure::Overflow | WireFailure::MessageTooLarge) => {
+            RouteError::Overflow { turn }
         }
-        WireError::Message(WireFailure::Overflow) => RouteError::Overflow { turn },
         WireError::Message(WireFailure::Transport)
         | WireError::Io(_)
         | WireError::Host(_)
@@ -904,17 +820,14 @@ fn protocol(turn: TurnNumber, detail: &'static str) -> RouteError {
 }
 
 fn transport(turn: TurnNumber) -> RouteError {
-    RouteError::TransportLost {
-        turn,
-        evidence: None,
-    }
+    RouteError::TransportLost { turn }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FakeMessage, HostError, Phase, RouteError, StoreError, StoreFailure, TurnNumber, WireError,
-        WireFailure, interrupt_failure, raw_failure, wire_cause,
+        FakeMessage, HostError, Phase, RouteError, StoreFailure, TurnNumber, WireError,
+        WireFailure, wire_cause,
     };
 
     fn decode(json: &str) -> FakeMessage {
@@ -995,24 +908,27 @@ mod tests {
         }
     }
 
-    /// Design §7.1 [r5.5, r5.6]: raw failures keep their classified kind,
-    /// and Host journal failures report their outcome.
+    /// Task 4 design §7.2: a folder or `stderr.log` that was not created is
+    /// a non-latching Store failure; Host journal failures report their
+    /// outcome [r5.5]; C1 §8.2: a message over the cap is `overflow`.
     #[test]
     fn store_failures_keep_their_kind() {
-        assert_eq!(
-            raw_failure(&StoreError::Raw("io".into())),
-            StoreFailure::Raw
-        );
-        assert_eq!(
-            raw_failure(&StoreError::WriterLost),
-            StoreFailure::WriterLost
-        );
-        assert_eq!(
-            raw_failure(&StoreError::Uncertain("commit".into())),
-            StoreFailure::Uncertain
-        );
-        assert!(StoreFailure::WriterLost.latches() && !StoreFailure::Raw.latches());
         let turn = TurnNumber::try_from(1).unwrap();
+        for error in [
+            WireError::Evidence(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            WireError::Host(HostError::Evidence(std::io::Error::from(
+                std::io::ErrorKind::AlreadyExists,
+            ))),
+        ] {
+            assert_eq!(
+                wire_cause(turn, &error),
+                RouteError::Store {
+                    turn,
+                    kind: StoreFailure::Evidence
+                }
+            );
+        }
+        assert!(StoreFailure::WriterLost.latches() && !StoreFailure::Evidence.latches());
         for (uncertain, kind) in [
             (false, StoreFailure::NotCommitted),
             (true, StoreFailure::Uncertain),
@@ -1026,44 +942,9 @@ mod tests {
             );
             assert_eq!(cause, RouteError::Store { turn, kind });
         }
-    }
-
-    /// S1 round-1 decision 4: a raw failure at the interrupt write ends the
-    /// turn with its Store kind, so `WriterLost` and `Uncertain` still latch;
-    /// a transport failure there is tolerated.
-    #[test]
-    fn interrupt_write_failures_keep_their_store_kind() {
-        let turn = TurnNumber::try_from(1).unwrap();
-        for (error, kind) in [
-            (StoreError::WriterLost, StoreFailure::WriterLost),
-            (
-                StoreError::Uncertain("commit".into()),
-                StoreFailure::Uncertain,
-            ),
-            (StoreError::Raw("io".into()), StoreFailure::Raw),
-        ] {
-            assert_eq!(
-                interrupt_failure(turn, &WireError::Raw(error)),
-                Some(RouteError::Store { turn, kind })
-            );
-        }
         assert_eq!(
-            interrupt_failure(turn, &WireError::Message(WireFailure::RawStore)),
-            Some(RouteError::Store {
-                turn,
-                kind: StoreFailure::Raw
-            })
+            wire_cause(turn, &WireError::Message(WireFailure::MessageTooLarge)),
+            RouteError::Overflow { turn }
         );
-        assert_eq!(
-            interrupt_failure(turn, &WireError::RawDeadline),
-            Some(RouteError::Deadline { turn })
-        );
-        for tolerated in [
-            WireError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-            WireError::Cancelled,
-            WireError::Message(WireFailure::Transport),
-        ] {
-            assert_eq!(interrupt_failure(turn, &tolerated), None);
-        }
     }
 }

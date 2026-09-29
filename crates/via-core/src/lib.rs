@@ -5,9 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use via_adapters::FakeConfig;
 pub use via_adapters::{AcceptanceToken, CancelOutcome, Cleanup, StartOutcome};
-pub use via_store::{
-    CommitOutcome, ConnectionId, Deadline, RawRef, SessionId, StoreLock, TurnNumber,
-};
+pub use via_store::{CommitOutcome, Deadline, SessionId, StoreLock, TurnNumber};
 
 /// Strict parameters for C1's mandatory first `hello` request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,8 +95,8 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 
 pub use api::{
     ApiError, CancelParams, CloseMode, CloseParams, DEFAULT_CLOSE_DEADLINE_MS,
-    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, Named,
-    ReadParams, ReceiptOutcome, ResumeParams, SessionReadParams, SpawnParams, SteerParams,
+    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, LogsParams,
+    Named, ReadParams, ReceiptOutcome, ResumeParams, SessionReadParams, SpawnParams, SteerParams,
     Unpersisted, WaitParams, hash_handle, parse_address, retry_identity,
 };
 

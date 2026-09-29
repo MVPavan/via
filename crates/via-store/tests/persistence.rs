@@ -1,4 +1,4 @@
-//! Failure-first checks for the real SQLite and raw durability boundary.
+//! Failure-first checks for the real SQLite durability boundary.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -6,16 +6,15 @@
 
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
 };
 
 use serde_json::json;
 use tempfile::TempDir;
 use via_store::{
-    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorPhase, CommitOutcome, ConnectionId,
-    RawRef, RawStream, SessionId, SpawnRecord, Store, StoreError, SubmissionRecord, TerminalRecord,
-    TurnNumber,
+    AcceptanceRecord, AnchorIdentity, AnchorIntent, AnchorPhase, CommitOutcome, SessionId,
+    SpawnRecord, Store, StoreError, SubmissionRecord, TerminalRecord, TurnNumber,
 };
 
 fn session() -> SessionId {
@@ -34,7 +33,7 @@ fn spawn(hash: [u8; 32]) -> SpawnRecord {
         params: json!({"harness":"fake"}),
         prompt: "test prompt".to_owned(),
         effective: json!({"deadlines":{"wall_ms":1}}),
-        initial_event: json!({"type":"turn.queued","seq":1}),
+        initial_event: json!({"type":"turn.queued","seq":1,"turn":1,"at":"2026-01-01T00:00:00.000Z"}),
     }
 }
 
@@ -42,18 +41,22 @@ fn submission() -> SubmissionRecord {
     SubmissionRecord {
         session_id: session(),
         turn: turn(),
-        event: json!({"type":"turn.submitted","seq":2,"at":"2026-01-01T00:00:00.000Z","raw_ref":null}),
+        event: json!({"type":"turn.submitted","seq":2,"turn":1,"at":"2026-01-01T00:00:00.000Z"}),
     }
 }
 
-fn acceptance(raw_ref: &RawRef) -> AcceptanceRecord {
+fn acceptance() -> AcceptanceRecord {
     AcceptanceRecord {
         session_id: session(),
         turn: turn(),
-        raw_ref: raw_ref.clone(),
         correlation: "fake-turn-1".to_owned(),
-        event: json!({"type":"turn.started","seq":3,"at":"2026-01-01T00:00:01.000Z","raw_ref":raw_ref}),
+        event: json!({"type":"turn.started","seq":3,"turn":1,"at":"2026-01-01T00:00:01.000Z"}),
     }
+}
+
+/// A `turn.ended` at `seq` with a canonical `at`.
+fn ended(seq: u64) -> serde_json::Value {
+    json!({"type":"turn.ended","seq":seq,"turn":1,"at":"2026-01-01T00:00:02.000Z"})
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -81,8 +84,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         session_id: session(),
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
-                        event: json!({"type":"turn.ended","seq":4,"raw_ref":null}),
-                        raw_ref: None,
+                        event: ended(4),
                     })
                     .await
                     .is_err()
@@ -98,31 +100,18 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         session_id: session(),
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
-                        event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
-                        raw_ref: None,
+                        event: ended(3),
                     })
                     .await
                     .is_err()
             );
-            let accepted = store
-                .runtime_resources()
-                .into_wire_parts()
-                .0
-                .open(ConnectionId::try_from("c_accept").unwrap())
-                .append(RawStream::Stdout, b"accepted\n".to_vec())
-                .await
-                .unwrap();
-            client
-                .commit_acceptance(acceptance(accepted.raw_ref()))
-                .await
-                .unwrap();
+            client.commit_acceptance(acceptance()).await.unwrap();
             client
                 .commit_terminal(TerminalRecord {
                     session_id: session(),
                     turn: turn(),
                     envelope: json!({"state":"completed","final_text":"reply"}),
-                    event: json!({"type":"turn.ended","seq":4,"raw_ref":null}),
-                    raw_ref: None,
+                    event: ended(4),
                 })
                 .await
                 .unwrap();
@@ -157,94 +146,6 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
 }
 
 #[test]
-fn raw_reference_requires_synced_index_entry() {
-    let root = TempDir::new().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let store = Store::open(root.path()).unwrap();
-    let client = store.client();
-    let rt = runtime();
-    rt.block_on(async {
-        client.commit_spawn(spawn([7_u8; 32])).await.unwrap();
-        client.commit_submission(submission()).await.unwrap();
-        let connection_id = ConnectionId::try_from("c_01").unwrap();
-        let writer = store
-            .runtime_resources()
-            .into_wire_parts()
-            .0
-            .open(connection_id.clone());
-        let accepted = writer
-            .append(RawStream::Stdout, b"accepted\n".to_vec())
-            .await
-            .unwrap();
-        client
-            .commit_acceptance(acceptance(accepted.raw_ref()))
-            .await
-            .unwrap();
-        let forged =
-            RawRef::new(connection_id.clone(), accepted.raw_ref().end_offset(), 6).unwrap();
-        assert!(matches!(
-            client
-                .commit_terminal(TerminalRecord {
-                    session_id: session(),
-                    turn: turn(),
-                    envelope: json!({"state":"completed"}),
-                    event: json!({"type":"turn.ended","seq":4,"raw_ref":forged}),
-                    raw_ref: Some(forged),
-                })
-                .await,
-            Err(StoreError::CorruptEvidence)
-        ));
-        client
-            .commit_acceptance(acceptance(accepted.raw_ref()))
-            .await
-            .unwrap();
-        let token = writer
-            .append(RawStream::Stdout, b"reply\n".to_vec())
-            .await
-            .unwrap();
-        assert_eq!(token.raw_ref().offset(), accepted.raw_ref().end_offset());
-        client
-            .commit_terminal(TerminalRecord {
-                session_id: session(),
-                turn: turn(),
-                envelope: json!({"state":"completed"}),
-                event: json!({"type":"turn.ended","seq":4,"raw_ref":token.raw_ref()}),
-                raw_ref: Some(token.raw_ref().clone()),
-            })
-            .await
-            .unwrap();
-        let logs = client.logs(&session()).await.unwrap();
-        assert_eq!(logs["entries"][0]["text"], "accepted\n");
-        assert_eq!(logs["entries"][1]["text"], "reply\n");
-        assert_eq!(logs["entries"][0]["offset"], 0);
-        assert_eq!(logs["next_after"], 4);
-    });
-}
-
-#[test]
-fn raw_writer_refuses_symlink_targets() {
-    let root = TempDir::new().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let store = Store::open(root.path()).unwrap();
-    let target = root.path().join("outside");
-    fs::write(&target, b"unchanged").unwrap();
-    symlink(&target, root.path().join("raw/c_link.raw")).unwrap();
-    symlink(&target, root.path().join("raw/c_link.idx")).unwrap();
-    let connection = ConnectionId::try_from("c_link").unwrap();
-    let writer = store
-        .runtime_resources()
-        .into_wire_parts()
-        .0
-        .open(connection);
-    assert!(
-        runtime()
-            .block_on(writer.append(RawStream::Stdout, b"secret\n".to_vec()))
-            .is_err()
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"unchanged");
-}
-
-#[test]
 fn failure_before_vendor_acceptance_is_still_durable() {
     let root = TempDir::new().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -258,8 +159,7 @@ fn failure_before_vendor_acceptance_is_still_durable() {
                 session_id: session(),
                 turn: turn(),
                 envelope: json!({"state":"failed","failure":{"class":"process_exited"}}),
-                event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
-                raw_ref: None,
+                event: ended(3),
             })
             .await
             .unwrap();
@@ -267,31 +167,6 @@ fn failure_before_vendor_acceptance_is_still_durable() {
             client.result(&session(), turn()).await.unwrap().unwrap()["state"],
             "failed"
         );
-    });
-}
-
-#[test]
-fn logs_bound_counts_json_escaping() {
-    let root = TempDir::new().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let store = Store::open(root.path()).unwrap();
-    let client = store.client();
-    runtime().block_on(async {
-        client.commit_spawn(spawn([6_u8; 32])).await.unwrap();
-        client.commit_submission(submission()).await.unwrap();
-        let raw = store
-            .runtime_resources()
-            .into_wire_parts()
-            .0
-            .open(ConnectionId::try_from("c_escape").unwrap())
-            .append(RawStream::Stdout, vec![1_u8; 300_000])
-            .await
-            .unwrap();
-        client
-            .commit_acceptance(acceptance(raw.raw_ref()))
-            .await
-            .unwrap();
-        assert!(client.logs(&session()).await.is_err());
     });
 }
 
@@ -394,7 +269,7 @@ fn newer_schema_is_refused_without_mutation() {
 }
 
 #[test]
-fn events_keep_dense_seq_and_cited_raw_span() {
+fn events_keep_dense_seq_and_a_strict_at() {
     let root = TempDir::new().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root.path()).unwrap();
@@ -410,46 +285,24 @@ fn events_keep_dense_seq_and_cited_raw_span() {
         let mut untimed = submission();
         untimed.event.as_object_mut().unwrap().remove("at");
         assert!(client.commit_submission(untimed).await.is_err());
+        // Task 4 design §6.6: `at` is parsed strictly to Unix ms.
+        for loose in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01 00:00:00.000Z",
+            "2026-13-01T00:00:00.000Z",
+        ] {
+            let mut loose_at = submission();
+            loose_at.event["at"] = json!(loose);
+            assert!(
+                client.commit_submission(loose_at).await.is_err(),
+                "{loose} was accepted"
+            );
+        }
         client.commit_submission(submission()).await.unwrap();
-        let writer = store
-            .runtime_resources()
-            .into_wire_parts()
-            .0
-            .open(ConnectionId::try_from("c_cite").unwrap());
-        let first = writer
-            .append(RawStream::Stdout, b"first\n".to_vec())
-            .await
-            .unwrap();
-        let second = writer
-            .append(RawStream::Stdout, b"second\n".to_vec())
-            .await
-            .unwrap();
-        let mut miscited = acceptance(first.raw_ref());
-        miscited.event["raw_ref"] = serde_json::to_value(second.raw_ref()).unwrap();
-        assert!(matches!(
-            client.commit_acceptance(miscited).await,
-            Err(StoreError::Constraint(_))
-        ));
-        let mut uncited = acceptance(first.raw_ref());
-        uncited.event.as_object_mut().unwrap().remove("raw_ref");
-        assert!(matches!(
-            client.commit_acceptance(uncited).await,
-            Err(StoreError::Constraint(_))
-        ));
-        let mut nulled = acceptance(first.raw_ref());
-        nulled.event["raw_ref"] = serde_json::Value::Null;
-        assert!(matches!(
-            client.commit_acceptance(nulled).await,
-            Err(StoreError::Constraint(_))
-        ));
-        client
-            .commit_acceptance(acceptance(first.raw_ref()))
-            .await
-            .unwrap();
+        client.commit_acceptance(acceptance()).await.unwrap();
         let events = client.events(&session(), 1, 10).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[2].event["type"], "turn.started");
-        assert_eq!(events[2].raw_ref.as_ref(), Some(first.raw_ref()));
     });
     drop(store);
     let db = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
@@ -544,7 +397,7 @@ fn a_ninth_queued_turn_is_refused_inside_the_receipt_transaction() {
         turn: TurnNumber::try_from(turn).unwrap(),
         prompt: "p".to_owned(),
         effective: json!({"deadlines":{"wall_ms":turn}}),
-        event: json!({"type":"turn.queued","seq":turn,"at":at,"raw_ref":null}),
+        event: json!({"type":"turn.queued","seq":turn,"at":at}),
         operation: None,
     };
     // Turn 1 and turns 2..=8 are the eight queued turns.
@@ -582,7 +435,7 @@ fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
         turn: TurnNumber::try_from(2).unwrap(),
         prompt: "p".to_owned(),
         effective: json!({"deadlines":{"wall_ms":2}}),
-        event: json!({"type":"turn.queued","seq":2,"at":at,"raw_ref":null}),
+        event: json!({"type":"turn.queued","seq":2,"at":at}),
         operation: None,
     };
     rt.block_on(client.commit_resume(second)).unwrap();
@@ -595,8 +448,7 @@ fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
         session_id: session(),
         turn: TurnNumber::try_from(2).unwrap(),
         envelope: json!({"state":"cancelled"}),
-        event: json!({"type":"turn.ended","seq":3,"raw_ref":null}),
-        raw_ref: None,
+        event: ended(3),
     }))
     .unwrap();
     let snapshot = rt

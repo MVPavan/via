@@ -42,7 +42,7 @@ fn via_binary() -> PathBuf {
 /// live under a fresh 0700 root.
 fn run_child(name: &str) {
     let root = tempfile::tempdir().unwrap();
-    for part in ["state", "state/raw", "runtime", "runtime/anchors", "sync"] {
+    for part in ["state", "runtime", "runtime/anchors", "sync"] {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(root.path().join(part))
@@ -224,35 +224,19 @@ fn force_during_stalled_acquisition_settles_the_turn() {
 }
 
 /// Task 1 Sol high 2 (supersedes W4-H round 3): a force that abandons an
-/// acquisition after ARM, once the vendor wrote output, drains the vendor
-/// pipes Host handed over before ARM: the raw log holds that output and is not
-/// reported incomplete. A vendor launched with neither stop nor terminal
-/// proved leaves the turn `unknown`.
+/// acquisition after ARM, once the vendor wrote output, stops the group; a
+/// vendor launched with neither stop nor terminal proved leaves the turn
+/// `unknown`. Since Task 4 no copy of that output is kept.
 #[test]
-fn force_after_arm_abandonment_drains_vendor_output() {
+fn force_after_arm_abandonment_leaves_the_turn_unknown() {
     const LINE: &str = "vendor output before launch reply";
     let Some(root) = env::var_os(CHILD) else {
-        return run_child("force_after_arm_abandonment_drains_vendor_output");
+        return run_child("force_after_arm_abandonment_leaves_the_turn_unknown");
     };
     let root = PathBuf::from(root);
-    let (envelope, events) = force_over_stand_in(&root, &AfterArm::Stall { line: LINE }, "wrote");
+    let (envelope, _events) = force_over_stand_in(&root, &AfterArm::Stall { line: LINE }, "wrote");
     assert_eq!(envelope["state"], "unknown", "{envelope}");
     assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
-    assert!(!warns(&envelope, "raw_log_incomplete"), "{envelope}");
-    assert!(
-        events
-            .iter()
-            .all(|event| event["type"] != "raw_log.incomplete"),
-        "{events:?}"
-    );
-    let session = envelope["session_id"].as_str().unwrap();
-    let connection = format!("c_{}", session.trim_start_matches("s_"));
-    let raw = fs::read(root.join(format!("state/raw/{connection}.raw"))).unwrap();
-    assert!(
-        raw.windows(LINE.len())
-            .any(|window| window == LINE.as_bytes()),
-        "the vendor's output must be in the raw log"
-    );
 }
 
 /// Runs one turn over a stand-in anchor, forces it once the stand-in set

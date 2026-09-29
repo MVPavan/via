@@ -65,6 +65,11 @@ enum Step {
         #[serde(default)]
         stream: Stream,
     },
+    /// Writes `bytes` pattern bytes (`b'a' + i % 26`) to stderr (Task 4
+    /// design §13.1): the evidence folder's `stderr.log` must hold them.
+    Stderr {
+        bytes: u64,
+    },
     ReportPids,
     SpawnGrandchild {
         name: String,
@@ -164,6 +169,7 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
                     write_bytes(stream, text.as_bytes())?;
                 }
             }
+            Step::Stderr { bytes } => write_pattern(bytes)?,
             Step::ReportPids => {
                 fs::write(sync_dir.join("agent.pid"), process::id().to_string())?;
             }
@@ -322,6 +328,21 @@ fn write_bytes(stream: Stream, bytes: &[u8]) -> io::Result<()> {
             out.flush()
         }
     }
+}
+
+/// Writes `count` bytes of the `b'a' + i % 26` pattern to stderr.
+fn write_pattern(count: u64) -> io::Result<()> {
+    let mut out = io::stderr().lock();
+    let mut chunk = Vec::with_capacity(64 * 1024);
+    for index in 0..count {
+        chunk.push(b'a' + u8::try_from(index % 26).unwrap_or(0));
+        if chunk.len() == chunk.capacity() {
+            out.write_all(&chunk)?;
+            chunk.clear();
+        }
+    }
+    out.write_all(&chunk)?;
+    out.flush()
 }
 
 fn gate(sync_dir: &Path, name: &str) -> io::Result<()> {

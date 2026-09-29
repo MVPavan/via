@@ -1,9 +1,7 @@
-//! SQLite and raw evidence resources owned exclusively by Store.
+//! SQLite and the evidence root, resources owned exclusively by Store.
 
 use std::{
-    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -16,12 +14,14 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use crate::{CommitOutcome, ConnectionId, RawRef, SessionId, StoreFailureKind, TurnNumber};
+use crate::{
+    CommitOutcome, EvidenceRoot, Identity, SessionId, StoreFailureKind, TurnNumber,
+    evidence::sync_dir,
+};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Most queued turns one session holds, enforced inside the receipt
 /// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
@@ -42,13 +42,10 @@ fn check_schema_version(version: i64, created: bool) -> Result<(), StoreError> {
     }
     Ok(())
 }
-const RAW_MAGIC: &[u8; 8] = b"VIARAW01";
-const INDEX_ENTRY_LEN: usize = 45;
-const RAW_UNIT_LIMIT: usize = 1_048_576;
 
-/// Storage or evidence failure, with no caller handle or vendor payload.
+/// Storage failure, with no caller handle or vendor payload.
 ///
-/// Design §7.1: `Write`, `Constraint`, `Raw`, `NotEnqueued` and `Refused` were
+/// Design §7.1: `Write`, `Constraint`, `NotEnqueued` and `Refused` were
 /// not committed; `Uncertain` and `WriterLost` may have committed; `Corrupt`
 /// is SQLite-level corruption, which always latches.
 #[derive(Debug, thiserror::Error)]
@@ -60,23 +57,20 @@ pub enum StoreError {
     /// A mutation failed before a positive commit receipt.
     #[error("Store write failed: {0}")]
     Write(String),
-    /// A raw payload or index append/sync failed.
-    #[error("raw Store write failed: {0}")]
-    Raw(String),
     /// SQLite reported failure while committing; do not resend the mutation.
     #[error("Store commit outcome uncertain: {0}")]
     Uncertain(String),
     /// A request violates a storage constraint.
     #[error("Store constraint: {0}")]
     Constraint(&'static str),
-    /// A referenced raw span is absent or corrupt.
-    #[error("raw evidence is missing or corrupt")]
+    /// A stored row cannot be read back as written.
+    #[error("stored evidence is missing or corrupt")]
     CorruptEvidence,
     /// The request never reached the SQLite writer: its bounded queue was
     /// full. Nothing was written.
     #[error("Store request not enqueued: the writer queue is full")]
     NotEnqueued,
-    /// The SQLite writer or raw thread is gone: its queue is disconnected or
+    /// The SQLite writer is gone: its queue is disconnected or
     /// it dropped the reply. The request may have committed.
     #[error("Store writer lost")]
     WriterLost,
@@ -94,7 +88,6 @@ impl StoreError {
         match self {
             Self::Open(_) => StoreFailureKind::Open,
             Self::Write(_) | Self::Constraint(_) | Self::Refused(_) => StoreFailureKind::Write,
-            Self::Raw(_) => StoreFailureKind::Raw,
             Self::Uncertain(_) | Self::WriterLost => StoreFailureKind::UncertainCommit,
             Self::CorruptEvidence => StoreFailureKind::CorruptEvidence,
             Self::NotEnqueued => StoreFailureKind::Quota,
@@ -111,7 +104,6 @@ impl StoreError {
             }
             Self::Open(_)
             | Self::Write(_)
-            | Self::Raw(_)
             | Self::Constraint(_)
             | Self::CorruptEvidence
             | Self::NotEnqueued
@@ -158,8 +150,8 @@ pub struct ReceiptRecord {
 pub struct SpawnKey {
     /// Caller key, unique per Store.
     pub key: String,
-    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
-    pub identity: Vec<u8>,
+    /// Retry identity of the params with the handle replaced by its hash.
+    pub identity: Identity,
 }
 
 /// A committed spawn key with the receipt it replays.
@@ -167,7 +159,7 @@ pub struct StoredSpawnKey {
     /// Session the key created.
     pub session_id: SessionId,
     /// Retry identity recorded with the key.
-    pub identity: Vec<u8>,
+    pub identity: Identity,
     /// Original C1 receipt.
     pub receipt: Value,
 }
@@ -176,8 +168,8 @@ pub struct StoredSpawnKey {
 pub struct OperationRecord {
     /// Caller key, unique per session.
     pub op_key: String,
-    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
-    pub identity: Vec<u8>,
+    /// Retry identity of the params with the handle replaced by its hash.
+    pub identity: Identity,
     /// Original C1 result.
     pub result: Value,
 }
@@ -250,8 +242,6 @@ pub struct AcceptanceRecord {
     pub session_id: SessionId,
     /// One-based turn number.
     pub turn: TurnNumber,
-    /// Synced raw span of the accepting vendor message.
-    pub raw_ref: RawRef,
     /// Vendor correlation retained as durable C2 acceptance evidence.
     pub correlation: String,
     /// Canonical event with the session's next sequence; its `at` becomes `accepted_at`.
@@ -266,8 +256,6 @@ pub struct EventRecord {
     pub turn: TurnNumber,
     /// Canonical event with the session's next sequence.
     pub event: Value,
-    /// Already-synced source span, or `None` for a synthesized event.
-    pub raw_ref: Option<RawRef>,
 }
 
 /// Core's terminal state and final event, committed atomically.
@@ -280,8 +268,6 @@ pub struct TerminalRecord {
     pub envelope: Value,
     /// Canonical final event.
     pub event: Value,
-    /// Optional already-synced evidence reference.
-    pub raw_ref: Option<RawRef>,
 }
 
 /// Who cancelled a turn: a caller `cancel` or a `close` (design §4, §10).
@@ -309,8 +295,6 @@ impl CancelCause {
 pub struct TerminalExtras {
     /// The turn's `cancel_cause`, when a caller cancel or a close ended it.
     pub cancel_cause: Option<CancelCause>,
-    /// A `raw_log.incomplete` event sequenced just before `turn.ended`.
-    pub raw_incomplete: Option<Value>,
 }
 
 /// A keyed close's `op_key` and exact retry identity (C1 §3).
@@ -318,8 +302,8 @@ pub struct TerminalExtras {
 pub struct CloseIntent {
     /// Caller key, unique per session.
     pub op_key: String,
-    /// Exact retry-identity bytes: the params with the handle replaced by its hash.
-    pub identity: Vec<u8>,
+    /// Retry identity of the params with the handle replaced by its hash.
+    pub identity: Identity,
 }
 
 /// The `Closing` commit: the session's `closing` gate and, when keyed, the
@@ -364,8 +348,8 @@ pub enum OperationVerb {
 pub struct KeyedOperation {
     /// The keyed mutation.
     pub verb: OperationVerb,
-    /// Exact retry-identity bytes.
-    pub identity: Vec<u8>,
+    /// Retry identity recorded with the key.
+    pub identity: Identity,
     /// Committed result; `None` while a close is in progress.
     pub result: Option<Value>,
 }
@@ -394,8 +378,6 @@ pub const FAILURE_BATCH_CANCELLATIONS: usize = 8;
 pub struct FailureResolutionRecord {
     /// The affected running turn's terminal.
     pub terminal: TerminalRecord,
-    /// Its `raw_log.incomplete` event, sequenced before the terminal.
-    pub raw_incomplete: Option<Value>,
     /// At most [`FAILURE_BATCH_CANCELLATIONS`] `queued → cancelled` records
     /// of the same session, sequenced after the terminal.
     pub cancellations: Vec<TerminalRecord>,
@@ -446,93 +428,21 @@ pub struct StoredEvent {
     pub seq: u64,
     /// Canonical event document.
     pub event: Value,
-    /// Optional raw evidence reference.
-    pub raw_ref: Option<RawRef>,
 }
 
-/// Source stream of a raw payload unit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawStream {
-    /// Agent standard output.
-    Stdout,
-    /// Agent standard error.
-    Stderr,
-    /// Successfully written prefix of agent standard input.
-    Stdin,
-}
-
-impl RawStream {
-    fn code(self) -> u8 {
-        match self {
-            Self::Stdout => 1,
-            Self::Stderr => 2,
-            Self::Stdin => 3,
-        }
-    }
-}
-
-/// A raw span whose payload and index were both synced before release.
-#[derive(Debug)]
-pub struct DurableRaw(RawRef);
-
-impl DurableRaw {
-    /// Returns the checked, persisted span.
-    pub fn raw_ref(&self) -> &RawRef {
-        &self.0
-    }
-}
-
-/// Cloneable bounded raw append capability; it owns no file descriptor.
-#[derive(Clone)]
-pub struct RawWriter {
-    connection_id: ConnectionId,
-    sender: SyncSender<RawCommand>,
-}
-
-/// Opaque capability that opens per-connection raw writers without exposing SQLite.
-#[derive(Clone)]
-pub struct RawFactory {
-    sender: SyncSender<RawCommand>,
-}
-
-impl RawFactory {
-    /// Opens an append capability for a validated connection id.
-    pub fn open(&self, connection_id: ConnectionId) -> RawWriter {
-        RawWriter {
-            connection_id,
-            sender: self.sender.clone(),
-        }
-    }
-}
-
-impl RawWriter {
-    /// Appends and syncs a bounded unit on Store's raw worker thread.
-    pub async fn append(
-        &self,
-        stream: RawStream,
-        bytes: Vec<u8>,
-    ) -> Result<DurableRaw, StoreError> {
-        if bytes.is_empty() || bytes.len() > RAW_UNIT_LIMIT {
-            return Err(StoreError::Constraint(
-                "raw unit must contain 1 to 1048576 bytes",
-            ));
-        }
-        let (reply, receive) = oneshot::channel();
-        self.sender
-            .try_send(RawCommand::Append {
-                connection_id: self.connection_id.clone(),
-                stream,
-                bytes,
-                reply,
-            })
-            .map_err(|error| match error {
-                // Design §7.1 [r4.5]: a full raw queue fails the connection
-                // (§7.2 row 6); a gone raw thread is uncertain and latches.
-                TrySendError::Full(_) => StoreError::Raw("raw queue full".to_owned()),
-                TrySendError::Disconnected(_) => StoreError::WriterLost,
-            })?;
-        receive.await.map_err(|_| StoreError::WriterLost)?
-    }
+/// Where a turn's evidence is (design §4.4, §6.7): the selected turn, its
+/// folder relative to the State directory (`None` for a turn never
+/// submitted) and the session's vendor identity and transcript hint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRefs {
+    /// The selected turn; `None` when the session has no such turn.
+    pub turn: Option<TurnNumber>,
+    /// `turns.evidence_dir`, relative to the State directory.
+    pub evidence_dir: Option<String>,
+    /// The session's confirmed vendor session ID.
+    pub vendor_session_id: Option<String>,
+    /// The route's path hint for the vendor transcript; never opened.
+    pub transcript_hint: Option<String>,
 }
 
 /// Full Host-created anchor intent, before process creation.
@@ -664,34 +574,26 @@ impl ReadCorruption {
     }
 }
 
-/// Owns the single SQLite writer and the independent raw worker.
+/// Owns the single SQLite writer and the evidence root.
 pub struct Store {
     client: StoreClient,
-    raw_sender: SyncSender<RawCommand>,
     writer_join: Option<JoinHandle<()>>,
-    raw_join: Option<JoinHandle<()>>,
     /// Read by the SQLite worker; set once by [`Store::on_read_corruption`].
     read_corruption: ReadCorruption,
     /// Released after `Drop` joined the workers: the last field.
     _lock: StoreLock,
 }
 
-/// Releases a stalled raw worker when dropped.
-#[cfg(feature = "test-failpoints")]
-pub struct RawStall {
-    _release: mpsc::Sender<()>,
-}
-
 /// One unopened pair of Store capabilities passed intact to Wire bootstrap.
 pub struct RuntimeResources {
-    raw: RawFactory,
+    evidence: EvidenceRoot,
     journal: ProcessJournal,
 }
 
 impl RuntimeResources {
     /// Consumes the bundle at the architectural Wire bootstrap boundary.
-    pub fn into_wire_parts(self) -> (RawFactory, ProcessJournal) {
-        (self.raw, self.journal)
+    pub fn into_wire_parts(self) -> (EvidenceRoot, ProcessJournal) {
+        (self.evidence, self.journal)
     }
 }
 
@@ -705,6 +607,7 @@ pub struct ProcessJournal {
 #[derive(Clone)]
 pub struct StoreClient {
     sender: SyncSender<Command>,
+    evidence: EvidenceRoot,
 }
 
 enum Command {
@@ -791,7 +694,11 @@ enum Command {
         u32,
         oneshot::Sender<Result<Vec<StoredEvent>, StoreError>>,
     ),
-    Logs(SessionId, oneshot::Sender<Result<Value, StoreError>>),
+    EvidenceRefs(
+        SessionId,
+        Option<TurnNumber>,
+        oneshot::Sender<Result<Option<EvidenceRefs>, StoreError>>,
+    ),
     Unfinished(oneshot::Sender<Result<Vec<UnfinishedTurn>, StoreError>>),
     AnchorOwners(
         Option<String>,
@@ -845,19 +752,6 @@ struct AnchorQuery {
     unproven: bool,
     owner: Option<SessionId>,
     cohort: Option<AnchorCohort>,
-}
-
-enum RawCommand {
-    Append {
-        connection_id: ConnectionId,
-        stream: RawStream,
-        bytes: Vec<u8>,
-        reply: oneshot::Sender<Result<DurableRaw, StoreError>>,
-    },
-    /// Test-only fault: holds the raw worker until the paired sender drops.
-    #[cfg(feature = "test-failpoints")]
-    Stall(Receiver<()>),
-    Shutdown,
 }
 
 /// `<state>/store.lock`, held for the life of the [`Store`] opened under
@@ -988,17 +882,17 @@ impl Store {
                     }
                 })?;
         }
-        let raw_dir = state.join("raw");
-        if raw_dir.exists() {
-            validate_state(&raw_dir)?;
+        // Design §7.2: the evidence root, validated as the State directory
+        // is; a new one is made durable with one sync of the State directory.
+        let evidence_dir = state.join("evidence");
+        if fs::symlink_metadata(&evidence_dir).is_ok() {
+            validate_state(&evidence_dir)?;
         } else {
             fs::DirBuilder::new()
                 .mode(0o700)
-                .create(&raw_dir)
+                .create(&evidence_dir)
                 .map_err(|error| StoreError::Open(error.to_string()))?;
-            File::open(state)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| StoreError::Open(error.to_string()))?;
+            sync_dir(state).map_err(|error| StoreError::Open(error.to_string()))?;
         }
         if created {
             // Exclusive (and never through a symlink): a file that appeared
@@ -1019,23 +913,18 @@ impl Store {
             .map_err(|error| StoreError::Open(error.to_string()))?;
         configure(&mut conn, created)?;
         let (sender, receiver) = mpsc::sync_channel(128);
-        let (raw_sender, raw_receiver) = mpsc::sync_channel(64);
-        let writer_root = state.to_path_buf();
         let read_corruption = ReadCorruption::default();
         let observer = read_corruption.clone();
         let writer_join = thread::Builder::new()
             .name("via-store-sqlite".to_owned())
-            .spawn(move || writer_loop(conn, &writer_root, &receiver, &observer))
-            .map_err(|error| StoreError::Open(error.to_string()))?;
-        let raw_join = thread::Builder::new()
-            .name("via-store-raw".to_owned())
-            .spawn(move || raw_loop(&raw_dir, &raw_receiver))
+            .spawn(move || writer_loop(conn, &receiver, &observer))
             .map_err(|error| StoreError::Open(error.to_string()))?;
         Ok(Self {
-            client: StoreClient { sender },
-            raw_sender,
+            client: StoreClient {
+                sender,
+                evidence: EvidenceRoot::new(state),
+            },
             writer_join: Some(writer_join),
-            raw_join: Some(raw_join),
             read_corruption,
             _lock: lock,
         })
@@ -1055,23 +944,10 @@ impl Store {
         self.client.clone()
     }
 
-    /// Test-only fault: every raw append queued after this call waits until the
-    /// returned guard drops. Drop the guard before the Store owner, whose drop
-    /// joins the raw worker.
-    #[cfg(feature = "test-failpoints")]
-    pub fn stall_raw_worker(&self) -> RawStall {
-        let (release, held) = mpsc::channel();
-        // The queue is bounded; a full queue only delays the stall behind real appends.
-        let _ = self.raw_sender.send(RawCommand::Stall(held));
-        RawStall { _release: release }
-    }
-
     /// Returns the unopened lower-layer bundle for Adapter and Route pass-through.
     pub fn runtime_resources(&self) -> RuntimeResources {
         RuntimeResources {
-            raw: RawFactory {
-                sender: self.raw_sender.clone(),
-            },
+            evidence: self.client.evidence.clone(),
             journal: ProcessJournal {
                 sender: self.client.sender.clone(),
             },
@@ -1083,11 +959,7 @@ impl Drop for Store {
     fn drop(&mut self) {
         // A queued mutation is handled before Shutdown; disconnect never aborts it.
         let _ = self.client.sender.send(Command::Shutdown);
-        let _ = self.raw_sender.send(RawCommand::Shutdown);
         if let Some(join) = self.writer_join.take() {
-            let _ = join.join();
-        }
-        if let Some(join) = self.raw_join.take() {
             let _ = join.join();
         }
     }
@@ -1186,7 +1058,7 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
-    /// Commits acceptance with a synced raw span and one vendor correlation.
+    /// Commits acceptance with one vendor correlation.
     pub async fn commit_acceptance(&self, record: AcceptanceRecord) -> Result<(), StoreError> {
         if record.correlation.is_empty() || record.correlation.len() > 128 {
             return Err(StoreError::Constraint(
@@ -1212,8 +1084,7 @@ impl StoreClient {
     }
 
     /// [`Self::commit_terminal`] that also records the turn's `cancel_cause`
-    /// and a `raw_log.incomplete` event before `turn.ended`, in the same
-    /// transaction (design §7.2 row 6, §10).
+    /// in the same transaction (design §10).
     pub async fn commit_terminal_with(
         &self,
         record: TerminalRecord,
@@ -1480,11 +1351,23 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
-    /// Reads committed raw excerpts for one session in event order.
-    pub async fn logs(&self, session_id: &SessionId) -> Result<Value, StoreError> {
+    /// Reads where a turn's evidence is (design §4.4, §6.7): `turn`, or
+    /// with none the session's running turn, else its latest submitted
+    /// turn, else its latest turn. `None` when the session does not exist.
+    /// Reads no file.
+    pub async fn evidence_refs(
+        &self,
+        session_id: &SessionId,
+        turn: Option<TurnNumber>,
+    ) -> Result<Option<EvidenceRefs>, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Logs(session_id.clone(), reply))?;
+        self.send(Command::EvidenceRefs(session_id.clone(), turn, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// The evidence root, for making a stored folder absolute; no I/O.
+    pub fn evidence(&self) -> &EvidenceRoot {
+        &self.evidence
     }
 
     /// Compares a Core-computed SHA-256 hash without receiving the plaintext handle.
@@ -1662,7 +1545,6 @@ impl ProcessJournal {
 }
 
 mod anchor;
-mod raw;
 mod sql;
 
 use anchor::{
@@ -1670,14 +1552,13 @@ use anchor::{
     commit_vendor_facts, count_unproven_anchors, read_anchor_cohort, read_anchor_owners,
     read_anchor_records,
 };
-use raw::{raw_loop, read_raw_ref, validate_raw_ref};
 use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitOutcome, ConnectionId, ProcessJournal, RawCommand, RawStream, RawWriter, SessionId,
-        StoreClient, StoreError, StoreFailureKind, mpsc,
+        CommitOutcome, EvidenceRoot, ProcessJournal, SessionId, StoreClient, StoreError,
+        StoreFailureKind, mpsc,
         sql::{commit, commit_error, sql_error},
     };
 
@@ -1696,7 +1577,10 @@ mod tests {
     #[test]
     fn writer_queue_failures_split_into_not_enqueued_and_writer_lost() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let client = StoreClient { sender };
+        let client = StoreClient {
+            sender,
+            evidence: EvidenceRoot::new(std::path::Path::new("/nonexistent")),
+        };
         let journal = ProcessJournal {
             sender: client.sender.clone(),
         };
@@ -1739,39 +1623,6 @@ mod tests {
             assert!(matches!(
                 journal.commit_vendor_facts("a", "g", 2).await,
                 CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)
-            ));
-        });
-    }
-
-    /// Design §7.1 [r4.5]: a full raw queue fails the connection (`Raw`,
-    /// row 6); a disconnected raw thread or a dropped raw reply is
-    /// `WriterLost`, which latches.
-    #[test]
-    fn raw_queue_failures_split_into_raw_and_writer_lost() {
-        let (sender, receiver) = mpsc::sync_channel::<RawCommand>(1);
-        let writer = RawWriter {
-            connection_id: ConnectionId::try_from("c_one").expect("connection"),
-            sender,
-        };
-        runtime().block_on(async {
-            let queued = tokio::spawn({
-                let writer = writer.clone();
-                async move { writer.append(RawStream::Stdout, b"a".to_vec()).await }
-            });
-            tokio::task::yield_now().await;
-            assert!(matches!(
-                writer.append(RawStream::Stdout, b"b".to_vec()).await,
-                Err(StoreError::Raw(_))
-            ));
-            drop(receiver.recv().expect("queued append"));
-            assert!(matches!(
-                queued.await.expect("join"),
-                Err(StoreError::WriterLost)
-            ));
-            drop(receiver);
-            assert!(matches!(
-                writer.append(RawStream::Stdout, b"c".to_vec()).await,
-                Err(StoreError::WriterLost)
             ));
         });
     }

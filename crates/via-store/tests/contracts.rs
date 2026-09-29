@@ -1,6 +1,6 @@
-//! Store identity and raw-range validation at the serialization boundary.
+//! Store identity validation at the serialization boundary.
 
-use via_store::{ConnectionId, RawRef, SessionId, TurnNumber};
+use via_store::{SessionId, TurnNumber};
 
 #[test]
 fn session_id_rejects_noncanonical_wire_values() {
@@ -17,11 +17,8 @@ fn session_id_rejects_noncanonical_wire_values() {
 }
 
 #[test]
-fn turn_number_and_raw_range_are_checked() {
+fn turn_number_is_checked() {
     assert!(serde_json::from_str::<TurnNumber>("0").is_err());
-    assert!(RawRef::new(ConnectionId::try_from("c_01").unwrap(), u64::MAX, 2).is_err());
-    assert!(RawRef::new(ConnectionId::try_from("c_01").unwrap(), 4, 0).is_err());
-    let raw: RawRef =
-        serde_json::from_str(r#"{"connection_id":"c_01","offset":4,"len":2}"#).unwrap();
-    assert_eq!(raw.end_offset(), 6);
+    let turn: TurnNumber = serde_json::from_str("2").unwrap();
+    assert_eq!(turn.get(), 2);
 }

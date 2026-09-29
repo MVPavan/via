@@ -18,14 +18,13 @@ use std::{
 
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, ConnectionId, Deadline,
-    FakeConfig, FakeObservation, FakeTerminalEvidence, RouteError, RouteFailure, RuntimeConfig,
-    SessionId, StopCause, StopOrder, StoreFailure, TurnNumber, VendorTerminalStatus,
+    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, Deadline, FakeConfig,
+    FakeObservation, FakeTerminalEvidence, RouteError, RouteFailure, RuntimeConfig, SessionId,
+    StopCause, StopOrder, StoreFailure, TurnNumber, VendorTerminalStatus,
 };
 use via_store::{SpawnRecord, Store, failpoint};
 
 const SESSION: &str = "s_0123456789ab";
-const CONNECTION: &str = "c_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STOP_CHILD";
 const TOKEN: &str = "route-stop-failpoint-token";
 const CHILD_LIMIT: Duration = Duration::from_secs(60);
@@ -114,7 +113,7 @@ impl Child {
                 params: serde_json::json!({"harness":"fake"}),
                 prompt: "hello".to_owned(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
-                initial_event: serde_json::json!({"seq":1,"type":"turn.queued"}),
+                initial_event: serde_json::json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
             }))
             .unwrap();
         let adapter = AdapterRuntime::new(
@@ -168,7 +167,6 @@ impl Child {
             let execute = self.adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
                 TurnNumber::try_from(1).unwrap(),
-                ConnectionId::try_from(CONNECTION).unwrap(),
                 "hello".to_owned(),
                 sender,
                 deadline,
@@ -304,8 +302,9 @@ fn force_at_without_a_terminal_force_closes_the_group() {
 }
 
 /// F21 (design §2): the vendor exits after an unterminated last line. The
-/// partial bytes are in the raw log and the Host-confirmed exit makes the
-/// turn `ProcessExited`, not a protocol failure.
+/// partial bytes are kept in `undecoded.bin` and named by the failure (Task 4
+/// design §7.3), and the Host-confirmed exit makes the turn `ProcessExited`,
+/// not a protocol failure.
 #[test]
 fn f21_exit_after_an_unterminated_line_is_process_exited() {
     let Some(root) = child_root() else {
@@ -322,8 +321,13 @@ fn f21_exit_after_an_unterminated_line_is_process_exited() {
         "{failure:?}"
     );
     assert_eq!(failure.exit.and_then(|exit| exit.code), Some(3));
-    let raw = fs::read(root.join("state/raw").join(format!("{CONNECTION}.raw"))).unwrap();
-    assert!(raw.ends_with(b"partial"));
+    let kept = root.join(format!("state/evidence/{SESSION}/1/undecoded.bin"));
+    assert_eq!(fs::read(&kept).unwrap(), b"partial");
+    let note = failure.undecoded.clone().unwrap_or_default();
+    assert!(
+        note.contains("7 bytes") && note.contains(&kept.display().to_string()),
+        "{note}"
+    );
 }
 
 /// Design §2 rule 3 [r1.23]: a decoded terminal whose finalization outlives
@@ -348,81 +352,6 @@ fn a_decoded_terminal_survives_wall_expiry_in_finalization() {
     assert_eq!(evidence.status, VendorTerminalStatus::Completed);
     assert_eq!(evidence.final_text, "done");
     assert_eq!(evidence.cleanup, Cleanup::Quiescent);
-}
-
-/// Design §7.2 row 6 [r5.5]: a raw append failure fails the connection;
-/// Route force-closes the group and reports `Store` with kind `Raw`, and the
-/// raw log is incomplete.
-#[test]
-fn a_raw_failure_reports_store_kind_raw() {
-    let Some(root) = child_root() else {
-        return run_child(
-            "a_raw_failure_reports_store_kind_raw",
-            &format!("read -r start\nprintf '%s\\n' '{ACCEPTED}'\nexec sleep 60\n"),
-        );
-    };
-    let child = Child::open(&root);
-    // The first raw append is the start message's stdin record.
-    child.arm("raw.append.fail", "fail_io");
-    let failure =
-        route_failure(child.execute(Duration::from_secs(10), watch::channel(None), |_, _| {}));
-    assert!(
-        matches!(
-            failure.cause,
-            RouteError::Store {
-                kind: StoreFailure::Raw,
-                ..
-            }
-        ),
-        "{failure:?}"
-    );
-    assert!(failure.launched && failure.raw_incomplete, "{failure:?}");
-    assert_eq!(failure.cleanup, Some(via_adapters::WireCleanup::Quiescent));
-}
-
-/// Design §7.2 row 6, S1 round-1 decision 4: the interrupt's raw record
-/// fails. That is a raw Store failure, not a transport error: Route
-/// force-closes the group under `now + 3 s` and reports `Store` with kind
-/// `Raw` at once, instead of reading on until `force_at`.
-#[test]
-fn a_raw_failure_at_the_interrupt_write_reports_store_kind_raw() {
-    let Some(root) = child_root() else {
-        return run_child(
-            "a_raw_failure_at_the_interrupt_write_reports_store_kind_raw",
-            &format!("read -r start\nprintf '%s\\n' '{ACCEPTED}'\nexec sleep 60\n"),
-        );
-    };
-    let child = Child::open(&root);
-    // Raw appends: 1 the start message (stdin), 2 the acceptance (stdout),
-    // 3 the interrupt (stdin).
-    child.arm_at("raw.append.fail", 3, "fail_io");
-    let force_after = Duration::from_secs(6);
-    let started = Instant::now();
-    let outcome = child.execute(
-        Duration::from_secs(20),
-        watch::channel(None),
-        |order, observation| {
-            if matches!(observation, FakeObservation::Accepted(_)) {
-                order.send_replace(Some(self::order(force_after)));
-            }
-        },
-    );
-    let elapsed = started.elapsed();
-    assert!(root.join("points/raw.append.fail.3.ack").exists());
-    let failure = route_failure(outcome);
-    assert!(
-        matches!(
-            failure.cause,
-            RouteError::Store {
-                kind: StoreFailure::Raw,
-                ..
-            }
-        ),
-        "{failure:?}"
-    );
-    assert!(failure.launched && failure.raw_incomplete, "{failure:?}");
-    assert_eq!(failure.cleanup, Some(via_adapters::WireCleanup::Quiescent));
-    assert!(elapsed < force_after, "reported only after {elapsed:?}");
 }
 
 /// Design §7.2 row 3: an anchor intent that is not committed starts no

@@ -68,7 +68,7 @@ impl Fixture {
                 params: serde_json::json!({"harness":"fake"}),
                 prompt: "fixture".into(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
-                initial_event: serde_json::json!({"seq":1,"type":"turn.queued"}),
+                initial_event: serde_json::json!({"seq":1,"turn":1,"type":"turn.queued","at":"2026-01-01T00:00:00.000Z"}),
             })
             .await
             .unwrap();
@@ -99,7 +99,7 @@ impl Fixture {
                 params: serde_json::json!({"harness":"fake"}),
                 prompt: "fixture".into(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
-                initial_event: serde_json::json!({"seq":1,"type":"turn.queued"}),
+                initial_event: serde_json::json!({"seq":1,"turn":1,"type":"turn.queued","at":"2026-01-01T00:00:00.000Z"}),
             })
             .await
             .unwrap();
@@ -124,6 +124,7 @@ impl Fixture {
                 session_id: session(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },
+            stderr_path: self.root.join(format!("stderr-{}.log", next_stderr())),
             capacity: None,
         }
     }
@@ -1526,4 +1527,10 @@ fn early_stops_are_concurrent() {
         let close = closing.await.unwrap();
         assert!(matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)));
     });
+}
+
+/// A fresh `stderr.log` name per spec: Host creates it exclusively.
+fn next_stderr() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

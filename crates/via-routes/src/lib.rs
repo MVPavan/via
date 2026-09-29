@@ -4,9 +4,7 @@
 use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use thiserror::Error;
 
-pub use via_wire::{
-    AnchorCohort, CloseRequest, Deadline, ExitReport, RawRef, SendOutcome, TurnNumber,
-};
+pub use via_wire::{AnchorCohort, CloseRequest, Deadline, ExitReport, SendOutcome, TurnNumber};
 
 /// Maximum bytes retained for an unknown fake notification's raw payload.
 pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;
@@ -189,8 +187,6 @@ pub enum RouteError {
     TransportLost {
         /// Affected turn.
         turn: TurnNumber,
-        /// Last durable raw evidence when available.
-        evidence: Option<RawRef>,
     },
     /// Host confirmed the process exited before terminal evidence.
     #[error("fake process exited in turn {turn:?}")]
@@ -204,9 +200,9 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
-    /// A Store write the turn depends on failed: raw evidence (design §7.2
-    /// row 6) or a Host journal write (rows 3 and 4), with its classified
-    /// outcome [r5.5].
+    /// A storage step the turn depends on failed: the evidence folder or
+    /// `stderr.log` (Task 4 design §7.2) or a Host journal write (rows 3 and
+    /// 4), with its classified outcome [r5.5].
     #[error("fake store failed in turn {turn:?}: {kind:?}")]
     Store {
         /// Affected turn.
@@ -216,7 +212,7 @@ pub enum RouteError {
     },
     /// The turn's stop order was honoured (design §2): before launch nothing
     /// started; after it, the group was force-closed at `force_at` under
-    /// `close_by` and both pipes were drained.
+    /// `close_by` and stdout was drained.
     #[error("fake turn stopped in turn {turn:?}")]
     Stopped {
         /// Affected turn.
@@ -229,7 +225,7 @@ pub enum RouteError {
         turn: TurnNumber,
     },
     /// The caller's force stop ended the turn; its private group was
-    /// force-closed and both pipes drained to the raw log when launched.
+    /// force-closed and stdout drained when launched.
     #[error("fake turn force-stopped in turn {turn:?}")]
     ForceStopped {
         /// Affected turn.
@@ -241,14 +237,14 @@ pub enum RouteError {
 /// §7.2 rows 3, 4 and 6 [r5.5]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreFailure {
-    /// A raw append or sync failed or the raw queue was full: not committed
-    /// (row 6).
-    Raw,
+    /// The turn's evidence folder or `stderr.log` could not be created
+    /// before launch: nothing was committed (Task 4 design §7.2).
+    Evidence,
     /// A Host journal write was not committed (rows 3 and 4).
     NotCommitted,
     /// The SQLite writer's queue was full: never enqueued, not committed.
     NotEnqueued,
-    /// The SQLite writer or raw thread is gone: uncertain.
+    /// The SQLite writer is gone: uncertain.
     WriterLost,
     /// The write's outcome is unknown.
     Uncertain,
@@ -294,20 +290,15 @@ pub type StopWatch = tokio::sync::watch::Receiver<Option<StopOrder>>;
 /// A failed route turn: the first typed cause plus the evidence Route still holds
 /// after its forced cleanup and bounded drain.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("{cause}")]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is independent evidence Core weighs separately"
-)]
+#[error("{cause}{}", undecoded_note(.undecoded.as_deref()))]
 pub struct RouteFailure {
     /// First cause; later cleanup failures never replace it.
     pub cause: RouteError,
-    /// Synced vendor message that proved a protocol failure, when one exists.
-    pub evidence: Option<RawRef>,
+    /// Where the message VIA could not decode was kept, or why not (Task 4
+    /// design §7.3); part of the failure's message.
+    pub undecoded: Option<String>,
     /// Host-confirmed vendor exit when one was observed.
     pub exit: Option<ExitReport>,
-    /// True when bytes read from or written to the vendor are missing from the raw log.
-    pub raw_incomplete: bool,
     /// A vendor may have launched: Host sent ARM for this turn.
     pub launched: bool,
     /// Cleanup certainty of Route's forced group close, when it ran one.
@@ -317,6 +308,11 @@ pub struct RouteFailure {
     /// A Host journal write in the turn's cleanup had an uncertain outcome:
     /// the daemon must latch (design §7.2 row 12).
     pub journal_uncertain: bool,
+}
+
+/// `; <note>` when an undecoded message was kept, else nothing.
+fn undecoded_note(note: Option<&str>) -> String {
+    note.map(|note| format!("; {note}")).unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -538,13 +534,11 @@ impl FakeMessage {
     }
 }
 
-/// A decoded message paired with its durable raw span.
+/// One decoded vendor message.
 #[derive(Eq, PartialEq)]
 pub struct RouteMessage {
     /// Typed fake payload.
     pub payload: FakeMessage,
-    /// Exact source bytes retained by Wire/Store first.
-    pub raw_ref: RawRef,
 }
 
 mod runtime;
@@ -552,8 +546,8 @@ mod runtime;
 pub use runtime::{FakeRoute, FakeRouteResult};
 pub use via_wire::StoreError;
 pub use via_wire::{
-    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport,
-    RuntimeConfig, RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
+    CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
+    RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
     WireTurnRecovery,
 };
 

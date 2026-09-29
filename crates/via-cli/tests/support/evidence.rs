@@ -30,13 +30,15 @@ impl Evidence {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scratchpad/execution/rust-foundation-release/s1-harness/runs");
         fs::create_dir_all(&root)?;
-        // Evidence holds Store backups and raw vendor bytes: private whatever the umask.
+        // Evidence holds Store backups and vendor stderr: private whatever the umask.
         let dir = tempfile::Builder::new()
             .prefix(&format!("{scenario}-"))
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(root)?
             .keep();
-        fs::DirBuilder::new().mode(0o700).create(dir.join("raw"))?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.join("evidence"))?;
         Ok(Self {
             dir,
             scenario: scenario.to_owned(),
@@ -69,14 +71,10 @@ impl Evidence {
         Ok(())
     }
 
-    pub(crate) fn copy_raw(&self, raw_dir: &Path) -> EvidenceResult {
-        for entry in fs::read_dir(raw_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::copy(entry.path(), self.dir.join("raw").join(entry.file_name()))?;
-            }
-        }
-        Ok(())
+    /// Copies the State's `evidence/<session>/<turn>/` folders, regular
+    /// files only, into the artifact's private `evidence/`.
+    pub(crate) fn copy_evidence(&self, root: &Path) -> EvidenceResult {
+        copy_tree(root, &self.dir.join("evidence"))
     }
 
     pub(crate) fn finish(mut self, outcome: &str, detail: &str) -> EvidenceResult<PathBuf> {
@@ -99,8 +97,8 @@ impl Evidence {
             .copied()
             .collect();
         let mut missing = missing;
-        if fs::read_dir(self.dir.join("raw"))?.next().is_none() {
-            missing.push("raw/*");
+        if fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
+            missing.push("evidence/*");
         }
         let final_outcome = outcome;
         let summary = self.summary(final_outcome, detail, &missing)?;
@@ -200,6 +198,21 @@ impl Drop for Evidence {
             let _ = self.write_manifest();
         }
     }
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> EvidenceResult {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            fs::DirBuilder::new().mode(0o700).create(&target)?;
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_files(root: &Path, dir: &Path, output: &mut Vec<PathBuf>) -> EvidenceResult {

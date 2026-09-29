@@ -1,4 +1,4 @@
-//! Route→Adapter observation stream and raw-evidence gaps through the real Route,
+//! Route→Adapter observation stream and failure causes through the real Route,
 //! Wire and Host, with a scripted vendor. Route's own crate cannot open a Store, so
 //! these run one layer up; each case re-executes this binary with its fake settings.
 //! The test binary cannot be the anchor: libtest's header would reach vendor stdout.
@@ -11,7 +11,6 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{Read, Seek, SeekFrom},
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -25,14 +24,12 @@ mod stand_in_anchor;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use via_adapters::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, ConnectionId, Deadline, FakeConfig,
-    FakeObservation, Observation, RawRef, RouteError, RuntimeConfig, SessionId, ToolStatus,
-    TurnNumber,
+    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Deadline, FakeConfig, FakeObservation,
+    Observation, RouteError, RuntimeConfig, SessionId, ToolStatus, TurnNumber,
 };
 use via_store::{SpawnRecord, Store};
 
 const SESSION: &str = "s_0123456789ab";
-const CONNECTION: &str = "c_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STREAM_CHILD";
 /// The ordinary turn deadline of each case.
 const TURN: Duration = Duration::from_secs(20);
@@ -121,7 +118,7 @@ impl Child {
                 params: json!({"harness":"fake"}),
                 prompt: "hello".to_owned(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
-                initial_event: json!({"seq":1,"type":"turn.queued"}),
+                initial_event: json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
             }))
             .unwrap();
         let adapter = AdapterRuntime::new(
@@ -165,7 +162,6 @@ impl Child {
             let execute = adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
                 TurnNumber::try_from(1).unwrap(),
-                ConnectionId::try_from(CONNECTION).unwrap(),
                 "hello".to_owned(),
                 sender,
                 deadline,
@@ -191,20 +187,6 @@ impl Child {
         });
         (observed, result)
     }
-
-    /// Reads exactly the durable bytes a reference cites.
-    fn raw(&self, reference: &RawRef) -> Vec<u8> {
-        let mut file = fs::File::open(
-            self.root
-                .join("state/raw")
-                .join(format!("{}.raw", reference.connection_id().as_str())),
-        )
-        .unwrap();
-        file.seek(SeekFrom::Start(reference.offset())).unwrap();
-        let mut bytes = vec![0; usize::try_from(reference.byte_len()).unwrap()];
-        file.read_exact(&mut bytes).unwrap();
-        bytes
-    }
 }
 
 fn child_root() -> Option<PathBuf> {
@@ -212,7 +194,7 @@ fn child_root() -> Option<PathBuf> {
 }
 
 #[test]
-fn route_forwards_every_observation_in_order_with_its_raw_ref() {
+fn route_forwards_every_observation_in_order() {
     let lines = [
         json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}),
         json!({"type":"text","vendor_turn_id":"fake-turn-1","text":"hi"}),
@@ -224,7 +206,7 @@ fn route_forwards_every_observation_in_order_with_its_raw_ref() {
     ];
     let Some(root) = child_root() else {
         return run_child(
-            "route_forwards_every_observation_in_order_with_its_raw_ref",
+            "route_forwards_every_observation_in_order",
             "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO\"\n",
             &lines,
         );
@@ -239,16 +221,12 @@ fn route_forwards_every_observation_in_order_with_its_raw_ref() {
         .collect();
     assert_eq!(observed.len(), expected.len());
     for (observation, line) in observed.iter().zip(expected) {
-        let raw_ref = match observation {
+        match observation {
             FakeObservation::Accepted(accepted) => {
                 assert_eq!(line["type"], "accepted");
                 assert_eq!(accepted.vendor_turn_id.as_str(), "fake-turn-1");
-                &accepted.raw_ref
             }
-            FakeObservation::Data {
-                observation,
-                raw_ref,
-            } => {
+            FakeObservation::Data { observation } => {
                 match (observation, line["type"].as_str().unwrap()) {
                     (Observation::AssistantText { text }, "text") => assert_eq!(text, "hi"),
                     (
@@ -285,146 +263,16 @@ fn route_forwards_every_observation_in_order_with_its_raw_ref() {
                     }
                     (other, kind) => panic!("{kind} became {other:?}"),
                 }
-                raw_ref
             }
-        };
-        let bytes = child.raw(raw_ref);
-        assert_eq!(bytes.last(), Some(&b'\n'));
-        assert_eq!(&serde_json::from_slice::<Value>(&bytes).unwrap(), line);
+        }
     }
-}
-
-#[test]
-fn failing_raw_append_keeps_draining_and_reports_incomplete_evidence() {
-    let lines = [
-        json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}),
-        json!({"type":"text","vendor_turn_id":"fake-turn-1","text":"after store loss"}),
-    ];
-    let Some(root) = child_root() else {
-        // Emit acceptance, wait for the test to fail the raw Store, then emit more
-        // stdout and stderr that can no longer be recorded.
-        return run_child(
-            "failing_raw_append_keeps_draining_and_reports_incomplete_evidence",
-            "read -r start\n\
-             /usr/bin/head -n 1 \"$VIA_FAKE_SCENARIO\"\n\
-             while [ ! -e \"$VIA_FAKE_SYNC_DIR/release\" ]; do /bin/sleep 0.01; done\n\
-             /usr/bin/tail -n 1 \"$VIA_FAKE_SCENARIO\"\n\
-             echo stderr-after-store-loss >&2\n",
-            &lines,
-        );
-    };
-    let mut child = Child::open(&root);
-    let (observed, result) = child.execute(TURN, |store, root, observation| {
-        if matches!(observation, FakeObservation::Accepted(_)) {
-            // Dropping the owner stops Store's raw writer; later appends fail.
-            drop(store.take());
-            fs::write(root.join("sync/release"), b"").unwrap();
-        }
-    });
-    assert_eq!(observed.len(), 1, "only acceptance was recorded");
-    let Err(AdapterError::Route(failure)) = result else {
-        panic!("expected a route failure, got {result:?}");
-    };
-    assert!(
-        matches!(failure.cause, RouteError::Store { .. }),
-        "{failure:?}"
-    );
-    assert!(failure.raw_incomplete, "{failure:?}");
-}
-
-#[test]
-fn stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline() {
-    let lines = [json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
-    let Some(root) = child_root() else {
-        // Emit acceptance, wait for the test to stall Store's raw worker, then emit
-        // an oversized line that only the failure drain records.
-        return run_child(
-            "stalled_raw_worker_cannot_hold_failure_cleanup_past_its_deadline",
-            "read -r start\n\
-             /usr/bin/head -n 1 \"$VIA_FAKE_SCENARIO\"\n\
-             while [ ! -e \"$VIA_FAKE_SYNC_DIR/release\" ]; do /bin/sleep 0.01; done\n\
-             /usr/bin/head -c 1100000 /dev/zero | /usr/bin/tr '\\0' x\n\
-             echo\n",
-            &lines,
-        );
-    };
-    let mut child = Child::open(&root);
-    let mut stall = None;
-    let mut released = None;
-    let (observed, result) = child.execute(TURN, |store, root, observation| {
-        if matches!(observation, FakeObservation::Accepted(_)) {
-            stall = Some(store.as_ref().unwrap().stall_raw_worker());
-            released = Some(Instant::now());
-            fs::write(root.join("sync/release"), b"").unwrap();
-        }
-    });
-    let elapsed = released.unwrap().elapsed();
-    // The Store owner's drop joins the raw worker; release it first.
-    drop(stall);
-    assert_eq!(observed.len(), 1, "only acceptance was recorded");
-    let Err(AdapterError::Route(failure)) = result else {
-        panic!("expected a route failure, got {result:?}");
-    };
-    assert!(
-        matches!(failure.cause, RouteError::Protocol { .. }),
-        "{failure:?}"
-    );
-    assert!(failure.raw_incomplete, "{failure:?}");
-    // Route's cleanup bound is 3 s; the 20 s turn deadline must not be reached.
-    assert!(elapsed < Duration::from_secs(8), "cleanup took {elapsed:?}");
-}
-
-#[test]
-fn raw_append_stalled_past_the_turn_deadline_is_a_wall_deadline() {
-    let lines = [
-        json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}),
-        json!({"type":"text","vendor_turn_id":"fake-turn-1","text":"stalled"}),
-    ];
-    let Some(root) = child_root() else {
-        // Emit acceptance, wait for the test to stall Store's raw worker, then emit
-        // an ordinary line whose append outlives the turn deadline.
-        return run_child(
-            "raw_append_stalled_past_the_turn_deadline_is_a_wall_deadline",
-            "read -r start\n\
-             /usr/bin/head -n 1 \"$VIA_FAKE_SCENARIO\"\n\
-             while [ ! -e \"$VIA_FAKE_SYNC_DIR/release\" ]; do /bin/sleep 0.01; done\n\
-             /usr/bin/tail -n 1 \"$VIA_FAKE_SCENARIO\"\n\
-             /bin/sleep 30\n",
-            &lines,
-        );
-    };
-    let mut child = Child::open(&root);
-    let mut stall = None;
-    let started = Instant::now();
-    let turn = Duration::from_secs(3);
-    let (observed, result) = child.execute(turn, |store, root, observation| {
-        if matches!(observation, FakeObservation::Accepted(_)) {
-            stall = Some(store.as_ref().unwrap().stall_raw_worker());
-            fs::write(root.join("sync/release"), b"").unwrap();
-        }
-    });
-    let elapsed = started.elapsed();
-    drop(stall);
-    assert_eq!(observed.len(), 1, "only acceptance was recorded");
-    let Err(AdapterError::Route(failure)) = result else {
-        panic!("expected a route failure, got {result:?}");
-    };
-    // C1 §7.6: the turn's own deadline expired, so Core classifies `deadline_wall`.
-    assert!(
-        matches!(failure.cause, RouteError::Deadline { .. }),
-        "{failure:?}"
-    );
-    assert!(failure.raw_incomplete, "{failure:?}");
-    // The turn deadline plus Route's 3 s cleanup bound, never the vendor's 30 s.
-    assert!(elapsed < Duration::from_secs(10), "turn took {elapsed:?}");
 }
 
 /// W4-H Sol 2: a force while Route waits for observation capacity (the
 /// consumer is not draining) still reaches Route's bounded force close and
-/// drain: every vendor byte, including an unterminated tail, is in the raw
-/// log, and the turn ends `ForceStopped` well before its deadline.
+/// drain, and the turn ends `ForceStopped` well before its deadline.
 #[test]
-fn force_while_forwarding_is_blocked_drains_every_byte() {
+fn force_while_forwarding_is_blocked_ends_the_turn() {
     let mut lines = vec![json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
     lines.extend(
         (0..300).map(
@@ -433,7 +281,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
     );
     let Some(root) = child_root() else {
         return run_child(
-            "force_while_forwarding_is_blocked_drains_every_byte",
+            "force_while_forwarding_is_blocked_ends_the_turn",
             "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO\"\nprintf 'unterminated tail'\nexec sleep 30\n",
             &lines,
         );
@@ -448,7 +296,6 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            ConnectionId::try_from(CONNECTION).unwrap(),
             "hello".to_owned(),
             sender,
             deadline,
@@ -494,27 +341,17 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
         matches!(failure.cause, RouteError::ForceStopped { .. }),
         "{failure:?}"
     );
-    assert!(!failure.raw_incomplete, "{failure:?}");
-    let raw = fs::read(root.join(format!("state/raw/{CONNECTION}.raw"))).unwrap();
-    for needle in [&b"line 299"[..], b"unterminated tail"] {
-        assert!(
-            raw.windows(needle.len()).any(|window| window == needle),
-            "raw log misses {}",
-            String::from_utf8_lossy(needle)
-        );
-    }
 }
 
 /// Task 1 Sol high 2: an acquisition that fails after ARM (here its deadline
-/// expires while Host awaits the launch reply) keeps its cause and settles raw
-/// completeness from evidence: the turn fails `Deadline`, not transport loss,
-/// and the vendor's output written before the failure is in the raw log.
+/// expires while Host awaits the launch reply) keeps its cause: the turn
+/// fails `Deadline`, not transport loss, and reports the launch.
 #[test]
-fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
+fn post_arm_acquisition_deadline_keeps_its_cause() {
     const LINE: &str = "vendor output before launch reply";
     let Some(root) = child_root() else {
         return run_child(
-            "post_arm_acquisition_deadline_keeps_cause_and_vendor_output",
+            "post_arm_acquisition_deadline_keeps_its_cause",
             "exit 0\n",
             &[],
         );
@@ -529,7 +366,6 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            ConnectionId::try_from(CONNECTION).unwrap(),
             "hello".to_owned(),
             sender,
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
@@ -550,13 +386,7 @@ fn post_arm_acquisition_deadline_keeps_cause_and_vendor_output() {
         matches!(failure.cause, RouteError::Deadline { .. }),
         "{failure:?}"
     );
-    assert!(!failure.raw_incomplete, "{failure:?}");
-    let raw = fs::read(root.join(format!("state/raw/{CONNECTION}.raw"))).unwrap_or_default();
-    assert!(
-        raw.windows(LINE.len())
-            .any(|window| window == LINE.as_bytes()),
-        "raw log misses the vendor output: {failure:?}"
-    );
+    assert!(failure.launched, "{failure:?}");
 }
 
 /// Runs a turn over the stalling stand-in with an acquisition deadline of
@@ -583,7 +413,6 @@ fn stalled_acquisition_with_force(
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            ConnectionId::try_from(CONNECTION).unwrap(),
             "hello".to_owned(),
             sender,
             Deadline::at(deadline),
@@ -624,7 +453,7 @@ fn force_before_acquisition_deadline_is_force_stopped() {
         matches!(failure.cause, RouteError::ForceStopped { .. }),
         "{failure:?}"
     );
-    assert!(failure.launched && !failure.raw_incomplete, "{failure:?}");
+    assert!(failure.launched, "{failure:?}");
 }
 
 /// Task 1 closeout round 2: an acquisition deadline that expired before the

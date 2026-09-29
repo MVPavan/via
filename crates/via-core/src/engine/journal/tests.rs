@@ -9,24 +9,23 @@ use std::{
 
 use serde_json::{Value, json};
 use via_store::{
-    EventRecord, QueuedTurn, RawStream, ResumeRecord, SpawnRecord, Store, StoreClient, StoreError,
-    StoredEvent, SubmissionRecord, TerminalExtras, TerminalRecord,
+    EventRecord, QueuedTurn, ResumeRecord, SpawnRecord, Store, StoreClient, StoreError,
+    StoredEvent, SubmissionRecord, TerminalRecord,
 };
 
 use super::{
     Head, TurnJournal, UNRESOLVED_LIMIT, Unresolved, admission, commit_event, read_result,
 };
 use crate::api::{Event, EventBody, FailureClass};
-use crate::engine::drive::{Commit, SubmitFailure};
+use crate::engine::drive::SubmitFailure;
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
-use crate::{
-    ApiError, ConnectionId, FakeConfig, RawRef, SessionId, SpawnParams, TurnNumber, TurnState,
-    WaitParams,
-};
+use crate::{ApiError, FakeConfig, SessionId, SpawnParams, TurnNumber, TurnState, WaitParams};
 
 const SESSION: &str = "s_0123456789ab";
-const CONNECTION: &str = "c_0123456789ab";
-const AT: &str = "2026-01-01T00:00:00Z";
+/// The turn's evidence folder as `Started` carries it.
+const FOLDER: &str = "/state/evidence/s_0123456789ab/1";
+/// Store parses `at` strictly as RFC 3339 UTC with milliseconds.
+const AT: &str = "2026-01-01T00:00:00.000Z";
 
 /// The one fixed outcome each injected event commit has.
 #[derive(Clone, Copy)]
@@ -158,15 +157,14 @@ fn event(seq: u64, body: EventBody) -> Value {
         turn: Some(1),
         late: false,
         at: AT,
-        raw_ref: None,
         body,
     }
     .to_value()
     .unwrap()
 }
 
-/// A receipted turn after `turn.submitted` (seq 2), plus one synced raw unit.
-async fn running_turn(root: &tempfile::TempDir) -> (Store, RawRef) {
+/// A receipted turn after `turn.submitted` (seq 2).
+async fn running_turn(root: &tempfile::TempDir) -> Store {
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root.path()).unwrap();
     let client = store.client();
@@ -190,14 +188,7 @@ async fn running_turn(root: &tempfile::TempDir) -> (Store, RawRef) {
         })
         .await
         .unwrap();
-    let (raw, _journal) = store.runtime_resources().into_wire_parts();
-    let durable = raw
-        .open(ConnectionId::try_from(CONNECTION).unwrap())
-        .append(RawStream::Stdout, b"{\"type\":\"text\"}\n".to_vec())
-        .await
-        .unwrap();
-    let raw_ref = durable.raw_ref().clone();
-    (store, raw_ref)
+    store
 }
 
 fn started() -> Started {
@@ -207,6 +198,7 @@ fn started() -> Started {
         queued_at: AT.to_owned(),
         first_seq: 1,
         submitted: Some((AT.to_owned(), Instant::now())),
+        folder: Some(FOLDER.to_owned()),
     }
 }
 
@@ -217,7 +209,6 @@ fn record() -> TurnRecord {
         // `turn.queued` and `turn.submitted` are committed.
         head: Head::new(Some(3)),
         accepted: None,
-        spans: Vec::new(),
         first_failure: None,
         uncertain: None,
     }
@@ -236,8 +227,6 @@ fn store_failure() -> Terminal {
         vendor_stop_reason: None,
         final_text: String::new(),
         exit: None,
-        raw_ref: None,
-        raw_incomplete: false,
         warnings: Vec::new(),
         cancel: None,
     }
@@ -247,14 +236,13 @@ fn store_failure() -> Terminal {
 async fn observe_then_finish(
     journal: &FaultJournal,
     unresolved: &Unresolved,
-    raw_ref: &RawRef,
 ) -> Result<(), crate::ApiError> {
     let mut record = record();
     let body = EventBody::AssistantText {
         text: "hi".to_owned(),
         is_final: false,
     };
-    commit_event(journal, &mut record, body, Some(raw_ref.clone())).await;
+    commit_event(journal, &mut record, body).await;
     assert!(
         record.first_failure.is_some(),
         "the injected fault reached Core"
@@ -282,7 +270,7 @@ fn event_types(events: &[StoredEvent]) -> Vec<(u64, String)> {
 #[tokio::test]
 async fn committed_uncertain_observation_is_settled_before_turn_ended() {
     let root = tempfile::tempdir().unwrap();
-    let (store, raw_ref) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
@@ -291,20 +279,16 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
         delayed_results: false,
     };
     let unresolved = Unresolved::default();
-    observe_then_finish(&journal, &unresolved, &raw_ref)
-        .await
-        .unwrap();
+    observe_then_finish(&journal, &unresolved).await.unwrap();
     let envelope = store.client().result(&session(), turn()).await.unwrap();
     let envelope = envelope.expect("the receipted turn reached a durable terminal");
     assert_eq!(envelope["state"], "failed");
     assert_eq!(envelope["failure"]["class"], "store");
     assert_eq!(envelope["events"]["last_seq"], 4);
-    // The durable observation's raw span stays inside the envelope's bounds.
-    assert_eq!(envelope["raw_spans"][0]["connection_id"], CONNECTION);
-    assert_eq!(envelope["raw_spans"][0]["first_offset"], raw_ref.offset());
+    // C1 §5: the envelope names the turn's evidence folder.
     assert_eq!(
-        envelope["raw_spans"][0]["last_offset"],
-        raw_ref.end_offset()
+        envelope["evidence"],
+        json!({"folder":FOLDER,"transcript":null})
     );
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(
@@ -321,7 +305,7 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
 #[tokio::test]
 async fn uncommitted_uncertain_observation_keeps_the_sequence() {
     let root = tempfile::tempdir().unwrap();
-    let (store, raw_ref) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::UncertainNotCommitted,
@@ -330,86 +314,12 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
         delayed_results: false,
     };
     let unresolved = Unresolved::default();
-    observe_then_finish(&journal, &unresolved, &raw_ref)
-        .await
-        .unwrap();
+    observe_then_finish(&journal, &unresolved).await.unwrap();
     let envelope = store.client().result(&session(), turn()).await.unwrap();
     let envelope = envelope.expect("the receipted turn reached a durable terminal");
     assert_eq!(envelope["events"]["last_seq"], 3);
-    assert_eq!(envelope["raw_spans"], json!([]));
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(event_types(&events)[2], (3, "turn.ended".to_owned()));
-}
-
-/// A turn whose `raw_log.incomplete` commit had the outcome `fault`, finished
-/// as `drive` does when the event is owed (design §7.2 row 6, `raw_owed`);
-/// returns the durable events.
-async fn raw_incomplete_then_finish(fault: EventFault) -> Vec<(u64, String)> {
-    let root = tempfile::tempdir().unwrap();
-    let (store, _raw_ref) = running_turn(&root).await;
-    let journal = FaultJournal {
-        store: store.client(),
-        event: fault,
-        head: HeadFault::Readable,
-        submission_fails: false,
-        delayed_results: false,
-    };
-    let mut record = record();
-    let body = EventBody::RawLogIncomplete {
-        connection_id: ConnectionId::try_from(CONNECTION).unwrap(),
-    };
-    commit_event(&journal, &mut record, body, None).await;
-    assert!(
-        record.first_failure.is_some(),
-        "the injected fault reached Core"
-    );
-    let mode = Commit {
-        retry: false,
-        raw_owed: true,
-    };
-    Engine::commit_turn_ended_with(
-        &journal,
-        &started(),
-        record,
-        store_failure(),
-        false,
-        TerminalExtras::default(),
-        mode,
-    )
-    .await
-    .unwrap();
-    event_types(&store.client().events(&session(), 1, 10).await.unwrap())
-}
-
-/// The event's commit succeeded but its reply was lost: the durable read-back
-/// finds the turn's `raw_log.incomplete`, so the terminal does not write a
-/// second one.
-#[tokio::test]
-async fn a_committed_uncertain_raw_incomplete_is_not_written_twice() {
-    assert_eq!(
-        raw_incomplete_then_finish(EventFault::CommittedThenUncertain).await,
-        [
-            (1, "turn.queued".to_owned()),
-            (2, "turn.submitted".to_owned()),
-            (3, "raw_log.incomplete".to_owned()),
-            (4, "turn.ended".to_owned()),
-        ]
-    );
-}
-
-/// The event's commit reported uncertain but left nothing durable: the
-/// read-back finds none, so the terminal writes the one it owes.
-#[tokio::test]
-async fn an_uncommitted_uncertain_raw_incomplete_is_written_by_the_terminal() {
-    assert_eq!(
-        raw_incomplete_then_finish(EventFault::UncertainNotCommitted).await,
-        [
-            (1, "turn.queued".to_owned()),
-            (2, "turn.submitted".to_owned()),
-            (3, "raw_log.incomplete".to_owned()),
-            (4, "turn.ended".to_owned()),
-        ]
-    );
 }
 
 /// Another writer of the session, such as a `resume` committing the next turn's
@@ -418,7 +328,7 @@ async fn an_uncommitted_uncertain_raw_incomplete_is_written_by_the_terminal() {
 #[tokio::test]
 async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns() {
     let root = tempfile::tempdir().unwrap();
-    let (store, raw_ref) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::UncertainNotCommitted,
@@ -431,7 +341,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         text: "hi".to_owned(),
         is_final: false,
     };
-    commit_event(&journal, &mut record, body, Some(raw_ref)).await;
+    commit_event(&journal, &mut record, body).await;
     assert!(
         record.first_failure.is_some(),
         "the injected fault reached Core"
@@ -444,7 +354,6 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         turn: Some(2),
         late: false,
         at: AT,
-        raw_ref: None,
         body: EventBody::TurnQueued { queue_position: 0 },
     }
     .to_value()
@@ -483,7 +392,6 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         envelope["events"],
         json!({"first_seq":1,"last_seq":4,"count":4})
     );
-    assert_eq!(envelope["raw_spans"], json!([]));
     let events = store.client().events(&session(), 1, 10).await.unwrap();
     assert_eq!(
         event_types(&events),
@@ -500,7 +408,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
 #[tokio::test]
 async fn unsettled_turn_reads_as_store_error_not_running() {
     let root = tempfile::tempdir().unwrap();
-    let (store, raw_ref) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
@@ -509,7 +417,7 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
         delayed_results: false,
     };
     let unresolved = Unresolved::default();
-    let finished = observe_then_finish(&journal, &unresolved, &raw_ref).await;
+    let finished = observe_then_finish(&journal, &unresolved).await;
     assert_eq!(finished.unwrap_err().kind, "store_error");
     // No terminal was invented, and `result`/`wait` report `store_error`.
     assert!(
@@ -555,7 +463,6 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             turn: Some(1),
             late: false,
             at: AT,
-            raw_ref: None,
             body,
         }
         .to_value()
@@ -622,7 +529,7 @@ async fn result_and_wait_report_the_unpersisted_turn_with_c1_data() {
         delayed_results: false,
     };
     let mut record = record();
-    commit_event(&journal, &mut record, EventBody::CancelRequested {}, None).await;
+    commit_event(&journal, &mut record, EventBody::CancelRequested {}).await;
     let finished = Engine::finish_turn(
         &journal,
         &engine.unresolved,
@@ -696,7 +603,7 @@ async fn failed_turns_are_bounded_and_each_keeps_store_error() {
 #[tokio::test]
 async fn a_failed_turn_whose_terminal_becomes_readable_is_removed() {
     let root = tempfile::tempdir().unwrap();
-    let (store, _raw_ref) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let unresolved = Unresolved::default();
     unresolved.receipt(&session(), turn());
     unresolved.fail(&session(), turn(), TurnState::Running);
@@ -823,7 +730,7 @@ async fn a_durable_terminal_behind_delayed_reads_is_settled_within_the_bound() {
 #[tokio::test]
 async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
     let root = tempfile::tempdir().unwrap();
-    let (store, _) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,
@@ -840,7 +747,6 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
             text: "lost".to_owned(),
             is_final: false,
         },
-        None,
     )
     .await;
     let note = record
@@ -862,7 +768,7 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
 #[tokio::test]
 async fn a_corrupt_head_read_before_a_terminal_is_a_corrupt_failure() {
     let root = tempfile::tempdir().unwrap();
-    let (store, _) = running_turn(&root).await;
+    let store = running_turn(&root).await;
     let journal = FaultJournal {
         store: store.client(),
         event: EventFault::CommittedThenUncertain,

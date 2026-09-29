@@ -40,7 +40,7 @@ fn binary(name: &str) -> PathBuf {
 /// that completes every turn 1..=8 prompted `p`.
 fn run_child(name: &str) {
     let root = tempfile::tempdir().unwrap();
-    for part in ["state", "state/raw", "runtime", "runtime/anchors", "sync"] {
+    for part in ["state", "runtime", "runtime/anchors", "sync"] {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(root.path().join(part))

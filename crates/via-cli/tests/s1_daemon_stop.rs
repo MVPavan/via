@@ -486,25 +486,6 @@ fn check_forced_lifecycle(
     )
 }
 
-/// Whether the envelope's bounding span for `reference`'s connection covers it.
-fn span_covers(envelope: &Value, reference: &Value) -> bool {
-    let (Some(offset), Some(len)) = (reference["offset"].as_u64(), reference["len"].as_u64())
-    else {
-        return false;
-    };
-    envelope["raw_spans"].as_array().is_some_and(|spans| {
-        spans.iter().any(|span| {
-            span["connection_id"] == reference["connection_id"]
-                && span["first_offset"]
-                    .as_u64()
-                    .is_some_and(|first| first <= offset)
-                && span["last_offset"]
-                    .as_u64()
-                    .is_some_and(|last| offset + len <= last)
-        })
-    })
-}
-
 /// Waits until the Store has committed an event of `kind` for `session`.
 fn wait_event(paths: &Paths, session: &str, kind: &str) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -632,12 +613,6 @@ fn s1_daemon_stop_force_ends_active_turn_immediately() -> TestResult {
             )?;
             let text = &events[3];
             check(text["text"] == "partial", || format!("text {text}"))?;
-            check(span_covers(&envelope, &text["raw_ref"]), || {
-                format!(
-                    "raw spans {} miss {}",
-                    envelope["raw_spans"], text["raw_ref"]
-                )
-            })?;
             check(elapsed < FINAL_SHUTDOWN, || {
                 format!("force took {elapsed:?}")
             })
@@ -870,7 +845,7 @@ fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
         &fixture,
         |paths, evidence| {
             let mut daemon = Daemon::start(paths, evidence)?;
-            // One completed turn first, so the run keeps raw evidence.
+            // One completed turn first, so the run keeps turn evidence.
             let spawn = paths.run(
                 evidence,
                 "spawn",
@@ -1211,7 +1186,7 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
 /// start waits in the channel, and a force lands on a third. Released, main
 /// starts A's dispatcher and enters final shutdown, which takes B from the
 /// queue: the summary counts one queued drive. A first turn completes
-/// beforehand, so the run has raw evidence.
+/// beforehand, so the run has turn evidence.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_daemon_stop_force_right_after_receipt_cancels_queued_turn() -> TestResult {
@@ -1395,81 +1370,4 @@ fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, Scenari
         [launched] => Some(*launched),
         _ => return Err(fail(&format!("{session}: more than one anchor"))),
     })
-}
-
-/// W3-F merge follow-up: a force while vendor output is in flight never leaves
-/// the raw log silently short. The vendor writes an unterminated line, which
-/// Wire holds unsplit, then waits; after the force, those bytes are in the
-/// connection's raw log, or the turn records `raw_log.incomplete` and the
-/// envelope warns `raw_log_incomplete`.
-#[test]
-fn s1_daemon_stop_force_keeps_in_flight_output_in_raw_log() -> TestResult {
-    const IN_FLIGHT: &str = r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":"in fli"#;
-    let fixture = json!({
-        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
-        "steps":[
-            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
-            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"partial"}},
-            {"action":"emit_raw","text":IN_FLIGHT},
-            {"action":"report_pids"},
-            {"action":"gate","name":"hold"},
-            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"late","stop_reason":"end_turn"}}
-        ]
-    });
-    scenario(
-        "s1_daemon_stop_force_in_flight_output",
-        &fixture,
-        |paths, evidence| {
-            let mut daemon = Daemon::start(paths, evidence)?;
-            let (session, agent, _) = start_held_turn(paths, evidence)?;
-            wait_event(paths, &session, "assistant.text")?;
-            let stop = paths.run(
-                evidence,
-                "stop_force",
-                &["daemon", "stop", "--force", "--json"],
-            )?;
-            check(stop.status.success(), || {
-                format!("force stop exited {}", stop.status)
-            })?;
-            let status = daemon
-                .wait_exit(FINAL_SHUTDOWN)?
-                .ok_or_else(|| fail("force stop did not exit"))?;
-            wait_not_live(agent)?;
-            check(status.code() == Some(0), || format!("exit {status}"))?;
-            let (envelope, events) = paths.committed(&session)?;
-            evidence
-                .write("envelope.json", envelope.to_string().as_bytes())
-                .map_err(infra)?;
-            check(
-                envelope["state"] == "cancelled"
-                    && envelope["cancel"]["outcome"] == "forced"
-                    && envelope["cancel"]["cleanup"] == "quiescent",
-                || format!("envelope {envelope}"),
-            )?;
-            let connection = format!("c_{}", session.trim_start_matches("s_"));
-            let raw = fs::read(paths.state.join("raw").join(format!("{connection}.raw")))
-                .map_err(infra)?;
-            let recorded = raw
-                .windows(IN_FLIGHT.len())
-                .any(|window| window == IN_FLIGHT.as_bytes());
-            let warned = envelope["warnings"].as_array().is_some_and(|warnings| {
-                warnings
-                    .iter()
-                    .any(|warning| warning["code"] == "raw_log_incomplete")
-            });
-            let mut prefix = vec![
-                "turn.queued",
-                "turn.submitted",
-                "turn.started",
-                "assistant.text",
-            ];
-            if !recorded {
-                prefix.push("raw_log.incomplete");
-            }
-            check(recorded != warned, || {
-                format!("raw log recorded in-flight bytes: {recorded}, warned: {warned}")
-            })?;
-            check_forced_lifecycle(&envelope, &events, &prefix)
-        },
-    )
 }

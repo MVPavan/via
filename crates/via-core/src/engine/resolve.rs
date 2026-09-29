@@ -6,7 +6,7 @@
 //! dispatcher and the restart handoff share it. It resolves a submission
 //! that did not commit, a corrupt frozen row and the dispatcher's expired
 //! read streak. And a running turn whose Route reports a Store failure: a
-//! Host journal write (rows 3 and 4) or raw evidence (row 6).
+//! Host journal write (rows 3 and 4) or the evidence folder.
 
 use std::fmt;
 use std::sync::atomic::Ordering;
@@ -253,16 +253,15 @@ impl Engine {
     /// One that did not commit stops the turn with cause `store`: the order
     /// is attached before the turn settles, so its disposition is `failed
     /// (store)` with the `cancel` evidence, and its terminal is the
-    /// resolution write. One that may have committed latches. Returns
-    /// whether the raw log lost bytes (row 6), which the resolution write
-    /// records as `raw_log.incomplete`. The caller holds no lock.
+    /// resolution write. One that may have committed latches. The caller
+    /// holds no lock.
     pub(super) async fn route_failed(
         &self,
         slot: &Slot,
         record: &mut TurnRecord,
         cause: Option<&RouteError>,
         journal_uncertain: bool,
-    ) -> bool {
+    ) {
         if journal_uncertain {
             let scope = FailureScope::Turn(&record.session, record.turn);
             self.store_failure(FailureSite::Journal, WriteOutcome::Uncertain, scope)
@@ -270,7 +269,7 @@ impl Engine {
                 .await;
         }
         let Some(RouteError::Store { kind, .. }) = cause else {
-            return false;
+            return;
         };
         if record.first_failure.is_some() {
             // An earlier write already failed and keeps the turn's note for
@@ -278,18 +277,18 @@ impl Engine {
             // one still latches (design §7.1: every uncertain outcome).
             if kind.latches() {
                 let scope = FailureScope::Turn(&record.session, record.turn);
-                self.store_failure(FailureSite::Raw, WriteOutcome::Uncertain, scope)
+                self.store_failure(FailureSite::Evidence, WriteOutcome::Uncertain, scope)
                     .finish()
                     .await;
             }
-            return false;
+            return;
         }
         let site = match kind {
             StoreFailure::NotCommitted => FailureSite::Journal,
-            StoreFailure::Raw
+            StoreFailure::Evidence
             | StoreFailure::NotEnqueued
             | StoreFailure::WriterLost
-            | StoreFailure::Uncertain => FailureSite::Raw,
+            | StoreFailure::Uncertain => FailureSite::Evidence,
         };
         let outcome = if kind.latches() {
             WriteOutcome::Uncertain
@@ -301,7 +300,6 @@ impl Engine {
         if outcome == WriteOutcome::NotCommitted {
             slot.store_order(record.turn, tokio::time::Instant::now());
         }
-        site == FailureSite::Raw && outcome == WriteOutcome::NotCommitted
     }
 
     /// Fails the claimed queue head `turn` with row 2's resolution write
@@ -369,8 +367,6 @@ pub(super) async fn commit_submit_failed(
         vendor_stop_reason: None,
         final_text: String::new(),
         exit: None,
-        raw_ref: None,
-        raw_incomplete: false,
         warnings: Vec::new(),
         cancel: None,
     };
@@ -381,7 +377,6 @@ pub(super) async fn commit_submit_failed(
             turn: Some(turn.get()),
             late: false,
             at: &at,
-            raw_ref: None,
             body,
         }
         .to_value()
@@ -408,7 +403,8 @@ pub(super) async fn commit_submit_failed(
         turn,
         terminal,
         None,
-        Vec::new(),
+        // Never submitted to a vendor: no evidence folder (design §7.1).
+        None,
         timestamps,
         None,
         (queueing.queued_seq, ended_seq),

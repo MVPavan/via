@@ -77,8 +77,8 @@ impl Engine {
         // progress bypass the fence [r3.1, r4.1].
         let operation = match key {
             Some(key) => {
-                let identity = retry_identity(raw_params, &hash)?;
-                match self.replay(&session, key, &identity).await? {
+                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
+                match self.replay(&session, key, identity).await? {
                     Replay::Result(result) => return Ok(result),
                     Replay::InProgress(watch) => return self.await_close(watch, admission).await,
                     Replay::New => Some(CloseIntent {
@@ -147,7 +147,7 @@ impl Engine {
         &self,
         session: &SessionId,
         key: &str,
-        identity: &[u8],
+        identity: via_store::Identity,
     ) -> Result<Replay, ApiError> {
         let stored = self
             .store
@@ -390,7 +390,6 @@ impl Engine {
             turn: None,
             late: false,
             at: &rfc3339(SystemTime::now()),
-            raw_ref: None,
             body: EventBody::SessionClosed {
                 reason: CLOSE_REASON,
             },

@@ -22,8 +22,8 @@ use via_store::{
 
 use super::latch::{FailureSite, WriteOutcome};
 use super::{Accepted, FailureNote, TurnRecord, lock};
-use crate::api::{Event, EventBody, RawSpan, ReceiptOutcome, rfc3339};
-use crate::{ApiError, RawRef, SessionId, TurnNumber, TurnState};
+use crate::api::{Event, EventBody, ReceiptOutcome, rfc3339};
+use crate::{ApiError, SessionId, TurnNumber, TurnState};
 
 /// Core's narrow Store port for one turn: `StoreClient` in production, a closed
 /// fault backend in unit tests.
@@ -224,7 +224,8 @@ pub(super) fn may_have_committed(error: &StoreError) -> bool {
 #[derive(Clone)]
 pub(super) struct UncertainEvent {
     pub(super) seq: u64,
-    pub(super) raw_ref: Option<RawRef>,
+    /// The event as sent: only this exact event at `seq` is its own.
+    pub(super) event: Value,
     /// Acceptance facts to restore if the uncertain event was `turn.started`.
     pub(super) accepted: Option<Accepted>,
 }
@@ -356,10 +357,9 @@ pub(super) async fn commit_event(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
     body: EventBody,
-    raw_ref: Option<RawRef>,
 ) {
     let at = rfc3339(SystemTime::now());
-    commit_event_at(journal, record, body, raw_ref, &at).await;
+    commit_event_at(journal, record, body, &at).await;
 }
 
 /// [`commit_event`] at a given wall time: a stop order's `cancel.requested`
@@ -368,7 +368,6 @@ pub(super) async fn commit_event_at(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
     body: EventBody,
-    raw_ref: Option<RawRef>,
     at: &str,
 ) {
     if record.first_failure.is_some() {
@@ -396,7 +395,6 @@ pub(super) async fn commit_event_at(
         turn: Some(record.turn.get()),
         late: false,
         at,
-        raw_ref: raw_ref.as_ref(),
         body,
     }
     .to_value();
@@ -412,8 +410,7 @@ pub(super) async fn commit_event_at(
         .commit_event(EventRecord {
             session_id: record.session.clone(),
             turn: record.turn,
-            event,
-            raw_ref: raw_ref.clone(),
+            event: event.clone(),
         })
         .await;
     if let Err(error) = committed {
@@ -423,48 +420,39 @@ pub(super) async fn commit_event_at(
             head.lost();
             record.uncertain = Some(UncertainEvent {
                 seq,
-                raw_ref,
+                event,
                 accepted: None,
             });
         }
         return;
     }
     head.committed(1);
-    if let Some(reference) = &raw_ref {
-        RawSpan::include(&mut record.spans, reference);
-    }
 }
 
 /// Settles an uncertain event against the durable stream: a durable event
 /// advances `record` exactly as a confirmed commit would; an absent one leaves
 /// it. Another writer of the session may have taken the sequence since, so
-/// only an event of this turn at that sequence is its own.
-///
-/// Returns whether the durable event is the turn's `raw_log.incomplete`
-/// (design §7.2 row 6): a write that owes that event, because its own commit
-/// failed, writes it only when this read-back did not find it.
+/// only an event of this turn at that sequence is its own, and only when it
+/// is the event sent.
 pub(super) async fn reconcile(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
-) -> Result<bool, StoreError> {
+) -> Result<(), StoreError> {
     let Some(uncertain) = record.uncertain.take() else {
-        return Ok(false);
+        return Ok(());
     };
     let head = journal.events(&record.session, uncertain.seq, 1).await?;
     let own_turn = json!(record.turn.get());
     match head.first() {
-        None => Ok(false),
+        None => Ok(()),
         Some(event) if event.seq != uncertain.seq || event.event.get("turn") != Some(&own_turn) => {
-            Ok(false)
+            Ok(())
         }
-        Some(event) if event.raw_ref == uncertain.raw_ref => {
-            if let Some(reference) = &uncertain.raw_ref {
-                RawSpan::include(&mut record.spans, reference);
-            }
+        Some(event) if event.event == uncertain.event => {
             if uncertain.accepted.is_some() {
                 record.accepted = uncertain.accepted;
             }
-            Ok(event.event.get("type").and_then(Value::as_str) == Some("raw_log.incomplete"))
+            Ok(())
         }
         // Core is the running turn's only writer; another event of it there is not its own.
         Some(_) => Err(StoreError::CorruptEvidence),
@@ -514,7 +502,7 @@ pub(super) async fn commit_terminal_with(
     retry: bool,
 ) -> Result<Durable, ApiError> {
     let (session, turn) = (record.session_id.clone(), record.turn);
-    let plain = extras.cancel_cause.is_none() && extras.raw_incomplete.is_none();
+    let plain = extras.cancel_cause.is_none();
     if closed.is_some() && !plain {
         return Err(ApiError::RECEIPT_NOT_COMMITTED);
     }
@@ -524,7 +512,6 @@ pub(super) async fn commit_terminal_with(
             closed.clone(),
             TerminalExtras {
                 cancel_cause: extras.cancel_cause,
-                raw_incomplete: extras.raw_incomplete.clone(),
             },
         )
     });
@@ -567,7 +554,7 @@ async fn attempt(
     closed: Option<Value>,
     extras: TerminalExtras,
 ) -> Result<bool, StoreError> {
-    if extras.cancel_cause.is_none() && extras.raw_incomplete.is_none() {
+    if extras.cancel_cause.is_none() {
         journal.commit_terminal(record, closed).await
     } else {
         journal
@@ -585,7 +572,6 @@ fn duplicate(record: &TerminalRecord) -> TerminalRecord {
         turn: record.turn,
         envelope: record.envelope.clone(),
         event: record.event.clone(),
-        raw_ref: record.raw_ref.clone(),
     }
 }
 

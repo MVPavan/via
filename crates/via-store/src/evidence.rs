@@ -1,0 +1,82 @@
+//! The evidence root `<state>/evidence` (Task 4 design §7): one folder per
+//! submitted turn, `evidence/<session_id>/<turn>/`. Store owns the root;
+//! Wire creates a turn's folder, the operating system and Wire write its
+//! files, and nothing in VIA reads them.
+
+use std::{
+    fs::{self, DirBuilder, File},
+    io,
+    os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use crate::{SessionId, TurnNumber};
+
+/// The fixed file names a turn's folder can hold, in the order `logs` lists
+/// them (design §7.1).
+pub const EVIDENCE_FILES: [&str; 3] = ["stderr.log", "undecoded.bin", "final_text.txt"];
+
+/// `<state>/evidence`, validated or created by [`crate::Store::open`].
+/// Computing a path does no I/O.
+#[derive(Clone, Debug)]
+pub struct EvidenceRoot {
+    /// The State directory.
+    state: Arc<PathBuf>,
+}
+
+impl EvidenceRoot {
+    pub(crate) fn new(state: &Path) -> Self {
+        Self {
+            state: Arc::new(state.to_path_buf()),
+        }
+    }
+
+    /// The turn's folder relative to the State directory, as
+    /// `turns.evidence_dir` stores it: `evidence/<session_id>/<turn>`.
+    pub fn relative(session: &SessionId, turn: TurnNumber) -> String {
+        format!("evidence/{}/{}", session.as_str(), turn.get())
+    }
+
+    /// A stored relative folder made absolute.
+    pub fn absolute(&self, relative: &str) -> PathBuf {
+        self.state.join(relative)
+    }
+
+    /// The turn's absolute folder; no I/O.
+    pub fn path(&self, session: &SessionId, turn: TurnNumber) -> PathBuf {
+        self.absolute(&Self::relative(session, turn))
+    }
+
+    /// Creates the turn's folder (design §7.2): `<session_id>` if missing and
+    /// `<turn>` exclusively, both 0700, then syncs each parent once
+    /// (`evidence/` after a new session folder, the session folder after the
+    /// turn folder), so the whole path is durable before a file in it is
+    /// relied on. Blocking: callers run it on the blocking pool. An existing
+    /// `<turn>` (a turn launches once) or a session entry that is not a
+    /// directory is an error.
+    pub fn create_turn(&self, session: &SessionId, turn: TurnNumber) -> io::Result<PathBuf> {
+        let root = self.state.join("evidence");
+        let session_dir = root.join(session.as_str());
+        match DirBuilder::new().mode(0o700).create(&session_dir) {
+            Ok(()) => sync_dir(&root)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::symlink_metadata(&session_dir)?.is_dir() {
+                    return Err(io::Error::other(
+                        "evidence session entry is not a directory",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let turn_dir = session_dir.join(turn.get().to_string());
+        DirBuilder::new().mode(0o700).create(&turn_dir)?;
+        sync_dir(&session_dir)?;
+        Ok(turn_dir)
+    }
+}
+
+/// Syncs a directory's entries.
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}

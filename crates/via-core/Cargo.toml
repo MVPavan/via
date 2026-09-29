@@ -19,7 +19,7 @@ tokio = { workspace = true, features = ["time", "sync"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-# Route-stream tests stall Store's raw worker through its closed fault hook.
+# Tests drive Store's test seams.
 via-store = { path = "../via-store", features = ["test-failpoints"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

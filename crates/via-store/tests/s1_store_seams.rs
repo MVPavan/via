@@ -12,9 +12,8 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use via_store::{
-    AnchorIntent, CommitOutcome, ConnectionId, EventRecord, RawStream, ResumeRecord, SessionId,
-    SpawnRecord, Store, StoreClient, StoreError, SubmissionRecord, TerminalRecord, TurnNumber,
-    failpoint,
+    AnchorIntent, CommitOutcome, EventRecord, ResumeRecord, SessionId, SpawnRecord, Store,
+    StoreClient, StoreError, SubmissionRecord, TerminalRecord, TurnNumber, failpoint,
 };
 
 const TOKEN: &str = "s1-store-seams-token-0123";
@@ -92,7 +91,7 @@ impl Seams {
 }
 
 fn event(kind: &str, seq: u64) -> Value {
-    json!({"type":kind,"seq":seq,"at":"2026-01-01T00:00:00.000Z","raw_ref":null})
+    json!({"type":kind,"seq":seq,"at":"2026-01-01T00:00:00.000Z"})
 }
 
 async fn running_turn(client: &StoreClient) {
@@ -123,7 +122,6 @@ fn text(seq: u64) -> EventRecord {
         session_id: session(),
         turn: turn(),
         event: event("assistant.text", seq),
-        raw_ref: None,
     }
 }
 
@@ -171,7 +169,6 @@ fn persistent_fail_io_fails_every_later_commit() {
                 turn: turn(),
                 envelope: json!({"state":"failed"}),
                 event: event("turn.ended", 3),
-                raw_ref: None,
             })
             .await;
         assert!(
@@ -224,7 +221,6 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
             turn: turn(),
             envelope: json!({"state":"cancelled"}),
             event: event("turn.ended", 2),
-            raw_ref: None,
         };
         let failed = client
             .commit_closing_terminal(cancelled(), event("session.closed", 3))
@@ -281,7 +277,6 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
                     turn: turn(),
                     envelope: json!({"state":"cancelled"}),
                     event: event("turn.ended", 3),
-                    raw_ref: None,
                 },
                 event("session.closed", 4),
             )
@@ -410,35 +405,6 @@ fn read_stall_holds_the_worker_until_release() {
     });
 }
 
-/// Design §7.1 [r4.5] and runtime §11: an injected raw append or sync
-/// failure is a raw I/O error (`Raw`, §7.2 row 6), persistent from the armed
-/// occurrence for `raw.sync.fail_persistent`.
-#[test]
-fn raw_seams_fail_as_raw_io() {
-    let seams = Seams::new();
-    let store = Store::open(seams.state()).unwrap();
-    let raw = store.runtime_resources().into_wire_parts().0;
-    seams.runtime.block_on(async {
-        let first = raw.open(ConnectionId::try_from("c_one").unwrap());
-        seams.arm("raw.append.fail", 1, "fail_io", false);
-        let failed = first.append(RawStream::Stdout, b"x\n".to_vec()).await;
-        assert!(matches!(failed, Err(StoreError::Raw(_))), "{failed:?}");
-        let second = raw.open(ConnectionId::try_from("c_two").unwrap());
-        second
-            .append(RawStream::Stdout, b"ok\n".to_vec())
-            .await
-            .unwrap();
-        seams.arm("raw.sync.fail_persistent", 2, "fail_io", true);
-        for connection in ["c_three", "c_four"] {
-            let failed = raw
-                .open(ConnectionId::try_from(connection).unwrap())
-                .append(RawStream::Stdout, b"y\n".to_vec())
-                .await;
-            assert!(matches!(failed, Err(StoreError::Raw(_))), "{failed:?}");
-        }
-    });
-}
-
 /// T3-S5 round 2, decision 11 (design §7.1): every read command, from the
 /// Core client or Host's journal, reports SQLite corruption to the
 /// registered observer before its caller receives the reply. Each read
@@ -488,7 +454,7 @@ fn every_read_reports_corruption_before_its_reply() {
         read!("closing_sessions", client.closing_sessions_page(None, 8)),
         read!("terminated", client.terminated(vec![(s.clone(), t)])),
         read!("events", client.events(&s, 1, 8)),
-        read!("logs", client.logs(&s)),
+        read!("logs", client.evidence_refs(&s, None)),
         read!("authenticate", client.authenticate(&s, &[7_u8; 32])),
         read!("unfinished", client.unfinished_turns()),
         read!("anchor_owners", client.anchor_owners_page(None, 8)),

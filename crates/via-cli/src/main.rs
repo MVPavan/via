@@ -360,8 +360,18 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Events(args) => {
             client::call("events", &json!({"session":args.address}), true, true)
         }
-        Command::Logs(args) => client::call("logs", &json!({"session":args.address}), true, true),
+        Command::Logs(args) => logs(&args.address),
     }
+}
+
+/// `via logs` (C1 §3.12): exactly one of a session or a turn address.
+fn logs(address: &str) -> anyhow::Result<i32> {
+    let member = if address.contains('/') {
+        "turn"
+    } else {
+        "session"
+    };
+    client::call("logs", &json!({member: address}), true, true)
 }
 
 /// `via cancel` (C1 §3.5).
