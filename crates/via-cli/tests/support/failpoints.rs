@@ -67,10 +67,20 @@ impl Failpoints {
         }
         // `fail_io_persist` is `fail_io` with `persist`: every hit from
         // `occurrence` on fails, each acknowledged as `fail_io` (design §10).
+        // `delay_persist:<ms>` delays every hit from `occurrence` on by
+        // `<ms>` milliseconds, each acknowledged as `delay` (Task 4 design
+        // §13.1 `store.read.delay_ms`).
         let command = match action {
             "fail_io_persist" => json!({"token":self.token,"occurrence":occurrence,
                 "action":"fail_io","persist":true}),
-            action => json!({"token":self.token,"occurrence":occurrence,"action":action}),
+            action => match action
+                .strip_prefix("delay_persist:")
+                .and_then(|millis| millis.parse::<u64>().ok())
+            {
+                Some(millis) => json!({"token":self.token,"occurrence":occurrence,
+                    "action":"delay","value":millis,"persist":true}),
+                None => json!({"token":self.token,"occurrence":occurrence,"action":action}),
+            },
         };
         let temporary = self.dir.join(format!(".{point}.json.tmp"));
         let mut file = OpenOptions::new()

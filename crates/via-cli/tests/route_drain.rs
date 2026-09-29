@@ -269,9 +269,6 @@ fn route_drain_survives_stderr_flood_after_terminal() {
     assert!(stderr.ends_with(b"flood-end\n"));
 }
 
-/// C2 A1: at most 256 KiB per encoded observation payload.
-const OBSERVATION_BYTES: usize = 256 * 1024;
-
 /// Checks the common C1 §6.1 fields, dense sequence and the envelope's event range.
 fn assert_dense(events: &[Value], session: &str, envelope: &Value) {
     for (index, event) in events.iter().enumerate() {
@@ -303,6 +300,9 @@ fn assert_undecoded(sandbox: &Sandbox, envelope: &Value, message: &Value) {
     );
 }
 
+/// Task 4 design §2.1, §3.2: text, tool and unknown messages are not
+/// events; the durable events stay dense, and the turn's one step has its
+/// row, committed with `turn.ended`.
 #[test]
 fn observations_become_ordered_events() {
     let big_text = "é".repeat(140_000);
@@ -335,48 +335,24 @@ fn observations_become_ordered_events() {
             "turn.queued",
             "turn.submitted",
             "turn.started",
-            "assistant.text",
-            "assistant.text",
-            "assistant.text",
-            "tool.started",
-            "tool.ended",
-            "vendor.other",
-            "vendor.other",
             "turn.ended",
         ]
     );
     assert_dense(&events, session, &envelope);
-
-    // Small text keeps its payload; oversized text is split in order at UTF-8
-    // boundaries.
-    assert_eq!(events[3]["text"], "hello ");
-    assert_eq!(events[3]["final"], false);
-    let mut joined = String::new();
-    for piece in &events[4..6] {
-        let payload = json!({"text":piece["text"],"final":piece["final"]});
-        assert!(serde_json::to_vec(&payload).unwrap().len() <= OBSERVATION_BYTES);
-        joined.push_str(piece["text"].as_str().unwrap());
-    }
-    assert_eq!(joined, big_text);
-
-    assert_eq!(events[6]["tool_id"], "t1");
-    assert_eq!(events[6]["name"], "shell");
-    assert_eq!(events[6]["input_summary"], "ls");
-    assert_eq!(events[7]["tool_id"], "t1");
-    assert_eq!(events[7]["status"], "failed");
-    assert_eq!(events[7]["output_summary"], "no such file");
-    assert_eq!(events[7]["exit_code"], 2);
-
-    // Unknown payloads keep a bounded prefix with an explicit truncation marker.
-    for (event, message, truncated) in [
-        (&events[8], &messages[5], true),
-        (&events[9], &messages[7], false),
-    ] {
-        assert_eq!(event["vendor_type"], message["type"]);
-        assert_eq!(event["truncated"], truncated, "{event}");
-        let payload = event["payload"].as_str().unwrap();
-        assert!(payload.len() <= 16 * 1024);
-    }
+    let store = rusqlite::Connection::open_with_flags(
+        sandbox.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows: Vec<u32> = store
+        .prepare("SELECT step FROM steps WHERE session_id=?1 AND turn=1 ORDER BY step")
+        .unwrap()
+        .query_map([session], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // No model output followed the tool result: one step.
+    assert_eq!(rows, [1]);
 }
 
 /// C1 §8.2, Task 4 design §7.3: a stdout line over the 1 MiB cap fails the
@@ -417,7 +393,8 @@ fn failed_turn(steps: &[Value], class: &str) -> (Sandbox, Value, Vec<Value>) {
 
 #[test]
 fn failure_class_protocol_cites_the_malformed_message() {
-    let malformed = json!({"type":"text","vendor_turn_id":"fake-turn-1"});
+    // Task 4 design §2.2: a known message without its turn is malformed.
+    let malformed = json!({"type":"text","text":"hi"});
     let (sandbox, envelope, _) = failed_turn(
         &[
             emit(ACCEPTED),
@@ -430,9 +407,11 @@ fn failure_class_protocol_cites_the_malformed_message() {
     assert_undecoded(&sandbox, &envelope, &malformed);
 }
 
+/// Task 4 design §2.2 rule 1: a tool name over 1 KiB is `protocol`; the
+/// input summary is skipped unread, so only the name can be oversized.
 #[test]
-fn failure_class_protocol_for_oversized_tool_payload() {
-    let tool = json!({"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"shell","input_summary":"y".repeat(300 * 1024)});
+fn failure_class_protocol_for_oversized_tool_name() {
+    let tool = json!({"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"y".repeat(300 * 1024),"input_summary":"ls"});
     let (sandbox, envelope, events) = failed_turn(
         &[
             emit(ACCEPTED),

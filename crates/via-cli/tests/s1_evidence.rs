@@ -257,7 +257,9 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
 #[test]
 fn s1_evidence_undecoded_message_is_saved_and_named() -> TestResult {
     const MALFORMED: usize = 200 * 1024;
-    let head = r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":1,"pad":""#;
+    // Task 4 design §2.2: `text` is skipped unread, so the malformed field
+    // is the turn ID.
+    let head = r#"{"type":"text","vendor_turn_id":1,"pad":""#;
     let tail = "\"}\n";
     let malformed = format!(
         "{head}{}{tail}",

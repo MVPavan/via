@@ -742,32 +742,27 @@ fn s1_f28_two_callers_drive_two_sessions_without_crosstalk() -> TestResult {
             for session in [&a, &b] {
                 let history = events(&sandbox, evidence, &format!("events_{session}"), session)?;
                 check_history(&sandbox, session, &history, 2)?;
-                let (own, foreign) = if *session == a {
-                    ("a", "b")
-                } else {
-                    ("b", "a")
-                };
-                // Each turn's own reply text is present, attributed to that turn.
+                // Each turn's own reply is its envelope's `final_text`
+                // (`wait_completed`); model text is not an event (Task 4
+                // design §2.1), so each turn is attributed by its one
+                // `turn.ended`, and no event carries text of either session.
                 for turn in 1..=2_u32 {
-                    let expected = format!("{own}{turn} reply");
-                    if !history.iter().any(|event| {
-                        event["type"] == "assistant.text"
-                            && event["turn"] == json!(turn)
-                            && event["text"] == expected.as_str()
-                    }) {
+                    let ended = history
+                        .iter()
+                        .filter(|event| {
+                            event["type"] == "turn.ended"
+                                && event["turn"] == json!(turn)
+                                && event["state"] == "completed"
+                        })
+                        .count();
+                    if ended != 1 {
                         return Err(failure(format!(
-                            "{session}/{turn} has no assistant.text {expected:?}"
+                            "{session}/{turn} has {ended} completed turn.ended events"
                         )));
                     }
                 }
-                if history.iter().any(|event| {
-                    event["text"]
-                        .as_str()
-                        .is_some_and(|text| text.starts_with(foreign))
-                }) {
-                    return Err(failure(format!(
-                        "{session} holds the other session's output"
-                    )));
+                if history.iter().any(|event| event.get("text").is_some()) {
+                    return Err(failure(format!("{session} holds model text in events")));
                 }
                 all.extend(history);
             }

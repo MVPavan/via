@@ -239,6 +239,11 @@ impl Sandbox {
         self.ok(&["wait", address, "--timeout-ms", "30000", "--json"])
     }
 
+    /// `via status <session>` (C1 §3.7).
+    fn status(&self, session: &str) -> TestResult<Value> {
+        self.ok(&["status", session, "--json"])
+    }
+
     fn events(&self, session: &str) -> TestResult<Vec<Value>> {
         let page = self.ok(&["events", session, "--json"])?;
         Ok(page["events"].as_array().cloned().unwrap_or_default())
@@ -789,7 +794,22 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     sandbox.release("noise1")?;
     sandbox.await_file("noise2.entered")?;
     thread::sleep(Duration::from_millis(600));
+    // Task 4 design §2.3, §2.6: an unknown message is no event; it moves
+    // only the activity clock. Its arrival is seen in `status` before the
+    // idle order, so the noise reached VIA without resetting idle.
+    let before = sandbox.status(&session)?["progress"]["last_activity_at"].clone();
     sandbox.release("noise2")?;
+    let noise_seen = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let progress = sandbox.status(&session)?["progress"].clone();
+            let moved = progress["last_activity_at"].as_str() > before.as_str();
+            if moved || Instant::now() >= deadline {
+                break moved;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
     // A monotonic observation of the idle order itself, on the clock that
     // started before the spawn request, so at or before the idle origin.
     sandbox.wait_for_event(&session, "cancel.requested")?;
@@ -834,10 +854,9 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
              {monotonic:?}; events {events:?})"
         )
     })?;
-    check(
-        events.iter().any(|event| event["type"] == "vendor.other"),
-        || "the unknown messages were not recorded".to_owned(),
-    )?;
+    check(noise_seen && before.is_string(), || {
+        "the unknown messages did not reach the activity clock".to_owned()
+    })?;
 
     let (silent_session, _) =
         sandbox.spawn("silent", &["--idle-ms", "1000", "--wall-ms", "2500"])?;

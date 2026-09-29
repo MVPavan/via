@@ -142,6 +142,22 @@ impl Paths {
     }
 
     /// Terminal envelope and ordered events, read-only after the daemon exited.
+    /// Turn 1's committed step rows (Task 4 design §3).
+    fn step_rows(&self, session: &str) -> Result<i64, ScenarioError> {
+        let store = rusqlite::Connection::open_with_flags(
+            self.state.join("store.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(infra)?;
+        store
+            .query_row(
+                "SELECT count(*) FROM steps WHERE session_id=?1 AND turn=1",
+                [session],
+                |row| row.get(0),
+            )
+            .map_err(infra)
+    }
+
     fn committed(&self, session: &str) -> Result<(Value, Vec<Value>), ScenarioError> {
         let store = rusqlite::Connection::open_with_flags(
             self.state.join("store.sqlite3"),
@@ -553,8 +569,9 @@ fn s1_daemon_stop_force_ends_active_turn_immediately() -> TestResult {
             let mut daemon = Daemon::start(paths, evidence)?;
             let (session, agent, grandchild) = start_held_turn(paths, evidence)?;
             // `hold.entered` proves only that the vendor emitted its text; force
-            // once the daemon has made it durable (and so `turn.started` too).
-            wait_event(paths, &session, "assistant.text")?;
+            // once the daemon has made the acceptance durable. Model text is
+            // not an event (Task 4 design §2.1).
+            wait_event(paths, &session, "turn.started")?;
             let started = Instant::now();
             let stop = paths.run(
                 evidence,
@@ -600,19 +617,16 @@ fn s1_daemon_stop_force_ends_active_turn_immediately() -> TestResult {
                     && envelope["cancel"]["cleanup"] == "quiescent",
                 || format!("cancel {}", envelope["cancel"]),
             )?;
-            // Observations committed before the force stay in the turn (W3-F 8).
+            // Events committed before the force stay in the turn (W3-F 8),
+            // and the forced terminal carries the open step's row (Task 4
+            // design §3.2).
             check_forced_lifecycle(
                 &envelope,
                 &events,
-                &[
-                    "turn.queued",
-                    "turn.submitted",
-                    "turn.started",
-                    "assistant.text",
-                ],
+                &["turn.queued", "turn.submitted", "turn.started"],
             )?;
-            let text = &events[3];
-            check(text["text"] == "partial", || format!("text {text}"))?;
+            let rows = paths.step_rows(&session)?;
+            check(rows == 1, || format!("{rows} step rows"))?;
             check(elapsed < FINAL_SHUTDOWN, || {
                 format!("force took {elapsed:?}")
             })
@@ -914,7 +928,9 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
         |paths, evidence| {
             let mut daemon = Daemon::start(paths, evidence)?;
             let (session, _, _) = start_held_turn(paths, evidence)?;
-            wait_event(paths, &session, "assistant.text")?;
+            // The acceptance is the turn's last write before its terminal;
+            // model text is not an event (Task 4 design §2.1).
+            wait_event(paths, &session, "turn.started")?;
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("hold.release"), b"").map_err(infra)?;
             let latched = wait_latched(paths);
@@ -1074,7 +1090,8 @@ fn s1_daemon_stop_force_before_acceptance_is_forced() -> TestResult {
     )
 }
 
-/// W3-F 8 under runtime §7: a turn whose event commit failed latches Store
+/// W3-F 8 under runtime §7: a turn whose write failed (Task 4: a step
+/// row's, since model text is no event) latches Store
 /// failure; the daemon force-stops itself and the turn ends `failed(store)`,
 /// not `cancelled`: C1 §8.2 `store` records that the durable stream lost an
 /// event, and hiding it behind a cancellation would claim a complete record.
@@ -1087,6 +1104,9 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
         "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hold"},
         "steps":[
             {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"first"}},
+            {"action":"emit","message":{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t","name":"shell"}},
+            {"action":"emit","message":{"type":"tool_ended","vendor_turn_id":"fake-turn-1","tool_id":"t"}},
             {"action":"gate","name":"text"},
             {"action":"emit","message":{"type":"text","vendor_turn_id":"fake-turn-1","text":"lost"}},
             {"action":"report_pids"},
@@ -1122,8 +1142,9 @@ fn s1_daemon_stop_force_after_store_failure_ends_failed_store() -> TestResult {
             wait_event(paths, &session, "turn.started")?;
             let lock = hold_store_write_lock(paths)?;
             fs::write(paths.sync.join("text.release"), b"").map_err(infra)?;
-            // Past the Store's 250 ms busy timeout the text commit fails and
-            // latches; the lock is released once the daemon reports the
+            // Past the Store's 250 ms busy timeout the commit of step 1's row,
+            // which the text after the tool result ends, fails and latches
+            // (Task 4 design §3.2); the lock is released once the daemon reports the
             // latch, so the failure-resolution batch can commit (re-pointed
             // in S5: the socket now stays through the diagnostic window).
             let latched = wait_latched(paths);

@@ -55,15 +55,33 @@ fn script(prompt: &str, steps: &[Value]) -> Value {
     json!({"expected_request":{"type":"start","id":1,"turn":1,"prompt":prompt},"steps":steps})
 }
 
-/// `count` copies of one text message in one write burst, then the vendor
+/// One step's messages as one write: a tool round, then model output.
+fn step_block() -> TestResult<String> {
+    let mut block = String::new();
+    for message in [
+        json!({"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t","name":"shell"}),
+        json!({"type":"tool_ended","vendor_turn_id":"fake-turn-1","tool_id":"t"}),
+        text("next"),
+    ] {
+        block.push_str(&serde_json::to_string(&message)?);
+        block.push('\n');
+    }
+    Ok(block)
+}
+
+/// Model output (Core is held on it), then `first` step blocks of three
+/// progress items each, gate `burst`, `second` more blocks; then the vendor
 /// reports its pid and falls silent.
-fn flood_then_silence(prompt: &str, piece: &str, count: u64) -> TestResult<Value> {
-    let line = format!("{}\n", serde_json::to_string(&text(piece))?);
+fn blocks_then_silence(prompt: &str, first: u64, second: u64) -> TestResult<Value> {
+    let block = step_block()?;
     Ok(script(
         prompt,
         &[
             accepted(),
-            json!({"action":"flood","text":line,"count":count}),
+            json!({"action":"emit","message":text("first")}),
+            json!({"action":"flood","text":block,"count":first}),
+            json!({"action":"gate","name":"burst"}),
+            json!({"action":"flood","text":block,"count":second}),
             json!({"action":"report_pids"}),
             json!({"action":"hang"}),
         ],
@@ -189,13 +207,6 @@ impl Setup {
             .ok_or_else(|| failure(format!("daemon status has no pid: {status}")))
     }
 
-    /// Committed events of `kind` in `session`.
-    fn committed(&self, session: &str, kind: &str) -> Result<i64, ScenarioError> {
-        self.sandbox.count(&format!(
-            "SELECT count(*) FROM events WHERE session_id='{session}' AND type='{kind}'"
-        ))
-    }
-
     /// Waits until the fake's reported process is gone: Route stopped it.
     fn await_vendor_stopped(&self) -> Result<(), ScenarioError> {
         let pid_file = self.sandbox.sync.join("agent.pid");
@@ -212,6 +223,37 @@ impl Setup {
                 ));
             }
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `via status <session>` (C1 §3.7).
+    fn status(&self, evidence: &Evidence, session: &str) -> Result<Value, ScenarioError> {
+        cli(
+            &self.sandbox,
+            evidence,
+            "status",
+            &["status", session, "--json"],
+        )
+    }
+
+    /// Waits until the turn's `last_activity_at` holds still across two
+    /// reads 100 ms apart: Route took what the vendor wrote.
+    fn activity_settled(&self, evidence: &Evidence, session: &str) -> Result<(), ScenarioError> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let activity = |status: Value| status["progress"]["last_activity_at"].clone();
+        let mut previous = activity(self.status(evidence, session)?);
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            let next = activity(self.status(evidence, session)?);
+            if next == previous && next.is_string() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ScenarioError::Timeout(format!(
+                    "activity never settled: {next}"
+                )));
+            }
+            previous = next;
         }
     }
 
@@ -234,9 +276,12 @@ fn stopped(pid: &str) -> bool {
     }
 }
 
-/// Holds Core at its first text observation, lets the stall fail the turn,
-/// then releases Core: every observation admitted before the stall commits.
-/// Returns the committed text count and the envelope.
+/// Holds Core at its first model output, lets the stall fail the turn,
+/// then releases Core: every observation admitted before the stall is
+/// handled. The vendor's second burst follows once Route took the first
+/// (its arrivals stopped moving the activity clock), so the Wire queue of
+/// 1,024 messages never overflows (A47). Returns the turn's step rows and
+/// the envelope.
 fn held_turn(
     setup: &Setup,
     evidence: &Evidence,
@@ -250,40 +295,43 @@ fn held_turn(
         .failpoints
         .wait_ack(PAUSE, 2, "pause", pid, Duration::from_secs(20))
         .map_err(failure)?;
+    setup.sandbox.await_gate("burst")?;
+    setup.activity_settled(evidence, &session)?;
+    setup.sandbox.release_gate("burst")?;
     setup.await_vendor_stopped()?;
     setup.failpoints.release(PAUSE, 2).map_err(infra)?;
     let envelope = setup.wait(evidence, &session)?;
     setup.record(evidence, &envelope, &session)?;
-    let texts = setup.committed(&session, "assistant.text")?;
+    let rows = setup.sandbox.count(&format!(
+        "SELECT count(*) FROM steps WHERE session_id='{session}' AND turn=1"
+    ))?;
     drop(daemon);
-    Ok((texts, envelope))
+    Ok((rows, envelope))
 }
 
 /// Design §2.3 Stall, §13.2: Core is held at `core.observations.pause` on
-/// its first text. The vendor then writes four texts of almost 1 MiB, each
-/// split into four items: three fill the 4 MiB byte budget (the held item
-/// counts until handled), the fourth's delivery blocks, and the vendor
-/// writes nothing more. At the lowered stall the Adapter drops the hop,
-/// Route fails the turn `overflow` and stops the vendor; the Wire queue
-/// never overflows (four messages, under 4 MiB). Once Core resumes, the
-/// three admitted texts commit.
+/// its first model output. The vendor then writes 341 steps of three
+/// progress items (1,023) and, once Route took them, two more steps whose
+/// items fill the 1,024-item channel and the hop until a delivery blocks;
+/// the vendor writes nothing more. At the lowered stall the Adapter drops
+/// the hop, Route fails the turn `overflow` and stops the vendor; the Wire
+/// queue never overflows. Once Core resumes, the admitted items are
+/// handled: 341 steps end, and the open step 342's row rides in the
+/// terminal (Task 4 design §3.2): step 342's model output was never
+/// admitted.
 #[test]
 fn s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output() -> TestResult {
-    let large = "s".repeat(1024 * 1024 - 1024);
-    let setup = Setup::new(&flood_then_silence("stall", &large, 4)?)?;
+    let setup = Setup::new(&blocks_then_silence("stall", 341, 2)?)?;
     let evidence = Evidence::new("s1_f24_stall", &setup.sandbox.fake, &setup.sandbox.fixture)?;
     let report = run_scenario(
         evidence,
         |evidence| {
-            let (texts, envelope) = held_turn(&setup, evidence, "stall")?;
+            let (rows, envelope) = held_turn(&setup, evidence, "stall")?;
             check(
                 envelope["state"] == "failed" && envelope["failure"]["class"] == "overflow",
                 || format!("stalled turn: {envelope}"),
             )?;
-            // Three texts of four pieces each were admitted.
-            check(texts == 12, || {
-                format!("{texts} text pieces committed, not 12")
-            })?;
+            check(rows == 342, || format!("{rows} step rows, not 342"))?;
             setup.no_fallback_drops()
         },
         |evidence| collect_available(evidence, &setup.sandbox.state),
@@ -344,13 +392,16 @@ fn s1_wire_route_services_cancel_while_stdin_is_held() -> TestResult {
     report.require_pass()
 }
 
-/// F27 through the daemon: a text message written in three pieces cut
-/// inside multi-byte characters commits byte-exact; once it has, a 2 MiB line
-/// fails the turn `overflow` with its first 64 KiB saved and named.
+/// F27 through the daemon: a `tool_started` message written in three pieces
+/// cut inside multi-byte characters reaches `status` byte-exact as the
+/// running tool's name; then a 2 MiB line fails the turn `overflow` with its
+/// first 64 KiB saved and named.
 #[test]
 fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix() -> TestResult {
     let exact = "é😀 split ✓";
-    let line = format!("{}\n", serde_json::to_string(&text(exact))?);
+    let started =
+        json!({"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t","name":exact});
+    let line = format!("{}\n", serde_json::to_string(&started)?);
     let bytes = line.as_bytes();
     let cut = |at: &str| {
         line.find(at)
@@ -385,13 +436,17 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
                 thread::sleep(Duration::from_millis(50));
                 setup.sandbox.release_gate(gate)?;
             }
-            // The text commits before the huge line: a latched failure
+            // The tool is running before the huge line: a latched failure
             // drops what is still in flight (design §8.5).
             setup.sandbox.await_gate("three")?;
-            let committed_by = Instant::now() + Duration::from_secs(20);
-            while setup.committed(&session, "assistant.text")? < 1 {
-                check(Instant::now() < committed_by, || {
-                    "the split text never committed".to_owned()
+            let running_by = Instant::now() + Duration::from_secs(20);
+            loop {
+                let status = setup.status(evidence, &session)?;
+                if status["progress"]["running_tools"] == json!([exact]) {
+                    break;
+                }
+                check(Instant::now() < running_by, || {
+                    format!("the split tool never ran: {status}")
                 })?;
                 thread::sleep(Duration::from_millis(10));
             }
@@ -401,25 +456,6 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
             check(
                 envelope["state"] == "failed" && envelope["failure"]["class"] == "overflow",
                 || format!("huge-line turn: {envelope}"),
-            )?;
-            let texts = cli(
-                &setup.sandbox,
-                evidence,
-                "events",
-                &["events", &session, "--json"],
-            )?;
-            let committed: Vec<&Value> = texts["events"]
-                .as_array()
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|event| event["type"] == "assistant.text")
-                        .collect()
-                })
-                .unwrap_or_default();
-            check(
-                committed.len() == 1 && committed[0]["text"] == exact,
-                || format!("split text: {committed:?}"),
             )?;
             let saved = fs::read(
                 setup

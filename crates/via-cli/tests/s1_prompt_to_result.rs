@@ -817,7 +817,7 @@ fn envelope_violations(
     if envelope["cost"] != json!({"usd":null,"scope":"turn","provenance":"unavailable"}) {
         problems.push(format!("envelope.cost = {}", envelope["cost"]));
     }
-    if envelope["events"] != json!({"first_seq":1,"last_seq":5,"count":5}) {
+    if envelope["events"] != json!({"first_seq":1,"last_seq":4,"count":4}) {
         problems.push(format!("envelope.events = {}", envelope["events"]));
     }
     // Task 4 design §7.5: the turn's evidence folder, absolute; no
@@ -851,7 +851,6 @@ fn event_violations(
             "turn.queued",
             "turn.submitted",
             "turn.started",
-            "assistant.text",
             "turn.ended",
         ]
     {
@@ -870,15 +869,17 @@ fn event_violations(
             ));
         }
     }
-    if let [queued, submitted, started, text, ended] = events {
+    // Task 4 design §2.1: model text is not an event; the reply is the
+    // envelope's `final_text`.
+    if envelope["final_text"] != "reply" {
+        problems.push(format!("envelope.final_text: {}", envelope["final_text"]));
+    }
+    if let [queued, submitted, started, ended] = events {
         if !queued["queue_position"].is_u64() || submitted["attempt"] != 1 {
             problems.push("turn.queued/turn.submitted payload".to_owned());
         }
         if started["effective"] != receipt["effective"] {
             problems.push(format!("turn.started payload: {started}"));
-        }
-        if text["text"] != "reply" || text["final"] != false {
-            problems.push(format!("assistant.text payload: {text}"));
         }
         if ended["state"] != "completed"
             || ended["stop_reason"] != "end_turn"
