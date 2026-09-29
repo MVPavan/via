@@ -4,10 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock,
-        mpsc::{self, Receiver, SyncSender, TrySendError},
-    },
+    sync::{Arc, OnceLock},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -18,10 +15,26 @@ use tokio::sync::oneshot;
 
 use crate::{
     CommitOutcome, EvidenceRoot, Identity, SessionId, StoreFailureKind, TurnNumber,
+    blob::{BlobReader, BlobRef, BlobTasks, BlobWriter, Blobs},
     evidence::sync_dir,
+    lanes::{Lane, Lanes},
 };
 
 const SCHEMA_VERSION: i64 = 6;
+
+/// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
+/// transaction's payload cap (design §6.4).
+pub const ENVELOPE_MAX: usize = 1024 * 1024;
+
+/// Most events one Store request carries (runtime §8, A30).
+const TRANSACTION_EVENTS: usize = 128;
+
+/// Most payload bytes one Store request carries, besides one terminal
+/// envelope (runtime §8, A30).
+const TRANSACTION_BYTES: usize = 1024 * 1024;
+
+/// Fixed overhead counted for every request: IDs, numbers and the command.
+const REQUEST_OVERHEAD: usize = 512;
 
 /// Most queued turns one session holds, enforced inside the receipt
 /// transaction (C1 P6, runtime §6); Core also checks it to answer `queue_full`.
@@ -66,9 +79,10 @@ pub enum StoreError {
     /// A stored row cannot be read back as written.
     #[error("stored evidence is missing or corrupt")]
     CorruptEvidence,
-    /// The request never reached the SQLite writer: its bounded queue was
-    /// full. Nothing was written.
-    #[error("Store request not enqueued: the writer queue is full")]
+    /// The request never reached the SQLite writer: its lane was full, the
+    /// request was over the transaction cap, or the Store was shutting
+    /// down. Nothing was written.
+    #[error("Store request not enqueued: its lane is full or it is too large")]
     NotEnqueued,
     /// The SQLite writer is gone: its queue is disconnected or
     /// it dropped the reply. The request may have committed.
@@ -112,13 +126,60 @@ impl StoreError {
     }
 }
 
-/// Maps a failed `try_send` to the SQLite writer: a full queue never
-/// enqueued the request, a disconnected one lost its writer (design §7.1).
-fn enqueue_error<T>(error: &TrySendError<T>) -> StoreError {
-    match error {
-        TrySendError::Full(_) => StoreError::NotEnqueued,
-        TrySendError::Disconnected(_) => StoreError::WriterLost,
+/// A turn's prompt as Store keeps it: inline, or, over [`crate::INLINE_MAX`]
+/// bytes, a finished blob (design §6.5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Prompt {
+    /// The prompt text, stored in `turns.prompt`.
+    Inline(String),
+    /// A finished blob holding the prompt, named by `turns.prompt_blob`.
+    Blob(BlobRef),
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self::Inline(text)
     }
+}
+
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Self {
+        Self::Inline(text.to_owned())
+    }
+}
+
+impl Prompt {
+    /// The bytes a request binds for it.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Inline(text) => text.len(),
+            Self::Blob(blob) => blob.id().len() + 96,
+        }
+    }
+}
+
+/// A terminal's facts, read from the stored envelope with `json_extract`
+/// and never parsed into a value (design §6.7): its state and its C1 §3.5
+/// `cancel` object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalFacts {
+    /// Terminal state: `completed`, `failed`, `cancelled` or `unknown`.
+    pub state: String,
+    /// The envelope's `cancel`; `None` when it is `null`.
+    pub cancel: Option<TerminalCancel>,
+}
+
+/// An envelope's C1 §3.5 `cancel` object.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct TerminalCancel {
+    /// `requested` or `forced`.
+    pub outcome: String,
+    /// `quiescent`, `uncertain` or `pending`.
+    pub cleanup: String,
+    /// When the stop was requested.
+    pub requested_at: String,
+    /// When the stop settled.
+    pub settled_at: String,
 }
 
 /// Atomic session and first-turn creation proposed by Core.
@@ -132,7 +193,7 @@ pub struct SpawnRecord {
     /// Frozen validated parameters for this turn.
     pub params: Value,
     /// Frozen first-turn prompt.
-    pub prompt: String,
+    pub prompt: Prompt,
     /// Turn 1's frozen effective per-turn values (C1 §3.2 `effective`).
     pub effective: Value,
     /// Core's initial canonical queued event, with sequence one.
@@ -181,7 +242,7 @@ pub struct ResumeRecord {
     /// The session's next turn number.
     pub turn: TurnNumber,
     /// Frozen prompt.
-    pub prompt: String,
+    pub prompt: Prompt,
     /// Frozen effective per-turn values, resolved by Core under admission
     /// against [`SessionSnapshot::latest_effective`] (C1 P5).
     pub effective: Value,
@@ -210,14 +271,15 @@ pub struct SessionSnapshot {
 pub struct Predecessors {
     /// An earlier turn is still queued or running: no terminal is durable.
     pub unresolved: bool,
-    /// Terminal envelope of the latest earlier turn that was submitted.
-    pub last_submitted: Option<Value>,
+    /// Terminal facts of the latest earlier turn that was submitted, once
+    /// its terminal committed.
+    pub last_submitted: Option<TerminalFacts>,
 }
 
 /// Durable facts of a queued turn that its submission needs.
 pub struct QueuedTurn {
     /// Frozen prompt.
-    pub prompt: String,
+    pub prompt: Prompt,
     /// Frozen effective per-turn values the turn is driven from.
     pub effective: Value,
     /// Time of `turn.queued`.
@@ -597,20 +659,27 @@ impl RuntimeResources {
     }
 }
 
-/// Host-only process journal port over Store's existing bounded writer.
+/// Host-only process journal port over Store's bounded writer: its requests
+/// join the Internal lane and never wait for room (design §6.1).
 #[derive(Clone)]
 pub struct ProcessJournal {
-    sender: SyncSender<Command>,
+    lanes: Arc<Lanes>,
 }
 
-/// Bounded asynchronous Core access to the sole SQLite connection.
+/// Bounded asynchronous access to the sole SQLite connection. A handle's
+/// requests join one lane: Internal by default, or the one
+/// [`StoreClient::public`], [`StoreClient::lifecycle`] or
+/// [`StoreClient::latch`] names (design §6.1).
 #[derive(Clone)]
 pub struct StoreClient {
-    sender: SyncSender<Command>,
+    lanes: Arc<Lanes>,
+    lane: Lane,
     evidence: EvidenceRoot,
+    blobs: Blobs,
 }
 
-enum Command {
+/// One request for the SQLite writer.
+pub(crate) enum Command {
     Spawn(
         SpawnRecord,
         Option<SpawnKey>,
@@ -684,6 +753,11 @@ enum Command {
         TurnNumber,
         oneshot::Sender<Result<Option<Value>, StoreError>>,
     ),
+    TerminalFacts(
+        SessionId,
+        TurnNumber,
+        oneshot::Sender<Result<Option<TerminalFacts>, StoreError>>,
+    ),
     Terminated(
         Vec<(SessionId, TurnNumber)>,
         oneshot::Sender<Result<Vec<(SessionId, TurnNumber)>, StoreError>>,
@@ -741,12 +815,253 @@ enum Command {
         AnchorQuery,
         oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>,
     ),
-    Shutdown,
+    VerifyBlobs(oneshot::Sender<Result<(), StoreError>>),
+    SweepBlobs(oneshot::Sender<Result<u64, StoreError>>),
+}
+
+/// A request's size for its lane and the transaction cap (design §6.4).
+struct Size {
+    /// Encoded variable payload plus [`REQUEST_OVERHEAD`].
+    bytes: usize,
+    /// The one terminal envelope the cap does not count.
+    envelope: usize,
+    /// Events the request commits.
+    events: usize,
+}
+
+impl Size {
+    /// Within the cap: at most 128 events and 1 MiB of payload besides one
+    /// envelope of at most `ENVELOPE_MAX`.
+    fn within_cap(&self) -> bool {
+        self.events <= TRANSACTION_EVENTS
+            && self.envelope <= ENVELOPE_MAX
+            && self.bytes - self.envelope - REQUEST_OVERHEAD <= TRANSACTION_BYTES
+    }
+}
+
+/// Counts bytes written through it.
+struct Counting(usize);
+
+impl std::io::Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The encoded length of `value`, as the writer binds it.
+fn encoded(value: &Value) -> usize {
+    let mut counting = Counting(0);
+    // Encoding a `Value` into a counter cannot fail.
+    let _ = serde_json::to_writer(&mut counting, value);
+    counting.0
+}
+
+impl TerminalRecord {
+    /// Payload bytes besides its envelope, and the envelope's.
+    fn sizes(&self) -> (usize, usize) {
+        (
+            self.session_id.as_str().len() + encoded(&self.event),
+            encoded(&self.envelope),
+        )
+    }
+}
+
+impl AnchorIdentity {
+    fn bytes(&self) -> usize {
+        self.boot_id.len() + self.pid_namespace.len() + self.marker.len()
+    }
+}
+
+impl Command {
+    /// What the request binds (design §6.4): an exhaustive match, so a new
+    /// command must say its size.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive match over every command"
+    )]
+    fn size(&self) -> Size {
+        let (payload, envelope, events) = match self {
+            Self::Spawn(record, key, _) => (
+                record.session_id.as_str().len()
+                    + encoded(&record.receipt)
+                    + encoded(&record.params)
+                    + record.prompt.bytes()
+                    + encoded(&record.effective)
+                    + encoded(&record.initial_event)
+                    + key.as_ref().map_or(0, |key| key.key.len()),
+                0,
+                1,
+            ),
+            Self::SpawnKey(key, _) => (key.len(), 0, 0),
+            Self::Resume(record, _) => (
+                record.session_id.as_str().len()
+                    + record.prompt.bytes()
+                    + encoded(&record.effective)
+                    + encoded(&record.event)
+                    + record.operation.as_ref().map_or(0, |operation| {
+                        operation.op_key.len() + encoded(&operation.result)
+                    }),
+                0,
+                1,
+            ),
+            Self::Operation(session, key, _) | Self::KeyedOperation(session, key, _) => {
+                (session.as_str().len() + key.len(), 0, 0)
+            }
+            Self::Snapshot(session, _)
+            | Self::QueuedTurn(session, _, _)
+            | Self::NextSeq(session, _)
+            | Self::Predecessors(session, _, _)
+            | Self::CloseResult(session, _)
+            | Self::Result(session, _, _)
+            | Self::TerminalFacts(session, _, _)
+            | Self::Events(session, _, _, _)
+            | Self::EvidenceRefs(session, _, _)
+            | Self::Authenticate(session, _, _) => (session.as_str().len(), 0, 0),
+            Self::Submission(record, _) => (
+                record.session_id.as_str().len() + encoded(&record.event),
+                0,
+                1,
+            ),
+            Self::Acceptance(record, _) => (
+                record.session_id.as_str().len()
+                    + record.correlation.len()
+                    + encoded(&record.event),
+                0,
+                1,
+            ),
+            Self::Event(record, _) => (
+                record.session_id.as_str().len() + encoded(&record.event),
+                0,
+                1,
+            ),
+            Self::Terminal(record, _, _) => {
+                let (payload, envelope) = record.sizes();
+                (payload, envelope, 1)
+            }
+            Self::Closing(record, _) => (
+                record.session_id.as_str().len()
+                    + record
+                        .operation
+                        .as_ref()
+                        .map_or(0, |operation| operation.op_key.len()),
+                0,
+                0,
+            ),
+            Self::Closed(record, _) => (
+                record.session_id.as_str().len()
+                    + encoded(&record.event)
+                    + record
+                        .operation
+                        .as_ref()
+                        .map_or(0, |operation| operation.op_key.len()),
+                0,
+                1,
+            ),
+            Self::ClosingSessions(after, _, _) => {
+                (after.as_ref().map_or(0, |after| after.as_str().len()), 0, 0)
+            }
+            Self::SubmitFailed(record, _) => (
+                record.session_id.as_str().len()
+                    + encoded(&record.submitted)
+                    + encoded(&record.ended),
+                encoded(&record.envelope),
+                2,
+            ),
+            Self::FailureResolution(record, _) => {
+                let (payload, envelope) = record.terminal.sizes();
+                let cancellations: usize = record
+                    .cancellations
+                    .iter()
+                    .map(|cancellation| {
+                        let (payload, envelope) = cancellation.sizes();
+                        payload + envelope
+                    })
+                    .sum();
+                (
+                    payload + cancellations,
+                    envelope,
+                    1 + record.cancellations.len(),
+                )
+            }
+            Self::ClosingTerminal(record, closed, _) => {
+                let (payload, envelope) = record.sizes();
+                (payload + encoded(closed), envelope, 2)
+            }
+            Self::SessionClosed(session, closed, _) => {
+                (session.as_str().len() + encoded(closed), 0, 1)
+            }
+            Self::Terminated(turns, _) => (
+                turns
+                    .iter()
+                    .map(|(session, _)| session.as_str().len() + 4)
+                    .sum(),
+                0,
+                0,
+            ),
+            Self::AnchorOwners(after, _, _, _) | Self::UnprovenAnchors(after, _, _, _) => {
+                (after.as_ref().map_or(0, String::len), 0, 0)
+            }
+            Self::QueuedTurns(after, _, _) => (
+                after
+                    .as_ref()
+                    .map_or(0, |(session, _)| session.as_str().len() + 4),
+                0,
+                0,
+            ),
+            Self::Unfinished(_)
+            | Self::AnchorCohort(_)
+            | Self::VerifyBlobs(_)
+            | Self::SweepBlobs(_) => (0, 0, 0),
+            Self::AnchorIntent(intent, _) => (
+                intent.anchor_id.len()
+                    + intent.generation.len()
+                    + intent.marker.len()
+                    + intent.socket_path.as_os_str().len()
+                    + intent.owner_session.as_str().len()
+                    + intent.boot_id.len()
+                    + intent.pid_namespace.len(),
+                0,
+                0,
+            ),
+            Self::AnchorIdentified(id, generation, _, identity, _) => {
+                (id.len() + generation.len() + identity.bytes(), 0, 0)
+            }
+            Self::ArmIntent(id, generation, _, _) | Self::VendorFacts(id, generation, _, _) => {
+                (id.len() + generation.len(), 0, 0)
+            }
+            Self::GroupAbsence(proof, _) => (
+                proof.anchor_id.len()
+                    + proof.generation.len()
+                    + proof.boot_id.len()
+                    + proof.pid_namespace.len()
+                    + proof.observed_at.len()
+                    + proof.identity.as_ref().map_or(0, AnchorIdentity::bytes),
+                0,
+                0,
+            ),
+            Self::AnchorRecords(query, _) => (
+                query.after.as_ref().map_or(0, String::len)
+                    + query.owner.as_ref().map_or(0, |owner| owner.as_str().len()),
+                0,
+                0,
+            ),
+        };
+        Size {
+            bytes: payload + envelope + REQUEST_OVERHEAD,
+            envelope,
+            events,
+        }
+    }
 }
 
 /// One page of anchor records: after `after`, at most `limit`, optionally
 /// only unproven ones, only one owner session's and only one cohort's.
-struct AnchorQuery {
+pub(crate) struct AnchorQuery {
     after: Option<String>,
     limit: u32,
     unproven: bool,
@@ -894,6 +1209,8 @@ impl Store {
                 .map_err(|error| StoreError::Open(error.to_string()))?;
             sync_dir(state).map_err(|error| StoreError::Open(error.to_string()))?;
         }
+        // Design §6.5: `blobs/`, validated or created the same way.
+        let blobs = Blobs::open(state)?;
         if created {
             // Exclusive (and never through a symlink): a file that appeared
             // since the check is not one VIA created.
@@ -912,17 +1229,20 @@ impl Store {
         fs::set_permissions(&db, fs::Permissions::from_mode(0o600))
             .map_err(|error| StoreError::Open(error.to_string()))?;
         configure(&mut conn, created)?;
-        let (sender, receiver) = mpsc::sync_channel(128);
+        let lanes = Arc::new(Lanes::default());
         let read_corruption = ReadCorruption::default();
         let observer = read_corruption.clone();
+        let (writer_lanes, writer_blobs) = (Arc::clone(&lanes), blobs.clone());
         let writer_join = thread::Builder::new()
             .name("via-store-sqlite".to_owned())
-            .spawn(move || writer_loop(conn, &receiver, &observer))
+            .spawn(move || writer_loop(conn, &writer_lanes, &observer, &writer_blobs))
             .map_err(|error| StoreError::Open(error.to_string()))?;
         Ok(Self {
             client: StoreClient {
-                sender,
+                lanes,
+                lane: Lane::Internal,
                 evidence: EvidenceRoot::new(state),
+                blobs,
             },
             writer_join: Some(writer_join),
             read_corruption,
@@ -949,23 +1269,118 @@ impl Store {
         RuntimeResources {
             evidence: self.client.evidence.clone(),
             journal: ProcessJournal {
-                sender: self.client.sender.clone(),
+                lanes: Arc::clone(&self.client.lanes),
             },
         }
+    }
+
+    /// Test builds: how many blob files this Store's handles created.
+    #[cfg(feature = "test-failpoints")]
+    pub fn blob_writes(&self) -> u64 {
+        self.client.blobs.writes()
+    }
+
+    /// Test builds: blob steps the Store still owns, after reaping ended ones.
+    #[cfg(feature = "test-failpoints")]
+    pub fn blob_tasks(&self) -> usize {
+        self.client.blobs.tasks.outstanding()
     }
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // A queued mutation is handled before Shutdown; disconnect never aborts it.
-        let _ = self.client.sender.send(Command::Shutdown);
+        // The admission fence (design §6.3): every request accepted before
+        // it is served in lane order, then the writer ends.
+        self.client.lanes.fence();
         if let Some(join) = self.writer_join.take() {
             let _ = join.join();
         }
+        // Owned blob steps (coding-style §5): a bounded wait; the rest end
+        // on their own, and final shutdown counts them through
+        // `StoreClient::blob_tasks` as pending work.
+        let _ = self.client.blobs.tasks.drain(crate::blob::BLOB_DRAIN);
     }
 }
 
 impl StoreClient {
+    fn on(&self, lane: Lane) -> Self {
+        Self {
+            lane,
+            ..self.clone()
+        }
+    }
+
+    /// This handle on the Public lane, for reads a C1 handler issues: a
+    /// full lane refuses them `NotEnqueued`, which never latches.
+    #[must_use]
+    pub fn public(&self) -> Self {
+        self.on(Lane::Public)
+    }
+
+    /// This handle on the Lifecycle lane, for final shutdown's pipeline.
+    #[must_use]
+    pub fn lifecycle(&self) -> Self {
+        self.on(Lane::Lifecycle)
+    }
+
+    /// This handle on the Latch lane, for the failure-resolution unit.
+    #[must_use]
+    pub fn latch(&self) -> Self {
+        self.on(Lane::Latch)
+    }
+
+    /// Test builds: the writer's lanes, for their accessors.
+    #[cfg(feature = "test-failpoints")]
+    pub fn lanes(&self) -> &Lanes {
+        &self.lanes
+    }
+
+    /// The Store's owned blob steps, for final shutdown to count those
+    /// still running after the Store is dropped.
+    pub fn blob_tasks(&self) -> BlobTasks {
+        self.blobs.tasks.clone()
+    }
+
+    /// Creates a new blob file for a request's large value (design §6.5),
+    /// before `admission` is taken.
+    pub async fn blob_writer(&self) -> Result<BlobWriter, StoreError> {
+        self.blobs.writer().await
+    }
+
+    /// Unlinks a finished blob after a commit known not to have happened;
+    /// a lost discard is swept at the next start.
+    pub async fn discard_blob(&self, blob: BlobRef) {
+        self.blobs.discard(&blob).await;
+    }
+
+    /// Opens a finished blob for chunked reading.
+    pub async fn blob_reader(&self, blob: &BlobRef) -> Result<BlobReader, StoreError> {
+        self.blobs.reader(blob).await
+    }
+
+    /// Loads a prompt blob into one exact `String` with SHA-256 and UTF-8
+    /// checks; a blob that differs from its record is `CorruptEvidence`.
+    pub async fn load_prompt(&self, blob: &BlobRef) -> Result<String, StoreError> {
+        self.blobs.load_text(blob).await
+    }
+
+    /// Checks every blob a row names, on the SQLite thread, before
+    /// admission: a regular file of the recorded length and SHA-256, else
+    /// `Corrupt` (design §6.5).
+    pub async fn verify_blobs(&self) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::VerifyBlobs(reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Unlinks every blob no row names, on the SQLite thread, before
+    /// admission; returns how many.
+    pub async fn sweep_blobs(&self) -> Result<u64, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SweepBlobs(reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
     /// Atomically persists the receipt, handle hash, session and queued first turn.
     pub async fn commit_spawn(&self, record: SpawnRecord) -> Result<ReceiptRecord, StoreError> {
         self.commit_keyed_spawn(record, None).await
@@ -1223,6 +1638,18 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
+    /// Reads a committed terminal's state and `cancel` with `json_extract`,
+    /// without parsing the envelope (design §6.7); `None` before it commits.
+    pub async fn terminal_facts(
+        &self,
+        session_id: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<TerminalFacts>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::TerminalFacts(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
     /// Returns those of at most 1000 `turns` whose terminal envelope has
     /// committed, in one Store operation.
     pub async fn terminated(
@@ -1382,20 +1809,24 @@ impl StoreClient {
     }
 
     fn send(&self, command: Command) -> Result<(), StoreError> {
-        send_command(&self.sender, command)
+        send_command(&self.lanes, self.lane, command)
     }
 }
 
-/// Enqueues one request for the SQLite writer. The test-only
-/// `store.request.not_enqueued` point reports a full queue.
-fn send_command(sender: &SyncSender<Command>, command: Command) -> Result<(), StoreError> {
+/// Pushes one request onto `lane` without blocking (design §6.1, §6.4): a
+/// request over the transaction cap is refused before it is queued, and a
+/// lifecycle batch is never split. The test-only
+/// `store.request.not_enqueued` point reports a full lane.
+fn send_command(lanes: &Lanes, lane: Lane, command: Command) -> Result<(), StoreError> {
     #[cfg(feature = "test-failpoints")]
     if crate::failpoint::hit("store.request.not_enqueued").is_err() {
         return Err(StoreError::NotEnqueued);
     }
-    sender
-        .try_send(command)
-        .map_err(|error| enqueue_error(&error))
+    let size = command.size();
+    if !size.within_cap() {
+        return Err(StoreError::NotEnqueued);
+    }
+    lanes.push(lane, command, size.bytes)
 }
 
 impl ProcessJournal {
@@ -1525,7 +1956,7 @@ impl ProcessJournal {
     }
 
     fn send(&self, command: Command) -> Result<(), StoreError> {
-        send_command(&self.sender, command)
+        send_command(&self.lanes, Lane::Internal, command)
     }
 
     /// Enqueues a journal mutation and awaits its outcome. A request never
@@ -1554,11 +1985,18 @@ use anchor::{
 };
 use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};
 
+/// Validates a Store-managed directory as the State directory is validated.
+pub(crate) fn validate_dir(path: &Path) -> Result<(), StoreError> {
+    validate_state(path)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        CommitOutcome, EvidenceRoot, ProcessJournal, SessionId, StoreClient, StoreError,
-        StoreFailureKind, mpsc,
+        Blobs, CommitOutcome, EvidenceRoot, Lane, Lanes, ProcessJournal, SessionId, StoreClient,
+        StoreError, StoreFailureKind,
         sql::{commit, commit_error, sql_error},
     };
 
@@ -1572,35 +2010,36 @@ mod tests {
             .expect("runtime")
     }
 
-    /// Design §7.1 [r3.9, r4.5]: a full writer queue never enqueued the
-    /// request; a disconnected queue or a dropped reply lost the writer.
+    /// Design §6.1, §6.3, §7.1 [r3.9, r4.5]: a full lane or the fence
+    /// never enqueued the request; a dropped reply or a dead writer lost
+    /// the writer. Task 4 replaced the one channel with lanes.
     #[test]
     fn writer_queue_failures_split_into_not_enqueued_and_writer_lost() {
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let root = tempfile::tempdir().expect("state");
+        let lanes = Arc::new(Lanes::default());
         let client = StoreClient {
-            sender,
-            evidence: EvidenceRoot::new(std::path::Path::new("/nonexistent")),
+            lanes: Arc::clone(&lanes),
+            lane: Lane::Internal,
+            evidence: EvidenceRoot::new(root.path()),
+            blobs: Blobs::open(root.path()).expect("blobs"),
         };
+        let latch = client.latch();
         let journal = ProcessJournal {
-            sender: client.sender.clone(),
+            lanes: Arc::clone(&lanes),
         };
         runtime().block_on(async {
-            // One request fills the queue; the reply of the queued one is kept.
+            // One request fills the Latch lane; the queued one's reply is kept.
             let queued = tokio::spawn({
-                let client = client.clone();
-                async move { client.next_seq(&session()).await }
+                let latch = latch.clone();
+                async move { latch.next_seq(&session()).await }
             });
             tokio::task::yield_now().await;
             assert!(matches!(
-                client.next_seq(&session()).await,
+                latch.next_seq(&session()).await,
                 Err(StoreError::NotEnqueued)
             ));
-            assert!(matches!(
-                journal.commit_vendor_facts("a", "g", 2).await,
-                CommitOutcome::NotCommitted(StoreFailureKind::Quota)
-            ));
             // The worker takes the request and drops its reply unserved.
-            drop(receiver.recv().expect("queued request"));
+            drop(lanes.pop().expect("queued request"));
             assert!(matches!(
                 queued.await.expect("join"),
                 Err(StoreError::WriterLost)
@@ -1610,12 +2049,12 @@ mod tests {
                 async move { journal.commit_vendor_facts("a", "g", 2).await }
             });
             tokio::task::yield_now().await;
-            drop(receiver.recv().expect("journal request"));
+            drop(lanes.pop().expect("journal request"));
             assert!(matches!(
                 journal_reply.await.expect("join"),
                 CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)
             ));
-            drop(receiver);
+            lanes.die(None);
             assert!(matches!(
                 client.next_seq(&session()).await,
                 Err(StoreError::WriterLost)
@@ -1623,6 +2062,15 @@ mod tests {
             assert!(matches!(
                 journal.commit_vendor_facts("a", "g", 2).await,
                 CommitOutcome::Uncertain(StoreFailureKind::UncertainCommit)
+            ));
+            // After the fence a journal write was never enqueued.
+            let fenced = ProcessJournal {
+                lanes: Arc::new(Lanes::default()),
+            };
+            fenced.lanes.fence();
+            assert!(matches!(
+                fenced.commit_vendor_facts("a", "g", 2).await,
+                CommitOutcome::NotCommitted(StoreFailureKind::Quota)
             ));
         });
     }
@@ -1651,9 +2099,10 @@ mod tests {
 
     /// Design §7.1 [O1.D8], S1 round-1 decision 1: a `COMMIT` step that
     /// reports `SQLITE_CORRUPT` or `SQLITE_NOTADB` is `Corrupt`; any other
-    /// commit failure stays `Uncertain`. Either latches. Every commit site
-    /// goes through `commit`, which a real failing `COMMIT` (a deferred
-    /// foreign key) exercises here.
+    /// commit failure stays `Uncertain`, except `SQLITE_FULL`, which rolls
+    /// back and is a known `Write` unless the rollback fails (Task 4 design
+    /// §5.3). Every commit site goes through `commit`, which a real failing
+    /// `COMMIT` (a deferred foreign key) exercises here.
     #[test]
     fn commit_failures_are_uncertain_unless_sqlite_reports_corruption() {
         let failure = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
@@ -1665,14 +2114,12 @@ mod tests {
                 CommitOutcome::Uncertain(StoreFailureKind::Corrupt)
             ));
         }
-        for code in [
-            rusqlite::ffi::SQLITE_FULL,
-            rusqlite::ffi::SQLITE_IOERR,
-            rusqlite::ffi::SQLITE_BUSY,
-        ] {
+        for code in [rusqlite::ffi::SQLITE_IOERR, rusqlite::ffi::SQLITE_BUSY] {
             let error = commit_error(failure(code));
             assert!(matches!(error, StoreError::Uncertain(_)), "{error:?}");
         }
+        let full = commit_error(failure(rusqlite::ffi::SQLITE_FULL));
+        assert!(matches!(full, StoreError::Write(_)), "{full:?}");
         let mut conn = rusqlite::Connection::open_in_memory().expect("memory database");
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;

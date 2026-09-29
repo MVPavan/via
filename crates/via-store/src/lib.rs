@@ -143,20 +143,26 @@ pub enum CommitOutcome<T> {
     Uncertain(StoreFailureKind),
 }
 
+mod blob;
 mod evidence;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint;
+pub mod json_limits;
+mod lanes;
 mod runtime;
 
+pub use blob::{BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX};
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
+pub use lanes::{Lane, Lanes};
 
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorCohort, AnchorIdentity, AnchorIntent,
     AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent,
-    ClosedOutcome, ClosedRecord, ClosingRecord, EventRecord, EvidenceRefs,
+    ClosedOutcome, ClosedRecord, ClosingRecord, ENVELOPE_MAX, EventRecord, EvidenceRefs,
     FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, GroupAbsenceRecord, KeyedOperation,
-    OperationRecord, OperationVerb, Predecessors, ProcessJournal, QueuedTurn, ReceiptRecord,
-    ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord,
-    Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    SubmitFailedRecord, TerminalExtras, TerminalRecord, UnfinishedTurn,
+    OperationRecord, OperationVerb, Predecessors, ProcessJournal, Prompt, QueuedTurn,
+    ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey,
+    SpawnRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey,
+    SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts,
+    TerminalRecord, UnfinishedTurn,
 };

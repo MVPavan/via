@@ -9,8 +9,8 @@ use std::{
 
 use serde_json::{Value, json};
 use via_store::{
-    EventRecord, QueuedTurn, ResumeRecord, SpawnRecord, Store, StoreClient, StoreError,
-    StoredEvent, SubmissionRecord, TerminalRecord,
+    BlobRef, EventRecord, QueuedTurn, ResumeRecord, SpawnRecord, Store, StoreClient, StoreError,
+    StoredEvent, SubmissionRecord, TerminalFacts, TerminalRecord,
 };
 
 use super::{
@@ -112,15 +112,19 @@ impl TurnJournal for FaultJournal {
         self.store.terminated(turns).await
     }
 
-    async fn result(
+    async fn terminal_facts(
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Option<Value>, StoreError> {
+    ) -> Result<Option<TerminalFacts>, StoreError> {
         if self.delayed_results && session.as_str() != SESSION {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        self.store.result(session, turn).await
+        self.store.terminal_facts(session, turn).await
+    }
+
+    async fn load_prompt(&self, blob: &BlobRef) -> Result<String, StoreError> {
+        self.store.load_prompt(blob).await
     }
 
     async fn queued_turn(
@@ -174,7 +178,7 @@ async fn running_turn(root: &tempfile::TempDir) -> Store {
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
-            prompt: "hello".to_owned(),
+            prompt: "hello".into(),
             effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
         })
@@ -363,7 +367,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         .commit_resume(ResumeRecord {
             session_id: session(),
             turn: TurnNumber::try_from(2).unwrap(),
-            prompt: "next".to_owned(),
+            prompt: "next".into(),
             effective: frozen(),
             event: queued,
             operation: None,
@@ -474,7 +478,7 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
-            prompt: "hello".to_owned(),
+            prompt: "hello".into(),
             effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
         })

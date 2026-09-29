@@ -11,8 +11,8 @@ use via_adapters::{
     RouteError, StopOrder, StopWatch, ToolStatus, WireCleanup,
 };
 use via_store::{
-    AcceptanceRecord, CancelCause, QueuedTurn, StoreError, SubmissionRecord, TerminalExtras,
-    TerminalRecord,
+    AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StoreError, SubmissionRecord,
+    TerminalExtras, TerminalRecord,
 };
 
 use super::batch::AffectedTurn;
@@ -31,12 +31,13 @@ use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 
-/// A committed submission: the queued turn's facts, its frozen effective
-/// values and the submission time.
+/// A committed submission: the queued turn's facts, its loaded prompt, its
+/// frozen effective values and the submission time.
 pub(super) struct Submission {
     session: SessionId,
     turn: TurnNumber,
     queued: QueuedTurn,
+    prompt: String,
     effective: Effective,
     submitted: SystemTime,
     clock: Instant,
@@ -531,11 +532,19 @@ impl Engine {
         if predecessors.unresolved {
             return Decision::Wait;
         }
+        // Design §6.7: the terminal's facts, never its parsed envelope.
         match predecessors.last_submitted {
             // C1 §7.3: dispatch needs settled cleanup; pending cleanup waits.
-            Some(envelope) if envelope["cancel"]["cleanup"] == "pending" => Decision::Wait,
+            Some(facts)
+                if facts
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.cleanup == "pending") =>
+            {
+                Decision::Wait
+            }
             // P6: behind an `unknown` predecessor the queue is cancelled.
-            Some(envelope) if envelope["state"] == "unknown" => Decision::Cancel,
+            Some(facts) if facts.state == "unknown" => Decision::Cancel,
             _ => Decision::Run,
         }
     }
@@ -577,6 +586,7 @@ impl Engine {
             session,
             turn,
             queued,
+            prompt,
             effective,
             submitted,
             clock,
@@ -612,7 +622,7 @@ impl Engine {
         let driven = self
             .execute(
                 &mut record,
-                (queued.prompt, &effective),
+                (prompt, &effective),
                 (deadline, route_stop),
                 Box::new(capacity),
                 &mut control,
@@ -942,8 +952,9 @@ impl Engine {
         close_session: bool,
         held: Option<&super::Admission<'_>>,
     ) -> Result<(), ApiError> {
+        // Design §6.2: final shutdown's terminal is on the Lifecycle lane.
         let finished = Self::finish_turn_with(
-            &self.store,
+            &self.store.lifecycle(),
             &self.unresolved,
             started,
             (record, terminal),
@@ -1441,16 +1452,29 @@ impl Engine {
         turn: TurnNumber,
         head: &Head,
     ) -> Result<Submission, SubmitFailure> {
-        let queued = match journal.queued_turn(session, turn).await {
+        let mut queued = match journal.queued_turn(session, turn).await {
             Ok(Some(queued)) => queued,
             // Store could not parse the row's frozen values (design §7.3).
             Err(StoreError::CorruptEvidence) => return Err(SubmitFailure::Corrupt(None)),
             Ok(None) | Err(_) => return Err(SubmitFailure::Unread),
         };
-        let queueing = || Queueing::from(&queued);
+        let queueing = |queued: &QueuedTurn| Queueing::from(queued);
         // A frozen row Core cannot read fails the turn: nothing is sent.
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
-            return Err(SubmitFailure::Corrupt(Some(queueing())));
+            return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
+        };
+        // Design §6.5: a blob prompt is loaded into one exact `String` with
+        // its SHA-256 and UTF-8 checks; a blob that differs from its record
+        // fails the turn as corrupt evidence, before anything is sent.
+        let prompt = match std::mem::replace(&mut queued.prompt, Prompt::Inline(String::new())) {
+            Prompt::Inline(text) => text,
+            Prompt::Blob(blob) => match journal.load_prompt(&blob).await {
+                Ok(text) => text,
+                Err(StoreError::CorruptEvidence) => {
+                    return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
+                }
+                Err(_) => return Err(SubmitFailure::Unread),
+            },
         };
         // Design §2 [r1.11]: the submission clock is taken immediately
         // before the commit; both deadlines run from it.
@@ -1475,7 +1499,7 @@ impl Engine {
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()
-        .map_err(|_| SubmitFailure::NotCommitted(queueing()))?;
+        .map_err(|_| SubmitFailure::NotCommitted(queueing(&queued)))?;
         let committed = journal
             .commit_submission(SubmissionRecord {
                 session_id: session.clone(),
@@ -1493,13 +1517,14 @@ impl Engine {
                 }
                 // Nothing was written: the sequence stays the session's next.
                 drop(head);
-                return Err(SubmitFailure::NotCommitted(queueing()));
+                return Err(SubmitFailure::NotCommitted(queueing(&queued)));
             }
         }
         Ok(Submission {
             session: session.clone(),
             turn,
             queued,
+            prompt,
             effective,
             submitted,
             clock,

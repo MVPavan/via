@@ -53,7 +53,7 @@ async fn spawn(client: &StoreClient, id: &str) {
             handle_hash: [7_u8; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
-            prompt: "p".to_owned(),
+            prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             initial_event: event("turn.queued", 1),
         })
@@ -66,7 +66,7 @@ async fn resume(client: &StoreClient, number: u32, seq: u64) -> Result<(), Store
         .commit_resume(ResumeRecord {
             session_id: session(),
             turn: turn(number),
-            prompt: "p".to_owned(),
+            prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             event: event("turn.queued", seq),
             operation: None,

@@ -1371,3 +1371,100 @@ fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, Scenari
         _ => return Err(fail(&format!("{session}: more than one anchor"))),
     })
 }
+
+/// T4-2 review round 2 (coding-style §5, design §6.5): a blob step still
+/// running after the Store's bounded drain is pending work, so final
+/// shutdown is `incomplete` (exit 4) and its summary counts the step. A
+/// prompt over 256 KiB stalls its first blob step (`blob.step.stall`);
+/// the spawn fails `not_committed` at the 2 s bound; an idle stop then
+/// drops the Store with the step still held. A first small turn completes,
+/// so the run has turn evidence.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hello"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"reply","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_daemon_stop_stalled_blob",
+        &fixture,
+        |paths, evidence| {
+            let root = paths
+                .state
+                .parent()
+                .ok_or_else(|| infra("the state directory has no parent"))?;
+            let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
+            let point = "blob.step.stall";
+            failpoints.arm(point, 1, "pause").map_err(infra)?;
+            let mut daemon =
+                Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
+            let receipted = paths.run(
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hello",
+                    "--json",
+                ],
+            )?;
+            check(receipted.status.success(), || {
+                format!("the small spawn exited {}", receipted.status)
+            })?;
+            let mut raw = Raw::connect(&paths.runtime.join("via.sock"))?;
+            let spawn = json!({"harness":"fake","model":"fake","prompt":"p".repeat(256 * 1024 + 1),"handle":format!("h_{}", "A".repeat(43))});
+            let refused = raw.request("spawn", &spawn)?;
+            failpoints
+                .wait_ack(point, 1, "pause", daemon.child.id(), FINAL_SHUTDOWN)
+                .map_err(infra)?;
+            check(
+                refused["error"]["data"]["kind"] == "store_error"
+                    && refused["error"]["data"]["commit_outcome"] == "not_committed",
+                || format!("the stalled blob spawn was not refused: {refused}"),
+            )?;
+            let stopping = raw.request("daemon/stop", &json!({}))?;
+            check(stopping["result"]["stopping"] == true, || {
+                stopping.to_string()
+            })?;
+            drop(raw);
+            // The summary is written with the step still held; the process
+            // itself exits once the step's thread ends.
+            let deadline = Instant::now() + FINAL_SHUTDOWN;
+            let summary = loop {
+                if let Ok(summary) = daemon.summary() {
+                    break summary;
+                }
+                if Instant::now() >= deadline {
+                    failpoints.release(point, 1).map_err(infra)?;
+                    return Err(fail("daemon wrote no final shutdown summary"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            failpoints.release(point, 1).map_err(infra)?;
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("the daemon did not exit"))?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            check(status.code() == Some(4), || {
+                format!("a stalled blob step must exit 4, got {status}; summary {summary}")
+            })?;
+            check(
+                summary["disposition"] == "incomplete"
+                    && summary["blob_tasks"] == 1
+                    && summary["pending_joins"] == 1
+                    && summary["store"] == "joined",
+                || format!("summary {summary}"),
+            )
+        },
+    )
+}

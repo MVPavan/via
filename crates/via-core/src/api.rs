@@ -535,6 +535,17 @@ impl ApiError {
         }
     }
 
+    /// A failed Store read's C1 error: a full Public lane is
+    /// [`Self::STORE_QUEUE_FULL`], which never latches; any other failure
+    /// is `store_error` (design §6.1).
+    pub(crate) fn read(error: &via_store::StoreError) -> Self {
+        if matches!(error, via_store::StoreError::NotEnqueued) {
+            Self::STORE_QUEUE_FULL
+        } else {
+            Self::STORE
+        }
+    }
+
     /// C1 §8.1 `store_error` for a receipt commit that definitely did not happen.
     pub const RECEIPT_NOT_COMMITTED: Self = Self {
         commit_outcome: Some(ReceiptOutcome::NotCommitted),
@@ -651,6 +662,17 @@ impl ApiError {
         code: -32012,
         kind: "admission_refused",
         message: "too many unresolved turns",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+    };
+    /// A C1 read found the Store's Public lane full (Task 4 design §6.1):
+    /// nothing was read, and the Store did not fail.
+    pub const STORE_QUEUE_FULL: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "the Store read lane is full",
         unpersisted: None,
         kind2: None,
         commit_outcome: None,

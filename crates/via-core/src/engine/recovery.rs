@@ -54,6 +54,11 @@ impl Engine {
     /// daemon admits requests only after this succeeds. A queued turn without
     /// submission intent stays queued.
     pub async fn recover(&self) -> Result<usize, String> {
+        // Design §6.5: every referenced blob is checked, then unreferenced
+        // ones (a lost discard, a crash before adoption) are unlinked.
+        let store_error = |error| format!("store_error: {error}");
+        self.store.verify_blobs().await.map_err(store_error)?;
+        self.store.sweep_blobs().await.map_err(store_error)?;
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
@@ -123,12 +128,17 @@ impl Engine {
                     .map_err(|error| format!("store_error: {error}"))?;
                 // The dispatcher's rule (§2.2): only behind an `unknown`
                 // predecessor with settled cleanup; pending cleanup waits.
+                // Design §6.7: the terminal's facts, never its envelope.
                 let unknown = predecessors
                     .last_submitted
                     .as_ref()
-                    .filter(|envelope| !predecessors.unresolved && envelope["state"] == "unknown");
-                let cancel =
-                    unknown.is_some_and(|envelope| envelope["cancel"]["cleanup"] != "pending");
+                    .filter(|facts| !predecessors.unresolved && facts.state == "unknown");
+                let cancel = unknown.is_some_and(|facts| {
+                    facts
+                        .cancel
+                        .as_ref()
+                        .is_none_or(|cancel| cancel.cleanup != "pending")
+                });
                 let close = closing.contains(&session);
                 let cause = close.then(|| (CancelCause::Close, rfc3339(SystemTime::now())));
                 if cancel || close {
