@@ -1,14 +1,17 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 16)
+# Task 4 design: events, progress, storage and C1 conformance (round 17)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 16.
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 17.
 Round 15 was SOUND at `778752c`. Round 16 applies the owner's revised
 [requirements](requirements.md) (marked "r16") and
 [`design-r16-decisions.md`](design-r16-decisions.md), tagged `[t4r16.N]`
 (`[t4r16.5.k]` for item k of decision 5, `[t4r16.7.N]` for item N of the
-owner's follow-up, decision 7); older tags mark reasoning that
-still stands. The requirements (R1–R8) override earlier design and spec
+owner's follow-up, decision 7). Round 17 fixes Sol's round-16 review
+([review-r16-sol.md](review-r16-sol.md)) per
+[`design-r17-decisions.md`](design-r17-decisions.md), tagged `[t4r17.N]`
+for decision N (`[t4r17.10]` records the Claude usage evidence). Older tags
+mark reasoning that still stands. The requirements (R1–R8) override earlier design and spec
 text; every conflict is an amendment in §12. Round history:
-[reports/T4-0.md](reports/T4-0.md) §9–§20. This step writes no code and no
+[reports/T4-0.md](reports/T4-0.md) §9–§21. This step writes no code and no
 tests.
 
 Round 16 removes VIA's raw log (R8: an evidence folder per turn takes its
@@ -280,7 +283,7 @@ step counts and `tokens` are claimed, and always includes a tool-only step
 | Vendor | `model` | `tools_started` | `tools_ended` | `usage` (key) | Envelope `steps` | Probe adds |
 |---|---|---|---|---|---|---|
 | Fake (runtime §3.1, A33) | `text` | `tool_started {tool_id, name}` | `tool_ended {tool_id}` | new `usage {total_tokens}`, no key | `null` | none: exact by construction |
-| Claude ([S §5]) | `assistant` with text or `tool_use` | each `tool_use` `(id, name)` | each `tool_result` in a `user` message | `assistant.message.usage`, key message ID **[U]** (the spec probes only `result.usage`; the transcript has per-message `usage` **[V, probe]**) | `num_turns` | usage sum against `result.usage`; VIA's count against `num_turns`; the largest tool-result and image messages against the 1 MiB cap (§5.1) |
+| Claude ([S §5]) | `assistant` with text or `tool_use` | each `tool_use` `(id, name)` | each `tool_result` in a `user` message | `assistant.message.usage`, key message ID: one API call streams as several `assistant` messages, one per content block, that share `message.id` and repeat the same `usage`, so samples with one key supersede and summing would double count (a local transcript: 1,875 assistant entries, 901 IDs; orchestrator, 2026-09-29, Claude Code 2.1.284 **[V]**) [t4r17.10] | `num_turns` | usage sum against `result.usage`; VIA's count against `num_turns`; the largest tool-result and image messages against the 1 MiB cap (§5.1) |
 | Codex ([S §5, §7]) | `item/started` or `item/agentMessage/delta` for `agentMessage` or `reasoning` | `item/started` for a tool item (`commandExecution`, `fileChange`; others **[U]**), name = item type | `item/completed` | `tokenUsage.last`, no key; scope `vendor_interval` | `null` | Σ`last` against the change in `total` |
 | OpenCode ([S §4, §5, §7]) | a text or reasoning part of the turn's assistant message | a tool part entering `running` | a tool part entering `completed` or `error` | the assistant message's tokens, key message ID | `null` | the ledger against the session total; event and part names **[U]** |
 
@@ -320,9 +323,12 @@ ordering relies on them. `tokens` is under the route's `usage.tokens` scope.
 
 ### 3.2 Write path and ordering against `turn.ended`
 
-- **Step end.** At a boundary the drive commits `CommitSteps { session,
-  turn, rows: [row N] }` on the Internal lane, awaited under `while_polling`
-  (§9) before the next observation. No `Head` is taken (a row has no `seq`).
+- **Step end.** At a boundary the drive first publishes the new progress
+  (`current_step` N + 1, §2.4), then enqueues `CommitSteps { session, turn,
+  rows: [row N] }` on the Internal lane, awaited under `while_polling` (§9)
+  before the next observation [t4r17.4]. So a row `status` can read implies
+  progress has already moved past it. No `Head` is taken (a row has no
+  `seq`).
 - **The last step** is written **in the terminal transaction**: every
   terminal built from the `TurnRecord` (`finish_with`, and `finish` for a
   forced turn, `drive.rs:1035`, `:1000` [V]) carries the open step's row. A
@@ -392,12 +398,14 @@ C1 §3.7 as A26 amends it:
    `process.alive`.
 
 So `progress` never describes another turn, and it is at least as new as the
-rows: the open step (`current_step`) never has a row, and a step that ended
-after the Store read appears on a later call. If the turn ended between the
-two reads, `active_turn` may say `running` with `progress: null`. The reply
-is at most `STATUS_MAX` = 1 MiB, else `admission_refused`; the fake's is far
-below (64 turn summaries, 8 queued `effective` values, `progress` at most
-70 KiB, 1000 rows of 128 B).
+rows: Core publishes a boundary's progress before it enqueues that row
+(§3.2) [t4r17.4], so the open step (`current_step`) never has a row, and a
+step that ended after the Store read appears on a later call. If the turn
+ended between the two reads, `active_turn` may say `running` with `progress:
+null`. The reply is at most `STATUS_MAX` = 1 MiB by construction (64 turn
+summaries, 8 queued `effective` values within §6.4's member maxima,
+`progress` at most 70 KiB, 1000 rows of 128 B) [I]; a debug assertion checks
+it, and there is no refusal path [t4r17.8].
 
 ### 4.3 `events`
 
@@ -408,8 +416,9 @@ on the v6 columns, stopping at `limit` or `PAGE_MAX` = 1 MiB (a row's
 borrowed length is checked before it is copied); the SQLite thread writes
 the `events` array as one JSON text. `next_after` is the last scanned seq;
 `more = next_after < head` (same transaction); `earliest_seq` is 1, since
-nothing is pruned: `history_pruned` is the retention task's [t4r16.5.9]. A
-first matching event larger than the page is `admission_refused`.
+nothing is pruned: `history_pruned` is the retention task's [t4r16.5.9].
+An event is far smaller than a page (its payload is at most 256 KiB), so the
+first match always fits: a debug assertion, not a refusal [t4r17.8].
 
 ### 4.4 `logs`: where the evidence is [t4r16.1]
 
@@ -505,22 +514,27 @@ turn with its first 64 KiB saved (§7.3), never a silent cut.
   `prompt_file`, an absolute path to a regular UTF-8 file the daemon's user
   can read, at most `PROMPT_MAX` = 16 MiB (today's largest prompt, the
   16 MiB line). VIA copies it into a blob (§10.4).
-- **Retry identity.** For a prompt file the identity carries the copy's
+- **Retry identity.** For a prompt file the identity carries the content's
   `"sha256:<64 hex>:<len>"` in place of the path (§10.3): the same content
-  matches, changed content is `idempotency_conflict`.
+  matches, changed content is `idempotency_conflict`. Identities are
+  compared by length and SHA-256 only (§6.5) [t4r17.1].
 
 ### 5.3 Disk: a free-space floor and a size warning [t4r16.3]
 
 There are no size budgets, headrooms, page ceilings or byte counters.
 
-- **Admission.** At a `spawn` or `resume` receipt (before a prompt-file
-  copy) and at a queued turn's dispatch, Core reads the free space of the
+- **Admission.** For new work only (a `spawn` or `resume` whose key, if
+  any, is not stored, after the key lookup and before a prompt-file copy,
+  §10.4) and at a queued turn's dispatch, Core reads the free space of the
   state directory's filesystem, `f_bavail × f_frsize` from
   `rustix::fs::statvfs` (`rustix-1.1.5/src/fs/abs.rs:288` [V]; via-store
   enables `rustix`'s `fs` feature, `crates/via-store/Cargo.toml:16` [V]), on
   the blocking pool. Below `disk.free_floor` (5 GiB):
   - a receipt is `admission_refused`, kind `disk_free_floor`, with
-    `data.free_bytes` and `data.floor_bytes`, before any write;
+    `data.free_bytes` and `data.floor_bytes`, before any write; a keyed
+    retry of a stored receipt is answered from its key first, as runtime
+    §6 requires (`docs/specs/runtime-contracts.md:732-734`), and never
+    meets the floor [t4r17.1];
   - a queued turn fails `store` at dispatch before submission, its
     `failure.message` naming the floor. It fails rather than waits because
     nothing would wake a waiting dispatcher when space returns.
@@ -537,7 +551,8 @@ There are no size budgets, headrooms, page ceilings or byte counters.
 - **Warning.** `daemon/status` gains `storage {free_bytes, data_bytes,
   data_measured_at, below_free_floor, over_warn_size}`. `data_bytes` sums
   the apparent lengths (`metadata().len()`) of `store.sqlite3`, its `-wal`
-  and `-shm` files and every file under `blobs/` and `evidence/`. Rule: a
+  and `-shm` files, `via.log` and `via.log.1` [t4r17.7], and every file
+  under `blobs/` and `evidence/`. Rule: a
   `daemon/status` that finds the cached value absent or older than 60 s
   recomputes it with one directory walk on the blocking pool, shared by
   concurrent calls. `over_warn_size` is `data_bytes > disk.warn_size`
@@ -557,23 +572,22 @@ below `wal.max` and its file length measures growth since the reset **[I]**
 
 **At the limit** (critical-review change 5, N5): after each commit the
 SQLite thread reads the WAL file's length; at or above `wal.max` it sets
-`wal_full` and runs `wal_checkpoint(TRUNCATE)`. While `wal_full` is set:
-- an ordinary write is refused before `BEGIN` as a known `NotCommitted`
-  (`StoreFailureKind::Quota`, kind `wal_full`): a receipt gets `store_error`
-  `not_committed`; a running turn's other durable event fails the turn
-  `store` (§3.2), whose terminal commits;
-- lifecycle and terminal writes (§5.3), a running turn's step rows included
-  [t4r16.7.6], still commit;
+`wal_full` and runs `wal_checkpoint(TRUNCATE)`. `wal.max` is soft for
+admitted turns [t4r17.2]. While `wal_full` is set, only new work is refused,
+the same split as the disk floor (§5.3):
+- a new `spawn` or `resume` receipt is refused before `BEGIN` as a known
+  `NotCommitted` (`StoreFailureKind::Quota`, kind `wal_full`): `store_error`
+  `not_committed`; a queued turn fails `store` at dispatch;
+- every write of an admitted turn commits (step rows, events, the terminal,
+  cancellations), as do the other lifecycle writes of §5.3;
 - a write arriving at least 1 s after the last attempt first retries
   `TRUNCATE`; below `wal.max`, `wal_full` clears.
 
 There is no Store health latch: an oversized WAL is a known, recoverable
-state, so an external `sqlite3` reader holding a snapshot delays ordinary
-writes and nothing else. The commit that crosses `wal.max` completes, so
-the WAL may exceed it by one transaction. SQLite writes each page a
-transaction dirties once, 4 KiB plus 24 B (`sqlite3.c:71575-71599` in
-`libsqlite3-sys` 0.38.2 [V]); the pages a maximal transaction dirties are
-not proved, and `via-d9o.2.3` measures them (Q-R9-1, a gate).
+state, so an external `sqlite3` reader holding a snapshot delays new work
+and nothing else. Growth past `wal.max` is bounded only by the admitted
+turns' writes while the checkpoint cannot truncate; `via-d9o.2.3` measures
+it (§16; Q-R9-1 is that measurement item).
 
 ### 5.5 Daemon config [t4r8.1, t4r16.3]
 
@@ -693,15 +707,25 @@ the in-flight item and fails them `WriterLost`, which latches.
   the evidence root, §7.2; `create_new`, 0600, `NOFOLLOW`), write the held
   text and the piece, and drop the buffer; later pieces are appended. Each
   append runs on the blocking pool under 2 s, awaited under `while_polling`
-  (§9). The file holds plain UTF-8 text. Past `FINAL_TEXT_FILE_MAX` = 64 MiB
-  the piece is cut at a character boundary and later pieces are dropped; a
-  write error likewise stops appending. Either sets `truncated`, and the
-  turn does not fail. `finish()` syncs the file before the terminal is
-  built. The envelope then carries `final_text: null` and `final_text_file
-  {path, bytes, truncated}`; otherwise `final_text_file` is `null`.
-- **Blobs** (runtime §8): prompts and identities over `INLINE_MAX` = 256 KiB
-  use the blob path, because the retry identity contains the prompt
-  (`crates/via-core/src/api.rs:804-858` [V]) and a spawn carries both.
+  (§9). The file holds plain UTF-8 text, written in whole characters only.
+  Past `FINAL_TEXT_FILE_MAX` = 64 MiB the piece is cut at a character
+  boundary, later pieces are dropped and `truncated` is set; the turn does
+  not fail for that. `finish()` syncs the file, then the turn folder, before
+  the terminal is built [t4r17.3]; the folder's own entry is durable from
+  launch (§7.2). The envelope then carries `final_text: null` and
+  `final_text_file {path, bytes, truncated}`; otherwise `final_text_file` is
+  `null`.
+- **A final-text write or sync failure** fails the turn `store`, as a known
+  `NotCommitted` does (§3.2) [t4r17.3]. After a write cut short, Core first
+  truncates the file (`set_len`) to its last complete character, then
+  records `bytes` and `truncated: true`, and syncs the file and the folder;
+  if that succeeds the envelope names the file, else `final_text_file` is
+  `null`. So the envelope never points to a file that is not durable or ends
+  inside a character.
+- **Blobs** (runtime §8): prompts over `INLINE_MAX` = 256 KiB use the blob
+  path. A retry identity (`crates/via-core/src/api.rs:804-858` [V]) is
+  stored as its length and SHA-256 only, never as bytes, because it is only
+  ever compared (§6.5) [t4r17.1].
 
 ### 6.5 Blob path [owner changed]
 
@@ -716,12 +740,13 @@ does its own I/O on the blocking pool (`spawn_blocking`, coding-style §5).
   unlinks a finished one after a commit known not to have happened (a lost
   discard is swept). `BlobReader::next_chunk()` returns at most 64 KiB. A
   row references a blob only after `finish`, in the same transaction.
-- **Exact replay comparison** (C1 byte-identical rule). An inline identity
-  is compared byte for byte; a blob identity by length and SHA-256, then by
-  streaming the blob against the incoming pieces. The key lookup runs under
-  `admission` (`receipt.rs:76`, `:202` [V]); a found row is immutable, so
-  Core releases `admission` before streaming (F5), under `REPLAY_COMPARE` =
-  10 s (expiry is `store_error` for that request).
+- **Replay comparison** (C1 byte-identical rule) [t4r17.1]. The identity
+  pass (§10.3) streams the incoming identity through a running SHA-256 and
+  length, and a retry matches when both equal the stored pair; there is no
+  byte-by-byte pass. The key lookup runs under `admission` (`receipt.rs:76`,
+  `:202` [V]) and comes first: a stored key is answered (receipt or
+  `idempotency_conflict`) with no blob written and no floor or WAL check
+  (§5.3, §5.4). Only new work writes a prompt blob.
 - **Dispatch load.** The dispatcher loads the prompt blob into an exact
   `String` with a running SHA-256 and UTF-8 check (a mismatch fails the turn
   as corrupt evidence) and moves it into the streamed start (§8.3), which
@@ -740,8 +765,14 @@ development Stores are refused untouched (`:34-37` [V]); a golden DDL test
 - **`steps`** (new): §3.1.
 - **`sessions`** gains `created_ms`, `updated_ms` (the `at` of the
   transaction's highest-`seq` event: `last_active_at`), `harness`, `label`,
-  `ord INTEGER NOT NULL UNIQUE` (`MAX(ord)+1` once at spawn; its index serves
-  `list`), and nullable `vendor_session_id` and `transcript_hint` (§7.4).
+  `ord INTEGER NOT NULL UNIQUE` (its index serves `list`), and nullable
+  `vendor_session_id` and `transcript_hint` (§7.4).
+- **`session_ord`** (new) [t4r17.6]: one row, `CREATE TABLE session_ord
+  (only INTEGER PRIMARY KEY CHECK(only = 1), next INTEGER NOT NULL)`,
+  created as `(1, 0)`. A spawn's receipt transaction runs `UPDATE
+  session_ord SET next = next + 1 RETURNING next` and stores the value as
+  `ord`. The counter is never decremented or reused, so deleting sessions
+  cannot bring an ordinal back.
 - **Frozen `params`** gains `cwd` and `allow_untested` (A14; today
   `receipt.rs:140` freezes only harness and model [V]).
 - **`events`** gains `turn INTEGER` (deferred composite FK to `turns`),
@@ -753,8 +784,9 @@ development Stores are refused untouched (`:34-37` [V]); a golden DDL test
   (A15); `prompt_blob` with `CHECK((prompt IS NULL) <> (prompt_blob IS
   NULL))`; and `evidence_dir TEXT`, relative to the state directory, written
   with `turn.submitted` [t4r16.1].
-- **`spawn_keys.identity`, `operations.identity`** become nullable with
-  `identity_blob` and the same CHECK.
+- **`spawn_keys.identity`, `operations.identity`** become `identity_len
+  INTEGER NOT NULL` and `identity_sha256 BLOB NOT NULL CHECK(length(
+  identity_sha256) = 32)` [t4r17.1].
 - **No `connections` table** [t4r16.1]: its columns served only the raw log.
   A per-turn connection's ID derives from session and turn
   (`crates/via-core/src/engine/drive.rs:48-58` [V]), identity confirmation's
@@ -789,7 +821,8 @@ matches, at `PAGE_MAX` (a row's borrowed length checked before its summary
 is built) or after the 1000 rows. `next_cursor` is `l3.<ord>` of the last row
 examined, or `null` once the oldest session was examined.
 
-Guarantee: `ord` is set once and strictly increases, so every session that
+Guarantee: `ord` is set once from a counter that never goes back (§6.6)
+[t4r17.6], so every session that
 existed at the first page is examined exactly once and returned if it
 matches the filters then; a later session is never returned. Termination:
 the cursor strictly decreases. A filter that matches little gives short or
@@ -836,7 +869,10 @@ the envelope make it absolute.
   `EvidenceRoot::path(session, turn)` computes a path with no I/O.
 - **Wire** creates `<session_id>` if missing and `<turn>` exclusively (a turn
   launches once), on the blocking pool, in `open_connection` before Host's
-  acquisition.
+  acquisition. It then syncs each parent directory once (`evidence/` after a
+  new session folder, the session folder after the turn folder), so the whole
+  path is durable before any file in it is relied on [t4r17.3]. Store syncs
+  the state directory once when it creates `evidence/`.
 - **Host** opens `stderr.log` (`create_new`, 0600, `NOFOLLOW`) from the new
   `PrivateProcessSpec.stderr_path` and gives it to the anchor as stderr, in
   place of a pipe (`crates/via-host/src/host.rs:1164-1166` [V]). The vendor
@@ -1067,25 +1103,33 @@ deadline, breaks silently on oversize (`:45-46`) and builds a whole-request
 Per line: (1) `json_limits::scan`; (2) the borrowed envelope `{jsonrpc, id,
 method, params}` as `&RawValue`, borrowed from the line
 (`serde_json-1.0.151/src/read.rs:637-652` [V]); (3) `id` checked and
-copied, `method` decoded; (4) for keyed calls the identity pass forms the
+copied, `method` decoded; (4) for keyed calls the identity pass feeds the
 borrowed pieces around the handle span and, for `prompt_file`, around its
-value, which becomes the copy's `"sha256:<64 hex>:<len>"` (§10.4): one `Vec`
-up to `INLINE_MAX`, else streamed into a `BlobWriter`; (5) the strict DTO
-decode; (6) a `prompt` over `INLINE_MAX` streams into a `BlobWriter`; (7)
-drop the line and decode buffers.
+value, which becomes the content's `"sha256:<64 hex>:<len>"` (§10.4), into a
+running SHA-256 and length; nothing is buffered [t4r17.1]; (5) the strict
+DTO decode; (6) the key lookup (§6.5); for new work only, a `prompt` over
+`INLINE_MAX` streams into a `BlobWriter`; (7) drop the line and decode
+buffers.
 
 ### 10.4 Prompt file [t4r16.2]
 
-For a `spawn` or `resume` with `prompt_file`, after the DTO decode and the
-floor check (§5.3), before the key lookup:
+For a `spawn` or `resume` with `prompt_file` [t4r17.1]:
+- **A stored key** (a retry): steps 1–3 below read the file into a running
+  SHA-256 and length only, writing no blob, and the resulting identity is
+  compared with the stored one (§6.5): the stored receipt, or
+  `idempotency_conflict`. No floor check.
+- **New work:** the floor check (§5.3), then steps 1–5, under the
+  `admission` lock as today's receipt is; so a copy (at most 10 s) delays
+  other receipts, not reads or controls.
 
 1. The path must be absolute and at most 4096 bytes. The handler opens it
    read-only with `O_NONBLOCK` (a FIFO cannot block the open), on the
    blocking pool, then `fstat`s the handle: a regular file of at most
    16 MiB.
-2. It copies the file into a `BlobWriter` in 64 KiB chunks with a running
-   SHA-256 and a streaming UTF-8 check (a sequence split across chunks
-   carries over), under one 10 s bound for the whole copy.
+2. It reads the file in 64 KiB chunks with a running SHA-256 and a
+   streaming UTF-8 check (a sequence split across chunks carries over),
+   under one 10 s bound for the whole read; for new work each chunk also
+   goes to a `BlobWriter`.
 3. After EOF it `fstat`s again. The copy is refused if the bytes read differ
    from the first size or the size, `mtime` or `ctime` changed. So a file
    that changed during the copy is refused, never stored torn; the blob is
@@ -1093,9 +1137,7 @@ floor check (§5.3), before the key lookup:
 4. A failure discards the blob and answers `invalid_params`, kind2
    `prompt_file`, `reason` one of `not_absolute`, `unreadable`,
    `not_regular`, `too_large`, `not_utf8`, `changed`, `timeout`.
-5. The prompt is the blob (`turns.prompt_blob`). A keyed retry copies again
-   and compares identities; on a match the new blob is discarded and the
-   stored receipt returned.
+5. The prompt is the blob (`turns.prompt_blob`).
 
 The daemon runs as the caller's user behind a user-only socket, so reading a
 file that user can read grants nothing new; the path is not stored.
@@ -1176,6 +1218,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A34 stop cause `overflow` | **withdrawn** [t4r16.5.7]; there is no envelope overrun (§2.3) [t4r16.7.8] |
 | A36 memory pool and disk budgets | **withdrawn** [t4r16.2, t4r16.3]; A42, A43 |
 | A37 daemon config | revised: five keys |
+| A30, A39, A42 | revised in round 17 [t4r17.1–3]; A46 is new [t4r17.5] |
 
 ### 12.2 Amendments
 
@@ -1322,7 +1365,7 @@ another session's evidence."
 
 | Location | Edit |
 |---|---|
-| RT §6 target table (`:702-712`) | `events` row (`:709`) becomes "`events`: separate `turn` and `type` columns (late and time stay in the event JSON); no raw reference columns \| `via-jm4.7.8`"; `sessions` vendor row (`:705`) becomes "`sessions`: vendor session ID and transcript hint \| columns `via-jm4.7.8`, values the first vendor adapter slice"; delete the `connections` row (`:710`) [t4r16.1]; add "`steps`: `(session_id, turn, step, started_ms, ended_ms, tokens)`, primary key `(session_id, turn, step)`, one row per completed model step, the last in the terminal transaction; a session's rows go by one keyed delete \| `via-jm4.7.8`" and "`turns.evidence_dir` (runtime §4) \| `via-jm4.7.8`" |
+| RT §6 target table (`:702-712`) | `events` row (`:709`) becomes "`events`: separate `turn` and `type` columns (late and time stay in the event JSON); no raw reference columns \| `via-jm4.7.8`"; `sessions` vendor row (`:705`) becomes "`sessions`: vendor session ID and transcript hint \| columns `via-jm4.7.8`, values the first vendor adapter slice"; delete the `connections` row (`:710`) [t4r16.1]; add "`steps`: `(session_id, turn, step, started_ms, ended_ms, tokens)`, primary key `(session_id, turn, step)`, one row per completed model step, the last in the terminal transaction; a session's rows go by one keyed delete \| `via-jm4.7.8`" "`turns.evidence_dir` (runtime §4) \| `via-jm4.7.8`" and "`session_ord`: a one-row counter that allocates `sessions.ord` and never goes back \| `via-jm4.7.8`" [t4r17.6] |
 | RT §6 v4 table (`:687-698`) | rewritten as v6 (A14); its `events` row (`:697`) loses the raw columns |
 | RT §6 write ordering items 3–6 (`:747-757`) | the text below |
 | RT §6 (`:759-767`) | "No SQLite transaction waits on a raw sync…" through "…after detecting corruption." becomes "No SQLite transaction waits on vendor I/O." |
@@ -1450,6 +1493,7 @@ t3.
 |---|---|
 | C1 §1 (`:78`, `:83`) | "line length capped (Proposed 16 MiB)" becomes "line length capped at 1 MiB"; "The 16 MiB limit includes the line feed." becomes "The 1 MiB limit includes the line feed; a longer line gets `request_too_large` and the connection closes. A larger prompt is passed as `prompt_file` (§4)." |
 | C1 §4 (`:401`) | the `prompt` row's note becomes "exactly one of `prompt` and `prompt_file`"; add "\| `prompt_file` \| absolute path \| per turn \| a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length \|" |
+| RT §6 (`:727-734`) | after "…to honor C1's byte-identical rule." add "Store keeps an identity as its length and SHA-256, never its bytes; a retry matches when both are equal, and a prompt file's identity is computed from the file's content without storing it." [t4r17.1] |
 | C1 §3.2 (`:175`) | `[--prompt-file F|-]` stays; add "`--prompt-file F` sends `prompt_file` with `F` made absolute; `-` reads stdin into `prompt`." |
 | C1 §8.1 | add "\| -32020 \| `request_too_large` \| request line over 1 MiB; `data.max_bytes`; the connection closes \|"; the `admission_refused` row (`:687`) gains "Store read lane full; disk free space below the floor" |
 | C1 §5 (`:473-474`) | "A terminal envelope that cannot fit the 16 MiB socket response limit …" goes with A30's text |
@@ -1510,12 +1554,13 @@ Withdraws A36's §6 text. RT §6 (`:769-777`), from "Checkpoint after 8 MiB
 WAL growth" to "never shortened by quota pressure.", becomes:
 
 > Checkpoint after 8 MiB of WAL growth or 1000 commits, both configurable.
-> At a 32 MiB WAL (configurable) refuse ordinary writes by name as known not
-> committed and retry a truncating checkpoint at most once a second, while
-> lifecycle and terminal writes, and running turns' step rows, still commit
-> [t4r16.7.6]; this is not a Store health
-> failure. The commit that crosses the limit completes, so the WAL may exceed
-> it by one transaction. Keep read transactions short (one bounded page); no
+> At a 32 MiB WAL (configurable) refuse new work (a receipt, a queued
+> turn's dispatch) by name as known not committed and retry a truncating
+> checkpoint at most once a second; every write of an admitted turn and
+> every lifecycle write still commits, so the limit is soft while admitted
+> turns run [t4r17.2]. This is not a Store health failure. Growth past the
+> limit is bounded by the admitted turns' writes and is measured in
+> end-to-end testing. Keep read transactions short (one bounded page); no
 > read holds a transaction open while waiting on a socket. No automatic
 > retention/pruning in S1. There are no disk size budgets. New work (a
 > receipt, a queued turn's dispatch) is refused by name while free space on
@@ -1566,6 +1611,27 @@ text.
 | RT §6.1 layout (`:805-812`) | after `store.lock` add "`via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB`" |
 | RT §7 (`:914-915`) | "one bounded JSON line on the daemon's stderr" becomes "one bounded JSON line in `via.log` (§6.1); the daemon writes stderr only while it starts, so an auto-starting CLI can report a failed start" |
 
+**T4-A46. Remaining raw-log instructions** [t4r17.5]. A re-grep of T3,
+runtime, C1 and C2 for "raw" found these live instructions beyond A24–A44.
+Each is void with the raw log (R8) and is edited or deleted as shown; the
+remaining hits are unrelated (`RawValue`, `unknown(raw)`, the fake's
+`emit_raw` step, raw file-descriptor closes), negative statements ("no raw
+handle", C2 `:93`, `:173`), the Codex task's text (C2 `:299`, `:307-308`)
+or history (the runtime §10 audit, RT `:1135`).
+
+| Location | Edit |
+|---|---|
+| RT §2 (`:58`), §2 (`:68`) | delete "`RawRef`" from the shared durable IDs; "Raw and SQLite threads have retained join handles." becomes "The SQLite thread has a retained join handle." |
+| RT §3.1 sketch (`:142`) | `pub struct RouteMessage { pub payload: FakeMessage }` |
+| RT §3.1 (`:180`), §5 (`:415`) | "Output drains and raw recording remain open." becomes "Output drains remain open."; "data, raw and SQLite queues" becomes "data and SQLite queues" |
+| RT §6 (`:654`), (`:724-725`), §6.1 (`:836`) | "drains raw/observations" becomes "drains observations"; delete "Durable raw tokens authorize referenced ranges; Store checks ranges against its synced raw index before committing a reference."; "SQLite/raw/blob files" becomes "SQLite, blob and evidence files" |
+| RT §10 (`:1142`), §11 (`:1220`, `:1236`, `:1293`, `:1308`) | "raw record layout (§4)" becomes "evidence folder (§4)"; "SQLite/raw data" becomes "SQLite and evidence data"; "while raw output still drains" becomes "while output still drains"; "raw/SQLite operations" becomes "SQLite and evidence-file operations"; delete ", raw log seals" |
+| C1 §7.5 (`:618`), §8.1 (`:693`) | "validates Store and raw evidence" becomes "validates the Store"; delete "A persistent raw-reference read failure also uses this kind." |
+| T3 §9 raw incompleteness (`t3/design.md:1515-1529`) | void: recovery commits no `raw_log.incomplete` event and adds no `raw_log_incomplete` warning; a recovered turn's `unknown` envelope is otherwise unchanged. `AnchorOwner` needs no anchor phase for this |
+| T3 raw-failure test (`t3/design.md:1756`, `s1_f12_raw_failure_records_incomplete`) and seam row (`:1632`) | void: there is no raw append to fail. The decisions file cites `:1754`, which is the event test A24 rewrites; the raw-failure test is `:1756` |
+| T3, other raw text | void: §2 rule 3's raw evidence failure (`:232-233`) and `raw_incomplete` (`:241`); `:288`; `:616`; `state/raw` (`:640`); the raw thread in §7.1 (`:1057`, `:1074`, `:1083`); row 5's intermediate `raw_log.incomplete` (`:1155`); `raw_failed` (`:1393`); the terminal record's `raw_log.incomplete` (`:1584-1585`); `s1_f21`'s "partial bytes in the raw log" (`:1709`; the partial line is now `undecoded.bin`); `s1_f09`'s `raw_log_incomplete` warning (`:1723`); T3's quoted runtime text (`:1889`, `:1907`) and its slice plan (`:2008`, `:2080`, `:2087-2088`) are history |
+| Code | the recovery procedure (`crates/via-core/src/engine/recovery.rs:393-522`), the drive's raw terminal (`crates/via-core/src/engine/drive.rs:672-760`, `:1176-1224`), `crates/via-core/src/engine/journal.rs:443-467`, `crates/via-core/src/engine.rs:176-177`, `:465`; tests `crates/via-core/tests/route_stop.rs:366-423`, `crates/via-core/tests/route_stream.rs`, `crates/via-core/tests/force_stop.rs:241-245`, `crates/via-cli/tests/evidence_collector.rs:50-61` |
+
 ## 13. Tests (failure-first)
 
 Each test is written first, fails on the code as found for the stated reason,
@@ -1586,9 +1652,11 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 `core.progress.publish`, `Store::read_count()`, `store.read.delay_ms`,
 `store.rollback.fail`, `store.statvfs.free_bytes`, `core.data_size.walks`,
 `prompt_file.copy.pause`, `blob.write.fail_after`,
-`Store::blob_chunk_reads()`, `VIA_TEST_EVENT_STALL_MS`,
+`Store::blob_writes()`, `VIA_TEST_EVENT_STALL_MS`,
 `VIA_TEST_PARTIAL_LINE_MS`, `VIA_TEST_REPLY_WRITE_MS`,
 `VIA_TEST_FINAL_TEXT_FILE_MAX`, `final_text.write.fail`,
+`final_text.write.short` (a write cut inside a character, then an error),
+`final_text.sync.fail`,
 `wire::fallback_drops()`, fake-agent steps `HoldStdin`, `ReportCwd`,
 `EchoPromptDigest`, `Stderr { bytes }` (`Emit`, `Gate` and `Flood`,
 `crates/via-fake-agent/src/main.rs:41-62` [V], already emit any line), and
@@ -1601,7 +1669,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 |---|---|
 | `s1_progress_step_rule_counts_output_after_tool_results` | fake: text, tool_started, tool_ended, text, text, tool_started, tool_ended, text → `current_step` 3; rows 1–2 before the terminal, row 3 in it (`store.commit.step` barriers); envelope `steps` `null` |
 | `s1_progress_snapshot_adds_no_store_read`; `s1_c1_status_latency_under_bounded_store_delay` | `status` on a running turn and on an idle session make the same number of Store reads; with `store.read.delay_ms` = 200 it answers within 300 ms while the turn progresses (Q-R5-5) |
-| `s1_c1_status_progress_only_for_the_selected_turn` [t4r16.5.2] | with turn 2 running, `status --turn 1` has `progress: null` and turn 1's rows; `status` has turn 2's `progress`, whose `current_step` has no row; a step ended after the Store read (`core.progress.publish` held) appears on the next call |
+| `s1_c1_status_progress_only_for_the_selected_turn` [t4r16.5.2] | with turn 2 running, `status --turn 1` has `progress: null` and turn 1's rows; `status` has turn 2's `progress`, whose `current_step` has no row; a step ended after the Store read (`core.progress.publish` held) appears on the next call; with `store.commit.step` held at a boundary, `status` shows the new `current_step` and no row for it, and once released the row appears while `current_step` is already past it [t4r17.4] |
 | `s1_progress_tokens_sum_per_step_and_label_scope` | two keyless samples in one step supersede, steps add; `tokens.scope` is the fake's declared scope |
 | `s1_progress_tools_overflow_and_untracked_end_count` | 70 concurrent tool starts: 64 names and `tools_overflow`; an untracked end then model output advances `current_step` and writes a row |
 | `s1_progress_unknown_messages_send_no_observation` | a flood of unknown messages sends no C2 item yet moves `last_activity_at` |
@@ -1616,25 +1684,25 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_evidence_undecoded_message_is_saved_and_named` | a malformed known message of 200 KiB, and a 2 MiB line: `failed(protocol)` and `failed(overflow)`, each `undecoded.bin` holds the first 64 KiB, and `failure.message` names the file (and the length, when known) |
 | `s1_evidence_folder_failure_fails_store_before_launch` | a pre-created `<turn>` folder: `failed(store)`, no anchor intent, no process |
 | `s1_c1_logs_selects_the_turn_and_never_reads_files` | a session address selects the running turn, else the latest submitted; a queued turn has `folder: null`; an unreadable file still lists with its size |
-| `s1_store_disk_floor_refuses_new_work_only` [t4r16.3] | free space below a lowered floor: `spawn` and `resume` are `admission_refused` `disk_free_floor` with no write; a queued turn fails `store` at dispatch; a running turn ends normally with its rows; a close and a queued-turn cancel commit; `below_free_floor` shows; a daemon started below the floor serves reads |
-| `s1_store_data_size_warning_is_cached` | lowered `warn_size` gives `over_warn_size`; `data_bytes` equals the summed apparent lengths; a second call within 60 s walks nothing |
+| `s1_store_disk_floor_refuses_new_work_only` [t4r16.3] | free space below a lowered floor: `spawn` and `resume` are `admission_refused` `disk_free_floor` with no write, while a keyed retry of a receipt stored before, prompt file included, returns that receipt [t4r17.1]; a queued turn fails `store` at dispatch; a running turn ends normally with its rows; a close and a queued-turn cancel commit; `below_free_floor` shows; a daemon started below the floor serves reads |
+| `s1_store_data_size_warning_is_cached` | lowered `warn_size` gives `over_warn_size`; `data_bytes` equals the summed apparent lengths, `via.log` and `via.log.1` included [t4r17.7]; a second call within 60 s walks nothing |
 | `s1_store_full_disk_rolls_back_known` | `SQLITE_FULL` on an ordinary commit and on a terminal: rolled back, `NotCommitted`, no latch; `store.rollback.fail` latches |
-| `s1_store_wal_limit_refuses_without_latch` [t4r16.3, t4r16.7.6] | lowered `wal.max` and an external reader holding a snapshot: a spawn is `store_error` `not_committed` `wal_full`; a running turn's step rows commit and it ends normally; a running turn's `warning` event is refused and fails it `store` while its terminal commits; a close commits; health stays healthy; the reader closes, a write after 1 s retries `TRUNCATE` and writes resume; WAL growth of a maximal batch and of a terminal with many rows is recorded for `via-d9o.2.3` (Q-R9-1) |
+| `s1_store_wal_limit_refuses_only_new_work` [t4r16.3, t4r17.2] | lowered `wal.max` and an external reader holding a snapshot: a spawn is `store_error` `not_committed` `wal_full` and a queued turn fails `store` at dispatch; a running turn's step rows, `warning` event, cancel and terminal all commit and it ends normally; a keyed retry of a stored spawn returns its receipt; a close commits; health stays healthy; the reader closes, a write after 1 s retries `TRUNCATE` and writes resume; WAL growth while the reader holds is recorded for `via-d9o.2.3` (§16) |
 | `s1_c1_request_too_large_is_named_then_closes` [t4r16.2] | 1 MiB + 1 bytes: `request_too_large`, then close; exactly 1 MiB is served; a partial line times out alone |
-| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt, changed content is `idempotency_conflict`; an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
+| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and writes no blob (`Store::blob_writes()`), also below a lowered floor; changed content is `idempotency_conflict` [t4r17.1]; an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
 | `s1_c1_list_creation_order_and_last_active` [t4r16.4] | 250 sessions page newest first with no repeats while states change; a session created mid-scan never appears; `last_active_at` is the latest event's time and `since` filters on it; `l2.` is `invalid_params`; a filter matching one old session gives empty pages with a cursor, then it |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket` | A31; A32, including a peer that never reads the first byte [t4r16.5.5] |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once (four turns with 16 MiB prompts flooding maximal messages and filling observations; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent: `overflow` at the lowered stall |
 | `s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib` | the C2 bounds |
-| `s1_bounds_final_text_spills_to_a_file` [t4r16.7.8] | a text of exactly 256 KiB encoded is inline; one more byte puts the exact text in `final_text.txt`, with `final_text: null` and `final_text_file {path, bytes, truncated: false}`; past a lowered file cap the file ends at a character boundary with `truncated: true`; `final_text.write.fail` also gives `truncated: true`; every such turn ends `completed` |
+| `s1_bounds_final_text_spills_to_a_file` [t4r16.7.8] | a text of exactly 256 KiB encoded is inline; one more byte puts the exact text in `final_text.txt`, with `final_text: null` and `final_text_file {path, bytes, truncated: false}`; past a lowered file cap the file ends at a character boundary with `truncated: true` and the turn ends `completed`; `final_text.write.short` fails the turn `store` with a file cut to its last complete character, named with its `bytes` and `truncated: true`; `final_text.sync.fail` fails it `store` with `final_text_file: null`; killed right after the terminal commit, the restarted daemon finds the named file with `bytes` bytes [t4r17.3] |
 | `s1_bounds_envelope_at_every_member_maximum_fits_1_mib` [t4r16.7.8] | every §6.4 member at its maximum, with 1,500 denials and 1,500 declines whose targets are 64 KiB: the envelope encodes within 1 MiB; each list holds 1,000 entries of at most 256 B citing their events, and each total is 1,500; a `bound` of 32 KiB + 1, a `vendor` of 16 KiB + 1 and a `model` of 1 KiB + 1 are `invalid_params` at receipt; a 1 KiB + 1 vendor short field is `protocol` |
 | `s1_bounds_final_text_piece_fits_256_kib` | a text of six-byte escapes is cut into pieces each at most 256 KiB encoded that concatenate to the text |
 | `s1_config_is_read_at_start_validated_and_reported` [t4r16.3] | no file gives the defaults; lowered values apply only after a restart; an unknown key (a `memory` object included), a duplicate key, `wal.max` ≤ `checkpoint_bytes`, `checkpoint_bytes` 0 or 4095, a value past 2^62 and a group-writable file each exit 78 naming key and rule, touching no Store or socket; `limits` equals the effective values |
 | `s1_daemon_log_after_startup_and_rotation` [t4r16.7.1] | an invalid `daemon.json` is reported by the auto-starting CLI from stderr; after a start that recovered a turn, the recovery warning is in `via.log` with its `session` and `turn`; a later warning is in `via.log` and not on stderr; the shutdown summary is the last line of `via.log`; a `via.log` of 10 MiB + 1 byte becomes `via.log.1` at the next start |
 | `s1_f05_…` (oversize, depth and nodes, partial line, 33rd socket) | F5 |
 | `s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_messages` | F27, seeded splitter: every complete message reaches Route byte-exact; a huge line fails `MessageTooLarge` with its prefix saved |
-| `s1_store_…`, `s1_wire_…`, `s1_blob_…` | death guard, lanes and fence, Latch fit with the largest `cwd`, Public saturation at the Store level, `finish` joins and hands off stragglers, torn and mismatched blobs, replay compare outside `admission` with a stalled reader |
+| `s1_store_…`, `s1_wire_…`, `s1_blob_…` | death guard, lanes and fence, Latch fit with the largest `cwd`, Public saturation at the Store level, `finish` joins and hands off stragglers, torn and mismatched blobs, identity compare by length and SHA-256 |
 
 ## 14. Task 4 scope disposition (`t4/t0.md`)
 
@@ -1659,12 +1727,12 @@ durable `output_schema` (§0).
 | A final text over 64 MiB is cut in its file; list entries past the first 1,000 are only in the events | measured sizes (§16) |
 | `via.log` grows without bound between daemon starts | its measured size (§16) |
 | Below the floor a queued turn fails `store` rather than waits | callers need queued work to survive a full disk |
-| At `wal.max` a running turn's step rows commit, but its other durable events are refused and fail it `store` | `via-d9o.2.3` measures the WAL policy |
+| At `wal.max` admitted turns keep writing, so the WAL grows past it while a reader holds a snapshot [t4r17.2] | `via-d9o.2.3` measures the growth (§16) |
 | `data_bytes` costs one directory walk per minute, linear in evidence files | retention (`via-jm4.18`), or the walk is slow |
 | Step counts and tokens are VIA's and unproven for Claude, Codex and OpenCode until their probes (§2.5), so `tokens` may be `null`; `running_tools` lists at most 64 names | each vendor's probe; the owner's accuracy decision (Q-R5-11) |
 | Transcript paths follow each vendor's internal layout; a deleted transcript loses the conversation (R8) | each vendor task |
 | Reusable connections and their evidence are not designed here | `via-4sw.3.2` and the Codex task |
-| The open-session tally is exact only until an uncertain close; `ord` increases strictly only while no session row is deleted; blob verification at start is linear in blob bytes | Store-failure recovery work; retention |
+| The open-session tally is exact only until an uncertain close; blob verification at start is linear in blob bytes | Store-failure recovery work; retention |
 | `revision` is 0; `process.idle_since` is `null` (A16) | late evidence; vendor idle shutdown |
 | Inferred: the §6.2 lifecycle count, the terminal and failure-batch sizes and the envelope maxima, `bound.effective` included (§6.4), the 128 B step row, the §5.1 sizes, `journal_size_limit` behaviour, and that `json_limits::scan` and serde_json agree on token boundaries | the checking test fails |
 
@@ -1681,7 +1749,8 @@ hardening follows the data.
 | The largest vendor message | the 1 MiB per-message cap | §5.1 |
 | Final text sizes; how often `final_text.txt` is used and truncated | 256 KiB inline, 64 MiB file | §6.4 |
 | Denied and declined list lengths | the first 1,000 entries | §6.4 |
-| Disk growth per turn and session; WAL growth of the largest transactions | the free-space floor, the size warning, `wal.max` plus one transaction (Q-R9-1) | §5.3, §5.4 |
+| Disk growth per turn and session; WAL growth past `wal.max` while admitted turns write and a reader holds a snapshot (Q-R9-1) [t4r17.2] | the free-space floor, the size warning, `wal.max` | §5.3, §5.4 |
 | Behaviour at the floor: refused receipts, queued turns failed at dispatch | the §5.3 rules | §5.3 |
 | Step counts and tokens per vendor, with tool-only and parallel-tool steps | the vendor's count and usage | §2.4, §2.5 |
 | `via.log` size between daemon starts | rotation at start past 10 MiB | §7.6 |
+| Whether the Latch and Lifecycle lanes and the seven-slot Lifecycle count are needed [t4r17.9] | the lanes as designed | §6.1, §6.2 |
