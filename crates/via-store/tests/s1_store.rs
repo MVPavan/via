@@ -1,5 +1,6 @@
-//! Task 3 S1 Store primitives (design §7.1, §10): schema v5, the close and
-//! F12 operations, and the error split. Written before the operations.
+//! Task 3 S1 Store primitives (design §7.1, §10): the close and F12
+//! operations and the error split, on schema v6 since Task 4. Written before
+//! the operations.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -12,9 +13,9 @@ use tempfile::TempDir;
 use via_store::{
     AnchorIdentity, AnchorIntent, AnchorPhase, CancelCause, CloseIntent, ClosedOutcome,
     ClosedRecord, ClosingRecord, CommitOutcome, FailureResolutionRecord, GroupAbsenceRecord,
-    OperationVerb, ProcessJournal, ResumeRecord, SessionId, SpawnRecord, Store, StoreClient,
-    StoreError, StoreLock, SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord,
-    TurnNumber,
+    Identity, OperationVerb, ProcessJournal, ResumeRecord, SessionId, SpawnRecord, Store,
+    StoreClient, StoreError, StoreLock, SubmissionRecord, SubmitFailedRecord, TerminalExtras,
+    TerminalRecord, TurnNumber,
 };
 
 const SESSION: &str = "s_7f3k9q2mzr4c";
@@ -42,7 +43,7 @@ fn private_dir() -> TempDir {
 }
 
 fn event(kind: &str, seq: u64) -> Value {
-    json!({"type":kind,"seq":seq,"at":"2026-01-01T00:00:00.000Z","raw_ref":null})
+    json!({"type":kind,"seq":seq,"at":"2026-01-01T00:00:00.000Z"})
 }
 
 async fn spawn(client: &StoreClient, id: &str) {
@@ -79,14 +80,12 @@ fn ended(number: u32, seq: u64, state: &str) -> TerminalRecord {
         turn: turn(number),
         envelope: json!({"state":state}),
         event: event("turn.ended", seq),
-        raw_ref: None,
     }
 }
 
 fn close_cause() -> TerminalExtras {
     TerminalExtras {
         cancel_cause: Some(CancelCause::Close),
-        raw_incomplete: None,
     }
 }
 
@@ -94,16 +93,16 @@ fn read_db(root: &TempDir) -> rusqlite::Connection {
     rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap()
 }
 
-/// Design §10: a fresh Store is schema v5; a v4 Store is an unreleased
-/// format refused with the recreate instruction, bytes untouched.
+/// Task 4 design §6.6: a fresh Store is schema v6; a v5 Store is an
+/// unreleased format refused with the recreate instruction, bytes untouched.
 #[test]
-fn fresh_store_is_v5_and_a_v4_store_is_refused() {
+fn fresh_store_is_v6_and_a_v5_store_is_refused() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let version: i64 = read_db(&root)
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 
     let old = private_dir();
     let db = old.path().join("store.sqlite3");
@@ -111,14 +110,14 @@ fn fresh_store_is_v5_and_a_v4_store_is_refused() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
             .unwrap();
-        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
     }
     fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
     let before = fs::read(&db).unwrap();
     let Err(error) = Store::open(old.path()) else {
-        panic!("a v4 Store opened");
+        panic!("a v5 Store opened");
     };
-    assert!(error.to_string().contains("schema v4"), "{error}");
+    assert!(error.to_string().contains("schema v5"), "{error}");
     assert!(error.to_string().contains("recreate"), "{error}");
     assert_eq!(fs::read(&db).unwrap(), before);
 }
@@ -194,7 +193,7 @@ fn close_derives_its_result_from_durable_cancel_cause_rows() {
         resume(&client, 2, 2).await.unwrap();
         let intent = CloseIntent {
             op_key: "close-1".to_owned(),
-            identity: b"close-params".to_vec(),
+            identity: Identity::of(b"close-params"),
         };
         client
             .commit_closing(ClosingRecord {
@@ -216,7 +215,7 @@ fn close_derives_its_result_from_durable_cancel_cause_rows() {
             .unwrap()
             .unwrap();
         assert_eq!(keyed.verb, OperationVerb::Close);
-        assert_eq!(keyed.identity, b"close-params");
+        assert_eq!(keyed.identity, Identity::of(b"close-params"));
         assert!(keyed.result.is_none());
         assert_eq!(
             client.closing_sessions_page(None, 10).await.unwrap(),
@@ -397,48 +396,72 @@ fn submit_failed_commits_submission_and_terminal_atomically() {
     assert_eq!(submitted.as_deref(), Some("2026-01-01T00:00:00.000Z"));
 }
 
-/// Design §7.2 row 6: a terminal may carry one `raw_log.incomplete` event in
-/// its own transaction, sequenced before `turn.ended`.
+/// Task 4 design §6.6: every terminal records the `seq` of its
+/// `turn.ended` in `turns.ended_seq`: a plain terminal, one with extras,
+/// a submit failure and each record of a failure-resolution batch.
 #[test]
-fn terminal_carries_its_raw_incomplete_event() {
+fn every_terminal_records_its_ended_seq() {
     let root = private_dir();
     let store = Store::open(root.path()).unwrap();
     let client = store.client();
     runtime().block_on(async {
         spawn(&client, SESSION).await;
+        resume(&client, 2, 2).await.unwrap();
+        client
+            .commit_terminal_with(ended(2, 3, "cancelled"), close_cause())
+            .await
+            .unwrap();
         client
             .commit_submission(SubmissionRecord {
                 session_id: session(),
                 turn: turn(1),
-                event: event("turn.submitted", 2),
+                event: event("turn.submitted", 4),
             })
             .await
             .unwrap();
+        resume(&client, 3, 5).await.unwrap();
         client
-            .commit_terminal_with(
-                ended(1, 4, "failed"),
-                TerminalExtras {
-                    cancel_cause: None,
-                    raw_incomplete: Some(event("raw_log.incomplete", 3)),
-                },
-            )
+            .commit_failure_resolution(FailureResolutionRecord {
+                terminal: ended(1, 6, "failed"),
+                cancellations: vec![ended(3, 7, "cancelled")],
+            })
             .await
             .unwrap();
-        let events = client.events(&session(), 1, 10).await.unwrap();
-        let kinds: Vec<&str> = events
-            .iter()
-            .map(|stored| stored.event["type"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                "turn.queued",
-                "turn.submitted",
-                "raw_log.incomplete",
-                "turn.ended"
-            ]
-        );
+        spawn(&client, OTHER).await;
+        client
+            .commit_submit_failed(SubmitFailedRecord {
+                session_id: SessionId::try_from(OTHER).unwrap(),
+                turn: turn(1),
+                submitted: event("turn.submitted", 2),
+                ended: event("turn.ended", 3),
+                envelope: json!({"state":"failed","failure":{"class":"store"}}),
+            })
+            .await
+            .unwrap();
+        resume(&client, 4, 8).await.unwrap();
+        client
+            .commit_terminal(ended(4, 9, "cancelled"))
+            .await
+            .unwrap();
     });
+    drop(store);
+    let rows: Vec<(String, u32, Option<i64>)> = read_db(&root)
+        .prepare("SELECT session_id,number,ended_seq FROM turns ORDER BY session_id,number")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (SESSION.to_owned(), 1, Some(6)),
+            (SESSION.to_owned(), 2, Some(3)),
+            (SESSION.to_owned(), 3, Some(7)),
+            (SESSION.to_owned(), 4, Some(9)),
+            (OTHER.to_owned(), 1, Some(3)),
+        ]
+    );
 }
 
 /// Design §7.4: the latch batch commits one terminal and the session's queued
@@ -466,7 +489,6 @@ fn failure_resolution_batch_is_one_bounded_transaction() {
         }
         let batch = |count: u32| FailureResolutionRecord {
             terminal: ended(1, 10, "failed"),
-            raw_incomplete: None,
             cancellations: (2..2 + count)
                 .map(|number| ended(number, u64::from(number) + 9, "cancelled"))
                 .collect(),
@@ -504,7 +526,6 @@ fn failure_resolution_refuses_a_primary_turn_that_is_not_running() {
         let refused = client
             .commit_failure_resolution(FailureResolutionRecord {
                 terminal: ended(1, 3, "cancelled"),
-                raw_incomplete: None,
                 cancellations: vec![ended(2, 4, "cancelled")],
             })
             .await;
@@ -545,7 +566,6 @@ fn failure_resolution_refuses_a_partial_cancellation_set() {
         let refused = client
             .commit_failure_resolution(FailureResolutionRecord {
                 terminal: ended(1, 5, "failed"),
-                raw_incomplete: None,
                 cancellations: vec![ended(2, 6, "cancelled")],
             })
             .await;

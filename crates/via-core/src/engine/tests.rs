@@ -35,7 +35,7 @@ fn child(name: &str) -> Option<PathBuf> {
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()
         .unwrap();
-    for part in ["state", "state/raw", "runtime", "runtime/anchors", "sync"] {
+    for part in ["state", "runtime", "runtime/anchors", "sync"] {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(root.path().join(part))
@@ -246,7 +246,6 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
             turn: Some(n),
             late: false,
             at: &at,
-            raw_ref: None,
             body,
         }
         .to_value()
@@ -286,7 +285,6 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                         cancel: None,
                     },
                 ),
-                raw_ref: None,
             })
             .await
             .unwrap();
@@ -2026,7 +2024,6 @@ fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
             turn: turn(1),
             head: super::journal::Head::new(Some(2)),
             accepted: None,
-            spans: Vec::new(),
             first_failure: Some(super::FailureNote {
                 site: super::latch::FailureSite::Event,
                 outcome: super::latch::WriteOutcome::NotCommitted,
@@ -2076,7 +2073,6 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             turn: turn(1),
             head: super::journal::Head::new(None),
             accepted: None,
-            spans: Vec::new(),
             first_failure: None,
             uncertain: None,
         };
@@ -2085,17 +2081,10 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
         .unwrap();
-        let raw_ref = crate::RawRef::new(
-            crate::ConnectionId::try_from("c_000000000000").unwrap(),
-            0,
-            1,
-        )
-        .unwrap();
         let queued = via_adapters::FakeObservation::Data {
             observation: via_adapters::Observation::AssistantText {
                 text: "lost".to_owned(),
             },
-            raw_ref,
         };
         engine
             .drain_queued(&slot, &mut record, &effective, orders, vec![queued])
@@ -2157,13 +2146,13 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             queued_at: rfc3339(std::time::SystemTime::now()),
             first_seq: 1,
             submitted: None,
+            folder: None,
         };
         let record = super::TurnRecord {
             session: session.clone(),
             turn: turn(1),
             head: super::journal::Head::new(None),
             accepted: None,
-            spans: Vec::new(),
             first_failure: None,
             uncertain: None,
         };
@@ -2178,8 +2167,6 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             vendor_stop_reason: None,
             final_text: String::new(),
             exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
             warnings: Vec::new(),
             cancel: None,
         };
@@ -2348,11 +2335,10 @@ fn turn_one(session: &SessionId, uncertain: bool) -> super::TurnRecord {
         turn: turn(1),
         head: super::journal::Head::new(Some(2)),
         accepted: None,
-        spans: Vec::new(),
         first_failure: None,
         uncertain: uncertain.then_some(super::journal::UncertainEvent {
             seq: 2,
-            raw_ref: None,
+            event: serde_json::Value::Null,
             accepted: None,
         }),
     }
@@ -2366,6 +2352,7 @@ fn started_one(session: &SessionId) -> super::Started {
         queued_at: rfc3339(std::time::SystemTime::now()),
         first_seq: 1,
         submitted: None,
+        folder: None,
     }
 }
 
@@ -2382,8 +2369,6 @@ fn store_terminal() -> super::Terminal {
         vendor_stop_reason: None,
         final_text: String::new(),
         exit: None,
-        raw_ref: None,
-        raw_incomplete: false,
         warnings: Vec::new(),
         cancel: None,
     }
@@ -2438,7 +2423,6 @@ fn batch_read_corruption(
             started: started_one(&session),
             record: record(&session),
             terminal: store_terminal(),
-            raw_incomplete: false,
         };
         let n = arm_next(&points, point);
         let mut batches = super::batch::FailureBatches::default();
@@ -2555,17 +2539,10 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
         .unwrap();
-        let raw_ref = crate::RawRef::new(
-            crate::ConnectionId::try_from("c_000000000000").unwrap(),
-            0,
-            1,
-        )
-        .unwrap();
         let accepted =
             via_adapters::FakeObservation::Accepted(via_adapters::FakeAcceptanceObservation {
                 correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
                 vendor_turn_id: via_adapters::VendorTurnId::try_from("v_1".to_owned()).unwrap(),
-                raw_ref,
             });
         let n = arm_next(&points, point);
         engine
@@ -2622,7 +2599,6 @@ async fn durably_closed_session(engine: &Engine) -> SessionId {
         turn: None,
         late: false,
         at: &rfc3339(std::time::SystemTime::now()),
-        raw_ref: None,
         body: EventBody::SessionClosed {
             reason: super::drive::FORCE_CLOSE_REASON,
         },

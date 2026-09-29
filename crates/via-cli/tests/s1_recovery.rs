@@ -1,17 +1,15 @@
 //! Recovery evidence through the real `via` binary, daemon and SQLite Store
 //! (design T3 §9, §7.3, §11): a crash while a turn runs (F9), Host's two
 //! positive cleanup paths after a crash (F22 a and b), the vendor
-//! environment (F23), the durable `cancel.requested` and raw-log
-//! incompleteness of a recovered turn, the restart handoff's corrupt-row
+//! environment (F23), the durable `cancel.requested` and evidence folder
+//! of a recovered turn, the restart handoff's corrupt-row
 //! rule (O1.D8, §7.2 row 13), and restart with nondefault frozen values.
 //! Waits are bounded waits on durable rows, fake gates, failpoint
 //! acknowledgements or process exit; no sleep orders two events.
 
 #[cfg(feature = "test-failpoints")]
-#[path = "support/anchors.rs"]
-mod anchors;
-#[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod failpoints;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/hits.rs"]
@@ -27,7 +25,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -156,32 +154,28 @@ impl Paths {
         Ok(store)
     }
 
-    /// A session's committed events with their connection ids, in sequence
-    /// order; fails unless the sequence is dense from one.
-    fn events(&self, session: &str) -> Result<Vec<(Value, Option<String>)>, ScenarioError> {
+    /// A session's committed events, in sequence order; fails unless the
+    /// sequence is dense from one.
+    fn events(&self, session: &str) -> Result<Vec<Value>, ScenarioError> {
         let store = self.store()?;
         let mut query = store
-            .prepare("SELECT seq,event,connection_id FROM events WHERE session_id=?1 ORDER BY seq")
+            .prepare("SELECT seq,event FROM events WHERE session_id=?1 ORDER BY seq")
             .map_err(infra)?;
         let rows = query
             .query_map([session], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(infra)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(infra)?;
         let mut events = Vec::new();
-        for (index, (seq, event, connection)) in rows.into_iter().enumerate() {
+        for (index, (seq, event)) in rows.into_iter().enumerate() {
             let event: Value = serde_json::from_str(&event).map_err(infra)?;
             check(
                 i64::try_from(index + 1) == Ok(seq) && event["seq"] == seq,
                 || format!("event sequence is not dense at {seq}: {event}"),
             )?;
-            events.push((event, connection));
+            events.push(event);
         }
         Ok(events)
     }
@@ -191,8 +185,8 @@ impl Paths {
         Ok(self
             .events(session)?
             .into_iter()
-            .filter(|(event, _)| event["turn"] == n)
-            .filter_map(|(event, _)| event["type"].as_str().map(str::to_owned))
+            .filter(|event| event["turn"] == n)
+            .filter_map(|event| event["type"].as_str().map(str::to_owned))
             .collect())
     }
 
@@ -200,10 +194,10 @@ impl Paths {
     fn await_event(&self, session: &str, n: u32, kind: &str) -> Result<Value, ScenarioError> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some((event, _)) = self
+            if let Some(event) = self
                 .events(session)?
                 .into_iter()
-                .find(|(event, _)| event["turn"] == n && event["type"] == kind)
+                .find(|event| event["turn"] == n && event["type"] == kind)
             {
                 return Ok(event);
             }
@@ -699,59 +693,25 @@ fn recovered_unknown(paths: &Paths, session: &str) -> Result<Value, ScenarioErro
     Ok(envelope)
 }
 
-/// Design §9: a recovered turn with a committed anchor at `arm_intent` or
-/// later carries exactly one `raw_log.incomplete` for its own connection,
-/// before its recovery settlement, and the `raw_log_incomplete` warning.
-fn raw_incomplete_recorded(
-    paths: &Paths,
-    session: &str,
-    envelope: &Value,
-    connection: &str,
-) -> Result<(), ScenarioError> {
-    let events = paths.events(session)?;
-    let incomplete: Vec<&Value> = events
-        .iter()
-        .map(|(event, _)| event)
-        .filter(|event| event["turn"] == 1 && event["type"] == "raw_log.incomplete")
-        .collect();
+/// Task 4 design §7.5, §9: a recovered turn's envelope names its evidence
+/// folder, computed from its address, and only the plan's warning.
+fn recovered_evidence(session: &str, envelope: &Value) -> Result<(), ScenarioError> {
+    let folder = envelope["evidence"]["folder"].as_str().unwrap_or_default();
     check(
-        incomplete.len() == 1 && incomplete[0]["connection_id"] == connection,
-        || format!("raw_log.incomplete events {incomplete:?}, connection {connection}"),
-    )?;
-    let types = paths.turn_types(session, 1)?;
-    let position = |kind: &str| types.iter().position(|seen| seen == kind);
-    check(
-        position("raw_log.incomplete") < position("cancel.requested"),
-        || format!("raw_log.incomplete after the settlement: {types:?}"),
-    )?;
-    check(
-        warnings(envelope).contains(&"raw_log_incomplete".to_owned()),
-        || format!("no raw_log_incomplete warning: {envelope}"),
+        Path::new(folder).is_absolute()
+            && folder.ends_with(&format!("evidence/{session}/1"))
+            && envelope["evidence"]["transcript"].is_null()
+            && warnings(envelope) == ["vendor_version_untested"],
+        || format!("recovered envelope evidence: {envelope}"),
     )
-}
-
-/// The one raw connection the turn's committed events cite.
-fn cited_connection(paths: &Paths, session: &str) -> Result<String, ScenarioError> {
-    let mut connections: Vec<String> = paths
-        .events(session)?
-        .into_iter()
-        .filter(|(event, _)| event["turn"] == 1)
-        .filter_map(|(_, connection)| connection)
-        .collect();
-    connections.dedup();
-    match connections.as_slice() {
-        [connection] => Ok(connection.clone()),
-        _ => Err(fail(&format!("turn 1 cites connections {connections:?}"))),
-    }
 }
 
 // ------------------------------------------------------------------ F9
 
-/// F9 (design §11), a characterization test except for the
-/// `raw_log_incomplete` assertions (design §9). Streamed events committed,
+/// F9 (design §11), a characterization test. Streamed events committed,
 /// then SIGKILL: after restart turn 1 is `unknown`, the fake received exactly
-/// one start, the queued successor is cancelled, and the unsealed connection
-/// is recorded incomplete with the warning.
+/// one start, the queued successor is cancelled, and the envelope names the
+/// turn's evidence folder and only the plan's warning (Task 4 design §7.5).
 #[test]
 fn s1_f09_kill_while_running_restarts_unknown_no_resend() -> TestResult {
     let fixture = json!({"scripts":[
@@ -765,7 +725,6 @@ fn s1_f09_kill_while_running_restarts_unknown_no_resend() -> TestResult {
         paths.await_file("streamed.entered")?;
         paths.await_event(&session, 1, "assistant.text")?;
         resume(paths, evidence, "resume", &session, "f09-next", &[])?;
-        let connection = cited_connection(paths, &session)?;
         daemon.kill()?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         let envelope = recovered_unknown(paths, &session)?;
@@ -778,7 +737,7 @@ fn s1_f09_kill_while_running_restarts_unknown_no_resend() -> TestResult {
             state == "cancelled" && second["timestamps"]["submitted_at"].is_null(),
             || format!("queued successor after restart: {state} {second}"),
         )?;
-        raw_incomplete_recorded(paths, &session, &envelope, &connection)
+        recovered_evidence(&session, &envelope)
     })
 }
 
@@ -1023,7 +982,6 @@ fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
             let durable = |kind: &str| {
                 events
                     .iter()
-                    .map(|(event, _)| event)
                     .find(|event| event["turn"] == 1 && event["type"] == kind)
                     .cloned()
                     .ok_or_else(|| fail(&format!("no durable {kind}")))
@@ -1053,106 +1011,15 @@ fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
     )
 }
 
-/// [`anchors::insert_proven_absent`] into the scenario's Store.
-#[cfg(feature = "test-failpoints")]
-fn insert_proven_absent(
-    paths: &Paths,
-    owner: &str,
-    prefix: &str,
-    count: u32,
-) -> Result<(), ScenarioError> {
-    anchors::insert_proven_absent(&paths.state.join("store.sqlite3"), owner, prefix, count)
-        .map_err(infra)
-}
+// ------------------------------------------------- recovery without an armed anchor
 
-/// [`anchors::delete_synthetic`] from the scenario's Store.
-#[cfg(feature = "test-failpoints")]
-fn delete_synthetic(paths: &Paths, prefix: &str) -> Result<(), ScenarioError> {
-    anchors::delete_synthetic(&paths.state.join("store.sqlite3"), prefix).map_err(infra)
-}
-
-/// Design §9: a durable `raw_log.incomplete` carries its warning. The
-/// crashed turn never launched. The first restart's inventory is
-/// incomplete (held at the page boundary past the 5 s reconciliation
-/// deadline over 300 synthetic anchors), so it commits the event, and its
-/// terminal write fails (`store.commit.terminal`): startup fails. The
-/// second restart's inventory is complete and shows no armed anchor, yet
-/// the envelope carries `raw_log_incomplete`, with the one durable event.
+/// Design §9: a recovered turn whose anchor never reached `arm_intent` (its
+/// ARM intent commit is held by `store.journal.arm_intent`), and one with no
+/// anchor at all (held right after submission intent), are `unknown` with
+/// their evidence folder named and only the plan's warning.
 #[cfg(feature = "test-failpoints")]
 #[test]
-fn s1_recovery_durable_raw_log_incomplete_keeps_its_warning() -> TestResult {
-    let fixture = json!({"scripts":[completes("seed", 1), completes("held", 1)]});
-    scenario(
-        "s1_recovery_durable_raw_incomplete",
-        &fixture,
-        |paths, evidence| {
-            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
-            let seed = session_of(&spawn(paths, evidence, "spawn-seed", "seed", &[])?)?;
-            let seeded = wait(paths, evidence, &format!("{seed}/1"))?;
-            check(seeded["state"] == "completed", || format!("seed: {seeded}"))?;
-            // The seed turn was hit 1; the crashed turn is hit 2.
-            let intent = "core.intent.after_commit";
-            paths.failpoints.arm(intent, 2, "pause").map_err(infra)?;
-            let session = session_of(&spawn(paths, evidence, "spawn", "held", &[])?)?;
-            paths
-                .failpoints
-                .wait_ack(intent, 2, "pause", daemon.child.id(), ACK_WAIT)
-                .map_err(|error| fail(&format!("failpoint {intent}: {error}")))?;
-            daemon.kill()?;
-            paths.failpoints.disarm(intent).map_err(infra)?;
-            check(paths.anchors_of_turn(&session, 1)? == 0, || {
-                "the held submission launched".to_owned()
-            })?;
-            // Ids sort before the real anchor's hex id: two pages.
-            insert_proven_absent(paths, &seed, "0-synthetic", 300)?;
-            let boundary = "core.recovery.page_boundary";
-            paths.failpoints.arm(boundary, 1, "pause").map_err(infra)?;
-            let terminal = "store.commit.terminal";
-            paths
-                .failpoints
-                .arm(terminal, 1, "fail_io")
-                .map_err(infra)?;
-            let mut refused = Daemon::spawn(paths, evidence, "refused", &[])?;
-            paths
-                .failpoints
-                .wait_ack(boundary, 1, "pause", refused.child.id(), ACK_WAIT)
-                .map_err(|error| fail(&format!("failpoint {boundary}: {error}")))?;
-            // Elapsed time only: the deadline began before the acknowledgement.
-            thread::sleep(Duration::from_millis(5_200));
-            paths.failpoints.release(boundary, 1).map_err(infra)?;
-            let status = wait_child(&mut refused.child, Duration::from_secs(15))?
-                .ok_or_else(|| fail("the daemon admitted after a failed recovery terminal"))?;
-            check(!status.success(), || {
-                format!("startup did not fail on the terminal write ({status})")
-            })?;
-            let (state, _) = paths.turn(&session, 1)?;
-            let types = paths.turn_types(&session, 1)?;
-            check(
-                state == "running" && types.contains(&"raw_log.incomplete".to_owned()),
-                || format!("before the second recovery: {state} {types:?}"),
-            )?;
-            delete_synthetic(paths, "0-synthetic")?;
-            drop(refused);
-            paths.failpoints.disarm(boundary).map_err(infra)?;
-            paths.failpoints.disarm(terminal).map_err(infra)?;
-            let _daemon = Daemon::start(paths, evidence, "final")?;
-            let envelope = recovered_unknown(paths, &session)?;
-            // Never launched: turn 1's connection is named from its session.
-            let connection = format!("c_{}", session.trim_start_matches("s_"));
-            raw_incomplete_recorded(paths, &session, &envelope, &connection)
-        },
-    )
-}
-
-// ------------------------------------------------- raw incompleteness negatives
-
-/// Design §9, the negative half: a recovered turn whose anchor never reached
-/// `arm_intent` (its ARM intent commit is held by `store.journal.arm_intent`),
-/// and one with no anchor at all (held right after submission intent), get
-/// neither `raw_log.incomplete` nor the warning.
-#[cfg(feature = "test-failpoints")]
-#[test]
-fn s1_recovery_without_armed_anchor_records_no_raw_incompleteness() -> TestResult {
+fn s1_recovery_without_armed_anchor_names_its_evidence_folder() -> TestResult {
     let fixture = json!({"scripts":[completes("pre-arm", 1), completes("no-anchor", 1)]});
     scenario(
         "s1_recovery_unarmed_raw_complete",
@@ -1190,17 +1057,12 @@ fn s1_recovery_without_armed_anchor_records_no_raw_incompleteness() -> TestResul
             paths.failpoints.disarm(intent).map_err(infra)?;
             paths.failpoints.disarm(arm).map_err(infra)?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
-            // The restarted daemon's own raw log, for the evidence set.
+            // The restarted daemon's own turn, for the evidence set.
             let after = session_of(&spawn(paths, evidence, "spawn-c", "pre-arm", &[])?)?;
             wait(paths, evidence, &format!("{after}/1"))?;
             for session in [&no_anchor, &pre_arm] {
                 let envelope = recovered_unknown(paths, session)?;
-                let types = paths.turn_types(session, 1)?;
-                check(
-                    !types.contains(&"raw_log.incomplete".to_owned())
-                        && !warnings(&envelope).contains(&"raw_log_incomplete".to_owned()),
-                    || format!("raw incompleteness without an armed anchor: {types:?} {envelope}"),
-                )?;
+                recovered_evidence(session, &envelope)?;
             }
             Ok(())
         },
@@ -1735,7 +1597,7 @@ fn s1_recovery_unreadable_row_in_a_closing_session_is_cancelled() -> TestResult 
             let closed = paths
                 .events(&session)?
                 .iter()
-                .any(|(event, _)| event["type"] == "session.closed");
+                .any(|event| event["type"] == "session.closed");
             check(closed, || {
                 "the restart did not close the session".to_owned()
             })?;

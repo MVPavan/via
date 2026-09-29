@@ -293,15 +293,15 @@ impl Sandbox {
         }
     }
 
-    /// Occurrences of `needle` across every raw log file.
-    fn raw_count(&self, needle: &str) -> TestResult<usize> {
-        let mut count = 0;
-        for entry in fs::read_dir(self.state.join("raw"))? {
-            let bytes = fs::read(entry?.path())?;
-            let text = String::from_utf8_lossy(&bytes);
-            count += text.matches(needle).count();
-        }
-        Ok(count)
+    /// A file in the turn's evidence folder (Task 4 design §7.1).
+    fn evidence_file(&self, session: &str, turn: u32, name: &str) -> TestResult<Vec<u8>> {
+        Ok(fs::read(
+            self.state
+                .join("evidence")
+                .join(session)
+                .join(turn.to_string())
+                .join(name),
+        )?)
     }
 
     fn trace(&self) -> String {
@@ -618,9 +618,11 @@ fn s1_cancel_running_turn_acknowledged() -> TestResult {
     check(requested == 1 && settled == 1, || {
         format!("events: {types:?}")
     })?;
-    let interrupts = sandbox.raw_count(r#""type":"interrupt","id":2"#)?;
-    check(interrupts == 1, || {
-        format!("{interrupts} interrupts were sent")
+    // The fake read exactly one interrupt: a second one makes it report
+    // "invalid typed interrupt request" on its stderr, `stderr.log`.
+    let stderr = sandbox.evidence_file(&session, 1, "stderr.log")?;
+    check(stderr.is_empty(), || {
+        format!("the fake reported: {}", String::from_utf8_lossy(&stderr))
     })?;
     let cause: String = sandbox.query(&format!(
         "SELECT cancel_cause FROM turns WHERE session_id='{session}' AND number=1"
@@ -888,7 +890,7 @@ fn s1_f19_wall_deadline_clears_grandchild() -> TestResult {
 
 /// F21 (design §2; characterization of S1's Route mapping end to end): an
 /// exit after an unterminated line is `failed(process_exited)`, and the
-/// partial bytes are in the raw log.
+/// partial bytes are the turn's `undecoded.bin` (Task 4 design §7.3).
 #[test]
 fn s1_f21_crash_mid_line_is_process_exited() -> TestResult {
     let sandbox = Sandbox::new(&script(
@@ -907,8 +909,9 @@ fn s1_f21_crash_mid_line_is_process_exited() -> TestResult {
         envelope["state"] == "failed" && envelope["failure"]["class"] == "process_exited",
         || format!("F21 envelope: {envelope}"),
     )?;
-    check(sandbox.raw_count("partial-f21")? >= 1, || {
-        "the partial line is not in the raw log".to_owned()
+    let saved = sandbox.evidence_file(&session, 1, "undecoded.bin")?;
+    check(saved == br#"{"type":"text","partial-f21"#, || {
+        format!("undecoded.bin holds {}", String::from_utf8_lossy(&saved))
     })?;
     daemon.finish()
 }

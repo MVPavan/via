@@ -66,7 +66,7 @@ impl Engine {
         let hash = hash_handle(&params.handle)?;
         let key = match retry_key(params.idempotency_key.as_deref())? {
             Some(key) => {
-                let identity = retry_identity(raw_params, &hash)?;
+                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
                 if let Some(stored) = self
                     .store
                     .spawn_key(key)
@@ -124,7 +124,6 @@ impl Engine {
             turn: Some(turn.get()),
             late: false,
             at: &at,
-            raw_ref: None,
             body: EventBody::TurnQueued { queue_position: 0 },
         }
         .to_value()?;
@@ -192,7 +191,7 @@ impl Engine {
         }
         let operation = match key {
             Some(key) => {
-                let identity = retry_identity(raw_params, &hash)?;
+                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
                 let stored = self
                     .store
                     .operation(&session, key)
@@ -254,7 +253,7 @@ impl Engine {
         session: SessionId,
         snapshot: &SessionSnapshot,
         (prompt, effective): (String, Effective),
-        operation: Option<(String, Vec<u8>)>,
+        operation: Option<(String, via_store::Identity)>,
         admission: &Admission<'_>,
     ) -> Result<Receipted, ApiError> {
         let turn = TurnNumber::try_from(snapshot.turns + 1).map_err(|_| ApiError::STORE)?;
@@ -279,7 +278,6 @@ impl Engine {
             turn: Some(turn.get()),
             late: false,
             at: &at,
-            raw_ref: None,
             body: EventBody::TurnQueued {
                 queue_position: snapshot.queued,
             },

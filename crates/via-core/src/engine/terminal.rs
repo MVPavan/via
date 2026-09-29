@@ -10,13 +10,14 @@ use via_store::CancelCause;
 use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
-    Bound, Cost, Envelope, EventRange, Exit, FailureClass, RawSpan, Requested, RoutePlan,
+    Bound, Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, Requested, RoutePlan,
     Timestamps, Usage, VendorFields, Warning,
 };
 use crate::{SessionId, TurnNumber};
 
 /// Assembles the C1 §5 envelope; `events` runs from the turn's `turn.queued` to
-/// its `turn.ended`, other turns' events of the session included.
+/// its `turn.ended`, other turns' events of the session included. `folder`
+/// is the turn's absolute evidence folder, `None` for a turn never submitted.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -26,7 +27,7 @@ pub(super) fn terminal_envelope(
     turn: TurnNumber,
     terminal: Terminal,
     accepted: Option<Accepted>,
-    raw_spans: Vec<RawSpan>,
+    folder: Option<String>,
     timestamps: Timestamps,
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
@@ -81,7 +82,11 @@ pub(super) fn terminal_envelope(
             last_seq,
             count: last_seq + 1 - first_seq,
         },
-        raw_spans,
+        // The fake reports no vendor transcript (design §7.4).
+        evidence: EvidenceRef {
+            folder,
+            transcript: None,
+        },
         vendor_options: json!({}),
         vendor: VendorFields {
             turn_id: accepted.map(|accepted| accepted.vendor_turn_id),
@@ -345,15 +350,13 @@ pub(super) fn classify(
             code: evidence.exit.code,
             signal: evidence.exit.signal,
         }),
-        raw_ref: Some(evidence.terminal_raw),
-        raw_incomplete: false,
         warnings: Vec::new(),
         cancel: None,
     }
 }
 
-/// Keeps the typed cause, cited vendor message, confirmed exit and raw completeness of a
-/// failed drive.
+/// Keeps the typed cause, the undecoded message's note and the confirmed
+/// exit of a failed drive.
 fn failed_terminal(error: AdapterError) -> Terminal {
     let message = error.to_string();
     let (state, class, stop_reason, route) = match error {
@@ -380,8 +383,6 @@ fn failed_terminal(error: AdapterError) -> Terminal {
                 code: exit.code,
                 signal: exit.signal,
             }),
-        raw_ref: route.as_ref().and_then(|route| route.evidence.clone()),
-        raw_incomplete: route.is_some_and(|route| route.raw_incomplete),
         warnings: Vec::new(),
         cancel: None,
     }
@@ -406,12 +407,11 @@ mod tests {
     use super::{FailureClass, TurnNumber, failed_terminal};
     use via_adapters::{AdapterError, RouteError, RouteFailure};
 
-    fn route(cause: RouteError, raw_incomplete: bool) -> AdapterError {
+    fn route(cause: RouteError, undecoded: Option<&str>) -> AdapterError {
         AdapterError::Route(RouteFailure {
             cause,
-            evidence: None,
+            undecoded: undecoded.map(str::to_owned),
             exit: None,
-            raw_incomplete,
             launched: false,
             cleanup: None,
             forced: false,
@@ -419,7 +419,9 @@ mod tests {
         })
     }
 
-    /// Causes the fake vendor cannot trigger end to end keep their C1 §8.2 class.
+    /// Causes the fake vendor cannot trigger end to end keep their C1 §8.2
+    /// class; a kept undecoded message is named in `failure.message` (Task 4
+    /// design §7.3).
     #[test]
     fn route_causes_keep_their_c1_disposition() {
         let turn = TurnNumber::try_from(1).unwrap();
@@ -428,7 +430,7 @@ mod tests {
             (
                 RouteError::Store {
                     turn,
-                    kind: via_adapters::StoreFailure::Raw,
+                    kind: via_adapters::StoreFailure::Evidence,
                 },
                 FailureClass::Store,
             ),
@@ -438,20 +440,27 @@ mod tests {
                 FailureClass::ProcessExited,
             ),
         ] {
-            let terminal = failed_terminal(route(cause, false));
+            let terminal = failed_terminal(route(cause, None));
             assert_eq!(terminal.state, "failed");
             assert_eq!(terminal.failure.map(|failure| failure.class), Some(class));
-            assert!(!terminal.raw_incomplete);
         }
-        let lost = failed_terminal(route(
-            RouteError::TransportLost {
+        let note = "undecodable vendor message: 9 bytes; first 9 in /s/undecoded.bin";
+        let protocol = failed_terminal(route(
+            RouteError::Protocol {
                 turn,
-                evidence: None,
+                detail: "malformed known fake message",
             },
-            true,
+            Some(note),
         ));
+        let failure = protocol.failure.expect("a protocol failure");
+        assert_eq!(failure.class, FailureClass::Protocol);
+        assert!(
+            failure.message.ends_with(&format!("; {note}")),
+            "{}",
+            failure.message
+        );
+        let lost = failed_terminal(route(RouteError::TransportLost { turn }, None));
         assert_eq!(lost.state, "unknown");
         assert!(lost.failure.is_none());
-        assert!(lost.raw_incomplete);
     }
 }

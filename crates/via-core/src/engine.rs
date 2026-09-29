@@ -14,8 +14,8 @@ use std::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::api::{Cancel, Exit, Failure, FailureClass, RawSpan, Warning};
-use crate::{FakeConfig, RawRef, SessionId, TurnNumber};
+use crate::api::{Cancel, Exit, Failure, FailureClass, Warning};
+use crate::{FakeConfig, SessionId, TurnNumber};
 use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
 use via_store::{Store, StoreClient, StoreLock};
 
@@ -172,11 +172,6 @@ struct ForcedTurn {
     started: Started,
     record: TurnRecord,
     requested_at: String,
-    /// Route's force cleanup could not record every vendor byte.
-    raw_incomplete: bool,
-    /// Its `raw_log.incomplete` was dropped after the turn's first failure
-    /// and is owed to the failure-resolution batch (design §7.4).
-    raw_owed: bool,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
     /// Route's own Host close: its stop found the vendor live, and whether it
@@ -205,6 +200,9 @@ struct Started {
     first_seq: u64,
     /// Submission time and clock; `None` for a turn cancelled while queued.
     submitted: Option<(String, Instant)>,
+    /// The turn's absolute evidence folder, once submitted (Task 4 design
+    /// §7.1); the envelope's `evidence.folder`.
+    folder: Option<String>,
 }
 
 /// A held `admission` guard: receipts, stop acceptance, the Store-failed
@@ -422,12 +420,11 @@ impl Engine {
 #[derive(Clone)]
 struct Accepted {
     at: String,
-    raw_ref: RawRef,
     vendor_turn_id: String,
 }
 
-/// Durable progress of a running turn: the session's shared event head and the
-/// bounding raw spans of every event committed so far. A clone is kept
+/// Durable progress of a running turn: the session's shared event head and
+/// what its committed events established. A clone is kept
 /// for the failure-resolution batch of a turn whose terminal failed
 /// (design §7.4).
 #[derive(Clone)]
@@ -436,7 +433,6 @@ struct TurnRecord {
     turn: TurnNumber,
     head: Arc<Head>,
     accepted: Option<Accepted>,
-    spans: Vec<RawSpan>,
     /// The turn's first failed Store write (design §7.2): after it the turn
     /// writes nothing but its one resolution write.
     first_failure: Option<FailureNote>,
@@ -461,8 +457,6 @@ struct Terminal {
     vendor_stop_reason: Option<String>,
     final_text: String,
     exit: Option<Exit>,
-    raw_ref: Option<RawRef>,
-    raw_incomplete: bool,
     warnings: Vec<Warning>,
     cancel: Option<Cancel>,
 }

@@ -84,8 +84,9 @@ pub(super) enum FailureSite {
     /// Final shutdown's failure-resolution batch (§7.4); only reached after
     /// the latch.
     Batch,
-    /// A raw append or sync Route depends on (row 6).
-    Raw,
+    /// A storage step Route depends on: the turn's evidence folder or
+    /// `stderr.log` (Task 4 design §7.2), or a Store write that latches.
+    Evidence,
     /// A Host journal write of a turn's acquisition (rows 3 and 4).
     Journal,
     /// A group-absence proof's commit (row 12).
@@ -112,7 +113,7 @@ impl FailureSite {
             | Self::Event
             | Self::Terminal
             | Self::QueuedCancel
-            | Self::Raw
+            | Self::Evidence
             | Self::Journal
             | Self::Absence
             | Self::Read
@@ -136,7 +137,7 @@ impl FailureSite {
             | Self::QueuedCancel
             | Self::ForcedTerminal
             | Self::Batch
-            | Self::Raw
+            | Self::Evidence
             | Self::Journal
             | Self::Read
             | Self::CorruptRow => "turn",
@@ -266,7 +267,7 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             | FailureSite::Closed
             | FailureSite::ForcedTerminal
             | FailureSite::Batch => "commit_failed",
-            FailureSite::Raw => "raw_failed",
+            FailureSite::Evidence => "evidence_failed",
             FailureSite::Journal | FailureSite::Absence => "journal_failed",
             FailureSite::Read => "read_failed",
             FailureSite::CorruptRow => "corrupt_row",

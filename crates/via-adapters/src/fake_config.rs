@@ -75,6 +75,8 @@ impl FakeConfig {
             cwd: self.cwd.clone(),
             env,
             owner,
+            // Wire creates the turn's evidence folder and names the file in it.
+            stderr_path: std::path::PathBuf::new(),
             capacity: None,
         })
     }

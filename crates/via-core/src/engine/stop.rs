@@ -13,7 +13,7 @@ use super::latch::{
     ABORTED_JOIN, FINALIZE_RESERVE, FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome,
 };
 use super::{Admission, Engine, Terminal, TurnRecord, lock};
-use crate::api::{Cancel, Event, EventBody, FailureClass, Warning, rfc3339};
+use crate::api::{Cancel, Event, EventBody, FailureClass, rfc3339};
 use crate::{ApiError, DaemonStopParams, Deadline, SessionId, TurnNumber};
 
 /// The C1 §3.14 stop mode Core accepted.
@@ -273,14 +273,12 @@ impl Engine {
             .instant()
             .min(tokio::time::Instant::now() + FINALIZE_WRITE);
         if batch::affected(&turn.record) {
-            let raw_incomplete = turn.raw_owed;
             // After the first failure `cancel.settled` is not written: no I/O.
             let (started, record, terminal) = self.forced_terminal(turn, facts).await;
             let affected = AffectedTurn {
                 started,
                 record,
                 terminal,
-                raw_incomplete,
             };
             self.resolve_affected(affected, deadline, batches).await;
             return true;
@@ -384,15 +382,9 @@ impl Engine {
             vendor_stop_reason: None,
             final_text: String::new(),
             exit: None,
-            raw_ref: None,
-            raw_incomplete: false,
             warnings: Vec::new(),
             cancel: Some(cancel),
         };
-        if turn.raw_incomplete {
-            // `raw_log.incomplete` committed when the drive ended.
-            terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
-        }
         if turn.cause == Some(StopCause::IdleDeadline) {
             // Design §2: force took over an idle stop.
             terminal.fail(
@@ -423,7 +415,7 @@ impl Engine {
         outcome: &'static str,
         cleanup: &'static str,
     ) -> Cancel {
-        self.commit_event(record, EventBody::CancelSettled { outcome, cleanup }, None)
+        self.commit_event(record, EventBody::CancelSettled { outcome, cleanup })
             .await;
         Cancel {
             outcome,
@@ -591,7 +583,6 @@ impl Engine {
             turn: None,
             late: false,
             at: &rfc3339(SystemTime::now()),
-            raw_ref: None,
             body: EventBody::SessionClosed {
                 reason: FORCE_CLOSE_REASON,
             },

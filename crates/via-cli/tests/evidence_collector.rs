@@ -22,9 +22,9 @@ fn evidence_collector_backs_up_live_wal_and_verifies_manifest() -> Result<(), Bo
     connection.execute_batch(
         "CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES ('committed');",
     )?;
-    let raw_dir = sandbox.path().join("raw");
-    fs::create_dir(&raw_dir)?;
-    fs::write(raw_dir.join("c_01.log"), b"raw bytes\n")?;
+    let folders = sandbox.path().join("evidence");
+    fs::create_dir_all(folders.join("s_01/1"))?;
+    fs::write(folders.join("s_01/1/stderr.log"), b"stderr bytes\n")?;
 
     let evidence = Evidence::new(
         "collector_self_test",
@@ -38,7 +38,7 @@ fn evidence_collector_backs_up_live_wal_and_verifies_manifest() -> Result<(), Bo
         "cleanup.json",
         b"{\"anchors\":{\"status\":\"self_test_no_process\"}}",
     )?;
-    evidence.copy_raw(&raw_dir)?;
+    evidence.copy_evidence(&folders)?;
     evidence.backup_store(&live_store)?;
     let artifact = evidence.finish("pass", "collector self-test")?;
 
@@ -47,9 +47,9 @@ fn evidence_collector_backs_up_live_wal_and_verifies_manifest() -> Result<(), Bo
     assert_eq!(value, "committed");
     assert!(artifact.join("sha256.manifest").is_file());
     assert!(artifact.join("summary.json").is_file());
-    let raw_log = artifact.join("raw/c_01.log");
-    let original = fs::read(&raw_log)?;
-    fs::write(&raw_log, b"tampered")?;
+    let stderr = artifact.join("evidence/s_01/1/stderr.log");
+    let original = fs::read(&stderr)?;
+    fs::write(&stderr, b"tampered")?;
     assert!(
         !Command::new("sha256sum")
             .args(["--check", "sha256.manifest"])
@@ -58,7 +58,7 @@ fn evidence_collector_backs_up_live_wal_and_verifies_manifest() -> Result<(), Bo
             .status
             .success()
     );
-    fs::write(&raw_log, original)?;
+    fs::write(&stderr, original)?;
     assert!(
         Command::new("sha256sum")
             .args(["--check", "sha256.manifest"])
@@ -78,9 +78,9 @@ fn failure_and_timeout_remain_distinct_evidence_outcomes() -> Result<(), Box<dyn
     let live_store = sandbox.path().join("store.sqlite3");
     let connection = Connection::open(&live_store)?;
     connection.execute_batch("CREATE TABLE evidence(value TEXT)")?;
-    let raw_dir = sandbox.path().join("raw");
-    fs::create_dir(&raw_dir)?;
-    fs::write(raw_dir.join("c_01.log"), b"raw bytes\n")?;
+    let folders = sandbox.path().join("evidence");
+    fs::create_dir_all(folders.join("s_01/1"))?;
+    fs::write(folders.join("s_01/1/stderr.log"), b"stderr bytes\n")?;
 
     for (name, outcome) in [
         ("collector_failure_test", "fail"),
@@ -98,7 +98,7 @@ fn failure_and_timeout_remain_distinct_evidence_outcomes() -> Result<(), Box<dyn
             "cleanup.json",
             b"{\"anchors\":{\"status\":\"self_test_no_process\"}}",
         )?;
-        evidence.copy_raw(&raw_dir)?;
+        evidence.copy_evidence(&folders)?;
         evidence.backup_store(&live_store)?;
         let artifact = evidence.finish(outcome, "simulated collector outcome")?;
         let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
@@ -107,10 +107,11 @@ fn failure_and_timeout_remain_distinct_evidence_outcomes() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// `via-jm4.7.6`: evidence can hold raw vendor bytes and Store backups, so the
-/// artifact directory and its `raw/` are private (0700) regardless of umask.
+/// `via-jm4.7.6`: evidence can hold vendor stderr and Store backups, so the
+/// artifact directory and its `evidence/` are private (0700) regardless of
+/// umask.
 #[test]
-fn evidence_and_raw_directories_are_private() -> Result<(), Box<dyn Error>> {
+fn evidence_and_evidence_folder_directories_are_private() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = tempfile::tempdir()?;
@@ -121,7 +122,7 @@ fn evidence_and_raw_directories_are_private() -> Result<(), Box<dyn Error>> {
         std::path::Path::new(env!("CARGO_BIN_EXE_via")),
         &fixture,
     )?;
-    for dir in [evidence.dir.clone(), evidence.dir.join("raw")] {
+    for dir in [evidence.dir.clone(), evidence.dir.join("evidence")] {
         let mode = fs::metadata(&dir)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{} has mode {mode:o}", dir.display());
     }

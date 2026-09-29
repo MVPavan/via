@@ -129,7 +129,6 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let store_lock =
         StoreLock::acquire(&paths.state).map_err(|error| anyhow::anyhow!("store lock: {error}"))?;
     // Both locks precede every mutation of the State directory (§6.1).
-    ensure_dir(&paths.state.join("raw"))?;
     ensure_dir(&paths.runtime.join("anchors"))?;
     let socket = paths.runtime.join("via.sock");
     if socket.exists() {

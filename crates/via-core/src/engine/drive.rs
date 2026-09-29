@@ -25,10 +25,8 @@ use super::terminal::{dispose, terminal_envelope};
 use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
-use crate::api::{
-    Cancel, Effective, Event, EventBody, FailureClass, RawSpan, Timestamps, Warning, rfc3339,
-};
-use crate::{ApiError, ConnectionId, Deadline, RawRef, SessionId, TurnNumber, TurnState};
+use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, rfc3339};
+use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
@@ -42,19 +40,6 @@ pub(super) struct Submission {
     effective: Effective,
     submitted: SystemTime,
     clock: Instant,
-}
-
-/// One private connection per turn; turn 1 keeps the session's own name.
-pub(super) fn connection_id(
-    session: &SessionId,
-    turn: TurnNumber,
-) -> Result<ConnectionId, <ConnectionId as TryFrom<&str>>::Error> {
-    let suffix = session.as_str().trim_start_matches("s_");
-    let connection = match turn.get() {
-        1 => format!("c_{suffix}"),
-        n => format!("c_{suffix}t{n}"),
-    };
-    ConnectionId::try_from(connection.as_str())
 }
 
 /// Why a granted turn's submission did not commit.
@@ -84,14 +69,10 @@ enum Decision {
 }
 
 /// How a terminal commits (design §7.2): retried once at the same sequence
-/// (rows 7 and 9), and with the `raw_log.incomplete` the turn's first
-/// failure dropped or left uncertain, sequenced just before `turn.ended` in
-/// the same transaction (row 6), unless the terminal's durable read-back
-/// finds the turn already has it.
+/// (rows 7 and 9).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Commit {
     pub(super) retry: bool,
-    pub(super) raw_owed: bool,
 }
 
 /// How a queued turn's cancellation ended.
@@ -180,8 +161,6 @@ impl Driven {
 /// Evidence of an execution a force stop closed through Route.
 struct Forced {
     requested_at: String,
-    /// Route's cleanup drain could not record every vendor byte.
-    raw_incomplete: bool,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
     /// Route's own Host close evidence.
@@ -608,16 +587,18 @@ impl Engine {
             queued_at: queued.queued_at,
             first_seq: queued.queued_seq,
             submitted: Some((rfc3339(submitted), clock)),
+            folder: Some(
+                self.store
+                    .evidence()
+                    .path(&session, turn)
+                    .display()
+                    .to_string(),
+            ),
         };
         // Design §2 [r1.11]: both deadlines run from the submission clock.
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
         let (route_stop, orders) = slot.start_running(turn, deadline.instant());
-        let Ok(connection) = connection_id(&session, turn) else {
-            self.unresolved.fail(&session, turn, TurnState::Running);
-            slot.finish_running(turn);
-            return;
-        };
         let mut record = new_record(slot, &session, turn);
         let mut control = Control {
             slot,
@@ -631,7 +612,6 @@ impl Engine {
         let driven = self
             .execute(
                 &mut record,
-                connection.clone(),
                 (queued.prompt, &effective),
                 (deadline, route_stop),
                 Box::new(capacity),
@@ -639,8 +619,7 @@ impl Engine {
             )
             .await;
         let (cause, journal_uncertain) = driven.store_facts();
-        let raw_lost = self
-            .route_failed(slot, &mut record, cause, journal_uncertain)
+        self.route_failed(slot, &mut record, cause, journal_uncertain)
             .await;
         // Design §2 [r1.4]: from here cancel and close send no order.
         let order = slot.settle(turn);
@@ -654,8 +633,7 @@ impl Engine {
         let outcome = match driven {
             Driven::Finished(outcome) => outcome,
             Driven::Forced(forced) => {
-                self.hand_off(slot, started, record, connection, forced, order)
-                    .await;
+                self.hand_off(slot, started, record, forced, order).await;
                 return;
             }
         };
@@ -668,17 +646,12 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
-        // Row 6: a failed raw append lost the connection's bytes.
-        terminal.raw_incomplete |= raw_lost;
-        let raw_owed = self
-            .raw_incomplete(&mut record, &mut terminal, connection)
-            .await;
         if let Some((outcome, cleanup)) = disposed.stop {
             let requested_at = if let Some(order) = &order {
                 order.requested_at.clone()
             } else {
                 // The wall deadline's own request (C1 §7.6).
-                self.commit_event(&mut record, EventBody::CancelRequested {}, None)
+                self.commit_event(&mut record, EventBody::CancelRequested {})
                     .await;
                 deadline_at
             };
@@ -695,31 +668,8 @@ impl Engine {
             .cancel_cause
             .filter(|_| terminal.state == "cancelled");
         // A terminal that did not commit reads `store_error` and latches.
-        let _ = self
-            .finish_with(started, (record, terminal), cause, raw_owed)
-            .await;
+        let _ = self.finish_with(started, (record, terminal), cause).await;
         slot.finish_running(turn);
-    }
-
-    /// Commits the terminal's `raw_log.incomplete` when the raw log lost
-    /// bytes, with the warning. After the turn's first failure the event is
-    /// dropped and owed to its resolution write (design §7.2 row 6):
-    /// returns whether it is owed.
-    async fn raw_incomplete(
-        &self,
-        record: &mut TurnRecord,
-        terminal: &mut Terminal,
-        connection: ConnectionId,
-    ) -> bool {
-        if !terminal.raw_incomplete {
-            return false;
-        }
-        let body = EventBody::RawLogIncomplete {
-            connection_id: connection,
-        };
-        self.commit_event(record, body, None).await;
-        terminal.warnings.push(Warning::RAW_LOG_INCOMPLETE);
-        record.first_failure.is_some()
     }
 
     /// Hands a forced turn to final shutdown, which commits its terminal once
@@ -730,24 +680,15 @@ impl Engine {
         slot: &Slot,
         started: Started,
         mut record: TurnRecord,
-        connection: ConnectionId,
         forced: Forced,
         order: Option<StopOrder>,
     ) {
         let turn = started.turn;
-        let mut raw_owed = false;
-        if forced.raw_incomplete {
-            let body = EventBody::RawLogIncomplete {
-                connection_id: connection,
-            };
-            self.commit_event(&mut record, body, None).await;
-            raw_owed = record.first_failure.is_some();
-        }
         // One `cancel.requested` per turn [r1.12]: an order's stays.
         let requested_at = if let Some(order) = &order {
             order.requested_at.clone()
         } else {
-            self.commit_event(&mut record, EventBody::CancelRequested {}, None)
+            self.commit_event(&mut record, EventBody::CancelRequested {})
                 .await;
             forced.requested_at
         };
@@ -757,8 +698,6 @@ impl Engine {
             started,
             record,
             requested_at,
-            raw_incomplete: forced.raw_incomplete,
-            raw_owed,
             launched: forced.launched,
             close: forced.close,
             cause: order.map(|order| order.cause),
@@ -782,7 +721,6 @@ impl Engine {
             &self.store,
             record,
             EventBody::CancelRequested {},
-            None,
             &order.requested_at,
         )
         .await;
@@ -963,7 +901,6 @@ impl Engine {
         }
         let mode = Commit {
             retry: retry && !faulted,
-            raw_owed: false,
         };
         Self::commit_turn_ended_with(&self.store, started, record, terminal, close, extras, mode)
             .await
@@ -1030,22 +967,17 @@ impl Engine {
     /// latches when it fails (escalation).
     ///
     /// A terminal that did not become durable leaves the turn affected: it
-    /// is kept, with the `raw_log.incomplete` it owes, for final shutdown's
-    /// failure-resolution batch (design §7.4) before the latch is finished.
+    /// is kept for final shutdown's failure-resolution batch (design §7.4)
+    /// before the latch is finished.
     async fn finish_with(
         &self,
         started: Started,
         (record, terminal): (TurnRecord, Terminal),
         cancel_cause: Option<CancelCause>,
-        raw_owed: bool,
     ) -> Result<(), ApiError> {
-        let extras = TerminalExtras {
-            cancel_cause,
-            raw_incomplete: None,
-        };
+        let extras = TerminalExtras { cancel_cause };
         let mode = Commit {
             retry: record.first_failure.is_none(),
-            raw_owed,
         };
         let kept = (record.clone(), terminal.clone());
         let finished = Self::finish_turn_with(
@@ -1064,7 +996,6 @@ impl Engine {
                 started: started.clone(),
                 record,
                 terminal,
-                raw_incomplete: mode.raw_owed,
             });
         }
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
@@ -1169,12 +1100,10 @@ impl Engine {
     }
 
     /// Commits `turn.ended` at the sequence after every event `record` committed,
-    /// with the terminal envelope whose raw spans bound every committed reference.
+    /// with the terminal envelope.
     /// An uncertain event commit is settled against the durable head first. With
     /// `close_session`, `session.closed` follows in the same transaction;
-    /// otherwise `extras` commit with the terminal, and an owed
-    /// `raw_log.incomplete` just before it (`mode.raw_owed`, design §7.2
-    /// row 6). With `mode.retry`, a commit known not committed is retried
+    /// otherwise `extras` commit with the terminal. With `mode.retry`, a commit known not committed is retried
     /// once at the same sequence, holding the session head across both
     /// attempts (design §7.2 rows 7 and 9 [r3.7]). The head advances only on
     /// a confirmed commit: a write that did not commit leaves it as it was,
@@ -1185,12 +1114,12 @@ impl Engine {
         mut record: TurnRecord,
         terminal: Terminal,
         close_session: bool,
-        mut extras: TerminalExtras,
+        extras: TerminalExtras,
         mode: Commit,
     ) -> Result<Durable, Unended> {
         // A failed read writes nothing; a corrupt one latches (design §7.1),
         // and the hook sees it as this write's outcome.
-        let logged = journal::reconcile(journal, &mut record)
+        journal::reconcile(journal, &mut record)
             .await
             .map_err(|error| Unended {
                 error: ApiError::STORE,
@@ -1205,25 +1134,7 @@ impl Engine {
                 outcome: WriteOutcome::of_read(&error),
             })?;
         let first = head.next();
-        let mut seq = first;
-        // The read-back decides: an uncertain `raw_log.incomplete` that
-        // committed is not written again.
-        if mode.raw_owed && !logged {
-            let connection_id =
-                connection_id(&started.session, started.turn).map_err(|_| ApiError::STORE)?;
-            let incomplete = Event {
-                seq,
-                session_id: &started.session,
-                turn: Some(started.turn.get()),
-                late: false,
-                at: &rfc3339(SystemTime::now()),
-                raw_ref: None,
-                body: EventBody::RawLogIncomplete { connection_id },
-            }
-            .to_value()?;
-            extras.raw_incomplete = Some(incomplete);
-            seq += 1;
-        }
+        let seq = first;
         let ended = ended_record(started, record, terminal, seq)?;
         let closed = if close_session {
             let closed = Event {
@@ -1232,7 +1143,6 @@ impl Engine {
                 turn: None,
                 late: false,
                 at: &rfc3339(SystemTime::now()),
-                raw_ref: None,
                 body: EventBody::SessionClosed {
                     reason: FORCE_CLOSE_REASON,
                 },
@@ -1261,7 +1171,7 @@ impl Engine {
     /// Drives the adapter under the turn deadline, committing each observation it
     /// reports in decode order before the adapter outcome is returned. A force stop
     /// reaches Route, which force-closes the group and drains its output first:
-    /// messages it read still commit, and the raw log is complete or reported not.
+    /// messages it read still commit.
     ///
     /// The turn's stop order reaches Route through `stop`; this loop observes
     /// it once (design §2), and orders the idle deadline itself when no
@@ -1269,7 +1179,6 @@ impl Engine {
     async fn execute(
         &self,
         record: &mut TurnRecord,
-        connection: ConnectionId,
         (prompt, effective): (String, &Effective),
         (deadline, stop): (Deadline, StopWatch),
         capacity: via_adapters::CapacityToken,
@@ -1281,7 +1190,6 @@ impl Engine {
         let mut execute = Box::pin(self.adapter.execute(
             record.session.clone(),
             record.turn,
-            connection,
             prompt,
             observed_tx,
             deadline,
@@ -1333,7 +1241,6 @@ impl Engine {
                                     .get()
                                     .cloned()
                                     .unwrap_or_else(|| rfc3339(SystemTime::now())),
-                                raw_incomplete: route.raw_incomplete,
                                 launched: route.launched,
                                 close: RouteClose {
                                     forced: route.forced,
@@ -1426,15 +1333,14 @@ impl Engine {
                 {
                     Ok(accepted) => {
                         head.committed(1);
-                        RawSpan::include(&mut record.spans, &accepted.raw_ref);
                         record.accepted = Some(accepted);
                     }
                     Err(uncertain) => {
-                        let outcome = if let Some(accepted) = uncertain {
+                        let outcome = if let Some((accepted, event)) = uncertain {
                             head.lost();
                             record.uncertain = Some(UncertainEvent {
                                 seq,
-                                raw_ref: Some(accepted.raw_ref.clone()),
+                                event,
                                 accepted: Some(accepted),
                             });
                             WriteOutcome::Uncertain
@@ -1447,25 +1353,16 @@ impl Engine {
                     }
                 }
             }
-            FakeObservation::Data {
-                observation,
-                raw_ref,
-            } => {
-                self.commit_event(record, event_body(observation), Some(raw_ref))
-                    .await;
+            FakeObservation::Data { observation } => {
+                self.commit_event(record, event_body(observation)).await;
             }
         }
     }
 
     /// Commits one non-lifecycle event of the running turn at the next sequence.
-    pub(super) async fn commit_event(
-        &self,
-        record: &mut TurnRecord,
-        body: EventBody,
-        raw_ref: Option<RawRef>,
-    ) {
+    pub(super) async fn commit_event(&self, record: &mut TurnRecord, body: EventBody) {
         let failed = record.first_failure.is_some();
-        journal::commit_event(&self.store, record, body, raw_ref).await;
+        journal::commit_event(&self.store, record, body).await;
         self.report_first_failure(record, failed).await;
     }
 
@@ -1575,7 +1472,6 @@ impl Engine {
             turn: Some(turn.get()),
             late: false,
             at: &rfc3339(submitted),
-            raw_ref: None,
             body: EventBody::TurnSubmitted { attempt: 1 },
         }
         .to_value()
@@ -1611,7 +1507,8 @@ impl Engine {
     }
 
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
-    /// A failure carries the acceptance when Store may have committed it.
+    /// A failure carries the acceptance and the event sent when Store may
+    /// have committed it.
     async fn accept(
         &self,
         session: &SessionId,
@@ -1619,7 +1516,7 @@ impl Engine {
         seq: u64,
         effective: &Effective,
         observation: FakeAcceptanceObservation,
-    ) -> Result<Accepted, Option<Accepted>> {
+    ) -> Result<Accepted, Option<(Accepted, serde_json::Value)>> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
             seq,
@@ -1627,7 +1524,6 @@ impl Engine {
             turn: Some(turn.get()),
             late: false,
             at: &at,
-            raw_ref: Some(&observation.raw_ref),
             body: EventBody::TurnStarted {
                 effective: effective.clone(),
             },
@@ -1648,44 +1544,33 @@ impl Engine {
             .commit_acceptance(AcceptanceRecord {
                 session_id: session.clone(),
                 turn,
-                raw_ref: observation.raw_ref.clone(),
                 correlation: vendor_turn_id.clone(),
-                event,
+                event: event.clone(),
             })
             .await;
-        let accepted = Accepted {
-            at,
-            raw_ref: observation.raw_ref,
-            vendor_turn_id,
-        };
+        let accepted = Accepted { at, vendor_turn_id };
         match committed {
             Ok(()) => Ok(accepted),
-            Err(error) => Err(journal::may_have_committed(&error).then_some(accepted)),
+            Err(error) => Err(journal::may_have_committed(&error).then_some((accepted, event))),
         }
     }
 }
 
-/// `turn.ended` at `seq` with the terminal envelope, whose raw spans bound
-/// every reference `record` committed and the terminal's own; `record` is
-/// already reconciled (design §7.4's batch builds it the same way).
+/// `turn.ended` at `seq` with the terminal envelope; `record` is already
+/// reconciled (design §7.4's batch builds it the same way).
 pub(super) fn ended_record(
     started: &Started,
-    mut record: TurnRecord,
+    record: TurnRecord,
     terminal: Terminal,
     seq: u64,
 ) -> Result<TerminalRecord, ApiError> {
-    if let Some(reference) = &terminal.raw_ref {
-        RawSpan::include(&mut record.spans, reference);
-    }
     let ended_at = rfc3339(SystemTime::now());
-    let raw_ref = terminal.raw_ref.clone();
     let event = Event {
         seq,
         session_id: &started.session,
         turn: Some(started.turn.get()),
         late: false,
         at: &ended_at,
-        raw_ref: raw_ref.as_ref(),
         body: EventBody::TurnEnded {
             state: terminal.state,
             failure: terminal.failure.clone(),
@@ -1710,7 +1595,7 @@ pub(super) fn ended_record(
         started.turn,
         terminal,
         record.accepted,
-        record.spans,
+        started.folder.clone(),
         timestamps,
         duration_ms,
         (started.first_seq, seq),
@@ -1721,7 +1606,6 @@ pub(super) fn ended_record(
         turn: started.turn,
         envelope,
         event,
-        raw_ref,
     })
 }
 
@@ -1791,7 +1675,6 @@ fn new_record(slot: &Slot, session: &SessionId, turn: TurnNumber) -> TurnRecord 
         turn,
         head: Arc::clone(&slot.head),
         accepted: None,
-        spans: Vec::new(),
         first_failure: None,
         uncertain: None,
     }
@@ -1814,6 +1697,7 @@ pub(super) fn queued_cancellation(
         queued_at: queued.queued_at,
         first_seq: queued.queued_seq,
         submitted: None,
+        folder: None,
     };
     let record = new_record(slot, session, turn);
     let terminal = Terminal {
@@ -1823,8 +1707,6 @@ pub(super) fn queued_cancellation(
         vendor_stop_reason: None,
         final_text: String::new(),
         exit: None,
-        raw_ref: None,
-        raw_incomplete: false,
         warnings: Vec::new(),
         cancel: cause.as_ref().map(|(_, requested_at)| Cancel {
             outcome: "acknowledged",
@@ -1835,7 +1717,6 @@ pub(super) fn queued_cancellation(
     };
     let extras = TerminalExtras {
         cancel_cause: cause.map(|(cause, _)| cause),
-        raw_incomplete: None,
     };
     (started, record, terminal, extras)
 }

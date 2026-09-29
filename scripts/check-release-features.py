@@ -38,7 +38,8 @@ POINTS = [
     "host.anchor.after_arm_intent_commit",
     "core.force.cancel_read",
     "core.dispatch.before_grant",
-    # Task 3 S1 (design §10): Store, raw, Host and anchor seams.
+    # Task 3 S1 (design §10): Store, Host and anchor seams (Task 4 removed
+    # the raw log's two).
     "store.commit.receipt",
     "store.commit.submission",
     "store.commit.event",
@@ -60,8 +61,6 @@ POINTS = [
     "store.request.not_enqueued",
     "store.writer.lost",
     "store.sqlite.corrupt",
-    "raw.append.fail",
-    "raw.sync.fail_persistent",
     "host.anchor.before_eof_cleanup",
     "host.anchor.final_reply_lost",
     "host.anchor.defer_cleanup",

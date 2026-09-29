@@ -79,6 +79,9 @@ pub struct PrivateProcessSpec {
     pub env: EnvAllowList,
     /// Durable owning turn.
     pub owner: ProcessOwner,
+    /// The turn's `stderr.log` (design §7.2): Host creates it and hands it to
+    /// the anchor as standard error, which the vendor inherits.
+    pub stderr_path: PathBuf,
     /// Capacity held for the group's life; dropped at once if no group starts.
     pub capacity: Option<CapacityToken>,
 }

@@ -17,7 +17,7 @@ use std::{
 use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use tokio::{
     net::UnixStream,
-    process::{ChildStderr, ChildStdin, ChildStdout},
+    process::{ChildStdin, ChildStdout},
     sync::{Mutex, watch},
     task::JoinHandle,
     time::{Instant, timeout_at},
@@ -362,6 +362,9 @@ pub enum HostError {
     Deadline,
     /// Anchor identity or private protocol failed validation.
     Protocol(&'static str),
+    /// The turn's `stderr.log` could not be created (design §7.2): nothing
+    /// was committed or launched.
+    Evidence(io::Error),
     /// The caller's stop signal was set at the pre-ARM gate: nothing launched.
     Stopped,
 }
@@ -370,6 +373,7 @@ impl std::fmt::Display for HostError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "Host I/O: {error}"),
+            Self::Evidence(error) => write!(formatter, "stderr.log not created: {error}"),
             Self::Store(message) | Self::Invalid(message) | Self::Protocol(message) => {
                 formatter.write_str(message)
             }
@@ -410,8 +414,6 @@ pub struct OwnedPipes {
     pub stdin: ChildStdin,
     /// Vendor stdout reader, transferred once to Wire.
     pub stdout: ChildStdout,
-    /// Vendor stderr reader, transferred once to Wire.
-    pub stderr: ChildStderr,
 }
 
 /// The vendor pipes of an acquisition from ARM on, owned by its caller.
@@ -1052,6 +1054,7 @@ impl Host {
         &self,
         owner: crate::ProcessOwner,
         capacity: Option<crate::CapacityToken>,
+        stderr: fs::File,
         state: &mut Acquisition,
     ) -> Result<StartedAnchor, HostError> {
         let anchor_id = linux::random_hex()?;
@@ -1085,7 +1088,7 @@ impl Host {
             failpoints: via_store::failpoint::activation(),
         };
         write_bootstrap(&config_path, &bootstrap)?;
-        let (pipes, anchor_process_id) = self.spawn_anchor(&config_path)?;
+        let (pipes, anchor_process_id) = self.spawn_anchor(&config_path, stderr)?;
         // The group exists from here: its capacity stays with Host until
         // absence is proved. A failure above dropped it with no group.
         let replaced = {
@@ -1154,7 +1157,13 @@ impl Host {
         })
     }
 
-    fn spawn_anchor(&self, config_path: &PathBuf) -> Result<(OwnedPipes, u32), HostError> {
+    /// Spawns the anchor with `stderr` as its standard error, which the
+    /// vendor inherits (design §7.2); only stdin and stdout are pipes.
+    fn spawn_anchor(
+        &self,
+        config_path: &PathBuf,
+        stderr: fs::File,
+    ) -> Result<(OwnedPipes, u32), HostError> {
         let mut command = CommandWrap::with_new(&self.anchor_binary, |command| {
             command
                 .arg("__via_host_anchor")
@@ -1163,7 +1172,7 @@ impl Host {
                 .current_dir(&self.anchor_dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stderr(stderr);
         });
         command.wrap(ProcessGroup::leader());
         let mut anchor = match command.spawn() {
@@ -1185,10 +1194,6 @@ impl Host {
                 .stdout()
                 .take()
                 .ok_or(HostError::Protocol("missing vendor stdout pipe"))?,
-            stderr: anchor
-                .stderr()
-                .take()
-                .ok_or(HostError::Protocol("missing vendor stderr pipe"))?,
         };
         // Reap the anchor regardless of later journal/control failures; a failed
         // wait is a failed task, never successful reaping.
@@ -1208,6 +1213,9 @@ impl Host {
         stopped: &(dyn Fn() -> bool + Send + Sync),
         state: &mut Acquisition,
     ) -> Result<AcquiredProcess, HostError> {
+        // Before the anchor intent: a file that cannot be created leaves
+        // nothing committed and nothing launched (design §7.2).
+        let stderr = open_stderr(&spec.stderr_path).map_err(HostError::Evidence)?;
         let StartedAnchor {
             anchor_id,
             generation,
@@ -1217,7 +1225,7 @@ impl Host {
             pipes,
             version,
         } = self
-            .start_anchor(spec.owner.clone(), spec.capacity.take(), state)
+            .start_anchor(spec.owner.clone(), spec.capacity.take(), stderr, state)
             .await?;
         let vendor = vendor_config(&spec)?;
         configure(&control, vendor).await?;
@@ -1830,6 +1838,17 @@ async fn configure(
         return Err(HostError::Protocol("anchor configuration refused"));
     };
     Ok(())
+}
+
+/// Creates the turn's `stderr.log` (design §7.2): new, 0600, never through a
+/// symlink. The operating system writes it; VIA never reads it.
+fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
 }
 
 /// Writes the anchor's private bootstrap file, synced, never over another.

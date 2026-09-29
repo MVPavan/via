@@ -4,8 +4,8 @@
 use std::num::NonZeroU64;
 
 pub use via_routes::{
-    Deadline, MAX_OBSERVATION_BYTES, RawRef, ReprobeReport, RouteError, RouteFailure, StopCause,
-    StopOrder, StopWatch, StoreFailure, ToolStatus, TurnNumber,
+    Deadline, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError, RouteFailure, StopCause, StopOrder,
+    StopWatch, StoreFailure, ToolStatus, TurnNumber,
 };
 
 /// Correlates a start reply with its acceptance observation within one turn.
@@ -116,8 +116,6 @@ pub struct InterruptReport {
     pub outcome: CancelOutcome,
     /// Separate side-effect cleanup certainty.
     pub cleanup: Cleanup,
-    /// Raw evidence when available.
-    pub evidence: Option<RawRef>,
 }
 
 /// First failure retained by the independent driver-health lane.
@@ -134,12 +132,10 @@ pub enum DriverFailure {
 pub enum DriverHealth {
     /// Driver accepts commands.
     Open,
-    /// First cause is latched; evidence can be attached after raw sync.
+    /// First cause is latched.
     Failed {
         /// First health failure.
         first_cause: DriverFailure,
-        /// Durable raw source when available.
-        evidence: Option<RawRef>,
     },
     /// Driver and its owned tasks have exited.
     Closed,
@@ -154,8 +150,8 @@ pub use runtime::{
     FakeTurnRecovery,
 };
 pub use via_routes::{
-    CapacityToken, ConnectionId, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig,
-    RuntimeResources, SessionId, WireCleanup,
+    CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
+    SessionId, WireCleanup,
 };
 
 /// Fake terminal status as vendor evidence; Core chooses the C1 disposition.
@@ -169,14 +165,12 @@ pub enum VendorTerminalStatus {
     Failed,
 }
 
-/// A paired fake acceptance observation with synced raw evidence.
+/// A paired fake acceptance observation.
 pub struct FakeAcceptanceObservation {
     /// Correlation ID shared with start outcome.
     pub correlation: AcceptanceToken,
     /// Vendor-scoped turn ID.
     pub vendor_turn_id: VendorTurnId,
-    /// Exact accepted vendor message.
-    pub raw_ref: RawRef,
 }
 
 /// One normalized C2 observation Core commits as a C1 §6.1 event.
@@ -184,7 +178,7 @@ pub struct FakeAcceptanceObservation {
 pub enum Observation {
     /// Incremental assistant text, at most one C2 payload bound per piece.
     AssistantText {
-        /// Text in decode order; pieces of one vendor message share its raw span.
+        /// Text in decode order.
         text: String,
     },
     /// A tool started inside the turn.
@@ -222,12 +216,10 @@ pub enum Observation {
 pub enum FakeObservation {
     /// The paired acceptance, always before any other observation of the turn.
     Accepted(FakeAcceptanceObservation),
-    /// A data observation and the synced vendor message it came from.
+    /// A data observation.
     Data {
         /// Normalized payload.
         observation: Observation,
-        /// Exact source vendor message.
-        raw_ref: RawRef,
     },
 }
 
@@ -241,8 +233,6 @@ pub struct FakeTerminalEvidence {
     pub stop_reason: String,
     /// Optional vendor failure code.
     pub vendor_code: Option<String>,
-    /// Synced terminal vendor message.
-    pub terminal_raw: RawRef,
     /// Independently confirmed vendor exit.
     pub exit: via_routes::ExitReport,
     /// Private-group cleanup certainty after vendor exit.

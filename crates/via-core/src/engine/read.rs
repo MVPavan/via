@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{Engine, journal};
 use crate::api::DEFAULT_WAIT_MS;
-use crate::{ApiError, SessionId, TurnNumber, WaitParams, parse_address};
+use crate::{ApiError, LogsParams, SessionId, TurnNumber, WaitParams, parse_address};
 
 impl Engine {
     /// Resolves a C1 address; a bare session names its latest turn.
@@ -134,12 +134,49 @@ impl Engine {
         )
     }
 
-    /// Reads bounded raw excerpts referenced by committed events.
-    pub async fn logs(&self, session: &str) -> Result<Value, ApiError> {
-        let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        match self.store.logs(&id).await {
-            Ok(logs) => Ok(logs),
-            Err(_) => Err(ApiError::STORE),
-        }
+    /// C1 §3.12 `logs` (Task 4 design §4.4): where the addressed turn's
+    /// evidence is, or for a session its running turn's, else its latest
+    /// submitted one's. Each fixed file name is `stat`ed once on the
+    /// blocking pool, without following a symlink; no file is opened.
+    pub async fn logs(&self, params: LogsParams) -> Result<Value, ApiError> {
+        let (session, turn) = params.address()?;
+        let refs = self
+            .store
+            .evidence_refs(&session, turn)
+            .await
+            .map_err(|_| ApiError::STORE)?
+            .ok_or(ApiError::SESSION_NOT_FOUND)?;
+        let number = refs.turn.ok_or(ApiError::TURN_NOT_FOUND)?;
+        let folder = refs
+            .evidence_dir
+            .map(|dir| self.store.evidence().absolute(&dir));
+        let files = match folder.clone() {
+            Some(folder) => tokio::task::spawn_blocking(move || evidence_files(&folder))
+                .await
+                .map_err(|_| ApiError::STORE)?,
+            None => Vec::new(),
+        };
+        Ok(json!({
+            "session_id": session,
+            "turn": number.get(),
+            "vendor_session_id": refs.vendor_session_id,
+            "transcript": refs.transcript_hint,
+            "folder": folder.map(|folder| folder.display().to_string()),
+            "files": files,
+        }))
     }
+}
+
+/// The fixed evidence files present in `folder`, as `{name, bytes}`: one
+/// `lstat` each, and only regular files count (design §4.4, §7.1).
+fn evidence_files(folder: &std::path::Path) -> Vec<Value> {
+    via_store::EVIDENCE_FILES
+        .iter()
+        .filter_map(|name| {
+            let metadata = std::fs::symlink_metadata(folder.join(name)).ok()?;
+            metadata
+                .is_file()
+                .then(|| json!({"name": name, "bytes": metadata.len()}))
+        })
+        .collect()
 }

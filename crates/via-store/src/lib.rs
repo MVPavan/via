@@ -77,100 +77,25 @@ impl<'de> Deserialize<'de> for TurnNumber {
     }
 }
 
-/// Connection-local raw log identity.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct ConnectionId(String);
-
-impl ConnectionId {
-    /// Returns the wire representation.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// A retry identity as Store keeps it: the identity bytes' length and
+/// SHA-256, never the bytes (Task 4 design §6.4, §6.5). A retry matches when
+/// both are equal, which keeps C1's byte-identical rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Identity {
+    /// Length of the identity bytes.
+    pub len: u64,
+    /// SHA-256 of the identity bytes.
+    pub sha256: [u8; 32],
 }
 
-impl TryFrom<&str> for ConnectionId {
-    type Error = &'static str;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let Some(suffix) = value.strip_prefix("c_") else {
-            return Err("connection id must start with c_");
-        };
-        if suffix.is_empty()
-            || suffix.len() > 64
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        {
-            return Err("connection id must contain 1 to 64 lowercase letters or digits");
+impl Identity {
+    /// The identity of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
         }
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl<'de> Deserialize<'de> for ConnectionId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::try_from(value.as_str()).map_err(serde::de::Error::custom)
-    }
-}
-
-/// A nonempty, checked byte span in one connection's durable raw payload file.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RawRef {
-    /// The file-owning connection.
-    connection_id: ConnectionId,
-    /// Byte offset in that connection's payload file.
-    offset: u64,
-    /// Number of bytes in the span.
-    len: u32,
-}
-
-impl RawRef {
-    /// Constructs a span only when its end offset is representable.
-    pub fn new(connection_id: ConnectionId, offset: u64, len: u32) -> Result<Self, &'static str> {
-        if len == 0 || offset.checked_add(u64::from(len)).is_none() {
-            return Err("raw reference must be nonempty and within u64 offsets");
-        }
-        Ok(Self {
-            connection_id,
-            offset,
-            len,
-        })
-    }
-
-    /// Returns the exclusive end offset, checked by construction.
-    pub fn end_offset(&self) -> u64 {
-        self.offset + u64::from(self.len)
-    }
-
-    /// Returns the owning connection.
-    pub fn connection_id(&self) -> &ConnectionId {
-        &self.connection_id
-    }
-
-    /// Returns the first byte offset.
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    /// Returns the number of bytes in the referenced span.
-    pub fn byte_len(&self) -> u32 {
-        self.len
-    }
-}
-
-impl<'de> Deserialize<'de> for RawRef {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Fields {
-            connection_id: ConnectionId,
-            offset: u64,
-            len: u32,
-        }
-        let fields = Fields::deserialize(deserializer)?;
-        Self::new(fields.connection_id, fields.offset, fields.len).map_err(serde::de::Error::custom)
     }
 }
 
@@ -199,8 +124,6 @@ pub enum StoreFailureKind {
     Write,
     /// The writer cannot establish whether a mutation committed.
     UncertainCommit,
-    /// Durable raw bytes or index failed to append or sync.
-    Raw,
     /// A referenced durable span was missing or corrupt.
     CorruptEvidence,
     /// The bounded request quota was exhausted.
@@ -220,21 +143,20 @@ pub enum CommitOutcome<T> {
     Uncertain(StoreFailureKind),
 }
 
+mod evidence;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint;
 mod runtime;
 
+pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
+
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, AnchorCohort, AnchorIdentity, AnchorIntent,
     AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent,
-    ClosedOutcome, ClosedRecord, ClosingRecord, DurableRaw, EventRecord,
+    ClosedOutcome, ClosedRecord, ClosingRecord, EventRecord, EvidenceRefs,
     FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, GroupAbsenceRecord, KeyedOperation,
-    OperationRecord, OperationVerb, Predecessors, ProcessJournal, QueuedTurn, RawFactory,
-    RawStream, RawWriter, ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT,
-    SessionSnapshot, SpawnKey, SpawnRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent,
-    StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord,
-    UnfinishedTurn,
+    OperationRecord, OperationVerb, Predecessors, ProcessJournal, QueuedTurn, ReceiptRecord,
+    ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, SessionSnapshot, SpawnKey, SpawnRecord,
+    Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalExtras, TerminalRecord, UnfinishedTurn,
 };
-
-#[cfg(feature = "test-failpoints")]
-pub use runtime::RawStall;

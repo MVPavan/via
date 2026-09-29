@@ -1,8 +1,7 @@
 //! Turn data path through the real `via` daemon and fake vendor: post-terminal
-//! drain (T1-I1), observation events (T1-I5), evidence gaps and failure classes.
+//! drain (T1-I1), observation events (T1-I5), evidence files and failure classes.
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     clippy::panic,
     reason = "test fixtures and assertions fail loudly"
 )]
@@ -124,31 +123,16 @@ impl Sandbox {
         lines[1].clone()
     }
 
-    /// Returns every durable raw unit for the sole connection as (stream code, bytes).
-    fn raw_units(&self) -> Vec<(u8, Vec<u8>)> {
-        let dir = self.state.join("raw");
-        let idx = fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "idx"))
-            .expect("raw index");
-        let mut payload = Vec::new();
-        fs::File::open(idx.with_extension("raw"))
-            .unwrap()
-            .read_to_end(&mut payload)
-            .unwrap();
-        let index = fs::read(idx).unwrap();
-        assert_eq!(&index[..8], b"VIARAW01");
-        index[8..]
-            .chunks(45)
-            .map(|entry| {
-                let offset =
-                    usize::try_from(u64::from_le_bytes(entry[1..9].try_into().unwrap())).unwrap();
-                let len =
-                    usize::try_from(u32::from_le_bytes(entry[9..13].try_into().unwrap())).unwrap();
-                (entry[0], payload[offset..offset + len].to_vec())
-            })
-            .collect()
+    /// A file in the turn's evidence folder (Task 4 design §7.1).
+    fn evidence_file(&self, session: &str, name: &str) -> Vec<u8> {
+        fs::read(
+            self.state
+                .join("evidence")
+                .join(session)
+                .join("1")
+                .join(name),
+        )
+        .unwrap()
     }
 
     /// Starts one background fake turn and returns its session id.
@@ -191,28 +175,6 @@ impl Sandbox {
         let page: Value = serde_json::from_slice(&output.stdout).unwrap();
         page["events"].as_array().unwrap().clone()
     }
-
-    /// Resolves an event `raw_ref` to its stream code and exact durable bytes.
-    fn raw_at(&self, reference: &Value) -> (u8, Vec<u8>) {
-        let offset = reference["offset"].as_u64().unwrap();
-        let len = reference["len"].as_u64().unwrap();
-        let mut position = 0;
-        for (code, bytes) in self.raw_units() {
-            if position == offset && bytes.len() as u64 == len {
-                return (code, bytes);
-            }
-            position += bytes.len() as u64;
-        }
-        panic!("raw_ref {reference} is not a durable unit");
-    }
-
-    fn stream(&self, code: u8) -> Vec<u8> {
-        self.raw_units()
-            .into_iter()
-            .filter(|(stream, _)| *stream == code)
-            .flat_map(|(_, bytes)| bytes)
-            .collect()
-    }
 }
 
 impl Drop for Sandbox {
@@ -236,34 +198,19 @@ fn read_all(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>>
     })
 }
 
-const STDOUT: u8 = 1;
-const STDERR: u8 = 2;
-
 fn emit(message: &str) -> Value {
     json!({"action":"emit","message":serde_json::from_str::<Value>(message).unwrap()})
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
-/// Counts stdout lines equal to `message` as JSON; the fake re-serializes its fixtures.
-fn json_lines(stdout: &[u8], message: &str) -> usize {
-    let expected: Value = serde_json::from_str(message).unwrap();
-    stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| serde_json::from_slice::<Value>(line).is_ok_and(|value| value == expected))
-        .count()
 }
 
 fn failure_text(envelope: &Value) -> String {
     envelope["failure"].to_string()
 }
 
+/// Task 4 design §7.1: VIA keeps no copy of vendor stdout; the vendor's
+/// stderr after the terminal is in `stderr.log`, written by the OS, and a
+/// late observation does not change the completed turn.
 #[test]
-fn route_drain_records_late_tool_end_and_stderr_tail_after_terminal() {
+fn route_drain_completes_with_late_tool_end_and_stderr_tail_in_stderr_log() {
     let tool_started = r#"{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"shell","input_summary":"ls"}"#;
     let tool_ended = r#"{"type":"tool_ended","vendor_turn_id":"fake-turn-1","tool_id":"t1","status":"completed","output_summary":"ok","exit_code":0}"#;
     let sandbox = Sandbox::new(&[
@@ -275,11 +222,11 @@ fn route_drain_records_late_tool_end_and_stderr_tail_after_terminal() {
     ]);
     let envelope = sandbox.spawn_turn();
     assert_eq!(envelope["state"], "completed", "{envelope}");
-    assert!(contains(
-        &sandbox.stream(STDERR),
+    let session = envelope["session_id"].as_str().unwrap();
+    assert_eq!(
+        sandbox.evidence_file(session, "stderr.log"),
         b"stderr-tail-after-terminal\n"
-    ));
-    assert_eq!(json_lines(&sandbox.stream(STDOUT), tool_ended), 1);
+    );
 }
 
 #[test]
@@ -298,16 +245,10 @@ fn route_drain_rejects_duplicate_terminal_after_late_observation() {
         failure_text(&envelope).contains("duplicate fake terminal"),
         "{envelope}"
     );
-    let stdout = sandbox.stream(STDOUT);
-    assert_eq!(
-        json_lines(&stdout, TERMINAL),
-        2,
-        "both terminals stay in the raw log"
-    );
-    assert!(contains(&stdout, b"stdout-tail-after-duplicate\n"));
-    assert_eq!(json_lines(&stdout, late), 1);
 }
 
+/// Task 4 design §7.1: a stderr flood after the terminal goes to
+/// `stderr.log` whole and never stalls the turn.
 #[test]
 fn route_drain_survives_stderr_flood_after_terminal() {
     const LINE: usize = 1024;
@@ -323,7 +264,7 @@ fn route_drain_survives_stderr_flood_after_terminal() {
     let envelope = sandbox.spawn_turn();
     assert_eq!(envelope["state"], "completed", "{envelope}");
     assert!(started.elapsed() < Duration::from_secs(30));
-    let stderr = sandbox.stream(STDERR);
+    let stderr = sandbox.evidence_file(envelope["session_id"].as_str().unwrap(), "stderr.log");
     assert_eq!(stderr.len(), LINE * COUNT + b"flood-end\n".len());
     assert!(stderr.ends_with(b"flood-end\n"));
 }
@@ -338,7 +279,6 @@ fn assert_dense(events: &[Value], session: &str, envelope: &Value) {
         assert_eq!(event["session_id"], session, "{event}");
         assert_eq!(event["turn"], 1, "{event}");
         assert_eq!(event["late"], false, "{event}");
-        assert!(event.get("raw_ref").is_some(), "{event}");
     }
     let last = events.last().unwrap();
     assert_eq!(last["type"], "turn.ended", "turn.ended is the last event");
@@ -350,20 +290,21 @@ fn assert_dense(events: &[Value], session: &str, envelope: &Value) {
     );
 }
 
-/// Asserts that a raw reference is an exact stdout message equal to `message`.
-fn assert_message(sandbox: &Sandbox, reference: &Value, message: &Value) {
-    let (code, bytes) = sandbox.raw_at(reference);
-    assert_eq!(code, STDOUT, "{reference}");
-    assert_eq!(bytes.last(), Some(&b'\n'), "{reference}");
-    assert_eq!(
-        &serde_json::from_slice::<Value>(&bytes).unwrap(),
-        message,
-        "{reference}"
+/// Task 4 design §7.3: the turn's `undecoded.bin` holds `message` and the
+/// failure message names the file.
+fn assert_undecoded(sandbox: &Sandbox, envelope: &Value, message: &Value) {
+    let session = envelope["session_id"].as_str().unwrap();
+    let bytes = sandbox.evidence_file(session, "undecoded.bin");
+    assert_eq!(bytes.last(), Some(&b'\n'), "{envelope}");
+    assert_eq!(&serde_json::from_slice::<Value>(&bytes).unwrap(), message);
+    assert!(
+        failure_text(envelope).contains(&format!("{session}/1/undecoded.bin")),
+        "{envelope}"
     );
 }
 
 #[test]
-fn observations_become_ordered_events_with_exact_raw_refs() {
+fn observations_become_ordered_events() {
     let big_text = "é".repeat(140_000);
     let messages = [
         json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}),
@@ -405,32 +346,26 @@ fn observations_become_ordered_events_with_exact_raw_refs() {
         ]
     );
     assert_dense(&events, session, &envelope);
-    assert_message(&sandbox, &events[2]["raw_ref"], &messages[0]);
 
     // Small text keeps its payload; oversized text is split in order at UTF-8
-    // boundaries, and every piece cites the one message it came from.
+    // boundaries.
     assert_eq!(events[3]["text"], "hello ");
     assert_eq!(events[3]["final"], false);
-    assert_message(&sandbox, &events[3]["raw_ref"], &messages[1]);
     let mut joined = String::new();
     for piece in &events[4..6] {
         let payload = json!({"text":piece["text"],"final":piece["final"]});
         assert!(serde_json::to_vec(&payload).unwrap().len() <= OBSERVATION_BYTES);
-        assert_eq!(piece["raw_ref"], events[4]["raw_ref"]);
         joined.push_str(piece["text"].as_str().unwrap());
     }
     assert_eq!(joined, big_text);
-    assert_message(&sandbox, &events[4]["raw_ref"], &messages[2]);
 
     assert_eq!(events[6]["tool_id"], "t1");
     assert_eq!(events[6]["name"], "shell");
     assert_eq!(events[6]["input_summary"], "ls");
-    assert_message(&sandbox, &events[6]["raw_ref"], &messages[3]);
     assert_eq!(events[7]["tool_id"], "t1");
     assert_eq!(events[7]["status"], "failed");
     assert_eq!(events[7]["output_summary"], "no such file");
     assert_eq!(events[7]["exit_code"], 2);
-    assert_message(&sandbox, &events[7]["raw_ref"], &messages[4]);
 
     // Unknown payloads keep a bounded prefix with an explicit truncation marker.
     for (event, message, truncated) in [
@@ -441,26 +376,13 @@ fn observations_become_ordered_events_with_exact_raw_refs() {
         assert_eq!(event["truncated"], truncated, "{event}");
         let payload = event["payload"].as_str().unwrap();
         assert!(payload.len() <= 16 * 1024);
-        let (_, raw) = sandbox.raw_at(&event["raw_ref"]);
-        assert!(raw.starts_with(payload.as_bytes()));
-        assert_message(&sandbox, &event["raw_ref"], message);
-    }
-    assert_message(&sandbox, &events[10]["raw_ref"], &messages[6]);
-
-    // The envelope's bounding span covers every cited reference.
-    let spans = envelope["raw_spans"].as_array().unwrap();
-    assert_eq!(spans.len(), 1, "{envelope}");
-    let first = spans[0]["first_offset"].as_u64().unwrap();
-    let last = spans[0]["last_offset"].as_u64().unwrap();
-    for event in &events[2..] {
-        let reference = &event["raw_ref"];
-        let offset = reference["offset"].as_u64().unwrap();
-        assert!(first <= offset && offset + reference["len"].as_u64().unwrap() <= last);
     }
 }
 
+/// C1 §8.2, Task 4 design §7.3: a stdout line over the 1 MiB cap fails the
+/// turn `overflow`; `undecoded.bin` keeps its first 64 KiB.
 #[test]
-fn oversized_stdout_line_is_retained_as_raw_evidence() {
+fn oversized_stdout_line_fails_overflow_and_keeps_its_head() {
     // Exactly 1 MiB before the LF: the line is complete only once it exceeds the cap.
     let sandbox = Sandbox::new(&[
         emit(ACCEPTED),
@@ -470,24 +392,14 @@ fn oversized_stdout_line_is_retained_as_raw_evidence() {
     ]);
     let envelope = sandbox.spawn_turn();
     assert_eq!(envelope["state"], "failed", "{envelope}");
-    assert_eq!(envelope["failure"]["class"], "protocol", "{envelope}");
-    let stdout = sandbox.stream(STDOUT);
-    let mut line = vec![b'x'; 1024 * 1024];
-    line.extend_from_slice(b"\nafter-oversized\n");
-    assert!(contains(&stdout, &line), "oversized line lost from raw log");
-    // Every byte was recorded, so the raw log is complete.
-    let events = sandbox.events(envelope["session_id"].as_str().unwrap());
-    assert!(
-        events
-            .iter()
-            .all(|event| event["type"] != "raw_log.incomplete")
+    assert_eq!(envelope["failure"]["class"], "overflow", "{envelope}");
+    let session = envelope["session_id"].as_str().unwrap();
+    assert_eq!(
+        sandbox.evidence_file(session, "undecoded.bin"),
+        vec![b'x'; 64 * 1024]
     );
     assert!(
-        envelope["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|warning| warning["code"] != "raw_log_incomplete"),
+        failure_text(&envelope).contains(&format!("{session}/1/undecoded.bin")),
         "{envelope}"
     );
 }
@@ -506,7 +418,7 @@ fn failed_turn(steps: &[Value], class: &str) -> (Sandbox, Value, Vec<Value>) {
 #[test]
 fn failure_class_protocol_cites_the_malformed_message() {
     let malformed = json!({"type":"text","vendor_turn_id":"fake-turn-1"});
-    let (sandbox, envelope, events) = failed_turn(
+    let (sandbox, envelope, _) = failed_turn(
         &[
             emit(ACCEPTED),
             json!({"action":"emit","message":malformed}),
@@ -515,13 +427,13 @@ fn failure_class_protocol_cites_the_malformed_message() {
         "protocol",
     );
     assert_eq!(envelope["stop_reason"], "error");
-    assert_message(&sandbox, &events.last().unwrap()["raw_ref"], &malformed);
+    assert_undecoded(&sandbox, &envelope, &malformed);
 }
 
 #[test]
 fn failure_class_protocol_for_oversized_tool_payload() {
     let tool = json!({"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"shell","input_summary":"y".repeat(300 * 1024)});
-    let (sandbox, _, events) = failed_turn(
+    let (sandbox, envelope, events) = failed_turn(
         &[
             emit(ACCEPTED),
             json!({"action":"emit","message":tool}),
@@ -530,7 +442,15 @@ fn failure_class_protocol_for_oversized_tool_payload() {
         "protocol",
     );
     assert!(events.iter().all(|event| event["type"] != "tool.started"));
-    assert_message(&sandbox, &events.last().unwrap()["raw_ref"], &tool);
+    // Over 64 KiB: `undecoded.bin` keeps the message's head.
+    let session = envelope["session_id"].as_str().unwrap();
+    let head = sandbox.evidence_file(session, "undecoded.bin");
+    assert_eq!(head.len(), 64 * 1024);
+    assert!(head.starts_with(b"{\""), "{envelope}");
+    assert!(
+        failure_text(&envelope).contains("undecodable vendor message"),
+        "{envelope}"
+    );
 }
 
 #[test]

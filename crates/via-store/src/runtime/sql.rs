@@ -2,16 +2,16 @@
 
 use super::{
     AcceptanceRecord, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
-    CommitOutcome, Connection, ConnectionId, Duration, EventRecord, FAILURE_BATCH_CANCELLATIONS,
-    FailureResolutionRecord, KeyedOperation, MetadataExt, OperationRecord, OperationVerb,
-    OptionalExtension, Path, Predecessors, QueuedTurn, RAW_UNIT_LIMIT, RawRef, RawStream,
+    CommitOutcome, Connection, Duration, EventRecord, EvidenceRefs, EvidenceRoot,
+    FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity, KeyedOperation, MetadataExt,
+    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, QueuedTurn,
     ReadCorruption, ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId,
     SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey,
     SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord, TransactionBehavior,
     TurnNumber, UnfinishedTurn, Value, check_schema_version, commit_anchor_identified,
     commit_anchor_intent, commit_arm_intent, commit_group_absence, commit_vendor_facts,
     count_unproven_anchors, fs, oneshot, params, read_anchor_cohort, read_anchor_owners,
-    read_anchor_records, read_raw_ref, validate_raw_ref,
+    read_anchor_records,
 };
 
 /// Classifies a SQLite error before `COMMIT`: corruption is `Corrupt`, which
@@ -113,6 +113,67 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Schema v6 (Task 4 design §6.6), frozen by `s1_store_v6_schema_is_frozen`.
+const SCHEMA_V6: &str = "CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
+    receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
+    next_seq INTEGER NOT NULL CHECK(next_seq>=2),
+    admission TEXT NOT NULL DEFAULT 'open' CHECK(admission IN ('open','closing')),
+    close_result TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+    harness TEXT NOT NULL, label TEXT, ord INTEGER NOT NULL UNIQUE,
+    vendor_session_id TEXT, transcript_hint TEXT);
+ CREATE TABLE session_ord (only INTEGER PRIMARY KEY CHECK(only = 1), next INTEGER NOT NULL);
+ INSERT INTO session_ord(only,next) VALUES (1,0);
+ CREATE TABLE turns (
+    session_id TEXT NOT NULL REFERENCES sessions(id), number INTEGER NOT NULL,
+    prompt TEXT, prompt_blob TEXT, effective TEXT NOT NULL, state TEXT NOT NULL,
+    queued_at TEXT, queued_seq INTEGER NOT NULL, submitted_at TEXT,
+    accepted_at TEXT, correlation TEXT, envelope TEXT,
+    cancel_cause TEXT CHECK(cancel_cause IN ('cancel','close')), ended_seq INTEGER,
+    evidence_dir TEXT,
+    CHECK((state IN ('completed','failed','cancelled','unknown')) = (ended_seq IS NOT NULL)),
+    CHECK((prompt IS NULL) <> (prompt_blob IS NULL)),
+    PRIMARY KEY(session_id,number));
+ CREATE UNIQUE INDEX turns_one_running ON turns(session_id) WHERE state='running';
+ CREATE TABLE spawn_keys (
+    key TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+    identity_len INTEGER NOT NULL,
+    identity_sha256 BLOB NOT NULL CHECK(length(identity_sha256)=32), receipt TEXT NOT NULL);
+ CREATE TABLE operations (
+    session_id TEXT NOT NULL REFERENCES sessions(id), op_key TEXT NOT NULL,
+    verb TEXT NOT NULL CHECK(verb IN ('resume','close')), identity_len INTEGER NOT NULL,
+    identity_sha256 BLOB NOT NULL CHECK(length(identity_sha256)=32),
+    turn INTEGER, result TEXT, PRIMARY KEY(session_id,op_key),
+    CHECK(verb='close' OR (turn IS NOT NULL AND result IS NOT NULL)),
+    FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number));
+ CREATE TABLE events (
+    session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
+    turn INTEGER, type TEXT NOT NULL, event TEXT NOT NULL,
+    PRIMARY KEY(session_id,seq),
+    FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number)
+        DEFERRABLE INITIALLY DEFERRED);
+ CREATE INDEX events_turn ON events(session_id,turn,seq);
+ CREATE TABLE steps (
+    session_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    step INTEGER NOT NULL CHECK(step >= 1),
+    started_ms INTEGER NOT NULL,
+    ended_ms INTEGER NOT NULL,
+    tokens INTEGER CHECK(tokens IS NULL OR tokens >= 0),
+    PRIMARY KEY(session_id, turn, step),
+    FOREIGN KEY(session_id, turn) REFERENCES turns(session_id, number)
+ ) WITHOUT ROWID;
+ CREATE TABLE anchors (
+    anchor_id TEXT PRIMARY KEY, generation TEXT NOT NULL, marker TEXT NOT NULL,
+    socket_path TEXT NOT NULL, owner_session TEXT NOT NULL, owner_turn INTEGER NOT NULL,
+    uid INTEGER NOT NULL, boot_id TEXT NOT NULL, pid_namespace TEXT NOT NULL,
+    phase TEXT NOT NULL, record_version INTEGER NOT NULL,
+    pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
+    absence_time TEXT,
+    FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
+ CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
+ PRAGMA user_version=6;";
+
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
 /// first mutation, the journal-mode switch.
@@ -144,46 +205,8 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(
-            "CREATE TABLE sessions (
-                id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
-                receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
-                next_seq INTEGER NOT NULL CHECK(next_seq>=2),
-                admission TEXT NOT NULL DEFAULT 'open' CHECK(admission IN ('open','closing')),
-                close_result TEXT);
-             CREATE TABLE turns (
-                session_id TEXT NOT NULL REFERENCES sessions(id), number INTEGER NOT NULL,
-                prompt TEXT NOT NULL, effective TEXT NOT NULL, state TEXT NOT NULL, queued_at TEXT,
-                queued_seq INTEGER NOT NULL, submitted_at TEXT,
-                accepted_at TEXT, correlation TEXT, envelope TEXT,
-                cancel_cause TEXT CHECK(cancel_cause IN ('cancel','close')),
-                PRIMARY KEY(session_id,number));
-             CREATE UNIQUE INDEX turns_one_running ON turns(session_id) WHERE state='running';
-             CREATE TABLE spawn_keys (
-                key TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
-                identity BLOB NOT NULL, receipt TEXT NOT NULL);
-             CREATE TABLE operations (
-                session_id TEXT NOT NULL REFERENCES sessions(id), op_key TEXT NOT NULL,
-                verb TEXT NOT NULL CHECK(verb IN ('resume','close')), identity BLOB NOT NULL,
-                turn INTEGER, result TEXT, PRIMARY KEY(session_id,op_key),
-                CHECK(verb='close' OR (turn IS NOT NULL AND result IS NOT NULL)),
-                FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number));
-             CREATE TABLE events (
-                session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
-                event TEXT NOT NULL, connection_id TEXT, raw_offset INTEGER, raw_len INTEGER,
-                PRIMARY KEY(session_id,seq));
-             CREATE TABLE anchors (
-                anchor_id TEXT PRIMARY KEY, generation TEXT NOT NULL, marker TEXT NOT NULL,
-                socket_path TEXT NOT NULL, owner_session TEXT NOT NULL, owner_turn INTEGER NOT NULL,
-                uid INTEGER NOT NULL, boot_id TEXT NOT NULL, pid_namespace TEXT NOT NULL,
-                phase TEXT NOT NULL, record_version INTEGER NOT NULL,
-                pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
-                absence_time TEXT,
-                FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
-             CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
-             PRAGMA user_version=5;",
-        )
-        .map_err(|error| StoreError::Open(error.to_string()))?;
+        tx.execute_batch(SCHEMA_V6)
+            .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
     Ok(())
@@ -191,7 +214,6 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
 
 pub(super) fn writer_loop(
     mut conn: Connection,
-    root: &Path,
     receiver: &Receiver<Command>,
     corruption: &ReadCorruption,
 ) {
@@ -208,10 +230,10 @@ pub(super) fn writer_loop(
             continue;
         }
         // Reads are served first; anything else is a mutation.
-        let Some(command) = serve_read(&conn, root, command, corruption) else {
+        let Some(command) = serve_read(&conn, command, corruption) else {
             continue;
         };
-        serve_write(&mut conn, root, command);
+        serve_write(&mut conn, command);
         commits += 1;
         if commits >= 1000 {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
@@ -238,7 +260,7 @@ impl Command {
                 | Self::ClosingSessions(..)
                 | Self::Terminated(..)
                 | Self::Events(..)
-                | Self::Logs(..)
+                | Self::EvidenceRefs(..)
                 | Self::Authenticate(..)
                 | Self::Unfinished(..)
                 | Self::AnchorOwners(..)
@@ -266,7 +288,7 @@ impl Command {
             Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
             Self::Terminated(..) => "store.read.corrupt.terminated",
             Self::Events(..) => "store.read.corrupt.events",
-            Self::Logs(..) => "store.read.corrupt.logs",
+            Self::EvidenceRefs(..) => "store.read.corrupt.logs",
             Self::Authenticate(..) => "store.read.corrupt.authenticate",
             Self::Unfinished(..) => "store.read.corrupt.unfinished",
             Self::AnchorOwners(..) => "store.read.corrupt.anchor_owners",
@@ -328,12 +350,7 @@ fn read_seams(command: &Command) -> Result<(), StoreError> {
 /// Serves a read command; returns any other command unserved. Every read
 /// reply, a test seam's failure included, passes [`answer`], so SQLite
 /// corruption on any read reaches the observer before the reply.
-fn serve_read(
-    conn: &Connection,
-    root: &Path,
-    command: Command,
-    corruption: &ReadCorruption,
-) -> Option<Command> {
+fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) -> Option<Command> {
     if !command.is_read() {
         return Some(command);
     }
@@ -373,7 +390,9 @@ fn serve_read(
         Command::Events(session, from, limit, reply) => {
             reply!(reply, read_events(conn, &session, from, limit));
         }
-        Command::Logs(session, reply) => reply!(reply, read_logs(conn, root, &session)),
+        Command::EvidenceRefs(session, turn, reply) => {
+            reply!(reply, read_evidence_refs(conn, &session, turn));
+        }
         Command::Authenticate(session, hash, reply) => {
             reply!(reply, authenticate(conn, &session, &hash));
         }
@@ -434,7 +453,7 @@ fn answer<T>(
 }
 
 /// Serves one mutation command.
-fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
+fn serve_write(conn: &mut Connection, command: Command) {
     match command {
         Command::Spawn(record, key, reply) => {
             send_commit(reply, commit_spawn(conn, record, key));
@@ -446,15 +465,15 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
             send_commit(reply, commit_submission(conn, &record));
         }
         Command::Acceptance(record, reply) => {
-            send_commit(reply, commit_acceptance(conn, root, &record));
+            send_commit(reply, commit_acceptance(conn, &record));
         }
         Command::Event(record, reply) => {
-            send_commit(reply, commit_event(conn, root, &record));
+            send_commit(reply, commit_event(conn, &record));
         }
         Command::Terminal(record, extras, reply) => {
             send_commit(
                 reply,
-                commit_terminal(conn, root, &record, &extras, None).map(drop),
+                commit_terminal(conn, &record, &extras, None).map(drop),
             );
         }
         Command::SessionClosed(session, closed, reply) => {
@@ -464,7 +483,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
             let extras = TerminalExtras::default();
             send_commit(
                 reply,
-                commit_terminal(conn, root, &record, &extras, Some(&closed)),
+                commit_terminal(conn, &record, &extras, Some(&closed)),
             );
         }
         Command::Closing(record, reply) => {
@@ -477,7 +496,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
             send_commit(reply, commit_submit_failed(conn, &record));
         }
         Command::FailureResolution(record, reply) => {
-            send_commit(reply, commit_failure_resolution(conn, root, &record));
+            send_commit(reply, commit_failure_resolution(conn, &record));
         }
         Command::AnchorIntent(intent, reply) => {
             let _ = reply.send(as_commit(commit_anchor_intent(conn, &intent)));
@@ -518,7 +537,7 @@ fn serve_write(conn: &mut Connection, root: &Path, command: Command) {
         | Command::ClosingSessions(..)
         | Command::Terminated(..)
         | Command::Events(..)
-        | Command::Logs(..)
+        | Command::EvidenceRefs(..)
         | Command::Authenticate(..)
         | Command::Unfinished(..)
         | Command::AnchorOwners(..)
@@ -559,6 +578,77 @@ fn json(value: &Value) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|error| StoreError::Write(error.to_string()))
 }
 
+/// A stored identity length; one past `i64` cannot be stored.
+fn identity_len(identity: &Identity) -> Result<i64, StoreError> {
+    i64::try_from(identity.len).map_err(|_| StoreError::Constraint("identity too long"))
+}
+
+/// Reads back a stored identity pair.
+fn stored_identity(len: i64, sha256: &[u8]) -> Result<Identity, StoreError> {
+    Ok(Identity {
+        len: u64::try_from(len).map_err(|_| StoreError::CorruptEvidence)?,
+        sha256: sha256.try_into().map_err(|_| StoreError::CorruptEvidence)?,
+    })
+}
+
+/// Parses an event's `at`, strictly `YYYY-MM-DDTHH:MM:SS.mmmZ` as Core
+/// writes it, to Unix milliseconds (design §6.6); anything else is
+/// `Constraint`.
+pub(super) fn at_ms(at: &str) -> Result<i64, StoreError> {
+    const BAD: StoreError = StoreError::Constraint("event time is not RFC 3339 UTC milliseconds");
+    let bytes = at.as_bytes();
+    if bytes.len() != 24
+        || [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b'T'),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+            (23, b'Z'),
+        ]
+        .iter()
+        .any(|&(index, byte)| bytes[index] != byte)
+    {
+        return Err(BAD);
+    }
+    let number = |from: usize, to: usize| -> Result<i64, StoreError> {
+        let digits = &bytes[from..to];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(BAD);
+        }
+        Ok(digits
+            .iter()
+            .fold(0_i64, |value, digit| value * 10 + i64::from(digit - b'0')))
+    };
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second, milli) = (
+        number(11, 13)?,
+        number(14, 16)?,
+        number(17, 19)?,
+        number(20, 23)?,
+    );
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(BAD),
+    };
+    if !(1..=month_days).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return Err(BAD);
+    }
+    // Days from civil (H. Hinnant), the inverse of Core's `rfc3339`.
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Ok(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + milli)
+}
+
 fn commit_spawn(
     conn: &mut Connection,
     record: SpawnRecord,
@@ -570,15 +660,37 @@ fn commit_spawn(
     let receipt = json(&record.receipt)?;
     let params_json = json(&record.params)?;
     let effective = json(&record.effective)?;
-    let event = json(&record.initial_event)?;
-    // Core's queued event always carries its time; bare fixtures of lower layers may not.
-    let queued_at = record.initial_event.get("at").and_then(Value::as_str);
+    let harness = record
+        .params
+        .get("harness")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Constraint("frozen params name no harness"))?;
+    let queued_at = event_at(&record.initial_event)?;
+    let created = at_ms(queued_at)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
+    // Design §6.6: the session's creation ordinal, from a counter that is
+    // never decremented, so no ordinal is ever reused.
+    let ord: i64 = tx
+        .query_row(
+            "UPDATE session_ord SET next=next+1 WHERE only=1 RETURNING next",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO sessions(id,handle_hash,receipt,params,state,next_seq) VALUES (?1,?2,?3,?4,'active',2)",
-        params![record.session_id.as_str(), &record.handle_hash[..], receipt, params_json],
+        "INSERT INTO sessions(id,handle_hash,receipt,params,state,next_seq,created_ms,updated_ms,harness,ord)
+         VALUES (?1,?2,?3,?4,'active',2,?5,?5,?6,?7)",
+        params![
+            record.session_id.as_str(),
+            &record.handle_hash[..],
+            receipt,
+            params_json,
+            created,
+            harness,
+            ord
+        ],
     )
     .map_err(sql_error)?;
     tx.execute(
@@ -586,15 +698,17 @@ fn commit_spawn(
         params![record.session_id.as_str(), record.prompt, effective, queued_at],
     )
     .map_err(sql_error)?;
-    tx.execute(
-        "INSERT INTO events(session_id,seq,event) VALUES (?1,1,?2)",
-        params![record.session_id.as_str(), event],
-    )
-    .map_err(sql_error)?;
+    insert_event_row(&tx, &record.session_id, 1, &record.initial_event)?;
     if let Some(key) = key {
         tx.execute(
-            "INSERT INTO spawn_keys(key,session_id,identity,receipt) VALUES (?1,?2,?3,?4)",
-            params![key.key, record.session_id.as_str(), key.identity, receipt],
+            "INSERT INTO spawn_keys(key,session_id,identity_len,identity_sha256,receipt) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                key.key,
+                record.session_id.as_str(),
+                identity_len(&key.identity)?,
+                &key.identity.sha256[..],
+                receipt
+            ],
         )
         .map_err(sql_error)?;
     }
@@ -614,19 +728,19 @@ fn commit_spawn(
 }
 
 fn read_spawn_key(conn: &Connection, key: &str) -> Result<Option<StoredSpawnKey>, StoreError> {
-    let row: Option<(String, Vec<u8>, String)> = conn
+    let row: Option<(String, i64, Vec<u8>, String)> = conn
         .query_row(
-            "SELECT session_id,identity,receipt FROM spawn_keys WHERE key=?1",
+            "SELECT session_id,identity_len,identity_sha256,receipt FROM spawn_keys WHERE key=?1",
             [key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(session, identity, receipt)| {
+    row.map(|(session, len, sha256, receipt)| {
         Ok(StoredSpawnKey {
             session_id: SessionId::try_from(session.as_str())
                 .map_err(|_| StoreError::CorruptEvidence)?,
-            identity,
+            identity: stored_identity(len, &sha256)?,
             receipt: serde_json::from_str(&receipt).map_err(|_| StoreError::CorruptEvidence)?,
         })
     })
@@ -681,14 +795,15 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
         ],
     )
     .map_err(sql_error)?;
-    insert_event(&tx, session, &record.event, None)?;
+    insert_event(&tx, session, &record.event)?;
     if let Some(operation) = &record.operation {
         tx.execute(
-            "INSERT INTO operations(session_id,op_key,verb,identity,turn,result) VALUES (?1,?2,'resume',?3,?4,?5)",
+            "INSERT INTO operations(session_id,op_key,verb,identity_len,identity_sha256,turn,result) VALUES (?1,?2,'resume',?3,?4,?5,?6)",
             params![
                 session.as_str(),
                 operation.op_key,
-                operation.identity,
+                identity_len(&operation.identity)?,
+                &operation.identity.sha256[..],
                 record.turn.get(),
                 json(&operation.result)?
             ],
@@ -724,22 +839,22 @@ fn read_keyed_operation(
     session: &SessionId,
     op_key: &str,
 ) -> Result<Option<KeyedOperation>, StoreError> {
-    let row: Option<(String, Vec<u8>, Option<String>)> = conn
+    let row: Option<(String, i64, Vec<u8>, Option<String>)> = conn
         .query_row(
-            "SELECT verb,identity,result FROM operations WHERE session_id=?1 AND op_key=?2",
+            "SELECT verb,identity_len,identity_sha256,result FROM operations WHERE session_id=?1 AND op_key=?2",
             params![session.as_str(), op_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(verb, identity, result)| {
+    row.map(|(verb, len, sha256, result)| {
         Ok(KeyedOperation {
             verb: match verb.as_str() {
                 "resume" => OperationVerb::Resume,
                 "close" => OperationVerb::Close,
                 _ => return Err(StoreError::CorruptEvidence),
             },
-            identity,
+            identity: stored_identity(len, &sha256)?,
             result: result
                 .map(|result| serde_json::from_str(&result))
                 .transpose()
@@ -893,29 +1008,31 @@ fn commit_submission(conn: &mut Connection, record: &SubmissionRecord) -> Result
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
+    // Design §7.1: the turn's evidence folder, relative to the State
+    // directory, commits with `turn.submitted`.
     let changed = tx
         .execute(
-            "UPDATE turns SET state='running',submitted_at=?3 WHERE session_id=?1 AND number=?2 AND state='queued'",
-            params![session.as_str(), record.turn.get(), at],
+            "UPDATE turns SET state='running',submitted_at=?3,evidence_dir=?4 WHERE session_id=?1 AND number=?2 AND state='queued'",
+            params![
+                session.as_str(),
+                record.turn.get(),
+                at,
+                EvidenceRoot::relative(session, record.turn)
+            ],
         )
         .map_err(sql_error)?;
     if changed != 1 {
         return Err(StoreError::Constraint("turn is not queued"));
     }
-    insert_event(&tx, session, &record.event, None)?;
+    insert_event(&tx, session, &record.event)?;
     before_commit!("store.commit.submission");
     commit(tx)
 }
 
-fn commit_acceptance(
-    conn: &mut Connection,
-    root: &Path,
-    record: &AcceptanceRecord,
-) -> Result<(), StoreError> {
+fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result<(), StoreError> {
     let session = &record.session_id;
     let turn = record.turn;
     let correlation = record.correlation.as_str();
-    validate_raw_ref(root, &record.raw_ref)?;
     let at = event_at(&record.event)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -946,7 +1063,7 @@ fn commit_acceptance(
         params![session.as_str(), turn.get(), correlation, at],
     )
     .map_err(sql_error)?;
-    insert_event(&tx, session, &record.event, Some(&record.raw_ref))?;
+    insert_event(&tx, session, &record.event)?;
     before_commit!("store.commit.event");
     commit(tx)
 }
@@ -959,15 +1076,10 @@ fn event_at(event: &Value) -> Result<&str, StoreError> {
 }
 
 /// Appends one event at the session's dense next sequence inside `tx`.
-///
-/// The event document's `raw_ref` (explicit `null` when there is no span)
-/// must equal the span stored in the columns, so `logs` reads exactly the
-/// bytes the event cites and no stored span is hidden from the public event.
 fn insert_event(
     tx: &rusqlite::Transaction<'_>,
     session: &SessionId,
     event: &Value,
-    raw_ref: Option<&RawRef>,
 ) -> Result<(), StoreError> {
     let next: i64 = tx
         .query_row(
@@ -976,35 +1088,11 @@ fn insert_event(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if seq(event)? != u64::try_from(next).map_err(|_| StoreError::CorruptEvidence)? {
+    let next = u64::try_from(next).map_err(|_| StoreError::CorruptEvidence)?;
+    if seq(event)? != next {
         return Err(StoreError::Constraint("event sequence is not the next one"));
     }
-    let cited = event
-        .get("raw_ref")
-        .ok_or(StoreError::Constraint("event raw_ref missing"))?;
-    let stored =
-        serde_json::to_value(raw_ref).map_err(|error| StoreError::Write(error.to_string()))?;
-    if *cited != stored {
-        return Err(StoreError::Constraint(
-            "event raw_ref differs from its span",
-        ));
-    }
-    let (connection, offset, len) = match raw_ref {
-        Some(reference) => (
-            Some(reference.connection_id().as_str()),
-            Some(
-                i64::try_from(reference.offset())
-                    .map_err(|_| StoreError::Constraint("raw offset too large"))?,
-            ),
-            Some(i64::from(reference.byte_len())),
-        ),
-        None => (None, None, None),
-    };
-    tx.execute(
-        "INSERT INTO events(session_id,seq,event,connection_id,raw_offset,raw_len) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![session.as_str(), next, json(event)?, connection, offset, len],
-    )
-    .map_err(sql_error)?;
+    insert_event_row(tx, session, next, event)?;
     tx.execute(
         "UPDATE sessions SET next_seq=next_seq+1 WHERE id=?1",
         [session.as_str()],
@@ -1013,14 +1101,44 @@ fn insert_event(
     Ok(())
 }
 
-fn commit_event(
-    conn: &mut Connection,
-    root: &Path,
-    record: &EventRecord,
+/// Writes event `seq` with its v6 `turn` and `type` columns, both from the
+/// event document, and moves the session's `updated_ms` to the event's time
+/// (design §6.6). Events are written in sequence order, so a transaction
+/// leaves `updated_ms` at the time of its highest-`seq` event.
+fn insert_event_row(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+    seq: u64,
+    event: &Value,
 ) -> Result<(), StoreError> {
-    if let Some(reference) = &record.raw_ref {
-        validate_raw_ref(root, reference)?;
-    }
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Constraint("event type missing"))?;
+    let turn = match event.get("turn") {
+        None | Some(Value::Null) => None,
+        Some(turn) => Some(
+            turn.as_u64()
+                .and_then(|turn| u32::try_from(turn).ok())
+                .ok_or(StoreError::Constraint("event turn invalid"))?,
+        ),
+    };
+    let at = at_ms(event_at(event)?)?;
+    let seq = i64::try_from(seq).map_err(|_| StoreError::Constraint("event sequence too large"))?;
+    tx.execute(
+        "INSERT INTO events(session_id,seq,turn,type,event) VALUES (?1,?2,?3,?4,?5)",
+        params![session.as_str(), seq, turn, kind, json(event)?],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "UPDATE sessions SET updated_ms=?2 WHERE id=?1",
+        params![session.as_str(), at],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn commit_event(conn: &mut Connection, record: &EventRecord) -> Result<(), StoreError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
@@ -1035,12 +1153,7 @@ fn commit_event(
     if state.as_deref() != Some("running") {
         return Err(StoreError::Constraint("turn is not running"));
     }
-    insert_event(
-        &tx,
-        &record.session_id,
-        &record.event,
-        record.raw_ref.as_ref(),
-    )?;
+    insert_event(&tx, &record.session_id, &record.event)?;
     before_commit!("store.commit.event");
     commit(tx)
 }
@@ -1067,7 +1180,7 @@ fn commit_session_closed(
     if !open || unfinished_turns(&tx, session)? {
         return Ok(false);
     }
-    insert_event(&tx, session, closed, None)?;
+    insert_event(&tx, session, closed)?;
     tx.execute(
         "UPDATE sessions SET state='closed' WHERE id=?1",
         [session.as_str()],
@@ -1080,18 +1193,13 @@ fn commit_session_closed(
 
 /// Commits the terminal and, when `closed` is given, the session's
 /// `session.closed` event after it, in the same transaction. `extras` adds
-/// the turn's `cancel_cause` and a `raw_log.incomplete` event before
-/// `turn.ended` (design §7.2 row 6, §10).
+/// the turn's `cancel_cause` (design §10).
 fn commit_terminal(
     conn: &mut Connection,
-    root: &Path,
     record: &TerminalRecord,
     extras: &TerminalExtras,
     closed: Option<&Value>,
 ) -> Result<bool, StoreError> {
-    if let Some(reference) = &record.raw_ref {
-        validate_raw_ref(root, reference)?;
-    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
@@ -1122,10 +1230,11 @@ fn turn_state(
     .map_err(sql_error)
 }
 
-/// Writes one terminal inside `tx`: its `raw_log.incomplete` event, the
-/// turn's state, envelope and `cancel_cause`, `turn.ended` and, with
-/// `closed`, `session.closed` when no other turn of the session is queued or
-/// running. Returns whether the close was written.
+/// Writes one terminal inside `tx`: the turn's state, envelope,
+/// `cancel_cause` and `ended_seq` (the sequence of its `turn.ended`, design
+/// §6.6), `turn.ended` and, with `closed`, `session.closed` when no other
+/// turn of the session is queued or running. Returns whether the close was
+/// written.
 fn insert_terminal(
     tx: &rusqlite::Transaction<'_>,
     record: &TerminalRecord,
@@ -1141,34 +1250,25 @@ fn insert_terminal(
         return Err(StoreError::Constraint("terminal state invalid"));
     }
     let envelope = json(&record.envelope)?;
-    if let Some(incomplete) = &extras.raw_incomplete {
-        // Only a running turn has a connection whose raw log can be incomplete.
-        if turn_state(tx, &record.session_id, record.turn)?.as_deref() != Some("running") {
-            return Err(StoreError::Constraint("turn is not running"));
-        }
-        insert_event(tx, &record.session_id, incomplete, None)?;
-    }
+    let ended_seq = i64::try_from(seq(&record.event)?)
+        .map_err(|_| StoreError::Constraint("event sequence too large"))?;
     let changed = tx
         .execute(
-            "UPDATE turns SET state=?3,envelope=?4,cancel_cause=?5 WHERE session_id=?1 AND number=?2 AND (?3!='completed' OR correlation IS NOT NULL) AND (state='running' OR (state='queued' AND ?3='cancelled'))",
+            "UPDATE turns SET state=?3,envelope=?4,cancel_cause=?5,ended_seq=?6 WHERE session_id=?1 AND number=?2 AND (?3!='completed' OR correlation IS NOT NULL) AND (state='running' OR (state='queued' AND ?3='cancelled'))",
             params![
                 record.session_id.as_str(),
                 record.turn.get(),
                 state,
                 envelope,
-                extras.cancel_cause.map(CancelCause::as_str)
+                extras.cancel_cause.map(CancelCause::as_str),
+                ended_seq
             ],
         )
         .map_err(sql_error)?;
     if changed != 1 {
         return Err(StoreError::Constraint("turn is not running"));
     }
-    insert_event(
-        tx,
-        &record.session_id,
-        &record.event,
-        record.raw_ref.as_ref(),
-    )?;
+    insert_event(tx, &record.session_id, &record.event)?;
     // `session.closed` only when no other turn of the session is queued or
     // running (this turn is already terminal); otherwise the terminal commits
     // alone and the close is reported as not written.
@@ -1177,7 +1277,7 @@ fn insert_terminal(
             if unfinished_turns(tx, &record.session_id)? {
                 false
             } else {
-                insert_event(tx, &record.session_id, closed, None)?;
+                insert_event(tx, &record.session_id, closed)?;
                 // Design §10 [r3.6]: the rider seam fails the combined
                 // transaction after the terminal and the close are inserted,
                 // before `COMMIT`; a terminal committing alone never reaches it.
@@ -1235,8 +1335,13 @@ fn commit_closing(conn: &mut Connection, record: &ClosingRecord) -> Result<(), S
     .map_err(sql_error)?;
     if let Some(operation) = &record.operation {
         tx.execute(
-            "INSERT INTO operations(session_id,op_key,verb,identity,turn,result) VALUES (?1,?2,'close',?3,NULL,NULL)",
-            params![session.as_str(), operation.op_key, operation.identity],
+            "INSERT INTO operations(session_id,op_key,verb,identity_len,identity_sha256,turn,result) VALUES (?1,?2,'close',?3,?4,NULL,NULL)",
+            params![
+                session.as_str(),
+                operation.op_key,
+                identity_len(&operation.identity)?,
+                &operation.identity.sha256[..]
+            ],
         )
         .map_err(sql_error)?;
     }
@@ -1272,7 +1377,7 @@ fn commit_closed(
     if unfinished_turns(&tx, session)? {
         return Ok(ClosedOutcome::Unfinished);
     }
-    insert_event(&tx, session, &record.event, None)?;
+    insert_event(&tx, session, &record.event)?;
     let result = derive_close_result(&tx, session)?;
     let encoded = json(&result)?;
     tx.execute(
@@ -1283,16 +1388,18 @@ fn commit_closed(
     if let Some(operation) = &record.operation {
         // The intent row `Closing` wrote, or a new one for a key first seen
         // on a session already closing.
+        let len = identity_len(&operation.identity)?;
+        let sha256 = &operation.identity.sha256[..];
         let completed = tx
             .execute(
-                "UPDATE operations SET result=?4 WHERE session_id=?1 AND op_key=?2 AND verb='close' AND identity=?3 AND result IS NULL",
-                params![session.as_str(), operation.op_key, operation.identity, encoded],
+                "UPDATE operations SET result=?5 WHERE session_id=?1 AND op_key=?2 AND verb='close' AND identity_len=?3 AND identity_sha256=?4 AND result IS NULL",
+                params![session.as_str(), operation.op_key, len, sha256, encoded],
             )
             .map_err(sql_error)?;
         if completed == 0 {
             tx.execute(
-                "INSERT INTO operations(session_id,op_key,verb,identity,turn,result) VALUES (?1,?2,'close',?3,NULL,?4)",
-                params![session.as_str(), operation.op_key, operation.identity, encoded],
+                "INSERT INTO operations(session_id,op_key,verb,identity_len,identity_sha256,turn,result) VALUES (?1,?2,'close',?3,?4,NULL,?5)",
+                params![session.as_str(), operation.op_key, len, sha256, encoded],
             )
             .map_err(sql_error)?;
         }
@@ -1388,20 +1495,23 @@ fn commit_submit_failed(
         return Err(StoreError::Constraint("a failed submission ends failed"));
     }
     let envelope = json(&record.envelope)?;
+    let ended_seq = i64::try_from(seq(&record.ended)?)
+        .map_err(|_| StoreError::Constraint("event sequence too large"))?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
+    // No agent I/O, so no evidence folder: `evidence_dir` stays NULL.
     let changed = tx
         .execute(
-            "UPDATE turns SET state='failed',submitted_at=?3,envelope=?4 WHERE session_id=?1 AND number=?2 AND state='queued'",
-            params![session.as_str(), record.turn.get(), at, envelope],
+            "UPDATE turns SET state='failed',submitted_at=?3,envelope=?4,ended_seq=?5 WHERE session_id=?1 AND number=?2 AND state='queued'",
+            params![session.as_str(), record.turn.get(), at, envelope, ended_seq],
         )
         .map_err(sql_error)?;
     if changed != 1 {
         return Err(StoreError::Constraint("turn is not queued"));
     }
-    insert_event(&tx, session, &record.submitted, None)?;
-    insert_event(&tx, session, &record.ended, None)?;
+    insert_event(&tx, session, &record.submitted)?;
+    insert_event(&tx, session, &record.ended)?;
     update_session_state(&tx, session, false)?;
     before_commit!("store.commit.terminal");
     commit(tx)
@@ -1411,7 +1521,6 @@ fn commit_submit_failed(
 /// cancellations, in one transaction and within the event bound.
 fn commit_failure_resolution(
     conn: &mut Connection,
-    root: &Path,
     record: &FailureResolutionRecord,
 ) -> Result<(), StoreError> {
     let session = &record.terminal.session_id;
@@ -1419,9 +1528,6 @@ fn commit_failure_resolution(
         return Err(StoreError::Constraint(
             "a failure batch carries at most 8 cancellations",
         ));
-    }
-    if let Some(reference) = &record.terminal.raw_ref {
-        validate_raw_ref(root, reference)?;
     }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1449,11 +1555,7 @@ fn commit_failure_resolution(
             "a failure batch cancels exactly its session's queued turns",
         ));
     }
-    let extras = TerminalExtras {
-        cancel_cause: None,
-        raw_incomplete: record.raw_incomplete.clone(),
-    };
-    insert_terminal(&tx, &record.terminal, &extras, None)?;
+    insert_terminal(&tx, &record.terminal, &TerminalExtras::default(), None)?;
     for cancellation in &record.cancellations {
         if cancellation.envelope.get("state").and_then(Value::as_str) != Some("cancelled") {
             return Err(StoreError::Constraint(
@@ -1573,72 +1675,62 @@ fn read_events(
     let from =
         i64::try_from(from).map_err(|_| StoreError::Constraint("event sequence too large"))?;
     let mut query = conn
-        .prepare("SELECT seq,event,connection_id,raw_offset,raw_len FROM events WHERE session_id=?1 AND seq>=?2 ORDER BY seq LIMIT ?3")
+        .prepare(
+            "SELECT seq,event FROM events WHERE session_id=?1 AND seq>=?2 ORDER BY seq LIMIT ?3",
+        )
         .map_err(sql_error)?;
     let rows = query
         .query_map(params![session.as_str(), from, limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(sql_error)?;
     let mut events = Vec::new();
     for row in rows {
-        let (seq, event, connection, offset, len) = row.map_err(sql_error)?;
-        let raw_ref = match (connection, offset, len) {
-            (Some(connection), Some(offset), Some(len)) => Some(
-                RawRef::new(
-                    ConnectionId::try_from(connection.as_str())
-                        .map_err(|_| StoreError::CorruptEvidence)?,
-                    u64::try_from(offset).map_err(|_| StoreError::CorruptEvidence)?,
-                    u32::try_from(len).map_err(|_| StoreError::CorruptEvidence)?,
-                )
-                .map_err(|_| StoreError::CorruptEvidence)?,
-            ),
-            (None, None, None) => None,
-            _ => return Err(StoreError::CorruptEvidence),
-        };
+        let (seq, event) = row.map_err(sql_error)?;
         events.push(StoredEvent {
             seq: u64::try_from(seq).map_err(|_| StoreError::CorruptEvidence)?,
             event: serde_json::from_str(&event).map_err(|_| StoreError::CorruptEvidence)?,
-            raw_ref,
         });
     }
     Ok(events)
 }
 
-fn read_logs(conn: &Connection, root: &Path, session: &SessionId) -> Result<Value, StoreError> {
-    let events = read_events(conn, session, 1, 1000)?;
-    let mut entries = Vec::new();
-    let mut total = 0_usize;
-    let mut next_after = 0_u64;
-    for event in events {
-        let Some(reference) = event.raw_ref else {
-            continue;
-        };
-        let (stream, bytes) = read_raw_ref(root, &reference)?;
-        let text = String::from_utf8_lossy(&bytes);
-        let entry = serde_json::json!({
-            "seq":event.seq,
-            "direction":match stream { RawStream::Stdin => "input", RawStream::Stdout | RawStream::Stderr => "output" },
-            "connection_id":reference.connection_id().as_str(),
-            "offset":reference.offset(),"len":reference.byte_len(),"text":text,
-        });
-        let encoded = serde_json::to_vec(&entry)
-            .map_err(|error| StoreError::Write(error.to_string()))?
-            .len();
-        if total.saturating_add(encoded) > RAW_UNIT_LIMIT.saturating_sub(64) {
-            return Err(StoreError::Constraint("raw log response exceeds 1 MiB"));
-        }
-        total += encoded;
-        next_after = event.seq;
-        entries.push(entry);
-    }
-    Ok(serde_json::json!({"entries":entries,"next_after":next_after}))
+/// Design §4.4, §6.7: the addressed turn, or the session's running turn,
+/// else its latest submitted turn, else its latest turn; with the turn's
+/// `evidence_dir` and the session's vendor identity and transcript hint.
+/// One small row: no file is read.
+fn read_evidence_refs(
+    conn: &Connection,
+    session: &SessionId,
+    turn: Option<TurnNumber>,
+) -> Result<Option<EvidenceRefs>, StoreError> {
+    /// Vendor session ID, transcript hint, turn number and its folder.
+    type Row = (Option<String>, Option<String>, Option<u32>, Option<String>);
+    let row: Option<Row> = conn
+        .query_row(
+            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir
+             FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
+                (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
+                (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
+                (SELECT max(number) FROM turns WHERE session_id=s.id))
+             WHERE s.id=?1",
+            params![session.as_str(), turn.map(TurnNumber::get)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((vendor_session_id, transcript_hint, number, evidence_dir)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(EvidenceRefs {
+        turn: number
+            .map(TurnNumber::try_from)
+            .transpose()
+            .map_err(|_| StoreError::CorruptEvidence)?,
+        evidence_dir,
+        vendor_session_id,
+        transcript_hint,
+    }))
 }
 
 fn authenticate(

@@ -58,7 +58,7 @@ impl Fixture {
                 params: serde_json::json!({"harness":"fake"}),
                 prompt: "fixture".into(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
-                initial_event: serde_json::json!({"seq":1,"type":"turn.queued"}),
+                initial_event: serde_json::json!({"seq":1,"turn":1,"type":"turn.queued","at":"2026-01-01T00:00:00.000Z"}),
             })
             .await
             .unwrap();
@@ -96,6 +96,7 @@ impl Fixture {
                 session_id: SessionId::try_from("s_0123456789ab").unwrap(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },
+            stderr_path: self.root.join(format!("stderr-{}.log", next_stderr())),
             capacity: None,
         }
     }
@@ -168,7 +169,9 @@ fn vendor_pipes_detach_and_verified_anchor_stops_its_group() {
         let fixture = Fixture::new().await;
         let host = fixture.host();
         let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(4));
-        let acquired = match host.acquire(fixture.spec("/bin/cat"), deadline).await {
+        let spec = fixture.spec("/bin/cat");
+        let stderr_path = spec.stderr_path.clone();
+        let acquired = match host.acquire(spec, deadline).await {
             Ok(value) => value,
             Err(error) => {
                 let paths: Vec<_> = fs::read_dir(fixture.root.join("anchors"))
@@ -199,18 +202,16 @@ fn vendor_pipes_detach_and_verified_anchor_stops_its_group() {
         let via_host::OwnedPipes {
             mut stdin,
             mut stdout,
-            mut stderr,
         } = acquired.pipes;
         stdin.write_all(b"vendor-data\n").await.unwrap();
         drop(stdin);
         let mut output = Vec::new();
-        let mut errors = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            stdout.read_to_end(&mut output).await.unwrap();
-            stderr.read_to_end(&mut errors).await.unwrap();
-        })
-        .await
-        .expect("anchor must detach all three vendor pipe descriptions");
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut output))
+            .await
+            .expect("anchor must detach both vendor pipe descriptions")
+            .unwrap();
+        // Design §7.2: stderr is the turn's file, not a pipe.
+        let errors = fs::read(&stderr_path).unwrap();
         assert!(
             output
                 .windows(b"vendor-data\n".len())
@@ -299,7 +300,6 @@ fn unauthenticated_reconnect_cannot_steal_live_controller() {
         let via_host::OwnedPipes {
             mut stdin,
             mut stdout,
-            stderr,
         } = acquired.pipes;
         stdin.write_all(b"still-alive\n").await.unwrap();
         drop(stdin);
@@ -315,7 +315,6 @@ fn unauthenticated_reconnect_cannot_steal_live_controller() {
             "unauthenticated socket connection interrupted vendor"
         );
         drop(stdout);
-        drop(stderr);
         let report = acquired
             .control
             .close(CloseRequest {
@@ -1084,4 +1083,10 @@ fn denied_group() -> Option<u32> {
             && rustix::process::test_kill_process_group(query) == Err(rustix::io::Errno::PERM))
         .then_some(group)
     })
+}
+
+/// A fresh `stderr.log` name per spec: Host creates it exclusively.
+fn next_stderr() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

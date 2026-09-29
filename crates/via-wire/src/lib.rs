@@ -1,11 +1,11 @@
-//! Wire owns message splitting, byte transport, and the raw log tap; it never interprets
-//! protocol messages or manages processes.
+//! Wire owns message splitting, byte transport and the turn's evidence
+//! folder; it never interprets protocol messages or manages processes.
 
 pub use via_host::{
     CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
     PrivateProcessSpec, ProcessOwner, TurnNumber,
 };
-pub use via_store::{AnchorCohort, ConnectionId, Deadline, RawRef, RuntimeResources, SessionId};
+pub use via_store::{AnchorCohort, Deadline, RuntimeResources, SessionId};
 
 /// The maximum complete stdout message, including its trailing LF.
 pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -33,40 +33,29 @@ impl BoundedBytes {
     }
 }
 
-/// A complete, undecoded vendor message and its byte-accurate raw evidence reference.
-/// The checked constructor is the only cross-crate construction path.
+/// A complete, undecoded vendor message. The bounded constructor is the only
+/// cross-crate construction path.
 ///
 /// ```compile_fail
-/// use via_wire::{BoundedBytes, ConnectionId, VendorMessage, RawRef};
+/// use via_wire::{BoundedBytes, VendorMessage};
 /// let bytes = BoundedBytes::try_from_message(b"ok\n".to_vec()).unwrap();
-/// let raw_ref = RawRef::new(ConnectionId::try_from("c_01").unwrap(), 0, 2).unwrap();
-/// let _invalid = VendorMessage { bytes, raw_ref };
+/// let _invalid = VendorMessage { bytes };
 /// ```
 #[derive(Eq, PartialEq)]
 pub struct VendorMessage {
     /// Exact bytes delivered to Route.
     bytes: BoundedBytes,
-    /// Reference to the corresponding raw stdout unit.
-    raw_ref: RawRef,
 }
 
 impl VendorMessage {
-    /// Validates that the raw reference covers this exact message length.
-    pub fn new(bytes: BoundedBytes, raw_ref: RawRef) -> Result<Self, WireFailure> {
-        if usize::try_from(raw_ref.byte_len()) != Ok(bytes.as_bytes().len()) {
-            return Err(WireFailure::RawRangeMismatch);
-        }
-        Ok(Self { bytes, raw_ref })
+    /// Wraps one complete bounded message.
+    pub fn new(bytes: BoundedBytes) -> Self {
+        Self { bytes }
     }
 
     /// Returns the exact message bytes, including the trailing LF.
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_bytes()
-    }
-
-    /// Returns the checked reference to these exact bytes.
-    pub fn raw_ref(&self) -> &RawRef {
-        &self.raw_ref
     }
 }
 
@@ -88,10 +77,6 @@ pub enum WireFailure {
     MessageTooLarge,
     /// EOF left a partial line that cannot be a protocol message.
     UnterminatedMessage,
-    /// Vendor message bytes and raw reference did not agree.
-    RawRangeMismatch,
-    /// Raw evidence append or sync failed.
-    RawStore,
     /// Staging or message staging budget was exhausted.
     Overflow,
     /// The pipe or socket transport failed.
@@ -103,12 +88,10 @@ pub enum WireFailure {
 pub enum WireHealth {
     /// Transport is currently open.
     Open,
-    /// First failure and whether the raw log lost bytes.
+    /// First failure.
     Failed {
         /// Latched first cause.
         cause: WireFailure,
-        /// True when exact traffic could not be durably retained.
-        raw_incomplete: bool,
     },
     /// Host confirmed exit of the owning process.
     Exited(ExitReport),
@@ -130,7 +113,7 @@ mod runtime;
 // Route needs the narrow connection handle returned by WireRuntime; its constructor
 // and Host process control remain private to Wire.
 pub use runtime::{
-    RawEvidence, RuntimeConfig, WireCloseReport, WireConnection, WireError, WireRecovery,
+    RuntimeConfig, UNDECODED_BYTES, WireCloseReport, WireConnection, WireError, WireRecovery,
     WireRuntime, WireShutdown, WireSignals, WireTurnRecovery,
 };
 pub use via_host::{JournalSite, ReprobeReport};

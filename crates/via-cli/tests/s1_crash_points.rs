@@ -626,7 +626,7 @@ fn acknowledged(
         .map_err(infra)
 }
 
-/// A turn that completes at once, used for post-recovery liveness and raw evidence.
+/// A turn that completes at once, used for post-recovery liveness and turn evidence.
 fn reply_steps(prompt: &str) -> Value {
     json!({
         "expected_request":{"type":"start","id":1,"turn":1,"prompt":prompt},
@@ -1616,7 +1616,7 @@ fn s1_f10_force_at_the_pre_arm_gate_launches_nothing() -> TestResult {
                 .ok_or_else(|| ScenarioError::Timeout("force stop never exited".to_owned()))?;
             check_pre_launch_force(paths, &session, true)?;
             check(status.code() == Some(0), || format!("daemon exit {status}"))?;
-            // A later daemon runs a normal turn, which also leaves raw evidence.
+            // A later daemon runs a normal turn, which also leaves turn evidence.
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
             let _daemon = Daemon::start(paths, evidence, "final")?;
@@ -2139,11 +2139,11 @@ fn s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits() -> TestRes
             check(resume.status.success(), || "resume refused".to_owned())?;
             daemon.kill()?;
             drop(daemon);
-            // Recovery commits turn 1's `raw_log.incomplete`,
-            // `cancel.requested`, `cancel.settled` and terminal; the
-            // handoff's cancellation of turn 2 is fifth.
+            // Recovery commits turn 1's `cancel.requested`,
+            // `cancel.settled` and terminal; the handoff's cancellation of
+            // turn 2 is fourth.
             let lost = "store.commit.reply_lost";
-            paths.failpoints.arm(lost, 5, "fail_io").map_err(infra)?;
+            paths.failpoints.arm(lost, 4, "fail_io").map_err(infra)?;
             let (status, trace) = refused_start(paths, evidence, "refused")?;
             check(
                 !status.success() && trace.contains("restart handoff failed"),

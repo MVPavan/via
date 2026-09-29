@@ -820,25 +820,18 @@ fn envelope_violations(
     if envelope["events"] != json!({"first_seq":1,"last_seq":5,"count":5}) {
         problems.push(format!("envelope.events = {}", envelope["events"]));
     }
-    let spans = envelope["raw_spans"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if spans.is_empty() {
-        problems.push("envelope.raw_spans empty".to_owned());
-    }
-    for span in &spans {
-        let valid = span["connection_id"]
-            .as_str()
-            .is_some_and(|connection| span["path"] == json!(format!("raw/{connection}.raw")))
-            && span["first_offset"]
-                .as_u64()
-                .zip(span["last_offset"].as_u64())
-                .is_some_and(|(first, last)| first < last)
-            && span.as_object().is_some_and(|fields| fields.len() == 4);
-        if !valid {
-            problems.push(format!("raw span shape: {span}"));
-        }
+    // Task 4 design §7.5: the turn's evidence folder, absolute; no
+    // transcript without a confirmed vendor identity.
+    let evidence = &envelope["evidence"];
+    let folder_ok = evidence["folder"].as_str().is_some_and(|folder| {
+        Path::new(folder).is_absolute() && folder.ends_with(&format!("evidence/{session}/1"))
+    });
+    if !folder_ok
+        || !evidence["transcript"].is_null()
+        || evidence.as_object().is_none_or(|fields| fields.len() != 2)
+        || envelope.get("raw_spans").is_some()
+    {
+        problems.push(format!("envelope.evidence shape: {evidence}"));
     }
 }
 
@@ -849,10 +842,6 @@ fn event_violations(
     events: &[Value],
     problems: &mut Vec<String>,
 ) {
-    let spans = envelope["raw_spans"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     let types: Vec<&str> = events
         .iter()
         .map(|event| event["type"].as_str().unwrap_or("<none>"))
@@ -873,8 +862,7 @@ fn event_violations(
             && event["session_id"] == json!(session)
             && event["turn"] == 1
             && event["late"] == false
-            && is_rfc3339_utc(&event["at"])
-            && event.get("raw_ref").is_some();
+            && is_rfc3339_utc(&event["at"]);
         if !common {
             problems.push(format!(
                 "event {} lacks C1 common fields: {event}",
@@ -886,30 +874,11 @@ fn event_violations(
         if !queued["queue_position"].is_u64() || submitted["attempt"] != 1 {
             problems.push("turn.queued/turn.submitted payload".to_owned());
         }
-        if started["effective"] != receipt["effective"] || !started["raw_ref"].is_object() {
+        if started["effective"] != receipt["effective"] {
             problems.push(format!("turn.started payload: {started}"));
         }
-        let within = |reference: &Value| {
-            spans.iter().any(|span| {
-                span["connection_id"] == reference["connection_id"]
-                    && reference["offset"]
-                        .as_u64()
-                        .zip(reference["len"].as_u64())
-                        .zip(
-                            span["first_offset"]
-                                .as_u64()
-                                .zip(span["last_offset"].as_u64()),
-                        )
-                        .is_some_and(|((offset, len), (first, last))| {
-                            first <= offset && offset + len <= last
-                        })
-            })
-        };
         if text["text"] != "reply" || text["final"] != false {
             problems.push(format!("assistant.text payload: {text}"));
-        }
-        if !within(&started["raw_ref"]) || !within(&text["raw_ref"]) || !within(&ended["raw_ref"]) {
-            problems.push("event raw_ref outside envelope raw_spans".to_owned());
         }
         if ended["state"] != "completed"
             || ended["stop_reason"] != "end_turn"

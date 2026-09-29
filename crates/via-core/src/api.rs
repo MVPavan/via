@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{ConnectionId, RawRef, SessionId, TurnNumber, TurnState};
+use crate::{SessionId, TurnNumber, TurnState};
 
 /// Strict C1 §3.2 parameters for creating a fake session and its first turn.
 #[derive(Deserialize)]
@@ -400,12 +400,39 @@ pub struct ReadParams {
     pub address: String,
 }
 
-/// Strict C1 session-address parameters for the current `events` and `logs`.
+/// Strict C1 session-address parameters for the current `events`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionReadParams {
     /// Session whose durable history is read.
     pub session: SessionId,
+}
+
+/// Strict C1 §3.12 `logs` parameters: exactly one of a session address or
+/// a turn address (Task 4 design §4.4).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsParams {
+    /// A session: its running turn, else its latest submitted one.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+    /// A turn address `<session_id>/<turn>`.
+    #[serde(default)]
+    pub turn: Option<String>,
+}
+
+impl LogsParams {
+    /// The session and, for a turn address, the turn.
+    pub(crate) fn address(self) -> Result<(SessionId, Option<TurnNumber>), ApiError> {
+        match (self.session, self.turn) {
+            (Some(session), None) => Ok((session, None)),
+            (None, Some(turn)) => match parse_address(&turn)? {
+                (session, Some(number)) => Ok((session, Some(number))),
+                (_, None) => Err(ApiError::INVALID_PARAMS),
+            },
+            (Some(_), Some(_)) | (None, None) => Err(ApiError::INVALID_PARAMS),
+        }
+    }
 }
 
 /// Strict C1 `daemon/status` parameters; the method takes none.
@@ -1058,12 +1085,6 @@ impl Warning {
         code: "cancel_cleanup_uncertain",
         message: "process group cleanup after cancellation is unconfirmed",
     };
-
-    /// Announces that bytes exchanged with the vendor are missing from the raw log.
-    pub(crate) const RAW_LOG_INCOMPLETE: Self = Self {
-        code: "raw_log_incomplete",
-        message: "the raw log lost bytes for this turn",
-    };
 }
 
 /// C1 §3.5/§7.4 cancel outcome with separate cleanup certainty.
@@ -1199,32 +1220,12 @@ pub(crate) struct EventRange {
     pub(crate) count: u64,
 }
 
-/// C1 §5 bounding span of one connection's raw log for a turn; `last_offset` is exclusive.
+/// C1 §5 `evidence`: the turn's evidence folder and the vendor's transcript
+/// hint, as `logs` returns them (§3.12).
 #[derive(Clone, Serialize)]
-pub(crate) struct RawSpan {
-    connection_id: ConnectionId,
-    path: String,
-    first_offset: u64,
-    last_offset: u64,
-}
-
-impl RawSpan {
-    /// Widens the per-connection bounding spans, in first-seen order, to cover one
-    /// committed event reference.
-    pub(crate) fn include(spans: &mut Vec<Self>, reference: &RawRef) {
-        let id = reference.connection_id();
-        if let Some(span) = spans.iter_mut().find(|span| &span.connection_id == id) {
-            span.first_offset = span.first_offset.min(reference.offset());
-            span.last_offset = span.last_offset.max(reference.end_offset());
-        } else {
-            spans.push(Self {
-                connection_id: id.clone(),
-                path: format!("raw/{}.raw", id.as_str()),
-                first_offset: reference.offset(),
-                last_offset: reference.end_offset(),
-            });
-        }
-    }
+pub(crate) struct EvidenceRef {
+    pub(crate) folder: Option<String>,
+    pub(crate) transcript: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1266,7 +1267,7 @@ pub(crate) struct Envelope {
     pub(crate) duration_ms: Option<u64>,
     pub(crate) exit: Option<Exit>,
     pub(crate) events: EventRange,
-    pub(crate) raw_spans: Vec<RawSpan>,
+    pub(crate) evidence: EvidenceRef,
     pub(crate) vendor_options: Value,
     pub(crate) warnings: Vec<Warning>,
     pub(crate) vendor: VendorFields,
@@ -1325,8 +1326,6 @@ pub(crate) enum EventBody {
         payload: String,
         truncated: bool,
     },
-    #[serde(rename = "raw_log.incomplete")]
-    RawLogIncomplete { connection_id: ConnectionId },
     #[serde(rename = "cancel.requested")]
     CancelRequested {},
     #[serde(rename = "cancel.settled")]
@@ -1346,7 +1345,6 @@ pub(crate) struct Event<'a> {
     pub(crate) turn: Option<u32>,
     pub(crate) late: bool,
     pub(crate) at: &'a str,
-    pub(crate) raw_ref: Option<&'a RawRef>,
     #[serde(flatten)]
     pub(crate) body: EventBody,
 }
@@ -1393,9 +1391,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{
-        ConnectionId, EventBody, SpawnParams, UNIX_EPOCH, retry_identity, retry_key, rfc3339,
-    };
+    use super::{EventBody, SpawnParams, UNIX_EPOCH, retry_identity, retry_key, rfc3339};
 
     /// Fake-route edge rules: an empty options object per harness passes; a
     /// null `bound`, `effort` or `deadlines` is `invalid_params` while a
@@ -1454,7 +1450,6 @@ mod tests {
 
     #[test]
     fn observation_events_use_c1_tags_and_fields() {
-        let connection = ConnectionId::try_from("c_01").unwrap();
         let bodies = [
             (
                 EventBody::AssistantText {
@@ -1470,12 +1465,6 @@ mod tests {
                     truncated: true,
                 },
                 json!({"type":"vendor.other","vendor_type":"note","payload":"{","truncated":true}),
-            ),
-            (
-                EventBody::RawLogIncomplete {
-                    connection_id: connection,
-                },
-                json!({"type":"raw_log.incomplete","connection_id":"c_01"}),
             ),
         ];
         for (body, expected) in bodies {

@@ -5,10 +5,10 @@ use tokio::{
 };
 
 use crate::{
-    AcceptanceToken, Cleanup, ConnectionId, Deadline, FakeAcceptanceObservation, FakeConfig,
-    FakeObservation, FakeTerminalEvidence, MAX_OBSERVATION_BYTES, Observation, ProcessOwner,
-    ReprobeReport, RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch,
-    TurnNumber, VendorTerminalStatus, VendorTurnId,
+    AcceptanceToken, Cleanup, Deadline, FakeAcceptanceObservation, FakeConfig, FakeObservation,
+    FakeTerminalEvidence, MAX_OBSERVATION_BYTES, Observation, ProcessOwner, ReprobeReport,
+    RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch, TurnNumber,
+    VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
     FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteMessage, TerminalStatus, WireRecovery,
@@ -107,7 +107,6 @@ impl AdapterRuntime {
         &self,
         session_id: SessionId,
         turn: TurnNumber,
-        connection_id: ConnectionId,
         prompt: String,
         observations: mpsc::Sender<FakeObservation>,
         deadline: Deadline,
@@ -130,15 +129,9 @@ impl AdapterRuntime {
         // Full: Route waits for capacity under the turn deadline while this loop
         // forwards to Core, which drains until the route finishes.
         let (route_tx, route_rx) = mpsc::channel::<RouteMessage>(64);
-        let route = self.route.execute(
-            connection_id,
-            process,
-            start,
-            route_tx,
-            deadline,
-            force.clone(),
-            stop,
-        );
+        let route = self
+            .route
+            .execute(process, start, route_tx, deadline, force.clone(), stop);
         let mut force = force;
         tokio::pin!(route);
         let mut route_rx = Some(route_rx);
@@ -166,9 +159,8 @@ impl AdapterRuntime {
                         Ok(result) if delivered => Ok(normalize_terminal(result)),
                         Ok(result) => Err(AdapterError::Route(RouteFailure {
                             cause: RouteError::Overflow { turn },
-                            evidence: None,
+                            undecoded: None,
                             exit: Some(result.exit),
-                            raw_incomplete: false,
                             launched: true,
                             cleanup: None,
                             forced: false,
@@ -332,18 +324,13 @@ async fn deliver(
 
 /// Maps one decoded fake message to C2 observations; oversized text is split.
 fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, ()> {
-    let raw_ref = message.raw_ref;
-    let data = |observation| FakeObservation::Data {
-        observation,
-        raw_ref: raw_ref.clone(),
-    };
+    let data = |observation| FakeObservation::Data { observation };
     Ok(match message.payload {
         // Route admits exactly one acceptance per turn.
         FakeMessage::Accepted { vendor_turn_id } => {
             vec![FakeObservation::Accepted(FakeAcceptanceObservation {
                 correlation: AcceptanceToken::try_from(1).map_err(|_| ())?,
                 vendor_turn_id: VendorTurnId::try_from(vendor_turn_id).map_err(|_| ())?,
-                raw_ref: raw_ref.clone(),
             })]
         }
         FakeMessage::Text { text, .. } => split_text(&text)
@@ -432,7 +419,6 @@ fn normalize_terminal(result: FakeRouteResult) -> FakeTerminalEvidence {
         final_text: result.final_text,
         stop_reason: result.stop_reason,
         vendor_code: result.vendor_code,
-        terminal_raw: result.terminal_raw,
         exit: result.exit,
         cleanup: match result.cleanup {
             via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,

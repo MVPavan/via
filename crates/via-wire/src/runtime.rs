@@ -1,3 +1,9 @@
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -6,34 +12,25 @@ use tokio::{
 };
 
 use super::{
-    BoundedBytes, ConnectionId, Deadline, PrivateProcessSpec, SendOutcome, VendorMessage,
-    WireCleanup, WireFailure,
+    BoundedBytes, Deadline, PrivateProcessSpec, SendOutcome, VendorMessage, WireCleanup,
+    WireFailure,
 };
 use via_host::{
-    AcquireFailure, AcquiredProcess, CleanupEvidence, ExitReceiver, Host, LaunchPipes, OwnedPipes,
+    AcquireFailure, AcquiredProcess, CleanupEvidence, ExitReceiver, Host, LaunchPipes,
     ProcessControl,
 };
-use via_store::{DurableRaw, RawFactory, RawStream, RawWriter, RuntimeResources};
+use via_store::{EvidenceRoot, RuntimeResources};
 
-/// Raw unit size for a retained line recorded by the failure drain.
-const DRAIN_UNIT_BYTES: usize = 64 * 1024;
+/// The prefix of an undecoded message VIA keeps (design §7.3).
+pub const UNDECODED_BYTES: usize = 64 * 1024;
+
+/// Bound on writing `undecoded.bin` (design §7.3).
+const UNDECODED_WRITE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an acquisition may still finish once its caller is cancelled: a
 /// normal one does, so its group is force-closed and proved absent; a stalled
 /// one is abandoned well inside the 10 s final shutdown.
 const CANCELLED_ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Bound on draining the vendor pipes of an acquisition that failed after ARM.
-const LAUNCH_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Whether every byte exchanged with the vendor reached the durable raw log.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawEvidence {
-    /// Every byte read or written was durably recorded.
-    Complete,
-    /// Some bytes were lost or left unread; counters cannot make the log complete.
-    Incomplete,
-}
 
 /// The signals Route hands Wire for one connection (design §2).
 pub struct WireSignals {
@@ -56,38 +53,43 @@ pub struct RuntimeConfig {
     pub anchor_dir: std::path::PathBuf,
 }
 
-/// Wire owns the raw and process capabilities split from one Store owner.
+/// Wire owns the evidence root and process capabilities split from one
+/// Store owner.
 pub struct WireRuntime {
-    raw: RawFactory,
+    evidence: EvidenceRoot,
     host: Host,
 }
 
 impl WireRuntime {
     /// Consumes the unopened Store bundle at the sole production split site.
     pub fn new(config: RuntimeConfig, resources: RuntimeResources) -> Result<Self, WireError> {
-        let (raw, journal) = resources.into_wire_parts();
+        let (evidence, journal) = resources.into_wire_parts();
         let host = Host::new(journal, config.anchor_binary, config.anchor_dir)?;
-        Ok(Self { raw, host })
+        Ok(Self { evidence, host })
     }
 
-    /// Opens one private connection with a Store-owned synced raw writer.
+    /// Opens one private connection for the turn `spec.owner` names. First
+    /// the turn's evidence folder is created on the blocking pool (design
+    /// §7.2); a failure there is [`WireError::Evidence`] and nothing is
+    /// acquired. Host then creates `stderr.log` in it for the vendor.
     /// Once `signals.force` is set, waits for vendor input, output or exit
-    /// end with [`WireError::Cancelled`]; bytes already read still reach the
-    /// raw log. A failed acquisition is [`WireError::Acquire`] with Host's
-    /// cleanup evidence.
+    /// end with [`WireError::Cancelled`]. A failed acquisition is
+    /// [`WireError::Acquire`] with Host's cleanup evidence.
     pub async fn open_connection(
         &self,
-        connection_id: ConnectionId,
-        spec: PrivateProcessSpec,
+        mut spec: PrivateProcessSpec,
         deadline: Deadline,
         signals: WireSignals,
     ) -> Result<WireConnection, WireError> {
+        let root = self.evidence.clone();
+        let (session, turn) = (spec.owner.session_id.clone(), spec.owner.turn);
+        let folder = tokio::task::spawn_blocking(move || root.create_turn(&session, turn))
+            .await
+            .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?
+            .map_err(WireError::Evidence)?;
+        spec.stderr_path = folder.join("stderr.log");
         Box::pin(WireConnection::open(
-            &self.host,
-            spec,
-            self.raw.open(connection_id),
-            deadline,
-            signals,
+            &self.host, spec, folder, deadline, signals,
         ))
         .await
     }
@@ -183,9 +185,10 @@ impl WireError {
     pub fn is_store_failure(&self) -> bool {
         matches!(
             self,
-            Self::Raw(_)
+            Self::Evidence(_)
                 | Self::Host(
-                    via_host::HostError::Store(_)
+                    via_host::HostError::Evidence(_)
+                        | via_host::HostError::Store(_)
                         | via_host::HostError::StoreUnavailable(_)
                         | via_host::HostError::Journal { .. }
                 )
@@ -241,18 +244,16 @@ pub enum WireError {
     /// Host could not acquire or supervise its private process.
     #[error("host acquisition failed: {0}")]
     Host(#[from] via_host::HostError),
-    /// Raw evidence could not be persisted before delivery.
-    #[error("raw evidence failed: {0}")]
-    Raw(#[from] via_store::StoreError),
+    /// The turn's evidence folder could not be created (design §7.2):
+    /// nothing was acquired.
+    #[error("evidence folder not created: {0}")]
+    Evidence(std::io::Error),
     /// A pipe operation failed.
     #[error("vendor pipe failed: {0}")]
     Io(#[from] std::io::Error),
     /// A pipe operation crossed its absolute deadline.
     #[error("vendor pipe deadline elapsed")]
     Deadline,
-    /// A raw evidence append was not confirmed by its absolute deadline.
-    #[error("raw evidence append deadline elapsed")]
-    RawDeadline,
     /// The caller's cancel signal ended a wait on the vendor.
     #[error("vendor wait cancelled")]
     Cancelled,
@@ -267,8 +268,6 @@ pub enum WireError {
         cause: Box<WireError>,
         /// ARM was sent: the vendor may have launched.
         launched: bool,
-        /// Whether every byte the vendor wrote reached the raw log.
-        raw: RawEvidence,
         /// Host's bounded absence verification; `None` when no anchor
         /// intent was committed, so no group can exist.
         cleanup: Option<WireCleanup>,
@@ -282,18 +281,18 @@ pub enum WireError {
     Message(WireFailure),
 }
 
-/// Exclusive transport for one private fake process and one raw connection.
+/// Exclusive transport for one private fake process. The vendor's stderr is
+/// the turn's `stderr.log`, which Wire never reads.
 pub struct WireConnection {
     stdin: Option<tokio::process::ChildStdin>,
     stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
     stdout_eof: bool,
-    stderr_eof: bool,
     unterminated_stdout: bool,
     buffered: Vec<u8>,
-    raw: RawWriter,
-    /// Latched `Incomplete` once any byte read from or written to the vendor was not recorded.
-    evidence: RawEvidence,
+    /// The turn's evidence folder.
+    folder: PathBuf,
+    /// The note of the first undecoded message kept (design §7.3).
+    undecoded: Option<String>,
     control: ProcessControl,
     exits: ExitReceiver,
     /// Caller's cancel signal; checked only where waiting loses no bytes.
@@ -307,7 +306,7 @@ impl WireConnection {
     async fn open(
         host: &Host,
         spec: PrivateProcessSpec,
-        raw: RawWriter,
+        folder: PathBuf,
         deadline: Deadline,
         signals: WireSignals,
     ) -> Result<Self, WireError> {
@@ -349,16 +348,13 @@ impl WireConnection {
                 // Dropping the acquisition closes its anchor control: an anchor
                 // that connected exits on EOF and stops its group, one that did
                 // not at its own bootstrap deadline; Host recovery reports what
-                // it can prove. After ARM the vendor pipes are still ours.
+                // it can prove. After ARM the vendor pipes are still ours;
+                // nothing keeps their bytes, so they are dropped.
                 drop(acquire);
-                let (launched, raw) = match launch.take() {
-                    Some(pipes) => (true, Box::pin(drain_pipes(pipes, &raw)).await),
-                    None => (false, RawEvidence::Complete),
-                };
+                let launched = launch.take().is_some();
                 return Err(WireError::Acquire {
                     cause: Box::new(cause),
                     launched,
-                    raw,
                     cleanup: evidence.cleanup,
                     forced: evidence.forced,
                     journal_uncertain: evidence.journal_uncertain,
@@ -368,13 +364,11 @@ impl WireConnection {
         Ok(Self {
             stdin: Some(pipes.stdin),
             stdout: pipes.stdout,
-            stderr: pipes.stderr,
             stdout_eof: false,
-            stderr_eof: false,
             unterminated_stdout: false,
             buffered: Vec::new(),
-            raw,
-            evidence: RawEvidence::Complete,
+            folder,
+            undecoded: None,
             control,
             exits,
             cancel,
@@ -382,7 +376,7 @@ impl WireConnection {
         })
     }
 
-    /// Writes one input message and durably records only successfully written prefixes.
+    /// Writes one input message.
     pub async fn write_message(
         &mut self,
         message: &[u8],
@@ -418,16 +412,10 @@ impl WireConnection {
                     return Ok(SendOutcome::Indeterminate);
                 }
             };
-            self.record(
-                RawStream::Stdin,
-                message[written..written + next].to_vec(),
-                deadline,
-            )
-            .await?;
             written += next;
         }
         // The whole input message (in S1 first the start carrying the prompt) is in the
-        // vendor's stdin; nothing it answered is recorded yet.
+        // vendor's stdin; nothing it answered is read yet.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::hit_async("wire.prompt.after_write")
             .await
@@ -447,134 +435,118 @@ impl WireConnection {
             .map_err(WireError::Io)
     }
 
-    /// Returns a message only after Store has synced its exact raw bytes.
+    /// Returns the next complete stdout message. A line over the cap and an
+    /// unterminated tail at EOF are kept in `undecoded.bin` first (design
+    /// §7.3); [`Self::take_undecoded`] then names them.
     pub async fn next_message(
         &mut self,
         deadline: Deadline,
     ) -> Result<Option<VendorMessage>, WireError> {
         loop {
             if let Some(index) = self.buffered.iter().position(|byte| *byte == b'\n') {
-                // An oversized line stays buffered so the failure drain records it.
                 if index >= super::MAX_STDOUT_MESSAGE_BYTES {
-                    return Err(WireError::Message(WireFailure::MessageTooLarge));
+                    return Err(self.too_large().await);
                 }
                 let bytes: Vec<u8> = self.buffered.drain(..=index).collect();
                 let bounded = BoundedBytes::try_from_message(bytes).map_err(WireError::Message)?;
-                let token = self
-                    .record(RawStream::Stdout, bounded.as_bytes().to_vec(), deadline)
-                    .await?;
-                return VendorMessage::new(bounded, token.raw_ref().clone())
-                    .map(Some)
-                    .map_err(WireError::Message);
+                return Ok(Some(VendorMessage::new(bounded)));
             }
             if self.buffered.len() > super::MAX_STDOUT_MESSAGE_BYTES {
-                return Err(WireError::Message(WireFailure::MessageTooLarge));
+                return Err(self.too_large().await);
             }
             if self.stdout_eof && !self.buffered.is_empty() {
                 self.unterminated_stdout = true;
                 let tail = std::mem::take(&mut self.buffered);
-                self.record(RawStream::Stdout, tail, deadline).await?;
+                let length = tail.len();
+                self.keep_undecoded(
+                    &tail,
+                    &format!("unterminated vendor message: {length} bytes"),
+                )
+                .await;
             }
-            if self.stdout_eof && self.stderr_eof {
+            if self.stdout_eof {
                 return if self.unterminated_stdout {
                     Err(WireError::Message(WireFailure::UnterminatedMessage))
                 } else {
                     Ok(None)
                 };
             }
-            Box::pin(self.read_either(deadline, false)).await?;
+            Box::pin(self.read_stdout(deadline, false)).await?;
         }
     }
 
-    /// Records every remaining byte of both pipes, unsplit, until both reach EOF or
-    /// the cleanup deadline. Used after a failure, when message splitting no longer decides
-    /// protocol meaning. A failed or expired append never stops the drain: later
-    /// bytes are read and discarded until the same deadline, and the result says the
-    /// raw log is incomplete.
-    pub async fn drain_to_eof(&mut self, deadline: Deadline) -> RawEvidence {
-        self.stdin.take();
-        // A retained oversized line may exceed the raw unit cap; store it in 64 KiB units.
-        let retained = std::mem::take(&mut self.buffered);
-        for chunk in retained.chunks(DRAIN_UNIT_BYTES) {
-            // A failure latches `Incomplete`; the remaining chunks are discarded.
-            let _recorded = self
-                .record(RawStream::Stdout, chunk.to_vec(), deadline)
-                .await;
+    /// Keeps the over-cap line's first bytes from the assembly buffer.
+    async fn too_large(&mut self) -> WireError {
+        let line = std::mem::take(&mut self.buffered);
+        self.keep_undecoded(
+            &line,
+            &format!(
+                "vendor message over the {} byte cap",
+                super::MAX_STDOUT_MESSAGE_BYTES
+            ),
+        )
+        .await;
+        WireError::Message(WireFailure::MessageTooLarge)
+    }
+
+    /// Writes the first 64 KiB of a message VIA cannot decode to the turn's
+    /// `undecoded.bin` (design §7.3): `create_new`, so the first failure
+    /// wins, one write on the blocking pool bounded by 2 s. `what` describes
+    /// the message; the note it becomes names the file or the error, and is
+    /// kept for [`Self::take_undecoded`]. Best effort: nothing fails here.
+    pub async fn keep_undecoded(&mut self, bytes: &[u8], what: &str) {
+        if self.undecoded.is_some() {
+            return;
         }
-        while !(self.stdout_eof && self.stderr_eof) {
+        let path = self.folder.join("undecoded.bin");
+        let prefix = bytes[..bytes.len().min(UNDECODED_BYTES)].to_vec();
+        let kept = prefix.len();
+        let target = path.clone();
+        let write = tokio::task::spawn_blocking(move || write_new(&target, &prefix));
+        let note = match tokio::time::timeout(UNDECODED_WRITE, write).await {
+            Ok(Ok(Ok(()))) => format!("{what}; first {kept} in {}", path.display()),
+            Ok(Ok(Err(error))) => format!("{what}; not saved: {error}"),
+            Ok(Err(error)) => format!("{what}; not saved: {error}"),
+            Err(_) => format!("{what}; not saved: the write outlived 2 s"),
+        };
+        self.undecoded = Some(note);
+    }
+
+    /// The note of the undecoded message kept for this turn, once.
+    pub fn take_undecoded(&mut self) -> Option<String> {
+        self.undecoded.take()
+    }
+
+    /// Reads and discards stdout until EOF or the cleanup deadline, after a
+    /// failure, so the vendor never blocks on a full pipe while its group
+    /// stops. Nothing is kept.
+    pub async fn drain_to_eof(&mut self, deadline: Deadline) {
+        self.stdin.take();
+        self.buffered.clear();
+        while !self.stdout_eof {
             // A read that is always ready must not extend the drain past its bound.
-            if tokio::time::Instant::now() >= deadline.instant() {
-                self.evidence = RawEvidence::Incomplete;
+            if tokio::time::Instant::now() >= deadline.instant()
+                || Box::pin(self.read_stdout(deadline, true)).await.is_err()
+            {
                 break;
             }
-            match Box::pin(self.read_either(deadline, true)).await {
-                // A raw failure is latched and later reads are discarded.
-                Ok(()) | Err(WireError::Raw(_) | WireError::RawDeadline) => {}
-                // Bytes may remain unread in the pipes.
-                Err(_) => {
-                    self.evidence = RawEvidence::Incomplete;
-                    break;
-                }
-            }
         }
-        self.evidence
     }
 
-    /// Durably appends one unit unless the log already lost bytes; any failure
-    /// latches `Incomplete`, because the unit's bytes can no longer be recorded.
-    /// The wait for Store's worker ends at `deadline`, so a stalled worker cannot
-    /// hold the caller past its bound; an unconfirmed unit counts as lost.
-    async fn record(
-        &mut self,
-        stream: RawStream,
-        bytes: Vec<u8>,
-        deadline: Deadline,
-    ) -> Result<DurableRaw, WireError> {
-        if self.evidence == RawEvidence::Incomplete {
-            return Err(WireError::Message(WireFailure::RawStore));
-        }
-        let result = match timeout_at(deadline.instant(), self.raw.append(stream, bytes)).await {
-            Ok(appended) => appended.map_err(WireError::Raw),
-            Err(_) => Err(WireError::RawDeadline),
-        };
-        if result.is_err() {
-            self.evidence = RawEvidence::Incomplete;
-        }
-        result
-    }
-
-    /// Reads one chunk from whichever open pipe is ready; stderr is always raw-logged
-    /// at once, so neither stream waits for the other. At most one 8 KiB chunk is
-    /// staged per call. Reads are cancel-safe, but dropping this future during a raw
-    /// append loses that chunk; Route awaits it to completion or to the deadline.
-    /// Once the raw log is incomplete, drain-mode chunks are read and discarded.
-    /// Outside drain mode, the cancel signal ends the wait before any byte is read.
-    async fn read_either(&mut self, deadline: Deadline, stdout_raw: bool) -> Result<(), WireError> {
+    /// Reads one stdout chunk of at most 8 KiB into the assembly buffer, or
+    /// discards it in drain mode. Outside drain mode the cancel signal and
+    /// Route's wake end the wait before any byte is read.
+    async fn read_stdout(&mut self, deadline: Deadline, drain: bool) -> Result<(), WireError> {
         let mut out = [0; 8192];
-        let mut err = [0; 8192];
         tokio::select! {
-            () = cancelled(&mut self.cancel), if !stdout_raw => return Err(WireError::Cancelled),
-            () = woken(&mut self.wake), if !stdout_raw => return Err(WireError::Woken),
-            read = timeout_at(deadline.instant(), self.stdout.read(&mut out)), if !self.stdout_eof => {
+            () = cancelled(&mut self.cancel), if !drain => return Err(WireError::Cancelled),
+            () = woken(&mut self.wake), if !drain => return Err(WireError::Woken),
+            read = timeout_at(deadline.instant(), self.stdout.read(&mut out)) => {
                 let count = read.map_err(|_| WireError::Deadline)??;
                 if count == 0 {
                     self.stdout_eof = true;
-                } else if stdout_raw {
-                    if self.evidence == RawEvidence::Complete {
-                        self.record(RawStream::Stdout, out[..count].to_vec(), deadline)
-                            .await?;
-                    }
-                } else {
+                } else if !drain {
                     self.buffered.extend_from_slice(&out[..count]);
-                }
-            }
-            read = timeout_at(deadline.instant(), self.stderr.read(&mut err)), if !self.stderr_eof => {
-                let count = read.map_err(|_| WireError::Deadline)??;
-                if count == 0 {
-                    self.stderr_eof = true;
-                } else if !stdout_raw || self.evidence == RawEvidence::Complete {
-                    self.record(RawStream::Stderr, err[..count].to_vec(), deadline)
-                        .await?;
                 }
             }
         }
@@ -620,50 +592,15 @@ impl WireConnection {
     }
 }
 
-/// Records both vendor output pipes of a failed acquisition until EOF or a
-/// bounded cleanup deadline: `Complete` only if both reached EOF and every
-/// chunk was durably appended.
-async fn drain_pipes(pipes: OwnedPipes, raw: &RawWriter) -> RawEvidence {
-    let deadline = tokio::time::Instant::now() + LAUNCH_DRAIN;
-    let OwnedPipes {
-        stdin,
-        mut stdout,
-        mut stderr,
-    } = pipes;
-    drop(stdin);
-    let (mut stdout_eof, mut stderr_eof) = (false, false);
-    let mut evidence = RawEvidence::Complete;
-    let (mut out, mut err) = ([0; 8192], [0; 8192]);
-    while !(stdout_eof && stderr_eof) {
-        let read = timeout_at(deadline, async {
-            tokio::select! {
-                read = stdout.read(&mut out), if !stdout_eof => (RawStream::Stdout, read),
-                read = stderr.read(&mut err), if !stderr_eof => (RawStream::Stderr, read),
-            }
-        })
-        .await;
-        // A failed or late read may leave bytes unread in the pipes.
-        let Ok((stream, Ok(count))) = read else {
-            return RawEvidence::Incomplete;
-        };
-        let (bytes, eof) = if stream == RawStream::Stdout {
-            (&out[..count], &mut stdout_eof)
-        } else {
-            (&err[..count], &mut stderr_eof)
-        };
-        if count == 0 {
-            *eof = true;
-        } else if evidence == RawEvidence::Complete
-            && !matches!(
-                timeout_at(deadline, raw.append(stream, bytes.to_vec())).await,
-                Ok(Ok(_))
-            )
-        {
-            // Later bytes are still read to EOF, but the log has a gap.
-            evidence = RawEvidence::Incomplete;
-        }
-    }
-    evidence
+/// Creates `path` (new, 0600) holding `bytes`. `create_new` is `O_EXCL`,
+/// which never follows a symlink.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes)
 }
 
 /// Host's evidence from a failed acquisition, as Wire passes it up.
