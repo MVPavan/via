@@ -285,6 +285,7 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                         cancel: None,
                     },
                 ),
+                steps: Vec::new(),
             })
             .await
             .unwrap();

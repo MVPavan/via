@@ -85,6 +85,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
                         event: ended(4),
+                        steps: Vec::new(),
                     })
                     .await
                     .is_err()
@@ -101,6 +102,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         turn: turn(),
                         envelope: json!({"state":"completed"}),
                         event: ended(3),
+                        steps: Vec::new(),
                     })
                     .await
                     .is_err()
@@ -112,6 +114,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                     turn: turn(),
                     envelope: json!({"state":"completed","final_text":"reply"}),
                     event: ended(4),
+                    steps: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -160,6 +163,7 @@ fn failure_before_vendor_acceptance_is_still_durable() {
                 turn: turn(),
                 envelope: json!({"state":"failed","failure":{"class":"process_exited"}}),
                 event: ended(3),
+                steps: Vec::new(),
             })
             .await
             .unwrap();
@@ -449,6 +453,7 @@ fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
         turn: TurnNumber::try_from(2).unwrap(),
         envelope: json!({"state":"cancelled"}),
         event: ended(3),
+        steps: Vec::new(),
     }))
     .unwrap();
     let snapshot = rt

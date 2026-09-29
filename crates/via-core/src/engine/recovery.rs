@@ -489,6 +489,7 @@ impl Engine {
                 turn,
                 envelope,
                 event,
+                steps: Vec::new(),
             },
             None,
         )

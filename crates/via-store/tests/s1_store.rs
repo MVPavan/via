@@ -80,6 +80,7 @@ fn ended(number: u32, seq: u64, state: &str) -> TerminalRecord {
         turn: turn(number),
         envelope: json!({"state":state}),
         event: event("turn.ended", seq),
+        steps: Vec::new(),
     }
 }
 

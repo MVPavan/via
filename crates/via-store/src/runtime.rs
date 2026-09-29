@@ -330,6 +330,121 @@ pub struct TerminalRecord {
     pub envelope: Value,
     /// Canonical final event.
     pub event: Value,
+    /// Step rows committed in the same transaction (Task 4 design §3.2):
+    /// the open step's and any a refused step commit carried. The
+    /// transaction cap does not count them (§6.4).
+    pub steps: Vec<StepRow>,
+}
+
+/// One completed model step (Task 4 design §3.1): its number and its start
+/// and end as Unix milliseconds from Core's wall clock, and its tokens
+/// under the route's `usage.tokens` scope when it had a sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StepRow {
+    /// One-based step number within the turn.
+    pub step: u32,
+    /// Start, Unix milliseconds.
+    pub started_ms: i64,
+    /// End, Unix milliseconds.
+    pub ended_ms: i64,
+    /// Tokens of the step, if the vendor reported any.
+    pub tokens: Option<u64>,
+}
+
+/// Step rows of a running turn, committed on the Internal lane (Task 4
+/// design §3.2); no event, so no session head.
+pub struct StepsRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// The running turn.
+    pub turn: TurnNumber,
+    /// Completed steps, in order.
+    pub rows: Vec<StepRow>,
+}
+
+/// Most queued turns `status` lists (Task 4 design §11.3).
+pub const STATUS_QUEUE: u32 = 8;
+
+/// Most turn summaries `status` lists, newest first (§11.3).
+pub const STATUS_TURNS: u32 = 64;
+
+/// Most step rows one `status` page returns (C1 §3.7 `limit` maximum).
+pub const STATUS_STEPS: u32 = 1000;
+
+/// Most unproven anchors of a session `status` reads, newest first; a live
+/// control is one of them (§11.3 `process.alive`).
+pub const STATUS_ANCHORS: u32 = 8;
+
+/// The running turn as `status` reports it (§11.3 `active_turn`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveTurn {
+    /// Turn number.
+    pub turn: u32,
+    /// The vendor accepted it: `accepted_at` is set.
+    pub accepted: bool,
+    /// When it was submitted.
+    pub submitted_at: Option<String>,
+    /// Its latest event's sequence.
+    pub last_event_seq: u64,
+    /// The `at` of its first `cancel.requested`, if any.
+    pub cancel_requested_at: Option<String>,
+}
+
+/// A queued turn as `status` lists it (§11.3 `queue`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedSummary {
+    /// Turn number.
+    pub turn: u32,
+    /// The keyed `resume`'s `op_key`, if any.
+    pub op_key: Option<String>,
+    /// When it was queued.
+    pub queued_at: Option<String>,
+    /// Its frozen effective values, as stored.
+    pub effective: Value,
+}
+
+/// `status`'s durable members and one page of the selected turn's step
+/// rows, read in one Store request (Task 4 design §4.2, §6.7, §11.3).
+#[derive(Clone, Debug)]
+pub struct SessionStatus {
+    /// `sessions.state`.
+    pub state: String,
+    /// `open` or `closing`.
+    pub admission: String,
+    /// The session's harness.
+    pub harness: String,
+    /// The session's label.
+    pub label: Option<String>,
+    /// Creation, Unix milliseconds.
+    pub created_ms: i64,
+    /// Last activity, Unix milliseconds.
+    pub updated_ms: i64,
+    /// `params.model`.
+    pub model: Option<String>,
+    /// `params.cwd`.
+    pub cwd: Option<String>,
+    /// `receipt.route`.
+    pub route: Option<String>,
+    /// The confirmed vendor session ID.
+    pub vendor_session_id: Option<String>,
+    /// A group of the session's turns lacks a durable absence proof.
+    pub cleanup_uncertain: bool,
+    /// The newest [`STATUS_ANCHORS`] anchors of the session with no
+    /// absence proof.
+    pub unproven_anchors: Vec<String>,
+    /// The selected turn and its state; `None` when the requested turn
+    /// does not exist.
+    pub selected: Option<(u32, String)>,
+    /// The running turn, if any.
+    pub active: Option<ActiveTurn>,
+    /// The first [`STATUS_QUEUE`] queued turns.
+    pub queue: Vec<QueuedSummary>,
+    /// The newest [`STATUS_TURNS`] turns and their states, newest first.
+    pub turns: Vec<(u32, String)>,
+    /// The selected turn's rows after `after_step`, at most `limit`.
+    pub steps: Vec<StepRow>,
+    /// More rows follow the page.
+    pub more: bool,
 }
 
 /// Who cancelled a turn: a caller `cancel` or a `close` (design §4, §10).
@@ -713,6 +828,11 @@ pub(crate) enum Command {
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
+    Steps(StepsRecord, oneshot::Sender<Result<(), StoreError>>),
+    Status(
+        StatusQuery,
+        oneshot::Sender<Result<Option<SessionStatus>, StoreError>>,
+    ),
     Terminal(
         TerminalRecord,
         TerminalExtras,
@@ -819,6 +939,15 @@ pub(crate) enum Command {
     SweepBlobs(oneshot::Sender<Result<u64, StoreError>>),
 }
 
+/// A `session_status` request: the session, the turn param, and the step
+/// page's cursor and size.
+pub(crate) struct StatusQuery {
+    session: SessionId,
+    turn: Option<TurnNumber>,
+    after_step: u32,
+    limit: u32,
+}
+
 /// A request's size for its lane and the transaction cap (design §6.4).
 struct Size {
     /// Encoded variable payload plus [`REQUEST_OVERHEAD`].
@@ -922,6 +1051,12 @@ impl Command {
             | Self::Events(session, _, _, _)
             | Self::EvidenceRefs(session, _, _)
             | Self::Authenticate(session, _, _) => (session.as_str().len(), 0, 0),
+            Self::Status(query, _) => (query.session.as_str().len(), 0, 0),
+            Self::Steps(record, _) => (
+                record.session_id.as_str().len() + 32 * record.rows.len(),
+                0,
+                0,
+            ),
             Self::Submission(record, _) => (
                 record.session_id.as_str().len() + encoded(&record.event),
                 0,
@@ -1274,6 +1409,13 @@ impl Store {
         }
     }
 
+    /// Test builds: how many read requests the writer served (Task 4
+    /// design §13.1 `Store::read_count()`).
+    #[cfg(feature = "test-failpoints")]
+    pub fn read_count(&self) -> u64 {
+        self.client.lanes.reads()
+    }
+
     /// Test builds: how many blob files this Store's handles created.
     #[cfg(feature = "test-failpoints")]
     pub fn blob_writes(&self) -> u64 {
@@ -1489,6 +1631,42 @@ impl StoreClient {
     pub async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Event(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits completed step rows of a turn that is still running (Task 4
+    /// design §3.2). Test builds: `store.commit.step` acts before the rows
+    /// are sent, so a pause leaves the writer free and `fail_io` is a
+    /// known failure that wrote nothing.
+    pub async fn commit_steps(&self, record: StepsRecord) -> Result<(), StoreError> {
+        #[cfg(feature = "test-failpoints")]
+        crate::failpoint::hit_async("store.commit.step")
+            .await
+            .map_err(|error| StoreError::Write(error.to_string()))?;
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Steps(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// `status`'s one read (Task 4 design §4.2, §6.7): selects the turn
+    /// (`turn`, else the running turn, else the latest) and returns the
+    /// session's durable members and at most `limit` of that turn's step
+    /// rows after `after_step`. `None` when the session does not exist.
+    pub async fn session_status(
+        &self,
+        session_id: &SessionId,
+        turn: Option<TurnNumber>,
+        after_step: u32,
+        limit: u32,
+    ) -> Result<Option<SessionStatus>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        let query = StatusQuery {
+            session: session_id.clone(),
+            turn,
+            after_step,
+            limit: limit.min(STATUS_STEPS),
+        };
+        self.send(Command::Status(query, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 

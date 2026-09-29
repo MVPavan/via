@@ -361,6 +361,7 @@ fn s1_store_latch_batch_with_largest_cwd_fits_its_lane() {
                 turn: turn(1),
                 envelope: envelope("failed", terminal_len),
                 event: event("turn.ended", 11),
+                steps: Vec::new(),
             },
             cancellations: (2..=9)
                 .map(|number| TerminalRecord {
@@ -368,6 +369,7 @@ fn s1_store_latch_batch_with_largest_cwd_fits_its_lane() {
                     turn: turn(number),
                     envelope: envelope("cancelled", 8 * 1024),
                     event: event("turn.ended", u64::from(number) + 10),
+                    steps: Vec::new(),
                 })
                 .collect(),
         };
@@ -443,6 +445,7 @@ fn s1_store_full_disk_rolls_back_known() {
                 turn: turn(1),
                 envelope: envelope("failed", 512 * 1024),
                 event: event("turn.ended", 3),
+                steps: Vec::new(),
             })
             .await;
         assert!(

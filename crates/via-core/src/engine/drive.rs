@@ -1661,6 +1661,7 @@ pub(super) fn ended_record(
         turn: started.turn,
         envelope,
         event,
+        steps: Vec::new(),
     })
 }
 

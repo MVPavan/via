@@ -15,6 +15,9 @@
 //! invalid shape is ignored and leaves `<dir>/<point>.<occurrence>.refused`.
 //! `fail_io` may add `"persist": true`: every hit from the armed occurrence
 //! on then fails (design §10), each acknowledged under its own occurrence.
+//! The action `delay` carries `"value"`, milliseconds the hit waits before
+//! the point continues (Task 4 design §13.1 `store.read.delay_ms`); it may
+//! also persist.
 //!
 //! A process VIA spawns without its environment, such as Host's anchor, is
 //! activated with the daemon's directory and token through [`activate`].
@@ -46,6 +49,8 @@ enum Action {
     Crash,
     /// Makes the point's operation report an I/O failure.
     FailIo,
+    /// Waits the command's `value` milliseconds, then continues.
+    Delay,
 }
 
 impl Action {
@@ -54,8 +59,18 @@ impl Action {
             Self::Pause => "pause",
             Self::Crash => "crash",
             Self::FailIo => "fail_io",
+            Self::Delay => "delay",
         }
     }
+}
+
+/// What a matching hit does, with a delay's length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Act {
+    Pause,
+    Crash,
+    FailIo,
+    Delay(Duration),
 }
 
 #[derive(Deserialize)]
@@ -64,9 +79,30 @@ struct Command {
     token: String,
     occurrence: u64,
     action: Action,
-    /// With `fail_io` only: fail every hit from `occurrence` on.
+    /// With `fail_io` or `delay` only: act on every hit from `occurrence` on.
     #[serde(default)]
     persist: bool,
+    /// With `delay` only, and required there: milliseconds to wait.
+    #[serde(default)]
+    value: Option<u64>,
+}
+
+impl Command {
+    /// Whether the command's shape is valid: `persist` only with `fail_io`
+    /// or `delay`, and `value` exactly with `delay`.
+    fn valid(&self) -> bool {
+        (!self.persist || matches!(self.action, Action::FailIo | Action::Delay))
+            && (self.value.is_some() == (self.action == Action::Delay))
+    }
+
+    fn act(&self) -> Act {
+        match self.action {
+            Action::Pause => Act::Pause,
+            Action::Crash => Act::Crash,
+            Action::FailIo => Act::FailIo,
+            Action::Delay => Act::Delay(Duration::from_millis(self.value.unwrap_or(0))),
+        }
+    }
 }
 
 struct Controller {
@@ -149,7 +185,7 @@ impl Controller {
     ///
     /// Acts only once the acknowledgement is published: a failed write is
     /// returned instead, and no injected action runs.
-    fn enter(&self, point: &'static str) -> io::Result<Option<(u64, Action)>> {
+    fn enter(&self, point: &'static str) -> io::Result<Option<(u64, Act)>> {
         let occurrence = {
             let mut hits = self.hits.lock().unwrap_or_else(PoisonError::into_inner);
             let count = hits.entry(point).or_insert(0);
@@ -160,12 +196,7 @@ impl Controller {
             return Ok(None);
         };
         let command = match serde_json::from_slice::<Command>(&bytes) {
-            Ok(command)
-                if command.token == self.token
-                    && (!command.persist || command.action == Action::FailIo) =>
-            {
-                command
-            }
+            Ok(command) if command.token == self.token && command.valid() => command,
             // Never echo the command or its token.
             _ => {
                 // Nothing acts on a refused command, so a lost marker is harmless.
@@ -190,7 +221,7 @@ impl Controller {
         // Without a published acknowledgement the harness could not tell entry
         // from absence, so the action never runs unacknowledged.
         self.write_marker(point, occurrence, "ack", ack.to_string().as_bytes())?;
-        Ok(Some((occurrence, command.action)))
+        Ok(Some((occurrence, command.act())))
     }
 
     fn write_marker(
@@ -241,9 +272,13 @@ pub fn hit(point: &'static str) -> io::Result<()> {
     };
     match controller.enter(point)? {
         None => Ok(()),
-        Some((_, Action::Crash)) => std::process::abort(),
-        Some((_, Action::FailIo)) => Err(injected(point)),
-        Some((occurrence, Action::Pause)) => {
+        Some((_, Act::Crash)) => std::process::abort(),
+        Some((_, Act::FailIo)) => Err(injected(point)),
+        Some((_, Act::Delay(delay))) => {
+            thread::sleep(delay);
+            Ok(())
+        }
+        Some((occurrence, Act::Pause)) => {
             let release = controller.release_path(point, occurrence);
             while !released(&release) {
                 thread::sleep(POLL);
@@ -261,9 +296,13 @@ pub async fn hit_async(point: &'static str) -> io::Result<()> {
     };
     match controller.enter(point)? {
         None => Ok(()),
-        Some((_, Action::Crash)) => std::process::abort(),
-        Some((_, Action::FailIo)) => Err(injected(point)),
-        Some((occurrence, Action::Pause)) => {
+        Some((_, Act::Crash)) => std::process::abort(),
+        Some((_, Act::FailIo)) => Err(injected(point)),
+        Some((_, Act::Delay(delay))) => {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
+        Some((occurrence, Act::Pause)) => {
             let release = controller.release_path(point, occurrence);
             while !released(&release) {
                 tokio::time::sleep(POLL).await;
@@ -277,7 +316,9 @@ pub async fn hit_async(point: &'static str) -> io::Result<()> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{Action, Controller};
+    use std::time::Duration;
+
+    use super::{Act, Controller};
 
     const TOKEN: &str = "0123456789abcdef0123";
 
@@ -309,7 +350,7 @@ mod tests {
         assert!(!dir.path().join("p.point.1.ack").exists());
         assert_eq!(
             controller.enter("p.point").expect("enter"),
-            Some((2, Action::FailIo))
+            Some((2, Act::FailIo))
         );
         let ack = std::fs::read_to_string(dir.path().join("p.point.2.ack")).expect("ack");
         assert!(!ack.contains(TOKEN));
@@ -327,7 +368,7 @@ mod tests {
         for occurrence in 2..5 {
             assert_eq!(
                 controller.enter("p.point").expect("enter"),
-                Some((occurrence, Action::FailIo))
+                Some((occurrence, Act::FailIo))
             );
             assert!(
                 dir.path()
@@ -341,6 +382,39 @@ mod tests {
         std::fs::write(dir.path().join("q.point.json"), pause).expect("arm");
         assert_eq!(controller.enter("q.point").expect("enter"), None);
         assert!(dir.path().join("q.point.1.refused").exists());
+    }
+
+    /// Task 4 design §13.1: `delay` carries its milliseconds and may
+    /// persist; without a value, or a value on another action, the command
+    /// is refused.
+    #[test]
+    fn a_delay_carries_its_value_and_may_persist() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let command = format!(
+            r#"{{"token":"{TOKEN}","occurrence":1,"action":"delay","value":200,"persist":true}}"#
+        );
+        std::fs::write(dir.path().join("d.point.json"), command).expect("arm");
+        for occurrence in 1..3 {
+            assert_eq!(
+                controller.enter("d.point").expect("enter"),
+                Some((occurrence, Act::Delay(Duration::from_millis(200))))
+            );
+        }
+        for (point, command) in [
+            (
+                "e.point",
+                format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"delay"}}"#),
+            ),
+            (
+                "f.point",
+                format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause","value":5}}"#),
+            ),
+        ] {
+            std::fs::write(dir.path().join(format!("{point}.json")), command).expect("arm");
+            assert_eq!(controller.enter(point).expect("enter"), None);
+            assert!(dir.path().join(format!("{point}.1.refused")).exists());
+        }
     }
 
     #[test]

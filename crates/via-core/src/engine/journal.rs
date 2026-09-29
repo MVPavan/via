@@ -582,6 +582,7 @@ fn duplicate(record: &TerminalRecord) -> TerminalRecord {
         turn: record.turn,
         envelope: record.envelope.clone(),
         event: record.event.clone(),
+        steps: record.steps.clone(),
     }
 }
 
