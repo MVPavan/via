@@ -265,7 +265,7 @@ The proposed ownership protocol is:
    anchor retains only its child handle/control path for supervision, never
    reads vendor bytes, and fails closed into cleanup if detachment fails.
    A vendor exit must yield both output EOFs and observable input closure
-   while the anchor is still alive, so Wire can seal the raw logs.
+   while the anchor is still alive, so Wire sees the vendor's end.
 3. Marker proof uses this live control endpoint, never process environments.
    Both ends validate the peer uid; the daemon supplies a fresh challenge
    nonce, and the anchor replies with the nonce and its own resident marker
@@ -446,8 +446,8 @@ emulation, Rosetta, a target's Rust tier and a green `--version` alone do not
 replace native OS/architecture execution. Containers do not supply an older
 kernel; baseline Linux proof needs an actual 5.15 guest/host kernel.
 
-Retain coding-style §10 artifacts: `summary.json`, per-scenario raw/event/log
-evidence, consistent SQLite backup, verified SHA-256 manifest and `REPORT.md`.
+Retain coding-style §10 artifacts: `summary.json`, per-scenario event logs and
+evidence folders, consistent SQLite backup, verified SHA-256 manifest and `REPORT.md`.
 Record OS/kernel/CPU, baseline/current designation, SDK/linker, fixture/vendor
 versions, source/lock/feature identity, exact tested binary hash and test-account
 capability. Re-hash the installed binary; artifact mismatch invalidates the row.

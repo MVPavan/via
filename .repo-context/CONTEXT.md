@@ -53,22 +53,26 @@ States: queued, running, completed, failed, cancelled, unknown. Core records the
 _Avoid_: step, run
 
 **Step**:
-One model step inside a turn. Claude Code's `--max-turns` and `num_turns` count steps; VIA's `max_steps` maps to `--max-turns`.
+One model step inside a turn. Claude Code's `--max-turns` and `num_turns` count steps; VIA's `max_steps` maps to `--max-turns`. VIA counts a step each time the model produces output after tool results, the same way for every vendor, and records one `steps` row per step; the envelope's `steps` is the vendor's own count.
 
 **Vendor message**:
-One message the agent sends VIA as JSON text: an NDJSON line on a CLI's stdout, a JSON-RPC notification from a vendor server, or an SSE event. It is the adapter's input. Wire splits the byte stream into messages and caps their size without decoding them; the route decodes each one into a typed struct. An unknown message type becomes a `vendor.other` event; a malformed known message is a protocol failure (adapter contract §1).
+One message the agent sends VIA as JSON text: an NDJSON line on a CLI's stdout, a JSON-RPC notification from a vendor server, or an SSE event. It is the adapter's input. Wire splits the byte stream into messages and caps their size without decoding them; the route decodes each one into a typed struct. An unknown message type is activity only; a malformed known message is a protocol failure (adapter contract §1).
 _Avoid_: frame, vendor event
 
+**Observation**:
+What an adapter reports from one vendor message. Core turns an observation into a durable event, a progress update, or envelope accumulation.
+_Avoid_: event (reserved for durable records)
+
 **Event**:
-VIA's normalized record of something that happened in a session, such as `turn.started`, `assistant.text`, `tool.started`, `tool.ended`, `usage.updated` or `turn.ended` (full list in VIA API §6). It is harness-neutral: the same event types come from every adapter. Most events belong to one turn; a few (`session.opened`, `session.closed`) belong to the session. Each event has a dense per-session `seq`. Core commits it to the Store, and callers read it through `events` (page or follow). One vendor message yields zero or more events, and VIA also creates events of its own (`turn.submitted`, `cancel.requested`).
+VIA's durable record of a lifecycle, control or safety fact in a session, such as `turn.started`, `cancel.requested`, `action.denied` or `turn.ended` (full list in VIA API §6). It is harness-neutral. Most events belong to one turn; a few (`session.opened`, `session.closed`) belong to the session. Each has a dense per-session `seq`. Core commits it to the Store, and callers page it with `events`. Model text, tool calls and usage are not events: they drive the progress snapshot and step rows, and the agent's own transcript keeps them.
 _Avoid_: frame, notification, message (reserved for vendor messages)
 
 **Event trace**:
 The ordered events of one turn, from `turn.queued` to `turn.ended`, read by `seq`. The session's trace is its turns' traces interleaved with its session events.
 _Avoid_: agent trace, log
 
-**Raw log**:
-The exact bytes a vendor connection sent and received, in one file per connection outside SQLite. Events point to their source bytes by offset and length; it is evidence, not an API.
+**Evidence folder**:
+One folder per turn under VIA's state directory, holding the agent's stderr, the message VIA failed to decode (if any) and a final text too large for the envelope. VIA keeps no copy of vendor traffic; the agent's own transcript keeps the conversation.
 
 **Run**:
 Deliberately not a VIA entity; use session or turn for VIA lifecycle concepts. Ordinary English may still say "run an agent."
@@ -86,7 +90,7 @@ _Avoid_: public session id as authority
 Caller policy for choosing explicit VIA parameters, not a VIA entity. VIA accepts harness/model, effort, instructions, permission bound, cwd, output schema and namespaced vendor options; a model catalog maps model to harness.
 
 **Envelope**:
-The structured result for a turn: session id and turn number, adapter and version, route, vendor session id, model/effort, terminal state, exit code, stop reason, final text, usage, cost with provenance, timestamps, log reference, tree pins, denied actions and auto-declined requests.
+The structured result for a turn: session id and turn number, adapter and version, route, vendor session id, model/effort, terminal state, exit code, stop reason, final text, usage, cost with provenance, timestamps, evidence locations, tree pins, denied actions and auto-declined requests.
 _Avoid_: result object, output
 
 **Submission intent**:
@@ -94,7 +98,7 @@ The durable `turn.submitted` record committed before VIA sends the prompt. If th
 _Avoid_: launch receipt (a receipt is the reply to spawn/resume)
 
 **Store**:
-VIA's SQLite database, written only by the daemon: sessions (parameters, state, handle hash), turns (prompt, state, envelope), events (the JSON body plus a pointer into the raw log), spawn and operation keys for retry replay, and anchors (VIA's process-supervision records). Raw vendor bytes stay in raw log files.
+VIA's SQLite database, written only by the daemon: sessions (parameters, state, handle hash), turns (prompt, state, envelope), events, step rows, spawn and operation keys for retry replay, and anchors (VIA's process-supervision records). Evidence files live in the evidence folder.
 _Avoid_: database, ledger (the parent repo's record store)
 
 **VIA daemon**:
@@ -114,7 +118,7 @@ L6, the only layer that starts and supervises vendor processes and servers. It r
 _Avoid_: daemon as a synonym
 
 **Wire**:
-L5, which moves bytes to and from vendor processes: it drains pipes within bounds, splits output into vendor messages, and writes the raw log per connection. It does not interpret vendor messages.
+L5, which moves bytes to and from vendor processes: it drains pipes within bounds, splits output into vendor messages, and creates the turn's evidence folder. It does not interpret vendor messages.
 
 **Layer**:
 One of six library responsibility boundaries, L1 Interface through L6 Host. The daemon is the process containing the server half of L1 and L2–L6, not a seventh layer.

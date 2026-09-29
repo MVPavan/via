@@ -11,7 +11,7 @@ Authority: [S1 plan](../workstreams/rust-foundation/s1-plan.md) §4,
 ## 1. Scope and guarantees
 
 Implement only the fake adapter's private process, one child per turn,
-NDJSON route, pipes, Linux supervision, SQLite and connection raw logs.
+NDJSON route, pipes, Linux supervision, SQLite and per-turn evidence folders.
 The fake session preserves a synthetic conversation identifier between child
 processes. Fake declares spawn/resume/result/cancel/close native and steer
 unsupported; S1 tests the named steer refusal. It does not establish vendor
@@ -23,18 +23,15 @@ families when their evidence requires it.
 Core is the only lifecycle authority. A receipt means the queued work and
 retry identity committed. Submission intent means input might have reached
 the agent; neither a timeout nor missing acceptance permits automatic resend.
-An event/result means its transaction committed and every referenced raw
-range was synced first. It does not promise that all traffic survived a crash.
-Live observers consume durable events, never an independent best-effort copy.
+An event/result means its transaction committed.
 
 Three limits on these guarantees must remain visible:
 
 1. Persistent storage failure may prevent a terminal result from being saved.
    Return `store_error`, close admission and clean up; never manufacture a
    durable envelope. Restart reconciles the last durable facts to `unknown`.
-2. A blocked peer cannot be guaranteed any final notification. Attempt
-   `event_end`, then close within a bound; the peer resumes from its own last
-   received sequence.
+2. A blocked peer cannot be guaranteed a reply. The daemon closes the socket
+   after the 10 s reply deadline; the caller retries the read.
 3. Group signalling covers processes that remain in the VIA-owned group.
    Escaped descendants and uninterruptible kernel waits prevent an absolute
    all-descendants-gone guarantee. Report uncertainty, never false quiescence.
@@ -55,7 +52,7 @@ parent's public facade where needed. Re-exporting is not permission to give
 Core a process or pipe handle. C1 DTOs and canonical lifecycle types live in
 Core; C2 operation/observation types live in Adapters; Core converts them.
 Store defines storage DTOs and shared durable IDs (`SessionId`, `TurnNumber`,
-`ConnectionId`, `ProcessId`, `RawRef`). These types contain no Core dependency
+`ConnectionId`, `ProcessId`). These types contain no Core dependency
 or business transitions. Core serializes validated C1 payloads into bounded
 Store documents; Store validates storage constraints, not vendor semantics.
 The adapters' facade re-exports the same lower-layer identity types, not new
@@ -65,7 +62,7 @@ Each owner has a cancellation token and a `JoinSet`; spawned tasks return
 typed outcomes and are collected promptly. A parent observes child failure
 through a reserved health path even when normal observations are full.
 `TaskTracker` alone is insufficient unless each task also reports its result.
-Raw and SQLite threads have retained join handles. Dropping a requester or
+The SQLite thread has a retained join handle. Dropping a requester or
 timing out a response does not cancel an already admitted mutation.
 While the daemon lives, no caller deadline or cancelled shutdown future
 abandons an owner: unfinished joins stay in the owner's registry until their
@@ -74,24 +71,24 @@ its own clean/incomplete policy (§6.2).
 
 | Owner | Resources and hidden complexity | Explicit upper-layer surface |
 |---|---|---|
-| Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, subscribers | C1 requests and committed DTOs |
+| Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, progress snapshots | C1 requests and committed DTOs |
 | Adapter | Fake protocol mapping and normalizer; C2 observation queue | Observations, control results, health |
 | Route | Fake protocol parsing, start correlation, command serialization | Typed fake requests/messages |
-| Wire | Pipe reader/writer tasks, byte message splitting and raw staging | Vendor messages with durable raw evidence, transport health |
+| Wire | Pipe reader/writer tasks, byte message splitting, evidence files | Vendor messages, transport health |
 | Host | Child handle, process group/identity, reap and escalation timers | Exclusive pipe endpoints, verified exit/cleanup |
-| Store | SQLite connection/thread, raw writer/thread, migration and backup; Core retains sole owner | `StoreClient` for Core lifecycle/reads; unopened `RuntimeResources` forwarded to Wire |
+| Store | SQLite connection/thread, evidence root, migration and backup; Core retains sole owner | `StoreClient` for Core lifecycle/reads; unopened `RuntimeResources` forwarded to Wire |
 
 Core alone opens and retains one Store owner and its `StoreClient`. It obtains
 one unopened, non-cloneable `RuntimeResources` bundle from that owner and
 passes it through Adapter and Route constructors without splitting it or
 calling Store again. Only Wire bootstrap consumes the bundle via
-`into_wire_parts(self)`, privately retaining `RawFactory` and moving the
+`into_wire_parts(self)`, privately retaining `EvidenceRoot` and moving the
 restricted `ProcessJournal` to Host. Rust does not enforce caller-specific
 visibility across crates; Wire-only split is an architectural no-call rule,
 not a claim that arbitrary Core code cannot misuse its Store dependency.
 Bundle construction clones bounded senders only: no second Store writer,
 database connection, worker, path reopen or I/O. Adapter/Route have no
-operational raw/journal access.
+operational journal access.
 `SessionCx` contains a clone of the opaque runtime, limits, tracker/token and
 absolute deadlines; remove its exposed `RawLogHandle` sketch (C2 amendment
 in §10). A session driver must not be able to query SQLite or handle hashes.
@@ -139,7 +136,7 @@ impl FakeRoute {
         -> impl Future<Output = CloseReport> + Send;
     pub fn health(&self) -> RouteHealth;
 }
-pub struct RouteMessage { pub payload: FakeMessage, pub raw_ref: RawRef }
+pub struct RouteMessage { pub payload: FakeMessage }
 ```
 
 `FakeStart` contains synthetic vendor session/turn IDs and prompt; the fake
@@ -177,7 +174,7 @@ and `Store` causes and evidence; Core alone selects C1 disposition.
 For this one-child-per-turn fake route, decoding its terminal message ends
 start/control admission on that connection and immediately requests Wire's
 `close_input` (§4), before awaiting Core's durable result, process exit or
-stdout EOF. Output drains and raw recording remain open. A duplicate
+stdout EOF. Output drains remain open. A duplicate
 `StartTurn` reaching Route is refused before any bytes are written;
 already accepted input is never replayed. This finite input lifetime lets
 the fake independently validate that no second start was sent. No fake
@@ -189,11 +186,11 @@ The S1 fake uses UTF-8 NDJSON, one JSON object per line. There is no JSON-RPC
 wrapper or `method`/`params` nesting. Every message requires a `type` tag.
 Route encodes requests and parses vendor responses; the fake validates
 requests. Known response types ignore extra fields but reject missing or
-wrong-type required fields. An unknown notification tag without `id` follows
-the existing bounded `vendor.other` path. An unknown tag carrying `id` is an
+wrong-type required fields. An unknown notification tag without `id` is
+activity only. An unknown tag carrying `id` is an
 unexpected protocol message and fails parsing: this private protocol defines
-no fake-to-VIA requests to answer. §4 message splitting, §8 structure/payload limits,
-text splitting and raw durability still apply.
+no fake-to-VIA requests to answer. §4 message splitting and §8
+structure/payload limits still apply.
 
 One child/connection serves one turn. Request IDs are positive JSON integers:
 `start.id = 1`, `interrupt.id = 2`. A repeated logical cancel coalesces to
@@ -223,8 +220,12 @@ class. The tool variants in §3 use two more tags when needed:
 `tool_started {vendor_turn_id, tool_id, name, input_summary}` and
 `tool_ended {vendor_turn_id, tool_id, status, output_summary, exit_code?}`.
 All these fields are strings except optional signed-integer `exit_code`;
-tool status is `completed`, `failed` or `cancelled`. They map to existing C2
-observations, not new C1 event types.
+tool status is `completed`, `failed` or `cancelled`. VIA reads only
+`vendor_turn_id` from `text`, and `tool_id` and `name` from the tool
+messages; the other fields are optional and not read. A fourth progress tag
+is `{"type":"usage","vendor_turn_id":"fake-turn-1","total_tokens":120}` (a
+non-negative integer): one interval sample. These map to C2 `progress` items
+(C2 §4), not C1 events.
 
 Acceptance must match request ID and the derived vendor turn ID. Progress,
 terminal and interrupt evidence must match the connection's turn ID. Driver
@@ -256,17 +257,17 @@ its completion/error belongs to normal finalization; a detached blocked
 reader is not success. Explicit exit/crash/hang fixture steps remain fault
 paths, not successful normal finalization. Existing input caps still apply.
 
-## 4. C4: message splitting, raw evidence and transport
+## 4. C4: message splitting, evidence folder and transport
 
 ```rust
 pub struct WireConnection { /* exclusive pipe/task ownership */ }
-pub struct WireRuntime { raw: RawFactory, host: Host }
+pub struct WireRuntime { evidence: EvidenceRoot, host: Host }
 pub struct RuntimeConfig { pub anchor_binary: PathBuf, pub anchor_dir: PathBuf }
 pub struct WireParts { pub sender: WireSender, pub messages: WireMessages }
-pub struct VendorMessage { pub bytes: BoundedBytes, pub raw_ref: RawRef }
+pub struct VendorMessage { pub bytes: BoundedBytes }
 pub enum WireHealth {
     Open,
-    Failed { cause: WireFailure, raw_incomplete: bool },
+    Failed { cause: WireFailure },
     Exited(ExitReport),
     Closed,
 }
@@ -274,7 +275,8 @@ impl WireRuntime {
     pub fn new(config: RuntimeConfig, resources: RuntimeResources)
         -> Result<Self, WireError>;
     pub fn open_connection(&self, connection_id: ConnectionId,
-                           spec: PrivateProcessSpec, deadline: Deadline)
+                           spec: PrivateProcessSpec, evidence: EvidenceFolder,
+                           deadline: Deadline)
         -> impl Future<Output = Result<WireConnection, WireError>> + Send;
 }
 impl WireConnection {
@@ -296,11 +298,11 @@ impl WireMessages {
 
 The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
-`WireRuntime::open_connection` obtains a `RawWriter` from its private factory
+`WireRuntime::open_connection` creates the turn's evidence folder
 and invokes Host acquisition. Direct `WireConnection::open(&Host, spec,
-RawWriter, deadline)` is private to Wire; `WireConnection::control()` is
+deadline)` is private to Wire; `WireConnection::control()` is
 private or removed. No public runtime/connection getter or facade re-export
-exposes Host, ProcessControl, RawWriter, RawFactory or ProcessJournal. Route
+exposes Host, ProcessControl or ProcessJournal. Route
 receives only narrow transport, close/control and health operations. Recovery
 follows Adapter → Route → Wire → Host with passive owner/session correlation,
 without exposing journal or Host getters; the separately reviewed outer
@@ -312,58 +314,29 @@ budget, then drops the endpoint. It starts no new write after close request
 and never interleaves bytes. A partial write that cannot finish closes input
 and reports the existing indeterminate transport condition; it never reuses
 the connection or extends the deadline. This operation does not request
-Host group cleanup, stop output readers, seal raw output or fabricate a
+Host group cleanup, stop output readers or fabricate a
 successful send. The future C4 owner implements it with the real WireSender;
 the frozen contract-only increment needs no unimplemented stub.
-One task drains stdout and one drains stderr. Neither waits for Route, Core,
-SQLite, fsync or a follower. They split bytes into bounded raw units and use
-nonblocking staging admission. Byte permits are acquired before copying;
-failure irreversibly marks the connection incomplete and fails it. Draining
-continues using a reusable 64 KiB discard buffer until EOF or the cleanup
-deadline; discarded bytes are counted. Counters cannot make the log complete.
+One task drains stdout. It never waits for Route, Core or SQLite. It
+splits bytes into vendor messages at LF, at most 1 MiB each including LF,
+and queues each with a nonblocking send; a full queue fails the connection
+`overflow`. At the cap without LF it fails `MessageTooLarge`. After a
+failure it reads to EOF in 64 KiB units and discards them, counting the
+bytes, so the vendor never blocks on a full pipe. The splitter retains
+split UTF-8 without interpreting it; only Route decodes UTF-8/JSON. EOF
+with an unfinished message is the in-band end `Unterminated`.
 
-The byte splitter retains split UTF-8 without interpreting it; only Route
-decodes UTF-8/JSON after raw persistence. Normal stdout units end at LF and
-include LF; EOF emits an unterminated raw unit that is not a valid message.
-Messages include LF in the 1 MiB cap. At that cap without LF, record the bounded
-prefix, fail with `MessageTooLarge`, then continue raw-only drain in 64 KiB
-units when staging permits. Invalid UTF-8 and malformed known messages
-remain exact raw bytes before protocol failure. Raw logging attempts to
-preserve the cleanup tail; any discarded tail is explicitly incomplete.
-
-One append-only payload file per connection contains contiguous raw units;
-Store serializes append order across stdout, stderr and stdin. A companion
-append-only index identifies each unit's stream/direction, payload offset,
-length and checksum. The file contains payload bytes only, so `RawRef`
-`{connection_id, offset, len}` resolves without a new public field. Whole
-valid stdout messages are single units and never interleaved with stderr.
-Per-stream byte order is preserved; append order across independent streams
-is not claimed to be physical observation order. Stderr units are at most
-64 KiB, no JSON interpretation. The bounded unfinished stdout message is part
-of raw staging accounting; do not also enqueue duplicate chunk copies.
-
-Outbound tap records only successfully written prefixes, not an intended
-whole input message before write. The one stdin writer retains its offset over
-cancellation. Partial send plus timeout closes stdin/connection before reuse
-and returns `Indeterminate`. Outbound prefixes may be multiple raw units;
-they are not represented as one fake contiguous reference. No semantic event
-references a bounding span containing another stream's traffic.
-
-Store's raw worker appends payload and index, calls `sync_data` on both, then
-releases a `DurableRaw` token for those units. Wire makes a message available
-to Route only after this token. Parent directories are synced when files
-are created. `flush` of userspace buffers alone is not durability. Sync batch
-thresholds are 1 MiB or 20 ms, whichever comes first. Partial writes use
-retained offsets; a sync/write error latches failure without automatic retry.
-Raw storage is separate from the SQLite thread so a database busy wait does
-not itself stop recording. Both remain Store-owned resources.
-
-The index is sufficient to reconstruct direction for C1 `logs`. It has a
-versioned header and length/checksum-delimited entries; checksum is for
-corruption detection, not authenticity. Recovery ignores an incomplete
-index tail, never fabricates bytes. An unsealed connection after crash is
-incomplete even if every committed reference is intact: bytes in pipes or
-the last unsynced unit cannot be recovered.
+VIA keeps no copy of vendor traffic (T4 requirements R8). Each submitted
+turn has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. The
+vendor's stderr is the file `stderr.log` there: Host opens it and gives
+it to the anchor as stderr, the vendor inherits it, and the operating
+system writes it; no VIA task reads it. When Route cannot decode a
+message, and when a message exceeds 1 MiB or ends unterminated, Wire
+writes its first 64 KiB to `undecoded.bin`, and the turn's failure names
+the file and the message's length. A final text too long for the
+envelope is written there as `final_text.txt` (C1 §5). The vendor's stderr
+is not capped. The vendor's own transcript keeps the
+conversation; SQLite keeps its path as a hint with the vendor session ID.
 
 ## 5. C5: private process supervision
 
@@ -412,7 +385,7 @@ impl ProcessControl {
 Host starts argv arrays with explicit cwd and an environment from the fake
 allow-list (`PATH` only if required, explicit test variables and vendor VIA
 marker). It never inherits the complete daemon environment. Wire exclusively
-owns vendor pipes. Host control bypasses data, raw and SQLite queues.
+owns vendor pipes. Host control bypasses data and SQLite queues.
 
 ### 5.1 Group anchor: selected design, native proof required
 
@@ -604,7 +577,7 @@ P7's shared-server pending-cleanup policy remains for its vendor slice.
 ```rust
 pub struct Store { /* writer threads and their joins */ }
 pub struct StoreClient { /* bounded sender, health receiver */ }
-pub struct RuntimeResources { raw: RawFactory, journal: ProcessJournal }
+pub struct RuntimeResources { evidence: EvidenceRoot, journal: ProcessJournal }
 #[derive(Clone)]
 pub struct ProcessJournal { /* private existing bounded SQLite sender */ }
 pub enum StoreHealth { Healthy, Failed(StoreFailure), Closing, Closed }
@@ -616,10 +589,7 @@ impl Store {
 }
 impl RuntimeResources {
     /// Architectural no-call rule: consumed only by Wire bootstrap.
-    pub fn into_wire_parts(self) -> (RawFactory, ProcessJournal);
-}
-impl RawFactory {
-    pub fn open(&self, connection_id: ConnectionId) -> RawWriter;
+    pub fn into_wire_parts(self) -> (EvidenceRoot, ProcessJournal);
 }
 impl StoreClient {
     pub fn commit(&self, batch: CommitBatch)
@@ -633,17 +603,17 @@ impl StoreClient {
 
 `RuntimeResources` has private fields and no borrowed getter, `Deref`,
 `Clone` or payload-bearing `Debug`; its construction is infallible and does
-no I/O. Store's standalone public raw-factory/raw-writer constructors become
-private helpers; isolated Store tests may consume the bundle. Move the
+no I/O. Store's standalone public evidence-root constructor becomes a
+private helper; isolated Store tests may consume the bundle. Move the
 existing `commit_anchor_intent`, `commit_anchor_identified`,
 `commit_arm_intent`, `commit_vendor_facts`, `commit_group_absence` and
 `list_anchor_records` operations, retaining their typed parameters/results
 and transaction semantics, from `StoreClient` to `ProcessJournal`. Journal
 uses the same writer/sender and has no spawn, turn, handle, result, event or
 log-query method. Host/ProcessControl hold only that restricted journal.
-Core's StoreClient has no raw-factory or journal accessor. Inspect production
+Core's StoreClient has no evidence-root or journal accessor. Inspect production
 call sites: only Store owns `Store::open`, Wire calls `into_wire_parts` and
-`RawFactory::open`, and Host calls the journal operations. This no-call rule
+creates evidence folders, and Host calls the journal operations. This no-call rule
 is a source review obligation, not compiler-enforced caller visibility.
 
 Core bootstrap opens Store once, keeps the owner alive, and passes
@@ -651,7 +621,7 @@ Core bootstrap opens Store once, keeps the owner alive, and passes
 If forwarding construction fails, no child has started; lower handles drop
 and Core shuts down the retained Store owner. Normal shutdown stops
 admission/dispatch, joins active drivers/transports through C2–C5 while Store
-is alive, drains raw/observations and commits final records, then releases
+is alive, drains observations and commits final records, then releases
 lower handles and flushes/joins Store before releasing its lock. Dropping a
 sender proves neither commit nor child exit. Current Store `Drop` joins both
 workers synchronously: on a failure path it must run on an owned blocking
@@ -684,17 +654,20 @@ refused at open with a named error telling the user to recreate the dev Store
 untouched. `user_version = 0` is initialized only in a database file that
 open itself creates (exclusively); an existing file at version 0, empty or
 not, gets the same refusal before any writable open. Migrations as described
-above start with the first released schema. Schema v4 (v1 was the unreleased
+above start with the first released schema. Schema v6 (v1 was the unreleased
 single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
-per-turn values) is exactly:
+per-turn values; v4 lacked the close admission state and cancel cause; v5
+lacked step rows, event columns, list order and evidence folders) is exactly:
 
 | Table | Implemented columns and constraints |
 |---|---|
-| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2 |
-| `turns` | PK (`session_id`, `number`), FK session; `prompt`; `effective` (the turn's frozen per-turn values, the receipt's `effective`, written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence); `envelope` (terminal). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
-| `spawn_keys` | PK `key`; FK `session_id`; `identity` (exact retry-identity bytes); `receipt`; kept for the session's lifetime |
-| `operations` | PK (`session_id`, `op_key`); `verb` (only `resume` so far); `identity`; `turn` with FK (`session_id`, `turn`); `result`; committed in the same transaction as the queued turn |
-| `events` | PK (`session_id`, `seq`), FK session; `event` (canonical JSON; type, turn, late and time live inside it); nullable `connection_id`, `raw_offset`, `raw_len`; `seq` allocated by Core and checked transactionally |
+| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model, cwd, `allow_untested`); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2; `admission` `open` or `closing`; `close_result`; `created_ms`, `updated_ms` (the `at` of the transaction's highest-`seq` event: `last_active_at`); `harness`; `label`; `ord INTEGER NOT NULL UNIQUE` (its index serves `list`); nullable `vendor_session_id` and `transcript_hint` |
+| `session_ord` | one row, `only INTEGER PRIMARY KEY CHECK(only = 1)`, `next INTEGER NOT NULL`, created as `(1, 0)`; a spawn's receipt transaction increments `next` and stores it as `sessions.ord`; never decremented or reused |
+| `turns` | PK (`session_id`, `number`), FK session; `prompt` or `prompt_blob`, exactly one non-null; `effective` (the turn's frozen per-turn values, the receipt's `effective`, written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence); `envelope` (terminal); `cancel_cause` `cancel` or `close`; `ended_seq`, non-null exactly when the state is terminal; `evidence_dir` (relative to the state directory, written with `turn.submitted`). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
+| `steps` | PK (`session_id`, `turn`, `step`), `WITHOUT ROWID`; FK (`session_id`, `turn`) to turns; `step` ≥ 1; `started_ms`, `ended_ms`; nullable `tokens` ≥ 0; one row per completed model step |
+| `spawn_keys` | PK `key`; FK `session_id`; `identity_len`, `identity_sha256` (32 bytes checked: the exact retry identity's length and SHA-256, never its bytes); `receipt`; kept for the session's lifetime |
+| `operations` | PK (`session_id`, `op_key`); `verb` `resume` or `close`; `identity_len`, `identity_sha256`; `turn` with FK (`session_id`, `turn`); `result`; a `resume` row is committed in the same transaction as the queued turn |
+| `events` | PK (`session_id`, `seq`), FK session; `turn` (deferred composite FK to `turns`); `type`; `event` (canonical JSON; late and time live inside it); index (`session_id`, `turn`, `seq`); `seq` allocated by Core and checked transactionally |
 | `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner (`owner_session`, `owner_turn`) FK turn; `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
 
 Target columns and tables not implemented yet, with their owners:
@@ -702,12 +675,14 @@ Target columns and tables not implemented yet, with their owners:
 | Target | Owner |
 |---|---|
 | `sessions`: `closing` admission state, record version and timestamps, frozen instructions/cwd/`allow_untested` | `via-jm4.7.7` (cancel/close, Task 3) |
-| `sessions`: vendor session ID | the first vendor adapter slice, after `via-jm4.7.9` |
+| `sessions`: vendor session ID and transcript hint | columns `via-jm4.7.8`, values the first vendor adapter slice |
 | `turns`: separate phase, cancel/cleanup columns (today inside `envelope`), revision of an `unknown` result by late evidence | `via-jm4.7.7` |
 | `turns`: event-bound columns (today the envelope's `events` range) | `via-jm4.7.8` |
 | `operations`: phase intent/done and other keyed verbs (`steer`, `close`) | `via-jm4.7.7` |
-| `events`: separate FK turn, type, late and time columns | `via-jm4.7.8` |
-| `connections` table: raw paths, high-water offsets, open/sealed/incomplete state (today the `raw/` payload and index files alone) | `via-jm4.7.8` |
+| `events`: separate `turn` and `type` columns (late and time stay in the event JSON); no raw reference columns | `via-jm4.7.8` |
+| `steps`: `(session_id, turn, step, started_ms, ended_ms, tokens)`, primary key `(session_id, turn, step)`, one row per completed model step, the last in the terminal transaction; a session's rows go by one keyed delete | `via-jm4.7.8` |
+| `turns.evidence_dir` (runtime §4) | `via-jm4.7.8` |
+| `session_ord`: a one-row counter that allocates `sessions.ord` and never goes back | `via-jm4.7.8` |
 | `processes` as a general table: vendor rows, exit and cleanup evidence beyond `anchors.vendor_pid` and `absence_time` | `via-jm4.7.7` |
 | `metadata` table: retention low-water marks (the schema version is `user_version`) | none in S1, which prunes nothing |
 
@@ -721,14 +696,18 @@ history. Terminal state requires envelope; nonterminal state forbids it.
 Unknown is terminal but may be revised using C1's explicit revision batch.
 Append events, resulting state, envelope and next seq commit together.
 `turn.ended` is the final non-late event for that turn. Session events share
-the same dense sequence. Durable raw tokens authorize referenced ranges;
-Store checks ranges against its synced raw index before committing a reference.
+the same dense sequence.
 
-Handle strings never enter batches, logs or stored identity bytes. Core hashes
+Handle strings never enter batches, logs or the stored identity. Core hashes
 them before persistence. Exact retry identity is the original validated C1
 params object byte slice with the top-level handle replaced by its fixed hash;
 the bounded parser tracks its byte range. Preserve all other bytes, including
-whitespace/key order, to honor C1's byte-identical rule. JSON duplicate keys
+whitespace/key order, to honor C1's byte-identical rule. Store keeps an
+identity as its length and SHA-256, never its bytes; a retry matches when
+both are equal. A prompt file is read once, before the lookup and outside
+the admission lock, into a temporary blob whose length and SHA-256 enter
+the identity; the blob is adopted by new work and discarded otherwise.
+JSON duplicate keys
 are refused. Replay lookup precedes current queue/admission/capability checks
 after authentication; a matching historical key returns its original receipt
 even if today's queue is full. A different payload/verb is a conflict.
@@ -744,37 +723,39 @@ Write ordering is explicit:
 2. Acquire dispatch capacity, commit `submitted_at` and `turn.submitted`.
    Only a positive commit receipt permits Adapter open/start. Unknown commit
    outcome causes Store-failed mode, never speculative send.
-3. Host commits anchor intent/generation, starts anchor, commits its verified
-   identity, configures, commits `ArmIntent`, then sends ARM once. Anchor
-   spawns vendor in its inherited group and detaches fd 0/1/2 before its
-   acknowledgement; Host records vendor facts. Wire starts
-   its drains and writes prompt. Vendor acceptance is independent evidence.
-4. Raw append/sync completes; Adapter emits observation; Core commits acceptance
-   or events. The two acceptance paths deduplicate by correlation token.
-5. Core commits terminal event/envelope with all referenced raw tokens, then
-   wakes waiters/followers. Cleanup gate separately controls next dispatch.
-6. Wire seals only after EOF, raw/index sync and final metadata commit. Shutdown
-   performs final Store flush/checkpoint and joins before releasing daemon lock.
+3. Host commits anchor intent/generation, starts anchor, commits its
+   verified identity, configures, commits `ArmIntent`, then sends ARM once.
+   Anchor spawns vendor in its inherited group with the turn's stderr file
+   and detaches fd 0/1/2 before its acknowledgement; Host records vendor
+   facts. Wire starts its stdout reader and writes the prompt. Vendor
+   acceptance is independent evidence.
+4. Adapter emits an observation; Core commits acceptance, durable events
+   or a step row, or folds it into the progress snapshot. The two
+   acceptance paths deduplicate by correlation token.
+5. Core commits terminal event/envelope, then wakes waiters. Cleanup gate
+   separately controls next dispatch.
+6. Shutdown performs final Store flush/checkpoint and joins before
+   releasing daemon lock.
 
-No SQLite transaction waits on a raw sync or any vendor I/O. Raw sync finishes
-before a batch is submitted. A crash between raw sync and SQLite commit leaves
-unreferenced bytes, which are safe and may be retained; a crash cannot make a
-committed event point at an unsynced unit. Recovery validates every referenced
-range against file length/index/checksum before serving it. A missing/corrupt
-range is explicit `store_error` for logs and incomplete evidence, never empty
-text. An unsealed connection is marked incomplete, with warning attached to
-recovered active-turn resolution. Existing durable terminal envelopes are not
-silently rewritten as complete evidence after detecting corruption.
+No SQLite transaction waits on vendor I/O.
 
-Checkpoint after 8 MiB WAL growth or 1000 commits; stop write admission at
-32 MiB WAL while attempting checkpoint, and fail Store health if growth cannot
-be bounded. Keep read transactions short (one bounded page); no follower holds
-a transaction open while waiting on a socket. No automatic retention/pruning
-in S1. Configure an initial 4 GiB Store+raw logical quota, checked before each
-append/batch; reserve 16 MiB for lifecycle metadata. Quota is not a guarantee
-against filesystem-full: actual I/O failures still follow §7. Stream payload
-stops at quota; process cleanup and recording incompleteness take priority.
-Key/receipt lifetime is never shortened by quota pressure.
+Checkpoint after 8 MiB of WAL growth or 1000 commits, both configurable.
+At a 32 MiB WAL (configurable) refuse new work (a receipt, a queued
+turn's dispatch) by name as known not committed and retry a truncating
+checkpoint at most once a second; every write of an admitted turn and
+every lifecycle write still commits, so the limit is soft while admitted
+turns run. This is not a Store health failure. Growth past the
+limit is bounded by the admitted turns' writes and is measured in
+end-to-end testing. Keep read transactions short (one bounded page); no
+read holds a transaction open while waiting on a socket. No automatic
+retention/pruning in S1. There are no disk size budgets. New work (a
+receipt, a queued turn's dispatch) is refused by name while free space on
+the state directory's filesystem is below a configurable floor, 5 GiB by
+default; running turns, lifecycle and terminal writes proceed.
+`daemon/status` warns when VIA's data exceeds a configurable size, 2 GiB
+by default. An actual `SQLITE_FULL` or `ENOSPC` rolls back as known not
+committed; only a failed rollback is uncertain (§7). Key/receipt lifetime
+is never shortened by disk pressure.
 
 ### 6.1 Daemon state/runtime paths and bootstrap
 
@@ -804,11 +785,12 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
+  daemon.json                optional daemon config: disk floor and warning, WAL (§8)
+  via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
-  raw/<connection-id>.raw    connection payload bytes
-  raw/<connection-id>.idx    stream/direction/offset/checksum index
+  evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt
   blobs/<blob-id>.blob       bounded immutable request/effective data
 <runtime>/
   daemon.lock                persistent daemon/socket-owner lock inode
@@ -817,10 +799,10 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 ```
 
 Filename IDs are validated internal IDs, never caller paths. §4/§6 still
-define raw/index format and durability. `daemon/status.store_path` returns
+define the evidence folder. `daemon/status.store_path` returns
 absolute `<state>/store.sqlite3`; `socket_path` returns
 `<runtime>/via.sock`. Evidence fixtures, sync barriers, manifests and Store
-backup destinations reside outside Store-owned raw/blob namespaces; test
+backup destinations reside outside Store-owned evidence/blob namespaces; test
 collectors receive the resolved root/path directly.
 
 The daemon creates missing VIA-managed roots/subdirectories mode 0700;
@@ -833,8 +815,10 @@ unsafe existing lock/database/log targets before mutation. Native race
 resistance remains a platform gate. Create regular state files and both
 socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
-SQLite/raw/blob files; Host owns anchor sockets; daemon main owns the
-singleton/socket lock.
+SQLite and blob files, and validates or creates the `evidence/` root; Wire
+creates each turn's folder under it; Host opens the turn's `stderr.log` for
+the child; `final_text.txt` is written through `StoreClient`. Host owns
+anchor sockets; daemon main owns the singleton/socket lock.
 
 Acquire nonblocking `daemon.lock` first, then nonblocking `store.lock`; hold
 both for daemon lifetime and never unlink either inode. Only after both
@@ -864,9 +848,8 @@ Without `drain` or `force`, a stop with active turns is refused
 - **Idle** (no active turn) and **force** enter final shutdown immediately
   after acceptance. Force closes every running turn with mode `force`: Core
   signals the turn's route, which asks the verified anchor to stop its
-  private group (C2 Close(Force)) and drains both pipes to the raw log under
-  its cleanup bound. Messages already read still become events; bytes the
-  drain cannot record mark the raw log incomplete. A receipted turn not yet
+  private group (C2 Close(Force)) and drains its pipes under its cleanup
+  bound. Messages already read are still delivered. A receipted turn not yet
   launched starts nothing; with a complete Host journal and no anchor intent
   for it, its cancel is `requested` with cleanup `quiescent` (C1 §7.4). Core
   commits the turn in final shutdown (C1 §7.6
@@ -879,16 +862,14 @@ Without `drain` or `force`, a stop with active turns is refused
   observed before an acquisition failure (including its deadline) owns that
   failure; an acquisition deadline observed first stays `deadline_wall`.
   Host shutdown leaves 1 s of the final deadline for these commits. After ARM, Host keeps the vendor pipes so Wire drains
-  them on every acquisition failure or abandonment; raw completeness is
-  then proven, or bytes the bounded drain could not record mark it
-  incomplete.
+  them on every acquisition failure or abandonment.
 - **Drain** keeps serving reads while accepted turns finish under their own
   existing work deadlines; the drain phase gets no invented 10 s deadline.
   When accepted and active work has settled, final shutdown begins.
 
 Final shutdown has **one absolute 10 s deadline** covering client closes,
 Host control closes, anchor reconciliation, task joins, final durable
-records, raw sync and the Store join; no phase receives a fresh budget. F12
+records and the Store join; no phase receives a fresh budget. F12
 measures the same total from the latching Store failure (`failed_at`) and does not restart it
 when final shutdown begins. Order: stop listening and admission; settle or
 classify turns; request owned-group cleanup; collect process/task evidence;
@@ -897,7 +878,7 @@ Tokio workers.
 
 **Clean** shutdown requires positive group absence for every committed
 anchor, no pending or failed owned join, every final record committed and
-the Store (writer and raw thread) joined. The daemon then emits its bounded
+the Store writer joined. The daemon then emits its bounded
 summary, releases resources and locks and exits **0**. **Incomplete**: at the
 deadline, or after a failure that precludes clean completion, the daemon
 snapshots the remaining uncertainty, aborts unfinished tasks, reports those
@@ -911,14 +892,17 @@ quiescence, and VIA promises no reaping after its own process exits. An
 uninterruptible kernel operation can still defeat the process-exit bound;
 that is an unmet bound or infrastructure failure, never a pass.
 
-The best-effort final summary is one bounded JSON line on the daemon's
-stderr, `{"daemon_shutdown":{…}}`, separating stop mode, elapsed time,
+The best-effort final summary is one bounded JSON line in `via.log` (§6.1);
+the daemon writes stderr only while it starts, so an auto-starting CLI can
+report a failed start. The line is `{"daemon_shutdown":{…}}`, separating
+stop mode, elapsed time,
 pending and failed joins, committed anchors, owners with uncertain cleanup,
 the named Host failure, force-stopped turns whose terminal did not commit,
 Store join status and the `clean`/`incomplete` disposition. `GroupAbsent`
 is not reaped, and a joined status task is not group absence. It adds no
-`daemon/status` field, RPC or durable report; it may be lost on Store failure
-or abrupt death, and the outer harness captures exit status and diagnostics.
+`daemon/status` field or RPC; `via.log` is diagnostic, not a contract, so
+the line is no durable report. It may be lost on Store failure or abrupt
+death, and the outer harness captures exit status and diagnostics.
 A result that cannot persist keeps F12's named `store_error` and
 `terminal_persisted:false`; no envelope is invented or replaced.
 
@@ -927,8 +911,6 @@ A result that cannot persist keeps F12's named `store_error` and
 First SQLite/state write failure or uncertain Store commit latches daemon health to
 `StoreFailed`, broadcasts through a reserved watch channel and stops admission
 and dispatch immediately. A watcher is independent of Store's work queue.
-Raw append/sync failure first fails its connection and attempts a durable
-incomplete record; if that record cannot commit, it also latches Store failure.
 A global Store failure
 cleans up every active connection. No Store task silently swallows failure.
 
@@ -938,7 +920,6 @@ cleans up every active connection. No Store task silently swallows failure.
 | Already receipted wait/result for affected nonterminal turn | `store_error` with session/turn, `durable_state` from last known commit, `terminal_persisted:false`; no invented envelope |
 | Durable terminal result readable after failure | Return that committed result, not a fabricated new failure |
 | New mutation or dispatch | Refuse `store_error`; authenticated cancel/close may still initiate best-effort cleanup but return `store_error` if their result cannot commit |
-| Following affected history | Attempt `event_end {reason:store_error,resume_after}`; close subscription and apply §9 socket deadline |
 | `daemon/status` | In-memory `health:store_failed`, bounded failure kind and affected IDs; no prompts, payloads or handle |
 
 Core makes one best-effort failure-resolution batch for each affected active
@@ -969,7 +950,7 @@ proves absence. The runtime does not promise that a group is gone within
 will not accept bytes on cannot be completed (amendment A23 in the Task 3
 design). Drain reads until EOF/deadline.
 The daemon remains available for diagnostic/read requests for at most 5 s
-after the latching failure (`failed_at`), attempts raw/Store flush and task
+after the latching failure (`failed_at`), attempts Store flush and task
 joins within a total 10 s shutdown bound measured from that failure (§6.2), then exits 4. No successful graceful-stop result
 is returned for failed flush/join. Synchronous disk I/O can hang in the kernel:
 it cannot be cancelled by a Rust timeout. Retain/report the unjoined thread;
@@ -977,7 +958,7 @@ the outer process supervisor enforces the process-exit bound in tests. The
 runtime cannot promise bounded in-process joining under an uninterruptible
 kernel operation; this is distinct from F12's repeatable returned I/O error.
 
-Restart first performs Store/raw validation and recovery writes, then enables
+Restart first performs Store validation and recovery writes, then enables
 admission. For each last-durable nonterminal turn: submission intent ->
 `unknown`, no automatic resend; cancel queued successors. A queued turn with
 no submission intent remains queued only when no predecessor is unknown.
@@ -991,38 +972,37 @@ recovery provides safety even if the last in-memory failure reason is lost.
 
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
-testing default ceilings. Configuration can lower bounds; raising them needs
-an explicitly checked aggregate budget and acceptance measurements. All
+testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
+data-size warning, WAL limit and checkpoint triggers; see the end of this
+section) are configurable; C1, C2 and every other limit here are fixed
+(T4-A37). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Active private connections | 4 daemon-wide (one vendor + one anchor each) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process and memory permits, not extra pools |
+| OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process admission, not extra pools. S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. |
 | OpenCode vendor child-session metadata | 32 records per live server; one active top-level turn per owner | Refuse excess child metadata without routing it to another owner; idle namespaces retain durable identity but no listener or server memory |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
 | Unresolved turns (receipted, no terminal known durable: in flight or failed to persist) | 256 daemon-wide | When full, `spawn` first forgets failed turns whose terminal a Store read now finds durable; still full of in-flight turns is `admission_refused` ("too many unresolved turns"), while a retained failed turn keeps refusal and its reads `store_error` |
 | Client sockets / in-flight requests | 32 / 1 per socket | Extra connection refused; parser stops accepting the next request until current response admission |
-| C1 line | 16 MiB including LF | Oversize closes connection; bounded parse error attempt |
-| Global C1 input buffers | 32 MiB | Reserve bytes before read; 5 s partial-request deadline prevents monopolization |
+| C1 line | 1 MiB including LF | `request_too_large`, then close |
+| Global C1 input buffers | 32 MiB by construction (32 sockets × 1 MiB) | 5 s partial-request deadline prevents monopolization |
 | JSON structure | depth 64, 65,536 nodes per document | Bound during streaming parse, before constructing a `Value`; named invalid params/protocol error |
-| Vendor stdout message | 1 MiB including LF | Fail connection; preserve prefix and raw-only cleanup tail where possible |
+| Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
-| Raw staging | 8 MiB/connection, 32 MiB total | Nonblocking failure; incomplete + cleanup, not pipe backpressure |
 | Route message staging | 64 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
-| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; 16 MiB global permit for Codex lanes/tool metadata | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
-| OpenCode HTTP/SSE transport metadata | Existing bounded Wire raw/message-splitting and global retained-payload permits | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
-| C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, Core fails `overflow` and interrupts (A1) |
-| C2 observation payload | 256 KiB encoded | Split text on UTF-8 boundaries preserving order; otherwise fail protocol with raw evidence; unknown payload keep at most 16 KiB with explicit truncation marker |
+| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
+| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
+| C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
+| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
 | Health channel | watch latch + at most one exit report/connection | Latest health replaces state; first failure retained; no event payloads |
-| Store requests | 64 + 8 reserved lifecycle, 8 MiB total | Request-side overload refusal; raw/Host cleanup never await this queue |
-| Store transaction | at most 128 events or 1 MiB payload | Split event batches without splitting a lifecycle atomic batch |
+| Store requests | 64 + 8 reserved lifecycle, 8 MiB total | Request-side overload refusal; Host cleanup never awaits this queue |
+| Store transaction | at most 128 events and 1 MiB payload, not counting the one terminal envelope a transaction may carry (itself at most 1 MiB, C1 §5) or the turn's step rows it carries | Split event batches without splitting a lifecycle atomic batch; refuse a larger request before it is queued |
 | Store operation watchdog | 2 s, busy timeout 250 ms | Latch uncertain failure; no resend; keep thread ownership |
-| Subscriber outbox | 1000 events and 1 MiB/subscriber | Lag handling (§9) |
-| Subscribers | 32 daemon-wide, 8/socket; total outbox 16 MiB | Refuse excess `admission_refused` |
-| Socket response serialization | 16 MiB per response; 32 MiB global | Stream bounded encoding; page reads stop on bytes as well as count |
-| Envelope accumulation | 1 MiB per turn, including text and collections | Fail turn `overflow`; persist bounded failure summary, with raw log as remaining evidence |
+| Socket response serialization | 1 MiB per response (a page, `status` or an envelope) plus 512 B | Stream bounded encoding; page reads stop on bytes as well as count; each reply written within 10 s of being ready, else the socket closes |
+| Envelope | 1 MiB by construction (C1 §5): final text over 256 KiB goes to a file of at most 64 MiB; the denied and declined lists keep 1,000 entries each | Never fails the turn |
 | Work deadlines | wall 1 h, idle 10 min | C1 deadline disposition; idle resets on normalized meaningful progress, not stderr/noise |
 | Cleanup / daemon idle | §5 (3 s OS cleanup); daemon 60 s idle | No idle exit with a live client, running/queued work or pending cleanup |
 
@@ -1031,17 +1011,15 @@ payloads over 1 MiB use bounded chunks in a temporary Store-owned blob file
 synced before the atomic row references it; never keep all queued prompts in
 memory or split atomic receipt creation across commits. Blob paths are
 private relative IDs, checksum/length checked at recovery; unreferenced blobs
-are harmless. The same mechanism stores input identity bytes and large
-immutable effective params, preserving the 16 MiB public request limit while
-keeping Store messages small. Load only the dispatched prompt into the global
-32 MiB input budget. Outbound fake start may encode beyond 1 MiB; its input
-message ceiling is C1's 16 MiB plus bounded JSON wrapper expansion, streamed
+are harmless. The same mechanism stores large immutable effective params, for inline prompts over 256 KiB and for prompt
+files, while keeping Store messages small. Load only the dispatched prompt,
+one per running turn. Outbound fake start may encode beyond 1 MiB; its input
+message ceiling is the 16 MiB prompt plus bounded JSON wrapper expansion, streamed
 without a whole second copy. Inbound vendor message cap remains 1 MiB.
 
-Use byte-permit wrappers with RAII release, including data waiting for sync,
-decode, channel send, serialization or task join. A JSON AST has a conservative
-allocation charge per node/string/container; no unchecked preallocation from
-a peer size or item count. Persisted history is paged, not cached per session.
+Every buffer has a fixed maximum and every kind of holder a fixed count;
+nothing is preallocated from an unchecked peer size or item count.
+Persisted history is paged, not cached per session.
 Idle session data is evicted and reloaded by bounded pages; the number of
 historical/idle sessions on disk does not imply one resident actor per session.
 Read requests and commits use separate bounded lanes with fair round-robin
@@ -1051,73 +1029,52 @@ control response scheduling within 100 ms absent OS scheduling starvation.
 
 Each of at most four anchors is limited to one 64 KiB launch spec and 64 KiB
 control/diagnostic staging; its measured RSS ceiling is 32 MiB. Anchor RSS is
-reported separately from the daemon and vendor in F24; combined daemon plus
-four anchors must remain below 384 MiB. Anchors load no SQLite or runtime
+reported separately from the daemon and vendor in F24. Anchors load no SQLite or runtime
 session cache and never receive queued prompts.
-The global daemon retained-payload allocation budget is 128 MiB across all buffers,
-AST charges, copies and outboxes, plus SQLite's 8 MiB cache. Per-queue maxima
-are upper bounds, not independent allocations; acquiring a global permit is
-required. Allocation failure is a named overload, never implicit unbounded
-growth. F24 records RSS at 10 ms intervals and requires daemon peak RSS below
-256 MiB and growth below 32 MiB after the first 64 MiB of a 256 MiB flood on
-the documented Linux test runner. Also assert byte-permit high-water <=128
-MiB. RSS is an empirical gate, not a mathematical bound on allocator/kernel
-overhead. Failure of either assertion requires correction or explicit design
-review, not silently enlarging the limit.
-The Codex 16 MiB permit is a sub-budget for observation/staging lanes and
-retained tool metadata, not an extra allocation beyond the 128 MiB global
-retained-payload budget. Measure 32 loaded leases and four active turns
-without preallocating 4 MiB per idle lease; retain the 256 MiB RSS target.
+There is no memory pool, byte counter or memory setting. The daemon's
+worst case is the sum over holders of each holder's fixed buffers times
+its fixed count (C1 sockets, connections, running turns, the Store), about
+332 MiB estimated. F24 drives every holder to its maximum at once and
+records RSS at 10 ms intervals; the daemon's peak RSS less its idle
+baseline must stay within that sum plus a 25% margin for allocator
+overhead and CI variance, and growth must stay below 32 MiB after the
+first 64 MiB of a 256 MiB flood. RSS is an empirical gate, not a
+mathematical bound. Failure of either assertion requires correction or
+explicit design review, not silently enlarging the limit.
+The disk free-space floor, the data-size warning, the WAL limit and its
+checkpoint triggers are keys of `daemon.json` in the state directory, with
+provisional defaults. The daemon reads it once at start; a change takes
+effect at the next start, and an invalid file refuses to start with a named
+error. C1, C2, memory and the other runtime §8 limits are not configurable.
+The Codex shared server's lanes and tool metadata are fixed buffers counted
+per server by the Codex task, which measures 32 loaded leases and four
+active turns against the RSS gate.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the frozen server key and vendor
 semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
-redacted raw capture and bounded staging; Host exclusively starts and
+bounded staging; Host exclusively starts and
 supervises the authenticated loopback server. Core's durable-state and Store
 ownership do not change, and Adapter receives no Store access. Four separate
 vendor processes and their external memory require their own measured gate;
 the S1 private-process fake cannot qualify these resources.
 
-## 9. Following, paging and slow peers
+## 9. Paging, polling and slow peers
 
-Store is the sole event source. In one bounded read transaction obtain the
-page, scan cursor and committed head. The session actor serializes registering
-the subscription at that cursor with receiving commit notifications. Before
-waiting for a wake, re-read the durable head; a wake is only a hint. Scan by
-`seq > cursor` on every iteration. Advance the scan cursor over filtered-out
-events; never advance the delivery cursor for unsent matching events. This
-avoids both an unbounded live replay buffer and the lost-wakeup gap.
+Store is the sole event source. A page is one bounded read transaction
+that returns the page, the scan cursor and the committed head. `next_after`
+records the last scanned seq, not just the last matched event; `more` uses
+the captured head. Filtering can yield an empty page that still advances.
+Page byte limit is 1 MiB. Keep read transactions short (one bounded page).
 
-The first page reply is enqueued before its live notifications. Page byte
-limit is 1 MiB, subject to the global socket budget. `next_after` records the
-last scanned seq, not just last matched event; `more` uses the captured head.
-Filtering can yield an empty page that still advances. Each delivery cursor
-is monotonically increasing; no queue contains two copies of the same seq.
-Session/turn terminal detection follows the scan, even if the caller filtered
-out `turn.ended`/`session.closed`.
+There is no follow stream and no subscription. Callers poll `status` for
+the in-memory progress snapshot and step history, and use `wait` for a
+turn's end; `wait` checks the Store at once, then once per second.
+Cancelling a wait request only releases that waiter.
 
-On item, byte or global outbox exhaustion, freeze the subscription, discard
-its unsent entries and reserve one <=1 KiB `event_end:lagged` notice outside
-the data outbox. `resume_after` is the last completely written notification
-seq (or the acknowledged initial page cursor); it is not proof the peer read
-those bytes. The client must persist its own last received seq and prefer it
-after abrupt disconnect. Each socket has one serializer and one reserved
-termination slot; if multiple subscriptions fail together, close the socket
-after the first notice/deadline and require the others to resume by cursor.
-
-Never insert an end notice inside a partially written NDJSON line. Finish
-that line and attempt the notice within a single 2 s absolute write deadline;
-otherwise close the socket. A peer that continues reading sees `event_end`.
-A peer that never reads may see only EOF later. The daemon frees subscription
-and outbox ownership within 2 s in both cases, without affecting any turn or
-other client. Already accepted kernel bytes may arrive after closure.
-
-`unsubscribe` removes the subscription and unsent entries, waits for any
-already started line to complete within the same 2 s bound, then enqueues
-the `unsubscribed` notice and reply in that order. No event for that subscription
-is enqueued after the reply. Disconnect releases all connection subscriptions
-immediately in memory. Cancelling a wait request only releases that waiter;
-it cannot cancel the turn. `logs` resolves only each selected event's validated
-raw reference; never expand to the connection's bounding spans.
+A reply is written within 10 s of being ready to write, otherwise the
+socket closes (C1 §1), so a peer that never reads holds its reply buffer
+for at most that long. `logs` returns only the addressed turn's evidence
+locations (C1 §3.12).
 
 ## 10. C1/C2 amendment audit
 
@@ -1129,7 +1086,7 @@ macOS linkage gate. No design text here claims those live gates have passed.
 | Source | Required clarification |
 |---|---|
 | C1 summary, §3.8–3.9, §8.1 | Qualify “every later problem resolves the turn, never a request error”: after a receipt, failure to persist a terminal result returns named `store_error` with `terminal_persisted:false`; this is not a terminal envelope. Define F12 error metadata in §7 above. Add health to `daemon/status`. |
-| C1 §3.11 | Make `event_end` delivery best-effort subject to the 2 s writer deadline; add `store_error` reason; define byte/count outbox limits, scan vs delivery cursors and unsubscribe ordering. Replace literal registration “in the same Store read transaction” with the equivalent serialized cursor registration plus durable rescan protocol in §9 (no durable subscription rows). |
+| C1 §3.11 | Make `event_end` delivery best-effort subject to the 2 s writer deadline; add `store_error` reason; define byte/count outbox limits, scan vs delivery cursors and unsubscribe ordering. Replace literal registration “in the same Store read transaction” with the equivalent serialized cursor registration plus durable rescan protocol in §9 (no durable subscription rows). Superseded by T4-A25: follow removed. |
 | C1 §1, §3.11–3.12 | State bounded JSON depth/node limits; pages are limited by bytes as well as requested item count; named overload on oversized aggregate result. Envelope accumulation overflow is explicit; no silently truncated successful result. |
 | C1 §7.5 | Replace direct vendor marker discovery/group kill with verified live anchor identity/challenge authorizing only anchor-issued own-group cleanup. Vendor identity is distinct evidence; no environment marker scan or daemon-side numeric TERM/KILL. Absent/unverified anchor means no signalling; cleanup is uncertain unless §5.2 independently proves group absence by a same-boot/namespace, non-signalling `ESRCH` probe. Submission recovery stays unknown/no resend, regardless of proven cleanup. |
 | C2 §2 SessionCx/SessionDriver | Opaque resource wiring instead of Adapter-accessible raw handle; separate control/health lanes; acceptance correlation token; health failures and Host cleanup travel upward/downward through C2/C3/C4 rather than Core calling Host directly. |
@@ -1139,7 +1096,7 @@ macOS linkage gate. No design text here claims those live gates have passed.
 | Coding standard §§5–6 | Permit signal setup in the same binary's internal Host-anchor entrypoint in addition to daemon main. Document anchor group creation and vendor inherited membership; distinguish durable anchor identity from vendor child facts. Force group KILL kills the anchor/reaper, so remaining child reaping is by the OS, never falsely reported as Host-reaped. Marker remains explicit vendor environment data but is never recovered by reading vendor environments. |
 | Platform packet §5/§5.1 and P-I2–P-I4 | Match anchor-based authority, all-three-fd detachment, persisted generation/ArmIntent and §5.2 positive absence predicate. Keep native positive cleanup and negative identity-refusal requirements, with no uncertainty-only substitute. |
 
-The anchored process lifetime (§5), raw record layout (§4), numerical limits
+The anchored process lifetime (§5), evidence folder (§4), numerical limits
 and F12 policy are material decisions for this packet's independent review.
 No P7/P11/P13 or A2–A8 vendor decision is made here. No change to the approved
 dependency graph, one-route invariant or credential boundary is requested.
@@ -1217,7 +1174,7 @@ default-path tests use an isolated HOME/XDG environment and never touch user
 files. Verify selected paths/status, default and override precedence,
 invalid/empty/relative settings, unsafe symlinks/owner/modes, same-runtime
 startup race, same-state/different-runtime writer refusal, client Store
-mismatch without daemon takeover, and disjoint sockets/locks/SQLite/raw data
+mismatch without daemon takeover, and disjoint sockets/locks/SQLite and evidence data
 for two scenarios. Use Store backup API for consistent evidence, never a
 copy of live SQLite/WAL files. F1–F3 and F8–F12 remain unchanged.
 
@@ -1233,7 +1190,7 @@ a duplicate read ahead, one after an in-lifetime gate, a partial second
 message, and a controller that leaves input open after terminal (bounded
 nonzero finalization failure). Direct fake tests close input after reading
 terminal, just as Route will. A future Route integration test must prove
-half-close begins before process-exit/result waiting while raw output still
+half-close begins before process-exit/result waiting while output still
 drains. Do not add a special `expect_request` step to the normal fixture
 or alter C1 lifecycle precedence to hide a Route resend.
 
@@ -1290,7 +1247,7 @@ the existing dependency edges only to owners that need it. Code and any
 environment-variable parsing for failpoints are inside
 `#[cfg(feature = "test-failpoints")]`; production contains no runtime switch
 that can activate them. Isolated tests use private injected clocks and a
-closed fault backend for raw/SQLite operations. Production uses concrete
+closed fault backend for SQLite and evidence-file operations. Production uses concrete
 implementations; no general-purpose dynamic plugin mechanism.
 
 Failpoint controller: private per-scenario directory plus token; commands
@@ -1305,22 +1262,21 @@ No prompt, handle or vendor secret is included in acknowledgements.
 | `store.spawn.before_commit`, `.after_commit` | F8/F13: none or session+turn+key+hash together; lost reply replays one receipt |
 | `core.intent.after_commit`, `wire.prompt.after_write`, `core.accept.before_commit` | F9/F10: restart unknown, zero second sends, queued successors cancelled |
 | `host.anchor.before_arm_intent_commit`, `.after_arm_intent_commit`, `.after_arm_write_before_ack`, `host.vendor.after_spawn` | No ARM before positive durable ArmIntent receipt; stored generation survives restart; crash/lost acknowledgement never causes a second ARM/spawn; EOF/reconnect cleanup works without vendor-facts commit |
-| `host.anchor.after_pipe_detach`, `.detach_fail_stdin`, `.detach_fail_stdout`, `.detach_fail_stderr` | Keep anchor alive after vendor exit: Wire sees both output EOFs and stdin `EPIPE`, raw log seals; each injected detachment failure returns no acquisition and performs bounded group cleanup |
+| `host.anchor.after_pipe_detach`, `.detach_fail_stdin`, `.detach_fail_stdout`, `.detach_fail_stderr` | Keep anchor alive after vendor exit: Wire sees both output EOFs and stdin `EPIPE`; each injected detachment failure returns no acquisition and performs bounded group cleanup |
 | `host.anchor.final_reply_lost`, `host.group_absence_probe` | Autonomous EOF and verified reconnect cleanup each produce positive same-boot/namespace `ESRCH` proof plus independently observed vendor/grandchild absence; leader-only exit, reused group, probe denial or namespace mismatch remains uncertain with no external numeric signal; lost reply never invents forced/acknowledged outcome |
-| `store.commit.fail_persistent`, `raw.sync.fail_persistent` | F12: named error after receipt, terminal flag false if failure cannot commit, dispatch stopped, group cleanup, bounded memory; restart either fails unwritable or reconciles unknown without resend |
+| `store.commit.fail_persistent` | F12: named error after receipt, terminal flag false if failure cannot commit, dispatch stopped, group cleanup, bounded memory; restart either fails unwritable or reconciles unknown without resend |
 | `store.commit.reply_lost` | Durable mutation may exist; no duplicate send from timeout; keyed retry sees exact committed result |
-| `raw.before_sync`, `events.before_commit`, `raw.index.torn_tail` | No committed reference before sync; partial/unreferenced tails classified; incomplete warning survives successful recovery commit |
-| `core.observations.pause`, fake flood and stderr flood | F24: 1024/byte bounds and 10 s overflow; independent control service; raw loss explicit; 256 MiB/RSS assertion |
-| blocked socket, replay boundary barrier, unsubscribe barrier | F25/F26: attempted notice vs actual delivery distinguished, release <=2 s, dense stored seq, no replay gap/duplicate or post-unsubscribe delivery after reply |
-| byte splitter proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact raw units or explicit incompleteness, no panic/unbounded allocation |
+| `core.observations.pause`, fake flood and stderr flood | F24: 1024/byte bounds and 10 s overflow; independent control service; RSS assertion |
+| `core.progress.publish`, crash after a step commit | F25/F26 (superseded): status answers from memory during a flood; step rows survive a crash up to the last committed step |
+| byte splitter proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact messages or explicit failure, no panic/unbounded allocation |
 | Linux identity/control seam and real process tests | F22: uid/start/boot/group/marker mismatch never commands cleanup; forged challenge refused; spawn/anchor-death race yields no unrelated signal; marker checks never read vendor environment; leader exit alone never quiescent |
 
 Implement scenario test names `s1_f01_...` through `s1_f30_...`, plus
-`s1_raw_...`, `s1_bounds_...`, `s1_store_...` for packet-specific assertions.
+`s1_bounds_...`, `s1_store_...` for packet-specific assertions.
 F1–F30's remaining requirements retain the S1 plan's acceptance; the matrix
 above adds sharper seam assertions, not replacements. Test harness output
 goes under gitignored `scratchpad/`; every scenario emits the coding-standard
-§10 summary, manifest, consistent SQLite backup, raw/event logs and report.
+§10 summary, manifest, consistent SQLite backup, event logs and report.
 Never copy a live WAL database as its alleged consistent backup.
 
 Exact implementation gates from repository root (these are required future
@@ -1335,7 +1291,7 @@ python3 scripts/check-layers.py
 cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings
 cargo nextest run --locked --workspace --features via-cli/test-failpoints
 cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08|09|10|12)_/)'
-cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_(f2[4567]|raw|bounds|store)_/)'
+cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_(f2[4567]|bounds|store)_/)'
 cargo build --locked --release -p via-cli --no-default-features
 python3 scripts/check-release-features.py target/release/via
 ```

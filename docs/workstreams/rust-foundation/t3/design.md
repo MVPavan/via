@@ -229,16 +229,16 @@ never extends permissible vendor work.
    - Route writes `{"type":"interrupt","id":2,...}` once and keeps reading.
      A matching `interrupt_ack` is control evidence only; it is no longer a
      protocol error once an interrupt was sent.
-   - If the interrupt write fails, a raw evidence failure fails the
+   - If the interrupt write fails, ~~a raw evidence failure fails the
      connection as §7.2 row 6 and keeps its classified Store kind. A raw
      append that outlives the turn deadline is `Deadline`, as at every other
-     Wire call site. A transport failure on that write is tolerated, because
+     Wire call site.~~ [void: T4-A46, no raw log] A transport failure on that write is tolerated, because
      `force_at` still bounds the turn [s1.4].
    - A terminal frame ends the turn on the normal path: half-close, drain,
      exit, then a graceful close under `close_by`.
    - At `force_at` with no terminal, Route calls `Close(Force)` with
      deadline `close_by` and drains. It returns `Stopped { launched: true,
-     forced, cleanup, raw_incomplete }`.
+     forced, cleanup }` (its former `raw_incomplete` is void: T4-A46).
    - If the terminal was decoded and the wall deadline then passes during
      finalization, Route still returns the terminal evidence, with cleanup
      from Host (`uncertain` when unproven). It never returns `Deadline`
@@ -285,7 +285,8 @@ tools, so cleanup settles at exit or close (C1 P7 stays with the Codex
 slice).
 
 **F21.** When the process exits with an unterminated last line, the partial
-bytes are recorded in the raw log (already done), and Route calls
+bytes ~~are recorded in the raw log (already done)~~ go to `undecoded.bin`
+(T4-A41, T4-A46), and Route calls
 `wait_exit`. With a Host-confirmed exit it returns `ProcessExited`, which
 gives `failed(process_exited)`. Otherwise it returns `TransportLost`. Today
 this path is `protocol` (`crates/via-routes/src/runtime.rs:410`).
@@ -606,14 +607,10 @@ Then subscribe to the slot's close watch, still under `admission`; release
   becomes supported.
 - The run loop keeps `idle_at = last_progress + idle_ms`, with
   `last_progress` starting at the submission clock (§2) [r1.11].
-- **Meaningful progress** [r1.10] is only:
-  - acceptance;
-  - assistant text;
-  - tool started and tool ended;
-  - an observation the route declares as progress. The fake route
-    declares none.
-- Unknown observations (`vendor.other`), `interrupt_ack`, stderr and
-  raw-only bytes never reset it (runtime §8).
+- **Meaningful progress** [r1.10] is only acceptance, and progress items
+  with model output or a tool start or end (T4-A24).
+- Unknown vendor messages (activity only), `interrupt_ack` and stderr never
+  reset it (runtime §8). ~~raw-only bytes~~ [void: T4-A46]
 - At `idle_at`, the loop issues a stop order with cause `idle_deadline`
   (§2). Once any order exists, the idle timer is disarmed.
 - New failure class `deadline_idle` (C1 §8.2).
@@ -637,7 +634,7 @@ Then subscribe to the slot's close watch, still under `admission`; release
 - **Failure after bind.** The socket is unlinked before the locks are
   released. That covers a Store refusal, a failed recovery and a failed
   handoff. The directory checks and both locks precede every mutation of
-  the State directory, including `state/raw`.
+  the State directory ~~, including `state/raw`~~ [void: T4-A46].
 - **CLI auto-start** (`client.rs::start_daemon`). One startup budget of
   15 s, longer than an old daemon's 10 s final shutdown.
   1. Spawn `via daemon` in its own process group
@@ -1054,12 +1051,12 @@ transient I/O errors restarting the daemon.
 ### 7.1 Write outcomes and error classification [O1.D2]
 
 **Outcomes.** Every Store write, whether a Core commit, a Host journal
-write or a raw append or sync, has exactly one outcome:
+write ~~or a raw append or sync~~ [void: T4-A46], has exactly one outcome:
 
 - **committed**;
 - **not committed**:
   - the error came before `COMMIT`, and SQLite rolled the transaction back
-    (`Write`, `Constraint`, `Raw`);
+    (`Write`, `Constraint` ~~, `Raw`~~ [void: T4-A46]);
   - or the request was never enqueued: the new `StoreError::NotEnqueued`
     covers today's `Unavailable` from the **SQLite writer's** `try_send`
     `Full` only [r3.9, r5.6]. There is no extra retry for `Full`; Task 4's
@@ -1071,8 +1068,8 @@ write or a raw append or sync, has exactly one outcome:
     commit helper that every commit site uses [s1.1];
   - a writer that is gone: the new `StoreError::WriterLost` covers today's
     `Unavailable` from a dropped reply **and** from `try_send`
-    `Disconnected`, for **both** the SQLite writer thread and the raw
-    thread [r3.9, r5.6]. It latches;
+    `Disconnected`, for ~~**both**~~ the SQLite writer thread ~~and the raw
+    thread~~ [r3.9, r5.6; raw thread void: T4-A46]. It latches;
   - the 2 s operation watchdog (runtime §8).
 
 **Classification rules.**
@@ -1080,16 +1077,16 @@ write or a raw append or sync, has exactly one outcome:
 - **One mapping** [r5.6], used alike by this section, A14 and the unit
   test. This corrects round 4's wording:
   - `NotEnqueued` applies only to the SQLite writer's `try_send` `Full`;
-  - on the raw thread, `Full` and I/O errors (append, sync or index) are
-    `StoreError::Raw`, which is §7.2 row 6;
-  - `Disconnected` and a dropped reply are `WriterLost` on both threads,
-    and latch.
+  - ~~on the raw thread, `Full` and I/O errors (append, sync or index) are
+    `StoreError::Raw`, which is §7.2 row 6;~~ [void: T4-A46]
+  - `Disconnected` and a dropped reply are `WriterLost` ~~on both threads~~
+    on the SQLite writer [void part: T4-A46], and latch.
 - **The kind travels upward** [r5.5]. Wire reports the classified Store
-  failure kind upward on `RouteError::Store`: `Raw`, `NotEnqueued`,
-  `WriterLost` or `Uncertain`.
+  failure kind upward on `RouteError::Store`: ~~`Raw`,~~ `NotEnqueued`,
+  `WriterLost` or `Uncertain` [`Raw` void: T4-A46].
   - S1 carries the kind.
   - S5's Core hook latches on `WriterLost` and `Uncertain`, and scopes
-    `Raw` and `NotEnqueued`.
+    ~~`Raw` and~~ `NotEnqueued` [`Raw` void: T4-A46].
   - Until S5, the hook latches on everything.
 
 - `journal::may_have_committed` becomes `Uncertain | WriterLost`. This
@@ -1152,8 +1149,8 @@ state for a queued turn it is resolving.
 | 2 | Submission intent (`turn.submitted`) | no agent I/O; the connection permit is dropped; resolution write `commit_submit_failed`: `turn.submitted` plus `turn.ended failed(store)`, `cancel: null`, in one transaction (`queued → running → failed`, C1 §7.2); successors dispatch normally | latch | the resolution write fails: latch |
 | 3 | Anchor intent (Host journal) [O1.D10] | no process; the permit is dropped; Route returns `Stopped { launched: false, cleanup: quiescent }` (no anchor intent) with cause `store`; resolution write: terminal `failed(store)` | latch | as row 2 |
 | 4 | Anchor identified, ARM intent or vendor facts (Host journal) [O1.D10] | Host stops the group through the still-live control, using the **in-memory** identity: before ARM it drops the control (EOF exit); after ARM it sends `Stop`. It proves absence within close's 3 s allowance, one deadline shared by the `Stop` and the absence check [s1.6]. Route returns `Stopped` with cause `store`, and the turn ends `failed(store)` with `cancel` evidence. If absence is unproven, the ledger entry keeps its token together with the in-memory identity, and re-probe owns it (§8) | latch | as row 2 |
-| 5 | Acceptance, a turn event, `cancel.requested`, or an intermediate `raw_log.incomplete` of a running turn | stop order with cause `store` (§2); later events are dropped; resolution write: terminal `failed(store)` with `cancel` evidence | latch | as row 2 |
-| 6 | Raw append or sync [O1.D11] | the connection fails (Wire), including at the interrupt write (§2 rule 3) [s1.4]; Route closes the group with `Close(Force)` under `now + 3 s` and reports `Store` [r3.10]; resolution write: terminal `failed(store)` **with** `raw_log.incomplete {connection_id}` in the same transaction, plus the `raw_log_incomplete` warning, and the cleanup evidence carried as in row 5. Whether `raw_log.incomplete` is still owed is decided by a durable read-back of the turn's events, in the terminal and in the batch, so an uncertain commit whose reply was lost is never written twice [t3r.3] | raw `Disconnected` or a dropped raw reply: `WriterLost`, reported on `RouteError::Store` and latched by the hook (§7.1) [r5.5, r5.6] | the resolution write fails: latch (runtime §7, first paragraph) |
+| 5 | Acceptance, a turn event or `cancel.requested` ~~, or an intermediate `raw_log.incomplete`~~ of a running turn [void part: T4-A46] | stop order with cause `store` (§2); later events are dropped; resolution write: terminal `failed(store)` with `cancel` evidence | latch | as row 2 |
+| 6 | ~~Raw append or sync [O1.D11]~~ | void (T4-A41, T4-A46): VIA keeps no raw log, so there is no raw append or sync to fail | — | — |
 | 7 | Natural terminal (`turn.ended` from vendor evidence), in the live run loop | retried once with the same content and the same sequence number, holding the session head across the retry [r3.7]; the retry is the resolution write; a retry that commits keeps the vendor's result [r3.13] | latch (existing: even when the read-back finds it) | the retry fails: latch |
 | 8 | `queued → cancelled`, owned by a request (caller cancel, §3.2) | roll back to `Waiting`; `store_error`, `not_committed`; the caller may retry | latch | none |
 | 9 | `queued → cancelled`, owned by the dispatcher (P6, the close pass, `force_queue`, `Cancelling{dispatcher}`), including a cancellation that carries the force closing rider in the same transaction [r3.6] | the claim, head and unresolved accounting are kept; retried once, holding the session head across the retry [r3.7]; the retry is the resolution write, and a retry that commits stays `cancelled` [r3.13]; if Store refuses the retried rider as a close because a turn is unfinished, the cancellation commits alone and the session counts in `unclosed_sessions` [r3.6] | latch | the retry fails: latch |
@@ -1390,7 +1387,7 @@ Scope of the batch:
   ```
 
   - `kind` ∈ `commit_failed`, `commit_uncertain`, `read_failed`,
-    `corrupt_row`, `corrupt_store`, `raw_failed`, `journal_failed`.
+    `corrupt_row`, `corrupt_store`, ~~`raw_failed`~~ [void: T4-A46], `journal_failed`.
   - `scope` ∈ `request` (a receipt, a caller cancel, `Closing`), `turn`,
     `session` (`Closed`, a closure commit), `daemon` (the latch).
   - `since` is the wall time of the latest failure.
@@ -1413,8 +1410,9 @@ Scope of the batch:
 
 ### 7.6 Followers [O1.D7]
 
-`event_end {reason: store_error}` goes to Task 4 (`via-jm4.7.8`), with
-follow.
+Obsolete (T4-A25): Task 4 removes follow, so there is no `event_end`.
+~~`event_end {reason: store_error}` goes to Task 4 (`via-jm4.7.8`), with
+follow.~~
 
 ### 7.7 Round-1 branches, resolved
 
@@ -1512,21 +1510,10 @@ Interactions:
 
 ## 9. Recovery additions (C1 §7.5, runtime §6)
 
-- **Raw incompleteness.** A recovered turn with a committed anchor at
-  `arm_intent` or later had a connection the crashed daemon never sealed.
-  - Recovery commits `raw_log.incomplete {connection_id}` and adds the
-    `raw_log_incomplete` warning to its `unknown` envelope.
-  - A turn with no such anchor adds neither.
-  - `AnchorOwner` gains the anchor phase for this.
-  - Recovery cannot always show that a raw log is complete, and then it
-    records the event. An owner with no readable phase, or an incomplete
-    Host inventory (a deadline or a failed page), counts as armed. The event
-    therefore means the raw evidence cannot be shown complete; it may name
-    a connection that never armed [s4.7, S4].
-  - The event is its own commit, before recovery's `cancel.requested`, and
-    names the connection id the dispatcher derives. An event already
-    durable from an interrupted recovery is not repeated, and it always
-    carries the warning, whatever the later inventory shows [s4.6, S4].
+- **Raw incompleteness** [void: T4-A46]. Recovery commits no
+  `raw_log.incomplete` event and adds no `raw_log_incomplete` warning; a
+  recovered turn's `unknown` envelope is otherwise unchanged. `AnchorOwner`
+  needs no anchor phase for this.
 - **A durable `cancel.requested` or `cancel.settled`.** If recovery finds
   one for the turn, it keeps it and commits no second one: `requested_at`
   is the request's `at`; the terminal cites the settlement's outcome,
@@ -1581,8 +1568,8 @@ isolated tests:
 - **For F12** [O1]:
   - `commit_submit_failed`: `turn.submitted` plus `turn.ended
     failed(store)` for a queued turn, used by §7.2 row 2 and §7.3;
-  - a terminal record that may carry one `raw_log.incomplete` event in the
-    same transaction (§7.2 row 6);
+  - ~~a terminal record that may carry one `raw_log.incomplete` event in the
+    same transaction (§7.2 row 6);~~ [void: T4-A46]
   - `commit_failure_resolution`: the latch batch, a terminal plus at most 8
     queued cancellations, within the 128-event transaction bound (§7.4).
     It is refused (`Refused`), writing nothing, unless its primary turn is
@@ -1629,7 +1616,7 @@ Also in test builds only, `VIA_TEST_CLIENT_VERSION` overrides the CLI's
 | `store.commit.submission` | 2 |
 | `store.journal.anchor_intent`, `store.journal.identified`, `store.journal.arm_intent`, `store.journal.vendor_facts` | 3, 4 |
 | `store.commit.event` (acceptance, turn events, `cancel.requested`) | 5 |
-| `raw.append.fail`, `raw.sync.fail_persistent` (runtime §11) | 6 |
+| ~~`raw.append.fail`, `raw.sync.fail_persistent` (runtime §11)~~ | 6, void (T4-A46): no raw append to fail |
 | `store.commit.terminal` | 7, and resolution writes |
 | `store.commit.cancel` | 8, 9 |
 | `store.commit.closing`, `store.commit.closed`, `store.commit.session_closed` | 10, 11, 14 |
@@ -1706,7 +1693,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f19_wall_deadline_clears_grandchild` | the wall variant with a grandchild |
 | `s1_f19_delayed_submission_gets_no_extra_wall_time` | `core.submit.before_commit` held past a short `wall_ms`: `deadline_wall` with no launch [r1.11] |
 | `s1_f20_sigterm_ignored_escalates_to_kill` | `ignore_term`: group gone within 3 s of `force_at`, outcome `forced` |
-| `s1_f21_crash_mid_line_is_process_exited` | `emit_raw` partial, then `exit`: `failed(process_exited)`; partial bytes in the raw log |
+| `s1_f21_crash_mid_line_is_process_exited` | `emit_raw` partial, then `exit`: `failed(process_exited)`; partial bytes in `undecoded.bin` (T4-A46) |
 | `s1_f01_concurrent_auto_start_one_daemon` | the first daemon paused at `daemon.startup.after_lock`, the second CLI started: the loser exits 75, one daemon, both calls succeed |
 | `s1_f02_stale_socket_replaced_after_lock` (characterization) | killed daemon's socket: the new daemon locks, then replaces it |
 | `s1_f03_unsafe_runtime_dir_refused` | symlink, mode and owner variants: clear message, exit 4, nothing created |
@@ -1720,7 +1707,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f11_newer_or_corrupt_store_refused_untouched` | newer version and a `quick_check` failure: exit 4, message shown, bytes and sidecars unchanged, no socket left |
 | `s1_f29_ctrl_c_foreground_spawn_exits_130` | receipt printed; the CLI exits 130; the daemon and turn continue; `result` works later |
 | `s1_force_cutoff_worker_stalled_read_is_never_clean` | `store.read.stall` on a force-path read: released gives exit 4 with `store: joined`; held gives exit 4 with `join_timed_out`, in bounded time |
-| `s1_f09_kill_while_running_restarts_unknown_no_resend` (characterization except the warning) | streamed events committed, then SIGKILL: `unknown`; the fake received exactly one start; the queued successor is cancelled; `raw_log_incomplete` warning |
+| `s1_f09_kill_while_running_restarts_unknown_no_resend` (characterization except the warning) | streamed events committed, then SIGKILL: `unknown`; the fake received exactly one start; the queued successor is cancelled; ~~`raw_log_incomplete` warning~~ [void: T4-A46] |
 | `s1_f22_surviving_anchor_verified_and_stopped_on_restart` | barrier-held anchor: restart verifies it, stops through it, `ESRCH`; the harness sees vendor and grandchild gone |
 | `s1_f22_autonomous_eof_cleanup_proved_on_restart` (characterization) | proof (a) end to end |
 | isolated F22 (via-host) | identity mismatch (uid, start ticks, pgid, marker), forged challenge, leader-only exit and denied probe: no command, no quiescence |
@@ -1751,9 +1738,9 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `s1_f12_anchor_intent_not_committed` | `store.journal.anchor_intent`: no process, `failed(store)`, and the next turn launches (row 3) |
 | `s1_f12_host_journal_failure_stops_group` | `store.journal.identified`, `.arm_intent`, `.vendor_facts`, one run each: the group is stopped through the live control and proved absent (harness check), `failed(store)` with `cancel`. The `identified` run shows the absence check ran from the identity recorded before the commit (row 4) [r3.12] |
 | `s1_f12_host_journal_failure_unproven_slot_reprobed` | as above with the anchor held at `host.anchor.before_eof_cleanup`: the slot stays held (`connections.held_unproven`); after release, re-probe commits the proof with the identity and frees the slot (rows 4, 12) |
-| `s1_f12_event_not_committed_stops_turn_and_reuses_seq` | `store.commit.event` on an `assistant.text`: stop order cause `store`, `failed(store)`, no later events, the group stopped; the session's events stay dense, and the next event reuses the failed number (row 5, §7.1) |
+| `s1_f12_event_not_committed_stops_turn_and_reuses_seq` | `store.commit.event` on a step-row commit and on `cancel.requested` (T4-A24): stop order cause `store`, `failed(store)`, no later events, the group stopped; the session's events stay dense, and the next event reuses the failed number (row 5, §7.1) |
 | `s1_f12_cancel_requested_not_committed` | a caller cancel whose `cancel.requested` commit fails: `failed(store)` with the `cancel` object; the caller gets `store_error` (row 5) |
-| `s1_f12_raw_failure_records_incomplete` | `raw.append.fail`: the group is force-closed and proved absent (harness), and the terminal is `failed(store)` with a `raw_log.incomplete` event, the warning and the cleanup evidence in one transaction (row 6) [r3.10] |
+| ~~`s1_f12_raw_failure_records_incomplete`~~ | void (T4-A46): there is no raw append to fail |
 | `s1_f12_terminal_retry_once` | `store.commit.terminal`, occurrence 1: the retry commits the same envelope with the same sequence number (row 7) |
 | `s1_f12_escalation_latches` | `store.commit.fail_persistent` armed at a turn event: the resolution write fails, then latch, health `store_failed`, `scope: daemon`, exit 4. The same for the terminal retry (§7.2 escalation) |
 | `s1_f12_queued_cancel_not_committed` | caller cancel with `store.commit.cancel`: rollback, `store_error`, and a retried cancel succeeds (row 8). The close pass's cancellation: one retry succeeds; persistent: latch (row 9) |
@@ -1786,7 +1773,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `a_failed_proof_before_a_page_read_failure_fails_the_restart_close` (engine) | a failed absence-proof write on page 1, then a page-read error on page 2: restart close fails startup and commits no `session.closed` [t3r.2] |
 | `s1_f12_latch_cancel_and_close_return_store_error` | after the latch, `cancel` and `close` return `store_error`, and the force stop cleans up (§7.4, O1.D13) |
 | unit (`via-core` journal) | an event that is not committed leaves the head's `next` unchanged; an uncertain one calls `lost()` (§7.1) |
-| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; the SQLite writer's `try_send` `Full` gives `NotEnqueued` [r6.4]; `try_send` `Disconnected` and a dropped reply give `WriterLost`, for the writer and the raw thread alike; raw `Full` and raw I/O errors give `Raw` (row 6); `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`Raw`, `NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5] |
+| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; the SQLite writer's `try_send` `Full` gives `NotEnqueued` [r6.4]; `try_send` `Disconnected` and a dropped reply give `WriterLost` for the SQLite writer; `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5]. The raw-thread, raw `Full`/I/O and `Raw` cases are void [T4-A46] |
 
 The existing T2-B2 latch tests stay. Those that inject a **not committed**
 failure and expect the latch (for example
@@ -1916,7 +1903,7 @@ round-1 "owner-pending" A5 (now replaced below).
 > | Receipted turn whose own write failed | the turn ends `failed(store)` with cleanup evidence, except that a natural terminal whose one retry commits keeps its result, and a dispatcher-owned queued cancellation whose retry commits stays `cancelled`; `wait` and `result` return that envelope [r3.13] | `store_error` with session/turn, `durable_state` from the last known commit, `terminal_persisted:false`; no invented envelope |
 > | Durable terminal result readable after failure | return it | return that committed result, not a fabricated new failure |
 > | Other mutations and dispatch | unaffected | refuse with `store_error`; `cancel` and `close` return `store_error`, and the latch's force stop performs cleanup |
-> | Following affected history | the turn's events end with its terminal | attempt `event_end {reason:store_error,resume_after}`; close the subscription and apply §9's socket deadline |
+> | ~~Following affected history~~ (obsolete, T4-A25) | the turn's events end with its terminal | attempt `event_end {reason:store_error,resume_after}`; close the subscription and apply §9's socket deadline |
 > | `daemon/status` | `health: healthy`; `store_failure` reports the latest failure and its scope | `health: store_failed`, which is sticky; `store_failure` reports the latest recorded failure and its scope; no prompts, payloads or handle [r3.14] |
 
 **A15. C1 §3.14: replacement text** [r3.15]. Replace the `daemon/status`

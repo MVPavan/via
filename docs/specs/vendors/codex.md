@@ -220,21 +220,26 @@ correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
 accepted turn must never take either fallback. Untagged connection status
-does not get fabricated thread ownership. Raw extraction uses individual
-event `raw_ref`s, never shared-connection bounding spans.
+does not get fabricated thread ownership. Evidence for the shared server
+(`logs`) is defined by this adapter's task under D4: it never returns
+another session's evidence.
 
 Retain `(connection generation, threadId, turnId) → (session_id, TurnNo)`
 for every accepted turn until that connection retires. After settlement it
 is a tombstone, retaining unresolved-tool metadata and a bounded session
 observation sender independent of the vendor lease. Unsubscribe, close,
 uncertain settlement and a successor turn do not evict it. Thus an already
-received or later delivered completion after lease release still reaches
-its original turn with `late:true`; unsubscribe does not promise more
-vendor notifications. A detached session's Core event sink remains eligible
-for these late observations even though admission to that session is closed.
+received or later delivered completion after lease release is still
+attributed to its original turn: it still counts for P7 cleanup
+(`tool.quiescent`), and any durable observation it yields (`action.denied`,
+`vendor.request_declined`, `warning`) is committed with `late:true`. A tool
+completion alone is no event (C1 §6.1). `thread/unsubscribe` does not
+promise more vendor notifications. A detached session's Core observation
+sink remains eligible for these late observations even though admission to
+that session is closed.
 
 Cap active mappings plus tombstones at 1024 entries and 256 KiB per
-connection, charged to the global 16 MiB permit pool; retain at most the
+connection; retain at most the
 32 resident session sinks above. This deliberate bound avoids adding Store
 lookups to Routes. Reserve correlation space before writing turn/start.
 If reservation or unresolved-tool metadata admission fails, latch explicit
@@ -247,10 +252,13 @@ continuity, not proof that unresolved tools stopped. Release tombstones
 only after raw/control draining ends and the continuity-loss reports have
 been handed to Core (or sticky Store/transport failure records their loss).
 
-Normalize agent-message deltas, completed agent text, tool starts/ends,
-file changes, reasoning summaries, usage and terminal statuses using C2.
-Accumulate final text by item ID; completed text replaces that item's delta
-accumulator instead of duplicating it. Preserve vendor item order. Retain
+Normalize with C2 `progress` items: `agentMessage` and `reasoning` item
+starts and deltas are `model`; a tool item's `item/started` is
+`tools_started (itemId, item type)` and its `item/completed` is
+`tools_ended`; `thread/tokenUsage/updated` `tokenUsage.last` is a `usage`
+sample. Terminal statuses map as below. For the envelope's final text, send
+each completed `agentMessage` text as C2 `final_text` pieces in order (C2
+§4); deltas are never final text. Preserve vendor item order. Retain
 only bounded metadata for open tools, keyed by `(threadId,turnId,itemId)`;
 1024 entries and 256 KiB/session, charged to the observation budget. A
 turn-terminal payload may carry partial items (`itemsView`); absence from
@@ -258,11 +266,10 @@ its `items` is not completion evidence. `error {willRetry:true}` is progress
 diagnostic, not a terminal failure. Core applies disposition precedence.
 
 Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
-64 KiB pipe buffers, 8 MiB raw staging/connection and 32 MiB globally,
-64 messages/4 MiB per connection, C2 1024 observations/4 MiB per
+64 KiB pipe buffers, 64 messages/4 MiB per connection, C2 1024 observations/4 MiB per
 session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
-65,536 nodes. Large text splits on UTF-8 boundaries; unknown notifications
-become `vendor.other` retaining at most 16 KiB with explicit truncation.
+65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
+256 KiB encoded; unknown notifications are activity only.
 No silent dropped lifecycle events. Large prompts are encoded using the
 runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
 
@@ -312,9 +319,8 @@ quarantine transition if ingress has not already overflowed. Thus C2 stall
 and Route ingress exhaustion are distinct stages, not two deadlines for
 one full queue. A full C2 channel with no further ingress waits for that
 timer; continued ingress may exhaust its staging earlier.
-Independent sticky health delivery bypasses data lanes. Add a 16 MiB global permit pool
-for all Codex observation/staging lanes and retained tool metadata; per-lane
-ceilings never authorize allocations above it. Measure the expanded
+Independent sticky health delivery bypasses data lanes. Codex observation/staging
+lanes and retained tool metadata are fixed per-server buffers. Measure the expanded
 aggregate budget for 32 loaded leases and four active turns; do not
 preallocate 4 MiB for every idle lease or assume S1's RSS result covers this
 extension. Retain the runtime's 256 MiB RSS acceptance target; a failure
@@ -353,8 +359,8 @@ To preserve terminal-envelope immutability, keep the acknowledged
 cancellation's turn nonterminal while cleanup is pending. Status and
 non-waiting cancel expose `acknowledged/pending`; `wait` resolves only
 when the cancelled envelope is committed with settled cleanup. Preserve
-the vendor terminal timestamp separately from settlement. Later tool events
-remain `late:true` evidence and do not rewrite a settled cancelled envelope.
+the vendor terminal timestamp separately from settlement. Later tool completions
+count for P7 cleanup only and do not rewrite a settled cancelled envelope.
 The `unknown` revision rule remains unchanged. Section 9 proposes this
 necessary shared-contract clarification explicitly.
 
