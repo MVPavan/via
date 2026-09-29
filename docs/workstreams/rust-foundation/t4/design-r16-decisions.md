@@ -223,3 +223,66 @@ This step writes no production code and no tests, and does not edit
   justify it.
 - Every file:line citation is rechecked.
 - There are no absolute paths and no "frame".
+
+## 7. Owner follow-up on the round-16 design (8772edb)
+
+The owner reviewed the round-16 choices on 2026-09-29. **Principle:** do not
+design mechanisms for problems that have not been observed. Choose the
+simplest behaviour now, and list the case for end-to-end measurement with
+every adapter (`via-d9o.2.3`). Apply these as a small update to round 16,
+tagged `[t4r16.7.N]`:
+
+1. **`via.log`.** The daemon's own warnings and errors (its `tracing`
+   output) go to `<state>/via.log`, with session and turn IDs where they
+   exist.
+   - Keep stderr only for startup, so the auto-starting CLI can still report
+     a failed start (`crates/via-cli/src/server.rs:96`,
+     `crates/via-cli/src/client.rs:133`).
+   - Lines are rare, so a plain synchronous append is acceptable.
+   - Bound the file simply: at daemon start, a `via.log` over 10 MiB replaces
+     `via.log.1`.
+   - It is diagnostic, not a C1 contract.
+2. **Drop Claude's debug file** (`claude-debug.log`, `--debug-file`) from
+   Task 4. The Claude task may add it later on evidence.
+3. **Keep** the transcript path hint (Q: B).
+4. **Accept** Q-R16-1: the RSS gate is 1.25 × the §5.1 sum.
+5. **Agent stderr stays uncapped.** The operating system writes
+   `stderr.log`, and VIA adds no size check, tick, failure or tail.
+   - Remove `EVIDENCE_FILE_MAX`, the 1 s tick and
+     `Reader(EvidenceTooLarge)`.
+   - Record uncapped stderr as a limitation and as a `via-d9o.2.3`
+     measurement item. Q-R16-2 is withdrawn.
+6. **At `wal.max`, running turns' step rows still commit.** Treat them like
+   lifecycle writes. Only new work and other ordinary writes are refused
+   (Q-R16-3).
+7. **`wait`** checks at once, then once per second. The backoff goes.
+8. **Large results travel as files; there is no envelope-overrun failure.**
+   - **Final text.** When the final text would not fit inline, choose the
+     threshold so that the envelope can never exceed 1 MiB. Core writes the
+     whole final text to `final_text.txt` in the turn's folder, and the
+     envelope carries its path and byte length instead of the text. The file
+     has a simple cap, for example 64 MiB: past it, stop appending and mark
+     it truncated. Do not fail the turn.
+   - **Denied and declined lists.** Keep the first 1,000 entries and a total
+     count.
+   - **Remove** the envelope-overrun path: Core's receiver drop on the
+     crossing item, the overrun precedence rule, and the overflow-only parts
+     of the bounded failure summary. The stall's `overflow` path (C2 A1) is
+     unchanged.
+   - The folder now also holds a result file. Rename it only if that clearly
+     reads better; keep the churn minimal.
+9. **Measurement list.** Add a short section listing every assumption left
+   to `via-d9o.2.3`:
+   - the RSS against §5.1;
+   - stderr sizes;
+   - the largest vendor message against 1 MiB;
+   - final-text sizes and how often the spill is used;
+   - list lengths;
+   - disk and WAL growth (Q-R9-1);
+   - floor behaviour;
+   - per-vendor steps and tokens;
+   - the size of `via.log`.
+
+   Do not redesign other sections for this principle. Name other
+   speculative mechanisms you would simplify in T4-0.md §20 as candidates
+   only.
