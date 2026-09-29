@@ -1,9 +1,9 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 12)
+# Task 4 design: events, progress, storage and C1 conformance (round 13)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 12.
-It replaces rounds 1–4. Rounds 6–12 apply the orchestrator's decisions on
-Sol's round-5 to round-11 reviews (`design-r5-decisions.md` to
-`design-r11-decisions.md`), tagged `[t4r5.N]` to `[t4r11.N]`. The
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 13.
+It replaces rounds 1–4. Rounds 6–13 apply the orchestrator's decisions on
+Sol's round-5 to round-12 reviews (`design-r5-decisions.md` to
+`design-r12-decisions.md`), tagged `[t4r5.N]` to `[t4r12.N]`. The
 owner-approved [requirements](requirements.md) (R1–R7, the "Bounding
 strategy" and "Thresholds are configuration") are normative and override
 earlier design assumptions and spec text; every such conflict is an
@@ -11,7 +11,7 @@ amendment in §11. Round 8 replaces exact memory and disk accounting with the ow
 coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4);
 round 9 makes every threshold daemon config (§5.2); round 12 narrows Task 4
 to per-turn connections (§4.4). Round history and
-decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§16.
+decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§17.
 This step writes no code and no tests; slices are re-planned after the
 owner's review (`s1.md`–`s7.md` are superseded).
 
@@ -671,8 +671,8 @@ fenced queue (`FencedQueue<T>`).
 
 - **Inbox.** A `FencedQueue<RawCommand>` bounded by staging permits: every
   `Append` carries an `Arc<Payload>` from `Payload::stage` (`max(len,
-  512)`), so at most 32 MiB / 512 B = 65,536 appends queue; a `Barrier` holds
-  no permit (one per connection); a blob command holds one 64 KiB chunk.
+  512)`), so at most 32 MiB / 512 B = 65,536 appends queue; a `Barrier` or a
+  `Seal` holds no permit (one each per connection); a blob command holds one 64 KiB chunk.
 - **Fault publication.** via-store declares `trait RawFaultSink { fn
   raw_failed(&self, error: &StoreError); }`; Wire implements it on the
   connection latch; the worker calls it on its own thread, lock-free and
@@ -687,6 +687,16 @@ fenced queue (`FencedQueue<T>`).
   failed connection keeps failing fast (`raw.rs:37-38` [V]). The death guard
   owns the in-flight batch; on exit or unwind it sets `dead`, takes the
   queue, sends `WriterLost` to each sink once and fails every reply.
+- **Seal** [t4r12.1]. The worker applies `Seal { connection, offset }` in
+  queue order: it flushes the batch, truncates the connection's payload file
+  to `offset` and its index to the entries ending at or before it, syncs
+  both, reconciles the byte counter (§6.9), and from then answers every
+  append for that connection `Sealed` without writing it. So no durable
+  byte lies past a sealed end. A `Seal` that cannot be enqueued (fenced
+  queue, dead worker) or applied (truncate or sync fails) is a raw-store
+  failure of the connection under the existing rules (§7.4, runtime §7).
+  Recovery truncates every sealed connection's files to `high_water`, so a
+  seal lost in a crash still takes effect.
 - **Lookup.** [V] `read_raw_ref` scans the 45-byte index linearly
   (`raw.rs:154-212`). Entries are in increasing payload offset, so lookup is
   a binary search (entry `i` at byte `8 + 45 × i`) then one payload read
@@ -794,9 +804,10 @@ golden DDL test (`s1_store_v6_schema_is_frozen`). Changes from v5
   from the id (`raw.rs:159-160` [V]). A per-turn connection is created in
   the submission transaction (`SubmissionRecord` gains `connection_id`);
   `incomplete` is set by a committed `raw_log.incomplete`; the transaction
-  that ends the turn seals the row from the index's last complete
-  entry (durable: `finish` ran its barrier), or sets `incomplete = 1` with
-  the offset it can prove; recovery seals open rows.
+  that ends the turn seals the row at `finish`'s offset (the barrier's
+  answer, or the `Seal` offset), with `incomplete = 1` when a raw loss was
+  recorded (§7.6) [t4r12.1]; recovery seals open rows from the index's last
+  complete entry.
 - **Time.** `at` strings parse strictly to Unix ms (else `Constraint`).
 
 ### 6.8 Store reads
@@ -1008,17 +1019,31 @@ kill, or vendor exit) and readers read the tail; (2) drain until both
 readers reach EOF and the writer ends, or `deadline − 250 ms`; (3) if
 anything still runs, mark `raw_incomplete`, set the stop signal and
 `abort_all()` (every await is cancel-safe); (4) barrier and join together
-until `deadline`; (5) at `deadline` an unanswered barrier marks
-`raw_incomplete`, unjoined tasks move into `WireRuntime::adopt(set)`, and
-`finish` returns; (6) `WireRuntime` joins each adopted set as its tasks end,
+until `deadline`; (5) at `deadline`, if the barrier is unanswered,
+`finish` enqueues `Seal { connection, offset }` behind it at the last offset
+proven durable (the end of the last acknowledged unit) [t4r12.1].
+`WireMessages` counts units submitted to raw and not yet acknowledged; it
+marks `raw_incomplete` from the seal exactly when that count is above zero,
+because those units are discarded (§6.4), and an unanswered barrier alone
+marks nothing. Unjoined tasks move into `WireRuntime::adopt(set)`, and
+`finish` returns with the offset; (6) `WireRuntime` joins each adopted set as its tasks end,
 and `WireRuntime::shutdown` (`crates/via-wire/src/runtime.rs:96` [V]) joins
 the rest after Host's shutdown, reporting stragglers in
 `WireShutdown.pending_tasks`. The connection charge (§5.1) moves with the
 set and is released only when the set is empty [t4r8.5].
 
-Every `run_turn` exit calls `finish` with one absolute deadline (the
-graceful close's `close_by`, the force close's cleanup deadline,
-`failed.close_by`, or `LAUNCH_DRAIN` for an open failure) [t4r11.1]. `Drop` without
+Once `open_connection` has returned a connection, every `run_turn` exit
+calls `finish` with one absolute deadline (the graceful close's `close_by`,
+the force close's cleanup deadline, or `failed.close_by`) [t4r11.1,
+t4r12.2]. An open that fails before then has no `WireMessages`: the
+existing path cleans up. `WireConnection::open` drops the Host acquisition,
+whose anchor stops the group, drains any launched pipes into raw under
+`LAUNCH_DRAIN` and returns `WireError::Acquire` with Host's evidence
+(`crates/via-wire/src/runtime.rs:348-366`, `drain_pipes` `:626-667` [V]);
+Route maps it (`crates/via-routes/src/runtime.rs:148-152`,
+`acquire_failure` `:769` [V]). When a drain append is still queued at its
+deadline, `drain_pipes` seals the same way; its `RawEvidence::Incomplete`
+already records the loss [t4r12.1]. `Drop` without
 `finish` aborts, adopts, and bumps a test-only `wire::fallback_drops()`
 counter that every normal test asserts is zero.
 
@@ -1407,7 +1432,11 @@ Replace C1 §3.12 (`via-api-v1.md:362`) with:
 > than that spans pages. Missing or corrupt raw evidence is `store_error`.
 
 `raw_log.incomplete` keeps its one meaning, raw bytes lost (C1 §7.6,
-`codex.md:299-300`); round 7's widening is reverted [t4r7.6]. Runtime §9's last
+`codex.md:299-300`); round 7's widening is reverted [t4r7.6]. A connection
+sealed at `finish`'s deadline discards its unacknowledged appends, a real
+loss, so its terminal carries `raw_log.incomplete` exactly when any were
+pending, and `logs` never returns a byte past the seal (§6.4, §7.6)
+[t4r12.1]. Runtime §9's last
 sentence (`:1119`, "`logs` resolves only each selected event's validated raw
 reference…") is replaced by A25's text. Restatements: C1 §5 `raw_spans` row
 (A24); `codex.md:223-224`, replace "Raw extraction uses individual event
@@ -1834,6 +1863,7 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` [t4r11.1] | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection, for another turn's connection under a turn address, or beyond a connection's end is `invalid_params`; after a crash mid-turn the turn's connection is readable and recovery seals it |
 | `s1_c1_logs_end_cursor_resumes_while_running` [t4r5.12, t4r6.11] | a call before any byte is durable returns `r1.start`, and a later call from it returns the first bytes; on a running turn `next_cursor` is non-null at the current end and a later call from it returns only new bytes; after the terminal and seal it is `null` |
 | `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4, t4r9.1, t4r9.5, t4r10.1] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`; an ordinary write begun just below the line that would commit above it is rolled back `NotCommitted` and leaves `page_count` at or below the line; a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health; the WAL growth of a maximal event batch and of a terminal with many carried rows on a near-ceiling store is recorded for `via-d9o.2.3` (no bound asserted, Q-R9-1) [t4r10.1] |
+| `s1_raw_seal_discards_late_appends_and_flags_loss` [t4r12.1] | (a) the raw worker stalled (`Store::stall_raw_worker()`) with one stdout append queued when `finish` reaches its deadline, then resumed: the append is truncated or refused `Sealed`, the payload file and index end at `high_water`, `logs` returns exactly the bytes up to the seal, and the terminal carries `raw_log.incomplete`; (b) the worker stalled with every unit acknowledged and only the barrier queued: the seal equals the durable end and no flag is set; (c) a crash after the terminal and before the worker applies the seal: restart truncates the files to `high_water` |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket_and_frees_the_permit` | A31; A32, with `VIA_TEST_REPLY_WRITE_MS` |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` | four turns, 256 MiB stdout flood; daemon peak RSS < 256 MiB, growth < 32 MiB after the first 64 MiB, each anchor ≤ 32 MiB, sum < 384 MiB, `MemoryBudget` high-water ≤ 128 MiB, the SQLite cache's 8 MiB included [t4r7.1]; `daemon/status`, `status` and a `cancel` of another turn answer within 100 ms, including with its interrupt write blocked at `HoldStdin`; the flood turn ends `failed(overflow)` with `raw_log.incomplete` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent after filling the channel: `overflow` at the lowered stall with no further vendor byte |
