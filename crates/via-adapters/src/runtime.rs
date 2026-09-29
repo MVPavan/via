@@ -320,6 +320,12 @@ impl AdapterRuntime {
         self.route.holdings_changed()
     }
 
+    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
+    /// design §11.3 `process.alive`).
+    pub fn live_armed(&self, anchors: &[String]) -> bool {
+        self.route.live_armed(anchors)
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns, which
     /// block idle exit (design §6.4).
     pub fn pending_cleanup(&self) -> usize {

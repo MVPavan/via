@@ -96,6 +96,9 @@ struct LiveControl {
     generation: String,
     stop: Arc<StopFacts>,
     phase: LaunchPhase,
+    /// The group's exit watch, from `Armed` on: [`Host::live_armed`] reads
+    /// it (Task 4 design §11.3).
+    exit: Option<watch::Receiver<Option<ExitReport>>>,
 }
 
 /// Where a verified control's launch is (design §6.8 [r6.1]). Only an
@@ -254,13 +257,29 @@ impl Capacity {
     /// entry was not `Armed` when `stopping` was set and the owner sends
     /// `Stop` itself. `stopping` is derived before the phase changes, so
     /// this entry is never in the task's snapshot as well.
-    fn armed(&self, anchor_id: &str) -> Option<Instant> {
+    fn armed(&self, anchor_id: &str, exit: watch::Receiver<Option<ExitReport>>) -> Option<Instant> {
         let mut ledger = self.lock();
         let stopping = ledger.stopping();
         if let Some(control) = ledger.live.get_mut(anchor_id) {
             control.phase = LaunchPhase::Armed;
+            control.exit = Some(exit);
         }
         stopping
+    }
+
+    /// [`Host::live_armed`] under the ledger mutex.
+    fn live_armed(&self, anchors: &[String]) -> bool {
+        let ledger = self.lock();
+        anchors.iter().any(|anchor_id| {
+            ledger.live.get(anchor_id).is_some_and(|control| {
+                control.phase == LaunchPhase::Armed
+                    && control.stream.strong_count() > 0
+                    && control
+                        .exit
+                        .as_ref()
+                        .is_some_and(|exit| exit.borrow().is_none())
+            })
+        })
     }
 
     /// Releases the anchor's capacity once its group is proved absent.
@@ -876,6 +895,13 @@ impl Host {
         live + ledger.acquiring.len()
     }
 
+    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
+    /// design §11.3 `process.alive`): its verified control is held, phase
+    /// `Armed`, and its exit watch has not reported an exit.
+    pub fn live_armed(&self, anchors: &[String]) -> bool {
+        self.capacity.live_armed(anchors)
+    }
+
     /// Subscribes Host's early-stop task to the daemon force signal (design
     /// §6.8 [r4.3, r5.1–r5.4]). On the signal it stops every live group in
     /// the ledger through its verified control, concurrently, each bounded
@@ -1129,6 +1155,7 @@ impl Host {
                 generation: generation.clone(),
                 stop: stop.clone(),
                 phase: LaunchPhase::Verified,
+                exit: None,
             },
         );
         if let Some(deadline) = registered {
@@ -1271,10 +1298,12 @@ impl Host {
                 "anchor did not confirm descriptor detachment",
             ));
         };
+        // The group's exit watch, which the ledger's `Armed` entry reads.
+        let (sender, exits) = watch::channel(None);
         // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
         // that already took its snapshot missed this group, so the owner
         // stops it under the original deadline.
-        if let Some(deadline) = self.capacity.armed(&anchor_id) {
+        if let Some(deadline) = self.capacity.armed(&anchor_id, exits.clone()) {
             let deadline = state.stop_early(deadline);
             state.forced = stop_through(&control, &generation, &stop, deadline).await;
             #[cfg(feature = "test-failpoints")]
@@ -1305,7 +1334,6 @@ impl Host {
         let pipes = launch
             .take()
             .ok_or(HostError::Protocol("launch pipes already taken"))?;
-        let (sender, exits) = watch::channel(None);
         let control = ProcessControl {
             stream: control,
             identity,
@@ -2506,6 +2534,7 @@ mod tests {
             generation: generation.to_owned(),
             stop: Arc::new(StopFacts::default()),
             phase: LaunchPhase::Verified,
+            exit: None,
         };
         (live, (control, peer))
     }
@@ -2540,10 +2569,46 @@ mod tests {
         let (late, _keep_second) = live_control("g2");
         assert_eq!(capacity.register("a2", late), expected);
         assert_eq!(capacity.begin_arming("a1"), Err(at + EARLY_STOP));
-        assert_eq!(capacity.armed("a1"), expected);
+        assert_eq!(capacity.armed("a1", watch::channel(None).1), expected);
         assert_eq!(
             capacity.begin_stopping().map(|(deadline, _)| deadline),
             expected
+        );
+    }
+
+    /// Task 4 design §11.3: `process.alive` is positive evidence only: an
+    /// `Armed` entry whose control is held and whose exit watch reported no
+    /// exit. An exit observed while the control is still upgradeable, or a
+    /// dropped control, is not alive.
+    #[tokio::test]
+    async fn live_armed_needs_a_held_armed_control_without_an_exit() {
+        let (capacity, _force) = ledger_with_force();
+        let (control, keep) = live_control("g1");
+        let anchors = ["a1".to_owned()];
+        assert_eq!(capacity.register("a1", control), None);
+        assert!(!capacity.live_armed(&anchors), "verified is not armed");
+        let (exit, exits) = watch::channel(None);
+        assert_eq!(capacity.armed("a1", exits), None);
+        assert!(capacity.live_armed(&anchors));
+        assert!(!capacity.live_armed(&["a2".to_owned()]));
+        exit.send_replace(Some(ExitReport {
+            code: Some(0),
+            signal: None,
+        }));
+        assert!(
+            !capacity.live_armed(&anchors),
+            "an observed exit is not alive"
+        );
+        let (control, keep_second) = live_control("g2");
+        assert_eq!(capacity.register("a2", control), None);
+        let (_exit, exits) = watch::channel(None);
+        assert_eq!(capacity.armed("a2", exits), None);
+        assert!(capacity.live_armed(&["a2".to_owned()]));
+        drop(keep);
+        drop(keep_second);
+        assert!(
+            !capacity.live_armed(&["a2".to_owned()]),
+            "a dropped control is not alive"
         );
     }
 
@@ -2567,7 +2632,7 @@ mod tests {
         let (control, _keep) = live_control("g1");
         assert_eq!(capacity.register("a1", control), None);
         assert_eq!(capacity.begin_arming("a1"), Ok(()));
-        assert_eq!(capacity.armed("a1"), None);
+        assert_eq!(capacity.armed("a1", watch::channel(None).1), None);
         assert_eq!(capacity.lock().live["a1"].phase, LaunchPhase::Armed);
     }
 
@@ -2588,7 +2653,7 @@ mod tests {
                 assert_eq!(capacity.begin_arming(anchor), Ok(()));
             }
             if phase >= 2 {
-                assert_eq!(capacity.armed(anchor), None);
+                assert_eq!(capacity.armed(anchor, watch::channel(None).1), None);
             }
         }
         (capacity, force, keep)
@@ -2612,7 +2677,10 @@ mod tests {
         let (capacity, force, _keep) = one_entry_per_phase();
         let at = Instant::now();
         force.send_replace(Some(at));
-        assert_eq!(capacity.armed("a_r"), Some(at + EARLY_STOP));
+        assert_eq!(
+            capacity.armed("a_r", watch::channel(None).1),
+            Some(at + EARLY_STOP)
+        );
         assert!(capacity.begin_arming("a_v").is_err());
         let (deadline, snapshot) = capacity.begin_stopping().expect("force is raised");
         assert_eq!(deadline, at + EARLY_STOP);
@@ -2635,7 +2703,10 @@ mod tests {
         let (deadline, snapshot) = capacity.begin_stopping().expect("force is raised");
         assert_eq!(deadline, at + EARLY_STOP);
         assert_eq!(generations(&snapshot), ["g_a_a"]);
-        assert_eq!(capacity.armed("a_r"), Some(at + EARLY_STOP));
+        assert_eq!(
+            capacity.armed("a_r", watch::channel(None).1),
+            Some(at + EARLY_STOP)
+        );
         assert!(capacity.begin_arming("a_v").is_err());
         let (late, _keep_late) = live_control("g_late");
         assert_eq!(capacity.register("a_late", late), Some(at + EARLY_STOP));
@@ -2648,7 +2719,7 @@ mod tests {
         let (control, _keep) = live_control("g1");
         assert_eq!(capacity.register("a1", control), None);
         assert_eq!(capacity.begin_arming("a1"), Ok(()));
-        assert_eq!(capacity.armed("a1"), None);
+        assert_eq!(capacity.armed("a1", watch::channel(None).1), None);
         assert!(capacity.begin_stopping().is_none());
     }
 }
