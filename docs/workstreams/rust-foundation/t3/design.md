@@ -1056,7 +1056,7 @@ write ~~or a raw append or sync~~ [void: T4-A46], has exactly one outcome:
 - **committed**;
 - **not committed**:
   - the error came before `COMMIT`, and SQLite rolled the transaction back
-    (`Write`, `Constraint`, `Raw`);
+    (`Write`, `Constraint` ~~, `Raw`~~ [void: T4-A46]);
   - or the request was never enqueued: the new `StoreError::NotEnqueued`
     covers today's `Unavailable` from the **SQLite writer's** `try_send`
     `Full` only [r3.9, r5.6]. There is no extra retry for `Full`; Task 4's
@@ -1079,14 +1079,14 @@ write ~~or a raw append or sync~~ [void: T4-A46], has exactly one outcome:
   - `NotEnqueued` applies only to the SQLite writer's `try_send` `Full`;
   - ~~on the raw thread, `Full` and I/O errors (append, sync or index) are
     `StoreError::Raw`, which is §7.2 row 6;~~ [void: T4-A46]
-  - `Disconnected` and a dropped reply are `WriterLost` on both threads,
-    and latch.
+  - `Disconnected` and a dropped reply are `WriterLost` ~~on both threads~~
+    on the SQLite writer [void part: T4-A46], and latch.
 - **The kind travels upward** [r5.5]. Wire reports the classified Store
-  failure kind upward on `RouteError::Store`: `Raw`, `NotEnqueued`,
-  `WriterLost` or `Uncertain`.
+  failure kind upward on `RouteError::Store`: ~~`Raw`,~~ `NotEnqueued`,
+  `WriterLost` or `Uncertain` [`Raw` void: T4-A46].
   - S1 carries the kind.
   - S5's Core hook latches on `WriterLost` and `Uncertain`, and scopes
-    `Raw` and `NotEnqueued`.
+    ~~`Raw` and~~ `NotEnqueued` [`Raw` void: T4-A46].
   - Until S5, the hook latches on everything.
 
 - `journal::may_have_committed` becomes `Uncertain | WriterLost`. This
@@ -1773,7 +1773,7 @@ the existing `expect_request`, `emit`, `hang`, `ignore_term`,
 | `a_failed_proof_before_a_page_read_failure_fails_the_restart_close` (engine) | a failed absence-proof write on page 1, then a page-read error on page 2: restart close fails startup and commits no `session.closed` [t3r.2] |
 | `s1_f12_latch_cancel_and_close_return_store_error` | after the latch, `cancel` and `close` return `store_error`, and the force stop cleans up (§7.4, O1.D13) |
 | unit (`via-core` journal) | an event that is not committed leaves the head's `next` unchanged; an uncertain one calls `lost()` (§7.1) |
-| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; the SQLite writer's `try_send` `Full` gives `NotEnqueued` [r6.4]; `try_send` `Disconnected` and a dropped reply give `WriterLost`, for the writer and the raw thread alike; raw `Full` and raw I/O errors give `Raw` (row 6); `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`Raw`, `NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5] |
+| unit (`via-store`) | error classification: pre-`COMMIT` failures give `Write`; a `COMMIT`-step failure gives `Uncertain`; the SQLite writer's `try_send` `Full` gives `NotEnqueued` [r6.4]; `try_send` `Disconnected` and a dropped reply give `WriterLost` for the SQLite writer; `SQLITE_CORRUPT` gives `Corrupt` (§7.1) [r3.9, r5.6]. Wire's `RouteError::Store` carries the kind (`NotEnqueued`, `WriterLost`, `Uncertain`) [r5.5]. The raw-thread, raw `Full`/I/O and `Raw` cases are void [T4-A46] |
 
 The existing T2-B2 latch tests stay. Those that inject a **not committed**
 failure and expect the latch (for example
