@@ -67,7 +67,7 @@ the set.
   - C1 requests use `#[serde(deny_unknown_fields)]`.
   - Vendor messages ignore unknown fields. Decode the protocol envelope
     first, then dispatch on the method or type. An unknown **notification**
-    becomes a raw-payload event (tag plus bounded payload) and is logged. An
+    produces no observation; it only moves the turn's activity time. An
     unknown **request** gets the protocol's decline or error response under
     a deadline and a canonical event (D3); it is never left unanswered.
   - A malformed message of a known type is a protocol error, not an
@@ -116,11 +116,10 @@ the set.
   fail). C2 observations have both 1024-item and 4 MiB/session limits; their
   control lane and sticky health failure path cannot wait behind data.
 - **Pipe reads never wait for consumers.** One reader task per vendor pipe
-  reads continuously. Raw-log staging is bounded in bytes. If lossless
-  recording cannot keep up, or a raw-log write fails, the connection fails:
-  Host supervises the process, draining continues (bounded) during cleanup,
-  and the raw log is marked incomplete. Never drop bytes silently, and never
-  report a turn as fully observed after a gap.
+  reads continuously. The message queue is bounded in messages and bytes.
+  If the consumer cannot keep up, the connection fails: Host supervises the
+  process and the reader keeps draining, discarding, during cleanup. Never
+  report a turn as fully observed after a lost message.
 - **Deadlines are absolute and monotonic.** Core hands down an absolute wall
   deadline (`Instant`) and a separate idle deadline that resets on
   progress. Nested operations use the remaining time; they never start a
@@ -140,7 +139,7 @@ the set.
 - **Shutdown order** (daemon and each component): stop admission; settle or
   classify active turns; close vendor input and transports while readers
   keep draining; escalate only VIA-owned processes on deadline; reap
-  children; flush raw logs and Store records; join the Store thread;
+  children; flush Store records; join the Store thread;
   release the daemon lock. Never kill a shared server to cancel one turn.
 
 ## 6. Processes, environment and the socket
@@ -202,9 +201,9 @@ the set.
   atomically. Refuse to open a database with a newer schema than the binary
   supports. Update the spec in the same change.
 - **Write order.** Persist a turn's submission intent before submitting to
-  the vendor; acknowledge state to a caller only after the commit. Raw-log
-  bytes are flushed before any Store row references their offsets; recovery
-  handles truncated or unreferenced raw spans.
+  the vendor; acknowledge state to a caller only after the commit. A file in
+  a turn's evidence folder that the envelope names is synced, with its
+  folder, before the terminal commits.
 - Disk-full and I/O failures map to named Store errors, never panics.
 
 ## 8. Observability and privacy
@@ -214,7 +213,7 @@ the set.
 - Tracing is the daemon's own diagnostics. Environment values, credentials
   and caller handles never appear in tracing at any level. Prompts and
   vendor payloads never appear in tracing at `info` or above.
-- Raw logs and Store contents are private local data and may contain
+- Evidence folders and Store contents are private local data and may contain
   sensitive vendor output. Retention and export are explicit. Only
   separately sanitized copies become fixtures or shared reports; originals
   stay local so their offsets remain valid.
@@ -271,7 +270,7 @@ Confirmed by the owner, 2026-09-26.
     dirty-tree status; `Cargo.lock` hash; toolchain; OS and architecture;
     features; fake binary and fixture hashes or vendor versions;
     normalization version;
-  - per scenario: envelopes, event logs, raw logs, a consistent Store dump
+  - per scenario: envelopes, event logs, evidence folders, a consistent Store dump
     (SQLite backup, not a copy of the live file) and the daemon trace;
   - a sha256 manifest, verified on replay, and a short `REPORT.md`.
   The gate fails if a scenario omits its summary, manifest or required

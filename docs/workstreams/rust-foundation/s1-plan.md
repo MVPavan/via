@@ -15,10 +15,10 @@ through all six layers and the Store, driven by a fake agent.
 - **In:** the `via` binary with the daemon (socket, lock, handshake,
   auto-start, idle exit, `daemon status|stop`); Store schema v1 with
   migrations; C1 methods `hello`, `describe`, `spawn`, `resume`, `steer`,
-  `cancel`, `close`, `status`, `wait`, `result`, `list`, `events` (page and
-  follow), `unsubscribe`, `logs`, `models`; harness `fake` only; wall and idle deadlines;
+  `cancel`, `close`, `status`, `wait`, `result`, `list`, `events` (page),
+  `logs`, `models`; harness `fake` only; wall and idle deadlines;
   process-group cleanup; crash recovery to `unknown`; orphan kill by verified
-  identity; raw log per connection and event log per turn; `serve --stdio` proxy.
+  identity; evidence folder and event log per turn; `serve --stdio` proxy.
 - **Out:** real vendors (S2+), vendor requests and auto-decline (S3), bound
   enforcement (the fake route declares bound `full` only), version gate
   (S2), server sharing (S3), structured-output validation (S2).
@@ -41,7 +41,7 @@ four original headline acceptance scenarios, not an exemption for other rows.
 | F2 | Daemon killed, stale socket file left | Next CLI starts a new daemon, which takes the lock before replacing the socket |
 | F3 | Socket directory unsafe (owner, mode, symlink) | Daemon refuses to start with a clear error; CLI exits 4 |
 | F4 | Client and daemon versions differ | `version_mismatch`; CLI restarts an idle daemon, else reports |
-| F5 | No `hello`, malformed JSON, unknown field, line over 16 MiB | Request error (oversize closes that connection); the daemon keeps serving others |
+| F5 | No `hello`, malformed JSON, unknown field, line over 1 MiB (T4-A39) | Request error (oversize is `request_too_large` and closes that connection); the daemon keeps serving others |
 | F6 | Idle exit races a new client | Never exits with a session active or a client connected; a late client gets a fresh daemon |
 | F7 | `daemon stop` while sessions are active | Refused; `--drain` finishes accepted turns then stops; `--force` closes sessions |
 
@@ -72,7 +72,7 @@ four original headline acceptance scenarios, not an exemption for other rows.
 |---|---|---|
 | F19 **A** | Agent hangs silently | Idle or wall deadline fails the turn; every process remaining in the VIA-owned process group, including an ordinary grandchild, is gone within the grace period |
 | F20 | Agent ignores SIGTERM | Escalated to SIGKILL after the grace period |
-| F21 | Agent crashes mid-line without a terminal result | Turn `failed(process_exited)` after Host confirms exit (C1 §7.6); the partial bytes stay in the raw log |
+| F21 | Agent crashes mid-line without a terminal result | Turn `failed(process_exited)` after Host confirms exit (C1 §7.6); the first 64 KiB of the partial line go to `undecoded.bin` (T4-A46) |
 | F22 | Agent outlives a daemon crash (as Claude did in probe P4) | Restarted daemon kills it only after confirming uid, start time, group and marker; a reused pid is never signalled (plus an *isolated* identity test) |
 | F23 | Secrets in the daemon's environment | The agent sees only allow-listed variables |
 
@@ -85,9 +85,9 @@ Document that boundary; stronger containment needs a separate design decision.
 | # | What goes wrong | Required behaviour |
 |---|---|---|
 | F24 **A** | Agent floods hundreds of MB | The pipe reader never stops; daemon memory stays bounded; if Core cannot drain for 10 s the turn fails `overflow` (A1) |
-| F25 | A follower stops reading | It gets `event_end: lagged`; the turn and other clients are unaffected |
-| F26 | Follow starts while events are being written | No gap or duplicate at the replay → live boundary; `seq` dense per session |
-| F27 | Invalid UTF-8, split or huge lines | Raw log keeps exact bytes; the framer never panics (plus *isolated* property tests) |
+| F25 | A client polls `status` during a flood (T4-A25; was: a follower stops reading) | `status` answers from memory; the turn and other clients are unaffected |
+| F26 | The daemon crashes after a step commit (T4-A25; was: follow starts while events are written) | Step rows survive up to the last committed step; `seq` dense per session |
+| F27 | Invalid UTF-8, split or huge lines | Exact messages or explicit failure, the first 64 KiB kept in `undecoded.bin`; the splitter never panics (plus *isolated* property tests) |
 | F28 **A** | Two callers drive two sessions at once | No crosstalk; each session's events stay ordered |
 
 ### CLI
@@ -109,7 +109,7 @@ Document that boundary; stronger containment needs a separate design decision.
   those fixtures against their real adapter/route code.
 - **Failpoints:** named pause and crash points (F8, F10, F12) behind a
   test-only cargo feature, absent from release builds.
-- **Isolated, failure-first:** NDJSON framer (property tests), process
+- **Isolated, failure-first:** NDJSON message splitter (property tests), process
   identity check, turn state machine, Store migrations.
 - **Artifact:** per run, as coding-style §10 specifies (summary, per-scenario evidence,
   sha256 manifest, `REPORT.md`).
@@ -131,8 +131,7 @@ C3 Route, C4 Wire, C5 Host and Store ownership/signatures, transaction and
 raw-log durability boundaries, F12 behavior under persistent storage failure,
 and numeric memory, cleanup and slow-client bounds. It specifies observable
 test seams and how test-only failpoints are enabled and excluded from release.
-For F25, distinguish attempted lag notification from delivery to a peer that
-never reads. Produce the bounded design under `docs/specs/`, with Rust doc
+Produce the bounded design under `docs/specs/`, with Rust doc
 comments reflecting it during implementation. Update C1/C2 only when the
 resolved behavior requires it; do not reopen approved decisions gratuitously.
 
@@ -204,10 +203,9 @@ Stage: `via-jm4.7`.
 
 Files: Wire, Route, Adapter, Core, CLI and stream/conformance tests. Interfaces:
 consumes Tasks 1–3; produces complete S1 behavior. Approach: failure-first F5
-and F24–F27, plus normal event paging/follow/unsubscribe, subscription cleanup
-on disconnect, log isolation, models/describe,
+and F24–F27, plus normal event paging, status progress, log isolation, models/describe,
 daemon status and `serve --stdio` parity. Assert the design packet's numeric
-bounds; cover frame property tests and replay-to-live ordering.
+bounds; cover message-splitter property tests.
 
 Verification: the full Rust and failpoint gates pass, every F1–F30 scenario has
 an artifact, and the normal default suite meets coding-style's speed budget.

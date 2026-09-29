@@ -815,8 +815,10 @@ unsafe existing lock/database/log targets before mutation. Native race
 resistance remains a platform gate. Create regular state files and both
 socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
-SQLite, blob and evidence files; Host owns anchor sockets; daemon main owns the
-singleton/socket lock.
+SQLite and blob files, and validates or creates the `evidence/` root; Wire
+creates each turn's folder under it; Host opens the turn's `stderr.log` for
+the child; `final_text.txt` is written through `StoreClient`. Host owns
+anchor sockets; daemon main owns the singleton/socket lock.
 
 Acquire nonblocking `daemon.lock` first, then nonblocking `store.lock`; hold
 both for daemon lifetime and never unlink either inode. Only after both
@@ -898,8 +900,9 @@ pending and failed joins, committed anchors, owners with uncertain cleanup,
 the named Host failure, force-stopped turns whose terminal did not commit,
 Store join status and the `clean`/`incomplete` disposition. `GroupAbsent`
 is not reaped, and a joined status task is not group absence. It adds no
-`daemon/status` field, RPC or durable report; it may be lost on Store failure
-or abrupt death, and the outer harness captures exit status and diagnostics.
+`daemon/status` field or RPC; `via.log` is diagnostic, not a contract, so
+the line is no durable report. It may be lost on Store failure or abrupt
+death, and the outer harness captures exit status and diagnostics.
 A result that cannot persist keeps F12's named `store_error` and
 `terminal_persisted:false`; no envelope is invented or replaced.
 
@@ -969,14 +972,16 @@ recovery provides safety even if the last in-memory failure reason is lost.
 
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
-testing default ceilings. Configuration can lower bounds; raising them needs
-an explicitly checked aggregate budget and acceptance measurements. All
+testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
+data-size warning, WAL limit and checkpoint triggers; see the end of this
+section) are configurable; C1, C2 and every other limit here are fixed
+(T4-A37). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Active private connections | 4 daemon-wide (one vendor + one anchor each) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process and memory permits, not extra pools |
+| OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process and memory permits, not extra pools. S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. |
 | OpenCode vendor child-session metadata | 32 records per live server; one active top-level turn per owner | Refuse excess child metadata without routing it to another owner; idle namespaces retain durable identity but no listener or server memory |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
 | Unresolved turns (receipted, no terminal known durable: in flight or failed to persist) | 256 daemon-wide | When full, `spawn` first forgets failed turns whose terminal a Store read now finds durable; still full of in-flight turns is `admission_refused` ("too many unresolved turns"), while a retained failed turn keeps refusal and its reads `store_error` |
