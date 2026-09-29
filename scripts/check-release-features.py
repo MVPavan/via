@@ -118,6 +118,10 @@ POINTS = [
     "store.read.corrupt.anchor_records",
     # Task 3 force row (design §6.8, §10): a recorded exit not yet returned.
     "wire.exit.observed",
+    # Task 4 T4-3 (design §2.3, §8.6, §13.1): Core held before handling an
+    # observation; a Wire connection dropped without `finish`.
+    "core.observations.pause",
+    "wire.fallback_drop",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
@@ -125,6 +129,7 @@ OVERRIDES = {
     "VIA_TEST_CLIENT_VERSION": "0.0.0-release-check",
     "VIA_TEST_IDLE_EXIT_MS": "1",
     "VIA_TEST_READ_FAILURE_MS": "1",
+    "VIA_TEST_EVENT_STALL_MS": "1",
 }
 MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {

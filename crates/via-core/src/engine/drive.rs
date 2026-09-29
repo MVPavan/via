@@ -7,8 +7,8 @@ use std::{
 
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    AdapterError, FakeAcceptanceObservation, FakeObservation, FakeTerminalEvidence, Observation,
-    RouteError, StopOrder, StopWatch, ToolStatus, WireCleanup,
+    AdapterError, AdmittedObservation, FakeAcceptanceObservation, FakeObservation,
+    FakeTerminalEvidence, Observation, RouteError, StopOrder, StopWatch, ToolStatus, WireCleanup,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, QueuedTurn, StoreError, SubmissionRecord, TerminalExtras,
@@ -1184,31 +1184,45 @@ impl Engine {
         capacity: via_adapters::CapacityToken,
         control: &mut Control<'_>,
     ) -> Driven {
-        // Full: Adapter waits under the turn deadline; this loop keeps draining until
-        // the adapter finishes.
-        let (observed_tx, mut observed_rx) = mpsc::channel::<FakeObservation>(64);
+        // Design §2.3: 1,024 items and a 4 MiB byte budget; an item's permit
+        // is held until it is handled.
+        let (sink, mut observed_rx) = via_adapters::observation_channel();
         let mut execute = Box::pin(self.adapter.execute(
             record.session.clone(),
             record.turn,
             prompt,
-            observed_tx,
+            sink,
             deadline,
             self.signal.force.subscribe(),
             stop,
             capacity,
         ));
-        // No branch is cancelled mid-commit: an observation arm runs to completion
-        // before the next poll, and the adapter's own sends wait for capacity.
-        loop {
+        // Design §9: every commit here runs inside `while_polling`, so the
+        // adapter keeps servicing its controls; a result it returns early is
+        // kept and acted on after the commit.
+        let mut early = None;
+        let result = loop {
+            if let Some(result) = early.take() {
+                break result;
+            }
             let idle_at = control.idle_at;
             tokio::select! {
-                Some(observation) = observed_rx.recv() => {
+                Some(admitted) = observed_rx.recv() => {
+                    let AdmittedObservation { observation, permit } = admitted;
                     if let Some(idle_at) = control.idle_at.as_mut()
                         && progress(&observation)
                     {
                         *idle_at = tokio::time::Instant::now() + control.idle;
                     }
-                    self.observe(record, effective, observation).await;
+                    while_polling(&mut execute, &mut early, async {
+                        // Test builds: Core holds before handling an observation.
+                        #[cfg(feature = "test-failpoints")]
+                        let _ = via_store::failpoint::hit_async("core.observations.pause").await;
+                        self.observe(record, effective, observation).await;
+                    })
+                    .await;
+                    // Handled: its bytes return to the budget.
+                    drop(permit);
                     stop_for_store(record, control);
                 }
                 changed = control.orders.changed(), if !control.observed => {
@@ -1216,7 +1230,12 @@ impl Engine {
                         .ok()
                         .and_then(|()| control.orders.borrow_and_update().clone());
                     if let Some(order) = order {
-                        self.observe_order(record, control, &order).await;
+                        while_polling(
+                            &mut execute,
+                            &mut early,
+                            self.observe_order(record, control, &order),
+                        )
+                        .await;
                         stop_for_store(record, control);
                     }
                 }
@@ -1228,31 +1247,31 @@ impl Engine {
                     let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
                     control.slot.idle_order(control.turn, tokio::time::Instant::now());
                 }
-                result = &mut execute => {
-                    self.drain(record, effective, control, &mut observed_rx).await;
-                    return match result {
-                        Err(AdapterError::Route(route))
-                            if matches!(route.cause, RouteError::ForceStopped { .. }) =>
-                        {
-                            Driven::Forced(Forced {
-                                requested_at: self
-                                    .signal
-                                    .force_requested_at
-                                    .get()
-                                    .cloned()
-                                    .unwrap_or_else(|| rfc3339(SystemTime::now())),
-                                launched: route.launched,
-                                close: RouteClose {
-                                    forced: route.forced,
-                                    quiescent: route.cleanup == Some(WireCleanup::Quiescent),
-                                },
-                                journal_uncertain: route.journal_uncertain,
-                            })
-                        }
-                        result => Driven::Finished(result),
-                    };
-                }
+                result = &mut execute => break result,
             }
+        };
+        self.drain(record, effective, control, &mut observed_rx)
+            .await;
+        match result {
+            Err(AdapterError::Route(route))
+                if matches!(route.cause, RouteError::ForceStopped { .. }) =>
+            {
+                Driven::Forced(Forced {
+                    requested_at: self
+                        .signal
+                        .force_requested_at
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| rfc3339(SystemTime::now())),
+                    launched: route.launched,
+                    close: RouteClose {
+                        forced: route.forced,
+                        quiescent: route.cleanup == Some(WireCleanup::Quiescent),
+                    },
+                    journal_uncertain: route.journal_uncertain,
+                })
+            }
+            result => Driven::Finished(result),
         }
     }
 
@@ -1264,10 +1283,15 @@ impl Engine {
         record: &mut TurnRecord,
         effective: &Effective,
         control: &mut Control<'_>,
-        observed: &mut mpsc::Receiver<FakeObservation>,
+        observed: &mut mpsc::Receiver<AdmittedObservation>,
     ) {
-        while let Ok(observation) = observed.try_recv() {
+        while let Ok(AdmittedObservation {
+            observation,
+            permit,
+        }) = observed.try_recv()
+        {
             self.observe(record, effective, observation).await;
+            drop(permit);
             stop_for_store(record, control);
         }
     }
@@ -1284,8 +1308,14 @@ impl Engine {
         queued: Vec<FakeObservation>,
     ) {
         let (sender, mut observed) = mpsc::channel(queued.len().max(1));
+        let budget = Arc::new(tokio::sync::Semaphore::new(queued.len()));
         for observation in queued {
-            let _ = sender.try_send(observation);
+            if let Ok(permit) = Arc::clone(&budget).try_acquire_owned() {
+                let _ = sender.try_send(AdmittedObservation {
+                    observation,
+                    permit,
+                });
+            }
         }
         drop(sender);
         let mut control = Control {
@@ -1651,6 +1681,25 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
+}
+
+/// Awaits `commit` while polling the adapter's `execute` (design §9): a
+/// result it returns meanwhile is kept in `early`, and a completed
+/// `execute` is never polled again.
+async fn while_polling<E, F>(execute: &mut E, early: &mut Option<E::Output>, commit: F) -> F::Output
+where
+    E: std::future::Future + Unpin,
+    F: std::future::Future,
+{
+    let mut commit = std::pin::pin!(commit);
+    if early.is_none() {
+        tokio::select! {
+            biased;
+            output = &mut commit => return output,
+            result = &mut *execute => *early = Some(result),
+        }
+    }
+    commit.await
 }
 
 /// Meaningful progress resets the idle deadline (design §5 [r1.10]):

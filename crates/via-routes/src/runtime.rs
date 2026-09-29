@@ -1,19 +1,17 @@
+use std::future::Future;
 use std::sync::Arc;
 
-use serde_json::to_vec;
-use tokio::{
-    sync::{mpsc, watch},
-    time::timeout_at,
-};
+use tokio::sync::{mpsc, watch};
 
 use super::{
-    Deadline, FakeMessage, FakeStart, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure,
-    RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome, StopWatch, StoreFailure,
-    TerminalStatus, TurnNumber, WireRecovery, WireShutdown,
+    Deadline, FakeMessage, OutboundMessage, PrivateProcessSpec, ReprobeReport, RouteError,
+    RouteFailure, RouteMessage, RuntimeConfig, RuntimeResources, SendOutcome, StopWatch,
+    StoreFailure, TerminalStatus, TurnNumber, TurnStart, WireRecovery, WireShutdown,
 };
 use via_wire::{
-    CloseMode, CloseRequest, ExitReport, HostError, WireCleanup, WireConnection, WireError,
-    WireFailure, WireRuntime, WireSignals,
+    CloseMode, CloseRequest, ExitReport, FailureCause, HostError, LatchState, PendingWrite,
+    WireCleanup, WireError, WireFailure, WireMessages, WireParts, WireRuntime, WireSender,
+    WireSignals,
 };
 
 /// Final fake protocol evidence, including independently confirmed process exit.
@@ -51,15 +49,17 @@ impl FakeRoute {
 
     /// Sends one prompt after durable submission and awaits paired terminal and real exit.
     ///
-    /// Every decoded message, including acceptance, the terminal and late observations
-    /// after it, is sent on `observations` in decode order.
-    /// When that channel is full the route waits, bounded by `deadline`; a dropped
-    /// receiver fails the turn as overflow. On any failure the private group is
-    /// force-closed and stdout is drained under a separate cleanup bound.
+    /// Every decoded message, including acceptance, the terminal and late
+    /// observations after it, is sent on the `hop` in decode order. While
+    /// the hop is full Route reads no further message, and a closed hop
+    /// (the Adapter's stall, C2 A1) fails the turn as overflow. Every wait
+    /// keeps the controls serviced (Task 4 design §9). On any failure the
+    /// private group is force-closed and the connection finished under a
+    /// separate cleanup bound.
     ///
     /// `force` set fails the turn [`RouteError::ForceStopped`]: before launch
-    /// nothing starts; after it, messages already read are still forwarded, then
-    /// the same cleanup follows. The daemon force overrides a stop order.
+    /// nothing starts; after it, the same cleanup follows. The daemon force
+    /// overrides a stop order.
     ///
     /// `stop` is the turn's stop order (design §2): set before ARM, nothing
     /// launches; after ARM but before the start message, the group is
@@ -70,8 +70,8 @@ impl FakeRoute {
     pub async fn execute(
         &self,
         process: PrivateProcessSpec,
-        start: FakeStart,
-        observations: mpsc::Sender<RouteMessage>,
+        start: TurnStart,
+        hop: mpsc::Sender<RouteMessage>,
         deadline: Deadline,
         force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
@@ -102,16 +102,20 @@ impl FakeRoute {
         };
         let signals = WireSignals {
             force: force.clone(),
-            wake: woken,
+            wake: woken.clone(),
             gate,
         };
         let turn_run = self.run_turn(
             process,
             start,
-            &observations,
+            &hop,
             deadline,
             signals,
-            (force, stop.clone()),
+            Signals {
+                force,
+                stop: stop.clone(),
+                wake: woken,
+            },
         );
         tokio::select! {
             result = turn_run => result,
@@ -119,36 +123,48 @@ impl FakeRoute {
         }
     }
 
-    /// [`Self::execute`] after its entry checks, while the waker runs.
+    /// [`Self::execute`] after its entry checks, while the waker runs. Every
+    /// exit after the connection opened finishes it once, under the graceful
+    /// close's `close_by`, the force close's cleanup deadline or the stop
+    /// order's `close_by` (design §8.6).
     async fn run_turn(
         &self,
         process: PrivateProcessSpec,
-        start: FakeStart,
-        observations: &mpsc::Sender<RouteMessage>,
+        start: TurnStart,
+        hop: &mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-        signals: WireSignals,
-        (force, stop): (watch::Receiver<Option<tokio::time::Instant>>, StopWatch),
+        wire_signals: WireSignals,
+        signals: Signals,
     ) -> Result<FakeRouteResult, RouteFailure> {
         let turn = start.turn();
-        let mut wire = self
+        let WireParts {
+            sender,
+            mut messages,
+        } = self
             .wire
-            .open_connection(process, deadline, signals)
+            .open_connection(process, deadline, wire_signals)
             .await
-            .map_err(|error| acquire_failure(turn, &error, &force))?;
-        let signals = (force, stop);
-        let drive = Self::drive(&mut wire, start, observations, deadline, &signals);
+            .map_err(|error| acquire_failure(turn, &error, &signals.force))?
+            .into_parts();
+        let mut serving = Serving::new(turn, &sender, hop, deadline, signals);
+        let drive = Self::drive(&mut serving, &mut messages, start);
         let failed = match Box::pin(drive).await {
-            Ok(Finished::Result(result)) => return Ok(result),
+            Ok(Finished::Result(result, close_by)) => {
+                messages.finish(close_by).await;
+                return Ok(result);
+            }
             Ok(Finished::Late(terminal)) => {
                 // Design §2 rule 3 [r1.23]: a decoded terminal is returned
                 // even though the wall deadline passed during finalization;
                 // cleanup comes from Host's force close.
-                let report = wire
+                let cleanup = cleanup_deadline();
+                let report = sender
                     .close(CloseRequest {
                         mode: CloseMode::Force,
-                        deadline: cleanup_deadline(),
+                        deadline: cleanup,
                     })
                     .await;
+                messages.finish(cleanup).await;
                 return Ok(terminal.result(
                     report.vendor_exit.unwrap_or(ExitReport {
                         code: None,
@@ -163,19 +179,20 @@ impl FakeRoute {
         // The turn deadline may already have elapsed; cleanup gets its own
         // bound, or the stop order's `close_by`.
         let cleanup = failed.close_by.unwrap_or_else(cleanup_deadline);
-        let report = wire
+        let report = sender
             .close(CloseRequest {
                 mode: CloseMode::Force,
                 deadline: cleanup,
             })
             .await;
-        // The group is stopping; its stdout is read and discarded so it
-        // never blocks. The original failure stays authoritative.
-        Box::pin(wire.drain_to_eof(cleanup)).await;
+        // The group is stopping; the reader reads its stdout to EOF and
+        // discards it, so it never blocks. The original failure stays
+        // authoritative.
+        messages.finish(cleanup).await;
         Err(RouteFailure {
             cause: failed.cause,
             // The one message this turn could not decode, if any (design §7.3).
-            undecoded: wire.take_undecoded(),
+            undecoded: sender.take_undecoded(),
             exit: failed.exit.or(report.vendor_exit),
             launched: true,
             cleanup: Some(report.cleanup),
@@ -259,43 +276,34 @@ impl FakeRoute {
         self.wire.watch_force(forced);
     }
 
+    /// Writes the start, reads and forwards messages to the terminal, then
+    /// finalizes. Every wait goes through [`Serving::serve`].
     async fn drive(
-        wire: &mut WireConnection,
-        start: FakeStart,
-        observations: &mpsc::Sender<RouteMessage>,
-        deadline: Deadline,
-        (force, stop): &(watch::Receiver<Option<tokio::time::Instant>>, StopWatch),
+        serving: &mut Serving<'_>,
+        messages: &mut WireMessages,
+        start: TurnStart,
     ) -> Result<Finished, Failed> {
-        let turn = start.turn();
-        let mut force = force.clone();
+        let turn = serving.turn;
         // Design §2 rule 2: after ARM, an order set before the start message
         // is written: the start is not written and the group closes at once.
-        if let Some(order) = stop.borrow().as_ref() {
+        if let Some(order) = serving.signals.stop.borrow().as_ref() {
             return Err(Failed::stopped(turn, order.close_by));
         }
-        let mut bytes = to_vec(&start).map_err(|_| protocol(turn, "cannot encode fake start"))?;
-        bytes.push(b'\n');
-        let sent = wire
-            .write_message(&bytes, deadline)
-            .await
+        let start = start.into_message().map_err(Failed::from)?;
+        // While the start is pending no message is read: nothing the vendor
+        // answers is taken before its whole input is written.
+        let write = serving.sender.write(start, serving.deadline);
+        let sent = serving
+            .serve(write)
+            .await?
             .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
         if sent != SendOutcome::Written {
             return Err(transport(turn).into());
         }
-        let mut control = Control {
-            turn,
-            force: force.clone(),
-            stop: stop.clone(),
-            interrupted: false,
-        };
         let mut phase = Phase::Submitted;
         let terminal = loop {
-            let message = match Box::pin(next_message(wire, turn, deadline)).await? {
+            let message = match serving.next(messages).await? {
                 Next::Message(message) => message,
-                Next::Woken => {
-                    control.on_wake(wire, deadline).await?;
-                    continue;
-                }
                 // EOF without a terminal: a Host-confirmed exit is
                 // `ProcessExited`. F21: after an unterminated last line
                 // (kept in `undecoded.bin`) the wait is bounded by the cleanup
@@ -305,10 +313,9 @@ impl FakeRoute {
                 // (Host's early stop, design §6.8): the force row, never
                 // `ProcessExited`.
                 end @ (Next::Eof | Next::Unterminated) => {
-                    control.after_terminal()?;
                     let unterminated = matches!(end, Next::Unterminated);
-                    let exit = control.wait_exit(wire, deadline, unterminated).await?;
-                    control.after_terminal()?;
+                    let exit = serving.exit_before_terminal(unterminated).await?;
+                    serving.after_terminal()?;
                     return Err(Failed {
                         cause: RouteError::ProcessExited { turn },
                         exit: Some(exit),
@@ -317,31 +324,34 @@ impl FakeRoute {
                 }
             };
             phase
-                .advance(&message.payload, turn, control.interrupted)
+                .advance(&message.payload, turn, serving.interrupted)
                 .map_err(Failed::from)?;
             let terminal = terminal_evidence(&message);
-            forward(observations, message, turn, deadline, &mut force).await?;
+            serving.held = Some(message);
             if let Some(terminal) = terminal {
                 break terminal;
             }
         };
-        match Self::finalize(wire, turn, observations, deadline, &mut phase, &mut control).await {
+        serving.terminated = true;
+        match Self::finalize(serving, messages, &mut phase).await {
             Ok(exit) => {
-                let close_by = stop
+                let close_by = serving
+                    .signals
+                    .stop
                     .borrow()
                     .as_ref()
                     .map_or_else(cleanup_deadline, |order| order.close_by);
-                let close = wire
+                let close = serving
+                    .sender
                     .close(CloseRequest {
                         mode: CloseMode::Graceful,
                         deadline: close_by,
                     })
                     .await;
-                Ok(Finished::Result(terminal.result(
-                    exit,
-                    close.cleanup,
-                    close.journal_uncertain,
-                )))
+                Ok(Finished::Result(
+                    terminal.result(exit, close.cleanup, close.journal_uncertain),
+                    close_by,
+                ))
             }
             Err(failed) if matches!(failed.cause, RouteError::Deadline { .. }) => {
                 Ok(Finished::Late(terminal))
@@ -351,85 +361,233 @@ impl FakeRoute {
     }
 
     /// Terminal is semantic completion, not transport EOF. Half-close input
-    /// (fake finalization waits on it), then drain both pipes to EOF under the
+    /// (fake finalization waits on it), then read stdout to EOF under the
     /// turn deadline: late observations are forwarded and anything that
     /// breaks the phase order, such as a second terminal, fails the turn. A
     /// stop order no longer forces the turn.
     async fn finalize(
-        wire: &mut WireConnection,
-        turn: TurnNumber,
-        observations: &mpsc::Sender<RouteMessage>,
-        deadline: Deadline,
+        serving: &mut Serving<'_>,
+        messages: &mut WireMessages,
         phase: &mut Phase,
-        control: &mut Control,
     ) -> Result<ExitReport, Failed> {
-        wire.close_input(deadline)
-            .await
+        let turn = serving.turn;
+        let close = serving.sender.close_input(serving.deadline);
+        serving
+            .serve(close)
+            .await?
             .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
-        let mut force = control.force.clone();
         loop {
-            match Box::pin(next_message(wire, turn, deadline)).await? {
+            match serving.next(messages).await? {
                 Next::Message(message) => {
                     phase
-                        .advance(&message.payload, turn, control.interrupted)
+                        .advance(&message.payload, turn, serving.interrupted)
                         .map_err(Failed::from)?;
-                    forward(observations, message, turn, deadline, &mut force).await?;
+                    serving.held = Some(message);
                 }
-                Next::Woken => control.after_terminal()?,
                 Next::Eof => break,
                 Next::Unterminated => {
                     return Err(protocol(turn, "fake stdout ended inside a message").into());
                 }
             }
         }
-        loop {
-            match wire.wait_exit(deadline).await {
-                // Host's early stop raises the force before it stops the
-                // vendor (design §6.8), so an exit it caused is read under a
-                // set force. Wire hands back a recorded exit without
-                // consulting the force, so read it here: the force row, never
-                // an exit status Route reports as the vendor's own.
-                Ok(exit) => {
-                    control.after_terminal()?;
-                    return Ok(exit);
-                }
-                Err(WireError::Woken) => control.after_terminal()?,
-                Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
-            }
-        }
+        serving.flush().await?;
+        let exit = serving.sender.wait_exit(serving.deadline);
+        let exit = serving
+            .serve(exit)
+            .await?
+            .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
+        // Host's early stop raises the force before it stops the vendor
+        // (design §6.8), so an exit it caused is read under a set force.
+        // Wire hands back a recorded exit without consulting the force, so
+        // read it here: the force row, never an exit status Route reports
+        // as the vendor's own.
+        serving.after_terminal()?;
+        Ok(exit)
     }
 }
 
 /// How `drive` ended without a failure.
 enum Finished {
-    /// The normal path: terminal, exit and graceful close.
-    Result(FakeRouteResult),
+    /// The normal path: terminal, exit and graceful close, with the close's
+    /// bound for `finish`.
+    Result(FakeRouteResult, Deadline),
     /// A decoded terminal whose finalization outlived the wall deadline.
     Late(TerminalEvidence),
 }
 
-/// Route's side of a turn's stop order after the start message was written.
-struct Control {
-    turn: TurnNumber,
+/// The turn's control signals.
+struct Signals {
+    /// The daemon force.
     force: watch::Receiver<Option<tokio::time::Instant>>,
+    /// The turn's stop order.
     stop: StopWatch,
-    /// The one interrupt was sent.
-    interrupted: bool,
+    /// Route's wake for a new stop order or its `force_at`.
+    wake: watch::Receiver<u64>,
 }
 
-impl Control {
-    /// Acts on a wake before a terminal (design §2 rules 3 and 4): the daemon
-    /// force wins; at `force_at` the group is force-closed under `close_by`;
-    /// otherwise the first order sends the one interrupt and reading goes on.
-    async fn on_wake(
-        &mut self,
-        wire: &mut WireConnection,
+/// Route's side of a running turn: every wait on the vendor, the Adapter
+/// or a write goes through [`Self::serve`], so no wait hides a control
+/// (Task 4 design §9).
+struct Serving<'a> {
+    turn: TurnNumber,
+    sender: &'a WireSender,
+    hop: &'a mpsc::Sender<RouteMessage>,
+    deadline: Deadline,
+    signals: Signals,
+    latch: watch::Receiver<LatchState>,
+    /// The one interrupt was enqueued.
+    interrupted: bool,
+    /// The terminal was read: a stop order no longer acts.
+    terminated: bool,
+    /// The pending interrupt write, kept pinned while other waits run.
+    pending: Option<PendingWrite>,
+    /// A decoded message waiting for room on the hop.
+    held: Option<RouteMessage>,
+}
+
+/// What [`Serving::next`] read.
+enum Next {
+    /// One decoded vendor message.
+    Message(RouteMessage),
+    /// Stdout ended.
+    Eof,
+    /// Stdout ended inside a message; Wire kept its bytes (F21, design §7.3).
+    Unterminated,
+}
+
+impl<'a> Serving<'a> {
+    fn new(
+        turn: TurnNumber,
+        sender: &'a WireSender,
+        hop: &'a mpsc::Sender<RouteMessage>,
         deadline: Deadline,
-    ) -> Result<(), Failed> {
-        if self.force.borrow().is_some() {
-            return Err(RouteError::ForceStopped { turn: self.turn }.into());
+        signals: Signals,
+    ) -> Self {
+        Self {
+            turn,
+            sender,
+            hop,
+            deadline,
+            latch: sender.latch(),
+            signals,
+            interrupted: false,
+            terminated: false,
+            pending: None,
+            held: None,
+        }
+    }
+
+    /// Awaits `op` while servicing every control, biased (design §9):
+    /// (1) daemon force; (2) turn deadline; (3) the connection latch;
+    /// (4) the hop closed → `Overflow`; (5) Route's wake → [`Self::on_wake`];
+    /// (6) the pending interrupt completing; (7) room on the hop, which sends
+    /// the held message; (8) `op`. Every arm is cancel-safe: `op` and the
+    /// pending write stay pinned, the reserve holds no message.
+    async fn serve<T>(&mut self, op: impl Future<Output = T>) -> Result<T, Failed> {
+        let mut op = std::pin::pin!(op);
+        loop {
+            if let Some(output) = self.serve_once(op.as_mut()).await? {
+                return Ok(output);
+            }
+        }
+    }
+
+    /// Serves until the held message is on the hop, reading nothing more:
+    /// Route blocked on the hop stops calling `next_message` (design §2.3).
+    async fn flush(&mut self) -> Result<(), Failed> {
+        let mut never = std::pin::pin!(std::future::pending::<()>());
+        while self.held.is_some() {
+            self.serve_once(never.as_mut()).await?;
+        }
+        Ok(())
+    }
+
+    /// One round of [`Self::serve`]: `Some` once `op` completed.
+    async fn serve_once<T>(
+        &mut self,
+        op: std::pin::Pin<&mut impl Future<Output = T>>,
+    ) -> Result<Option<T>, Failed> {
+        let turn = self.turn;
+        let hop = self.hop;
+        tokio::select! {
+            biased;
+            () = forced(&mut self.signals.force) => Err(RouteError::ForceStopped { turn }.into()),
+            () = tokio::time::sleep_until(self.deadline.instant()) => {
+                Err(RouteError::Deadline { turn }.into())
+            }
+            cause = latched(&mut self.latch) => Err(wire_cause(turn, &cause.error()).into()),
+            () = hop.closed() => Err(self.hop_closed()),
+            () = woken(&mut self.signals.wake) => self.on_wake().map(|()| None),
+            // Not written or cut short: `force_at` still bounds the turn.
+            _unsent = pending(self.pending.as_mut()), if self.pending.is_some() => {
+                self.pending = None;
+                Ok(None)
+            }
+            permit = hop.reserve(), if self.held.is_some() => match (permit, self.held.take()) {
+                (Ok(permit), Some(message)) => {
+                    permit.send(message);
+                    Ok(None)
+                }
+                (Ok(_), None) => Ok(None),
+                (Err(_), _) => Err(self.hop_closed()),
+            },
+            output = op => Ok(Some(output)),
+        }
+    }
+
+    /// Reads and decodes the next vendor message once the held one is on
+    /// the hop. One Route cannot decode is kept in `undecoded.bin` first
+    /// (design §7.3).
+    async fn next(&mut self, messages: &mut WireMessages) -> Result<Next, Failed> {
+        let turn = self.turn;
+        loop {
+            self.flush().await?;
+            let message = match self.serve(messages.next_message()).await? {
+                Ok(Some(message)) => message,
+                Ok(None) => return Ok(Next::Eof),
+                // Route's own wake arm acts on it; nothing was lost.
+                Err(WireError::Woken) => continue,
+                Err(WireError::Message(WireFailure::UnterminatedMessage)) => {
+                    return Ok(Next::Unterminated);
+                }
+                Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
+            };
+            return match FakeMessage::decode(message.bytes(), turn) {
+                Ok(payload) => Ok(Next::Message(RouteMessage { payload })),
+                Err(cause) => {
+                    let what = format!(
+                        "undecodable vendor message: {} bytes",
+                        message.bytes().len()
+                    );
+                    self.sender.keep_undecoded(message.bytes(), &what).await;
+                    Err(Failed::from(cause))
+                }
+            };
+        }
+    }
+
+    /// A closed hop: the Adapter's stall (overflow), or its stop under the
+    /// daemon force.
+    fn hop_closed(&self) -> Failed {
+        let turn = self.turn;
+        if self.signals.force.borrow().is_some() {
+            RouteError::ForceStopped { turn }.into()
+        } else {
+            RouteError::Overflow { turn }.into()
+        }
+    }
+
+    /// Acts on a wake (design §2 rules 3 and 4): the daemon force wins;
+    /// after the terminal nothing else acts; at `force_at` the group is
+    /// force-closed under `close_by`; otherwise the first order enqueues the
+    /// one interrupt. It never waits.
+    fn on_wake(&mut self) -> Result<(), Failed> {
+        self.after_terminal()?;
+        if self.terminated {
+            return Ok(());
         }
         let Some((force_at, close_by)) = self
+            .signals
             .stop
             .borrow()
             .as_ref()
@@ -446,50 +604,49 @@ impl Control {
                 "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
                 self.turn.get()
             );
-            // Not written or cut short: `force_at` still bounds the turn.
-            let _unsent = wire.write_message(interrupt.as_bytes(), deadline).await;
+            self.pending = Some(self.sender.write(
+                OutboundMessage::Interrupt(interrupt.into_bytes()),
+                self.deadline,
+            ));
         }
         Ok(())
     }
 
     /// After the terminal only the daemon force ends the turn early.
     fn after_terminal(&self) -> Result<(), Failed> {
-        if self.force.borrow().is_some() {
+        if self.signals.force.borrow().is_some() {
             return Err(RouteError::ForceStopped { turn: self.turn }.into());
         }
         Ok(())
     }
 
-    /// Waits for Host's confirmed exit after EOF, acting on wakes. With
+    /// Waits for Host's confirmed exit after EOF before a terminal. With
     /// `unterminated` (F21) the wait ends at the cleanup allowance and any
-    /// failure is transport loss; otherwise its cause is kept.
-    async fn wait_exit(
-        &mut self,
-        wire: &mut WireConnection,
-        deadline: Deadline,
-        unterminated: bool,
-    ) -> Result<ExitReport, Failed> {
+    /// failure of the exit wait is transport loss; otherwise its cause is
+    /// kept.
+    async fn exit_before_terminal(&mut self, unterminated: bool) -> Result<ExitReport, Failed> {
+        self.after_terminal()?;
         let bound = if unterminated {
-            Deadline::at(deadline.instant().min(cleanup_deadline().instant()))
+            Deadline::at(self.deadline.instant().min(cleanup_deadline().instant()))
         } else {
-            deadline
+            self.deadline
         };
-        loop {
-            match wire.wait_exit(bound).await {
-                Ok(exit) => return Ok(exit),
-                Err(WireError::Woken) => self.on_wake(wire, deadline).await?,
-                Err(WireError::Cancelled) => {
-                    return Err(RouteError::ForceStopped { turn: self.turn }.into());
-                }
-                Err(_) if unterminated => return Err(transport(self.turn).into()),
-                Err(error) => return Err(wire_cause(self.turn, &error).into()),
+        let turn = self.turn;
+        let exit = self.sender.wait_exit(bound);
+        match self.serve(exit).await {
+            Ok(Ok(exit)) => Ok(exit),
+            Ok(Err(_)) if unterminated => Err(transport(turn).into()),
+            Ok(Err(error)) => Err(wire_cause(turn, &error).into()),
+            Err(failed) if unterminated && matches!(failed.cause, RouteError::Deadline { .. }) => {
+                Err(transport(turn).into())
             }
+            Err(failed) => Err(failed),
         }
     }
 }
 
-/// Wakes Wire's current wait whenever the stop order appears or changes, and
-/// again at its `force_at`. Never returns.
+/// Wakes Route whenever the stop order appears or changes, and again at
+/// its `force_at`. Never returns.
 async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>) {
     loop {
         let force_at = stop
@@ -659,74 +816,38 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
     }
 }
 
-/// What the next read produced.
-enum Next {
-    /// One decoded vendor message.
-    Message(RouteMessage),
-    /// Both pipes reached EOF.
-    Eof,
-    /// Stdout ended inside a message; Wire kept its bytes (F21, design §7.3).
-    Unterminated,
-    /// Route's wake ended the wait before any byte was read.
-    Woken,
-}
-
-/// Reads and decodes the next vendor message. One Route cannot decode is
-/// kept in `undecoded.bin` first (design §7.3).
-async fn next_message(
-    wire: &mut WireConnection,
-    turn: TurnNumber,
-    deadline: Deadline,
-) -> Result<Next, Failed> {
-    let message = match wire.next_message(deadline).await {
-        Ok(Some(message)) => message,
-        Ok(None) => return Ok(Next::Eof),
-        Err(WireError::Woken) => return Ok(Next::Woken),
-        Err(WireError::Message(WireFailure::UnterminatedMessage)) => return Ok(Next::Unterminated),
-        Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
-    };
-    match FakeMessage::decode(message.bytes(), turn) {
-        Ok(payload) => Ok(Next::Message(RouteMessage { payload })),
-        Err(cause) => {
-            let what = format!(
-                "undecodable vendor message: {} bytes",
-                message.bytes().len()
-            );
-            wire.keep_undecoded(message.bytes(), &what).await;
-            Err(Failed::from(cause))
-        }
-    }
-}
-
-/// Waits for observation capacity until the turn deadline; a consumer that neither
-/// drains nor stays attached is an overflow, never a silent drop. A force ends
-/// the wait: the unsent message is dropped, and Route's force close and drain
-/// follow.
-async fn forward(
-    observations: &mpsc::Sender<RouteMessage>,
-    message: RouteMessage,
-    turn: TurnNumber,
-    deadline: Deadline,
-    force: &mut watch::Receiver<Option<tokio::time::Instant>>,
-) -> Result<(), Failed> {
-    let sent = tokio::select! {
-        // Capacity first: a draining consumer still receives messages already read.
-        biased;
-        sent = timeout_at(deadline.instant(), observations.send(message)) => sent,
-        () = forced(force) => return Err(RouteError::ForceStopped { turn }.into()),
-    };
-    match sent {
-        Ok(Ok(())) => Ok(()),
-        // A forced Adapter stops taking messages; that is the force, not overflow.
-        Ok(Err(_)) if force.borrow().is_some() => Err(RouteError::ForceStopped { turn }.into()),
-        Ok(Err(_)) | Err(_) => Err(RouteError::Overflow { turn }.into()),
-    }
-}
-
 /// Resolves once `force` is set; never when its sender is gone unset.
 async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
     if force.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves on the connection's first failure; never when the latch is gone.
+async fn latched(latch: &mut watch::Receiver<LatchState>) -> FailureCause {
+    // The watch guard is dropped before any further await.
+    let first = latch
+        .wait_for(|state| state.first.is_some())
+        .await
+        .map(|state| state.first);
+    match first {
+        Ok(first) => first.unwrap_or(FailureCause::Reader(WireFailure::Transport)),
+        Err(_) => std::future::pending().await,
+    }
+}
+
+/// Resolves on the next change of Route's wake; never once its sender is gone.
+async fn woken(wake: &mut watch::Receiver<u64>) {
+    if wake.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Polls the pending write, if any; never resolves without one.
+async fn pending(write: Option<&mut PendingWrite>) -> Result<SendOutcome, WireError> {
+    match write {
+        Some(write) => write.await,
+        None => std::future::pending().await,
     }
 }
 

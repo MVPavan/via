@@ -1,22 +1,60 @@
 //! Private fake-route wire validation and attribution.
 
-use via_routes::{FakeMessage, FakeStart, RouteError, TerminalStatus, TurnNumber};
+use via_routes::{FakeMessage, OutboundMessage, RouteError, TerminalStatus, TurnNumber, TurnStart};
+
+/// The start's bytes as Wire writes them: the prefix, the prompt escaped in
+/// slices of at most 16 KiB cut at character boundaries, the suffix;
+/// `None` if it is not a streamed start.
+fn streamed(start: TurnStart) -> Option<Vec<u8>> {
+    let OutboundMessage::Start {
+        prefix,
+        prompt,
+        suffix,
+        escape,
+    } = start.into_message().ok()?
+    else {
+        return None;
+    };
+    let mut bytes = prefix;
+    let mut piece = Vec::new();
+    let mut at = 0;
+    while at < prompt.len() {
+        let mut end = (at + 16 * 1024).min(prompt.len());
+        while !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        piece.clear();
+        escape(&prompt[at..end], &mut piece);
+        bytes.extend_from_slice(&piece);
+        at = end;
+    }
+    bytes.extend_from_slice(&suffix);
+    Some(bytes)
+}
 
 #[test]
 fn start_wire_schema_is_exact_and_typed() {
-    let start = FakeStart::new(
-        "fake-session-1".to_owned(),
-        TurnNumber::try_from(1).unwrap(),
+    let turn = TurnNumber::try_from(1).unwrap();
+    let prompts = [
         "hello".to_owned(),
-    )
-    .unwrap();
-    let json = serde_json::to_value(&start).unwrap();
-    assert_eq!(
-        json,
-        serde_json::json!({"type":"start","id":1,"session_id":"fake-session-1","turn":1,"prompt":"hello"})
-    );
-    assert!(serde_json::from_value::<FakeStart>(serde_json::json!({"type":"start","id":1,"session_id":"fake-session-1","turn":0,"prompt":"hello"})).is_err());
-    assert!(serde_json::from_value::<FakeStart>(serde_json::json!({"type":"start","id":2,"session_id":"fake-session-1","turn":1,"prompt":"hello"})).is_err());
+        String::new(),
+        "quote \" back \\ nl \n tab \t nul \u{0} é😀".repeat(3000),
+    ];
+    for prompt in prompts {
+        let start = TurnStart::new("fake-session-1".to_owned(), turn, prompt.clone()).unwrap();
+        let bytes = streamed(start).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            bytes.iter().position(|byte| *byte == b'\n'),
+            Some(bytes.len() - 1)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type":"start","id":1,"session_id":"fake-session-1","turn":1,"prompt":prompt})
+        );
+    }
+    assert!(TurnStart::new(String::new(), turn, "hello".to_owned()).is_err());
 }
 
 #[test]

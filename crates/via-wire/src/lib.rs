@@ -83,22 +83,6 @@ pub enum WireFailure {
     Transport,
 }
 
-/// Independently observable connection health.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WireHealth {
-    /// Transport is currently open.
-    Open,
-    /// First failure.
-    Failed {
-        /// Latched first cause.
-        cause: WireFailure,
-    },
-    /// Host confirmed exit of the owning process.
-    Exited(ExitReport),
-    /// All connection tasks have closed.
-    Closed,
-}
-
 /// Passive cleanup certainty passed upward without Host signal authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WireCleanup {
@@ -108,14 +92,23 @@ pub enum WireCleanup {
     Uncertain,
 }
 
+mod connection;
 mod runtime;
+mod split;
 
-// Route needs the narrow connection handle returned by WireRuntime; its constructor
-// and Host process control remain private to Wire.
-pub use runtime::{
-    RuntimeConfig, UNDECODED_BYTES, WireCloseReport, WireConnection, WireError, WireRecovery,
-    WireRuntime, WireShutdown, WireSignals, WireTurnRecovery,
+// Route needs the narrow connection handles returned by WireRuntime; their
+// constructor and Host process control remain private to Wire.
+pub use connection::{
+    FailureCause, LatchState, OutboundMessage, PendingWrite, UNDECODED_BYTES, WireConnection,
+    WireMessages, WireParts, WireSender,
 };
+#[cfg(feature = "test-failpoints")]
+pub use connection::{fallback_drops, testing};
+pub use runtime::{
+    RuntimeConfig, WireCloseReport, WireError, WireRecovery, WireRuntime, WireShutdown,
+    WireSignals, WireTurnRecovery,
+};
+pub use split::{LineSplitter, Pushed};
 pub use via_host::{JournalSite, ReprobeReport};
 pub use via_store::StoreError;
 
