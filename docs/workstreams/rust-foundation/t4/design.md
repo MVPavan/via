@@ -1,16 +1,17 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 11)
+# Task 4 design: events, progress, storage and C1 conformance (round 12)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 11.
-It replaces rounds 1–4. Rounds 6–11 apply the orchestrator's decisions on
-Sol's round-5 to round-10 reviews (`design-r5-decisions.md` to
-`design-r10-decisions.md`), tagged `[t4r5.N]` to `[t4r10.N]`. The
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 12.
+It replaces rounds 1–4. Rounds 6–12 apply the orchestrator's decisions on
+Sol's round-5 to round-11 reviews (`design-r5-decisions.md` to
+`design-r11-decisions.md`), tagged `[t4r5.N]` to `[t4r11.N]`. The
 owner-approved [requirements](requirements.md) (R1–R7, the "Bounding
 strategy" and "Thresholds are configuration") are normative and override
 earlier design assumptions and spec text; every such conflict is an
 amendment in §11. Round 8 replaces exact memory and disk accounting with the owner's
 coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4);
-round 9 makes every threshold daemon config (§5.2). Round history and
-decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§15.
+round 9 makes every threshold daemon config (§5.2); round 12 narrows Task 4
+to per-turn connections (§4.4). Round history and
+decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§16.
 This step writes no code and no tests; slices are re-planned after the
 owner's review (`s1.md`–`s7.md` are superseded).
 
@@ -61,7 +62,7 @@ Out of scope, each with its revisit condition:
 | Store operation watchdog (runtime §8) | not a Task 4 item | the S1 close review |
 | Blob-backed `effective` | the fake's `Effective` is a few hundred bytes (`api.rs:979` [V]) | a route accepts large `bound`/`vendor` values |
 | Retention and the per-session delete | requirement non-goal; `via-jm4.18` | that task; §3.4 gives the keyed delete it uses |
-| `logs` on shared servers [t4r7.3] | Task 4 covers private connections only; the per-session split of a shared Codex or OpenCode server's raw data, under D4 (§4.4) | those adapter tasks |
+| Reusable connections: per-session and shared servers [t4r7.3, t4r11.1] | S1 has per-turn connections only; their lifecycle, spans and `logs` split, under the constraints in §4.4 | the OpenCode (`via-4sw.3.2`) and Codex adapter tasks |
 
 ## 1. Owners, lock order and wakes
 
@@ -72,12 +73,12 @@ Out of scope, each with its revisit condition:
 | Store request lanes (Latch, Lifecycle, Internal, Public) | `Store`; served by the SQLite thread | `Store::open` | `StoreClient` handles by lane tag | fence, or writer death | §6.1 |
 | Raw inbox, raw worker, blob files | Store raw worker | `Store::open` | `RawWriter`, `BlobWriter`, `BlobReader` | fence, then join; death guard | §6.4, §6.6 |
 | `ConnectionLatch` | via-wire, per connection | `open_connection` | readers, stdin writer, raw worker via `RawFaultSink` | last holder after `finish` | §7.4 |
-| Reader and stdin-writer tasks | `WireMessages` (unique; a per-session connection's is kept by its session owner [t4r9.3]) | `open_connection` | the tasks | `finish` under one deadline, then adoption | §7.6 |
+| Reader and stdin-writer tasks | `WireMessages` (unique) | `open_connection` | the tasks | `finish` under one deadline, then adoption | §7.6 |
 | Message queue | `WireMessages` | `open_connection` | stdout reader | `next_message`, or `finish` | 64 messages, 4 MiB |
 | Route → Adapter hop | Adapter `execute` | per drive | Route | end of `execute` | 1 message |
 | Observation channel and its byte semaphore | Core drive | per drive | Adapter | end of the drive | 1024 items, 4 MiB |
 | Stall timer | Adapter pending delivery | first blocked send | Adapter | acceptance of that item, or 10 s | one per drive |
-| Connection charge [t4r8.5, t4r9.3] | `WireMessages` (with its session owner), then its adopted set | before the connection opens | — | `finish` returned and every adopted task joined | `memory.connection` (§5.1) |
+| Connection charge [t4r8.5] | `WireMessages`, then its adopted set | before the connection opens | — | `finish` returned and every adopted task joined | `memory.connection` (§5.1) |
 | Drive charge | Core drive | dispatch, before submission | — | end of the drive | `memory.drive` (§5.1) |
 | Envelope accumulation and meter [t4r6.4] | Core drive (`TurnRecord`) | submission | the drive, per accumulated item | the terminal commit | `ENVELOPE_MAX` (§6.5) |
 | Turn activity clock (`TurnActivity`, one `AtomicU64`) [t4r5.11] | Core drive; a clone in the `Running` entry | submission | the Adapter, for each vendor message attributed to the turn | end of the drive | 8 B |
@@ -198,11 +199,9 @@ Core constant), restarted only when that item is accepted. On expiry the
 Adapter drops the session's hop receiver; Route selects on `hop.closed()`
 in every wait (§8) and sees it at once:
 
-- **Private route** (one hop per connection: the fake, Claude, OpenCode's
-  per-session server): Route fails `RouteError::Overflow`. A per-turn
-  connection is force-closed (Host stops its private process group: the
-  interrupt); on a per-session server Route sends the vendor interrupt and
-  ends the turn without stopping the server (§7.6) [t4r10.2]. Core
+- **Private route** (one hop per connection: the fake, Claude): Route fails
+  `RouteError::Overflow` and force-closes the connection (Host stops its
+  private process group: the interrupt) [t4r11.1]. Core
   disposes `Overflow` as today (`crates/via-core/src/engine/terminal.rs:97`
   [V]: `failed`, `overflow`).
 - **Shared route** (Codex's shared server, one hop per thread generation):
@@ -441,47 +440,34 @@ request (a `wait` releases only its waiter).
 C1 §3.12 as A27 replaces it (params, result, the end cursor); `text` is
 lossy UTF-8 that VIA does not parse (R5).
 
-- **Private connections only.** Task 4 serves connections that belong to one
-  session: per turn (the fake, Claude) or per session (one server per
-  session). A per-turn connection belongs wholly to its turn. On a
-  per-session connection a turn's span is `[raw_start, raw_end)`, and units
-  outside every span are session-level; nothing is written per vendor
-  message.
-- **Raw boundary** [t4r8.8]. Before building `turn.submitted`, the drive
-  awaits `WireMessages::boundary()`: a `Barrier` queued to the raw worker
-  behind every unit already enqueued on the connection [t4r10.6], answered with the
-  connection's end offset once all of them are durable. That offset is
-  `raw_start`, written in the submission transaction, and nothing is sent to
-  stdin before it. Rule for units being read [t4r9.4]: attribution follows
-  the order in which units are enqueued to the raw worker. A unit enqueued
-  after the barrier falls inside the turn, even if it was read or staged
-  before it (a reader between `Payload::stage` and `RawWriter::submit`, the
-  rest of a partial stdout message); every unit enqueued before it falls
-  outside, whether durable or not. Both sides belong to the same session, so
-  D4 is unaffected. `raw_end` is taken the same way before the terminal is
-  built.
-- **Shared servers: the D4 constraint.** The per-session split of a shared
-  Codex or OpenCode server's raw data belongs to those adapter tasks; fixed
-  constraint (D4): `logs` never returns bytes to a session other than the
-  one they are attributed to, nor unattributed bytes. S1 has no shared
-  connection.
-- **Scope.** A turn address reads its span; a session address reads the
-  session's connections whole, in `connections.ord` order, then offset. A
-  session's connections do not overlap in time (a turn's connection is
-  sealed before the next turn starts, a server generation before the next),
-  so only the last can be unsealed. A per-session connection is kept by its
-  session owner across turns and sealed only at server retirement or fatal
-  connection loss (§7.6) [t4r9.3, t4r10.2].
+- **Per-turn connections only** [t4r7.3, t4r11.1]. Task 4 serves what S1
+  has: one private connection per turn (the fake; Claude, "one process for
+  one VIA turn", `claude-code.md:61`). A connection belongs wholly to its
+  turn (`connections.turn`), so a turn's raw data is its own connection or
+  connections, whole; nothing is written per vendor message.
+- **Reusable connections** (OpenCode's per-session server, Codex's shared
+  server) belong to those adapter tasks (`via-4sw.3.2` for OpenCode)
+  [t4r11.1], which must meet: cancel and close keep a
+  dedicated server running (`opencode.md:596-599`); P7 settles before the
+  terminal commits (`via-api-v1.md:240-245`); a turn's span on a reusable
+  connection is bounded by raw barriers, and an unanswered end barrier
+  retires the connection; a turn's handles cannot outlive the turn or close
+  the server; D4: `logs` never returns bytes to a session other than the
+  one they are attributed to, nor unattributed bytes; and T3 and C2
+  amendments that separate per-session turn failure from per-turn
+  connection failure (`force_at`, the Store latch, daemon shutdown).
+- **Scope.** A turn address reads its connections; a session address reads
+  the session's connections; both whole, in `connections.ord` order, then
+  offset. A session's connections do not overlap in time (a turn's
+  connection is sealed before the next turn starts), so only the last can
+  be unsealed.
 - **Cursor**, one per connection: the sentinel `r1.start` (an omitted
   cursor) or `r1.<connection_id>.<offset>`, the next byte to return, parsed
-  strictly. The sentinel resolves to the first offset of the scope: a turn
-  on a per-session connection starts at `raw_start`, anything else at
-  offset 0 of the first connection [t4r8.7]. A supplied cursor is valid
-  only on a connection in scope and inside its span: at least `raw_start`
-  (for a turn) and at most the span's end (`raw_end`, or the durable end
-  while open); anything else is `invalid_params`. Paging for a turn stops
-  at `raw_end`. With nothing new durable, `next_cursor` is the request's
-  cursor [t4r5.12].
+  strictly. The sentinel resolves to offset 0 of the scope's first
+  connection. A supplied cursor is valid only on a connection in scope and
+  at most its end (the sealed end, or the durable end while open) [t4r8.7];
+  anything else is `invalid_params`. With nothing new durable,
+  `next_cursor` is the request's cursor [t4r5.12].
 - **Paging.** The SQLite thread binary-searches the index for the unit
   holding the offset (§6.4), walks consecutive units in scope (to the next
   connection at a sealed end), reads each whole unit (at most 1 MiB,
@@ -536,9 +522,9 @@ before allocating and releases it on drop. Every amount is an assumption
 |---|---|---|---|
 | Store request lanes (`memory.latch_lane`, `memory.lifecycle_lane`, `memory.ordinary_lanes`) | 2 + 2 + 4 MiB, from `Store::open` | open fails | the lane allowances (§6.1); lane high-water test |
 | SQLite page cache (`memory.sqlite_cache`) | 8 MiB, from `Store::open` | open fails | `cache_size` on the one long-lived connection, the writer (`crates/via-store/src/runtime/sql.rs:140`, `runtime.rs:1013` [V]); approximate, so the RSS gate confirms it |
-| Connection (`memory.connection`) [t4r8.5] | 16 MiB, from before the connection opens until `finish` has returned and every task it adopted has been joined (§7.6); a per-session connection's session owner holds it across turns until server retirement or fatal connection loss [t4r9.3, t4r10.2] | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), the 64-message / 4 MiB Wire queue, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, payloads queued for raw; F24's per-connection figures |
+| Connection (`memory.connection`) [t4r8.5] | 16 MiB, from before the connection opens until `finish` has returned and every task it adopted has been joined (§7.6) | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), the 64-message / 4 MiB Wire queue, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, payloads queued for raw; F24's per-connection figures |
 | Drive (`memory.drive`) | 8 MiB, from dispatch (before the submission commit) to the drive's end | the dispatcher waits; the turn stays queued | 4 MiB of observations (C2 A1), decoded messages in flight, the envelope accumulation (at most 1 MiB) and its encoding, the step tracker and carried rows |
-| C1 request (`memory.request_multiplier`, `memory.request_nodes`) | `request_multiplier × len + min(8 × len, request_nodes) + 64 KiB` for a line of `len` bytes (defaults 4 and 2 MiB), taken as the line is read; line bytes also count against runtime §8's 32 MiB C1 input cap | waits until the 5 s partial-line deadline, then discards the line and replies `admission_refused` (`MEMORY_BUDGET`, `id: null`) | the segments, the line, serde's scratch and the decoded strings, list headers within 65,536 nodes; a counting-allocator test on a 16 MiB escaped prompt and a 65,536-node list |
+| C1 request (`memory.request_multiplier`, `memory.request_nodes`) | `request_multiplier × len + min(8 × len, request_nodes) + 64 KiB` for a line of `len` bytes (defaults 4 and 2 MiB), taken as the line is read; line bytes also count against runtime §8's 32 MiB C1 input cap. When the DTO is built, the line and decode share is released and the charge shrinks to the DTO's retained bytes (at most `len`); that remainder is released when the handler has handed the DTO's contents to their owner (a Store command, a blob writer) or dropped them, always before the reply charge is acquired, so a request and its reply are never charged together [t4r11.2] | waits until the 5 s partial-line deadline, then discards the line and replies `admission_refused` (`MEMORY_BUDGET`, `id: null`) | the segments, the line, serde's scratch and the decoded strings, list headers within 65,536 nodes; a counting-allocator test on a 16 MiB escaped prompt and a 65,536-node list |
 | Reply or Store page (`memory.reply_small`, `memory.reply_page`, `memory.reply_logs`) [t4r10.3] | 64 KiB for a small reply, `PAGE_MAX + 4 KiB` for a page and 2 MiB for `logs` (832 KiB encoded plus one 1 MiB unit read, §6.8); replies together at most runtime §8's 32 MiB | `admission_refused` (`MEMORY_BUDGET`) | held at most `REPLY_WRITE` (A32); capacity checked in the test binary |
 | Codex shared server (`memory.codex_shared`) [t4r9.2] | 16 MiB per shared server, from launch to its end (runtime §8) | the server is not launched | observation and staging lanes, retained tool metadata; not in S1, so the Codex extension's gate confirms it |
 | Blob chunk (`memory.blob_chunk`) [t4r10.3]; dispatched blob prompt | 64 KiB, one in flight per handle; the prompt's length until its start is written (§7.3) | waits under the chunk's 2 s bound; the turn stays queued | exact |
@@ -599,7 +585,8 @@ peak exceeds its charge gets a larger default.
     `codex_shared` 5 MiB (one turn's 4 MiB of observations and one 1 MiB
     message).
   - Aggregates: `pool` at least the lanes, the cache, 4 × (`connection` +
-    `drive`) and the larger of `reply_page` and `reply_logs` [t4r10.3], and at least the lanes, the cache and a maximal
+    `drive`) and the larger of `reply_page` and `reply_logs` [t4r10.3]
+    (a request's charge is released before its reply's, §5.1 [t4r11.2]), and at least the lanes, the cache and a maximal
     16 MiB request's charge; `codex_shared` at most `pool` less the lanes
     and the cache.
   - Disk and WAL: `sqlite_headroom` at least the 16 MiB terminal reserve
@@ -797,19 +784,17 @@ golden DDL test (`s1_store_v6_schema_is_frozen`). Changes from v5
 - **`turns`** gains `ended_seq` with `CHECK((state IN
   ('completed','failed','cancelled','unknown')) = (ended_seq IS NOT NULL))`
   (A15); `prompt_blob` with `CHECK((prompt IS NULL) <> (prompt_blob IS
-  NULL))`; and `connection_id` (FK), `raw_start`, `raw_end` (§4.4), the
-  last two written with `turn.submitted` and the terminal, and NULL for a
-  per-turn connection, which the turn owns whole [t4r7.3].
+  NULL))` [t4r11.1].
 - **`spawn_keys.identity`, `operations.identity`** become nullable with
   `identity_blob` and the same CHECK.
 - **`connections`** (new) [t4r7.3]: `id TEXT PRIMARY KEY`, `ord INTEGER NOT
-  NULL UNIQUE` (creation order), `session_id NOT NULL`, `turn` (FK; NULL for
-  a per-session connection), `high_water INTEGER` (NULL until sealed),
+  NULL UNIQUE` (creation order), `session_id NOT NULL`, `turn NOT NULL` (FK)
+  [t4r11.1], `high_water INTEGER` (NULL until sealed),
   `incomplete INTEGER NOT NULL CHECK(incomplete IN (0,1))`. Files are named
   from the id (`raw.rs:159-160` [V]). A per-turn connection is created in
   the submission transaction (`SubmissionRecord` gains `connection_id`);
   `incomplete` is set by a committed `raw_log.incomplete`; the transaction
-  that ends the turn or server seals the row from the index's last complete
+  that ends the turn seals the row from the index's last complete
   entry (durable: `finish` ran its barrier), or sets `incomplete = 1` with
   the offset it can prove; recovery seals open rows.
 - **Time.** `at` strings parse strictly to Unix ms (else `Constraint`).
@@ -945,15 +930,8 @@ senders, `Arc<ProcessControl>`, the exit and latch receivers; `write`,
 `close_input`, `close`, `wait_exit`, `failure()`). `WireMessages` is unique
 and owns the connection's life (the message receiver, one `pending` entry,
 the task `JoinSet`, the stop signal, a `RawWriter` for the barrier;
-`next_message(&mut self)`, `boundary(&mut self)` (§4.4), `finish(self, deadline)`).
-A per-turn connection's `WireParts` belong to the turn. A per-session
-connection's belong to its session owner (the per-session server's Route),
-which lends each turn a `TurnWire<'_>` [t4r9.3, t4r10.2]: `&mut
-WireMessages` (`next_message` and `boundary`, but not `finish(self)`) and a
-`TurnSender` from `WireSender::for_turn()`, which has only `write` and
-`failure()`: no `close`, `close_input`, `wait_exit` or `ProcessControl`. So
-a turn cannot close a per-session connection or ask Host to stop its server;
-only the owner can.
+`next_message(&mut self)`, `finish(self, deadline)`). Both belong to the
+turn [t4r11.1].
 
 ### 7.2 Readers
 
@@ -966,7 +944,7 @@ only the owner can.
    buffer when it lies in one read) is copied by `Payload::stage(&[u8])`,
    whose staging count `max(len, 512)` is taken first, nonblocking, from the
    connection's 8 MiB staging allowance (runtime §8, inside the connection
-   charge [t4r9.3]). The payload is submitted to raw, counted against the
+   charge [t4r8.5]). The payload is submitted to raw, counted against the
    64-message / 4 MiB residency, and `try_send` into the queue with its ack.
    `Payload::stage` is the one constructor for stdout, stderr and stdin
    units.
@@ -1038,24 +1016,9 @@ the rest after Host's shutdown, reporting stragglers in
 `WireShutdown.pending_tasks`. The connection charge (§5.1) moves with the
 set and is released only when the set is empty [t4r8.5].
 
-Every `run_turn` exit ends the turn's use with one absolute deadline (the
+Every `run_turn` exit calls `finish` with one absolute deadline (the
 graceful close's `close_by`, the force close's cleanup deadline,
-`failed.close_by`, or `LAUNCH_DRAIN` for an open failure) [t4r9.3]. On a
-per-turn connection that is `finish`. On a per-session connection a turn's
-end never stops the server (`opencode.md:596-599`) [t4r10.2]. Cancel and
-force close (the turn's, or a session close's) send the vendor interrupt
-through `TurnSender::write` and wait for terminal evidence until the
-deadline, else end with unknown cancellation or uncertain cleanup as C1 and
-C2 require; Core applies P7's cleanup gate before the next turn. The turn
-then awaits `boundary()` for `raw_end` under its deadline (unanswered: the
-span ends at the connection's proven durable offset and the terminal
-carries `raw_log.incomplete`), commits its terminal with that span and the
-cleanup evidence, and drops its `TurnWire`; readers, writer, queue and
-charge stay with the owner. Only the owner calls `finish`, asks Host to stop
-the server group and adopts tasks, and only at server retirement (idle or
-daemon shutdown) or on fatal connection loss (server exit, a latch, a Route
-failure that leaves the connection unusable); a running turn then fails
-with the connection's cause. `Drop` without
+`failed.close_by`, or `LAUNCH_DRAIN` for an open failure) [t4r11.1]. `Drop` without
 `finish` aborts, adopts, and bumps a test-only `wire::fallback_drops()`
 counter that every normal test asserts is zero.
 
@@ -1432,8 +1395,8 @@ Replace C1 §3.12 (`via-api-v1.md:362`) with:
 > next_cursor}`. `stream` is `stdout`, `stderr` or `stdin`; `text` is the
 > bytes as lossy UTF-8, which VIA does not interpret; `offset` and `len`
 > locate them in the connection's raw log. A per-turn process's traffic
-> belongs to its turn; on a per-session server, a turn's traffic is the
-> range between its submission and its terminal. Bytes are never returned
+> belongs to its turn; reusable connections are defined by their adapter's
+> section. Bytes are never returned
 > to another session (D4). `cursor` is opaque, and an omitted one starts at
 > the beginning; `next_cursor` resumes after the last returned byte (before
 > any byte is durable, from the beginning), and is `null` only when every
@@ -1461,9 +1424,8 @@ Runtime §6 target table: the `events` row becomes "`events`: separate
 ended_ms, tokens)`, primary key `(session_id, turn, step)`, one row per
 completed model step, written by the single writer, the last in the terminal
 transaction; a session's rows are removed by one keyed delete |
-`via-jm4.7.8`" and "`connections` per turn or per session, and a turn's
-`raw_start`/`raw_end` on a per-session connection (T4 design §4.4) |
-`via-jm4.7.8`" [t4r7.3]. Write-ordering item 4 (`:752`): "Adapter emits
+`via-jm4.7.8`" and "`connections`: one per turn, sealed with the turn's end
+(T4 design §6.7) | `via-jm4.7.8`" [t4r7.3, t4r11.1]. Write-ordering item 4 (`:752`): "Adapter emits
 observation; Core commits acceptance or events" becomes "Adapter emits
 observation; Core commits acceptance, durable events or a step row, or folds
 it into the progress snapshot". The quota paragraph is replaced by A36.
@@ -1869,11 +1831,8 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_status_every_member_after_eviction_and_restart` | durable members equal before and after; `progress` null after restart; `steps` paged |
 | `s1_c1_status_alive_false_after_exit_before_control_drop` | exit observed, control still upgradeable → `alive` false |
 | `s1_c1_events_page_filters_and_bounds`; `s1_c1_follow_and_unsubscribe_are_refused` | window, `types`, `turn`, `next_after` across filtered rows, `more`, the byte bound with a Store-level fixture; `follow: true` is `invalid_params`, `unsubscribe` `method_not_found` |
-| `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection is `invalid_params` |
+| `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` [t4r11.1] | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection, for another turn's connection under a turn address, or beyond a connection's end is `invalid_params`; after a crash mid-turn the turn's connection is readable and recovery seals it |
 | `s1_c1_logs_end_cursor_resumes_while_running` [t4r5.12, t4r6.11] | a call before any byte is durable returns `r1.start`, and a later call from it returns the first bytes; on a running turn `next_cursor` is non-null at the current end and a later call from it returns only new bytes; after the terminal and seal it is `null` |
-| `s1_c1_logs_per_session_spans_bound_each_turn` [t4r7.3, t4r8.7, t4r8.8, t4r9.3, t4r9.4, t4r10.4] | a per-session connection whose readers, writer and charge survive turn 1's end, carrying two turns; session-level stdout and stderr enqueued before turn 2's barrier become durable and the barrier answers; one unit staged before the barrier is held unenqueued across it (reader held between `stage` and `submit`) and then released: it lies inside turn 2's span; the raw worker is then stalled after submission with turn 2's later output enqueued: a turn address returns exactly the durable part of `[raw_start, raw_end)` and none of the earlier traffic; `r1.start` for turn 2 begins at its `raw_start`; a cursor below `raw_start` or beyond the span's durable end is `invalid_params`; a crash between submission and terminal leaves the open span readable to the session |
-| `s1_wire_per_session_cancel_and_force_close_keep_the_server` [t4r10.2] | on a per-session server (a test route keeping one fake process per session), turn 1 is cancelled (vendor acknowledges and ends it) and turn 2 is force-closed with the vendor silent past the deadline, then its session closed with `force`: each turn ends (`cancelled`; unknown cancellation with uncertain cleanup) with its span sealed at `raw_end` and its cleanup evidence in the terminal; the server's process group stays alive, Host receives no stop request, the connection stays unsealed with its charge held and no task adopted, P7's gate runs before turn 3, and turn 3 runs on the same connection; a `compile_fail` doctest shows a `TurnSender` has no `close`, `close_input` or `wait_exit` and a lent `&mut WireMessages` cannot `finish` |
-| `s1_wire_per_session_retirement_and_loss_finish_through_the_owner` [t4r10.2] | on the same test route, (a) daemon shutdown makes the owner call `finish`, Host stop the group and the connection seal (idle retirement is tested by the task that adds idle shutdown); (b) the server exiting mid-turn, and (c) a latch, fail the running turn with the connection's cause and finish through the owner, adopting a task held past the deadline; the charge is released only after the adopted set is joined; `wire::fallback_drops()` stays zero |
 | `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4, t4r9.1, t4r9.5, t4r10.1] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`; an ordinary write begun just below the line that would commit above it is rolled back `NotCommitted` and leaves `page_count` at or below the line; a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health; the WAL growth of a maximal event batch and of a terminal with many carried rows on a near-ceiling store is recorded for `via-d9o.2.3` (no bound asserted, Q-R9-1) [t4r10.1] |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket_and_frees_the_permit` | A31; A32, with `VIA_TEST_REPLY_WRITE_MS` |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` | four turns, 256 MiB stdout flood; daemon peak RSS < 256 MiB, growth < 32 MiB after the first 64 MiB, each anchor ≤ 32 MiB, sum < 384 MiB, `MemoryBudget` high-water ≤ 128 MiB, the SQLite cache's 8 MiB included [t4r7.1]; `daemon/status`, `status` and a `cancel` of another turn answer within 100 ms, including with its interrupt write blocked at `HoldStdin`; the flood turn ends `failed(overflow)` with `raw_log.incomplete` |
@@ -1881,7 +1840,7 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib` | the C2 bounds |
 | `s1_f24_envelope_overrun_stops_the_turn_at_once` [t4r5.5, t4r6.4, t4r6.5] | a test route emits declined requests past 1 MiB and then stays silent, and another streams `final_text` appends past it: the stop order with cause `overflow` is sent on the crossing item; a vendor `completed` terminal that follows still ends `failed(overflow)` |
 | `s1_bounds_failure_summary_bounds_every_member` [t4r5.6, t4r6.6, t4r6.7] | a turn with 1 MiB escaped `final_text`, a 64 KiB `failure.message`, 1 KiB vendor fields, a 6 KiB + 1 `model`, 2,000 `extra_write_dirs`, a 64 KiB `vendor` map and 600 KiB of declined requests: `final_text` empty with its length in `truncation`, the message cut to 2 KiB, each member within its budget, lists as prefixes, `truncation` totals exact, the summary at most 720 KiB; a 1 KiB + 1 vendor field is `protocol` |
-| `s1_bounds_class_charges_cover_measured_peaks` [t4r7.1] | one counting-allocator binary: no reallocation on the stdout, C1 line, reply or encode paths at their maxima; C1 decode of a 16 MiB prompt of six-byte escapes and of a 65,536-node list each allocate at most the C1 request charge; a maximal connection and drive allocate at most their charges; a connection whose tasks were adopted keeps its charge until they are joined [t4r8.5]; a `final_text` piece of six-byte escapes with a 1 KiB key encodes to at most 256 KiB [t4r8.6]; a request that cannot be charged is `admission_refused` (`MEMORY_BUDGET`) |
+| `s1_bounds_class_charges_cover_measured_peaks` [t4r7.1, t4r11.2] | one counting-allocator binary: no reallocation on the stdout, C1 line, reply or encode paths at their maxima; C1 decode of a 16 MiB prompt of six-byte escapes and of a 65,536-node list each allocate at most the C1 request charge; a maximal connection and drive allocate at most their charges; a connection whose tasks were adopted keeps its charge until they are joined [t4r8.5]; a `final_text` piece of six-byte escapes with a 1 KiB key encodes to at most 256 KiB [t4r8.6]; a request that cannot be charged is `admission_refused` (`MEMORY_BUDGET`); a request's charge is fully released before its reply charge is acquired, so with the pool at its validated floor and four turns holding their charges a `logs` request gets its 2 MiB reply [t4r11.2] |
 | `s1_config_is_read_at_start_validated_and_reported` [t4r8.1, t4r9.2, t4r9.5] | a missing file gives the defaults; lowered values change the pool and budgets only after a restart; an unknown key, a duplicate key, a headroom below the terminal reserve, each key one below its minimum, a value past its range, a sum that overflows `u64`, `checkpoint_bytes` of 0 or 4095 and a group-writable file each refuse start with exit 78 and the named key and rule, touching no Store or socket; `daemon/status` `limits` equals the effective values |
 | `s1_f05_…` (oversize, depth and nodes, partial line, 33rd socket) | F5 |
 | `s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_raw_bytes` | F27, with a seeded splitter test |
@@ -1909,7 +1868,7 @@ cleanup (A25), Wire `read_either`. Out of scope: durable `output_schema`
 | A maximal 16 MiB C1 request is charged about 66 MiB, so it is admitted only while at most one turn runs; otherwise `admission_refused` | real routes measure prompt sizes, or the counting-allocator test allows a smaller charge |
 | The class charges (§5.1) and disk headrooms (§6.9) are assumptions; admission near a budget refuses work that would have fit; uncharged allocator and SQLite overhead is left to the RSS gate | a check shows a charge too small, refusals too early, or the RSS gate fails |
 | `running_tools` lists at most 64 names plus a flag; a missed tool end misreports `phase` until the next boundary; tokens are approximate under the declared scope, and unprobed for Claude, Codex and OpenCode (§2.5), so `tokens` may be `null`; R3's accuracy is not claimed for them [t4r8.10] | a caller needs exact live figures; each vendor's probe; the owner's accuracy decision (Q-R5-11) |
-| `logs` on shared servers is not designed here; only the D4 constraint is fixed | the Codex and OpenCode tasks |
+| Reusable connections (per-session and shared servers) are not designed here; §4.4 lists the constraints their tasks must meet [t4r11.1] | the OpenCode (`via-4sw.3.2`) and Codex tasks |
 | A step that ended while its row commit was in flight is lost in a crash | the owner's R4 wording decision (Q-R5-15) [t4r8.10] |
 | The open-session tally is exact only until an uncertain close | Store-failure recovery work |
 | `stamp` and `ord` increase strictly only while no `sessions` row is deleted; `list` phase 2 examines every `ord` up to `w0`; blob verification at start is linear in blob bytes | retention (`via-jm4.18`), or session counts make it slow |
