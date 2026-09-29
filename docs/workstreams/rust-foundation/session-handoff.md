@@ -122,7 +122,8 @@ the historical checkpoint; its findings table is updated by this section.
   reviews, then implementation slices. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
-  owner decision), compared with Opus in
+  owner decision); from 2026-09-29 design-first steps go to Opus 5.5 high
+  (`implementer-high`), compared with Opus in
   [model-observations.md](model-observations.md). **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After

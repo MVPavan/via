@@ -45,3 +45,12 @@ whether the design had to be reinterpreted.
 - Working hypothesis: Sonnet xhigh suits bounded fixes with the design
   settled in the brief; state the owning mechanism explicitly when the
   design leaves a choice open. Keep observing on Task 4.
+
+## Owner decision (2026-09-29)
+
+Following the early read, design-first steps (inventory, normative design,
+slice plan and design revision rounds) go to Opus 5.5 high
+(`implementer-high`). Implementation slices stay on Sonnet 5.5 (high, or
+xhigh for hard work). The T4-0 round-2 revision already under way on Sonnet
+finishes; any later design round goes to Opus. The comparison continues on
+the implementation slices.
