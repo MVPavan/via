@@ -43,7 +43,7 @@ turns vendor traffic into **observations**. Core alone commits states,
 |---|---|
 | Core | deadlines, queue and dispatch gate, admission, states and commits, seq, envelope, Store, handle, op keys |
 | Adapter | route choice, capability declaration, version gate, vendor mapping, reserved-key refusal, auto-decline, cancel sequence, quiescence evidence, observation normalization, vendor-code → class hint |
-| Routes / Wire / Host | typed protocol calls and request pairing / framing, transport, raw tap, bounded staging / anchor-owned process group and verified cleanup |
+| Routes / Wire / Host | typed protocol calls and request pairing / message splitting, transport, raw tap, bounded staging / anchor-owned process group and verified cleanup |
 
 **Owner, 2026-09-26:** A1 approved as written. A2/A3/A6 are resolved by
 the reviewed Claude packet; A7/A8 by the reviewed Codex packet. OpenCode
@@ -197,7 +197,7 @@ Contract points:
   emits `session.vendor_identity_confirmed {vendor_session_id,
   connection_id}`. Core checks the current generation, then atomically
   persists ID, verified true and exactly one `session.opened` or
-  `session.reopened` before any same-frame acceptance. A pre-init
+  `session.reopened` before any same-message acceptance. A pre-init
   startup/resume rejection cannot confirm or open, even if it echoes the
   expected ID. Every init/result ID is checked; mismatch fails
   `resume_mismatch` without replacement or resend. Other routes may return
@@ -263,7 +263,7 @@ Contract points:
 | Submission record, envelope, Store, op keys | owns | — | — | raw log append | process/server records |
 | Route choice, capabilities, version gate, server key | consumes | owns | protocol version | — | binary version |
 | Canonical → vendor mapping, reserved keys | — | owns | typed calls | — | — |
-| Request pairing, server-request deadlines | — | answers (control path) | correlates | framing | — |
+| Request pairing, server-request deadlines | — | answers (control path) | correlates | message splitting | — |
 | Cancel sequence, quiescence evidence | initiates; waits | owns | protocol call | forwards control/health | anchor issues own-group signal on verified request; group absence separately proven |
 | Backpressure | drains; fails `overflow` | bounded observations; independent control/health | bounded data | bounded staging; fails connection | supervises independently |
 | Observation normalization, class hints | commits classes | owns | messages | bytes | exit status, death confirmation |
@@ -277,7 +277,7 @@ Contract points:
 
 | Observation | Fields | Core commit |
 |---|---|---|
-| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id` | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-frame acceptance |
+| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id` | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
 | `turn.accepted` | `correlation: AcceptanceToken`, `vendor_turn_id` | deduplicate against start reply; phase `accepted`, `turn.started` once |
 | `turn.vendor_terminal` | `vendor_status: Completed\|Interrupted\|Failed`, `vendor_code?`, `class_hint`, `stop_reason`, `final_text`, `structured_output?`, `usage?` | apply C1 §7.6; Codex interrupted terminal acknowledges cancel but may hold turn nonterminal while P7 cleanup is pending |
 | `tool.quiescent` | `vendor_turn_id` | cleanup `quiescent`; may settle the held cancelled terminal |
@@ -292,8 +292,8 @@ before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure
 and cleanup evidence remain deliverable when observations are saturated.
 
-For Codex shared stdio, Route partitions its existing 64-frame/4 MiB
-framed-data staging into per-thread ingress lanes capped at 16 frames/1 MiB,
+For Codex shared stdio, Route partitions its existing 64-message/4 MiB
+message staging into per-thread ingress lanes capped at 16 messages/1 MiB,
 before C2 observations. This adds no extra buffer tier. The first full lane
 immediately quarantines that thread generation, with sticky overflow health
 carrying lane generation, the original triggering turn, first unqueued raw

@@ -196,7 +196,7 @@ fn force_during_stalled_acquisition_settles_the_turn() {
         let (driven, ()) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(8), engine.dispatcher(session.clone())),
             async {
-                // Acquisition is then waiting for the anchor's ready frame.
+                // Acquisition is then waiting for the anchor's ready message.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 forced_at.set(Some(tokio::time::Instant::now()));
                 engine.request_stop(&force).await.unwrap();

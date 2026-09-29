@@ -469,7 +469,7 @@ fn force_while_forwarding_is_blocked_drains_every_byte() {
             );
             assert!(tokio::time::Instant::now() < observed, "no backpressure");
         }
-        // Let the adapter reach its blocked send with more frames queued behind it.
+        // Let the adapter reach its blocked send with more messages queued behind it.
         assert!(
             tokio::time::timeout(Duration::from_millis(200), &mut execute)
                 .await

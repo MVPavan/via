@@ -28,6 +28,8 @@ whether the design had to be reinterpreted.
 | T3 review X (decisions 1–4) | `implementer-sonnet-xhigh` | ~250 lines prod (Core reprobe, close, drive, batch, journal; Host re-probe) | 2 | 1 important (Host discarded a failed proof before a later error), 1 minor (clock-bound test) | none; kept the dispatch trailer against a harness reminder | removed an outer timeout on its own judgement and Sol confirmed it; round 2 picked the simpler of two fixes with callers checked |
 | T3 review Y (decisions 6–9) | `implementer-sonnet` | ~20 lines prod (CLI client) + ~40 test-seam lines (Core stop) | 3 | 1 major (§11 ordering proof used Host proxies); round 2 had 1 important (the seam re-read a record rather than the terminal's input) | 2 commits used a harness trailer instead of the dispatch trailer; an intermittent failure reported without its log | the CLI fix and the characterization tests were right the first time; the proof-quality items needed two more rounds |
 | T3 force-row + decision 5 | `implementer-sonnet-xhigh` | ~40 lines (Route, Wire seam) + ~300 (force watch type across 5 crates, Host ledger, stop delivery) | force row 1; decision 5 3 | force row: none (design-doc minor only). Decision 5 round 1 UNSOUND: 2 important (a second force watch published out of order; delayed-watcher window left open). Round 2: 1 important (a late reply counted as evidence), plus a spec gap | round 1: 2 commits with a deliberately failing tree; none after the correction | strong diagnosis (deterministic seam, 30/30 RED, 0/1200 after); its first decision-5 design picked the narrow carrier over the owning one, and needed the orchestrator's design calls; it caught its own non-exercising test draft |
+| T4-0 design (docs only) | `implementer-sonnet-xhigh` | 1,076-line design + 169-line report | in progress | round 1 UNSOUND from both Astra high (7 blockers) and Sol high (2 blockers): control and cleanup under overload, incomplete memory accounting, reserved capacity not end to end, follower lifetime; deferred a runtime-required blob path; one false inventory inference | none | complete method and carried-item coverage and good restatement lists; weak on concurrency protocols and chose deferral or amendment where the contract required implementation |
+| Frame → message rename (via-jm4.17) | `implementer-sonnet` | 32 files: 7 docs, 25 Rust (pure rename) | 0 worker rounds; 2 orchestrator wording rounds | Sol medium: 1 important ("HTTP framing evidence" narrowed to message splitting), 1 minor (`VendorMessage` implied decoded JSON). Round 2 found 1 minor in the orchestrator's own glossary fix | none; fixed its own clippy slip before committing | correct four-way meaning mapping from the brief; full gate green first time; the misses were spec-semantics nuances in two sentences |
 
 ## Early read (2026-09-28, three Sonnet workers on the Task 3 review)
 
@@ -44,3 +46,12 @@ whether the design had to be reinterpreted.
 - Working hypothesis: Sonnet xhigh suits bounded fixes with the design
   settled in the brief; state the owning mechanism explicitly when the
   design leaves a choice open. Keep observing on Task 4.
+
+## Owner decision (2026-09-29)
+
+Following the early read, design-first steps (inventory, normative design,
+slice plan and design revision rounds) go to Opus 5.5 high
+(`implementer-high`). Implementation slices stay on Sonnet 5.5 (high, or
+xhigh for hard work). The T4-0 round-2 revision already under way on Sonnet
+finishes; any later design round goes to Opus. The comparison continues on
+the implementation slices.

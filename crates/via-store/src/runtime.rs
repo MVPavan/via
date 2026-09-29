@@ -250,7 +250,7 @@ pub struct AcceptanceRecord {
     pub session_id: SessionId,
     /// One-based turn number.
     pub turn: TurnNumber,
-    /// Synced raw span of the accepting frame.
+    /// Synced raw span of the accepting vendor message.
     pub raw_ref: RawRef,
     /// Vendor correlation retained as durable C2 acceptance evidence.
     pub correlation: String,

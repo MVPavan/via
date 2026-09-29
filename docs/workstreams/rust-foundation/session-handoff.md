@@ -116,10 +116,23 @@ the historical checkpoint; its findings table is updated by this section.
   tracked as `via-jm4.15` and `via-jm4.16`. A Sol high re-check of the fix
   delta accepted Task 3 after the runtime §7 Host bound was recorded as
   amendment A23 (`t3/sol-review-T3-recheck.md`, five rounds). **Task 3
-  (`via-jm4.7.7`) is closed.** Next: Task 4 (`.7.8`) on Sonnet workers. From
+  (`via-jm4.7.7`) is closed.** Now Task 4 (`.7.8`, claimed): design-first T4-0
+  ([t4/t0.md](t4/t0.md)) by `implementer-sonnet-xhigh` in worktree
+  `via-wt/t4-0` (branch `wt/t4-0`); then Astra high and Sol high design
+  reviews, then implementation slices. T4-0 design rounds 1–4 are done
+  (round 4 on `wt/t4-0` at `d75705d`, still UNSOUND from both reviewers;
+  round-4 reviews in `scratchpad/reviews/t4/`, not yet committed). The owner
+  is choosing the path: a last narrow round, full rounds, or a disk-first
+  simplification. The simplification also asks whether streaming text events
+  (`assistant.text`) need SQLite rows at all. On 2026-09-29 the owner renamed
+  "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
+  specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
+  design drafts on `wt/t4-0` still say "frame"; the next design round adopts
+  the new terms. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
-  owner decision), compared with Opus in
+  owner decision); from 2026-09-29 design-first steps go to Opus 5.5 high
+  (`implementer-high`), compared with Opus in
   [model-observations.md](model-observations.md). **From 2026-09-28 no new cloud work: Claude workers are local
   subagents (`implementer`, `implementer-high`, `fable-reviewer`), Codex
   reviews in tmux** ([cloud-and-local.md](cloud-and-local.md) §7). After

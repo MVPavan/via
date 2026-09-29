@@ -1,4 +1,4 @@
-//! Bounded private control frames. Vendor bytes never travel here.
+//! Bounded private control messages. Vendor bytes never travel here.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -150,21 +150,21 @@ impl WireIdentity {
     }
 }
 
-pub(crate) async fn write_frame<T: Serialize>(
+pub(crate) async fn write_message<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),
     value: &T,
     max: usize,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     if bytes.len() > max {
-        return Err(io::Error::other("control frame too large"));
+        return Err(io::Error::other("control message too large"));
     }
     stream.write_all(&bytes).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await
 }
 
-pub(crate) async fn read_frame<T: DeserializeOwned>(
+pub(crate) async fn read_message<T: DeserializeOwned>(
     stream: &mut (impl AsyncRead + Unpin),
     max: usize,
 ) -> io::Result<Option<T>> {
@@ -176,7 +176,7 @@ pub(crate) async fn read_frame<T: DeserializeOwned>(
             0 => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "partial control frame",
+                    "partial control message",
                 ));
             }
             _ if byte[0] == b'\n' => {
@@ -184,19 +184,19 @@ pub(crate) async fn read_frame<T: DeserializeOwned>(
                     .map(Some)
                     .map_err(io::Error::other);
             }
-            _ if bytes.len() == max => return Err(io::Error::other("control frame too large")),
+            _ if bytes.len() == max => return Err(io::Error::other("control message too large")),
             _ => bytes.push(byte[0]),
         }
     }
 }
 
 /// Keeps consumed bytes across cancellation by timers or signal branches.
-pub(crate) struct FrameReader {
+pub(crate) struct ControlReader {
     bytes: Vec<u8>,
     max: usize,
 }
 
-impl FrameReader {
+impl ControlReader {
     pub(crate) fn new(max: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max.min(1024)),
@@ -220,16 +220,16 @@ impl FrameReader {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "partial control frame",
+                        "partial control message",
                     ));
                 }
                 Ok(_) if byte[0] == b'\n' => {
-                    let frame = serde_json::from_slice(&self.bytes).map_err(io::Error::other)?;
+                    let message = serde_json::from_slice(&self.bytes).map_err(io::Error::other)?;
                     self.bytes.clear();
-                    return Ok(Some(frame));
+                    return Ok(Some(message));
                 }
                 Ok(_) if self.bytes.len() == self.max => {
-                    return Err(io::Error::other("control frame too large"));
+                    return Err(io::Error::other("control message too large"));
                 }
                 Ok(_) => self.bytes.push(byte[0]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -244,8 +244,8 @@ pub(crate) async fn transact(
     request: &Request,
     max: usize,
 ) -> io::Result<Reply> {
-    write_frame(stream, request, max).await?;
-    read_frame(stream, 1024)
+    write_message(stream, request, max).await?;
+    read_message(stream, 1024)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
 }

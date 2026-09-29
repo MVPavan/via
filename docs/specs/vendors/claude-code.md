@@ -41,8 +41,8 @@ assumption that a refusal or this specification satisfies the release goal.
 
 ## 2. Ownership, methods and process lifetime
 
-Adapter owns Claude semantics; Route owns typed stream-json parsing, outbound
-frames and control correlation; Wire owns framing/raw bytes; Host owns executable,
+Adapter owns Claude semantics; Route owns typed stream-json parsing, input
+messages and control correlation; Wire owns message splitting/raw bytes; Host owns executable,
 environment, anchored private process and cleanup. Core owns receipt/intent,
 FIFO, deadlines, retries, state and final envelope. No new crate or SDK route.
 
@@ -66,7 +66,7 @@ do not qualify conversation continuity.
 
 The session driver may be idle with no vendor process. `open_session` logically
 allocates or retains the expected vendor UUID; it must not wait indefinitely for
-`system/init` before input. Captured runs send the user frame before observing
+`system/init` before input. Captured runs send the user message before observing
 init, so pre-input identity verification is not established. Start launches with
 the effective TurnSpec after Core has durably recorded submission intent. Every
 init/result UUID must equal the expected UUID. First init proves identity, not
@@ -84,13 +84,13 @@ Only a matching init or a matching non-rejection result can confirm this launch.
 Core persists that evidence, the confirmed ID and `vendor_identity_verified:true`
 with exactly one `session.opened` event on first confirmation, or
 `session.reopened` on subsequent process confirmation, before committing any
-acceptance derived from the same frame. The confirmation observation carries
-connection identity so old/late frames cannot verify a later launch. A pre-init
+acceptance derived from the same message. The confirmation observation carries
+connection identity so old/late messages cannot verify a later launch. A pre-init
 startup/resume rejection never confirms identity or emits either event, even if
 its error result echoes the expected UUID. Logical open must still return to
 permit StartTurn; these delayed events do not delay the original VIA receipt.
 
-The process remains open during the turn so interrupt frames can be sent. After
+The process remains open during the turn so interrupt messages can be sent. After
 its terminal, close stdin, await exit and settle group cleanup before another
 process for this session starts. Core's cleanup gate is unchanged. Do not create
 a child until a runtime connection slot is reserved. Close/restart failures must
@@ -298,7 +298,7 @@ the unanswered request and protocol failure; do not claim a delivered decline.
 raw evidence; a partial write is uncertain. Failed response/cleanup cannot hang
 the session or be counted as a passing auto-decline test.
 
-Carry runtime §8 ceilings unchanged: 1 MiB inbound frame; 64 frames/4 MiB route
+Carry runtime §8 ceilings unchanged: 1 MiB inbound vendor message; 64 messages/4 MiB route
 data; 1024 observations/4 MiB; 256 KiB known observation (split text only);
 8 MiB connection/32 MiB global raw staging; one data command and eight controls
 (64 KiB total); 1 MiB envelope. Controls and sticky health bypass blocked normal
@@ -343,7 +343,7 @@ requires Host evidence that the anchor issued force; quiescence and reaping are
 separate. SIGTERM/process exit 143 is not graceful cancellation. Close never
 deletes the vendor transcript; a closed VIA session cannot accept resume.
 
-Recovery never invokes `--resume` and never sends a user frame. Challenge the
+Recovery never invokes `--resume` and never sends a user message. Challenge the
 persisted anchor and request owned cleanup if verified. `Dead` is allowed only
 with confirmed process death, not merely because the stdio cannot be rejoined;
 otherwise `Unknown`. Same-boot/namespace positive absence can settle cleanup,
@@ -406,15 +406,15 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_preflight_pure_version` | describe creates no process/file; absent/stale cached version is untested; exact 2.1.283 only; untested opt-in cannot waive bound/protocol/identity refusal |
 | `claude_reserved_options` | Every normalized alias for owned flags/settings/env is refused before vendor I/O; no arbitrary argv |
 | `claude_lazy_init_acceptance` | Logical open returns with internal expected UUID, public ID null/verified false and no opened event; init emitted only after input cannot deadlock; matching init confirms identity/opened but is not acceptance; sole successful terminal confirms before one acceptance token; pre-init rejection echoes UUID without confirming or opening |
-| `claude_identity_resume` | Same UUID across three children; historical confirmed ID remains visible with verified false during reopening; matching init/non-rejection result commits one reopened event and verified true; late prior-generation frame cannot confirm; mismatch/missing-session rejection never reopens or creates fresh; no duplicate input after loss |
-| `claude_fifo_busy_input` | Queue two VIA turns while fake tool runs; first process receives exactly one user frame; second starts only after terminal/cleanup; vendor queue count has no authority |
+| `claude_identity_resume` | Same UUID across three children; historical confirmed ID remains visible with verified false during reopening; matching init/non-rejection result commits one reopened event and verified true; late prior-generation message cannot confirm; mismatch/missing-session rejection never reopens or creates fresh; no duplicate input after loss |
+| `claude_fifo_busy_input` | Queue two VIA turns while fake tool runs; first process receives exactly one user message; second starts only after terminal/cleanup; vendor queue count has no authority |
 | `claude_schema_replace_clear` | Disjoint schemas A/B and null across same UUID; actual structured output validated by Core; missing/invalid output fails; launch rejection never recreates session |
 | `claude_agentic_step_limit` | N=1 terminal error_max_turns maps failed/budget_exceeded/max_steps even with num_turns=2; N=2 on resume succeeds; null clears flag; N counts agentic iterations, not tool calls |
 | `claude_instructions_effort` | Frozen instruction bytes reapplied after source file changes; explicit model-supported effort preserved on resume; invalid effort refused; large argv budget error before prompt |
 | `claude_never_ask` | Denied action settles; live permission_denied and terminal denials deduplicated; unknown request refusal or fail-closed action completes within 5 s while normal observations are full |
 | `claude_interrupt_pairing` | Correct nested receipt then abort terminal acknowledges; wrong IDs, missing terminal, late response, natural-success race and duplicate cancel never falsely acknowledge |
 | `claude_cleanup_not_ack` | Receipt/terminal with open tool stays pending; child surviving leader exit not quiescent; anchor force not acknowledgement; group absence provenance required |
-| `claude_recovery_no_submit` | Crash after intent/before acceptance, accepted crash and survivor: zero replay frames; verified anchor cleanup only; unverified anchor never signalled; recovered turn unknown |
+| `claude_recovery_no_submit` | Crash after intent/before acceptance, accepted crash and survivor: zero replay messages; verified anchor cleanup only; unverified anchor never signalled; recovered turn unknown |
 | `claude_normalizer_accounting` | Repeated assistant block not doubled; denial dedup; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, absent fields and counter reset |
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory/raw incompleteness; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
@@ -458,7 +458,7 @@ zero tests serve as acceptance. Keep network and credentials out of default CI.
    Core verifies that connection is current and atomically persists confirmed
    identity, verified true, and `session.opened` on first confirmation or
    `session.reopened` on later confirmations. Emit once per connection, before
-   any acceptance derived from the same frame. No opened/reopened event is
+   any acceptance derived from the same message. No opened/reopened event is
    emitted for a pre-init startup/resume rejection, even with an echoed expected
    UUID. The VIA receipt/session exists independently of vendor confirmation.
    Every init/result ID is checked; mismatch fails `resume_mismatch` without

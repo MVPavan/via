@@ -77,7 +77,7 @@ its own clean/incomplete policy (§6.2).
 | Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, subscribers | C1 requests and committed DTOs |
 | Adapter | Fake protocol mapping and normalizer; C2 observation queue | Observations, control results, health |
 | Route | Fake protocol parsing, start correlation, command serialization | Typed fake requests/messages |
-| Wire | Pipe reader/writer tasks, byte framing and raw staging | Frames with durable raw evidence, transport health |
+| Wire | Pipe reader/writer tasks, byte message splitting and raw staging | Vendor messages with durable raw evidence, transport health |
 | Host | Child handle, process group/identity, reap and escalation timers | Exclusive pipe endpoints, verified exit/cleanup |
 | Store | SQLite connection/thread, raw writer/thread, migration and backup; Core retains sole owner | `StoreClient` for Core lifecycle/reads; unopened `RuntimeResources` forwarded to Wire |
 
@@ -170,11 +170,11 @@ intent already committed.
 
 Adapter command admission has separate data and control lanes (see §8).
 Route control and health handling do not await the normalizer. A control
-write can follow an in-progress frame but cannot interleave its bytes. If the
+write can follow an in-progress input message but cannot interleave its bytes. If the
 peer does not read stdin, Host escalation stays available without stdin.
 Route errors preserve `Protocol`, `TransportLost`, `ProcessExited`, `Overflow`
 and `Store` causes and evidence; Core alone selects C1 disposition.
-For this one-child-per-turn fake route, decoding its terminal frame ends
+For this one-child-per-turn fake route, decoding its terminal message ends
 start/control admission on that connection and immediately requests Wire's
 `close_input` (§4), before awaiting Core's durable result, process exit or
 stdout EOF. Output drains and raw recording remain open. A duplicate
@@ -192,7 +192,7 @@ requests. Known response types ignore extra fields but reject missing or
 wrong-type required fields. An unknown notification tag without `id` follows
 the existing bounded `vendor.other` path. An unknown tag carrying `id` is an
 unexpected protocol message and fails parsing: this private protocol defines
-no fake-to-VIA requests to answer. §4 framing, §8 structure/payload limits,
+no fake-to-VIA requests to answer. §4 message splitting, §8 structure/payload limits,
 text splitting and raw durability still apply.
 
 One child/connection serves one turn. Request IDs are positive JSON integers:
@@ -243,11 +243,11 @@ not appended again to chunks. Fake steer is unsupported and has no wire
 request. Close uses existing process cleanup, not a fake protocol message.
 This seam adds no public C1 method or test CLI surface.
 
-On a normal fixture, the fake emits its terminal frame **before** waiting
+On a normal fixture, the fake emits its terminal message **before** waiting
 for finalization, then drains and validates all remaining stdin bytes through
 EOF within 2 s. It exits zero only after EOF with no protocol violation.
 A second start, duplicate/invalid interrupt, unknown request, partial final
-frame or timeout gives a named diagnostic and nonzero exit. A permitted id-2
+message or timeout gives a named diagnostic and nonzero exit. A permitted id-2
 interrupt racing terminal is consumed and validated even if no longer
 actionable; it cannot trigger another terminal or cancel completed work.
 The fake retains one parser/buffer for its entire input lifetime, so read-
@@ -256,14 +256,14 @@ its completion/error belongs to normal finalization; a detached blocked
 reader is not success. Explicit exit/crash/hang fixture steps remain fault
 paths, not successful normal finalization. Existing input caps still apply.
 
-## 4. C4: framing, raw evidence and transport
+## 4. C4: message splitting, raw evidence and transport
 
 ```rust
 pub struct WireConnection { /* exclusive pipe/task ownership */ }
 pub struct WireRuntime { raw: RawFactory, host: Host }
 pub struct RuntimeConfig { pub anchor_binary: PathBuf, pub anchor_dir: PathBuf }
-pub struct WireParts { pub sender: WireSender, pub frames: WireFrames }
-pub struct Frame { pub bytes: BoundedBytes, pub raw_ref: RawRef }
+pub struct WireParts { pub sender: WireSender, pub messages: WireMessages }
+pub struct VendorMessage { pub bytes: BoundedBytes, pub raw_ref: RawRef }
 pub enum WireHealth {
     Open,
     Failed { cause: WireFailure, raw_incomplete: bool },
@@ -281,20 +281,20 @@ impl WireConnection {
     pub fn into_parts(self) -> WireParts;
 }
 impl WireSender {
-    pub fn write(&self, frame: OutboundFrame, deadline: Deadline)
+    pub fn write(&self, message: InputMessage, deadline: Deadline)
         -> impl Future<Output = Result<SendOutcome, WireError>> + Send;
     pub fn close_input(&self, deadline: Deadline)
         -> impl Future<Output = Result<(), WireError>> + Send;
     pub fn close(&self, request: CloseRequest)
         -> impl Future<Output = CloseReport> + Send;
 }
-impl WireFrames {
-    pub fn next_frame(&mut self)
-        -> impl Future<Output = Result<Option<Frame>, WireError>> + Send;
+impl WireMessages {
+    pub fn next_message(&mut self)
+        -> impl Future<Output = Result<Option<VendorMessage>, WireError>> + Send;
 }
 ```
 
-The clonable sender/control handle and unique frame receiver allow reads and
+The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
 `WireRuntime::open_connection` obtains a `RawWriter` from its private factory
 and invokes Host acquisition. Direct `WireConnection::open(&Host, spec,
@@ -307,7 +307,7 @@ without exposing journal or Host getters; the separately reviewed outer
 test-supervisor identity snapshot/cleanup remains unchanged.
 `close_input` is idempotent, closes only vendor stdin and acknowledges only
 after its endpoint is dropped. The one stdin writer settles any previously
-admitted complete control frame within the remaining 2 s finalization
+admitted complete input message within the remaining 2 s finalization
 budget, then drops the endpoint. It starts no new write after close request
 and never interleaves bytes. A partial write that cannot finish closes input
 and reports the existing indeterminate transport condition; it never reuses
@@ -316,17 +316,17 @@ Host group cleanup, stop output readers, seal raw output or fabricate a
 successful send. The future C4 owner implements it with the real WireSender;
 the frozen contract-only increment needs no unimplemented stub.
 One task drains stdout and one drains stderr. Neither waits for Route, Core,
-SQLite, fsync or a follower. They frame bytes into bounded raw units and use
+SQLite, fsync or a follower. They split bytes into bounded raw units and use
 nonblocking staging admission. Byte permits are acquired before copying;
 failure irreversibly marks the connection incomplete and fails it. Draining
 continues using a reusable 64 KiB discard buffer until EOF or the cleanup
 deadline; discarded bytes are counted. Counters cannot make the log complete.
 
-The byte framer retains split UTF-8 without interpreting it; only Route
+The byte splitter retains split UTF-8 without interpreting it; only Route
 decodes UTF-8/JSON after raw persistence. Normal stdout units end at LF and
-include LF; EOF emits an unterminated raw unit that is not a valid frame.
-Frames include LF in the 1 MiB cap. At that cap without LF, record the bounded
-prefix, fail with `FrameTooLarge`, then continue raw-only drain in 64 KiB
+include LF; EOF emits an unterminated raw unit that is not a valid message.
+Messages include LF in the 1 MiB cap. At that cap without LF, record the bounded
+prefix, fail with `MessageTooLarge`, then continue raw-only drain in 64 KiB
 units when staging permits. Invalid UTF-8 and malformed known messages
 remain exact raw bytes before protocol failure. Raw logging attempts to
 preserve the cleanup tail; any discarded tail is explicitly incomplete.
@@ -336,21 +336,21 @@ Store serializes append order across stdout, stderr and stdin. A companion
 append-only index identifies each unit's stream/direction, payload offset,
 length and checksum. The file contains payload bytes only, so `RawRef`
 `{connection_id, offset, len}` resolves without a new public field. Whole
-valid stdout frames are single units and never interleaved with stderr.
+valid stdout messages are single units and never interleaved with stderr.
 Per-stream byte order is preserved; append order across independent streams
 is not claimed to be physical observation order. Stderr units are at most
-64 KiB, no JSON interpretation. The bounded unfinished stdout frame is part
+64 KiB, no JSON interpretation. The bounded unfinished stdout message is part
 of raw staging accounting; do not also enqueue duplicate chunk copies.
 
 Outbound tap records only successfully written prefixes, not an intended
-whole frame before write. The one stdin writer retains its offset over
+whole input message before write. The one stdin writer retains its offset over
 cancellation. Partial send plus timeout closes stdin/connection before reuse
 and returns `Indeterminate`. Outbound prefixes may be multiple raw units;
 they are not represented as one fake contiguous reference. No semantic event
 references a bounding span containing another stream's traffic.
 
 Store's raw worker appends payload and index, calls `sync_data` on both, then
-releases a `DurableRaw` token for those units. Wire makes a frame available
+releases a `DurableRaw` token for those units. Wire makes a message available
 to Route only after this token. Parent directories are synced when files
 are created. `flush` of userspace buffers alone is not durability. Sync batch
 thresholds are 1 MiB or 20 ms, whichever comes first. Partial writes use
@@ -495,7 +495,7 @@ Configure, failed storage or reconnect.
 The control protocol is a closed enum of `Challenge`, `Configure`, `Arm`,
 `Stop`, `Status` and replies. Configure is accepted once, before ARM, only
 on the original bootstrap controller connection; its validated argv/env/cwd
-spec is <=64 KiB. Other frames are <=1 KiB, with at most one outstanding
+spec is <=64 KiB. Other control messages are <=1 KiB, with at most one outstanding
 request and bounded integer fields. Restart cannot configure or start a
 vendor; it connects to the stored private socket and sends a
 fresh random challenge; the anchor returns the challenge plus its own private
@@ -865,7 +865,7 @@ Without `drain` or `force`, a stop with active turns is refused
   after acceptance. Force closes every running turn with mode `force`: Core
   signals the turn's route, which asks the verified anchor to stop its
   private group (C2 Close(Force)) and drains both pipes to the raw log under
-  its cleanup bound. Frames already read still become events; bytes the
+  its cleanup bound. Messages already read still become events; bytes the
   drain cannot record mark the raw log incomplete. A receipted turn not yet
   launched starts nothing; with a complete Host journal and no anchor intent
   for it, its cancel is `requested` with cleanup `quiescent` (C1 §7.4). Core
@@ -1006,12 +1006,12 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | C1 line | 16 MiB including LF | Oversize closes connection; bounded parse error attempt |
 | Global C1 input buffers | 32 MiB | Reserve bytes before read; 5 s partial-request deadline prevents monopolization |
 | JSON structure | depth 64, 65,536 nodes per document | Bound during streaming parse, before constructing a `Value`; named invalid params/protocol error |
-| Vendor stdout frame | 1 MiB including LF | Fail connection; preserve prefix and raw-only cleanup tail where possible |
+| Vendor stdout message | 1 MiB including LF | Fail connection; preserve prefix and raw-only cleanup tail where possible |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
 | Raw staging | 8 MiB/connection, 32 MiB total | Nonblocking failure; incomplete + cleanup, not pipe backpressure |
-| Framed Route data | 64 frames and 4 MiB/connection | Fail connection if saturated; health/control bypass |
-| Codex shared Route ingress | 16 frames and 1 MiB/thread within the existing connection staging; 16 MiB global permit for Codex lanes/tool metadata | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
-| OpenCode HTTP/SSE transport metadata | Existing bounded Wire raw/framing and global retained-payload permits | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body/framing evidence; route by owned server generation and vendor session/message IDs |
+| Route message staging | 64 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
+| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; 16 MiB global permit for Codex lanes/tool metadata | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
+| OpenCode HTTP/SSE transport metadata | Existing bounded Wire raw/message-splitting and global retained-payload permits | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, Core fails `overflow` and interrupts (A1) |
 | C2 observation payload | 256 KiB encoded | Split text on UTF-8 boundaries preserving order; otherwise fail protocol with raw evidence; unknown payload keep at most 16 KiB with explicit truncation marker |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
@@ -1035,8 +1035,8 @@ are harmless. The same mechanism stores input identity bytes and large
 immutable effective params, preserving the 16 MiB public request limit while
 keeping Store messages small. Load only the dispatched prompt into the global
 32 MiB input budget. Outbound fake start may encode beyond 1 MiB; its input
-frame ceiling is C1's 16 MiB plus bounded JSON framing expansion, streamed
-without a whole second copy. Inbound vendor frame cap remains 1 MiB.
+message ceiling is C1's 16 MiB plus bounded JSON wrapper expansion, streamed
+without a whole second copy. Inbound vendor message cap remains 1 MiB.
 
 Use byte-permit wrappers with RAII release, including data waiting for sync,
 decode, channel send, serialization or task join. A JSON AST has a conservative
@@ -1070,7 +1070,7 @@ retained-payload budget. Measure 32 loaded leases and four active turns
 without preallocating 4 MiB per idle lease; retain the 256 MiB RSS target.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the frozen server key and vendor
-semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, framing,
+semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
 redacted raw capture and bounded staging; Host exclusively starts and
 supervises the authenticated loopback server. Core's durable-state and Store
 ownership do not change, and Adapter receives no Store access. Four separate
@@ -1104,15 +1104,15 @@ after abrupt disconnect. Each socket has one serializer and one reserved
 termination slot; if multiple subscriptions fail together, close the socket
 after the first notice/deadline and require the others to resume by cursor.
 
-Never insert an end notice inside a partially written NDJSON frame. Finish
-that frame and attempt the notice within a single 2 s absolute write deadline;
+Never insert an end notice inside a partially written NDJSON line. Finish
+that line and attempt the notice within a single 2 s absolute write deadline;
 otherwise close the socket. A peer that continues reading sees `event_end`.
 A peer that never reads may see only EOF later. The daemon frees subscription
 and outbox ownership within 2 s in both cases, without affecting any turn or
 other client. Already accepted kernel bytes may arrive after closure.
 
 `unsubscribe` removes the subscription and unsent entries, waits for any
-already started frame to complete within the same 2 s bound, then enqueues
+already started line to complete within the same 2 s bound, then enqueues
 the `unsubscribed` notice and reply in that order. No event for that subscription
 is enqueued after the reply. Disconnect releases all connection subscriptions
 immediately in memory. Cancelling a wait request only releases that waiter;
@@ -1230,7 +1230,7 @@ full starts before releasing its existing pre-accept gate: after terminal
 and input close, fake must exit nonzero for the duplicate. The same fixture
 with one start exits zero; a permitted interrupt remains valid. Also cover
 a duplicate read ahead, one after an in-lifetime gate, a partial second
-frame, and a controller that leaves input open after terminal (bounded
+message, and a controller that leaves input open after terminal (bounded
 nonzero finalization failure). Direct fake tests close input after reading
 terminal, just as Route will. A future Route integration test must prove
 half-close begins before process-exit/result waiting while raw output still
@@ -1312,7 +1312,7 @@ No prompt, handle or vendor secret is included in acknowledgements.
 | `raw.before_sync`, `events.before_commit`, `raw.index.torn_tail` | No committed reference before sync; partial/unreferenced tails classified; incomplete warning survives successful recovery commit |
 | `core.observations.pause`, fake flood and stderr flood | F24: 1024/byte bounds and 10 s overflow; independent control service; raw loss explicit; 256 MiB/RSS assertion |
 | blocked socket, replay boundary barrier, unsubscribe barrier | F25/F26: attempted notice vs actual delivery distinguished, release <=2 s, dense stored seq, no replay gap/duplicate or post-unsubscribe delivery after reply |
-| byte framer proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact raw units or explicit incompleteness, no panic/unbounded allocation |
+| byte splitter proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact raw units or explicit incompleteness, no panic/unbounded allocation |
 | Linux identity/control seam and real process tests | F22: uid/start/boot/group/marker mismatch never commands cleanup; forged challenge refused; spawn/anchor-death race yields no unrelated signal; marker checks never read vendor environment; leader exit alone never quiescent |
 
 Implement scenario test names `s1_f01_...` through `s1_f30_...`, plus

@@ -1399,7 +1399,7 @@ fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, Scenari
 
 /// W3-F merge follow-up: a force while vendor output is in flight never leaves
 /// the raw log silently short. The vendor writes an unterminated line, which
-/// Wire holds unframed, then waits; after the force, those bytes are in the
+/// Wire holds unsplit, then waits; after the force, those bytes are in the
 /// connection's raw log, or the turn records `raw_log.incomplete` and the
 /// envelope warns `raw_log_incomplete`.
 #[test]

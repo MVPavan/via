@@ -1077,7 +1077,7 @@ fn a_control_registering_before_the_delayed_early_stop_task_runs_is_stopped_at_o
 /// acquisition is held after its ARM intent committed, before the ARM gate.
 /// The force is raised while it waits. The gate reads the force in its own
 /// ledger section and refuses, though the task has set no `stopping`: the
-/// anchor never receives ARM, and no `Stop` frame goes to a pre-ARM anchor.
+/// anchor never receives ARM, and no `Stop` message goes to a pre-ARM anchor.
 #[test]
 fn the_arm_gate_refuses_after_the_force_though_the_early_stop_task_is_delayed() {
     runtime().block_on(async {
@@ -1376,9 +1376,9 @@ fn arm_completing_after_the_snapshot_is_stopped_by_its_owner() {
 
 /// Design §6.8 [r6.1]: before ARM the early stop sends nothing (the pre-ARM
 /// anchor treats `Stop` as invalid); the ARM gate reads `stopping` and
-/// refuses: `Stopped`, not launched, no `Stop` frame, absence proved.
+/// refuses: `Stopped`, not launched, no `Stop` message, absence proved.
 #[test]
-fn a_pre_arm_acquisition_is_refused_at_the_gate_without_a_stop_frame() {
+fn a_pre_arm_acquisition_is_refused_at_the_gate_without_a_stop_message() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();

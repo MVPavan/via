@@ -1708,7 +1708,7 @@ fn s1_f12_raw_incomplete_reply_lost_is_written_once() -> TestResult {
 }
 
 fn raw_incomplete_reply_lost(end: RawEnd) -> TestResult {
-    // A second acceptance is a protocol failure once its own frame is
+    // A second acceptance is a protocol failure once its own message is
     // recorded; the line behind it, written together, is only in Wire's
     // buffer, so the failure drain records it.
     let duplicate = json!({"action":"emit_raw","text":
@@ -1731,7 +1731,7 @@ fn raw_incomplete_reply_lost(end: RawEnd) -> TestResult {
     let (session, _) = sandbox.spawn("first")?;
     sandbox.await_file("first.entered")?;
     sandbox.await_accepted(&session, 1)?;
-    // The duplicate frame's append succeeds; the tail's is the next.
+    // The duplicate message's append succeeds; the tail's is the next.
     let append = sandbox.next_hit("raw.append.fail")? + 1;
     sandbox.arm("raw.append.fail", append, "fail_io")?;
     // The turn's first event after acceptance is `raw_log.incomplete`; the

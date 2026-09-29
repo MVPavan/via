@@ -302,7 +302,7 @@ pub type StopWatch = tokio::sync::watch::Receiver<Option<StopOrder>>;
 pub struct RouteFailure {
     /// First cause; later cleanup failures never replace it.
     pub cause: RouteError,
-    /// Synced frame that proved a protocol failure, when one exists.
+    /// Synced vendor message that proved a protocol failure, when one exists.
     pub evidence: Option<RawRef>,
     /// Host-confirmed vendor exit when one was observed.
     pub exit: Option<ExitReport>,
@@ -408,10 +408,10 @@ impl FakeMessage {
     /// Decodes one bounded fake message and validates its connection-local ID.
     /// Caller still owns duplicate/order checks and the global JSON node budget.
     pub fn decode(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
-        if input.len() > via_wire::MAX_STDOUT_FRAME_BYTES {
+        if input.len() > via_wire::MAX_STDOUT_MESSAGE_BYTES {
             return Err(RouteError::Protocol {
                 turn,
-                detail: "fake frame exceeds wire cap",
+                detail: "fake message exceeds wire cap",
             });
         }
         let tag: Tag = known(input, turn)?;

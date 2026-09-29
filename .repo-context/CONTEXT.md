@@ -15,43 +15,28 @@ harnesses remain extension concepts, not first-release requirements.
 A coding-agent product VIA drives through its vendor's own binary or server (Claude Code, Codex, OpenCode, Pi, …).
 _Avoid_: agent (ambiguous), provider, backend
 
-**Tier 1 / Tier 2**:
-Tier 1 is a model provider's own harness (Claude Code, Codex, Antigravity); tier 2 is a multi-provider aggregator (OpenCode, Cursor, Pi, …).
-
 **Adapter**:
-L3's per-harness integration: maps canonical operations and parameters to a chosen route, declares capabilities, normalizes events, and classifies failures. Pinned and contract-tested against specific vendor versions, with a recorded terms status.
+L3's per-harness integration: maps VIA operations and parameters to a chosen route, declares capabilities, turns vendor messages into events, and classifies failures. Pinned and contract-tested against specific vendor versions.
 _Avoid_: profile, driver, plugin
-
-**Terms status**:
-The recorded position of a vendor's terms on automated access through an adapter's route; informs disabling an adapter, never gates development.
-
-**Drift**:
-A vendor binary, SDK or bridge version outside the versions an adapter was contract-tested against.
 
 ## Routes
 
 **Route**:
 L4's protocol client for reaching a harness: vendor CLI, vendor RPC or native ACP for now. One session keeps one route for its life; fallback is allowed only before submission.
-_Avoid_: transport, channel
+_Avoid_: transport, channel, SDK route (VIA does not use vendor SDKs; see `docs/brainstorms/routes-decision.md`)
 
 **CLI route**:
 VIA uses the vendor binary in its documented headless mode and reads structured output and exit status. A route may start a fresh process for a later turn while resuming the same vendor session.
-
-**SDK route**:
-A vendor library integration style, not a wire mechanism; most SDKs spawn a vendor binary underneath. VIA does not use SDK routes for now. Revisit conditions are in `docs/brainstorms/routes-decision.md`.
 
 **Vendor RPC route**:
 A vendor-specific server started by VIA and spoken to through the vendor's own protocol (Codex `app-server`, Pi `--mode rpc`). VIA never attaches to or stops a server it did not start.
 _Avoid_: app-server (one instance of it)
 
 **ACP route**:
-Zed's Agent Client Protocol: JSON-RPC over stdio to a native ACP agent subprocess. Bridged ACP is not used for now.
+Zed's Agent Client Protocol: JSON-RPC over stdio to a native ACP agent subprocess. An extension concept; ACP bridges (`codex-acp` and similar) are not used.
 _Avoid_: Agent Communication Protocol (IBM/BeeAI's, merged into A2A)
 
-**Bridge**:
-A separate program that translates ACP to a harness's own surface (`codex-acp`, `claude-agent-acp`, community `pi-acp`); each bridge adds a layer and a failure domain.
-
-## Sessions and turns
+## Sessions, turns and events
 
 **Session**:
 One resumable conversation with one agent. VIA mints its id; it has a
@@ -63,11 +48,27 @@ It maps one-to-one to a vendor session. States: idle, active, closed.
 _Avoid_: job, task
 
 **Turn**:
-One caller prompt, the agent's tool calls, and one result envelope. Identified by session id and turn number (`s_7f3/2`). States: queued, running, completed, failed, cancelled, unknown. `spawn` starts turn 1; `resume` adds a turn; steer and cancel target the active turn.
-_Avoid_: step
+One exchange between VIA's caller and the agent: the caller's prompt goes in, one result envelope comes out, and events record what happened in between. Identified by session id and turn number (`s_7f3/2`). `spawn` starts turn 1; `resume` adds a turn; steer and cancel target the running turn. A session runs at most one turn at a time; later turns wait in its queue.
+States: queued, running, completed, failed, cancelled, unknown. Core records the start as `turn.started` when the agent accepts the prompt (the vendor's acceptance message). It records the end as `turn.ended` when the agent's terminal message arrives (Claude Code `result`, Codex `turn/completed`), or when VIA ends the turn itself: cancel, deadline, process exit or overflow.
+_Avoid_: step, run
 
 **Step**:
 One model step inside a turn. Claude Code's `--max-turns` and `num_turns` count steps; VIA's `max_steps` maps to `--max-turns`.
+
+**Vendor message**:
+One message the agent sends VIA as JSON text: an NDJSON line on a CLI's stdout, a JSON-RPC notification from a vendor server, or an SSE event. It is the adapter's input. Wire splits the byte stream into messages and caps their size without decoding them; the route decodes each one into a typed struct. An unknown message type becomes a `vendor.other` event; a malformed known message is a protocol failure (adapter contract §1).
+_Avoid_: frame, vendor event
+
+**Event**:
+VIA's normalized record of something that happened in a session, such as `turn.started`, `assistant.text`, `tool.started`, `tool.ended`, `usage.updated` or `turn.ended` (full list in VIA API §6). It is harness-neutral: the same event types come from every adapter. Most events belong to one turn; a few (`session.opened`, `session.closed`) belong to the session. Each event has a dense per-session `seq`. Core commits it to the Store, and callers read it through `events` (page or follow). One vendor message yields zero or more events, and VIA also creates events of its own (`turn.submitted`, `cancel.requested`).
+_Avoid_: frame, notification, message (reserved for vendor messages)
+
+**Event trace**:
+The ordered events of one turn, from `turn.queued` to `turn.ended`, read by `seq`. The session's trace is its turns' traces interleaved with its session events.
+_Avoid_: agent trace, log
+
+**Raw log**:
+The exact bytes a vendor connection sent and received, in one file per connection outside SQLite. Events point to their source bytes by offset and length; it is evidence, not an API.
 
 **Run**:
 Deliberately not a VIA entity; use session or turn for VIA lifecycle concepts. Ordinary English may still say "run an agent."
@@ -88,16 +89,13 @@ Caller policy for choosing explicit VIA parameters, not a VIA entity. VIA accept
 The structured result for a turn: session id and turn number, adapter and version, route, vendor session id, model/effort, terminal state, exit code, stop reason, final text, usage, cost with provenance, timestamps, log reference, tree pins, denied actions and auto-declined requests.
 _Avoid_: result object, output
 
-**Launch receipt**:
-The turn's intent persisted before dispatch; if the daemon dies around submission and the outcome cannot be established, the turn remains *unknown* and the prompt is never resent automatically.
+**Submission intent**:
+The durable `turn.submitted` record committed before VIA sends the prompt. If the daemon dies around submission and the outcome cannot be established, the turn ends *unknown* and the prompt is never resent automatically.
+_Avoid_: launch receipt (a receipt is the reply to spawn/resume)
 
 **Store**:
-Durable session, turn, event and process records behind a small SQLite storage interface. The daemon is its only writer; L5's tap writes a raw log per connection, while normalized events are indexed per turn.
+VIA's SQLite database, written only by the daemon: sessions (parameters, state, handle hash), turns (prompt, state, envelope), events (the JSON body plus a pointer into the raw log), spawn and operation keys for retry replay, and anchors (VIA's process-supervision records). Raw vendor bytes stay in raw log files.
 _Avoid_: database, ledger (the parent repo's record store)
-
-**Worker**:
-An agent process or task supervised by the VIA daemon; it does not own VIA's session lifecycle or Store.
-_Avoid_: daemon
 
 **VIA daemon**:
 The one process per user that owns agent processes, vendor connections and the Store. It hosts L1's server half plus L2–L6 and the Store; its `main` wires them and handles the single-instance lock, idle exit and signals. It does not constitute another layer.
@@ -116,7 +114,7 @@ L6, the only layer that starts and supervises vendor processes and servers. It r
 _Avoid_: daemon as a synonym
 
 **Wire**:
-L5, responsible for framing, byte transport, bounded pipe draining and the exact-byte raw tap per connection. It does not interpret vendor messages.
+L5, which moves bytes to and from vendor processes: it drains pipes within bounds, splits output into vendor messages, and writes the raw log per connection. It does not interpret vendor messages.
 
 **Layer**:
 One of six library responsibility boundaries, L1 Interface through L6 Host. The daemon is the process containing the server half of L1 and L2–L6, not a seventh layer.
@@ -159,11 +157,3 @@ Each adapter's per-verb mark: `native`, `partial` (with stated semantics), or `u
 **Named refusal**:
 The error VIA returns, naming the verb and adapter, when a verb is unsupported or a requested bound cannot be expressed.
 _Avoid_: fallback, emulation
-
-## Consumers
-
-**Thin SDK**:
-A small per-language library that uses the VIA binary as a C1 client; no in-process native binding.
-
-**Foreman**:
-The parent repo's workflow-interpreter component that is to call VIA to run crews.
