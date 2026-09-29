@@ -158,9 +158,17 @@ the historical checkpoint; its findings table is updated by this section.
   (`t4/review-r18-sol.md`). The design ([t4/design.md](t4/design.md), 1,775
   lines, amendments A24–A46) is merged into `rust-foundation` (`f42c52c`).
   Assumptions not yet observed are listed in design §16 and measured with
-  every adapter in `via-d9o.2.3`. **Next, after the owner's go-ahead:** apply
-  the spec amendments and the CONTEXT.md terms, then slice planning (Opus high;
-  the old `t4/s1.md`–`s7.md` are superseded). Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  every adapter in `via-d9o.2.3`. On 2026-09-29 the owner authorized
+  implementation: each chunk by `implementer` (Opus 5.5 medium) and reviewed
+  by Sol high until SOUND; Astra high and Fable 5.1 high critical reviews
+  once, on the whole epic after all chunks merge. Spec amendments (T4-A,
+  `via-jm4.7.8.2`) are merged (`ee5b8d6`, Sol r3 SOUND,
+  `t4/reviews/T4-A-sol-r*.md`). The plan is [t4/plan.md](t4/plan.md)
+  (`76001d0`; the old `t4/s1.md`–`s7.md` are superseded): T4-1 → (T4-2 ∥ T4-3)
+  → T4-4 → T4-5 → (T4-6 ∥ T4-7) → Close → critic, Beads `via-jm4.7.8.3`–`.10`
+  with T4-7 = `.7.8.1`. **Now:** T4-1 in worktree `via-wt/t4-1` (branch
+  `wt/t4-1`). Ledger: `scratchpad/execution/t4-impl/progress.md`; worker
+  logs under `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From
