@@ -56,7 +56,7 @@ FIFO, deadlines, retries, state and final envelope. No new crate or SDK route.
 | `steer` | `unsupported_verb` naming `claude-cli`; no input written |
 | `cancel` | Queued cancellation is Core-local; running cancellation follows §7 |
 | `close` | Core closes admission; graceful drains permitted work and closes stdin; force requests anchor-owned cleanup |
-| `status`, `wait`, `result`, `list`, `events`, `unsubscribe`, `logs` | Core/Store APIs; no vendor readback, polling or transcript scraping |
+| `status`, `wait`, `result`, `list`, `events`, `logs` | Core/Store APIs; no vendor readback, polling or transcript scraping |
 
 Use one process for **one** VIA turn, even when effective parameters are unchanged.
 This reduces process reuse states and makes process-start options apply at every
@@ -230,18 +230,17 @@ in one ordered observation batch. Pre-init startup rejection remains rejection.
 | Incoming traffic | Normalized behavior |
 |---|---|
 | `system/init` | Validate UUID, actual version, permission mode and expected capabilities/tool surface; record bounded metadata; never count as model progress |
-| `assistant.message.content` text | Emit ordered `assistant.text` once; deduplicate by actual message/block identity when Claude repeats an assistant message with additional metadata; final text comes from result |
-| assistant `tool_use` | `tool.started` with tool ID/name and bounded input summary; retain open-item set |
-| user `tool_result` | `tool.ended` for matching tool ID; error/refusal remains error, not successful tool execution; unmatched IDs retained as diagnostic/protocol evidence |
+| `assistant.message.content` text | `progress` with `model`; final text comes from `result`, sent as completed C2 `final_text` pieces of at most 256 KiB encoded before the terminal |
+| assistant `tool_use` | `progress` with `model` and `tools_started (id, name)`; retain the open-item set |
+| user `tool_result` | `progress` with `tools_ended (tool ID)`; error/refusal remains error; unmatched IDs are protocol evidence |
+| `message.usage` | `progress` `usage` keyed by message ID (unprobed) |
 | `system/permission_denied` | `action.denied`; deduplicate matching terminal `permission_denials` by tool-use ID |
 | `result` | Validate session, normalize terminal only once, report text/structured output/denials/accounting before `turn.vendor_terminal` |
-| unknown notification | `vendor.other`, at most 16 KiB with explicit truncation; cannot advance lifecycle or idle timer |
-| malformed known message / contradictory duplicate result | Protocol health failure with raw reference; never invent a second terminal |
-| stderr | Raw-only diagnostics; never parsed as a result or used to reset idle |
+| unknown notification | no observation; moves the turn's activity time; cannot advance lifecycle or the idle timer |
+| malformed known message / contradictory duplicate result | Protocol health failure; never invent a second terminal |
+| stderr | written by the operating system to the turn's evidence folder; never read, parsed or used to reset idle |
 
-Never synthesize `file.changed` from a tool's name or claimed intent. Report it
-only from verified vendor change evidence; otherwise the tool event suffices.
-Do not expose private chain-of-thought as `reasoning.summary`. Preserve unknown
+VIA does not report file changes. Preserve unknown
 metadata in bounded vendor data, not invented portable fields. Late messages
 retain their original connection/turn correlation and cannot leak to a later
 process for the same session.
@@ -294,16 +293,17 @@ qualification gate in §9 before claiming complete A6 implementation. Do not sen
 an invented permission-allow response. When no safe encoding exists, fail the
 connection and request private cleanup within the same 5 s deadline, reporting
 the unanswered request and protocol failure; do not claim a delivered decline.
-`vendor.request_declined` is emitted only for an actually written refusal with
-raw evidence; a partial write is uncertain. Failed response/cleanup cannot hang
+`vendor.request_declined` is emitted only for an actually written refusal;
+a partial write is uncertain. Failed response/cleanup cannot hang
 the session or be counted as a passing auto-decline test.
 
 Carry runtime §8 ceilings unchanged: 1 MiB inbound vendor message; 64 messages/4 MiB route
-data; 1024 observations/4 MiB; 256 KiB known observation (split text only);
-8 MiB connection/32 MiB global raw staging; one data command and eight controls
+data; 1024 observations/4 MiB; 256 KiB known observation (final text in pieces);
+one data command and eight controls
 (64 KiB total); 1 MiB envelope. Controls and sticky health bypass blocked normal
-observations. At 10 s stalled observations Core fails overflow and interrupts;
-raw/staging saturation fails the connection with explicit incompleteness. No
+observations. At 10 s stalled observations the adapter closes the route hop and
+the route fails the connection `overflow`, which interrupts;
+staging saturation fails the connection. No
 silent drops, unbounded result collection or hidden vendor-process queue.
 
 ## 7. Interrupt, close and recovery
@@ -397,8 +397,8 @@ must appear in user-facing describe/help and the release report.
 
 These are **required future tests**, none run by this documentation task. Build
 sanitized minimal fixtures from protocol structure, not copied private sessions.
-Use real daemon/Store/raw logs where lifecycle assertions require them. Every
-case emits the coding-standard summary, raw/event references, consistent Store
+Use the real daemon and Store where lifecycle assertions require them. Every
+case emits the coding-standard summary, event references, consistent Store
 backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 
 | Test name | Original failure / decisive assertion |
@@ -416,7 +416,7 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_cleanup_not_ack` | Receipt/terminal with open tool stays pending; child surviving leader exit not quiescent; anchor force not acknowledgement; group absence provenance required |
 | `claude_recovery_no_submit` | Crash after intent/before acceptance, accepted crash and survivor: zero replay messages; verified anchor cleanup only; unverified anchor never signalled; recovered turn unknown |
 | `claude_normalizer_accounting` | Repeated assistant block not doubled; denial dedup; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, absent fields and counter reset |
-| `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory/raw incompleteness; cancel/close still serviceable; no false successful truncated envelope |
+| `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
 | `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn; SIGTERM-only is a negative case |
 | `claude_live_bounds` | CLAUDE-BOUND-1 matrix on Linux/macOS including missing dependency fail-closed and resume-bound changes; infrastructure failure never passes |

@@ -458,7 +458,7 @@ model, variant, system, format, session/message identity, `--auto`,
 | Steer | Named unsupported-verb refusal, no vendor request |
 | Interrupt / cancel | `POST /session/{id}/abort`; interpret active cancellation evidence as §6 |
 | Close | Cancel/drain according to mode/deadline, release session driver/subscriptions/reference; preserve vendor session/DB |
-| `status`, `wait`, `result`, `list`, `events`, `unsubscribe`, `logs` | Core's durable VIA state/event/raw APIs. Vendor reads are observations, not an alternate public state source |
+| `status`, `wait`, `result`, `list`, `events`, `logs` | Core's durable VIA state/event/evidence APIs. Vendor reads are observations, not an alternate public state source |
 | `daemon/status`, `daemon/stop` | Core registry and reviewed shutdown; Host stops only VIA-owned server groups during whole-server shutdown |
 
 Use one explicit cwd selector consistently on every request and SSE connection;
@@ -518,16 +518,20 @@ Wire parses SSE incrementally: UTF-8 boundaries, CRLF/LF, comments, multiple
 proves stream setup; `server.heartbeat` is transport liveness, not progress
 that extends a work idle deadline. Use the legacy `message.*`/`session.*`
 event family described by the served schema as canonical; future/parallel
-`session.next.*` events are retained as bounded `vendor.other`, never a second
+`session.next.*` events are activity only, never a second
 text/tool/usage emission. Permission/question request aliases must be decoded
 and deduplicated by request ID even if represented in both event families.
 Source directory filtering and the observed default SSE message are independently
 required fixture cases. [Event handler](https://raw.githubusercontent.com/anomalyco/opencode/v1.18.32/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts).
 
-Map text deltas and authoritative part snapshots without appending the same
-text twice. Correlate tools by session/message/part/call IDs; state is
-pending/running/completed/error. Keep partial text distinct from final text.
-Unknown notification types become bounded `vendor.other`; malformed known
+Map assistant text and reasoning parts to C2 `progress` `model`, a tool part
+entering `running` to `tools_started (call ID, tool name)` and one entering
+`completed` or `error` to `tools_ended`, correlated by
+session/message/part/call IDs; each assistant message's token snapshot is a
+`usage` sample keyed by message ID (§7 one ledger). Final text is the
+correlated completed assistant's text, sent as completed C2 `final_text`
+pieces of at most 256 KiB encoded. Unknown notification types are activity
+only; malformed known
 payloads fail the connection. An unrouteable mutation/request never guesses a
 session. Deduplicate known vendor event IDs with a bounded 4,096-entry window;
 do not promise exactly-once vendor delivery beyond it. Core durable event

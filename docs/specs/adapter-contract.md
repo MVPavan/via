@@ -37,13 +37,13 @@ turns vendor traffic into **observations**. Core alone commits states,
 | `Steer` | command | text, expected vendor turn → delivery |
 | `Interrupt` | command | vendor turn, deadline → cancel outcome, cleanup certainty |
 | `Close` | command | mode, deadline → close report |
-| observations | stream | C1 events minus Core fields, plus `turn.vendor_terminal`, `turn.accepted`, `tool.quiescent` |
+| observations | stream | the durable C1 event payloads an adapter reports (`action.denied`, `vendor.request_declined`, `steer.delivered`, `warning`), `progress` and `final_text`, plus `turn.vendor_terminal`, `turn.accepted`, `tool.quiescent` and the other internal observations of §4 |
 
 | Owner | Responsibility |
 |---|---|
 | Core | deadlines, queue and dispatch gate, admission, states and commits, seq, envelope, Store, handle, op keys |
 | Adapter | route choice, capability declaration, version gate, vendor mapping, reserved-key refusal, auto-decline, cancel sequence, quiescence evidence, observation normalization, vendor-code → class hint |
-| Routes / Wire / Host | typed protocol calls and request pairing / message splitting, transport, raw tap, bounded staging / anchor-owned process group and verified cleanup |
+| Routes / Wire / Host | typed protocol calls and request pairing / message splitting, transport, evidence files, bounded staging / anchor-owned process group and verified cleanup |
 
 **Owner, 2026-09-26:** A1 approved as written. A2/A3/A6 are resolved by
 the reviewed Claude packet; A7/A8 by the reviewed Codex packet. OpenCode
@@ -52,7 +52,7 @@ A5 (S6) remains for its vendor slice.
 
 | # | Decision | Recommendation / alternative |
 |---|---|---|
-| A1 | Backpressure: per-session observation channel of 1024 items and 4 MiB; a full channel blocks only that session's normalizer; control and sticky health travel separately and stay serviceable; Core failing to drain for `event_stall_ms` (10 s) fails the turn `overflow` and interrupts it; L5 staging overflow fails the connection (coding-style §5). Each observation is at most 256 KiB encoded; split text at UTF-8 boundaries in order, or fail protocol with raw evidence. Unknown payload keeps at most 16 KiB with explicit truncation marker. | as written; alternative: drop-and-count with `raw_log_incomplete` |
+| A1 | Backpressure: per-session observation channel of 1024 items and 4 MiB; a full channel blocks only that session's normalizer; control and sticky health travel separately and stay serviceable; Core failing to drain for `event_stall_ms` (10 s) fails the turn `overflow`: the adapter closes the session's route hop; a private route fails the connection, which interrupts the vendor, and a shared route quarantines that thread generation as for an ingress overflow (§4) while other threads continue; Wire message-queue overflow fails the connection (coding-style §5). A known observation payload is at most 256 KiB encoded (final text is sent in pieces), else protocol failure; IDs, names, stop reasons and codes are at most 1 KiB each. Unknown and unattributed messages produce no observation. | as written; alternative: drop-and-count with `raw_log_incomplete` |
 | A2 | Version gate = tested version sets or ranges per route (Claude initially exactly `{2.1.283}`); outside: `version_status: untested`, bound-bearing spawn/resume refused unless immutable `allow_untested`; read/cleanup remain available; protocol handshake failure = `refused` (C1 P13) | as reviewed in Claude §10 |
 | A3 | Claude `claude-cli`: interrupt `partial: aborts_tools_then_result`, gated on init capability `interrupt_receipt_v1`, matching nested receipt and abort terminal; steer `unsupported` (busy input merged into one result). Unknown-control encoding remains a qualification gate | as reviewed in Claude §10 |
 | A4 | OpenCode: only `full,network:true`; other levels and `network:false` refused. Nonempty `extra_write_dirs` with `full` is `invalid_params` before namespace allocation or vendor I/O; `allow_untested` does not waive bound validation. External sandbox remains D9 | as reviewed in OpenCode §§2–3 |
@@ -77,8 +77,9 @@ A5 (S6) remains for its vendor slice.
    list (§6.1).
 5. Every vendor request is answered under a deadline on the control path;
    unknown requests are declined (D3, coding-style §3).
-6. Unknown vendor notifications become `vendor.other` with a bounded
-   payload; a malformed known message is a `protocol` observation.
+6. Unknown vendor notifications produce no observation: when the route
+   attributes them to a turn, they update that turn's activity time; a
+   malformed known message is a `protocol` observation.
 7. Adapters report; Core commits. No adapter emits `turn.ended`.
 
 ## 2. Operations (Rust sketch)
@@ -87,10 +88,10 @@ Closed-enum dispatch (coding-style §1): no `Box<dyn Adapter>`.
 Core retains the sole Store owner and `StoreClient`, then passes the unopened
 `RuntimeResources` from `Store::runtime_resources()` into
 `AdapterRuntime::new(config, resources)`. Adapter and Route only forward it;
-Wire bootstrap alone consumes `into_wire_parts(self)` to retain `RawFactory`
+Wire bootstrap alone consumes `into_wire_parts(self)` to retain `EvidenceRoot`
 and construct Host with restricted `ProcessJournal`. This Wire-only call rule
 is architectural, not compiler-enforced caller visibility across crates.
-The adapter has no SQLite, raw-handle, journal or handle-hash access.
+The adapter has no SQLite, journal or handle-hash access.
 Lower-layer identity types and the opaque bundle are re-exported through
 immediate parent facades; no extra dependency edge is implied. Each owner
 retains task joins and sends failures through independent health, even if
@@ -98,16 +99,16 @@ observations are full.
 The Wire-defined `RuntimeConfig` carries validated `anchor_binary` and
 `anchor_dir` paths through Route/Adapter aliases; fake fixture data remains
 Adapter-owned. No production Core/Adapter/Route call site splits resources,
-opens raw access or constructs Host. Wire creates each connection's raw writer
-and owns its narrow connection. Operational Host, ProcessControl, RawWriter,
-RawFactory and ProcessJournal re-exports/getters are removed from Wire,
+opens raw access or constructs Host. Wire creates each turn's evidence folder
+and owns its narrow connection. Operational Host, ProcessControl and
+ProcessJournal re-exports/getters are removed from Wire,
 Route and Adapter facades; passive IDs, deadlines, errors and evidence DTOs
 remain available. Core supplies canonical IDs/prompt/deadline to Adapter,
 not a Host process spec. The Task 1 result remains C2 evidence, not a
 committed TurnState; the existing acceptance/observation contract still
 applies. Recovery delegates downward through the same wrappers and returns
 passive facts, never a Host or journal handle. Store must outlive active
-driver cleanup and raw/terminal commits; its currently blocking Drop is not
+driver cleanup and terminal commits; its currently blocking Drop is not
 a bounded async shutdown guarantee (runtime §6). Shutdown delegates down the
 same wrappers and returns a passive report on every path: reconciled anchor
 facts, pending and failed Host joins and a bounded named failure, never a
@@ -153,10 +154,10 @@ pub enum ControlCommand {
 pub enum StartOutcome { Accepted { correlation: AcceptanceToken, vendor_turn_id: Option<VendorTurnId>, accepted_at: Instant },
                         Rejected(StartRejected), Unknown { reason: String } }
 pub enum StartRejected { BoundUnsupported(String), VendorError(VendorCode, String), SessionGone, Protocol(String) }
-pub struct InterruptReport { pub outcome: CancelOutcome, pub cleanup: Cleanup, pub evidence: Option<RawRef> }
+pub struct InterruptReport { pub outcome: CancelOutcome, pub cleanup: Cleanup }
 pub enum Cleanup { Quiescent, Uncertain, Pending }
 pub enum Recovery { Resumed(SessionDriver), Unknown { reason: String }, Dead { evidence: String } }
-pub enum DriverHealth { Open, Failed { first_cause: DriverFailure, evidence: Option<RawRef> }, Closed }
+pub enum DriverHealth { Open, Failed { first_cause: DriverFailure }, Closed }
 pub struct OpenedSession { pub driver: SessionDriver, pub identity: VendorIdentity }
 pub struct VendorIdentity {
     pub expected_id: VendorSessionId,       // internal, never a public confirmed ID
@@ -225,10 +226,9 @@ Contract points:
   eight control commands (64 KiB total) remain independently serviceable.
   Duplicate interrupt/close coalesces; other over-capacity control admission
   is refused explicitly. The 1024-item observation queue also has a 4 MiB
-  budget, and no payload exceeds 256 KiB encoded. Split text at UTF-8
-  boundaries while preserving order; another oversize known payload fails
-  protocol with raw evidence. An unknown payload retains at most 16 KiB with
-  an explicit truncation marker. A sticky health watch keeps the first failure
+  budget; final text is sent as completed `final_text` pieces whose whole
+  encoded observation is at most 256 KiB; another known payload over
+  256 KiB encoded fails protocol. A sticky health watch keeps the first failure
   and latest state, plus at most one exit report per connection; it cannot be
   blocked by data/normalizer congestion. Host cleanup requests and reports
   traverse Adapter → Route → Wire → Host and back; Core does not call Host.
@@ -260,7 +260,7 @@ Contract points:
 |---|---|---|---|---|---|
 | Wall/idle deadlines, cleanup deadline | owns | receives absolute deadlines | — | forwards | timed anchor own-group escalation (private groups) |
 | Queue, dispatch gate, admission, states, seq, commits | owns | — | — | — | — |
-| Submission record, envelope, Store, op keys | owns | — | — | raw log append | process/server records |
+| Submission record, envelope, Store, op keys | owns | — | — | evidence files | process/server records |
 | Route choice, capabilities, version gate, server key | consumes | owns | protocol version | — | binary version |
 | Canonical → vendor mapping, reserved keys | — | owns | typed calls | — | — |
 | Request pairing, server-request deadlines | — | answers (control path) | correlates | message splitting | — |
@@ -270,22 +270,24 @@ Contract points:
 
 ## 4. Observations and ordering
 
-`Observation` = C1 event payloads (`assistant.text`, `reasoning.summary`,
-`tool.started`, `tool.ended`, `file.changed`, `action.denied`,
-`vendor.request_declined`, `steer.delivered`, `usage.updated`, `warning`,
-`vendor.other`) plus internal ones Core turns into commits:
+`Observation` = the C1 event payloads Core commits (`action.denied`,
+`vendor.request_declined`, `steer.delivered`, `warning`), at most one
+`progress` item per vendor message that carries a progress mark,
+`final_text` pieces, plus internal ones Core turns into commits:
 
 | Observation | Fields | Core commit |
 |---|---|---|
-| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id` | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
+| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id`, `transcript?` (committed with the ID) | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
 | `turn.accepted` | `correlation: AcceptanceToken`, `vendor_turn_id` | deduplicate against start reply; phase `accepted`, `turn.started` once |
-| `turn.vendor_terminal` | `vendor_status: Completed\|Interrupted\|Failed`, `vendor_code?`, `class_hint`, `stop_reason`, `final_text`, `structured_output?`, `usage?` | apply C1 §7.6; Codex interrupted terminal acknowledges cancel but may hold turn nonterminal while P7 cleanup is pending |
+| `turn.vendor_terminal` | `vendor_status: Completed\|Interrupted\|Failed`, `vendor_code?`, `class_hint`, `stop_reason`, `structured_output?`, `usage?` | apply C1 §7.6; Codex interrupted terminal acknowledges cancel but may hold turn nonterminal while P7 cleanup is pending |
 | `tool.quiescent` | `vendor_turn_id` | cleanup `quiescent`; may settle the held cancelled terminal |
 | `session.vendor_closed` | `reason` | session close or `unknown` |
 | `resume.mismatch` | `requested`, `returned` | `failed(resume_mismatch)` |
+| `progress` | `at`, `model: bool`, `tools_started: [(id, name)]`, `tools_ended: [id]`, `usage?: (key?, total)` | no commit: Core folds it into the running turn's progress snapshot and commits a `steps` row when a step ends (C1 §3.7). `model` marks model output (text, reasoning or a tool request); `usage` is an interval sample, never a cumulative total. A message with no mark sends no item |
+| `final_text` | `text` | no commit: Core appends the text to the turn's final text, inline up to 256 KiB encoded, else in the turn's `final_text.txt` (C1 §5). The adapter sends completed text only, cut so that the whole encoded observation, escaping included, is at most 256 KiB |
 
-Each observation carries `raw_ref: Option<RawRef>` and `at: Instant`
-(Core records wall time). Ordering (D4): per session, the order the driver
+Each observation carries `at: Instant` (Core records wall time).
+Ordering (D4): per session, the order the driver
 decoded them; none across sessions. `class_hint` is a suggestion from the
 vendor code table (§6); Core applies C1 §7.6 precedence (cancel evidence
 before generic errors). Control acknowledgement may bypass observations, but
@@ -446,11 +448,13 @@ Against a fake vendor (default gate) and the pinned real binary (live set):
    ambiguity, and never twice for one turn.
 6. Emit one vendor-terminal observation per turn after previously decoded
    observations of that turn (or report death/loss). Tool completion and other
-   evidence may arrive afterward, retain the original turn ID and become
+   evidence may arrive afterward and keep the original turn ID: a tool
+   completion counts for P7 cleanup; a durable observation is committed
    `late` after Core terminal commit. Vendor terminal alone does not seal
    cleanup.
-7. Every observation resolves its `raw_ref`, except declared synthesized ones.
-8. Unknown notifications → `vendor.other`; unknown requests are declined
+7. A decode failure saves the message to the turn's evidence folder before
+   the route fails `protocol`.
+8. Unknown notifications → activity only; unknown requests are declined
    within the 5 s control deadline with `vendor.request_declined`, or the
    connection fails closed with explicit evidence. No fabricated decline or
    indefinite request wait counts as success.
@@ -467,7 +471,9 @@ Against a fake vendor (default gate) and the pinned real binary (live set):
     neither close mode touches a shared server's stdin for one session.
 12. Backpressure: with Core stalled, the driver blocks on the observation
     channel while the vendor pipe keeps draining; a stall past
-    `event_stall_ms` yields an interrupt and `overflow`; control commands
+    `event_stall_ms` closes the session's route hop: a private route fails
+    the connection `overflow`; a shared route quarantines the thread
+    generation (§4); control commands
     still complete. Codex per-thread Route ingress can quarantine earlier
     on its separate immediate lane limit (§4), without changing C2's timer.
 13. Bound re-validation: a turn whose bound the route cannot apply is

@@ -34,7 +34,7 @@ approved; vendor-dependent decisions remain recorded in the tables below.
 | `cancel` | `via cancel` | yes | idempotent | cancel outcome + cleanup certainty |
 | `close` | `via close` | yes | idempotent | session closed |
 | `status`, `wait`, `result`, `list` | same names | no | read-only | status, envelope, envelope, page |
-| `events`, `logs` | same names | no | read-only | canonical events (page/follow), raw excerpts |
+| `events`, `logs` | same names | no | read-only | durable events (page), evidence locations |
 | `models`, `daemon/status`, `daemon/stop` | `via models`, `via daemon …` | no | read-only / idempotent | catalog, daemon state |
 
 | Entity | States |
@@ -46,8 +46,8 @@ approved; vendor-dependent decisions remain recorded in the tables below.
 | Piece | Key points |
 |---|---|
 | Identifiers | `s_` + 12 base32; turn `s_…/N`; vendor session id opaque; handle `h_` + 43 base64url, caller-generated, hashed at rest |
-| Envelope | state, failure class, stop reason, cancel outcome and cleanup, final text, structured output, denied actions, auto-declined requests, route and versions, usage and cost with per-field scope, event range, raw spans, `revision` |
-| Events | `type` tag, per-session dense `seq`, `turn` nullable for session events, `late` flag, optional `raw_ref` |
+| Envelope | state, failure class, stop reason, cancel outcome and cleanup, final text, structured output, denied actions, auto-declined requests, route and versions, usage and cost with per-field scope, event range, evidence locations, `revision` |
+| Events | `type` tag, per-session dense `seq`, `turn` nullable for session events, `late` flag |
 | Errors | request errors: JSON-RPC `error` with stable `data.kind`; turn failures: `failure.class`. After a receipt, a persistent Store failure that prevents a terminal commit returns `store_error` with `terminal_persisted:false`, never a fabricated terminal envelope |
 | Evolution | additive; unknown request fields rejected; every wire enum decodes unknown values into an explicit `unknown(raw)` fallback |
 
@@ -75,12 +75,17 @@ decided in the slice that needs them, after re-probing.
 ## 1. Scope, transport, versioning
 
 - **Transport (decided, D1).** JSON-RPC 2.0 over the daemon's Unix socket,
-  one JSON object per line, UTF-8, line length capped (Proposed 16 MiB).
-  Requests carry `id`; notifications flow daemon → client only for follow
-  (§3.11). No batches. `via serve --stdio` forwards messages unchanged.
+  one JSON object per line, UTF-8, line length capped at 1 MiB.
+  Requests carry `id` (A31); the daemon sends no notifications. No batches.
+  `via serve --stdio` forwards messages unchanged.
   Parse JSON with depth at most 64 and 65,536 nodes per document before
   constructing an unbounded value; reject an excess as the named parse or
-  parameter error. The 16 MiB limit includes the line feed.
+  parameter error. The 1 MiB limit includes the line feed; a longer line
+  gets `request_too_large` and the connection closes. A larger prompt is
+  passed as `prompt_file` (§4). A request `id` is a string, a number or
+  `null`, at most 256 bytes encoded; a longer one is `invalid_request`.
+  The daemon writes each reply within 10 s of having it ready to write; a
+  peer that does not read it in that time is disconnected.
 - **Socket (P10).** Directory validated (owner, 0700, no symlink); socket
   0600; both ends verify the peer uid (coding-style §6).
 - **Local paths.** The daemon and CLI resolve `VIA_STATE_DIR` and
@@ -173,6 +178,9 @@ Never starts a process or server (Q5). Errors: `unknown_model`,
 ### 3.2 `spawn` — new session and turn 1
 
 CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--allow-untested] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background]`
+
+`--prompt-file F` sends `prompt_file` with `F` made absolute; `-` reads
+stdin into `prompt`.
 
 Params: §4 parameters, `handle` (required), `require?`, `label?`,
 `idempotency_key?` (the same bound as `op_key`: 1–64 printable ASCII
@@ -273,14 +281,55 @@ Idempotent; a second `close` during closing waits for the first.
 
 ### 3.7 `status`
 
+`via status <session> [--turn N] [--after-step N] [--limit N]`
+
+Params: `session`, `turn?` (default the running turn, else the latest),
+`after_step?` (default 0), `limit?` (default 100, max 1000).
+
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"idle_since":null},
+ "route":"codex-app-server","vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
+ "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
+             "tokens":{"total":18200,"scope":"vendor_interval"}},
+ "steps":{"turn":2,"items":[{"step":1,"started_at":"…","ended_at":"…","tokens":5100}],"next_after":1,"more":true},
  "queue":[{"n":3,"op_key":"k-17","queued_at":"…","effective":{…}}],
  "turns":[{"n":1,"state":"completed","revision":0},{"n":2,"state":"running"},{"n":3,"state":"queued"}],
 "label":null,"created_at":"…","updated_at":"…"}
 ```
+
+`status` describes one turn: the `turn` param, else the running turn, else
+the latest. `progress` is an in-memory snapshot of that turn while it runs
+in this daemon, read after `steps` without a Store round trip, and `null`
+otherwise, including as soon as the turn is terminal. `current_step` is
+VIA's count of model steps: 0 before the vendor accepts the turn, 1 after,
+and one more each time the model produces output after tool results,
+derived the same way for every vendor; it equals the vendor's model calls
+only where that vendor's evidence shows it. `running_tools` holds at most
+64 names of tools started and not ended, never inputs or outputs;
+`tools_overflow` is true when more started since the last step boundary.
+`phase` is `tools` while a listed tool runs or `tools_overflow` is true,
+else `model`; both reset at each step boundary. `last_activity_at` is the
+arrival time of the last vendor message attributed to the turn. `tokens` is
+an approximate running total of completed steps, updated once per step,
+labelled with the route's token scope (§4.1), or `null` when the route has
+no validated source or before the first sample. The envelope's `steps` and
+`usage` hold the final figures.
+
+`steps` pages the durable step history of the selected turn, running or
+finished: one item per completed step, ordered by `step`. The step in
+progress has no item yet, and a step that ended after the Store read
+appears on a later call. After a daemon crash the history holds every step
+whose row was committed; a step whose row was being committed, and the
+step then in progress, are missing, and the agent's transcript has them. A
+committed `turn.ended` implies that all the turn's rows are durable, also
+after a refused Store write or a stop forced at shutdown, except for a
+terminal synthesized by crash recovery or by the failure-resolution batch
+after a Store write of uncertain outcome (runtime §7).
+
+`process.alive` is true only on positive evidence that the vendor process
+is live; `process.cleanup` is `uncertain` when any process group of the
+session lacks a proof of absence, else `quiescent` (T4-A23).
 
 `vendor_session_id` is nullable and contains only the last confirmed vendor
 ID. `vendor_identity_verified` is false until the current connection
@@ -300,24 +349,33 @@ returns `store_error` with `session`, `turn`, last-known `durable_state` and
 envelope. An already committed, readable terminal result is returned as is.
 A `wait` whose result is still absent once final shutdown has committed its
 last record ends `daemon_stopping`.
+`wait` is the only blocking read; it checks at once, then once per second.
+A caller that wants progress polls `status` (§3.7) on another connection,
+since a connection carries one request at a time. Closing the connection of
+a pending `wait` releases only that waiter.
 
 ### 3.10 `list`
 
 `via list [--state S] [--harness H] [--label L] [--since T] [--limit N] [--cursor C]`.
-Ordered by `(updated_at desc, session_id)`; `cursor` is an opaque keyset
-cursor over that order (stable across concurrent updates: a session updated
-after the cursor was issued may appear again, never be skipped). Result
+Ordered by creation, newest first. `cursor` is opaque; each session that
+existed when the first page was read is examined once and returned if it
+matches the filters then; sessions created later are not returned. A page
+examines at most 1000 sessions, so it can be short or empty while
+`next_cursor` is not `null`. Each summary is `{session_id, state,
+admission, harness, model, label, created_at, last_active_at}`;
+`last_active_at` is the time of the session's latest durable event, and
+`since` matches `last_active_at ≥ since`. Result
 `{sessions: [summary], next_cursor}`. The page stops at both requested item
 count and 1 MiB encoded bytes; an individual result that cannot fit the
 bounded response is refused with `admission_refused`, never truncated.
 
-### 3.11 `events` — page or follow
+### 3.11 `events` — page
 
-`via events <session|turn> [--after SEQ] [--limit N] [--follow] [--types T,…]`
+`via events <session|turn> [--after SEQ] [--limit N] [--types T,…]`
 
 Params: `session` or `turn`, `after?` (default 0), `limit?` (default 200,
-max 1000), `follow?`, `types?`. Result `{events, next_after, more: bool,
-earliest_seq, subscription?}`. Semantics:
+max 1000), `types?`. Result `{events, next_after, more: bool,
+earliest_seq}`. Semantics:
 
 - The page is a bounded Store scan in `seq` order from `after`, filtered by
   `types` (gaps in `seq` are expected under a filter). It stops at both the
@@ -325,56 +383,36 @@ earliest_seq, subscription?}`. Semantics:
   seq, including filtered-out events; `more` uses the committed head captured
   with the page. An individual result exceeding the response bound is
   `admission_refused`, never a truncated success.
-- `follow: true` serializes cursor registration with commit notifications in
-  the session actor after the bounded Store read. The initial page is queued
-  before live notifications. The daemon rescans durable `seq > scan_cursor`
-  and checks the durable head before waiting for a wake, so notifications are
-  hints and the replay → live boundary has no gap. No subscription row is
-  stored. It pushes each matching event as
-  `{"method":"event","params":{"subscription":"sub_…","event":{…}}}`.
-  The scan cursor advances across filtered events; the delivery cursor advances
-  only after complete notification writes. A seq is never enqueued twice.
-- Session-wide follow (Q1): covers every turn until `session.closed`;
-  turn follow ends at that turn's `turn.ended`.
-- Each subscription has an outbox of at most 1000 events and 1 MiB; at most
-  32 subscriptions exist daemon-wide and 8 per socket, with a 16 MiB total
-  outbox budget. On exhaustion, freeze it, discard unsent entries and reserve
-  one termination notice outside the data outbox. The daemon attempts
-  `{"method":"event_end","params":
-  {"subscription","reason":"lagged","resume_after":<seq>}}` and the client
-  re-requests from `resume_after`. This cursor is the last fully written
-  notification seq or the acknowledged initial-page cursor, not proof that
-  the client read the bytes. Clients should retain their last received seq.
-  Other `reason` values: `terminal`, `unsubscribed`, `closing`, `store_error`.
-  `event_end` is best-effort: finish any started NDJSON line, attempt the
-  notice within one 2 s absolute writer deadline, then close on timeout.
-  Subscription and outbox ownership is released within 2 s even for a peer
-  that never reads. If several subscriptions fail together, the socket may
-  close after the first notice/deadline.
 - History pruned by retention: `history_pruned` error carrying
-  `earliest_seq` when `after < earliest_seq - 1`.
-- `unsubscribe {subscription}` removes unsent entries, finishes any started
-  line within the same 2 s bound, then queues `event_end:unsubscribed` before
-  the reply. No event for that subscription is enqueued after the reply.
-  Connection close drops its subscriptions immediately in memory. Terminal
-  detection follows the scan even when its event type is filtered out.
+  `earliest_seq` when `after < earliest_seq - 1`. Until retention prunes,
+  `earliest_seq` is 1.
 
-### 3.12 `logs` — raw-log excerpts
+There is no follow stream: callers poll `status` (§3.7) for progress and
+`wait` (§3.8) for the end of a turn.
 
-`via logs <session|turn> [--after SEQ] [--limit N]`. Returns the bytes each
-addressed event's `raw_ref` points to (lossy UTF-8), in event order:
-`{entries: [{seq, direction, connection_id, offset, len, text}], next_after}`.
-Never another session's traffic (D4); only referenced spans are read. Pages
-stop at both requested item count and 1 MiB encoded bytes. A single entry
-too large for the bounded response is `admission_refused`, never silently
-truncated; missing or corrupt referenced raw evidence is `store_error`.
+### 3.12 `logs` — evidence locations
+
+`via logs <session|turn>`. Returns where a turn's evidence is, for the
+addressed turn or, for a session, its running turn else its latest
+submitted turn: `{session_id, turn, vendor_session_id, transcript, folder,
+files: [{name, bytes}]}`. `transcript` is the path of the vendor's own
+transcript, a hint that follows the vendor's layout, or `null`. `folder`
+is the turn's evidence folder in VIA's state directory, or `null` for a
+turn never submitted. `files` lists the files there that exist:
+`stderr.log` (the agent's stderr), `undecoded.bin` (the first 64 KiB of a
+vendor message VIA could not decode, named by the turn's failure) and
+`final_text.txt` (a final text too long for the envelope, §5). VIA does
+not read or decode them; the caller reads the files. There is no paging.
 
 ### 3.13 `models`; 3.14 `daemon/status`, `daemon/stop`
 
 `via models [--harness H]` → `{models: [{model, harness, aliases, source}]}`.
 `via daemon status` → `{daemon_version, pid, started_at, sessions: {idle,
 active, closing}, servers: [{harness, vendor_version, key, sessions}],
-socket_path, store_path, health}`. `health` reports `healthy` or
+socket_path, store_path, health, limits, storage}`. `limits` holds the
+effective disk and WAL thresholds; `storage` holds `free_bytes`,
+`data_bytes`, `data_measured_at`, `below_free_floor` and `over_warn_size`.
+`health` reports `healthy` or
 `store_failed` with a bounded failure kind and affected IDs from memory,
 without prompts, payloads or handles. `via daemon stop [--drain|--force]`: refuses
 while sessions are active unless `drain` (gate every session `closing`
@@ -398,7 +436,8 @@ only after positive cleanup, joins and durable records, otherwise 4
 | `allow_untested` | bool, default false | session | immutable after spawn; describe may request a route plan using it; applies only to tested-version restriction (P13) |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused |
 | `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial) |
-| `prompt` | string | per turn | required |
+| `prompt` | string | per turn | exactly one of `prompt` and `prompt_file` |
+| `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length |
 | `bound` | `{mode: read_only\|workspace_write\|full, extra_write_dirs: [path], network: bool}` | per turn (D5): inherited unless set on `resume` | always never-ask (D3); combinations per §4.2 |
 | `cwd` | absolute path | session | must exist |
 | `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12, size ≤ 256 KiB) |
@@ -467,11 +506,20 @@ qualification claim.
 
 Immutable once terminal, except `unknown` revised by late evidence (§7.6);
 `revision` counts revisions and `turn.revised` announces them.
-Accumulation is bounded to 1 MiB encoded per turn, including text and
-collections. On overflow Core fails the turn with class `overflow`, persists
-a bounded failure summary and leaves the raw log as evidence; no successful
-result is silently truncated. A terminal envelope that cannot fit the 16 MiB
-socket response limit is a named `admission_refused` read error.
+The encoded envelope is at most 1 MiB by construction, and no turn fails
+for the size of its result. `final_text` is inline up to 256 KiB encoded.
+A longer final text is written to `final_text.txt` in the turn's evidence
+folder (§3.12): `final_text` is then `null` and `final_text_file` gives
+`{path, bytes, truncated}`. The file holds at most 64 MiB; a longer text is
+cut there at a character boundary with `truncated: true`, as is a text
+whose file write failed. `denied_actions` and `auto_declined_requests`
+hold the first 1,000 entries each; `denied_actions_total` and
+`auto_declined_requests_total` count all. An entry's strings are cut at a
+character boundary to keep it within 256 bytes; its `event_seq` cites the
+event with the full payload. At receipt a `bound` over 32 KiB, a `vendor`
+over 16 KiB, or a `model` or `effort` over 1 KiB encoded is
+`invalid_params` naming the member. `failure.message` is at most 2 KiB,
+cut at a character boundary.
 
 ```json
 {"api_version":1,"session_id":"s_7f3k9q2mzr4c","turn":2,"address":"s_7f3k9q2mzr4c/2","revision":0,
@@ -481,16 +529,17 @@ socket response limit is a named `admission_refused` read error.
  "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1","version_status":"tested",
  "vendor_session_id":"0192f…","cwd":"/work/repo",
  "bound":{"requested":{…},"effective":{…},"inherited":true},
- "final_text":"","structured_output":null,
+ "final_text":"","final_text_file":null,"structured_output":null,
  "denied_actions":[{"kind":"command","target":"curl …","reason":"network disabled","at":"…","event_seq":41}],
  "auto_declined_requests":[{"vendor_method":"item/tool/requestUserInput","summary":"2 questions","blocking":true,"at":"…","event_seq":52}],
+ "denied_actions_total":1,"auto_declined_requests_total":1,
  "steps":3,
  "usage":{"input_tokens":18000,"cached_input_tokens":12000,"output_tokens":900,"reasoning_output_tokens":300,"total_tokens":19200,
           "scope":"vendor_interval","provenance":"reported"},
  "cost":{"usd":null,"scope":"turn","provenance":"unavailable"},
  "timestamps":{"queued_at":"…","submitted_at":"…","accepted_at":"…","ended_at":"…"},"duration_ms":48210,
  "exit":null,"events":{"first_seq":23,"last_seq":71,"count":49},
- "raw_spans":[{"connection_id":"c_01","path":"raw/c_01.log","first_offset":10240,"last_offset":40960}],
+ "evidence":{"folder":"…/evidence/s_7f3k9q2mzr4c/2","transcript":null},
  "vendor_options":{"codex":{}},"warnings":[{"code":"cancel_cleanup_uncertain","message":"…"}],"vendor":{"turn_id":"0192f…"}}
 ```
 
@@ -503,24 +552,28 @@ socket response limit is a named `admission_refused` read error.
 | `denied_actions` | actions the vendor's own bound denied (D3): `file_write`, `command`, `network`, `other` |
 | `auto_declined_requests` | vendor requests VIA declined (D3) |
 | `usage` | `scope` ∈ `turn` (verified per-turn), `session_cumulative`, `vendor_interval` (numbers reported, interval not verified); `provenance` `reported`/`unavailable` |
+| `steps` | the vendor's own count of model steps in the turn (Claude `num_turns`), or `null` when the vendor reports none; VIA's count is only in `status` `progress` (§3.7) |
+| `events` | `{first_seq, last_seq, count}` of the turn's durable events (§6.1) |
+| `final_text_file` | `{path, bytes, truncated}` when the final text is in `final_text.txt`, else `null` |
+| `denied_actions_total`, `auto_declined_requests_total` | entries of each list, including those past the first 1,000 |
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
-| `raw_spans` | bounding spans per connection for the turn, **not** extraction ranges on shared connections; event `raw_ref`s are authoritative |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `raw_log_incomplete`, `deprecated` |
+| `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `deprecated` |
 
-## 6. Canonical event stream
+## 6. Durable events
 
 ### 6.1 Envelope and types
 
 ```json
 {"seq":41,"session_id":"s_7f3k9q2mzr4c","turn":2,"late":false,"at":"…","type":"action.denied",
- "raw_ref":{"connection_id":"c_01","offset":31744,"len":412},"kind":"command","target":"curl …","reason":"network disabled"}
+ "kind":"command","target":"curl …","reason":"network disabled"}
 ```
 
 `seq`: Core-assigned per session, dense from 1. `turn`: `null` for
 session-level events. `late: true`: attributed to a turn already terminal
 (vendor turn id mapped by the adapter); such events never change the
-envelope except through §7.6. `raw_ref` is `null` for synthesized events.
+envelope except through §7.6.
 
 | Type | Payload | Committed by |
 |---|---|---|
@@ -528,16 +581,17 @@ envelope except through §7.6. `raw_ref` is `null` for synthesized events.
 | `turn.queued` / `turn.submitted` / `turn.started` | `queue_position` / `attempt` / `effective` | Core |
 | `turn.ended` | `state`, `failure?`, `stop_reason`, `cancel?` | **Core only** |
 | `turn.revised` | `revision`, `from_state`, `state`, `evidence` | Core |
-| `assistant.text`, `reasoning.summary` | `text`, `final` | Adapter observation |
-| `tool.started` / `tool.ended` | `tool_id`, `name`, `input_summary` / `status`, `output_summary`, `exit_code?` | Adapter |
-| `file.changed` | `path`, `change`, `diff?` | Adapter |
 | `action.denied`, `vendor.request_declined` | as envelope lists; `blocking` on declines | Adapter |
 | `steer.delivered` | `delivery` | Adapter |
 | `cancel.requested` / `cancel.settled` | — / `outcome`, `cleanup` | Core |
-| `usage.updated` | as envelope `usage` | Adapter |
 | `warning` | `code`, `message` | either |
-| `process.exited`, `server.lost`, `raw_log.incomplete` | `code`, `signal` / `key` / `connection_id` | Core (from Host / Wire) |
-| `vendor.other` | `vendor_type`, `payload` (bounded to 16 KiB), `truncated` (`true` when the payload was cut to that bound, C2 A1) | Adapter |
+| `process.exited`, `server.lost` | `code`, `signal` / `key` | Core (from Host) |
+
+Events are durable records only: an event exists when crash recovery or the
+envelope depends on it. Model text, reasoning, tool calls, usage updates,
+file changes and unknown vendor messages are not events; the agent's own
+transcript keeps them (`logs`, §3.12), and a running turn's progress is in
+`status` (§3.7).
 
 For a delayed-init CLI such as Claude, `session.opened`/`session.reopened`
 is committed exactly once per connection generation only after matching
@@ -547,13 +601,13 @@ same message. A pre-init startup/resume rejection emits neither event, even
 when it echoes the expected UUID. Matching init confirms identity, not turn
 acceptance; prompt-associated evidence is still required.
 
-Rust: `#[serde(tag = "type")]`, tags set with `rename`, unknown types kept
-as `Other { type, payload }`.
+Rust: `#[serde(tag = "type")]` on the serialize side, tags set with
+`rename`; a client keeps an unknown type as `Other { type, payload }`.
 
-### 6.2 Ordering; 6.3 following
+### 6.2 Ordering
 
 Per session FIFO in `seq`; no promise across sessions (D4). `turn.ended`
-is the last non-late event of its turn. Following: §3.11.
+is the last non-late event of its turn.
 
 ## 7. States
 
@@ -615,7 +669,7 @@ certainty is separate (§3.5).
 
 ### 7.5 Crash recovery (D2, P12)
 
-The new daemon validates Store and raw evidence and commits recovery before
+The new daemon validates the Store and commits recovery before
 admission. Per turn: `queued` with no submission intent stays queued only when
 no predecessor is `unknown`; an intent without accepted evidence becomes
 `unknown`; an accepted turn becomes `unknown` unless a route's rejoin was
@@ -654,11 +708,11 @@ that does not prove its submitted work had no effect.
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |
 | Transport lost, process alive or unconfirmed | running | `unknown` |
-| Codex per-thread ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread dispatch until clean reopen; preserve prior terminal envelopes and other threads; record normalized-event loss separately from any actual raw gap (C2 §4) |
-| Raw-log or event overflow failed the connection | running | resolve by applicable server death/process exit evidence; `raw_log_incomplete` only when raw bytes were actually lost, while normalized-event loss is separately recorded |
+| Codex per-thread ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread dispatch until clean reopen; preserve prior terminal envelopes and other threads |
+| Observation or message overflow failed the connection | running | `failed(overflow)` |
 | Submission rejected definitively | submitting | `failed(submit_failed)` |
 | Daemon restart | any | §7.5 |
-| Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; followers whose subscription ended must poll `result` |
+| Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again |
 
 ## 8. Errors
 
@@ -684,14 +738,15 @@ that does not prove its submitted work had no effect.
 | -32009 | `harness_unavailable` | binary missing, version refused (P13), server failed to start |
 | -32010 | `unknown_model` | |
 | -32011 | `queue_full` | |
-| -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response |
+| -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response; Store read lane full; disk free space below the floor |
 | -32013 | `no_active_turn` | |
 | -32014 | `turn_mismatch` | |
 | -32015 | `turn_not_finished` | |
 | -32016 | `wait_timeout` | |
 | -32017 | `daemon_stopping` | |
-| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. A persistent raw-reference read failure also uses this kind. |
+| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
+| -32020 | `request_too_large` | request line over 1 MiB; `data.max_bytes`; the connection closes |
 
 A receipt whose commit outcome is `unknown` latches Store failure (runtime
 §7). Restart recovery settles it; a keyed retry after restart learns its
@@ -708,7 +763,7 @@ receipt. An unkeyed caller must not resend the request.
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |
 | `server_lost`, `process_exited` | Host-confirmed death | Core |
 | `protocol` | malformed known message, or vendor stream contradiction | Adapter |
-| `overflow` | this session's event channel stalled past its limit (C2 A1) | Core |
+| `overflow` | this session's observation channel stalled past its limit, the connection's message queue overflowed, or a vendor message exceeded 1 MiB (C2 A1) | Core |
 | `structured_output_invalid` | VIA validation failed (Q2) | Core |
 | `daemon_restart`, `store` | §7.5; Store write failed after dispatch | Core |
 
@@ -745,7 +800,7 @@ Adapters never commit a class; they report observations and Core commits
 
 ## 10. Open questions
 
-Confirmed by review (Astra): Q1 session-wide follow; Q2 VIA validates
+Confirmed by review (Astra): Q2 VIA validates
 structured output; Q3 `wait` = latest turn at acceptance; Q4 15-minute
 process shutdown, configurable; Q5 catalog-only `describe`. D9 stays open.
 Owner, 2026-09-26: P12 approved as written; P7/P11 and P13 are resolved by
@@ -758,4 +813,4 @@ the reviewed Codex and Claude vendor packets. Vendor live gates remain open.
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
 | P13 | version gate | tested sets/ranges + immutable `allow_untested`; Claude initial set exactly `{2.1.283}` |
 | Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |
-| Q7 | Outbox and channel sizes (1000 events; C2 A1 limits) | as written, config-tunable |
+| Q7 | Channel sizes (C2 A1 limits) | as written, fixed; disk and WAL thresholds are daemon config (runtime §8) |
