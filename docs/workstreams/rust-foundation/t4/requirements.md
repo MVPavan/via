@@ -91,6 +91,21 @@ It keeps its 1 MiB accumulation bound.
 - blob files for large prompts;
 - the snapshot and the step rows.
 
+Bounding strategy (owner decision 2026-09-29, after round 7 found exact
+accounting was not converging):
+- **Memory:** one 128 MiB pool. Each kind of buffer is charged a
+  conservative flat amount. A request that cannot be charged is refused with
+  a named overload error. The measured RSS gate verifies the whole.
+- **Disk:** SQLite and raw/blob files get separate hard budgets. These are
+  checked against actual file sizes when a turn is admitted, and admission
+  stops early to leave headroom for running turns. A checkpoint policy bounds
+  the WAL. Hitting the hard limit mid-turn fails that turn visibly.
+- **Shared-server `logs`:** Task 4 covers private connections only. The
+  per-session split of shared Codex and OpenCode raw data belongs to those
+  adapter tasks, with D4 session isolation as a fixed constraint.
+
+`via-d9o.2.3` verifies these bounds thoroughly in end-to-end testing.
+
 ## Non-goals
 
 - Human live viewing.
