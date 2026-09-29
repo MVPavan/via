@@ -24,8 +24,8 @@ stream per-message detail, and keeps no copy of vendor traffic **(owner,
 - **Event**: a durable record in SQLite with a per-session `seq` (R1).
 - **Event trace**: the ordered events of one turn.
 - **Evidence folder**: one folder per turn under VIA's state directory, holding
-  the agent's stderr, the message VIA failed to understand (if any) and the
-  vendor's own debug file where it has one (R8).
+  the agent's stderr, the message VIA failed to understand (if any) and a
+  final text too large for the envelope (R6, R8).
 
 ## Requirements
 
@@ -86,8 +86,8 @@ progress, and a step whose row commit was in flight, are missing from the
 history; the agent's transcript still has them.
 
 **R5. Caller interface.**
-- `wait` blocks until the turn ends. It polls with backoff, not at a fixed
-  fast rate.
+- `wait` blocks until the turn ends. It checks at once, then once per
+  second.
 - `status` returns the progress snapshot and step history (R3, R4) for one
   moment of one turn; callers poll it.
 - `events` pages the durable events. There is no follow stream.
@@ -98,11 +98,14 @@ history; the agent's transcript still has them.
   session's last-active time **(owner, 2026-09-29 r16)**.
 
 **R6. Envelope.** It carries:
-- final text;
+- final text, inline when it fits; otherwise the path and size of a
+  `final_text.txt` file in the turn's folder, so a turn never fails for a
+  large answer **(owner, 2026-09-29 r16)**;
 - `steps`: the vendor's own step count, or `null` when the vendor reports
   none. VIA's own count stays in `status` **(owner, 2026-09-29 r16)**;
 - `usage` (exact where the vendor reports it);
-- denied actions and declined requests;
+- denied actions and declined requests: the first 1,000 of each and their
+  total counts;
 - cost;
 - the evidence locations (R5 `logs`), in place of raw log spans.
 
@@ -144,8 +147,9 @@ raw log, `docs/brainstorms/README.md` §15)**.
   by the operating system.
 - When VIA cannot understand a vendor message, it writes that message,
   capped, to the evidence folder, and the failure names the file.
-- Where the vendor offers a debug file (Claude `--debug-file`), VIA points it
-  into the evidence folder.
+- VIA's own warnings and errors go to one daemon log, `via.log`, in its
+  state directory. It is for diagnosis and is not part of the caller API.
+- Agent stderr is not capped. Its size is measured in `via-d9o.2.3`.
 - SQLite stores the vendor session ID, the vendor transcript path as a hint,
   and the evidence folder path. The transcript is the vendor's file: VIA
   neither parses nor deletes it.
@@ -175,6 +179,10 @@ raw log, `docs/brainstorms/README.md` §15)**.
 - Transcript paths follow each vendor's internal layout. VIA records them as
   hints, and each vendor task confirms them.
 - Memory has no enforced ceiling; its worst case is measured, not guaranteed.
+- Simple first, measure later **(owner, 2026-09-29 r16)**. Problems not yet
+  observed get the simplest behaviour: uncapped stderr, a 1 MiB per-message
+  cap, and one-transaction WAL overshoot. `via-d9o.2.3` measures each with
+  every adapter, and hardening follows the data.
 - Step count and live tokens are approximate across vendors. The envelope holds
   exact usage where the vendor reports it.
 - This changes VIA API v1 before its first release: §3.7 `status`, §3.11
