@@ -111,10 +111,15 @@ pub(super) async fn final_shutdown(
     failed_joins += failed;
     // Store Drop blocks on its writer and raw threads: keep it off Tokio workers
     // and bounded; a stalled join is left to process exit, never waited out.
+    let blob_tasks = engine.blob_tasks();
     let store = match Arc::try_unwrap(engine) {
         Ok(engine) => drop_blocking(engine, deadline).await,
         Err(_) => "not_released",
     };
+    // Blob steps still running after the Store's bounded drain are pending
+    // work (coding-style §5): never a clean exit.
+    let blob_tasks = blob_tasks.outstanding();
+    pending_joins += blob_tasks;
     let host = report.as_ref().ok();
     let clean = pending_joins == 0
         && failed_joins == 0
@@ -140,6 +145,7 @@ pub(super) async fn final_shutdown(
             "skipped":host.failure_batches.skipped,
         })),
         "store":store,
+        "blob_tasks":blob_tasks,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
     // Best-effort bounded diagnostic; the exit status is the authoritative result.

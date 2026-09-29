@@ -123,9 +123,11 @@ pub(crate) const BLOB_DRAIN: Duration = Duration::from_secs(1);
 
 /// The Store's owned blob steps (coding-style §5 task ownership): every
 /// step runs on the blocking pool inside this `JoinSet`, which keeps it
-/// until it ends. The mutex is never held across an `.await`.
+/// until it ends. The mutex is never held across an `.await`. Final
+/// shutdown holds a clone to count the steps still running after the
+/// Store's bounded drain.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct BlobTasks {
+pub struct BlobTasks {
     set: Arc<Mutex<JoinSet<()>>>,
 }
 
@@ -197,7 +199,7 @@ impl BlobTasks {
     }
 
     /// Steps still owned, after reaping ended ones.
-    pub(crate) fn pending(&self) -> usize {
+    pub fn outstanding(&self) -> usize {
         let mut set = self.lock();
         while set.try_join_next().is_some() {}
         set.len()
@@ -208,7 +210,7 @@ impl BlobTasks {
     pub(crate) fn drain(&self, bound: Duration) -> usize {
         let deadline = Instant::now() + bound;
         loop {
-            let pending = self.pending();
+            let pending = self.outstanding();
             if pending == 0 || Instant::now() >= deadline {
                 return pending;
             }
@@ -563,7 +565,7 @@ mod tests {
                     })
                     .expect("admitted");
             }
-            assert_eq!(tasks.pending(), BLOB_TASKS);
+            assert_eq!(tasks.outstanding(), BLOB_TASKS);
             let refused = tasks.run(|| Ok(())).await;
             assert!(
                 matches!(&refused, Err(StoreError::Write(message)) if message.contains("outstanding")),

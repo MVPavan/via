@@ -353,6 +353,13 @@ impl Engine {
         }
     }
 
+    /// The Store's owned blob steps (design §6.5, coding-style §5): final
+    /// shutdown counts those still running after the Store is dropped as
+    /// pending work.
+    pub fn blob_tasks(&self) -> via_store::BlobTasks {
+        self.store.blob_tasks()
+    }
+
     /// Moves pending starts into the channel while it has capacity. Daemon
     /// main calls it after each start it takes and in final shutdown.
     pub fn retry_starts(&self) {

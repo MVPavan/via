@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     CommitOutcome, EvidenceRoot, Identity, SessionId, StoreFailureKind, TurnNumber,
-    blob::{BlobReader, BlobRef, BlobWriter, Blobs},
+    blob::{BlobReader, BlobRef, BlobTasks, BlobWriter, Blobs},
     evidence::sync_dir,
     lanes::{Lane, Lanes},
 };
@@ -1283,7 +1283,7 @@ impl Store {
     /// Test builds: blob steps the Store still owns, after reaping ended ones.
     #[cfg(feature = "test-failpoints")]
     pub fn blob_tasks(&self) -> usize {
-        self.client.blobs.tasks.pending()
+        self.client.blobs.tasks.outstanding()
     }
 }
 
@@ -1295,16 +1295,10 @@ impl Drop for Store {
         if let Some(join) = self.writer_join.take() {
             let _ = join.join();
         }
-        // Owned blob steps (coding-style §5): a bounded wait, then the rest
-        // are reported as stragglers and left to end on their own.
-        let pending = self.client.blobs.tasks.drain(crate::blob::BLOB_DRAIN);
-        if pending > 0 {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "via store: {pending} blob task(s) still running at shutdown"
-            );
-        }
+        // Owned blob steps (coding-style §5): a bounded wait; the rest end
+        // on their own, and final shutdown counts them through
+        // `StoreClient::blob_tasks` as pending work.
+        let _ = self.client.blobs.tasks.drain(crate::blob::BLOB_DRAIN);
     }
 }
 
@@ -1339,6 +1333,12 @@ impl StoreClient {
     #[cfg(feature = "test-failpoints")]
     pub fn lanes(&self) -> &Lanes {
         &self.lanes
+    }
+
+    /// The Store's owned blob steps, for final shutdown to count those
+    /// still running after the Store is dropped.
+    pub fn blob_tasks(&self) -> BlobTasks {
+        self.blobs.tasks.clone()
     }
 
     /// Creates a new blob file for a request's large value (design §6.5),
