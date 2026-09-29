@@ -708,8 +708,8 @@ fn recovered_evidence(session: &str, envelope: &Value) -> Result<(), ScenarioErr
 
 // ------------------------------------------------------------------ F9
 
-/// F9 (design §11), a characterization test. Streamed events committed,
-/// then SIGKILL: after restart turn 1 is `unknown`, the fake received exactly
+/// F9 (design §11), a characterization test. The acceptance committed and
+/// text streamed, then SIGKILL: after restart turn 1 is `unknown`, the fake received exactly
 /// one start, the queued successor is cancelled, and the envelope names the
 /// turn's evidence folder and only the plan's warning (Task 4 design §7.5).
 #[test]
@@ -723,7 +723,9 @@ fn s1_f09_kill_while_running_restarts_unknown_no_resend() -> TestResult {
         let mut daemon = Daemon::start(paths, evidence, "crashed")?;
         let session = session_of(&spawn(paths, evidence, "spawn", "f09", &[])?)?;
         paths.await_file("streamed.entered")?;
-        paths.await_event(&session, 1, "assistant.text")?;
+        // Model text is not an event (Task 4 design §2.1): the acceptance
+        // is the turn's last committed event before the kill.
+        paths.await_event(&session, 1, "turn.started")?;
         resume(paths, evidence, "resume", &session, "f09-next", &[])?;
         daemon.kill()?;
         let _daemon = Daemon::start(paths, evidence, "final")?;

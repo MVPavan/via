@@ -408,6 +408,24 @@ pub struct SessionReadParams {
     pub session: SessionId,
 }
 
+/// Strict C1 §3.7 `status` parameters (Task 4 A26): the turn defaults to
+/// the running turn, else the latest; `limit` is 1 to 1000, default 100.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusParams {
+    /// The session described.
+    pub session: SessionId,
+    /// The selected turn.
+    #[serde(default)]
+    pub turn: Option<TurnNumber>,
+    /// Step rows after this step.
+    #[serde(default)]
+    pub after_step: Option<u32>,
+    /// At most this many step rows.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// Strict C1 §3.12 `logs` parameters: exactly one of a session address or
 /// a turn address (Task 4 design §4.4).
 #[derive(Deserialize)]
@@ -965,6 +983,11 @@ pub(crate) struct UsageSupport {
     cost: &'static str,
 }
 
+/// The fake route's declared `capabilities.usage.tokens`, which labels
+/// `status` `progress.tokens` (Task 4 design §2.4) and the envelope's
+/// `usage`: its samples are exact per turn by construction (§2.5).
+pub(crate) const FAKE_TOKEN_SCOPE: &str = "turn";
+
 /// C1 §4.1 capabilities, stating only what this build actually does.
 #[derive(Serialize)]
 pub(crate) struct Capabilities {
@@ -998,7 +1021,7 @@ impl Capabilities {
             network_control: false,
             recover: unsupported("fake turns do not survive a daemon restart"),
             usage: UsageSupport {
-                tokens: "unavailable",
+                tokens: FAKE_TOKEN_SCOPE,
                 cost: "unavailable",
             },
         }
@@ -1181,7 +1204,8 @@ pub(crate) struct Failure {
     pub(crate) retryable: bool,
 }
 
-/// C1 §5 `usage`: every count `null` while provenance is `unavailable`.
+/// C1 §5 `usage`: every count `null` while provenance is `unavailable`;
+/// a route that reports only a total fills `total_tokens`.
 #[derive(Serialize)]
 pub(crate) struct Usage {
     input_tokens: Option<u64>,
@@ -1203,6 +1227,20 @@ impl Usage {
         scope: "turn",
         provenance: "unavailable",
     };
+
+    /// The fake route's figure: the turn's summed samples under its declared
+    /// scope, reported; unavailable without a sample.
+    pub(crate) fn fake(total: Option<u64>) -> Self {
+        match total {
+            Some(total) => Self {
+                total_tokens: Some(total),
+                scope: FAKE_TOKEN_SCOPE,
+                provenance: "reported",
+                ..Self::UNAVAILABLE
+            },
+            None => Self::UNAVAILABLE,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1321,32 +1359,6 @@ pub(crate) enum EventBody {
         stop_reason: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         cancel: Option<Cancel>,
-    },
-    #[serde(rename = "assistant.text")]
-    AssistantText {
-        text: String,
-        #[serde(rename = "final")]
-        is_final: bool,
-    },
-    #[serde(rename = "tool.started")]
-    ToolStarted {
-        tool_id: String,
-        name: String,
-        input_summary: String,
-    },
-    #[serde(rename = "tool.ended")]
-    ToolEnded {
-        tool_id: String,
-        status: &'static str,
-        output_summary: String,
-        exit_code: Option<i32>,
-    },
-    /// C2 A1 keeps an explicit `truncated` marker beside the bounded payload.
-    #[serde(rename = "vendor.other")]
-    VendorOther {
-        vendor_type: String,
-        payload: String,
-        truncated: bool,
     },
     #[serde(rename = "cancel.requested")]
     CancelRequested {},
@@ -1471,22 +1483,18 @@ mod tests {
     }
 
     #[test]
-    fn observation_events_use_c1_tags_and_fields() {
+    fn durable_events_use_c1_tags_and_fields() {
         let bodies = [
             (
-                EventBody::AssistantText {
-                    text: "t".to_owned(),
-                    is_final: false,
+                EventBody::CancelSettled {
+                    outcome: "acknowledged",
+                    cleanup: "quiescent",
                 },
-                json!({"type":"assistant.text","text":"t","final":false}),
+                json!({"type":"cancel.settled","outcome":"acknowledged","cleanup":"quiescent"}),
             ),
             (
-                EventBody::VendorOther {
-                    vendor_type: "note".to_owned(),
-                    payload: "{".to_owned(),
-                    truncated: true,
-                },
-                json!({"type":"vendor.other","vendor_type":"note","payload":"{","truncated":true}),
+                EventBody::SessionClosed { reason: "closed" },
+                json!({"type":"session.closed","reason":"closed"}),
             ),
         ];
         for (body, expected) in bodies {

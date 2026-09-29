@@ -129,6 +129,14 @@ POINTS = [
     # observation; a Wire connection dropped without `finish`.
     "core.observations.pause",
     "wire.fallback_drop",
+    # Task 4 T4-4 (design §3.2, §4.2, §13.1): a step-row commit, a delayed
+    # Store read, the `status` read's corruption, a boundary's progress
+    # publish, the drive between the terminal commit and `finish_running`.
+    "store.commit.step",
+    "store.read.delay_ms",
+    "store.read.corrupt.status",
+    "core.progress.publish",
+    "core.finish_running.pause",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

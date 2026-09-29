@@ -133,6 +133,9 @@ impl State {
 pub struct Lanes {
     state: Mutex<State>,
     ready: Condvar,
+    /// Test builds: read requests the writer served.
+    #[cfg(feature = "test-failpoints")]
+    reads: std::sync::atomic::AtomicU64,
 }
 
 impl Lanes {
@@ -226,6 +229,19 @@ impl Lanes {
     #[cfg(feature = "test-failpoints")]
     pub fn peak(&self, lane: Lane) -> usize {
         self.lock().queues[lane.index()].peak
+    }
+
+    /// Test builds: counts one read request served.
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn count_read(&self) {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test builds: read requests the writer served.
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test builds: whether `Store::drop` has set the fence.

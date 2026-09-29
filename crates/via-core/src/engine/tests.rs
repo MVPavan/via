@@ -285,6 +285,7 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                         cancel: None,
                     },
                 ),
+                steps: Vec::new(),
             })
             .await
             .unwrap();
@@ -1844,7 +1845,11 @@ fn the_force_set_reads_a_slot_in_one_section() {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let slot = engine.slot(&session).unwrap();
-        let _orders = slot.start_running(turn(1), tokio::time::Instant::now());
+        let _orders = slot.start_running(
+            turn(1),
+            tokio::time::Instant::now(),
+            super::progress::Progress::starting(1),
+        );
         assert!(slot.queued().is_empty());
         assert_eq!(engine.unfinished_sessions(), std::slice::from_ref(&session));
         slot.finish_running(turn(1));
@@ -2029,6 +2034,7 @@ fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
                 outcome: super::latch::WriteOutcome::NotCommitted,
             }),
             uncertain: None,
+            steps: super::progress::StepTracker::default(),
         };
         assert!(!engine.store_failed(), "the clean failure is scoped");
         let cause = via_adapters::RouteError::Store {
@@ -2065,7 +2071,8 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
         let session = new_session(&engine).await;
         let slot = engine.slot(&session).unwrap();
         let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
-        let (_route, orders) = slot.start_running(turn(1), wall);
+        let (_route, orders) =
+            slot.start_running(turn(1), wall, super::progress::Progress::starting(1));
         let watched = orders.clone();
         // A session Store does not hold: the head read writes nothing.
         let mut record = super::TurnRecord {
@@ -2075,19 +2082,28 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             accepted: None,
             first_failure: None,
             uncertain: None,
+            steps: super::progress::StepTracker::default(),
         };
         let effective: crate::api::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
         .unwrap();
-        let queued = via_adapters::FakeObservation::Data {
-            observation: via_adapters::Observation::AssistantText {
-                text: "lost".to_owned(),
-            },
+        // Model output after a tool result ends step 1: its row's commit
+        // is the drained write (Task 4 design §3.2).
+        let _ = record.steps.accept();
+        let marks = |model: bool, ended: &[&str]| via_adapters::FakeObservation::Data {
+            observation: via_adapters::Observation::Progress(via_adapters::ProgressMarks {
+                at: tokio::time::Instant::now(),
+                model,
+                tools_started: Vec::new(),
+                tools_ended: ended.iter().map(|id| (*id).to_owned()).collect(),
+                usage: None,
+            }),
         };
+        let queued = vec![marks(false, &["t"]), marks(true, &[])];
         engine
-            .drain_queued(&slot, &mut record, &effective, orders, vec![queued])
+            .drain_queued(&slot, &mut record, &effective, orders, queued)
             .await;
         let note = record.first_failure.expect("the drained write failed");
         assert_eq!(note.outcome, super::latch::WriteOutcome::NotCommitted);
@@ -2155,6 +2171,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             accepted: None,
             first_failure: None,
             uncertain: None,
+            steps: super::progress::StepTracker::default(),
         };
         let terminal = super::Terminal {
             state: "failed",
@@ -2341,6 +2358,7 @@ fn turn_one(session: &SessionId, uncertain: bool) -> super::TurnRecord {
             event: serde_json::Value::Null,
             accepted: None,
         }),
+        steps: super::progress::StepTracker::default(),
     }
 }
 
@@ -2530,7 +2548,8 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
         let session = new_session(&engine).await;
         let slot = engine.slot(&session).unwrap();
         let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
-        let (_route, orders) = slot.start_running(turn(1), wall);
+        let (_route, orders) =
+            slot.start_running(turn(1), wall, super::progress::Progress::starting(1));
         let mut record = super::TurnRecord {
             head: super::journal::Head::new(None),
             ..turn_one(&session, false)

@@ -264,6 +264,12 @@ impl FakeRoute {
         self.wire.holdings_changed()
     }
 
+    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
+    /// design §11.3 `process.alive`).
+    pub fn live_armed(&self, anchors: &[String]) -> bool {
+        self.wire.live_armed(anchors)
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns
     /// (design §6.4).
     pub fn pending_cleanup(&self) -> usize {
@@ -751,14 +757,16 @@ impl Phase {
                 FakeMessage::Text { .. }
                 | FakeMessage::ToolStarted { .. }
                 | FakeMessage::ToolEnded { .. }
-                | FakeMessage::UnknownNotification { .. },
+                | FakeMessage::Usage { .. }
+                | FakeMessage::Unknown { .. },
                 Self::Submitted,
             ) => return Err(protocol(turn, "fake observation before acceptance")),
             (
                 FakeMessage::Text { .. }
                 | FakeMessage::ToolStarted { .. }
                 | FakeMessage::ToolEnded { .. }
-                | FakeMessage::UnknownNotification { .. },
+                | FakeMessage::Usage { .. }
+                | FakeMessage::Unknown { .. },
                 Self::Accepted | Self::Terminated,
             ) => {}
         }
@@ -811,8 +819,9 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
         | FakeMessage::Text { .. }
         | FakeMessage::ToolStarted { .. }
         | FakeMessage::ToolEnded { .. }
+        | FakeMessage::Usage { .. }
         | FakeMessage::InterruptAck { .. }
-        | FakeMessage::UnknownNotification { .. } => None,
+        | FakeMessage::Unknown { .. } => None,
     }
 }
 
@@ -965,8 +974,9 @@ mod tests {
 
     const ACCEPTED: &str = r#"{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}"#;
     const TERMINAL: &str = r#"{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"","stop_reason":"end_turn"}"#;
-    const OBSERVATIONS: [&str; 4] = [
+    const OBSERVATIONS: [&str; 5] = [
         r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":"hi"}"#,
+        r#"{"type":"usage","vendor_turn_id":"fake-turn-1","total_tokens":7}"#,
         r#"{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t","name":"sh","input_summary":""}"#,
         r#"{"type":"tool_ended","vendor_turn_id":"fake-turn-1","tool_id":"t","status":"completed","output_summary":"","exit_code":null}"#,
         r#"{"type":"later","value":1}"#,
@@ -1015,6 +1025,67 @@ mod tests {
                 Some("unsolicited fake interrupt acknowledgement")
             );
         }
+    }
+
+    fn refused(input: &[u8]) -> Option<&'static str> {
+        match FakeMessage::decode(input, TurnNumber::try_from(1).unwrap()) {
+            Ok(_) => None,
+            Err(RouteError::Protocol { detail, .. }) => Some(detail),
+            Err(other) => panic!("unexpected route error {other:?}"),
+        }
+    }
+
+    /// Task 4 design §2.2: what the fake keeps, and rules 1 and 3 plus
+    /// UTF-8. Skipped fields are never decoded, whatever their type.
+    #[test]
+    fn decode_keeps_the_marks_and_bounds_short_fields() {
+        let tool = |name: &str| {
+            format!(
+                r#"{{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t","name":"{name}","input_summary":{{"x":[1]}}}}"#
+            )
+        };
+        let kept = tool(&"n".repeat(1024));
+        assert!(matches!(
+            decode(&kept),
+            FakeMessage::ToolStarted { ref name, .. } if name.len() == 1024
+        ));
+        assert_eq!(
+            refused(tool(&"n".repeat(1025)).as_bytes()),
+            Some("fake short field exceeds 1 KiB")
+        );
+        assert!(matches!(
+            decode(r#"{"type":"text","vendor_turn_id":"fake-turn-1","text":1}"#),
+            FakeMessage::Text { .. }
+        ));
+        assert!(matches!(
+            decode(r#"{"type":"usage","vendor_turn_id":"fake-turn-1","total_tokens":9}"#),
+            FakeMessage::Usage {
+                total_tokens: 9,
+                ..
+            }
+        ));
+        let tag = |length: usize| format!(r#"{{"type":"{}","v":1}}"#, "u".repeat(length));
+        assert!(matches!(
+            decode(&tag(256)),
+            FakeMessage::Unknown { ref vendor_type } if vendor_type.len() == 256
+        ));
+        assert_eq!(
+            refused(tag(257).as_bytes()),
+            Some("fake type tag exceeds 256 bytes")
+        );
+        let deep = format!(
+            r#"{{"type":"text","vendor_turn_id":"fake-turn-1","x":{}{}}}"#,
+            "[".repeat(64),
+            "]".repeat(64)
+        );
+        assert_eq!(
+            refused(deep.as_bytes()),
+            Some("fake message exceeds JSON structure limits")
+        );
+        assert_eq!(
+            refused(b"{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"x\":\"\xff\"}"),
+            Some("fake message is not UTF-8")
+        );
     }
 
     /// Design §2 rule 3: once Route sent its interrupt, an `interrupt_ack`

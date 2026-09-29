@@ -25,6 +25,7 @@ mod control;
 mod drive;
 mod journal;
 mod latch;
+mod progress;
 mod queue;
 mod read;
 mod receipt;
@@ -178,7 +179,8 @@ struct ForcedTurn {
     /// proved group absence; recovery can add to these, never retract them.
     close: RouteClose,
     /// The turn's stop order's cause, if any: an idle order ends the forced
-    /// turn `failed(deadline_idle)` (design §2).
+    /// turn `failed(deadline_idle)` (design §2), a `protocol` one
+    /// `failed(protocol)`.
     cause: Option<via_adapters::StopCause>,
 }
 
@@ -445,6 +447,9 @@ struct TurnRecord {
     first_failure: Option<FailureNote>,
     /// The event commit Store left uncertain, settled before `turn.ended`.
     uncertain: Option<UncertainEvent>,
+    /// The step tracker (Task 4 design §2.4) and the rows the terminal
+    /// carries (§3.2).
+    steps: progress::StepTracker,
 }
 
 /// A turn's first failed Store write: where it failed and whether it may

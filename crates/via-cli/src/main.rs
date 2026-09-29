@@ -27,6 +27,7 @@ enum Command {
     Wait(WaitArgs),
     Events(ReadArgs),
     Logs(ReadArgs),
+    Status(StatusArgs),
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
@@ -205,6 +206,20 @@ struct CloseArgs {
     json: bool,
 }
 
+/// C1 §3.7 `via status <session> [--turn N] [--after-step N] [--limit N]`.
+#[derive(Args)]
+struct StatusArgs {
+    session: String,
+    #[arg(long)]
+    turn: Option<u32>,
+    #[arg(long)]
+    after_step: Option<u32>,
+    #[arg(long)]
+    limit: Option<u32>,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args)]
 struct ReadArgs {
     address: String,
@@ -345,23 +360,42 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Result(args) => {
             client::call("result", &json!({"address":args.address}), true, true)
         }
-        Command::Wait(args) => {
-            let mut params = json!({"address":args.address});
-            let mut read = Duration::from_millis(via_core::DEFAULT_WAIT_MS);
-            if let Some(timeout) = args.timeout_ms {
-                params["timeout_ms"] = Value::from(timeout);
-                read = Duration::from_millis(timeout);
-            }
-            // The daemon answers `wait_timeout` at the bound; allow for the reply.
-            let read = read.saturating_add(Duration::from_secs(5));
-            let _interrupt = exit_on_interrupt()?;
-            client::call_within("wait", &params, true, true, read)
-        }
+        Command::Wait(args) => wait(&args),
         Command::Events(args) => {
             client::call("events", &json!({"session":args.address}), true, true)
         }
         Command::Logs(args) => logs(&args.address),
+        Command::Status(args) => status(&args),
     }
+}
+
+/// `via wait` (C1 §3.8).
+fn wait(args: &WaitArgs) -> anyhow::Result<i32> {
+    let mut params = json!({"address":args.address});
+    let mut read = Duration::from_millis(via_core::DEFAULT_WAIT_MS);
+    if let Some(timeout) = args.timeout_ms {
+        params["timeout_ms"] = Value::from(timeout);
+        read = Duration::from_millis(timeout);
+    }
+    // The daemon answers `wait_timeout` at the bound; allow for the reply.
+    let read = read.saturating_add(Duration::from_secs(5));
+    let _interrupt = exit_on_interrupt()?;
+    client::call_within("wait", &params, true, true, read)
+}
+
+/// `via status` (C1 §3.7): the omitted members take the daemon's defaults.
+fn status(args: &StatusArgs) -> anyhow::Result<i32> {
+    let mut params = json!({"session":args.session});
+    for (member, value) in [
+        ("turn", args.turn),
+        ("after_step", args.after_step),
+        ("limit", args.limit),
+    ] {
+        if let Some(value) = value {
+            params[member] = Value::from(value);
+        }
+    }
+    client::call("status", &params, true, true)
 }
 
 /// `via logs` (C1 §3.12): exactly one of a session or a turn address.

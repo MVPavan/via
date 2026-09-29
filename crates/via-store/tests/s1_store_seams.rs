@@ -169,6 +169,7 @@ fn persistent_fail_io_fails_every_later_commit() {
                 turn: turn(),
                 envelope: json!({"state":"failed"}),
                 event: event("turn.ended", 3),
+                steps: Vec::new(),
             })
             .await;
         assert!(
@@ -221,6 +222,7 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
             turn: turn(),
             envelope: json!({"state":"cancelled"}),
             event: event("turn.ended", 2),
+            steps: Vec::new(),
         };
         let failed = client
             .commit_closing_terminal(cancelled(), event("session.closed", 3))
@@ -277,6 +279,7 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
                     turn: turn(),
                     envelope: json!({"state":"cancelled"}),
                     event: event("turn.ended", 3),
+                    steps: Vec::new(),
                 },
                 event("session.closed", 4),
             )

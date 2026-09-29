@@ -399,6 +399,12 @@ impl Engine {
             );
             terminal.stop_reason = "deadline";
         }
+        if turn.cause == Some(StopCause::Protocol) || record.steps.unrepresentable() {
+            // Review r2: the tracker refused a token count (a `protocol`
+            // order, or a refusal after Route ended under the force); the
+            // known failure outranks the idle and cancel rows.
+            terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
+        }
         if record.first_failure.is_some() {
             // C1 §8.2: the durable stream already lost an event; a
             // cancellation must not present it as a complete record.

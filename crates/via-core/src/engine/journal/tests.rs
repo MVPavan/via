@@ -215,6 +215,7 @@ fn record() -> TurnRecord {
         accepted: None,
         first_failure: None,
         uncertain: None,
+        steps: crate::engine::progress::StepTracker::default(),
     }
 }
 
@@ -236,16 +237,14 @@ fn store_failure() -> Terminal {
     }
 }
 
-/// Commits one observation through `journal`, then finishes the turn as `drive` does.
+/// Commits one turn event (`cancel.requested`) through `journal`, then
+/// finishes the turn as `drive` does.
 async fn observe_then_finish(
     journal: &FaultJournal,
     unresolved: &Unresolved,
 ) -> Result<(), crate::ApiError> {
     let mut record = record();
-    let body = EventBody::AssistantText {
-        text: "hi".to_owned(),
-        is_final: false,
-    };
+    let body = EventBody::CancelRequested {};
     commit_event(journal, &mut record, body).await;
     assert!(
         record.first_failure.is_some(),
@@ -300,7 +299,7 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
         [
             (1, "turn.queued".to_owned()),
             (2, "turn.submitted".to_owned()),
-            (3, "assistant.text".to_owned()),
+            (3, "cancel.requested".to_owned()),
             (4, "turn.ended".to_owned()),
         ]
     );
@@ -341,10 +340,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
         delayed_results: false,
     };
     let mut record = record();
-    let body = EventBody::AssistantText {
-        text: "hi".to_owned(),
-        is_final: false,
-    };
+    let body = EventBody::CancelRequested {};
     commit_event(&journal, &mut record, body).await;
     assert!(
         record.first_failure.is_some(),
@@ -744,15 +740,7 @@ async fn a_corrupt_head_read_before_an_event_is_a_corrupt_failure() {
     };
     let mut record = record();
     record.head = Head::new(None);
-    commit_event(
-        &journal,
-        &mut record,
-        EventBody::AssistantText {
-            text: "lost".to_owned(),
-            is_final: false,
-        },
-    )
-    .await;
+    commit_event(&journal, &mut record, EventBody::CancelRequested {}).await;
     let note = record
         .first_failure
         .expect("the head read failed the event");

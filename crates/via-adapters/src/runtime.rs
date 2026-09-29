@@ -9,8 +9,8 @@ use tokio::time::timeout_at;
 
 use crate::{
     AcceptanceToken, Cleanup, Deadline, FakeAcceptanceObservation, FakeConfig, FakeObservation,
-    FakeTerminalEvidence, MAX_OBSERVATION_BYTES, Observation, ProcessOwner, ReprobeReport,
-    RouteError, RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch, TurnNumber,
+    FakeTerminalEvidence, Observation, ProcessOwner, ProgressMarks, ReprobeReport, RouteError,
+    RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch, TurnActivity, TurnNumber,
     VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
@@ -151,7 +151,8 @@ impl AdapterRuntime {
     /// the drive's budget, then sends each item, while `route` keeps being
     /// polled. A delivery blocked for the stall bound without an item
     /// accepted drops the hop's receiver, so Route fails the turn as
-    /// overflow and still performs its cleanup. `force` set force-closes the
+    /// overflow and still performs its cleanup. Each message's arrival
+    /// moves `activity` (design §2.4), unknown types included. `force` set force-closes the
     /// turn through Route (C2 Close(Force)). `stop` is the turn's stop
     /// order, passed through to Route (design §2).
     #[expect(
@@ -164,6 +165,7 @@ impl AdapterRuntime {
         turn: TurnNumber,
         prompt: String,
         observations: ObservationSink,
+        activity: TurnActivity,
         deadline: Deadline,
         force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
@@ -206,7 +208,9 @@ impl AdapterRuntime {
                 message = recv(hop_rx.as_mut()), if delivery.is_none() && hop_rx.is_some() => {
                     match message {
                         Some(message) => {
-                            delivery = Some(Box::pin(deliver(message, observations.clone(), stall)));
+                            let at = tokio::time::Instant::now();
+                            activity.record(at);
+                            delivery = Some(Box::pin(deliver(message, at, observations.clone(), stall)));
                         }
                         None => hop_rx = None,
                     }
@@ -224,7 +228,12 @@ impl AdapterRuntime {
             }
             if let Some(receiver) = hop_rx.as_mut() {
                 while let Ok(message) = receiver.try_recv() {
-                    if deliver(message, observations.clone(), stall).await.is_err() {
+                    let at = tokio::time::Instant::now();
+                    activity.record(at);
+                    if deliver(message, at, observations.clone(), stall)
+                        .await
+                        .is_err()
+                    {
                         return false;
                     }
                 }
@@ -320,6 +329,12 @@ impl AdapterRuntime {
         self.route.holdings_changed()
     }
 
+    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
+    /// design §11.3 `process.alive`).
+    pub fn live_armed(&self, anchors: &[String]) -> bool {
+        self.route.live_armed(anchors)
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns, which
     /// block idle exit (design §6.4).
     pub fn pending_cleanup(&self) -> usize {
@@ -401,24 +416,22 @@ fn item_cost(strings: &[&str]) -> usize {
         .sum::<usize>()
 }
 
-/// Delivers one Route message (design §2.3): acquires the byte cost of
-/// every item it yields before building them, then sends each item with its
-/// share of the permits. The pending delivery owns one stall deadline, set
-/// at its first block and cleared only when an item is accepted; at the
+/// Delivers one Route message (design §2.3): builds its observation, if
+/// any, acquires the item's byte cost, then sends it with the permit. The
+/// pending delivery owns one stall deadline, set at its first block; at the
 /// deadline it gives up. The terminal travels in the route result.
 async fn deliver(
     message: RouteMessage,
+    at: tokio::time::Instant,
     sink: ObservationSink,
     stall: Duration,
 ) -> Result<(), Undelivered> {
-    let costs = costs(&message.payload);
-    let total: usize = costs.iter().sum();
-    if total == 0 {
+    let Some(observation) = normalize(message, at)? else {
         return Ok(());
-    }
+    };
     let mut stall_at = None;
-    let wanted = u32::try_from(total).map_err(|_| Undelivered)?;
-    let mut permit = match Arc::clone(&sink.budget).try_acquire_many_owned(wanted) {
+    let wanted = u32::try_from(observation_cost(&observation)).map_err(|_| Undelivered)?;
+    let permit = match Arc::clone(&sink.budget).try_acquire_many_owned(wanted) {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => {
             let at = *stall_at.get_or_insert_with(|| tokio::time::Instant::now() + stall);
@@ -429,146 +442,92 @@ async fn deliver(
         }
         Err(TryAcquireError::Closed) => return Err(Undelivered),
     };
-    for (observation, cost) in normalize(message)?.into_iter().zip(costs) {
-        let share = permit.split(cost).ok_or(Undelivered)?;
-        let item = AdmittedObservation {
-            observation,
-            permit: share,
-        };
-        match sink.sender.try_send(item) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                let at = *stall_at.get_or_insert_with(|| tokio::time::Instant::now() + stall);
-                timeout_at(at, sink.sender.send(item))
-                    .await
-                    .map_err(|_| Undelivered)?
-                    .map_err(|_| Undelivered)?;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(Undelivered),
+    let item = AdmittedObservation {
+        observation,
+        permit,
+    };
+    match sink.sender.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(item)) => {
+            let at = *stall_at.get_or_insert_with(|| tokio::time::Instant::now() + stall);
+            timeout_at(at, sink.sender.send(item))
+                .await
+                .map_err(|_| Undelivered)?
+                .map_err(|_| Undelivered)
         }
-        // Accepted: the next block starts a new stall deadline.
-        stall_at = None;
-    }
-    Ok(())
-}
-
-/// The byte cost of each item `message` yields, in order.
-fn costs(message: &FakeMessage) -> Vec<usize> {
-    match message {
-        FakeMessage::Accepted { vendor_turn_id } => vec![item_cost(&[vendor_turn_id])],
-        FakeMessage::Text { text, .. } => split_ranges(text)
-            .into_iter()
-            .map(|range| item_cost(&[&text[range]]))
-            .collect(),
-        FakeMessage::ToolStarted {
-            tool_id,
-            name,
-            input_summary,
-            ..
-        } => vec![item_cost(&[tool_id, name, input_summary])],
-        FakeMessage::ToolEnded {
-            tool_id,
-            output_summary,
-            ..
-        } => vec![item_cost(&[tool_id, output_summary])],
-        FakeMessage::UnknownNotification {
-            vendor_type,
-            raw_payload,
-            ..
-        } => vec![item_cost(&[vendor_type, raw_payload])],
-        FakeMessage::Terminal { .. } | FakeMessage::InterruptAck { .. } => Vec::new(),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered),
     }
 }
 
-/// Maps one decoded fake message to C2 observations; oversized text is
-/// split. An acceptance that cannot be represented is not delivered.
-fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, Undelivered> {
-    let data = |observation| FakeObservation::Data { observation };
+/// Maps one decoded fake message to its C2 observation, if any (design
+/// §2.3, §2.5): one item at most, only for an acceptance or a message with
+/// a mark. Unknown messages move only the activity clock.
+fn normalize(
+    message: RouteMessage,
+    at: tokio::time::Instant,
+) -> Result<Option<FakeObservation>, Undelivered> {
+    let marks = |marks: ProgressMarks| {
+        Some(FakeObservation::Data {
+            observation: Observation::Progress(marks),
+        })
+    };
+    let empty = ProgressMarks {
+        at,
+        model: false,
+        tools_started: Vec::new(),
+        tools_ended: Vec::new(),
+        usage: None,
+    };
     Ok(match message.payload {
         // Route admits exactly one acceptance per turn.
         FakeMessage::Accepted { vendor_turn_id } => {
-            vec![FakeObservation::Accepted(FakeAcceptanceObservation {
+            Some(FakeObservation::Accepted(FakeAcceptanceObservation {
                 correlation: AcceptanceToken::try_from(1).map_err(|_| Undelivered)?,
                 vendor_turn_id: VendorTurnId::try_from(vendor_turn_id).map_err(|_| Undelivered)?,
-            })]
+            }))
         }
-        FakeMessage::Text { text, .. } => split_ranges(&text)
-            .into_iter()
-            .map(|range| {
-                data(Observation::AssistantText {
-                    text: text[range].to_owned(),
-                })
-            })
-            .collect(),
-        FakeMessage::ToolStarted {
-            tool_id,
-            name,
-            input_summary,
-            ..
-        } => vec![data(Observation::ToolStarted {
-            tool_id,
-            name,
-            input_summary,
-        })],
-        FakeMessage::ToolEnded {
-            tool_id,
-            status,
-            output_summary,
-            exit_code,
-            ..
-        } => vec![data(Observation::ToolEnded {
-            tool_id,
-            status,
-            output_summary,
-            exit_code,
-        })],
-        FakeMessage::UnknownNotification {
-            vendor_type,
-            raw_payload,
-            truncated,
-        } => vec![data(Observation::VendorOther {
-            vendor_type,
-            payload: raw_payload,
-            truncated,
-        })],
-        // Route rejects interrupt acknowledgements; the terminal is the route result.
-        FakeMessage::Terminal { .. } | FakeMessage::InterruptAck { .. } => Vec::new(),
+        FakeMessage::Text { .. } => marks(ProgressMarks {
+            model: true,
+            ..empty
+        }),
+        FakeMessage::ToolStarted { tool_id, name, .. } => marks(ProgressMarks {
+            tools_started: vec![(tool_id, name)],
+            ..empty
+        }),
+        FakeMessage::ToolEnded { tool_id, .. } => marks(ProgressMarks {
+            tools_ended: vec![tool_id],
+            ..empty
+        }),
+        FakeMessage::Usage { total_tokens, .. } => marks(ProgressMarks {
+            usage: Some((None, total_tokens)),
+            ..empty
+        }),
+        // Route rejects interrupt acknowledgements; the terminal is the route
+        // result; an unknown message is activity only.
+        FakeMessage::Terminal { .. }
+        | FakeMessage::InterruptAck { .. }
+        | FakeMessage::Unknown { .. } => None,
     })
 }
 
-/// Encoded bytes of an `assistant.text` payload other than its text:
-/// `{"text":"","final":false}`.
-const TEXT_PAYLOAD_OVERHEAD: usize = 25;
-
-/// Splits text in order at UTF-8 boundaries so that each piece's encoded
-/// `assistant.text` payload stays within C2's 256 KiB bound; returns the
-/// pieces' byte ranges.
-fn split_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let budget = MAX_OBSERVATION_BYTES - TEXT_PAYLOAD_OVERHEAD;
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    let mut encoded = 0;
-    for (index, character) in text.char_indices() {
-        let width = escaped_len(character);
-        if encoded + width > budget {
-            pieces.push(start..index);
-            start = index;
-            encoded = 0;
+/// The byte cost of an observation: its strings (design §2.3).
+fn observation_cost(observation: &FakeObservation) -> usize {
+    match observation {
+        FakeObservation::Accepted(accepted) => item_cost(&[accepted.vendor_turn_id.as_str()]),
+        FakeObservation::Data {
+            observation: Observation::Progress(marks),
+        } => {
+            let mut strings: Vec<&str> = Vec::new();
+            for (id, name) in &marks.tools_started {
+                strings.push(id);
+                strings.push(name);
+            }
+            strings.extend(marks.tools_ended.iter().map(String::as_str));
+            if let Some((Some(key), _)) = &marks.usage {
+                strings.push(key);
+            }
+            item_cost(&strings)
         }
-        encoded += width;
-    }
-    if start < text.len() || pieces.is_empty() {
-        pieces.push(start..text.len());
-    }
-    pieces
-}
-
-/// Bytes `serde_json` writes for one character inside a JSON string.
-fn escaped_len(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
-        '\0'..='\u{1f}' => 6,
-        _ => character.len_utf8(),
     }
 }
 
@@ -636,46 +595,51 @@ pub struct FakeShutdown {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OBSERVATION_BYTES, split_ranges};
+    use super::{
+        FakeMessage, OBSERVATION_BYTES, OBSERVATION_ITEMS, RouteMessage, deliver,
+        observation_channel,
+    };
+    use std::time::Duration;
 
-    fn split_text(text: &str) -> Vec<String> {
-        split_ranges(text)
-            .into_iter()
-            .map(|range| text[range].to_owned())
-            .collect()
-    }
-
-    /// Encoded bytes of the `assistant.text` payload Core commits for one piece.
-    fn encoded(text: &str) -> usize {
-        serde_json::to_vec(&serde_json::json!({"text":text,"final":false}))
-            .unwrap()
-            .len()
-    }
-
-    #[test]
-    fn text_splits_in_order_within_the_encoded_payload_bound() {
-        let cases = [
-            String::new(),
-            "short".to_owned(),
-            "é".repeat(140_000),
-            "a".repeat(MAX_OBSERVATION_BYTES),
-            "\u{1}\"\n😀".repeat(40_000),
-        ];
-        for text in cases {
-            let pieces = split_text(&text);
-            assert_eq!(pieces.concat(), text);
-            assert!(!pieces.is_empty());
-            for piece in &pieces {
-                assert!(
-                    encoded(piece) <= MAX_OBSERVATION_BYTES,
-                    "{}",
-                    encoded(piece)
-                );
-            }
-            // Greedy: every piece but the last is filled to within one character.
-            for piece in &pieces[..pieces.len() - 1] {
-                assert!(encoded(piece) + 6 > MAX_OBSERVATION_BYTES);
-            }
+    fn tool(name: &str) -> RouteMessage {
+        RouteMessage {
+            payload: FakeMessage::ToolStarted {
+                vendor_turn_id: "fake-turn-1".to_owned(),
+                tool_id: "t".to_owned(),
+                name: name.to_owned(),
+            },
         }
+    }
+
+    /// Design §2.3 Bounds: an item costs `512 + Σ(64 + len)` of the drive's
+    /// 4 MiB; with the receiver never drained, large items fill the budget
+    /// well before 1,024 items and the next delivery stays blocked until
+    /// the stall. The fake route's short fields (at most 1 KiB) cannot
+    /// reach 4 MiB within 1,024 items, so the byte bound is checked here.
+    #[test]
+    fn the_byte_budget_admits_items_to_4_mib_then_the_next_stalls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let name = "n".repeat(100 * 1024);
+        let cost = 512 + (64 + 1) + (64 + name.len());
+        let fits = OBSERVATION_BYTES / cost;
+        assert!(fits < OBSERVATION_ITEMS);
+        let (sink, receiver) = observation_channel();
+        runtime.block_on(async {
+            let stall = Duration::from_millis(50);
+            for _ in 0..fits {
+                let at = tokio::time::Instant::now();
+                assert!(deliver(tool(&name), at, sink.clone(), stall).await.is_ok());
+            }
+            assert_eq!(receiver.len(), fits);
+            let at = tokio::time::Instant::now();
+            assert!(deliver(tool(&name), at, sink.clone(), stall).await.is_err());
+            assert_eq!(receiver.len(), fits);
+            // A small item still fits what is left.
+            assert!(deliver(tool("n"), at, sink, stall).await.is_ok());
+            assert_eq!(receiver.len(), fits + 1);
+        });
     }
 }

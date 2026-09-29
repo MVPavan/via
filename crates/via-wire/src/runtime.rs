@@ -129,6 +129,12 @@ impl WireRuntime {
         self.host.holdings_changed()
     }
 
+    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
+    /// design §11.3 `process.alive`).
+    pub fn live_armed(&self, anchors: &[String]) -> bool {
+        self.host.live_armed(anchors)
+    }
+
     /// Groups whose cleanup a live control or acquisition still owns
     /// (design §6.4).
     pub fn pending_cleanup(&self) -> usize {

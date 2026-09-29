@@ -2,10 +2,12 @@
 //! they never split bytes into messages, own processes, or decide admission.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use via_routes::{
     Deadline, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError, RouteFailure, StopCause, StopOrder,
-    StopWatch, StoreFailure, ToolStatus, TurnNumber,
+    StopWatch, StoreFailure, TurnNumber,
 };
 
 /// Correlates a start reply with its acceptance observation within one turn.
@@ -174,43 +176,59 @@ pub struct FakeAcceptanceObservation {
     pub vendor_turn_id: VendorTurnId,
 }
 
-/// One normalized C2 observation Core commits as a C1 §6.1 event.
+/// One normalized C2 data observation (C2 A1 after Task 4 design §2.3).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Observation {
-    /// Incremental assistant text, at most one C2 payload bound per piece.
-    AssistantText {
-        /// Text in decode order.
-        text: String,
-    },
-    /// A tool started inside the turn.
-    ToolStarted {
-        /// Vendor tool identifier.
-        tool_id: String,
-        /// Tool name.
-        name: String,
-        /// Bounded input summary.
-        input_summary: String,
-    },
-    /// A tool ended inside the turn.
-    ToolEnded {
-        /// Vendor tool identifier.
-        tool_id: String,
-        /// Vendor completion status.
-        status: ToolStatus,
-        /// Bounded output summary.
-        output_summary: String,
-        /// Exit code when present.
-        exit_code: Option<i32>,
-    },
-    /// Unknown vendor notification with its bounded payload prefix.
-    VendorOther {
-        /// Original vendor type tag.
-        vendor_type: String,
-        /// Encoded message prefix of at most 16 KiB.
-        payload: String,
-        /// Explicit marker that the prefix omitted bytes.
-        truncated: bool,
-    },
+    /// The marks of one vendor message; Core folds them into the step
+    /// tracker (design §2.4). Sent only when the message carries a mark.
+    Progress(ProgressMarks),
+}
+
+/// A vendor message's progress marks (design §2.4, §2.5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressMarks {
+    /// When the message arrived.
+    pub at: tokio::time::Instant,
+    /// Model output: text, reasoning or a tool request. Applies before
+    /// the message's tool starts.
+    pub model: bool,
+    /// Tools started, as `(id, name)`.
+    pub tools_started: Vec<(String, String)>,
+    /// Ids of tools ended.
+    pub tools_ended: Vec<String>,
+    /// An interval usage sample `(key?, total)`.
+    pub usage: Option<(Option<String>, u64)>,
+}
+
+/// The turn's activity clock (design §2.4): the arrival of the last vendor
+/// message attributed to the turn, unknown types included, as milliseconds
+/// since the clock's base instant. The Adapter stores; Core reads.
+#[derive(Clone, Debug)]
+pub struct TurnActivity {
+    base: tokio::time::Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl TurnActivity {
+    /// A clock whose base, and first reading, is `base`.
+    pub fn new(base: tokio::time::Instant) -> Self {
+        Self {
+            base,
+            last_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Records a message arrival at `at`.
+    pub fn record(&self, at: tokio::time::Instant) {
+        let millis =
+            u64::try_from(at.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    /// Milliseconds from the base to the last recorded arrival.
+    pub fn last_ms(&self) -> u64 {
+        self.last_ms.load(Ordering::Relaxed)
+    }
 }
 
 /// Adapter output to Core, in the order the driver decoded it (C2 §4).

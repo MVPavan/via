@@ -1,12 +1,13 @@
 //! SQLite migration and single-writer transaction implementation.
 
 use super::{
-    AcceptanceRecord, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
+    AcceptanceRecord, ActiveTurn, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
     CommitOutcome, Connection, Duration, EventRecord, EvidenceRefs, EvidenceRoot,
     FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity, KeyedOperation, MetadataExt,
-    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, Prompt, QueuedTurn,
-    ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId, SessionSnapshot,
-    SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, Prompt, QueuedSummary,
+    QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT, STATUS_ANCHORS,
+    STATUS_QUEUE, STATUS_TURNS, SessionId, SessionSnapshot, SessionStatus, SpawnKey, SpawnRecord,
+    StatusQuery, StepRow, StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
     SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
     TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
@@ -282,6 +283,13 @@ pub(super) fn writer_loop(
             drop(command);
             continue;
         }
+        // Test builds: each read is counted (`Store::read_count`) and
+        // `store.read.delay_ms` may delay it (design §13.1).
+        #[cfg(feature = "test-failpoints")]
+        if command.is_read() {
+            lanes.count_read();
+            let _ = crate::failpoint::hit("store.read.delay_ms");
+        }
         // Reads are served first; anything else is a mutation.
         let Some(command) = serve_read(&conn, command, corruption) else {
             continue;
@@ -324,6 +332,7 @@ impl Command {
                 | Self::Terminated(..)
                 | Self::Events(..)
                 | Self::EvidenceRefs(..)
+                | Self::Status(..)
                 | Self::Authenticate(..)
                 | Self::Unfinished(..)
                 | Self::AnchorOwners(..)
@@ -353,6 +362,7 @@ impl Command {
             Self::Terminated(..) => "store.read.corrupt.terminated",
             Self::Events(..) => "store.read.corrupt.events",
             Self::EvidenceRefs(..) => "store.read.corrupt.logs",
+            Self::Status(..) => "store.read.corrupt.status",
             Self::Authenticate(..) => "store.read.corrupt.authenticate",
             Self::Unfinished(..) => "store.read.corrupt.unfinished",
             Self::AnchorOwners(..) => "store.read.corrupt.anchor_owners",
@@ -365,6 +375,7 @@ impl Command {
             | Self::Submission(..)
             | Self::Acceptance(..)
             | Self::Event(..)
+            | Self::Steps(..)
             | Self::Terminal(..)
             | Self::Closing(..)
             | Self::Closed(..)
@@ -461,6 +472,7 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         Command::EvidenceRefs(session, turn, reply) => {
             reply!(reply, read_evidence_refs(conn, &session, turn));
         }
+        Command::Status(query, reply) => reply!(reply, read_session_status(conn, &query)),
         Command::Authenticate(session, hash, reply) => {
             reply!(reply, authenticate(conn, &session, &hash));
         }
@@ -490,6 +502,7 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::Submission(..)
         | Command::Acceptance(..)
         | Command::Event(..)
+        | Command::Steps(..)
         | Command::Terminal(..)
         | Command::ClosingTerminal(..)
         | Command::SessionClosed(..)
@@ -575,6 +588,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::Submission(record, reply) => reply!(reply, commit_submission(conn, &record)),
         Command::Acceptance(record, reply) => reply!(reply, commit_acceptance(conn, &record)),
         Command::Event(record, reply) => reply!(reply, commit_event(conn, &record)),
+        Command::Steps(record, reply) => reply!(reply, commit_steps(conn, &record)),
         Command::Terminal(record, extras, reply) => {
             reply!(
                 reply,
@@ -628,6 +642,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::Terminated(..)
         | Command::Events(..)
         | Command::EvidenceRefs(..)
+        | Command::Status(..)
         | Command::Authenticate(..)
         | Command::Unfinished(..)
         | Command::AnchorOwners(..)
@@ -1304,6 +1319,51 @@ fn commit_event(conn: &mut Connection, record: &EventRecord) -> Result<(), Store
     commit(tx)
 }
 
+/// Commits completed step rows of a turn that is still running (design
+/// §3.2); a terminal turn takes none.
+fn commit_steps(conn: &mut Connection, record: &StepsRecord) -> Result<(), StoreError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error)?;
+    if turn_state(&tx, &record.session_id, record.turn)?.as_deref() != Some("running") {
+        return Err(StoreError::Constraint("turn is not running"));
+    }
+    insert_steps(&tx, &record.session_id, record.turn, &record.rows)?;
+    commit(tx)
+}
+
+/// Inserts step rows of `turn` (design §3.1).
+fn insert_steps(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionId,
+    turn: TurnNumber,
+    rows: &[StepRow],
+) -> Result<(), StoreError> {
+    let mut insert = tx
+        .prepare_cached(
+            "INSERT INTO steps(session_id,turn,step,started_ms,ended_ms,tokens) VALUES (?1,?2,?3,?4,?5,?6)",
+        )
+        .map_err(sql_error)?;
+    for row in rows {
+        let tokens = row
+            .tokens
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::Constraint("step tokens too large"))?;
+        insert
+            .execute(params![
+                session.as_str(),
+                turn.get(),
+                row.step,
+                row.started_ms,
+                row.ended_ms,
+                tokens
+            ])
+            .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
 /// Commits `session.closed` alone once every turn of the session has a
 /// terminal, and marks the session closed. A session already closed or
 /// holding a queued or running turn commits nothing and reports the close as
@@ -1415,6 +1475,7 @@ fn insert_terminal(
         return Err(StoreError::Constraint("turn is not running"));
     }
     insert_event(tx, &record.session_id, &record.event)?;
+    insert_steps(tx, &record.session_id, record.turn, &record.steps)?;
     // `session.closed` only when no other turn of the session is queued or
     // running (this turn is already terminal); otherwise the terminal commits
     // alone and the close is reported as not written.
@@ -1932,6 +1993,220 @@ fn read_evidence_refs(
         vendor_session_id,
         transcript_hint,
     }))
+}
+
+/// `status`'s one read (design §4.2, §6.7, §11.3): the session's durable
+/// members, the selected turn (the param, else the running turn, else the
+/// latest) and a primary-key range page of its step rows. The writer
+/// serves it alone, so its statements see one state.
+fn read_session_status(
+    conn: &Connection,
+    query: &StatusQuery,
+) -> Result<Option<SessionStatus>, StoreError> {
+    /// Session columns, `model`, `cwd` and `route`.
+    type Session = (
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let session = query.session.as_str();
+    let row: Option<Session> = conn
+        .query_row(
+            "SELECT state,admission,harness,label,created_ms,updated_ms,
+                json_extract(params,'$.model'),json_extract(params,'$.cwd'),
+                json_extract(receipt,'$.route'),vendor_session_id
+             FROM sessions WHERE id=?1",
+            [session],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((state, admission, harness, label, created_ms, updated_ms, model, cwd, route, vendor)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let unproven_anchors = read_unproven_anchors(conn, session)?;
+    let active = read_active_turn(conn, session)?;
+    let selected: Option<(u32, String)> = conn
+        .query_row(
+            "SELECT number,state FROM turns WHERE session_id=?1 AND number=coalesce(?2,
+                (SELECT number FROM turns WHERE session_id=?1 AND state='running'),
+                (SELECT max(number) FROM turns WHERE session_id=?1))",
+            params![session, query.turn.map(TurnNumber::get)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let queue = read_status_queue(conn, session)?;
+    let turns = read_status_turns(conn, session)?;
+    let (steps, more) = match &selected {
+        Some((number, _)) => read_step_page(conn, session, *number, query)?,
+        None => (Vec::new(), false),
+    };
+    Ok(Some(SessionStatus {
+        state,
+        admission,
+        harness,
+        label,
+        created_ms,
+        updated_ms,
+        model,
+        cwd,
+        route,
+        vendor_session_id: vendor,
+        cleanup_uncertain: !unproven_anchors.is_empty(),
+        unproven_anchors,
+        selected,
+        active,
+        queue,
+        turns,
+        steps,
+        more,
+    }))
+}
+
+/// The newest [`STATUS_ANCHORS`] anchors of the session with no absence
+/// proof (§11.3 `process`).
+fn read_unproven_anchors(conn: &Connection, session: &str) -> Result<Vec<String>, StoreError> {
+    conn.prepare_cached(
+        "SELECT anchor_id FROM anchors WHERE owner_session=?1 AND absence_time IS NULL
+             ORDER BY rowid DESC LIMIT ?2",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![session, STATUS_ANCHORS], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()
+    })
+    .map_err(sql_error)
+}
+
+/// The session's first [`STATUS_QUEUE`] queued turns (§11.3 `queue`).
+fn read_status_queue(conn: &Connection, session: &str) -> Result<Vec<QueuedSummary>, StoreError> {
+    conn
+        .prepare_cached(
+            "SELECT t.number,o.op_key,t.queued_at,t.effective FROM turns t
+             LEFT JOIN operations o ON o.session_id=t.session_id AND o.turn=t.number AND o.verb='resume'
+             WHERE t.session_id=?1 AND t.state='queued' ORDER BY t.number LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![session, STATUS_QUEUE], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, String>(3)?))
+                })?
+                .collect::<Result<Vec<(u32, Option<String>, Option<String>, String)>, _>>()
+        })
+        .map_err(sql_error)?
+        .into_iter()
+        .map(|(turn, op_key, queued_at, effective)| {
+            Ok(QueuedSummary {
+                turn,
+                op_key,
+                queued_at,
+                effective: serde_json::from_str(&effective)
+                    .map_err(|_| StoreError::CorruptEvidence)?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()
+}
+
+/// The session's newest [`STATUS_TURNS`] turns and their states (§11.3).
+fn read_status_turns(conn: &Connection, session: &str) -> Result<Vec<(u32, String)>, StoreError> {
+    conn.prepare_cached(
+        "SELECT number,state FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT ?2",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![session, STATUS_TURNS], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<(u32, String)>, _>>()
+    })
+    .map_err(sql_error)
+}
+
+/// The session's running turn as `status` reports it (§11.3).
+fn read_active_turn(conn: &Connection, session: &str) -> Result<Option<ActiveTurn>, StoreError> {
+    conn.query_row(
+        "SELECT t.number,t.accepted_at IS NOT NULL,t.submitted_at,
+            (SELECT max(seq) FROM events WHERE session_id=t.session_id AND turn=t.number),
+            (SELECT json_extract(event,'$.at') FROM events
+                WHERE session_id=t.session_id AND turn=t.number AND type='cancel.requested'
+                ORDER BY seq LIMIT 1)
+         FROM turns t WHERE t.session_id=?1 AND t.state='running'",
+        [session],
+        |row| {
+            Ok(ActiveTurn {
+                turn: row.get(0)?,
+                accepted: row.get(1)?,
+                submitted_at: row.get(2)?,
+                last_event_seq: row
+                    .get::<_, Option<i64>>(3)?
+                    .and_then(|seq| u64::try_from(seq).ok())
+                    .unwrap_or(0),
+                cancel_requested_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+/// A primary-key range page of a turn's step rows after `after_step`, and
+/// whether more follow (design §3.4).
+fn read_step_page(
+    conn: &Connection,
+    session: &str,
+    turn: u32,
+    query: &StatusQuery,
+) -> Result<(Vec<StepRow>, bool), StoreError> {
+    let mut rows = conn
+        .prepare_cached(
+            "SELECT step,started_ms,ended_ms,tokens FROM steps
+             WHERE session_id=?1 AND turn=?2 AND step>?3 ORDER BY step LIMIT ?4",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![session, turn, query.after_step, query.limit + 1],
+                    |row| {
+                        Ok(StepRow {
+                            step: row.get(0)?,
+                            started_ms: row.get(1)?,
+                            ended_ms: row.get(2)?,
+                            tokens: row
+                                .get::<_, Option<i64>>(3)?
+                                .and_then(|tokens| u64::try_from(tokens).ok()),
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(sql_error)?;
+    let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    Ok((rows, more))
 }
 
 fn authenticate(
