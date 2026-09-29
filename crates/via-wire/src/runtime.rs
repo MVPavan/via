@@ -779,6 +779,10 @@ mod undecoded_tests {
     /// before the failure note names the file. A folder that can be written
     /// but not opened for its sync makes the save fail.
     #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skipped check under root is reported"
+    )]
     fn a_saved_undecoded_file_is_synced_with_its_folder() -> std::io::Result<()> {
         let folder = scratch("synced")?;
         let saved = folder.0.join("undecoded.bin");
@@ -788,9 +792,15 @@ mod undecoded_tests {
         // Write and search only: the file can be created, the folder not
         // opened to sync it.
         std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o300))?;
+        // Root (CAP_DAC_OVERRIDE) opens the folder anyway: the premise fails.
+        let bypassed = std::fs::File::open(&folder.0).is_ok();
         let unsynced = write_new(&saved, b"head");
         std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o700))?;
-        assert!(unsynced.is_err(), "an unsynced folder was reported saved");
+        if bypassed {
+            eprintln!("skipped: this process bypasses file permissions (root)");
+        } else {
+            assert!(unsynced.is_err(), "an unsynced folder was reported saved");
+        }
         Ok(())
     }
 }

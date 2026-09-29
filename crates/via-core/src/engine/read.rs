@@ -150,9 +150,12 @@ impl Engine {
         let folder = refs
             .evidence_dir
             .map(|dir| self.store.evidence().absolute(&dir));
+        // A failed `lstat` is a failed evidence read: `store_error`, as for
+        // the Store read above.
         let files = match folder.clone() {
             Some(folder) => tokio::task::spawn_blocking(move || evidence_files(&folder))
                 .await
+                .map_err(|_| ApiError::STORE)?
                 .map_err(|_| ApiError::STORE)?,
             None => Vec::new(),
         };
@@ -168,15 +171,54 @@ impl Engine {
 }
 
 /// The fixed evidence files present in `folder`, as `{name, bytes}`: one
-/// `lstat` each, and only regular files count (design §4.4, §7.1).
-fn evidence_files(folder: &std::path::Path) -> Vec<Value> {
-    via_store::EVIDENCE_FILES
-        .iter()
-        .filter_map(|name| {
-            let metadata = std::fs::symlink_metadata(folder.join(name)).ok()?;
-            metadata
-                .is_file()
-                .then(|| json!({"name": name, "bytes": metadata.len()}))
-        })
-        .collect()
+/// `lstat` each, and only regular files count (design §4.4, §7.1). A
+/// missing name is absent; any other `lstat` error fails the read, so an
+/// existing file never drops out of the list (C1 §3.12).
+fn evidence_files(folder: &std::path::Path) -> std::io::Result<Vec<Value>> {
+    let mut files = Vec::new();
+    for name in via_store::EVIDENCE_FILES {
+        let metadata = match std::fs::symlink_metadata(folder.join(name)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.is_file() {
+            files.push(json!({"name": name, "bytes": metadata.len()}));
+        }
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::evidence_files;
+
+    /// C1 §3.12: `files` lists the files that exist. A missing file is
+    /// absent; a file that cannot be stated fails the read, never drops out.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skipped check under root is reported"
+    )]
+    fn evidence_files_skips_only_missing_files() -> std::io::Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let folder = root.path().join("1");
+        std::fs::create_dir(&folder)?;
+        std::fs::write(folder.join("stderr.log"), b"abc")?;
+        let listed = evidence_files(&folder)?;
+        assert_eq!(listed, [serde_json::json!({"name":"stderr.log","bytes":3})]);
+        // No search permission: each `lstat` fails with EACCES.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o600))?;
+        let bypassed = std::fs::symlink_metadata(folder.join("stderr.log")).is_ok();
+        let unstated = evidence_files(&folder);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))?;
+        if bypassed {
+            eprintln!("skipped: this process bypasses file permissions (root)");
+        } else {
+            assert!(unstated.is_err(), "an unstated file was listed as absent");
+        }
+        Ok(())
+    }
 }
