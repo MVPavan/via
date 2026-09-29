@@ -10,7 +10,8 @@ pub use via_store::{AnchorCohort, ConnectionId, Deadline, RawRef, RuntimeResourc
 /// The maximum complete stdout message, including its trailing LF.
 pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
 
-/// A complete, newline-terminated vendor message with bounded bytes.
+/// The bytes of one complete, newline-terminated vendor message, bounded but
+/// not yet decoded; Route may still reject them as malformed.
 #[derive(Eq, PartialEq)]
 pub struct BoundedBytes(Vec<u8>);
 
@@ -32,7 +33,7 @@ impl BoundedBytes {
     }
 }
 
-/// A complete vendor message and its byte-accurate raw evidence reference.
+/// A complete, undecoded vendor message and its byte-accurate raw evidence reference.
 /// The checked constructor is the only cross-crate construction path.
 ///
 /// ```compile_fail

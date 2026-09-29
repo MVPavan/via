@@ -144,7 +144,7 @@ that exact loopback origin. Disable HTTP redirects and proxies for this local
 client, including inherited proxy environment handling. Never put passwords
 in URLs, Store, manifests, traces, HTTP raw captures or command argv. Redact
 Authorization before HTTP metadata enters a raw log; retain vendor body bytes
-and message-splitting evidence. VIA creates the password only in daemon memory and the
+and HTTP message-boundary evidence (content length, chunk and SSE delimiters). VIA creates the password only in daemon memory and the
 owned server launch environment. That is a VIA handling rule, **not a claim
 that the vendor keeps it from descendants**; the source-backed exposure below
 precludes that assertion under the temporary exception. Restart cannot recover
