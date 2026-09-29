@@ -1,15 +1,16 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 8)
+# Task 4 design: events, progress, storage and C1 conformance (round 9)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 8.
-It replaces rounds 1–4. Rounds 6–8 apply the orchestrator's decisions on
-Sol's round-5 to round-7 reviews (`design-r5-decisions.md`,
-`design-r6-decisions.md`, `design-r7-decisions.md`), tagged `[t4r5.N]`,
-`[t4r6.N]`, `[t4r7.N]`. The owner-approved [requirements](requirements.md)
-(R1–R7 and the "Bounding strategy") are normative and override earlier
-design assumptions and spec text; every such conflict is an amendment in
-§11. Round 8 replaces exact memory and disk accounting with the owner's
-coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4).
-Round history and decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§12.
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 9.
+It replaces rounds 1–4. Rounds 6–9 apply the orchestrator's decisions on
+Sol's round-5 to round-8 reviews (`design-r5-decisions.md` to
+`design-r8-decisions.md`), tagged `[t4r5.N]` to `[t4r8.N]`. The
+owner-approved [requirements](requirements.md) (R1–R7, the "Bounding
+strategy" and "Thresholds are configuration") are normative and override
+earlier design assumptions and spec text; every such conflict is an
+amendment in §11. Round 8 replaces exact memory and disk accounting with the owner's
+coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4);
+round 9 makes every threshold daemon config (§5.2). Round history and
+decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§13.
 This step writes no code and no tests; slices are re-planned after the
 owner's review (`s1.md`–`s7.md` are superseded).
 
@@ -66,7 +67,8 @@ Out of scope, each with its revisit condition:
 
 | State | Owner | Created by | Written by | Ended by | Bound |
 |---|---|---|---|---|---|
-| Global memory pool (`MemoryBudget`, one 128 MiB semaphore; per-class flat charges) [t4r7.1] | via-store | `Store::open` | each class's owner (§5) | last `Arc` after Store threads join | 128 MiB |
+| Daemon config (`DaemonConfig`) [t4r8.1] | daemon start | read once before `Store::open` | never | daemon end | §5.2 |
+| Global memory pool (`MemoryBudget`, one semaphore; per-class flat charges) [t4r7.1] | via-store | `Store::open` | each class's owner (§5) | last `Arc` after Store threads join | `memory.pool` |
 | Store request lanes (Latch, Lifecycle, Internal, Public) | `Store`; served by the SQLite thread | `Store::open` | `StoreClient` handles by lane tag | fence, or writer death | §6.1 |
 | Raw inbox, raw worker, blob files | Store raw worker | `Store::open` | `RawWriter`, `BlobWriter`, `BlobReader` | fence, then join; death guard | §6.4, §6.6 |
 | `ConnectionLatch` | via-wire, per connection | `open_connection` | readers, stdin writer, raw worker via `RawFaultSink` | last holder after `finish` | §7.4 |
@@ -75,14 +77,15 @@ Out of scope, each with its revisit condition:
 | Route → Adapter hop | Adapter `execute` | per drive | Route | end of `execute` | 1 message |
 | Observation channel and its byte semaphore | Core drive | per drive | Adapter | end of the drive | 1024 items, 4 MiB |
 | Stall timer | Adapter pending delivery | first blocked send | Adapter | acceptance of that item, or 10 s | one per drive |
-| Drive charge | Core drive | dispatch, before submission | — | end of the drive | 24 MiB (§5) |
+| Connection charge [t4r8.5] | `WireMessages`, then its adopted set | before the connection opens | — | `finish` returned and every adopted task joined | `memory.connection` (§5.1) |
+| Drive charge | Core drive | dispatch, before submission | — | end of the drive | `memory.drive` (§5.1) |
 | Envelope accumulation and meter [t4r6.4] | Core drive (`TurnRecord`) | submission | the drive, per accumulated item | the terminal commit | `ENVELOPE_MAX` (§6.5) |
 | Turn activity clock (`TurnActivity`, one `AtomicU64`) [t4r5.11] | Core drive; a clone in the `Running` entry | submission | the Adapter, for each vendor message attributed to the turn | end of the drive | 8 B |
 | Step tracker | Core drive (`TurnRecord`) | submission | the drive | the terminal commit | §2.4 |
 | Published progress | `Slot` `Running` entry (`crates/via-core/src/engine/queue.rs:274` [V]) | `Running` creation (`:488` [V]) | the session's drive only | `finish_running` (`:593` [V]) | §2.4 |
 | Open-session tally, closing set | `Engine` (`Sessions`) | `Engine::open`, seeded from Store | receipt and closed-now answers | never | §10.2 |
 | Live `Armed` controls | Host ledger (`crates/via-host/src/host.rs:72` [V]) | control verification | `Capacity::armed` | control drop | one per anchor |
-| Disk budgets (SQLite `max_page_count`; the raw worker's byte counter) [t4r7.2] | Store | `Store::open`, from the files on disk | SQLite; the raw worker, per append | never | 1 GiB SQLite, 3 GiB raw and blobs (§6.9) |
+| Disk budgets (SQLite `max_page_count`; the raw worker's byte counter) [t4r7.2] | Store | `Store::open`, from the files on disk | SQLite; the raw worker, per write | never | `disk.*`, `wal.*` (§6.9) |
 
 **Lock order.** T3 §1 stands (`admission` → `sessions` → slot state; `Head`
 as T3 orders it; `stop` alone; no std mutex across an `.await`). An async
@@ -140,7 +143,9 @@ outputs are never copied (R2). Rules, enforced in Route's decode:
    protocol failure citing its raw ref (C2 §1 rule 6).
 2. **Payloads at most 256 KiB** (C2 A1). A durable payload over it is a
    protocol failure with raw evidence. Final text is split at character
-   boundaries into `final_text` pieces of at most 256 KiB (§2.3) [t4r7.6].
+   boundaries into `final_text` pieces sized so that the whole encoded
+   observation (key, fields and escaped text) is at most 256 KiB (§2.3)
+   [t4r7.6, t4r8.6].
 3. **Structure limits first.** `json_limits::scan` (§9.2) enforces depth 64
    and 65,536 nodes before the typed decode; an excess is a protocol failure.
 4. **No peer `Value`** (§9.2), and no `#[serde(flatten)]`,
@@ -169,7 +174,7 @@ Core's drive creates the channel per drive (today `mpsc::channel(64)`,
 | `turn.accepted`, `session.vendor_identity_confirmed`, `resume.mismatch`, `session.vendor_closed`, `tool.quiescent`, `turn.vendor_terminal` | as C2 §4 today |
 | `action.denied`, `vendor.request_declined`, `steer.delivered`, `warning` | commit the event (existing `commit_event`, `drive.rs:1461` [V]) |
 | **`progress { at, model, tools_started, tools_ended, usage }`** (new) | fold into the step tracker (§2.4); no Store write, except a step row at a step boundary (§3) |
-| **`final_text { key, text, replace }`** (new) [t4r6.4, t4r7.6] | append to, or replace, that key's final text in the envelope, metered (§6.5). All final text arrives this way, a terminal message's included, before `turn.vendor_terminal`, which carries none. A piece is at most 256 KiB; a longer text is several pieces, the first carrying `replace` |
+| **`final_text { key, text, replace }`** (new) [t4r6.4, t4r7.6] | append to, or replace, that key's final text in the envelope, metered (§6.5). All final text arrives this way, a terminal message's included, before `turn.vendor_terminal`, which carries none. The Adapter cuts a piece at the last character whose escaped encoding keeps the whole observation within 256 KiB (a counting writer over key, fields and text) [t4r8.6]; a longer text is several pieces, the first carrying `replace` |
 
 One vendor message yields at most one `progress` item, only when it carries
 a mark (model output, a tool start or end, or a usage sample), plus its other
@@ -437,10 +442,19 @@ lossy UTF-8 that VIA does not parse (R5).
 - **Private connections only.** Task 4 serves connections that belong to one
   session: per turn (the fake, Claude) or per session (one server per
   session). A per-turn connection belongs wholly to its turn. On a
-  per-session connection a turn's span is `[raw_start, raw_end)`: the
-  connection's durable end when `turn.submitted` commits, and when the
-  terminal commits, each written in that transaction. Units outside every
-  span are session-level. Nothing is written per vendor message.
+  per-session connection a turn's span is `[raw_start, raw_end)`, and units
+  outside every span are session-level; nothing is written per vendor
+  message.
+- **Raw boundary** [t4r8.8]. Before building `turn.submitted`, the drive
+  awaits `WireMessages::boundary()`: a `Barrier` queued to the raw worker
+  behind every unit already staged on the connection, answered with the
+  connection's end offset once all of them are durable. That offset is
+  `raw_start`, written in the submission transaction, and nothing is sent to
+  stdin before it. Rule for units being read: attribution follows staging
+  order, so bytes read before the boundary but staged after it (the rest of
+  a partial stdout message, a stderr chunk in flight) fall inside the turn;
+  every unit staged before it falls outside, whether durable or not.
+  `raw_end` is taken the same way before the terminal is built.
 - **Shared servers: the D4 constraint.** The per-session split of a shared
   Codex or OpenCode server's raw data belongs to those adapter tasks; fixed
   constraint (D4): `logs` never returns bytes to a session other than the
@@ -452,11 +466,15 @@ lossy UTF-8 that VIA does not parse (R5).
   sealed before the next turn starts, a server generation before the next),
   so only the last can be unsealed.
 - **Cursor**, one per connection: the sentinel `r1.start` (an omitted
-  cursor; the walk starts at offset 0 of the first connection in scope) or
-  `r1.<connection_id>.<offset>`, the next byte to return, parsed strictly. A
-  connection outside the scope, or an offset beyond its durable range, is
-  `invalid_params`. With nothing new durable, `next_cursor` is the
-  request's cursor [t4r5.12].
+  cursor) or `r1.<connection_id>.<offset>`, the next byte to return, parsed
+  strictly. The sentinel resolves to the first offset of the scope: a turn
+  on a per-session connection starts at `raw_start`, anything else at
+  offset 0 of the first connection [t4r8.7]. A supplied cursor is valid
+  only on a connection in scope and inside its span: at least `raw_start`
+  (for a turn) and at most the span's end (`raw_end`, or the durable end
+  while open); anything else is `invalid_params`. Paging for a turn stops
+  at `raw_end`. With nothing new durable, `next_cursor` is the request's
+  cursor [t4r5.12].
 - **Paging.** The SQLite thread binary-searches the index for the unit
   holding the offset (§6.4), walks consecutive units in scope (to the next
   connection at a sealed end), reads each whole unit (at most 1 MiB,
@@ -491,53 +509,89 @@ lossy UTF-8 that VIA does not parse (R5).
   scripted sequence over the socket and over the proxy gives the same
   replies, the oversize case included.
 
-## 5. Memory and disk bounds (R7) [t4r7.1]
+## 5. Memory and disk bounds (R7) [t4r7.1, t4r8.1]
 
-The owner's bounding strategy (requirements, "Bounding strategy") replaces
-exact accounting: one 128 MiB memory pool, a conservative flat charge per
-class of retained buffer taken before its owner allocates, and a named
-overload when a charge cannot be granted. No maximal combination is claimed
-to fit. Disk bounds are §6.9.
+The owner's bounding strategy replaces exact accounting: one memory pool, a
+conservative flat charge per class of retained buffer taken before its owner
+allocates, and a named overload when a charge cannot be granted. No maximal
+combination is claimed to fit. Every threshold is a daemon config key with a
+provisional default (§5.2); `via-d9o.2.3` tunes them. Disk bounds are §6.9.
 
 ### 5.1 One pool, flat charges per class
 
 `MemoryBudget` (via-store, the lowest crate, `scripts/check-layers.py:20`
-[V]) is one `tokio::sync::Semaphore` of 128 MiB created by `Store::open`,
-with no partitions. An owner acquires its class's charge before allocating
-and releases it on drop. Every amount is an assumption **[I]**, confirmed by
-the named check.
+[V]) is one `tokio::sync::Semaphore` of `memory.pool` created by
+`Store::open`, with no partitions. An owner acquires its class's charge
+before allocating and releases it on drop. Every amount is an assumption
+**[I]**, confirmed by the named check.
 
-| Class | Flat charge, held | Cannot be charged | Covers; confirmed by |
+| Class (key) | Default, held | Cannot be charged | Covers; confirmed by |
 |---|---|---|---|
-| Store request lanes | 8 MiB, from `Store::open` | open fails | the lane allowances (§6.1); lane high-water test |
-| SQLite page cache | 8 MiB, from `Store::open` (runtime §8) | open fails | `cache_size=-8192` on the one long-lived connection, the writer (`crates/via-store/src/runtime/sql.rs:140`, `runtime.rs:1013` [V]); approximate, so the RSS gate confirms it |
-| Drive: one running turn and its private connection | 24 MiB, from dispatch (before the submission commit) to the drive's end | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), 4 MiB of observations (C2 A1), the Wire queue's staged units, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, decoded messages in flight, the envelope accumulation (at most 1 MiB) and its encoding, the step tracker and carried rows; F24's per-turn figures |
-| C1 request | `4 × len + min(8 × len, 2 MiB) + 64 KiB` for a line of `len` bytes, taken as the line is read; line bytes also count against runtime §8's 32 MiB C1 input cap | waits until the 5 s partial-line deadline, then discards the line and replies `admission_refused` (`MEMORY_BUDGET`, `id: null`) | the segments, the assembled line, serde's doubling scratch and the decoded strings, list headers within 65,536 nodes, decode state; a counting-allocator test on a 16 MiB escaped prompt and a 65,536-node list |
-| Reply or Store page | `PAGE_MAX + 4 KiB`; 2 MiB for `logs` (a unit read plus the page); 64 KiB for small replies; replies together at most runtime §8's 32 MiB | `admission_refused` (`MEMORY_BUDGET`) | held at most `REPLY_WRITE` (A32); capacity checked in the test binary |
-| Blob chunk | 64 KiB, one in flight per handle | waits under the chunk's 2 s bound | exact |
-| Dispatched blob prompt | its length, until the streamed start is written (§7.3) | the dispatcher waits; the turn stays queued | the loaded `String` |
+| Store request lanes (`memory.latch_lane`, `memory.lifecycle_lane`, `memory.ordinary_lanes`) | 2 + 2 + 4 MiB, from `Store::open` | open fails | the lane allowances (§6.1); lane high-water test |
+| SQLite page cache (`memory.sqlite_cache`) | 8 MiB, from `Store::open` | open fails | `cache_size` on the one long-lived connection, the writer (`crates/via-store/src/runtime/sql.rs:140`, `runtime.rs:1013` [V]); approximate, so the RSS gate confirms it |
+| Connection (`memory.connection`) [t4r8.5] | 16 MiB, from before the connection opens until `finish` has returned and every task it adopted has been joined (§7.6); a per-session connection holds it for its whole life, across turns | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), the 64-message / 4 MiB Wire queue, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, payloads queued for raw; F24's per-connection figures |
+| Drive (`memory.drive`) | 8 MiB, from dispatch (before the submission commit) to the drive's end | the dispatcher waits; the turn stays queued | 4 MiB of observations (C2 A1), decoded messages in flight, the envelope accumulation (at most 1 MiB) and its encoding, the step tracker and carried rows |
+| C1 request (`memory.request_multiplier`, `memory.request_nodes`) | `request_multiplier × len + min(8 × len, request_nodes) + 64 KiB` for a line of `len` bytes (defaults 4 and 2 MiB), taken as the line is read; line bytes also count against runtime §8's 32 MiB C1 input cap | waits until the 5 s partial-line deadline, then discards the line and replies `admission_refused` (`MEMORY_BUDGET`, `id: null`) | the segments, the line, serde's scratch and the decoded strings, list headers within 65,536 nodes; a counting-allocator test on a 16 MiB escaped prompt and a 65,536-node list |
+| Reply or Store page (`memory.reply_small`) | 64 KiB for a small reply; `PAGE_MAX + 4 KiB` for a page and 2 MiB for `logs`, derived from fixed C1 limits; replies together at most runtime §8's 32 MiB | `admission_refused` (`MEMORY_BUDGET`) | held at most `REPLY_WRITE` (A32); capacity checked in the test binary |
+| Blob chunk; dispatched blob prompt | 64 KiB, one in flight per handle; the prompt's length until its start is written (§7.3) | waits under the chunk's 2 s bound; the turn stays queued | exact |
 
-With four turns running (`CONNECTION_SLOTS` = 4,
-`crates/via-core/src/engine/queue.rs:33` [V]), 112 MiB is held and 16 MiB
-remains for C1 requests and replies, so `status`, `cancel` and other small
-requests are still served. A maximal 16 MiB request is charged about 66 MiB:
-it is admitted while at most one turn runs, else refused by name. Waits are
-acyclic: a dispatcher waits only for the pool; C1 handlers, replies and blob
-chunks never wait for a drive.
+With four connections and four drives (`CONNECTION_SLOTS` = 4,
+`crates/via-core/src/engine/queue.rs:33` [V]), 112 MiB of the default
+128 MiB is held and 16 MiB remains for C1 requests and replies, so
+`status`, `cancel` and other small requests are still served. A maximal
+16 MiB request is charged about 66 MiB: it is admitted while at most one
+turn runs, else refused by name. Waits are acyclic: a dispatcher waits only
+for the pool; C1 handlers, replies and blob chunks never wait for a drive.
 
 Not charged, measured by the RSS gate: allocator overhead, SQLite's other
 allocations, task stacks, fixed-size structs. **Verification:** F24's RSS
-gate, `MemoryBudget::high_water()` at most 128 MiB, the counting-allocator
-test (§12.2) and `via-d9o.2.3`. A class whose measured peak exceeds its
-charge gets a larger charge; nothing else depends on the amounts.
+gate, `MemoryBudget::high_water()` at most `memory.pool`, the
+counting-allocator test (§12.2) and `via-d9o.2.3`. A class whose measured
+peak exceeds its charge gets a larger default.
 
-### 5.2 R7's bounds
+### 5.2 Daemon config [t4r8.1]
 
-Vendor message 1 MiB and the Wire queue 64 messages / 4 MiB (§7.2); raw
-staging 8 MiB per connection (§7.2, A1); observations 1024 / 4 MiB (§2.3);
-envelope 1 MiB, then the bounded summary (§6.5); snapshot 70 KiB (§2.4);
-step rows under the SQLite budget (§3.2); replies (§4, A32); memory (§5.1);
-SQLite, raw and blob files (§6.9).
+- **File.** `daemon.json` in the state directory (`VIA_STATE_DIR`, default
+  `~/.via/state`, `crates/via-cli/src/client.rs:30-37` [V]). JSON, so
+  serde_json parses it and no dependency is added. The file is optional:
+  absent means every default. It is validated like the Store directory
+  (regular file, the daemon's uid, not a symlink, not group- or
+  world-writable) and is at most 64 KiB.
+- **Read once.** The daemon reads it at start, before `Store::open` and
+  before binding the socket; a changed value takes effect at the next daemon
+  start.
+- **Shape.** One object `{memory, disk, wal}` decoded into strict DTOs
+  (`deny_unknown_fields`; serde refuses a duplicate key). Every key is
+  optional; values are non-negative integers in bytes (`wal.checkpoint_commits`
+  counts commits).
+- **Keys and defaults.** `memory`: `pool` 128 MiB, `sqlite_cache` 8 MiB,
+  `latch_lane` 2 MiB, `lifecycle_lane` 2 MiB, `ordinary_lanes` 4 MiB,
+  `connection` 16 MiB, `drive` 8 MiB, `request_multiplier` 4,
+  `request_nodes` 2 MiB, `reply_small` 64 KiB. `disk`: `sqlite_budget`
+  1 GiB, `sqlite_headroom` 64 MiB, `files_budget` 3 GiB, `files_headroom`
+  256 MiB. `wal`: `max` 32 MiB, `checkpoint_bytes` 8 MiB,
+  `checkpoint_commits` 1000.
+- **Validation**, each failure naming its key and rule: `pool` at least the
+  lanes, the cache, 4 × (`connection` + `drive`) and 1 MiB; `latch_lane`,
+  `lifecycle_lane` and `ordinary_lanes` at least 1.5 MiB (one terminal,
+  §6.5); `connection` at least 14 MiB (staging, queue and assembly buffers);
+  `drive` at least 6 MiB (observations, envelope and encoding);
+  `request_multiplier` at least 2; `sqlite_headroom` at least the 16 MiB
+  terminal reserve (§6.9); `wal.max` at least 4 MiB and above
+  `checkpoint_bytes`; `sqlite_budget` at least `wal.max` +
+  `sqlite_headroom` + 64 MiB; `files_headroom` at least 32 MiB (four
+  connections' staging) and below `files_budget`; `checkpoint_commits` at
+  least 1.
+- **Invalid** (unreadable, not JSON, an unknown or duplicate key, a failed
+  rule): the daemon refuses to start, writes `via: daemon config invalid:
+  <key>: <rule>` to stderr and exits with status 78, before any Store or
+  socket state changes; the auto-starting CLI reports that message.
+- **Reported.** `daemon/status` returns the effective values and their
+  source (A37).
+- **Fixed, not config:** the C1 limits (line, depth, nodes, pages, envelope,
+  `id`, reply deadline), C2 A1's channel and payload limits, runtime §8's
+  queue and staging limits, the 4 KiB page size (fixed when the database is
+  created) and the blob chunk.
 
 ## 6. Store
 
@@ -552,9 +606,9 @@ sender; `Store::drop` sends `Shutdown` with a blocking `send`.
 
 | Lane | Members | Slots | Bytes |
 |---|---|---|---|
-| Latch | the failure-resolution unit only (`crates/via-core/src/engine/batch.rs:85`, `:91`, `:165` [V]) | 1 | 2 MiB |
-| Lifecycle | every other Store call of the shutdown pipeline | 7 | 2 MiB |
-| Internal | every other commit and every read by Core, Route, Host or recovery | 64 less Public's | 4 MiB less Public's |
+| Latch | the failure-resolution unit only (`crates/via-core/src/engine/batch.rs:85`, `:91`, `:165` [V]) | 1 | `latch_lane` |
+| Lifecycle | every other Store call of the shutdown pipeline | 7 | `lifecycle_lane` |
+| Internal | every other commit and every read by Core, Route, Host or recovery | 64 less Public's | `ordinary_lanes` less Public's |
 | Public | reads issued by C1 handlers | at most 32 of the 64 | 4 KiB each |
 
 Membership is by handle (`StoreClient::public()`, `lifecycle()`, `latch()`;
@@ -576,8 +630,8 @@ abandoned Latch request makes the next push `NotEnqueued` (runtime §7's
 "skipped batch"). At most five Lifecycle requests are abandoned at a full
 2 s and one at the remainder, so 7 slots cover them plus the one being
 issued ([I]: each Lifecycle bound is at least `min(2 s, remaining)` and each
-step checks the deadline first). The 2 MiB allowances are flat [I]
-[t4r7.1]: each holds one terminal (§6.5) with wide margin, and the
+step checks the deadline first). The allowances (§5.2, 2, 2 and 4 MiB by
+default) are flat [I] [t4r7.1]: each holds one terminal (§6.5), and the
 Latch-fit test measures the largest failure batch. When abandoned requests
 hold the bytes, a push is `NotEnqueued`, reported `not_committed`, and
 recovery resolves the turn at restart (T3 §7). `finish` (`drive.rs:1000`)
@@ -750,43 +804,64 @@ all of which need only existence, `state` or `cancel` [V]:
 `stop.rs:632`, `batch.rs:85`. C1 `result`, `wait` and `await_terminal` use
 `result_text`, so no daemon path parses a stored envelope into a `Value`.
 
-### 6.9 Disk budgets [t4r7.2]
+### 6.9 Disk budgets [t4r7.2, t4r8.2–4]
 
-Runtime §6's 4 GiB under the owner's strategy (A36); nothing is reserved per
-write. `SQLITE_BUDGET` = 1 GiB covers the database and its WAL;
-`FILES_BUDGET` = 3 GiB covers `raw/` and `blobs/`.
+Runtime §6's 4 GiB, as configured budgets (§5.2, A36); nothing is reserved
+per write. A write may overshoot a budget by at most one bounded
+transaction or append (requirements, "Thresholds are configuration").
 
-- **Admission.** At a turn's receipt (`spawn`, `resume`, `send`), at its
-  dispatch and before a connection opens, Store compares `page_count ×
-  page_size` plus the WAL file with `SQLITE_BUDGET − SQLITE_HEADROOM`
-  (64 MiB), and the raw worker's byte counter (seeded from the files at
-  open, raised per append and blob chunk, lowered by discards and the sweep)
-  with `FILES_BUDGET − FILES_HEADROOM` (256 MiB). Over either, a receipt is
-  `store_error` `not_committed` and a queued turn fails `store` at dispatch
-  before submission, a known outcome (T3 §7.1). Nothing else is checked, so
-  the writes that let admitted work finish (terminals, cancel events,
-  session close, queued-turn cancellations, `raw_log.incomplete`, seals) use
-  the headroom.
-- **Hard limits.** The page size is pinned at 4 KiB at creation and checked
-  at open; `PRAGMA max_page_count` = `(SQLITE_BUDGET − WAL_MAX) /
-  page_size`, so SQLite refuses growth (`SQLITE_FULL` before `COMMIT`: a
-  known `NotCommitted`, `StoreFailureKind::Quota`). The raw worker refuses
-  an append or chunk past `FILES_BUDGET` like a failed write (§6.4).
-- **Mid-turn**, a hard limit fails the turn visibly with class `store`: raw
-  by T3 §7.2 row 6 (connection failed, `raw_log.incomplete`), SQLite by T3
-  §7.2 (rows ride in the resolution write, §3.2). A spawn, resume or blob
-  write is `store_error` `not_committed`. Key and receipt rows are never
-  deleted to make room. An actual I/O failure follows runtime §7.
-- **WAL** (runtime §6's checkpoint policy): automatic checkpoints every 1000
-  pages, `journal_size_limit` 32 MiB; after each commit the SQLite thread
-  reads the WAL size, and at 32 MiB stops admitting writes and runs
-  `wal_checkpoint(TRUNCATE)`. The writer is the only connection, so it
-  normally completes; if it fails or the WAL stays above `WAL_MAX` = 64 MiB,
-  Store health fails (runtime §7 latch).
-- **Headroom** [I]: 64 MiB covers four running terminals (about 1.3 MiB
-  each), their cancel events, 128 queued-turn cancellations and session
-  closes with wide margin; 256 MiB lets running turns' output finish, and a
-  flood meets the hard limit and fails its own turn. Confirmed by
+- **SQLite lines.** The page size is 4 KiB, set when the database is created.
+  The ceiling is `max_page_count` = `(sqlite_budget − wal.max) / 4096`. At
+  open Store sets it, reads back both pragmas, and refuses to start with
+  `store_over_budget` when either differs (a store already above a lowered
+  ceiling reads back its larger size) [t4r8.2]. The admission line is the
+  ceiling less `sqlite_headroom`, compared with `page_count × page_size`.
+- **Two write classes** [t4r8.2]. A terminal or lifecycle write (every
+  terminal, including `failed(store)` and forced ones; cancel events;
+  session close; queued-turn cancellation; `raw_log.incomplete`; seals;
+  recovery's and the Latch batch's writes) may use the headroom, up to the
+  ceiling. Every other write (receipts, dispatch's submission, step rows,
+  durable events) is refused before `BEGIN` once the database is above the
+  admission line: a known `NotCommitted` (`StoreFailureKind::Quota`). A
+  receipt is then `store_error` `not_committed`; a queued turn fails
+  `store` at dispatch before submission; a running turn fails `store` and
+  writes its terminal from the headroom (T3 §7.2, rows ride in it, §3.2).
+  The headroom must hold the 16 MiB terminal reserve (four running
+  terminals of about 1.3 MiB, 128 queued-turn cancellations of at most
+  32 KiB, session closes), which §5.2's validation enforces.
+- **`SQLITE_FULL`** at the ceiling: Store issues `ROLLBACK` and, only when it
+  succeeds, reports a known `NotCommitted`; if the rollback fails, the
+  outcome is uncertain and latches (runtime §7) [t4r8.2].
+- **Files** [t4r8.4]. The raw worker's counter is the sum of the actual
+  lengths of every file in `raw/` and `blobs/`: payloads, index entries
+  (45 B each, `crates/via-store/src/runtime/raw.rs:138-145` [V]), index and file
+  headers, and partial writes. It is seeded from the file lengths at open.
+  Before each append or chunk the worker computes its complete prospective
+  growth (payload, index entry, a new file's header) and refuses it past
+  `files_budget`; admission compares the counter with `files_budget −
+  files_headroom`. After any failed write it reconciles the counter with
+  the affected files' lengths (`fstat`). Blob discards and the sweep lower
+  it. A refused append fails its connection like a failed write (§6.4, T3
+  §7.2 row 6, `raw_log.incomplete`).
+- **Admission** checks both lines at a turn's receipt, at its dispatch and
+  before a connection opens. Key and receipt rows are never deleted to make
+  room; an actual I/O failure follows runtime §7.
+- **WAL** [t4r8.3] (runtime §6's policy, as configured): a passive
+  checkpoint after `wal.checkpoint_bytes` of WAL growth
+  (`wal_autocheckpoint` in pages) or `wal.checkpoint_commits` commits (a
+  counter on the SQLite thread); `journal_size_limit` = `wal.max`. After
+  each commit the SQLite thread reads the WAL size; at `wal.max` it admits
+  no write, runs `wal_checkpoint(TRUNCATE)`, and fails Store health
+  (runtime §7 latch) if the WAL is still at or above `wal.max`. There is no
+  prewrite prediction: the commit that crosses `wal.max` completes, so the
+  WAL overshoots by at most one transaction, whose payload the cap bounds
+  (1 MiB, plus one envelope and the carried rows, §6.5) and whose WAL
+  pages are those rows' pages and the index pages they touch [I]. The
+  database plus WAL therefore stay within `sqlite_budget` plus one
+  transaction.
+- **Defaults** [I]: 64 MiB of SQLite headroom leaves 48 MiB beyond the
+  terminal reserve; 256 MiB of file headroom lets running turns' output
+  finish, and a flood meets the ceiling and fails its own turn. Confirmed by
   `via-d9o.2.3` and `s1_store_disk_budgets_stop_admission_and_fail_visibly`.
 
 ### 6.10 `list` paging [kept: A12]
@@ -836,7 +911,7 @@ senders, `Arc<ProcessControl>`, the exit and latch receivers; `write`,
 `close_input`, `close`, `wait_exit`, `failure()`). `WireMessages` is unique
 and owns the connection's life (the message receiver, one `pending` entry,
 the task `JoinSet`, the stop signal, a `RawWriter` for the barrier;
-`next_message(&mut self)`, `finish(self, deadline)`).
+`next_message(&mut self)`, `boundary(&mut self)` (§4.4), `finish(self, deadline)`).
 
 ### 7.2 Readers
 
@@ -915,9 +990,11 @@ anything still runs, mark `raw_incomplete`, set the stop signal and
 `abort_all()` (every await is cancel-safe); (4) barrier and join together
 until `deadline`; (5) at `deadline` an unanswered barrier marks
 `raw_incomplete`, unjoined tasks move into `WireRuntime::adopt(set)`, and
-`finish` returns; (6) `WireRuntime::shutdown`
-(`crates/via-wire/src/runtime.rs:96` [V]) joins adopted sets after Host's
-shutdown and reports stragglers in `WireShutdown.pending_tasks`.
+`finish` returns; (6) `WireRuntime` joins each adopted set as its tasks end,
+and `WireRuntime::shutdown` (`crates/via-wire/src/runtime.rs:96` [V]) joins
+the rest after Host's shutdown, reporting stragglers in
+`WireShutdown.pending_tasks`. The connection charge (§5.1) moves with the
+set and is released only when the set is empty [t4r8.5].
 
 Every `run_turn` exit calls `finish` with one absolute deadline (the
 graceful close's `close_by`, the force close's cleanup deadline,
@@ -1359,8 +1436,8 @@ known message is a `protocol` observation." [t4r5.11]
 C2 §2 "Independent lanes" (`:227-231`): replace the sentences from "The
 1024-item observation queue also has a 4 MiB budget" to "explicit truncation
 marker." with "The 1024-item observation queue also has a 4 MiB budget;
-final text is split at character boundaries into `final_text` pieces of at
-most 256 KiB; another known payload over 256 KiB encoded fails protocol with
+final text is split at character boundaries into `final_text` pieces whose
+whole encoded observation is at most 256 KiB [t4r8.6]; another known payload over 256 KiB encoded fails protocol with
 raw evidence."
 
 C2 summary row `observations` (`:40`) [t4r6.13]: "C1 events minus Core
@@ -1381,7 +1458,7 @@ In the `turn.vendor_terminal` row delete "`final_text`, " (all final text
 arrives as `final_text` pieces first) [t4r7.6], and add the rows:
 
 > | `progress` | `at`, `model: bool`, `tools_started: [(id, name)]`, `tools_ended: [id]`, `usage?: (key?, total)` | no commit: Core folds it into the running turn's progress snapshot and commits a `steps` row when a step ends (C1 §3.7). `model` marks model output (text, reasoning or a tool request); `usage` is an interval sample, never a cumulative total. A message with no mark sends no item |
-> | `final_text` | `key`, `text`, `replace: bool` | no commit: Core appends the text to, or replaces, that key's part of the envelope's final text, metering key and text against the 1 MiB envelope; the item that would exceed it fails the turn `overflow` at once (C1 §5). A piece is at most 256 KiB; a longer text is several pieces, the first carrying `replace` |
+> | `final_text` | `key`, `text`, `replace: bool` | no commit: Core appends the text to, or replaces, that key's part of the envelope's final text, metering key and text against the 1 MiB envelope; the item that would exceed it fails the turn `overflow` at once (C1 §5). A piece is cut so that the whole encoded observation, key, fields and escaping included, is at most 256 KiB; a longer text is several pieces, the first carrying `replace` |
 
 C2 §7 [t4r6.13]: item 6's sentence "Tool completion and other evidence may
 arrive afterward, …" (`adapter-contract.md:448-450`) becomes "Tool
@@ -1405,6 +1482,12 @@ C1 §8.2 `overflow` row (`via-api-v1.md:711`): "this session's event channel
 stalled past its limit (C2 A1)" becomes "this session's observation channel
 stalled past its limit, or the turn's envelope accumulation exceeded 1 MiB
 (C2 A1, §5)".
+
+C1 §7.6 (`via-api-v1.md:657-658`) [t4r8.9]: "record normalized-event loss
+separately from any actual raw gap (C2 §4)" becomes "set `raw_log_incomplete`
+only for an actual raw gap (C2 §4)"; "Raw-log or event overflow failed the
+connection" becomes "Raw-log or observation overflow failed the
+connection"; delete ", while normalized-event loss is separately recorded".
 
 Withdraws A19's stall trigger (A34's cause is the overrun only).
 `claude-code.md:305` [t4r5.8]: "At 10 s stalled
@@ -1481,7 +1564,7 @@ to the paragraph's end with:
 
 `claude-code.md` §5 table, replace the rows:
 
-> | `assistant.message.content` text | `progress` with `model`; final text comes from `result`, sent as C2 `final_text` pieces of at most 256 KiB before the terminal |
+> | `assistant.message.content` text | `progress` with `model`; final text comes from `result`, sent as C2 `final_text` pieces of at most 256 KiB encoded (C2 §4) before the terminal |
 > | assistant `tool_use` | `progress` with `model` and `tools_started (id, name)`; retain the open-item set; no input summary |
 > | user `tool_result` | `progress` with `tools_ended (tool ID)`; error/refusal remains error; unmatched IDs are protocol evidence |
 > | assistant `message.usage` | `progress` `usage` keyed by message ID (unprobed: the pinned packet probes only `result.usage`) |
@@ -1503,11 +1586,13 @@ known observation (split text only)" becomes "256 KiB known observation
 > sample. Terminal statuses map as below. For the envelope's final text only,
 > send `agentMessage` deltas as C2 `final_text` appends keyed by item ID and
 > the completed text as that key's replacement, so completed text never
-> duplicates its deltas; pieces are at most 256 KiB [t4r6.4, t4r7.6].
+> duplicates its deltas; each piece's encoded observation is at most 256 KiB
+> (C2 §4) [t4r6.4, t4r7.6, t4r8.6].
 
 At `:264-265`, "Large text splits on UTF-8 boundaries; unknown notifications
 become `vendor.other` retaining at most 16 KiB with explicit truncation"
-becomes "Final text is split into C2 `final_text` pieces of at most 256 KiB;
+becomes "Final text is split into C2 `final_text` pieces of at most 256 KiB
+encoded (C2 §4);
 unknown notifications are raw-log-only activity".
 
 Codex §5 late detail [t4r5.13]: the sentences from "Thus an already received
@@ -1543,8 +1628,9 @@ becomes:
 > session/message/part/call IDs; each assistant message's token snapshot is
 > a `usage` sample keyed by message ID (§7 one ledger). Final text is the
 > correlated completed assistant's text, sent as a C2 `final_text`
-> replacement keyed by message ID, in pieces of at most 256 KiB, so the
-> 256 KiB normalized observation maximum holds [t4r6.4, t4r7.6]. Unknown
+> replacement keyed by message ID, in pieces of at most 256 KiB encoded
+> (C2 §4), so the 256 KiB normalized observation maximum holds [t4r6.4,
+> t4r7.6, t4r8.6]. Unknown
 > notification types are raw-log-only activity;
 
 and at `:521`, "`session.next.*` events are retained as bounded
@@ -1591,41 +1677,77 @@ t4r7.5]. Amends T3 §2 (`t3/design.md:148`, `:165-171`, `:185-187`,
 serde's scratch buffer at four times the line, so no key limit is needed;
 C1 §1, runtime §8's JSON row and `codex.md:263-264` stay as written.
 
-**T4-A36. Coarse memory and disk bounds** [t4r7.1, t4r7.2]. Amends runtime
-§6 and §8 (requirements, "Bounding strategy").
+**T4-A36. Coarse memory and disk bounds** [t4r7.1, t4r7.2, t4r8.1–4,
+t4r8.9]. Amends runtime §6 and §8; `codex.md` §5.
 
-Runtime §8 (`docs/specs/runtime-contracts.md:1057-1060`): replace the two
-sentences from "The global daemon retained-payload allocation budget" to
-"acquiring a global permit is required." with:
+Runtime §8 (`runtime-contracts.md:1057-1060`): replace the two sentences
+from "The global daemon retained-payload allocation budget" to "acquiring a
+global permit is required." with:
 
-> The global daemon retained-payload budget is one 128 MiB pool that
-> includes SQLite's 8 MiB cache. Each class of retained buffer (Store
-> lanes, the SQLite cache, a running turn with its connection, a C1
-> request, a reply, a blob chunk, a dispatched prompt) takes a
-> conservative flat charge from the pool before it allocates; per-queue
-> maxima are limits inside a charge, not separate permits. The charges are
-> assumptions, confirmed by F24's RSS gate and a pool high-water mark of at
-> most 128 MiB.
+> The global daemon retained-payload budget is one pool, 128 MiB by default
+> and configurable (daemon config), that includes SQLite's page cache (8 MiB
+> by default). Each class of retained buffer (Store lanes, the SQLite cache,
+> a connection, a running turn, a C1 request, a reply, a blob chunk, a
+> dispatched prompt) takes a conservative flat charge, configurable, from
+> the pool before it allocates; per-queue maxima are limits inside a charge,
+> not separate permits. The charges are assumptions, confirmed by F24's RSS
+> gate and the pool's high-water mark.
+
+Runtime §8, other edits: at `:1041-1044`, the two sentences from "Use
+byte-permit wrappers" to "a peer size or item count." become "Each class
+charge is an RAII permit held while its buffers live, including data waiting
+for sync, decode, channel send, serialization or task join; nothing is
+preallocated from an unchecked peer size or item count."; at `:1063-1064`,
+"byte-permit high-water <=128 MiB" becomes "pool high-water at most the
+configured pool"; at `:1068`, "beyond the 128 MiB global" becomes "beyond
+the global"; row "Store requests" (`:1019`): "8 MiB total" becomes "8 MiB
+total by default, configurable"; row "Codex shared Route ingress"
+(`:1013`): "16 MiB global permit for" becomes "a 16 MiB class charge from
+the global pool for".
 
 Runtime §6 (`:773-777`): replace the sentences from "Configure an initial
 4 GiB Store+raw logical quota" to "never shortened by quota pressure." with:
 
-> Disk has two hard budgets within 4 GiB: 1 GiB for SQLite with its WAL
-> (`max_page_count`) and 3 GiB for raw and blob files (the raw writer's
-> byte count). Turn admission and connection open compare actual sizes
-> with each budget less a headroom (64 MiB, 256 MiB) and refuse by name
-> above it; the headroom covers the writes that let admitted work finish,
-> session close and queued-turn cancellation included. A turn that meets a
+> Disk has two hard budgets, configurable (daemon config), by default 1 GiB
+> for SQLite with its WAL (`max_page_count`) and 3 GiB for raw and blob
+> files (the sum of their lengths). Turn admission, connection open and
+> every ordinary write compare actual sizes with each budget less a
+> configured headroom (64 MiB and 256 MiB by default) and refuse by name
+> above it; terminal and lifecycle writes may use the headroom, session
+> close and queued-turn cancellation included. A write may overshoot a
+> budget by at most one bounded transaction or append. A turn that meets a
 > hard limit fails with class `store`. The budgets are no guarantee against
 > filesystem-full: actual I/O failures still follow §7. Key/receipt
 > lifetime is never shortened by budget pressure.
 
-Unchanged and consistent: the checkpoint sentence (`:769-771`; §6.9, with
-`WAL_MAX` = 64 MiB inside the SQLite budget); runtime §8's rows for C1 input,
-raw staging and responses (limits inside charges); the Codex 16 MiB permit
-(`:1013`, `:1067-1070`; `codex.md:315`), a class that task charges from the
-pool; C1 §8.2's `store` row (a budget refusal after dispatch is a failed
-Store write).
+Runtime §6 checkpoint sentence (`:769-771`), from "Checkpoint after 8 MiB WAL
+growth" to "if growth cannot be bounded.", becomes "By default and
+configurably, checkpoint after 8 MiB of WAL growth or 1000 commits; at a
+32 MiB WAL, stop write admission while attempting a truncating checkpoint,
+and fail Store health if it cannot bring the WAL below that limit. The
+commit that crosses the limit completes, so the WAL overshoots by at most
+one transaction." [t4r8.3]
+
+`codex.md`: at `:315`, "Add a 16 MiB global permit pool" becomes "Charge a
+16 MiB class from the global pool (runtime §8)"; at `:237`, "charged to the
+global 16 MiB permit pool" becomes "charged to that 16 MiB class"; at
+`:299-300`, "Core records explicit normalized-event loss with the overflow,
+and" becomes "Core fails the affected turns `overflow`, and records".
+Unchanged and consistent: runtime §4's staging permits (`:320`, inside the
+connection charge); C1 §8.2's `store` row.
+
+**T4-A37. Daemon config for thresholds** [t4r8.1]. Amends runtime §8; C1
+§3.14.
+
+Runtime §8, add after the pool paragraph: "Memory and disk thresholds (the
+pool, class charges, disk budgets and headrooms, WAL limit and checkpoint
+triggers) are keys of `daemon.json` in the state directory, with
+provisional defaults. The daemon reads it once at start; a change takes
+effect at the next start, and an invalid file refuses to start with a named
+error. C1, C2 and the other runtime §8 limits are not configurable." C1
+§3.14 (`via-api-v1.md:375-377`): after "socket_path, store_path, health" add
+", limits"; after that sentence add "`limits` holds the effective memory,
+disk and WAL thresholds and `source` (`file` or `defaults`)."
 
 ## 12. Tests (failure-first)
 
@@ -1650,14 +1772,15 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 `raw.worker.panic_after_dequeue`, `store.writer.before_serve`,
 `Lanes::high_water(lane)`, `MemoryBudget::high_water()`,
 `store.commit.step`, `core.observations.pause`, `core.progress.publish`,
-`Store::read_count()`, `store.read.delay_ms`, `VIA_TEST_SQLITE_BUDGET`,
-`VIA_TEST_FILES_BUDGET`, `VIA_TEST_EVENT_STALL_MS`,
+`Store::read_count()`, `store.read.delay_ms`, `store.rollback.fail`,
+`VIA_TEST_EVENT_STALL_MS`,
 `VIA_TEST_PARTIAL_LINE_MS`, `VIA_TEST_REPLY_WRITE_MS`,
 `wire::fallback_drops()`, `blob.write.fail_after`,
 `Store::blob_chunk_reads()`, fake-agent steps `HoldStdin`, `ReportCwd`,
 `EchoPromptDigest` (`Emit`, `Gate` and `Flood`,
 `crates/via-fake-agent/src/main.rs:41-62` [V], already emit any line), and
-`/proc/<pid>/status` sampling.
+`/proc/<pid>/status` sampling. Budgets and charges are lowered through
+`daemon.json` (§5.2), not a seam.
 
 ### 12.2 Scenarios
 
@@ -1677,15 +1800,16 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_events_page_filters_and_bounds`; `s1_c1_follow_and_unsubscribe_are_refused` | window, `types`, `turn`, `next_after` across filtered rows, `more`, the byte bound with a Store-level fixture; `follow: true` is `invalid_params`, `unsubscribe` `method_not_found` |
 | `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection is `invalid_params` |
 | `s1_c1_logs_end_cursor_resumes_while_running` [t4r5.12, t4r6.11] | a call before any byte is durable returns `r1.start`, and a later call from it returns the first bytes; on a running turn `next_cursor` is non-null at the current end and a later call from it returns only new bytes; after the terminal and seal it is `null` |
-| `s1_c1_logs_per_session_spans_bound_each_turn` [t4r7.3] | a per-session connection carrying two turns: a turn address returns exactly `[raw_start, raw_end)`; units before the first turn are returned only to the session address; a crash between submission and terminal leaves the open span readable to the session |
-| `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2] | lowered budgets: over `SQLITE_BUDGET − SQLITE_HEADROOM` or `FILES_BUDGET − FILES_HEADROOM` a spawn is `store_error` `not_committed` and a queued turn fails `store` at dispatch, while a running turn's terminal, a session close and queued-turn cancellations still commit; a flood reaching the raw hard limit fails its turn `store` with `raw_log.incomplete`; `max_page_count` gives `SQLITE_FULL` as a known `NotCommitted`; the counter equals the files after restart |
+| `s1_c1_logs_per_session_spans_bound_each_turn` [t4r7.3, t4r8.7, t4r8.8] | a per-session connection carrying two turns, with session-level stdout and stderr staged but not yet durable when the second is submitted (raw worker stalled): a turn address returns exactly `[raw_start, raw_end)` and none of that earlier traffic; `r1.start` for turn 2 begins at its `raw_start`; a cursor below `raw_start` or beyond the span is `invalid_params`; a crash between submission and terminal leaves the open span readable to the session |
+| `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`, a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket_and_frees_the_permit` | A31; A32, with `VIA_TEST_REPLY_WRITE_MS` |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` | four turns, 256 MiB stdout flood; daemon peak RSS < 256 MiB, growth < 32 MiB after the first 64 MiB, each anchor ≤ 32 MiB, sum < 384 MiB, `MemoryBudget` high-water ≤ 128 MiB, the SQLite cache's 8 MiB included [t4r7.1]; `daemon/status`, `status` and a `cancel` of another turn answer within 100 ms, including with its interrupt write blocked at `HoldStdin`; the flood turn ends `failed(overflow)` with `raw_log.incomplete` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent after filling the channel: `overflow` at the lowered stall with no further vendor byte |
 | `s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib` | the C2 bounds |
 | `s1_f24_envelope_overrun_stops_the_turn_at_once` [t4r5.5, t4r6.4, t4r6.5] | a test route emits declined requests past 1 MiB and then stays silent, and another streams `final_text` appends past it: the stop order with cause `overflow` is sent on the crossing item; a vendor `completed` terminal that follows still ends `failed(overflow)` |
 | `s1_bounds_failure_summary_bounds_every_member` [t4r5.6, t4r6.6, t4r6.7] | a turn with 1 MiB escaped `final_text`, a 64 KiB `failure.message`, 1 KiB vendor fields, a 6 KiB + 1 `model`, 2,000 `extra_write_dirs`, a 64 KiB `vendor` map and 600 KiB of declined requests: `final_text` empty with its length in `truncation`, the message cut to 2 KiB, each member within its budget, lists as prefixes, `truncation` totals exact, the summary at most 720 KiB; a 1 KiB + 1 vendor field is `protocol` |
-| `s1_bounds_class_charges_cover_measured_peaks` [t4r7.1] | one counting-allocator binary: no reallocation on the stdout, C1 line, reply or encode paths at their maxima; C1 decode of a 16 MiB prompt of six-byte escapes and of a 65,536-node list each allocate at most the C1 request charge; a maximal drive allocates at most 24 MiB; a request that cannot be charged is `admission_refused` (`MEMORY_BUDGET`) |
+| `s1_bounds_class_charges_cover_measured_peaks` [t4r7.1] | one counting-allocator binary: no reallocation on the stdout, C1 line, reply or encode paths at their maxima; C1 decode of a 16 MiB prompt of six-byte escapes and of a 65,536-node list each allocate at most the C1 request charge; a maximal connection and drive allocate at most their charges; a connection whose tasks were adopted keeps its charge until they are joined [t4r8.5]; a `final_text` piece of six-byte escapes with a 1 KiB key encodes to at most 256 KiB [t4r8.6]; a request that cannot be charged is `admission_refused` (`MEMORY_BUDGET`) |
+| `s1_config_is_read_at_start_validated_and_reported` [t4r8.1] | a missing file gives the defaults; lowered values change the pool and budgets only after a restart; an unknown key, a duplicate key, a headroom below the terminal reserve and a group-writable file each refuse start with exit 78 and the named key and rule, touching no Store or socket; `daemon/status` `limits` equals the effective values |
 | `s1_f05_…` (oversize, depth and nodes, partial line, 33rd socket) | F5 |
 | `s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_raw_bytes` | F27, with a seeded splitter test |
 | `s1_raw_…`, `s1_store_…`, `s1_wire_…`, `s1_blob_…` | round 4's mechanism tests for kept mechanisms: group commit by count, death guards, lanes and fence, Latch fit with the largest `cwd` (end to end with the longest creatable path; the 4096-byte bound with synthetic records), Public saturation at the Store level (not through sockets), binary lookup, finish adoption, torn and mismatched blobs, replay compare outside `admission` with a stalled reader |
@@ -1699,7 +1823,8 @@ limits before a `Value` (§9.2); A1, A2 (§6.1, §6.2), A3, A9; `daemon/status`
 strict paging DTOs, `logs` by cursor (A27); blob path, schema v6, Store
 shutdown ordering. The 256 KiB rule holds with final text in pieces (A29);
 memory is charged per class (§5); runtime §6's quota is built as two disk
-budgets (§6.9, A36) [t4r7.2]. Obsolete: F25 and F26 (no follow stream;
+budgets (§6.9, A36) [t4r7.2]; thresholds are daemon config (§5.2, A37;
+`via-jm4.7.8.1`) [t4r8.1]. Obsolete: F25 and F26 (no follow stream;
 replacement scenarios in Q-R5-5), `events` follow, `unsubscribe`, follower
 cleanup (A25), Wire `read_either`. Out of scope: durable `output_schema`
 (§0).
@@ -1710,9 +1835,9 @@ cleanup (A25), Wire `read_either`. Out of scope: durable `output_schema`
 |---|---|
 | A maximal 16 MiB C1 request is charged about 66 MiB, so it is admitted only while at most one turn runs; otherwise `admission_refused` | real routes measure prompt sizes, or the counting-allocator test allows a smaller charge |
 | The class charges (§5.1) and disk headrooms (§6.9) are assumptions; admission near a budget refuses work that would have fit; uncharged allocator and SQLite overhead is left to the RSS gate | a check shows a charge too small, refusals too early, or the RSS gate fails |
-| `running_tools` lists at most 64 names plus a flag; a missed tool end misreports `phase` until the next boundary; tokens are approximate under the declared scope, and unprobed for Claude, Codex and OpenCode (§2.5), so `tokens` may be `null` | a caller needs exact live figures; each vendor's probe; the owner's accuracy decision (Q-R5-11) |
+| `running_tools` lists at most 64 names plus a flag; a missed tool end misreports `phase` until the next boundary; tokens are approximate under the declared scope, and unprobed for Claude, Codex and OpenCode (§2.5), so `tokens` may be `null`; R3's accuracy is not claimed for them [t4r8.10] | a caller needs exact live figures; each vendor's probe; the owner's accuracy decision (Q-R5-11) |
 | `logs` on shared servers is not designed here; only the D4 constraint is fixed | the Codex and OpenCode tasks |
-| A step that ended while its row commit was in flight is lost in a crash | never; R4 accepts it |
+| A step that ended while its row commit was in flight is lost in a crash | the owner's R4 wording decision (Q-R5-15) [t4r8.10] |
 | The open-session tally is exact only until an uncertain close | Store-failure recovery work |
 | `stamp` and `ord` increase strictly only while no `sessions` row is deleted; `list` phase 2 examines every `ord` up to `w0`; blob verification at start is linear in blob bytes | retention (`via-jm4.18`), or session counts make it slow |
 | `revision` is 0; `process.idle_since` is `null` (A16) | late evidence; vendor idle shutdown |
