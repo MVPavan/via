@@ -991,7 +991,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | JSON structure | depth 64, 65,536 nodes per document | Bound during streaming parse, before constructing a `Value`; named invalid params/protocol error |
 | Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
-| Route message staging | 64 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
+| Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
 | Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |

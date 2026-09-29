@@ -16,5 +16,8 @@ via-store = { path = "../via-store" }
 tokio = { workspace = true, features = ["io-util", "sync", "time", "rt"] }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
 [lints]
 workspace = true

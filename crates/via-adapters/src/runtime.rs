@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, watch},
-    time::timeout_at,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch};
+use tokio::time::timeout_at;
 
 use crate::{
     AcceptanceToken, Cleanup, Deadline, FakeAcceptanceObservation, FakeConfig, FakeObservation,
@@ -11,8 +14,57 @@ use crate::{
     VendorTerminalStatus, VendorTurnId,
 };
 use via_routes::{
-    FakeMessage, FakeRoute, FakeRouteResult, FakeStart, RouteMessage, TerminalStatus, WireRecovery,
+    FakeMessage, FakeRoute, FakeRouteResult, RouteMessage, TerminalStatus, TurnStart, WireRecovery,
 };
+
+/// C2 A1: the observation channel holds at most 1,024 items ...
+pub const OBSERVATION_ITEMS: usize = 1024;
+
+/// ... and at most 4 MiB of them, counted by [`item_cost`].
+pub const OBSERVATION_BYTES: usize = 4 * 1024 * 1024;
+
+/// C2 A1: a delivery blocked this long without an item accepted fails the
+/// turn `overflow`.
+const EVENT_STALL: Duration = Duration::from_secs(10);
+
+/// The stall bound: 10 s. Test builds only: `VIA_TEST_EVENT_STALL_MS`
+/// lowers it (Task 4 design §13.1).
+fn event_stall() -> Duration {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(lowered) = std::env::var("VIA_TEST_EVENT_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(lowered);
+    }
+    EVENT_STALL
+}
+
+/// One observation in Core's channel with its share of the drive's byte
+/// budget (Task 4 design §2.3): Core holds `permit` until it has handled
+/// the observation.
+pub struct AdmittedObservation {
+    /// The normalized observation.
+    pub observation: FakeObservation,
+    /// The item's bytes of the drive's 4 MiB budget.
+    pub permit: OwnedSemaphorePermit,
+}
+
+/// The sending side of one drive's observation channel and its byte
+/// budget; Core keeps the receiver.
+#[derive(Clone)]
+pub struct ObservationSink {
+    sender: mpsc::Sender<AdmittedObservation>,
+    budget: Arc<Semaphore>,
+}
+
+/// One drive's observation channel: 1,024 items and a 4 MiB byte budget
+/// (C2 A1, Task 4 design §2.3).
+pub fn observation_channel() -> (ObservationSink, mpsc::Receiver<AdmittedObservation>) {
+    let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
+    let budget = Arc::new(Semaphore::new(OBSERVATION_BYTES));
+    (ObservationSink { sender, budget }, receiver)
+}
 
 /// Immutable fake deployment and Host paths supplied at daemon bootstrap.
 pub struct AdapterRuntimeConfig {
@@ -93,12 +145,15 @@ impl AdapterRuntime {
         self.fake.is_available()
     }
 
-    /// Runs one submitted fake turn and forwards every observation to Core in
-    /// decode order. When Core's channel is full this waits, bounded by `deadline`;
-    /// if Core cannot take an observation, the Route receiver is dropped so Route
-    /// fails the turn as overflow and still performs its cleanup and drain.
-    /// `force` set force-closes the turn through Route (C2 Close(Force)).
-    /// `stop` is the turn's stop order, passed through to Route (design §2).
+    /// Runs one submitted fake turn and delivers every observation to Core
+    /// in decode order (Task 4 design §2.3, §9). Route hands one message at
+    /// a time over a hop of one; its delivery acquires the items' bytes of
+    /// the drive's budget, then sends each item, while `route` keeps being
+    /// polled. A delivery blocked for the stall bound without an item
+    /// accepted drops the hop's receiver, so Route fails the turn as
+    /// overflow and still performs its cleanup. `force` set force-closes the
+    /// turn through Route (C2 Close(Force)). `stop` is the turn's stop
+    /// order, passed through to Route (design §2).
     #[expect(
         clippy::too_many_arguments,
         reason = "each argument is a distinct input of the one turn"
@@ -108,7 +163,7 @@ impl AdapterRuntime {
         session_id: SessionId,
         turn: TurnNumber,
         prompt: String,
-        observations: mpsc::Sender<FakeObservation>,
+        observations: ObservationSink,
         deadline: Deadline,
         force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
@@ -124,52 +179,78 @@ impl AdapterRuntime {
             .map_err(|_| AdapterError::Unavailable)?;
         // Host owns the connection slot for the group's life (design §11).
         process.capacity = Some(capacity);
-        let start = FakeStart::new(session_id.as_str().to_owned(), turn, prompt)
+        let start = TurnStart::new(session_id.as_str().to_owned(), turn, prompt)
             .map_err(|_| AdapterError::Protocol)?;
-        // Full: Route waits for capacity under the turn deadline while this loop
-        // forwards to Core, which drains until the route finishes.
-        let (route_tx, route_rx) = mpsc::channel::<RouteMessage>(64);
+        let (hop, hop_rx) = mpsc::channel::<RouteMessage>(1);
+        let mut forced_stop = force.clone();
         let route = self
             .route
-            .execute(process, start, route_tx, deadline, force.clone(), stop);
-        let mut force = force;
+            .execute(process, start, hop, deadline, force, stop);
         tokio::pin!(route);
-        let mut route_rx = Some(route_rx);
-        loop {
+        let stall = event_stall();
+        let mut hop_rx = Some(hop_rx);
+        let mut delivery: Option<Delivery> = None;
+        let mut delivered = true;
+        let result = loop {
             tokio::select! {
-                Some(message) = recv(route_rx.as_mut()) => {
-                    if deliver(message, &observations, deadline, &mut force).await.is_err() {
-                        // Route observes the closed channel as overflow, or
-                        // after a force stops forwarding and force-closes.
-                        route_rx = None;
+                biased;
+                outcome = poll_delivery(delivery.as_mut()), if delivery.is_some() => {
+                    delivery = None;
+                    if outcome.is_err() {
+                        // Route observes the closed hop as overflow, or as
+                        // the force's stop under a force.
+                        hop_rx = None;
+                        delivered = false;
                     }
                 }
-                result = &mut route => {
-                    let mut delivered = true;
-                    if let Some(receiver) = route_rx.as_mut() {
-                        while let Ok(message) = receiver.try_recv() {
-                            if deliver(message, &observations, deadline, &mut force).await.is_err() {
-                                delivered = false;
-                                break;
-                            }
+                message = recv(hop_rx.as_mut()), if delivery.is_none() && hop_rx.is_some() => {
+                    match message {
+                        Some(message) => {
+                            delivery = Some(Box::pin(deliver(message, observations.clone(), stall)));
                         }
+                        None => hop_rx = None,
                     }
-                    // A route failure is the first cause; undelivered data fails a success.
-                    return match result {
-                        Ok(result) if delivered => Ok(normalize_terminal(result)),
-                        Ok(result) => Err(AdapterError::Route(RouteFailure {
-                            cause: RouteError::Overflow { turn },
-                            undecoded: None,
-                            exit: Some(result.exit),
-                            launched: true,
-                            cleanup: None,
-                            forced: false,
-                            journal_uncertain: result.journal_uncertain,
-                        })),
-                        Err(failure) => Err(AdapterError::Route(failure)),
-                    };
+                }
+                result = &mut route => break result,
+            }
+        };
+        // Route ended: what it already handed over is still delivered, unless
+        // the daemon force ends the wait.
+        let rest = async {
+            if let Some(delivery) = delivery
+                && delivery.await.is_err()
+            {
+                return false;
+            }
+            if let Some(receiver) = hop_rx.as_mut() {
+                while let Ok(message) = receiver.try_recv() {
+                    if deliver(message, observations.clone(), stall).await.is_err() {
+                        return false;
+                    }
                 }
             }
+            true
+        };
+        if delivered {
+            delivered = tokio::select! {
+                biased;
+                () = forced(&mut forced_stop) => false,
+                rest = rest => rest,
+            };
+        }
+        // A route failure is the first cause; undelivered data fails a success.
+        match result {
+            Ok(result) if delivered => Ok(normalize_terminal(result)),
+            Ok(result) => Err(AdapterError::Route(RouteFailure {
+                cause: RouteError::Overflow { turn },
+                undecoded: None,
+                exit: Some(result.exit),
+                launched: true,
+                cleanup: None,
+                forced: false,
+                journal_uncertain: result.journal_uncertain,
+            })),
+            Err(failure) => Err(AdapterError::Route(failure)),
         }
     }
 
@@ -291,6 +372,19 @@ async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
     }
 }
 
+/// A pending delivery, polled beside `route` (Task 4 design §9).
+type Delivery = Pin<Box<dyn Future<Output = Result<(), Undelivered>> + Send>>;
+
+/// A delivery that did not complete: stalled, or Core's channel is gone.
+struct Undelivered;
+
+async fn poll_delivery(delivery: Option<&mut Delivery>) -> Result<(), Undelivered> {
+    match delivery {
+        Some(delivery) => delivery.await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<RouteMessage> {
     match receiver {
         Some(receiver) => receiver.recv().await,
@@ -298,44 +392,113 @@ async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<Rou
     }
 }
 
-/// Normalizes one Route message and waits, bounded by `deadline`, for Core to
-/// take each resulting observation. The terminal travels in the route result.
-/// A force ends the wait, so Route is polled into its force close and drain.
+/// An item's cost against the byte budget: `512 + Σ(64 + len)` over its
+/// strings (Task 4 design §2.3).
+fn item_cost(strings: &[&str]) -> usize {
+    512 + strings
+        .iter()
+        .map(|string| 64 + string.len())
+        .sum::<usize>()
+}
+
+/// Delivers one Route message (design §2.3): acquires the byte cost of
+/// every item it yields before building them, then sends each item with its
+/// share of the permits. The pending delivery owns one stall deadline, set
+/// at its first block and cleared only when an item is accepted; at the
+/// deadline it gives up. The terminal travels in the route result.
 async fn deliver(
     message: RouteMessage,
-    observations: &mpsc::Sender<FakeObservation>,
-    deadline: Deadline,
-    force: &mut watch::Receiver<Option<tokio::time::Instant>>,
-) -> Result<(), ()> {
-    for observation in normalize(message)? {
-        let sent = tokio::select! {
-            // Capacity first: a draining Core still commits messages already read.
-            biased;
-            sent = timeout_at(deadline.instant(), observations.send(observation)) => sent,
-            () = forced(force) => return Err(()),
-        };
-        match sent {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => return Err(()),
+    sink: ObservationSink,
+    stall: Duration,
+) -> Result<(), Undelivered> {
+    let costs = costs(&message.payload);
+    let total: usize = costs.iter().sum();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut stall_at = None;
+    let wanted = u32::try_from(total).map_err(|_| Undelivered)?;
+    let mut permit = match Arc::clone(&sink.budget).try_acquire_many_owned(wanted) {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            let at = *stall_at.get_or_insert_with(|| tokio::time::Instant::now() + stall);
+            timeout_at(at, Arc::clone(&sink.budget).acquire_many_owned(wanted))
+                .await
+                .map_err(|_| Undelivered)?
+                .map_err(|_| Undelivered)?
         }
+        Err(TryAcquireError::Closed) => return Err(Undelivered),
+    };
+    for (observation, cost) in normalize(message)?.into_iter().zip(costs) {
+        let share = permit.split(cost).ok_or(Undelivered)?;
+        let item = AdmittedObservation {
+            observation,
+            permit: share,
+        };
+        match sink.sender.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                let at = *stall_at.get_or_insert_with(|| tokio::time::Instant::now() + stall);
+                timeout_at(at, sink.sender.send(item))
+                    .await
+                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered)?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(Undelivered),
+        }
+        // Accepted: the next block starts a new stall deadline.
+        stall_at = None;
     }
     Ok(())
 }
 
-/// Maps one decoded fake message to C2 observations; oversized text is split.
-fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, ()> {
+/// The byte cost of each item `message` yields, in order.
+fn costs(message: &FakeMessage) -> Vec<usize> {
+    match message {
+        FakeMessage::Accepted { vendor_turn_id } => vec![item_cost(&[vendor_turn_id])],
+        FakeMessage::Text { text, .. } => split_ranges(text)
+            .into_iter()
+            .map(|range| item_cost(&[&text[range]]))
+            .collect(),
+        FakeMessage::ToolStarted {
+            tool_id,
+            name,
+            input_summary,
+            ..
+        } => vec![item_cost(&[tool_id, name, input_summary])],
+        FakeMessage::ToolEnded {
+            tool_id,
+            output_summary,
+            ..
+        } => vec![item_cost(&[tool_id, output_summary])],
+        FakeMessage::UnknownNotification {
+            vendor_type,
+            raw_payload,
+            ..
+        } => vec![item_cost(&[vendor_type, raw_payload])],
+        FakeMessage::Terminal { .. } | FakeMessage::InterruptAck { .. } => Vec::new(),
+    }
+}
+
+/// Maps one decoded fake message to C2 observations; oversized text is
+/// split. An acceptance that cannot be represented is not delivered.
+fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, Undelivered> {
     let data = |observation| FakeObservation::Data { observation };
     Ok(match message.payload {
         // Route admits exactly one acceptance per turn.
         FakeMessage::Accepted { vendor_turn_id } => {
             vec![FakeObservation::Accepted(FakeAcceptanceObservation {
-                correlation: AcceptanceToken::try_from(1).map_err(|_| ())?,
-                vendor_turn_id: VendorTurnId::try_from(vendor_turn_id).map_err(|_| ())?,
+                correlation: AcceptanceToken::try_from(1).map_err(|_| Undelivered)?,
+                vendor_turn_id: VendorTurnId::try_from(vendor_turn_id).map_err(|_| Undelivered)?,
             })]
         }
-        FakeMessage::Text { text, .. } => split_text(&text)
+        FakeMessage::Text { text, .. } => split_ranges(&text)
             .into_iter()
-            .map(|text| data(Observation::AssistantText { text }))
+            .map(|range| {
+                data(Observation::AssistantText {
+                    text: text[range].to_owned(),
+                })
+            })
             .collect(),
         FakeMessage::ToolStarted {
             tool_id,
@@ -378,8 +541,9 @@ fn normalize(message: RouteMessage) -> Result<Vec<FakeObservation>, ()> {
 const TEXT_PAYLOAD_OVERHEAD: usize = 25;
 
 /// Splits text in order at UTF-8 boundaries so that each piece's encoded
-/// `assistant.text` payload stays within C2's 256 KiB bound.
-fn split_text(text: &str) -> Vec<String> {
+/// `assistant.text` payload stays within C2's 256 KiB bound; returns the
+/// pieces' byte ranges.
+fn split_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     let budget = MAX_OBSERVATION_BYTES - TEXT_PAYLOAD_OVERHEAD;
     let mut pieces = Vec::new();
     let mut start = 0;
@@ -387,14 +551,14 @@ fn split_text(text: &str) -> Vec<String> {
     for (index, character) in text.char_indices() {
         let width = escaped_len(character);
         if encoded + width > budget {
-            pieces.push(text[start..index].to_owned());
+            pieces.push(start..index);
             start = index;
             encoded = 0;
         }
         encoded += width;
     }
     if start < text.len() || pieces.is_empty() {
-        pieces.push(text[start..].to_owned());
+        pieces.push(start..text.len());
     }
     pieces
 }
@@ -472,7 +636,14 @@ pub struct FakeShutdown {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OBSERVATION_BYTES, split_text};
+    use super::{MAX_OBSERVATION_BYTES, split_ranges};
+
+    fn split_text(text: &str) -> Vec<String> {
+        split_ranges(text)
+            .into_iter()
+            .map(|range| text[range].to_owned())
+            .collect()
+    }
 
     /// Encoded bytes of the `assistant.text` payload Core commits for one piece.
     fn encoded(text: &str) -> usize {

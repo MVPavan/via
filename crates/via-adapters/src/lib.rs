@@ -146,8 +146,9 @@ mod runtime;
 
 pub use fake_config::FakeConfig;
 pub use runtime::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, FakeRecovery, FakeShutdown,
-    FakeTurnRecovery,
+    AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdmittedObservation, FakeRecovery,
+    FakeShutdown, FakeTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink,
+    observation_channel,
 };
 pub use via_routes::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,

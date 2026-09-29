@@ -1,31 +1,10 @@
-use std::{
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
-
 use thiserror::Error;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::watch,
-    time::timeout_at,
-};
+use tokio::sync::watch;
 
-use super::{
-    BoundedBytes, Deadline, PrivateProcessSpec, SendOutcome, VendorMessage, WireCleanup,
-    WireFailure,
-};
-use via_host::{
-    AcquireFailure, AcquiredProcess, CleanupEvidence, ExitReceiver, Host, LaunchPipes,
-    ProcessControl,
-};
+use super::{Deadline, PrivateProcessSpec, WireCleanup, WireFailure};
+use crate::connection::{self, Stragglers, Waits, WireConnection, cancelled};
+use via_host::{AcquireFailure, AcquiredProcess, CleanupEvidence, Host, LaunchPipes};
 use via_store::{EvidenceRoot, RuntimeResources};
-
-/// The prefix of an undecoded message VIA keeps (design §7.3).
-pub const UNDECODED_BYTES: usize = 64 * 1024;
-
-/// Bound on writing `undecoded.bin` (design §7.3).
-const UNDECODED_WRITE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an acquisition may still finish once its caller is cancelled: a
 /// normal one does, so its group is force-closed and proved absent; a stalled
@@ -34,12 +13,11 @@ const CANCELLED_ACQUIRE_GRACE: std::time::Duration = std::time::Duration::from_s
 
 /// The signals Route hands Wire for one connection (design §2).
 pub struct WireSignals {
-    /// The daemon force watch: once set, every wait on the vendor ends with
-    /// [`WireError::Cancelled`].
+    /// The daemon force watch: once set, the acquisition and
+    /// [`crate::WireMessages::next_message`] end with [`WireError::Cancelled`].
     pub force: watch::Receiver<Option<tokio::time::Instant>>,
-    /// Route's wake: each change ends the current wait on the vendor once
-    /// with [`WireError::Woken`], before any byte is read, so Route can act on
-    /// its turn's stop order without losing bytes.
+    /// Route's wake: each change ends the current `next_message` once with
+    /// [`WireError::Woken`]; queued messages are kept, so nothing is lost.
     pub wake: watch::Receiver<u64>,
     /// Host's pre-ARM gate (design §2 rule 1): true stops the launch.
     pub gate: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
@@ -58,6 +36,8 @@ pub struct RuntimeConfig {
 pub struct WireRuntime {
     evidence: EvidenceRoot,
     host: Host,
+    /// Connection tasks that missed their join bound (design §8.6).
+    stragglers: Stragglers,
 }
 
 impl WireRuntime {
@@ -65,7 +45,11 @@ impl WireRuntime {
     pub fn new(config: RuntimeConfig, resources: RuntimeResources) -> Result<Self, WireError> {
         let (evidence, journal) = resources.into_wire_parts();
         let host = Host::new(journal, config.anchor_binary, config.anchor_dir)?;
-        Ok(Self { evidence, host })
+        Ok(Self {
+            evidence,
+            host,
+            stragglers: Stragglers::default(),
+        })
     }
 
     /// Opens one private connection for the turn `spec.owner` names. First
@@ -88,19 +72,28 @@ impl WireRuntime {
             .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?
             .map_err(WireError::Evidence)?;
         spec.stderr_path = folder.join("stderr.log");
-        Box::pin(WireConnection::open(
-            &self.host, spec, folder, deadline, signals,
+        Box::pin(open(
+            &self.host,
+            spec,
+            folder,
+            deadline,
+            (signals, &self.stragglers),
         ))
         .await
     }
 
-    /// Drains Host controls and tasks before the Store owner is released.
+    /// Drains Host controls and tasks before the Store owner is released;
+    /// connection tasks still unjoined by `deadline` count as pending.
     pub async fn shutdown(
         &self,
         deadline: Deadline,
         turns: &[(via_store::SessionId, via_store::TurnNumber)],
     ) -> WireShutdown {
-        summarize_shutdown(self.host.shutdown(deadline, turns).await)
+        let mut summary = summarize_shutdown(self.host.shutdown(deadline, turns).await);
+        self.stragglers.join_until(deadline).await;
+        summary.pending_tasks += self.stragglers.pending();
+        summary.failed_tasks += self.stragglers.failed();
+        summary
     }
 
     /// Hands Host capacity for a group it did not launch (design §11).
@@ -281,332 +274,73 @@ pub enum WireError {
     Message(WireFailure),
 }
 
-/// Exclusive transport for one private fake process. The vendor's stderr is
-/// the turn's `stderr.log`, which Wire never reads.
-pub struct WireConnection {
-    stdin: Option<tokio::process::ChildStdin>,
-    stdout: tokio::process::ChildStdout,
-    stdout_eof: bool,
-    unterminated_stdout: bool,
-    buffered: Vec<u8>,
-    /// The turn's evidence folder.
-    folder: PathBuf,
-    /// The note of the first undecoded message kept (design §7.3).
-    undecoded: Option<String>,
-    control: ProcessControl,
-    exits: ExitReceiver,
-    /// Caller's cancel signal; checked only where waiting loses no bytes.
-    cancel: watch::Receiver<Option<tokio::time::Instant>>,
-    /// Route's wake, likewise checked only where waiting loses no bytes.
-    wake: watch::Receiver<u64>,
-}
-
-impl WireConnection {
-    /// Acquires one Host-owned process after the caller's durable submission intent.
-    async fn open(
-        host: &Host,
-        spec: PrivateProcessSpec,
-        folder: PathBuf,
-        deadline: Deadline,
-        signals: WireSignals,
-    ) -> Result<Self, WireError> {
-        let WireSignals {
-            force: mut cancel,
-            wake,
-            gate,
-        } = signals;
-        let launch = LaunchPipes::default();
-        // The gate is checked inside Host just before ARM: set by then,
-        // nothing launches.
-        let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &*gate));
-        let acquired = tokio::select! {
-            // A force already set when the acquisition's own result is observed
-            // came first.
-            biased;
-            () = cancelled(&mut cancel) => {
-                // After the force, a failure within the grace (including the
-                // acquisition deadline) is the force's, not its own cause.
-                match tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire).await {
-                    Ok(Ok(acquired)) => Ok(acquired),
-                    Ok(Err(failure)) => Err((WireError::Cancelled, evidence(&failure))),
-                    // Abandoned mid-way: nothing proved the group absent.
-                    Err(_) => Err((WireError::Cancelled, Evidence::abandoned())),
-                }
-            }
-            acquired = &mut acquire => acquired.map_err(|failure| {
-                let evidence = evidence(&failure);
-                (WireError::Host(failure.error), evidence)
-            }),
-        };
-        let AcquiredProcess {
-            pipes,
-            control,
-            exits,
-        } = match acquired {
-            Ok(acquired) => acquired,
-            Err((cause, evidence)) => {
-                // Dropping the acquisition closes its anchor control: an anchor
-                // that connected exits on EOF and stops its group, one that did
-                // not at its own bootstrap deadline; Host recovery reports what
-                // it can prove. After ARM the vendor pipes are still ours;
-                // nothing keeps their bytes, so they are dropped.
-                drop(acquire);
-                let launched = launch.take().is_some();
-                return Err(WireError::Acquire {
-                    cause: Box::new(cause),
-                    launched,
-                    cleanup: evidence.cleanup,
-                    forced: evidence.forced,
-                    journal_uncertain: evidence.journal_uncertain,
-                });
-            }
-        };
-        Ok(Self {
-            stdin: Some(pipes.stdin),
-            stdout: pipes.stdout,
-            stdout_eof: false,
-            unterminated_stdout: false,
-            buffered: Vec::new(),
-            folder,
-            undecoded: None,
-            control,
-            exits,
-            cancel,
-            wake,
-        })
-    }
-
-    /// Writes one input message.
-    pub async fn write_message(
-        &mut self,
-        message: &[u8],
-        deadline: Deadline,
-    ) -> Result<SendOutcome, WireError> {
-        let mut written = 0;
-        while written < message.len() {
-            let Some(stdin) = self.stdin.as_mut() else {
-                return Ok(SendOutcome::NotWritten);
-            };
-            // A pipe write is cancel-safe: a cancelled one wrote nothing.
-            let write = tokio::select! {
-                biased;
-                () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
-                write = timeout_at(deadline.instant(), stdin.write(&message[written..])) => write,
-            };
-            let next = match write {
-                Ok(Ok(0)) => {
-                    self.stdin.take();
-                    return Ok(if written == 0 {
-                        SendOutcome::NotWritten
-                    } else {
-                        SendOutcome::Indeterminate
-                    });
-                }
-                Ok(Ok(count)) => count,
-                Ok(Err(error)) => {
-                    self.stdin.take();
-                    return Err(WireError::Io(error));
-                }
-                Err(_) => {
-                    self.stdin.take();
-                    return Ok(SendOutcome::Indeterminate);
-                }
-            };
-            written += next;
-        }
-        // The whole input message (in S1 first the start carrying the prompt) is in the
-        // vendor's stdin; nothing it answered is read yet.
-        #[cfg(feature = "test-failpoints")]
-        via_store::failpoint::hit_async("wire.prompt.after_write")
-            .await
-            .map_err(WireError::Io)?;
-        Ok(SendOutcome::Written)
-    }
-
-    /// Drops only vendor stdin; output drains and Host supervision remain live.
-    pub async fn close_input(&mut self, deadline: Deadline) -> Result<(), WireError> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Ok(());
-        };
-        let result = timeout_at(deadline.instant(), stdin.shutdown()).await;
-        self.stdin.take();
-        result
-            .map_err(|_| WireError::Deadline)?
-            .map_err(WireError::Io)
-    }
-
-    /// Returns the next complete stdout message. A line over the cap and an
-    /// unterminated tail at EOF are kept in `undecoded.bin` first (design
-    /// §7.3); [`Self::take_undecoded`] then names them.
-    pub async fn next_message(
-        &mut self,
-        deadline: Deadline,
-    ) -> Result<Option<VendorMessage>, WireError> {
-        loop {
-            if let Some(index) = self.buffered.iter().position(|byte| *byte == b'\n') {
-                if index >= super::MAX_STDOUT_MESSAGE_BYTES {
-                    return Err(self.too_large().await);
-                }
-                let bytes: Vec<u8> = self.buffered.drain(..=index).collect();
-                let bounded = BoundedBytes::try_from_message(bytes).map_err(WireError::Message)?;
-                return Ok(Some(VendorMessage::new(bounded)));
-            }
-            if self.buffered.len() > super::MAX_STDOUT_MESSAGE_BYTES {
-                return Err(self.too_large().await);
-            }
-            if self.stdout_eof && !self.buffered.is_empty() {
-                self.unterminated_stdout = true;
-                let tail = std::mem::take(&mut self.buffered);
-                let length = tail.len();
-                self.keep_undecoded(
-                    &tail,
-                    &format!("unterminated vendor message: {length} bytes"),
-                )
-                .await;
-            }
-            if self.stdout_eof {
-                return if self.unterminated_stdout {
-                    Err(WireError::Message(WireFailure::UnterminatedMessage))
-                } else {
-                    Ok(None)
-                };
-            }
-            Box::pin(self.read_stdout(deadline, false)).await?;
-        }
-    }
-
-    /// Keeps the over-cap line's first bytes from the assembly buffer.
-    async fn too_large(&mut self) -> WireError {
-        let line = std::mem::take(&mut self.buffered);
-        self.keep_undecoded(
-            &line,
-            &format!(
-                "vendor message over the {} byte cap",
-                super::MAX_STDOUT_MESSAGE_BYTES
-            ),
-        )
-        .await;
-        WireError::Message(WireFailure::MessageTooLarge)
-    }
-
-    /// Writes the first 64 KiB of a message VIA cannot decode to the turn's
-    /// `undecoded.bin` (design §7.3): `create_new`, so the first failure
-    /// wins, one write on the blocking pool bounded by 2 s. `what` describes
-    /// the message; the note it becomes names the file or the error, and is
-    /// kept for [`Self::take_undecoded`]. Best effort: nothing fails here.
-    pub async fn keep_undecoded(&mut self, bytes: &[u8], what: &str) {
-        if self.undecoded.is_some() {
-            return;
-        }
-        let path = self.folder.join("undecoded.bin");
-        let prefix = bytes[..bytes.len().min(UNDECODED_BYTES)].to_vec();
-        let kept = prefix.len();
-        let target = path.clone();
-        let write = tokio::task::spawn_blocking(move || write_new(&target, &prefix));
-        let note = match tokio::time::timeout(UNDECODED_WRITE, write).await {
-            Ok(Ok(Ok(()))) => format!("{what}; first {kept} in {}", path.display()),
-            Ok(Ok(Err(error))) => format!("{what}; not saved: {error}"),
-            Ok(Err(error)) => format!("{what}; not saved: {error}"),
-            Err(_) => format!("{what}; not saved: the write outlived 2 s"),
-        };
-        self.undecoded = Some(note);
-    }
-
-    /// The note of the undecoded message kept for this turn, once.
-    pub fn take_undecoded(&mut self) -> Option<String> {
-        self.undecoded.take()
-    }
-
-    /// Reads and discards stdout until EOF or the cleanup deadline, after a
-    /// failure, so the vendor never blocks on a full pipe while its group
-    /// stops. Nothing is kept.
-    pub async fn drain_to_eof(&mut self, deadline: Deadline) {
-        self.stdin.take();
-        self.buffered.clear();
-        while !self.stdout_eof {
-            // A read that is always ready must not extend the drain past its bound.
-            if tokio::time::Instant::now() >= deadline.instant()
-                || Box::pin(self.read_stdout(deadline, true)).await.is_err()
-            {
-                break;
+/// Acquires one Host-owned process after the caller's durable submission
+/// intent, then starts its reader and writer tasks.
+async fn open(
+    host: &Host,
+    spec: PrivateProcessSpec,
+    folder: std::path::PathBuf,
+    deadline: Deadline,
+    (signals, stragglers): (WireSignals, &Stragglers),
+) -> Result<WireConnection, WireError> {
+    let WireSignals {
+        force: mut cancel,
+        wake,
+        gate,
+    } = signals;
+    let launch = LaunchPipes::default();
+    // The gate is checked inside Host just before ARM: set by then,
+    // nothing launches.
+    let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &*gate));
+    let acquired = tokio::select! {
+        // A force already set when the acquisition's own result is observed
+        // came first.
+        biased;
+        () = cancelled(&mut cancel) => {
+            // After the force, a failure within the grace (including the
+            // acquisition deadline) is the force's, not its own cause.
+            match tokio::time::timeout(CANCELLED_ACQUIRE_GRACE, &mut acquire).await {
+                Ok(Ok(acquired)) => Ok(acquired),
+                Ok(Err(failure)) => Err((WireError::Cancelled, evidence(&failure))),
+                // Abandoned mid-way: nothing proved the group absent.
+                Err(_) => Err((WireError::Cancelled, Evidence::abandoned())),
             }
         }
-    }
-
-    /// Reads one stdout chunk of at most 8 KiB into the assembly buffer, or
-    /// discards it in drain mode. Outside drain mode the cancel signal and
-    /// Route's wake end the wait before any byte is read.
-    async fn read_stdout(&mut self, deadline: Deadline, drain: bool) -> Result<(), WireError> {
-        let mut out = [0; 8192];
-        tokio::select! {
-            () = cancelled(&mut self.cancel), if !drain => return Err(WireError::Cancelled),
-            () = woken(&mut self.wake), if !drain => return Err(WireError::Woken),
-            read = timeout_at(deadline.instant(), self.stdout.read(&mut out)) => {
-                let count = read.map_err(|_| WireError::Deadline)??;
-                if count == 0 {
-                    self.stdout_eof = true;
-                } else if !drain {
-                    self.buffered.extend_from_slice(&out[..count]);
-                }
-            }
+        acquired = &mut acquire => acquired.map_err(|failure| {
+            let evidence = evidence(&failure);
+            (WireError::Host(failure.error), evidence)
+        }),
+    };
+    let AcquiredProcess {
+        pipes,
+        control,
+        exits,
+    } = match acquired {
+        Ok(acquired) => acquired,
+        Err((cause, evidence)) => {
+            // Dropping the acquisition closes its anchor control: an anchor
+            // that connected exits on EOF and stops its group, one that did
+            // not at its own bootstrap deadline; Host recovery reports what
+            // it can prove. After ARM the vendor pipes are still ours;
+            // nothing keeps their bytes, so they are dropped.
+            drop(acquire);
+            let launched = launch.take().is_some();
+            return Err(WireError::Acquire {
+                cause: Box::new(cause),
+                launched,
+                cleanup: evidence.cleanup,
+                forced: evidence.forced,
+                journal_uncertain: evidence.journal_uncertain,
+            });
         }
-        Ok(())
-    }
-
-    /// Observes Host-confirmed vendor exit without treating a terminal message as exit proof.
-    pub async fn wait_exit(&mut self, deadline: Deadline) -> Result<super::ExitReport, WireError> {
-        loop {
-            // Copied out so no watch guard is held across the test seam's await.
-            let recorded = *self.exits.borrow();
-            if let Some(exit) = recorded {
-                // A recorded exit is returned without consulting `cancel`: the
-                // caller must read the daemon force after it (design §6.8).
-                // Test builds pause here, exit recorded and not yet returned.
-                #[cfg(feature = "test-failpoints")]
-                via_store::failpoint::hit_async("wire.exit.observed")
-                    .await
-                    .map_err(WireError::Io)?;
-                return Ok(exit);
-            }
-            let changed = tokio::select! {
-                () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
-                () = woken(&mut self.wake) => return Err(WireError::Woken),
-                changed = timeout_at(deadline.instant(), self.exits.changed()) => changed,
-            };
-            changed
-                .map_err(|_| WireError::Deadline)?
-                // Host dropped its exit supervision: transport loss, not a deadline.
-                .map_err(|_| WireError::Message(WireFailure::Transport))?;
-        }
-    }
-
-    /// Requests Host cleanup through the verified anchor.
-    pub async fn close(&self, request: super::CloseRequest) -> WireCloseReport {
-        let report = self.control.close(request).await;
-        WireCloseReport {
-            cleanup: wire_cleanup(&report.cleanup),
-            vendor_exit: report.vendor_exit,
-            forced: report.forced,
-            journal_uncertain: report.journal_uncertain,
-        }
-    }
-}
-
-/// Creates `path` (new, 0600) holding `bytes`, then syncs it and its
-/// folder, so the failure message may name it (coding style §7 "Write
-/// order"). `create_new` is `O_EXCL`, which never follows a symlink.
-fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    let folder = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("undecoded.bin has no folder"))?;
-    std::fs::File::open(folder)?.sync_all()
+    };
+    let waits = Waits {
+        force: cancel,
+        wake,
+    };
+    Ok(connection::open(
+        pipes, control, exits, folder, waits, stragglers,
+    ))
 }
 
 /// Host's evidence from a failed acquisition, as Wire passes it up.
@@ -635,24 +369,10 @@ fn evidence(failure: &AcquireFailure) -> Evidence {
     }
 }
 
-fn wire_cleanup(cleanup: &CleanupEvidence) -> WireCleanup {
+pub(crate) fn wire_cleanup(cleanup: &CleanupEvidence) -> WireCleanup {
     match cleanup {
         CleanupEvidence::GroupAbsent(_) => WireCleanup::Quiescent,
         CleanupEvidence::Uncertain(_) => WireCleanup::Uncertain,
-    }
-}
-
-/// Resolves on the next change of Route's wake; never once its sender is gone.
-async fn woken(wake: &mut watch::Receiver<u64>) {
-    if wake.changed().await.is_err() {
-        std::future::pending::<()>().await;
-    }
-}
-
-/// Resolves once `cancel` is set; never when its sender is gone unset.
-async fn cancelled(cancel: &mut watch::Receiver<Option<tokio::time::Instant>>) {
-    if cancel.wait_for(Option::is_some).await.is_err() {
-        std::future::pending::<()>().await;
     }
 }
 
@@ -714,9 +434,11 @@ pub struct WireShutdown {
     pub anchors: usize,
     /// Reconciled anchors without positive absence proof.
     pub uncertain_anchors: usize,
-    /// Host-owned child/status tasks not joined by the bounded deadline.
+    /// Host-owned child/status tasks and connection tasks not joined by the
+    /// bounded deadline.
     pub pending_tasks: usize,
-    /// Host-owned tasks that panicked, were cancelled or failed their child wait.
+    /// Host-owned tasks that panicked, were cancelled or failed their child
+    /// wait, and connection tasks that panicked.
     pub failed_tasks: usize,
     /// Bounded description of the deadline, Store or recovery failure, if any.
     pub failure: Option<String>,
@@ -744,63 +466,5 @@ mod shutdown_tests {
                 .failure
                 .is_some_and(|failure| failure.contains("journal"))
         );
-    }
-}
-
-#[cfg(test)]
-mod undecoded_tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use super::*;
-
-    /// A private scratch folder, removed on drop.
-    struct Scratch(std::path::PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(name: &str) -> std::io::Result<Scratch> {
-        let dir = std::env::temp_dir().join(format!(
-            "via-wire-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir(&dir)?;
-        Ok(Scratch(dir))
-    }
-
-    /// Coding style §7 "Write order": the file and its folder are synced
-    /// before the failure note names the file. A folder that can be written
-    /// but not opened for its sync makes the save fail.
-    #[test]
-    #[expect(
-        clippy::print_stderr,
-        reason = "a skipped check under root is reported"
-    )]
-    fn a_saved_undecoded_file_is_synced_with_its_folder() -> std::io::Result<()> {
-        let folder = scratch("synced")?;
-        let saved = folder.0.join("undecoded.bin");
-        write_new(&saved, b"head")?;
-        assert_eq!(std::fs::read(&saved)?, b"head");
-        std::fs::remove_file(&saved)?;
-        // Write and search only: the file can be created, the folder not
-        // opened to sync it.
-        std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o300))?;
-        // Root (CAP_DAC_OVERRIDE) opens the folder anyway: the premise fails.
-        let bypassed = std::fs::File::open(&folder.0).is_ok();
-        let unsynced = write_new(&saved, b"head");
-        std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o700))?;
-        if bypassed {
-            eprintln!("skipped: this process bypasses file permissions (root)");
-        } else {
-            assert!(unsynced.is_err(), "an unsynced folder was reported saved");
-        }
-        Ok(())
     }
 }

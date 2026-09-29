@@ -215,7 +215,7 @@ Each client response routes by request ID; each known notification routes
 by exact `threadId` and, where present, `turnId`. Server requests additionally
 carry their own request IDs. Install registrations before releasing a
 thread response to its driver. Bound pre-registration buffering by the
-existing 64-message/4 MiB connection staging limit. Lookup includes retained
+existing 1,024-message/4 MiB connection staging limit. Lookup includes retained
 correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
@@ -266,7 +266,7 @@ its `items` is not completion evidence. `error {willRetry:true}` is progress
 diagnostic, not a terminal failure. Core applies disposition precedence.
 
 Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
-64 KiB pipe buffers, 64 messages/4 MiB per connection, C2 1024 observations/4 MiB per
+64 KiB pipe buffers, 1,024 messages/4 MiB per connection, C2 1024 observations/4 MiB per
 session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
 256 KiB encoded; unknown notifications are activity only.
@@ -276,7 +276,7 @@ runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging
 into per-thread ingress lanes, each capped at 16 messages/1 MiB within the
-unchanged 64-message/4 MiB connection aggregate; this adds no buffer tier.
+unchanged 1,024-message/4 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting

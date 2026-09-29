@@ -294,7 +294,7 @@ before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure
 and cleanup evidence remain deliverable when observations are saturated.
 
-For Codex shared stdio, Route partitions its existing 64-message/4 MiB
+For Codex shared stdio, Route partitions its existing 1,024-message/4 MiB
 message staging into per-thread ingress lanes capped at 16 messages/1 MiB,
 before C2 observations. This adds no extra buffer tier. The first full lane
 immediately quarantines that thread generation, with sticky overflow health

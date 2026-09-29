@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, Deadline, FakeConfig,
     FakeObservation, FakeTerminalEvidence, RouteError, RouteFailure, RuntimeConfig, SessionId,
@@ -159,7 +159,7 @@ impl Child {
         ),
         mut on_observation: impl FnMut(&watch::Sender<Option<StopOrder>>, &FakeObservation),
     ) -> Outcome {
-        let (sender, mut receiver) = mpsc::channel(4);
+        let (sender, mut receiver) = via_adapters::observation_channel();
         let deadline = Deadline::at(tokio::time::Instant::now() + turn);
         let (_force, force) = watch::channel(None);
         let (order, orders) = stop;
@@ -177,7 +177,7 @@ impl Child {
             tokio::pin!(execute);
             loop {
                 tokio::select! {
-                    Some(observation) = receiver.recv() => on_observation(&order, &observation),
+                    Some(admitted) = receiver.recv() => on_observation(&order, &admitted.observation),
                     result = &mut execute => break result,
                 }
             }

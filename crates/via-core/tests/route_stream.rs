@@ -22,7 +22,6 @@ use std::{
 mod stand_in_anchor;
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Deadline, FakeConfig, FakeObservation,
     Observation, RouteError, RuntimeConfig, SessionId, ToolStatus, TurnNumber,
@@ -153,7 +152,7 @@ impl Child {
             adapter,
             runtime,
         } = self;
-        let (sender, mut receiver) = mpsc::channel(4);
+        let (sender, mut receiver) = via_adapters::observation_channel();
         let deadline = Deadline::at(tokio::time::Instant::now() + turn);
         let mut observed = Vec::new();
         // Never set: these turns are not force-stopped.
@@ -172,13 +171,13 @@ impl Child {
             tokio::pin!(execute);
             loop {
                 tokio::select! {
-                    Some(observation) = receiver.recv() => {
-                        on_observation(store, root, &observation);
-                        observed.push(observation);
+                    Some(admitted) = receiver.recv() => {
+                        on_observation(store, root, &admitted.observation);
+                        observed.push(admitted.observation);
                     }
                     result = &mut execute => {
-                        while let Ok(observation) = receiver.try_recv() {
-                            observed.push(observation);
+                        while let Ok(admitted) = receiver.try_recv() {
+                            observed.push(admitted.observation);
                         }
                         break result.map(|_| ());
                     }
@@ -268,28 +267,40 @@ fn route_forwards_every_observation_in_order() {
     }
 }
 
+/// Writes the first 1,000 lines at once, then the rest: Wire's queue holds
+/// 1,024 messages (A47), and this child's current-thread runtime lets the
+/// reader take a whole burst before Route runs, so one burst of all
+/// 1,045 lines fails `overflow` by design (§8.2).
+const TWO_BURSTS: &str = "read -r start
+/usr/bin/head -n 1000 \"$VIA_FAKE_SCENARIO\"
+sleep 0.2
+/usr/bin/tail -n +1001 \"$VIA_FAKE_SCENARIO\"
+printf 'unterminated tail'
+exec sleep 30
+";
+
 /// W4-H Sol 2: a force while Route waits for observation capacity (the
 /// consumer is not draining) still reaches Route's bounded force close and
-/// drain, and the turn ends `ForceStopped` well before its deadline.
+/// drain, and the turn ends `ForceStopped` well before its deadline. Task 4
+/// design §2.3: the channel holds 1,024 items, so the vendor sends 20 more.
 #[test]
 fn force_while_forwarding_is_blocked_ends_the_turn() {
     let mut lines = vec![json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
     lines.extend(
-        (0..300).map(
+        (0..via_adapters::OBSERVATION_ITEMS + 20).map(
             |n| json!({"type":"text","vendor_turn_id":"fake-turn-1","text":format!("line {n}")}),
         ),
     );
     let Some(root) = child_root() else {
         return run_child(
             "force_while_forwarding_is_blocked_ends_the_turn",
-            "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO\"\nprintf 'unterminated tail'\nexec sleep 30\n",
+            TWO_BURSTS,
             &lines,
         );
     };
     let child = Child::open(&root);
     // Never read: the adapter and then Route block on observation capacity.
-    let (sender, _receiver) = mpsc::channel(1);
-    let probe = sender.clone();
+    let (sender, receiver) = via_adapters::observation_channel();
     let (force_tx, force) = tokio::sync::watch::channel(None);
     let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
     let (result, elapsed) = child.runtime.block_on(async {
@@ -307,7 +318,7 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
         // Force only once backpressure is observed: the channel is full, so the
         // adapter's next delivery waits for capacity (W4-H Sol r2).
         let observed = tokio::time::Instant::now() + Duration::from_secs(10);
-        while probe.capacity() > 0 {
+        while receiver.len() < via_adapters::OBSERVATION_ITEMS {
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), &mut execute)
                     .await
@@ -324,8 +335,8 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
             "the blocked turn must still be running"
         );
         assert_eq!(
-            probe.capacity(),
-            0,
+            receiver.len(),
+            via_adapters::OBSERVATION_ITEMS,
             "the observation channel must stay full"
         );
         let forced_at = tokio::time::Instant::now();
@@ -359,7 +370,7 @@ fn post_arm_acquisition_deadline_keeps_its_cause() {
     let anchor = root.join("stand-in-anchor");
     stand_in_anchor::AfterArm::Stall { line: LINE }.install(&anchor);
     let child = Child::open_with_anchor(&root, anchor);
-    let (sender, _receiver) = mpsc::channel(4);
+    let (sender, _receiver) = via_adapters::observation_channel();
     // Never set: this failure is the acquisition deadline, not a force.
     let (_force, force) = tokio::sync::watch::channel(None);
     let result = child.runtime.block_on(async {
@@ -406,7 +417,7 @@ fn stalled_acquisition_with_force(
     }
     .install(&anchor);
     let child = Child::open_with_anchor(&root, anchor);
-    let (sender, _receiver) = mpsc::channel(4);
+    let (sender, _receiver) = via_adapters::observation_channel();
     let (force_tx, force) = tokio::sync::watch::channel(None);
     let result = child.runtime.block_on(async {
         let deadline = tokio::time::Instant::now() + deadline;

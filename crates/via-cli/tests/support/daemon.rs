@@ -144,7 +144,18 @@ pub(crate) struct Daemon<'a> {
 
 impl<'a> Daemon<'a> {
     pub(crate) fn start(sandbox: &'a Sandbox, evidence: &Evidence) -> Result<Self, ScenarioError> {
+        Self::start_with(sandbox, evidence, |_| {})
+    }
+
+    /// [`Self::start`] with extra daemon environment, such as failpoint
+    /// activation or a lowered test bound.
+    pub(crate) fn start_with(
+        sandbox: &'a Sandbox,
+        evidence: &Evidence,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Self, ScenarioError> {
         let mut command = sandbox.command();
+        configure(&mut command);
         command
             .arg("daemon")
             .stdin(Stdio::null())

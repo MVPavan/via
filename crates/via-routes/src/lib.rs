@@ -4,7 +4,9 @@
 use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use thiserror::Error;
 
-pub use via_wire::{AnchorCohort, CloseRequest, Deadline, ExitReport, SendOutcome, TurnNumber};
+pub use via_wire::{
+    AnchorCohort, CloseRequest, Deadline, ExitReport, OutboundMessage, SendOutcome, TurnNumber,
+};
 
 /// Maximum bytes retained for an unknown fake notification's raw payload.
 pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;
@@ -13,55 +15,21 @@ pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;
 /// any other known payload above it fails the turn as a protocol error.
 pub const MAX_OBSERVATION_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-enum StartTag {
-    #[serde(rename = "start")]
-    Start,
-}
-
-fn start_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
-    let id = u8::deserialize(deserializer)?;
-    if id == 1 {
-        Ok(id)
-    } else {
-        Err(serde::de::Error::custom("start id must be 1"))
-    }
-}
-
-fn vendor_session_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    if value.is_empty() {
-        Err(serde::de::Error::custom(
-            "fake vendor session id cannot be empty",
-        ))
-    } else {
-        Ok(value)
-    }
-}
-
-/// One typed prompt submission on a private fake connection.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FakeStart {
-    #[serde(rename = "type")]
-    kind: StartTag,
-    #[serde(deserialize_with = "start_id")]
-    id: u8,
-    #[serde(deserialize_with = "vendor_session_id")]
+/// The one prompt submission of a private fake connection. Wire streams it
+/// without a second whole copy of the prompt (Task 4 design §8.3).
+pub struct TurnStart {
     session_id: String,
     turn: TurnNumber,
     prompt: String,
 }
 
-impl FakeStart {
+impl TurnStart {
     /// Creates the only allowed start request for a connection.
     pub fn new(session_id: String, turn: TurnNumber, prompt: String) -> Result<Self, &'static str> {
         if session_id.is_empty() {
             return Err("fake vendor session id cannot be empty");
         }
         Ok(Self {
-            kind: StartTag::Start,
-            id: 1,
             session_id,
             turn,
             prompt,
@@ -76,6 +44,38 @@ impl FakeStart {
     /// Returns the canonical turn number.
     pub fn turn(&self) -> TurnNumber {
         self.turn
+    }
+
+    /// The start as Wire writes it, one JSON line:
+    /// `{"type":"start","id":1,"session_id":…,"turn":…,"prompt":"…"}`, the
+    /// prompt escaped slice by slice.
+    pub fn into_message(self) -> Result<OutboundMessage, RouteError> {
+        let session_id =
+            serde_json::to_string(&self.session_id).map_err(|_| RouteError::Protocol {
+                turn: self.turn,
+                detail: "cannot encode fake start",
+            })?;
+        Ok(OutboundMessage::Start {
+            prefix: format!(
+                r#"{{"type":"start","id":1,"session_id":{session_id},"turn":{},"prompt":""#,
+                self.turn.get()
+            )
+            .into_bytes(),
+            prompt: self.prompt,
+            suffix: b"\"}\n".to_vec(),
+            escape: escape_json,
+        })
+    }
+}
+
+/// Appends `slice` as the contents of a JSON string, escaped as `serde_json`
+/// writes it.
+fn escape_json(slice: &str, piece: &mut Vec<u8>) {
+    let start = piece.len();
+    if serde_json::to_writer(&mut *piece, slice).is_ok() {
+        // Drop the quotes around the string.
+        piece.remove(start);
+        piece.pop();
     }
 }
 

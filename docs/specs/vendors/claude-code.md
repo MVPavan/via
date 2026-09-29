@@ -297,7 +297,7 @@ the unanswered request and protocol failure; do not claim a delivered decline.
 a partial write is uncertain. Failed response/cleanup cannot hang
 the session or be counted as a passing auto-decline test.
 
-Carry runtime §8 ceilings unchanged: 1 MiB inbound vendor message; 64 messages/4 MiB route
+Carry runtime §8 ceilings unchanged: 1 MiB inbound vendor message; 1,024 messages/4 MiB route
 data; 1024 observations/4 MiB; 256 KiB known observation (final text in pieces);
 one data command and eight controls
 (64 KiB total); 1 MiB envelope. Controls and sticky health bypass blocked normal
