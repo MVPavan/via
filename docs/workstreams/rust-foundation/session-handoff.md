@@ -141,9 +141,19 @@ the historical checkpoint; its findings table is updated by this section.
   including memory-pool liveness: tokio's fair semaphore lets a waiting
   acquire take every free permit. It also has recommended simplifications
   (drop A34 for a receiver drop; completed final text only) and owner
-  questions, including the new N1–N5. **Waiting on the owner.** Next: one
-  Opus 5.5 high revision round, a Sol high review of that change set, the
-  merge of `wt/t4-0`, the spec amendments, then slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  questions, including the new N1–N5. The owner then revised the
+  requirements (r16 marks in [t4/requirements.md](t4/requirements.md)):
+  - no VIA raw log: the agents keep their own transcripts, and VIA keeps a
+    per-turn evidence folder instead (D4 revised);
+  - no memory pool, since memory is bounded by construction;
+  - 1 MiB request lines, with a prompt file for larger prompts;
+  - a disk free-space floor instead of budgets;
+  - the vendor's own `steps` in the envelope;
+  - `list` in creation order, with `last_active_at` on each row.
+
+  Now: round 16 (Opus 5.5 high, [t4/design-r16-decisions.md](t4/design-r16-decisions.md)),
+  then one Sol high review, a report to the owner, the merge of `wt/t4-0`,
+  the spec amendments, and slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From

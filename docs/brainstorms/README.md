@@ -423,6 +423,11 @@ compact constraint list is [`.repo-context/invariants.md`](../../.repo-context/i
   connection. L3/L4 split normalized events per turn by vendor session id,
   with raw offsets. `via logs` shows only the requested session's or turn's
   events; C2 promises per-session order only.
+  **Revised 2026-09-29 (owner):** VIA keeps no raw log. It reads vendor
+  streams live and keeps, per turn, an evidence folder (the agent's stderr,
+  a message it could not understand, the vendor's debug file) plus the
+  vendor session ID and transcript path. `logs` returns those locations. See
+  `docs/workstreams/rust-foundation/t4/requirements.md` R8.
 - **D5 — vocabulary (clarified 2026-09-26):** A session is a resumable
   conversation and owns its queue, route, adapter version and caller handle.
   Its route and adapter version stay fixed for life; its permission bound
