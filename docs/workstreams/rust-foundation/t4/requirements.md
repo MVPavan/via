@@ -106,6 +106,17 @@ accounting was not converging):
 
 `via-d9o.2.3` verifies these bounds thoroughly in end-to-end testing.
 
+Thresholds are configuration (owner decision 2026-09-29). Build the
+mechanisms, but do not fix the values until real use is measured:
+- Every memory and disk threshold is a key in a daemon config file, with
+  provisional defaults: pool size, class charges, disk budgets, headrooms,
+  and WAL limit and triggers.
+- The daemon reads the file at start, so a changed value takes effect at the
+  next daemon start. Invalid values refuse to start with a named error.
+- C1 API limits are not configurable.
+- A write may overshoot a disk budget by at most one bounded transaction.
+- Task: `via-jm4.7.8.1`.
+
 ## Non-goals
 
 - Human live viewing.
