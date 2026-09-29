@@ -87,7 +87,7 @@ its `JoinSet`, and stops, drains and joins it within a bound.
 | `via.log` | `DaemonLog` (the daemon's `tracing` writer) | daemon start, after both locks | any daemon task, one line at a time | daemon exit | rotated at start past 10 MiB (§7.6) |
 | `ConnectionLatch` | Wire, per connection | `open_connection` | reader, stdin writer | last holder after `finish` | §8.4 |
 | Reader and stdin-writer tasks | `WireMessages` | `open_connection` | the tasks | `finish` | §8.6 |
-| Message queue | `WireMessages` | `open_connection` | stdout reader | `next_message` or `finish` | 64 messages, 4 MiB |
+| Message queue | `WireMessages` | `open_connection` | stdout reader | `next_message` or `finish` | 1,024 messages, 4 MiB (A47) |
 | Route → Adapter hop | Adapter `execute` | per drive | Route | end of `execute` | 1 message |
 | Observation channel and byte semaphore | Core drive | per drive | Adapter | end of the drive | 1024 items, 4 MiB |
 | Stall timer | Adapter pending delivery | first blocked send | Adapter | that item accepted, or 10 s | one per drive |
@@ -489,7 +489,7 @@ sum and allows 1.25 × it (Q-R16-1, accepted [t4r16.7.4]).
 | Holder | Count, fixed by | Largest buffers each | Each | Total |
 |---|---|---|---|---|
 | C1 socket | 32: the accept loop's `Semaphore(32)` (§10.1), one request at a time | the line (1 MiB); its decode: serde's scratch (≤ the longest string), decoded strings and `Box<RawValue>` copies (≤ the line), list headers (65,536 nodes × 24 B, doubled for `Vec` growth); the reply, built after those are dropped (≤ 1 MiB + 512 B); one 64 KiB blob chunk while copying a prompt file or comparing a replay | 6 MiB | 192 MiB |
-| Wire connection | 4: `CONNECTION_SLOTS` (`crates/via-core/src/engine/queue.rs:33` [V]) | read buffer 64 KiB; assembly buffer, one message (1 MiB); queue, 64 messages and 4 MiB; the message Route holds (1 MiB); stdin piece buffer (96 KiB) and control queue (64 KiB); undecoded-message write (64 KiB) | 6.3 MiB | 25 MiB |
+| Wire connection | 4: `CONNECTION_SLOTS` (`crates/via-core/src/engine/queue.rs:33` [V]) | read buffer 64 KiB; assembly buffer, one message (1 MiB); queue, 1,024 messages and 4 MiB (A47); the message Route holds (1 MiB); stdin piece buffer (96 KiB) and control queue (64 KiB); undecoded-message write (64 KiB) | 6.3 MiB | 25 MiB |
 | Running turn (Route, Adapter, Core drive) | 4: one per connection slot | hop (1 MiB) and decoded struct (≤ 1 MiB); observations 4 MiB (C2 A1); envelope accumulation (inline final text 256 KiB, lists 500 KiB) and its terminal encoding (1 MiB); step tracker, copy and carried rows (270 KiB); the dispatched prompt (≤ 16 MiB, §10.4) until its start is written | 24.1 MiB | 96.3 MiB |
 | Store | 1 | lanes 8 MiB (§6.1); the command or page in hand (≤ 2.3 MiB, §6.4); page cache 8 MiB (`cache_size=-8192`, `crates/via-store/src/runtime/sql.rs:140` [V]) | 18.3 MiB | 18.3 MiB |
 | **Sum** | | | | **≈ 332 MiB [I]** |
@@ -980,7 +980,7 @@ deadline)`). Both belong to the turn. `VendorMessage` is its bytes alone.
 One task reads stdout up to 64 KiB into its fixed buffer and never awaits a
 consumer or the Store (runtime §4, coding-style §5). A `LineSplitter` splits
 on LF; an unfinished message goes to the 1 MiB assembly buffer; at LF the
-message is counted against the 64-message / 4 MiB queue and sent with
+message is counted against the 1,024-message / 4 MiB queue (A47) and sent with
 `try_send`. A message over 1 MiB is `MessageTooLarge` (prefix saved, §7.3);
 a full queue is `Reader(Overflow)`. Either switches the reader to discard
 mode: read to EOF, count discarded bytes, keep nothing, so the vendor never
@@ -1238,6 +1238,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A36 memory pool and disk budgets | **withdrawn** [t4r16.2, t4r16.3]; A42, A43 |
 | A37 daemon config | revised: five keys |
 | A30, A39, A42 | revised in round 17 [t4r17.1–3]; A46 is new [t4r17.5] |
+| A47 Wire queue count | new during implementation (T4-3, 2026-09-29) |
 
 ### 12.2 Amendments
 
@@ -1650,6 +1651,24 @@ or history (the runtime §10 audit, RT `:1135`).
 | T3 raw-failure test (`t3/design.md:1756`, `s1_f12_raw_failure_records_incomplete`) and seam row (`:1632`) | void: there is no raw append to fail. The decisions file cites `:1754`, which is the event test A24 rewrites; the raw-failure test is `:1756` |
 | T3, other raw text | void: §2 rule 3's raw evidence failure (`:232-233`) and `raw_incomplete` (`:241`); `:288`; `:616`; `state/raw` (`:640`); the raw thread in §7.1 (`:1057`, `:1074`, `:1083`); row 5's intermediate `raw_log.incomplete` (`:1155`); `raw_failed` (`:1393`); the terminal record's `raw_log.incomplete` (`:1584-1585`); `s1_f21`'s "partial bytes in the raw log" (`:1709`; the partial line is now `undecoded.bin`); `s1_f09`'s `raw_log_incomplete` warning (`:1723`); T3's quoted runtime text (`:1889`, `:1907`) and its slice plan (`:2008`, `:2080`, `:2087-2088`) are history |
 | Code | the recovery procedure (`crates/via-core/src/engine/recovery.rs:393-522`), the drive's raw terminal (`crates/via-core/src/engine/drive.rs:672-760`, `:1176-1224`), `crates/via-core/src/engine/journal.rs:443-467`, `crates/via-core/src/engine.rs:176-177`, `:465`; tests `crates/via-core/tests/route_stop.rs:366-423`, `crates/via-core/tests/route_stream.rs`, `crates/via-core/tests/force_stop.rs:241-245`, `crates/via-cli/tests/evidence_collector.rs:50-61` |
+
+**T4-A47. Wire message queue: 1,024 messages** (implementation, T4-3,
+2026-09-29). The stdout reader reads up to 64 KiB at a time and queues every
+complete message in it without waiting (§8.2). At 64 messages, one read of
+small lines filled the queue before the consumer ran: in the T4-3 daemon
+check, 1,040 small lines failed a healthy turn `overflow` in 241 ms. The
+queue becomes 1,024 messages and 4 MiB, the same count as C2's observation
+limit. Pipe reads still never wait for consumers, a saturated queue still
+fails the connection `overflow`, and memory stays bounded by the 4 MiB byte
+cap (the added slots cost about 32 KiB per connection; §5.1 totals are
+unchanged at their precision). Real vendors' burst sizes are measured with
+the other §16 items in `via-d9o.2.3`.
+
+| Location | Edit |
+|---|---|
+| RT §8 row "Route message staging" (`runtime-contracts.md`) | "64 messages and 4 MiB/connection" becomes "1,024 messages and 4 MiB/connection" |
+| C2 Codex shared stdio (`adapter-contract.md`) | "64-message/4 MiB" becomes "1,024-message/4 MiB" |
+| `vendors/codex.md` (three places), `vendors/claude-code.md` (one) | "64-message/4 MiB" and "64 messages/4 MiB" become the 1,024-message forms |
 
 ## 13. Tests (failure-first)
 

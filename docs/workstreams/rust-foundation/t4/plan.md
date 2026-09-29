@@ -279,7 +279,7 @@ controls serviceable; the observation channel is 1024 items and 4 MiB with a
 
 **Implements.** §8.1 (`WireSender`/`WireMessages`, `into_parts`,
 `VendorMessage` as bytes, `keep_undecoded` on `WireSender`); §8.2 (64 KiB
-reads, `LineSplitter`, 1 MiB assembly, 64-message/4 MiB queue with
+reads, `LineSplitter`, 1 MiB assembly, 1,024-message/4 MiB queue (A47) with
 `try_send`, discard mode); §8.3 (stdin task, data `mpsc(1)`, control `mpsc(8)`
 coalesced, `PendingWrite`, streamed `OutboundMessage::Start` in 16 KiB
 slices); §8.4 `ConnectionLatch`; §8.5; §8.6 `finish(deadline)`, straggler
