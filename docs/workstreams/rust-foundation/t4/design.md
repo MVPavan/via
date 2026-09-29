@@ -1,16 +1,16 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 10)
+# Task 4 design: events, progress, storage and C1 conformance (round 11)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 10.
-It replaces rounds 1–4. Rounds 6–10 apply the orchestrator's decisions on
-Sol's round-5 to round-9 reviews (`design-r5-decisions.md` to
-`design-r9-decisions.md`), tagged `[t4r5.N]` to `[t4r9.N]`. The
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 11.
+It replaces rounds 1–4. Rounds 6–11 apply the orchestrator's decisions on
+Sol's round-5 to round-10 reviews (`design-r5-decisions.md` to
+`design-r10-decisions.md`), tagged `[t4r5.N]` to `[t4r10.N]`. The
 owner-approved [requirements](requirements.md) (R1–R7, the "Bounding
 strategy" and "Thresholds are configuration") are normative and override
 earlier design assumptions and spec text; every such conflict is an
 amendment in §11. Round 8 replaces exact memory and disk accounting with the owner's
 coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4);
 round 9 makes every threshold daemon config (§5.2). Round history and
-decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§14.
+decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§15.
 This step writes no code and no tests; slices are re-planned after the
 owner's review (`s1.md`–`s7.md` are superseded).
 
@@ -199,8 +199,10 @@ Adapter drops the session's hop receiver; Route selects on `hop.closed()`
 in every wait (§8) and sees it at once:
 
 - **Private route** (one hop per connection: the fake, Claude, OpenCode's
-  per-session server): Route fails `RouteError::Overflow` and force-closes
-  the connection (Host stops a private process group: the interrupt). Core
+  per-session server): Route fails `RouteError::Overflow`. A per-turn
+  connection is force-closed (Host stops its private process group: the
+  interrupt); on a per-session server Route sends the vendor interrupt and
+  ends the turn without stopping the server (§7.6) [t4r10.2]. Core
   disposes `Overflow` as today (`crates/via-core/src/engine/terminal.rs:97`
   [V]: `failed`, `overflow`).
 - **Shared route** (Codex's shared server, one hop per thread generation):
@@ -447,7 +449,7 @@ lossy UTF-8 that VIA does not parse (R5).
   message.
 - **Raw boundary** [t4r8.8]. Before building `turn.submitted`, the drive
   awaits `WireMessages::boundary()`: a `Barrier` queued to the raw worker
-  behind every unit already staged on the connection, answered with the
+  behind every unit already enqueued on the connection [t4r10.6], answered with the
   connection's end offset once all of them are durable. That offset is
   `raw_start`, written in the submission transaction, and nothing is sent to
   stdin before it. Rule for units being read [t4r9.4]: attribution follows
@@ -468,8 +470,8 @@ lossy UTF-8 that VIA does not parse (R5).
   session's connections do not overlap in time (a turn's connection is
   sealed before the next turn starts, a server generation before the next),
   so only the last can be unsealed. A per-session connection is kept by its
-  session owner across turns and sealed only at server or session close
-  (§7.6) [t4r9.3].
+  session owner across turns and sealed only at server retirement or fatal
+  connection loss (§7.6) [t4r9.3, t4r10.2].
 - **Cursor**, one per connection: the sentinel `r1.start` (an omitted
   cursor) or `r1.<connection_id>.<offset>`, the next byte to return, parsed
   strictly. The sentinel resolves to the first offset of the scope: a turn
@@ -534,12 +536,12 @@ before allocating and releases it on drop. Every amount is an assumption
 |---|---|---|---|
 | Store request lanes (`memory.latch_lane`, `memory.lifecycle_lane`, `memory.ordinary_lanes`) | 2 + 2 + 4 MiB, from `Store::open` | open fails | the lane allowances (§6.1); lane high-water test |
 | SQLite page cache (`memory.sqlite_cache`) | 8 MiB, from `Store::open` | open fails | `cache_size` on the one long-lived connection, the writer (`crates/via-store/src/runtime/sql.rs:140`, `runtime.rs:1013` [V]); approximate, so the RSS gate confirms it |
-| Connection (`memory.connection`) [t4r8.5] | 16 MiB, from before the connection opens until `finish` has returned and every task it adopted has been joined (§7.6); a per-session connection's session owner holds it across turns until server or session close [t4r9.3] | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), the 64-message / 4 MiB Wire queue, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, payloads queued for raw; F24's per-connection figures |
+| Connection (`memory.connection`) [t4r8.5] | 16 MiB, from before the connection opens until `finish` has returned and every task it adopted has been joined (§7.6); a per-session connection's session owner holds it across turns until server retirement or fatal connection loss [t4r9.3, t4r10.2] | the dispatcher waits; the turn stays queued | 8 MiB raw staging (runtime §8), the 64-message / 4 MiB Wire queue, pipe buffers, the 1 MiB stdout assembly buffer, stdin pieces, payloads queued for raw; F24's per-connection figures |
 | Drive (`memory.drive`) | 8 MiB, from dispatch (before the submission commit) to the drive's end | the dispatcher waits; the turn stays queued | 4 MiB of observations (C2 A1), decoded messages in flight, the envelope accumulation (at most 1 MiB) and its encoding, the step tracker and carried rows |
 | C1 request (`memory.request_multiplier`, `memory.request_nodes`) | `request_multiplier × len + min(8 × len, request_nodes) + 64 KiB` for a line of `len` bytes (defaults 4 and 2 MiB), taken as the line is read; line bytes also count against runtime §8's 32 MiB C1 input cap | waits until the 5 s partial-line deadline, then discards the line and replies `admission_refused` (`MEMORY_BUDGET`, `id: null`) | the segments, the line, serde's scratch and the decoded strings, list headers within 65,536 nodes; a counting-allocator test on a 16 MiB escaped prompt and a 65,536-node list |
-| Reply or Store page (`memory.reply_small`) | 64 KiB for a small reply; `PAGE_MAX + 4 KiB` for a page and 2 MiB for `logs`, derived from fixed C1 limits; replies together at most runtime §8's 32 MiB | `admission_refused` (`MEMORY_BUDGET`) | held at most `REPLY_WRITE` (A32); capacity checked in the test binary |
+| Reply or Store page (`memory.reply_small`, `memory.reply_page`, `memory.reply_logs`) [t4r10.3] | 64 KiB for a small reply, `PAGE_MAX + 4 KiB` for a page and 2 MiB for `logs` (832 KiB encoded plus one 1 MiB unit read, §6.8); replies together at most runtime §8's 32 MiB | `admission_refused` (`MEMORY_BUDGET`) | held at most `REPLY_WRITE` (A32); capacity checked in the test binary |
 | Codex shared server (`memory.codex_shared`) [t4r9.2] | 16 MiB per shared server, from launch to its end (runtime §8) | the server is not launched | observation and staging lanes, retained tool metadata; not in S1, so the Codex extension's gate confirms it |
-| Blob chunk; dispatched blob prompt | 64 KiB, one in flight per handle; the prompt's length until its start is written (§7.3) | waits under the chunk's 2 s bound; the turn stays queued | exact |
+| Blob chunk (`memory.blob_chunk`) [t4r10.3]; dispatched blob prompt | 64 KiB, one in flight per handle; the prompt's length until its start is written (§7.3) | waits under the chunk's 2 s bound; the turn stays queued | exact |
 
 With four connections and four drives (`CONNECTION_SLOTS` = 4,
 `crates/via-core/src/engine/queue.rs:33` [V]), 112 MiB of the default
@@ -573,7 +575,8 @@ peak exceeds its charge gets a larger default.
 - **Keys and defaults.** `memory`: `pool` 128 MiB, `sqlite_cache` 8 MiB,
   `latch_lane` 2 MiB, `lifecycle_lane` 2 MiB, `ordinary_lanes` 4 MiB,
   `connection` 16 MiB, `drive` 8 MiB, `request_multiplier` 4,
-  `request_nodes` 2 MiB, `reply_small` 64 KiB, `codex_shared` 16 MiB
+  `request_nodes` 2 MiB, `reply_small` 64 KiB, `reply_page` 1 MiB + 4 KiB,
+  `reply_logs` 2 MiB, `blob_chunk` 64 KiB [t4r10.3], `codex_shared` 16 MiB
   [t4r9.2]. `disk`: `sqlite_budget`
   1 GiB, `sqlite_headroom` 64 MiB, `files_budget` 3 GiB, `files_headroom`
   256 MiB. `wal`: `max` 32 MiB, `checkpoint_bytes` 8 MiB,
@@ -590,10 +593,13 @@ peak exceeds its charge gets a larger default.
     6 MiB (observations, envelope and encoding); `request_multiplier` 4 and
     `request_nodes` 2 MiB (the four copies and 65,536 list headers);
     `reply_small` 64 KiB (the largest reply that is not a page);
+    `reply_page` `PAGE_MAX + 4 KiB`; `reply_logs` 1,860 KiB (§6.8's
+    832 KiB and one 1 MiB unit, plus 4 KiB); `blob_chunk` 64 KiB (the fixed
+    chunk) [t4r10.3];
     `codex_shared` 5 MiB (one turn's 4 MiB of observations and one 1 MiB
     message).
   - Aggregates: `pool` at least the lanes, the cache, 4 × (`connection` +
-    `drive`) and 1 MiB, and at least the lanes, the cache and a maximal
+    `drive`) and the larger of `reply_page` and `reply_logs` [t4r10.3], and at least the lanes, the cache and a maximal
     16 MiB request's charge; `codex_shared` at most `pool` less the lanes
     and the cache.
   - Disk and WAL: `sqlite_headroom` at least the 16 MiB terminal reserve
@@ -612,7 +618,7 @@ peak exceeds its charge gets a larger default.
 - **Fixed, not config:** the C1 limits (line, depth, nodes, pages, envelope,
   `id`, reply deadline), C2 A1's channel and payload limits, runtime §8's
   queue and staging limits, the 4 KiB page size (fixed when the database is
-  created) and the blob chunk.
+  created) and the blob chunk's size (its charge is `blob_chunk`).
 
 ## 6. Store
 
@@ -877,25 +883,16 @@ transaction or append (requirements, "Thresholds are configuration").
   each commit the SQLite thread reads the WAL size; at `wal.max` it admits
   no write, runs `wal_checkpoint(TRUNCATE)`, and fails Store health
   (runtime §7 latch) if the WAL is still at or above `wal.max`. There is no
-  prewrite prediction: the commit that crosses `wal.max` completes, so the
-  WAL overshoots by at most one transaction [t4r9.5]. SQLite appends each
-  page the transaction dirtied once (a page it already wrote is
-  overwritten), plus one more copy of the commit page and a 32 B header
-  after a restart, each copy 4 KiB plus 24 B (bundled SQLite 3.53.2,
-  `sqlite3.c:71575-71599` in `libsqlite3-sys` 0.38.2 [V]). An entry write (a
-  row or index entry inserted or deleted; an update of an indexed column
-  counts two) rebalances at most five pages per level (`NB` = 3,
-  `sqlite3.c:80653`, `:81400` [V]), adds at most one root page, and each
-  allocation dirties at most one freelist trunk. A transaction with `E`
-  entry writes, `D` new bytes and trees of height at most `h` therefore
-  writes at most `P = 2 + 2⌈D/4092⌉ + E × (7h + 2)` pages, and the WAL
-  grows by at most `32 + 4120 × (P + 1)` B. For a maximal event batch
-  (`E` ≤ 400: three entries per event plus 16 row moves; `D` ≤ 2 MiB; `h`
-  ≤ 6 at a 1 GiB ceiling) [I], that is about 73 MiB; a terminal adds two
-  entries per carried row. The bound is conservative (it assumes a split at
-  every level for every entry); the disk test records the measured growth of
-  a maximal transaction on a near-ceiling store. The database plus WAL
-  therefore stay within `sqlite_budget` plus that bound.
+  prewrite prediction: the commit that crosses `wal.max` completes. The
+  policy is the owner's: disk may overshoot by at most one transaction
+  [t4r10.1]. SQLite appends each page a transaction dirtied once (a page it
+  already wrote is overwritten), 4 KiB plus 24 B each (bundled SQLite
+  3.53.2, `sqlite3.c:71575-71599` in `libsqlite3-sys` 0.38.2 [V]); the
+  number of pages a maximal transaction dirties is not proved. An
+  unverified estimate, assuming a split at every level for every entry, is
+  about 73 MiB for a maximal event batch, and more for a terminal carrying
+  many step rows [I]. `via-d9o.2.3` measures it, and the WAL's byte bound is
+  an owner gate (Q-R9-1).
 - **Defaults** [I]: 64 MiB of SQLite headroom leaves 48 MiB beyond the
   terminal reserve; 256 MiB of file headroom lets running turns' output
   finish, and a flood meets the ceiling and fails its own turn. Confirmed by
@@ -950,9 +947,13 @@ and owns the connection's life (the message receiver, one `pending` entry,
 the task `JoinSet`, the stop signal, a `RawWriter` for the barrier;
 `next_message(&mut self)`, `boundary(&mut self)` (§4.4), `finish(self, deadline)`).
 A per-turn connection's `WireParts` belong to the turn. A per-session
-connection's belong to its session owner (the per-session server's Route,
-alive until server or session close), which lends `&mut WireMessages` and a
-`WireSender` clone to each turn [t4r9.3].
+connection's belong to its session owner (the per-session server's Route),
+which lends each turn a `TurnWire<'_>` [t4r9.3, t4r10.2]: `&mut
+WireMessages` (`next_message` and `boundary`, but not `finish(self)`) and a
+`TurnSender` from `WireSender::for_turn()`, which has only `write` and
+`failure()`: no `close`, `close_input`, `wait_exit` or `ProcessControl`. So
+a turn cannot close a per-session connection or ask Host to stop its server;
+only the owner can.
 
 ### 7.2 Readers
 
@@ -1040,12 +1041,21 @@ set and is released only when the set is empty [t4r8.5].
 Every `run_turn` exit ends the turn's use with one absolute deadline (the
 graceful close's `close_by`, the force close's cleanup deadline,
 `failed.close_by`, or `LAUNCH_DRAIN` for an open failure) [t4r9.3]. On a
-per-turn connection that is `finish`. On a per-session connection the turn
-awaits `boundary()` for `raw_end` under that deadline and returns the
-borrow; readers, writer, queue and charge stay with the session owner, which
-calls `finish` at server or session close (the close's deadline). A turn
-end that must stop the server (a force close, a Route failure, a latch)
-closes it through the owner, which then calls `finish`. `Drop` without
+per-turn connection that is `finish`. On a per-session connection a turn's
+end never stops the server (`opencode.md:596-599`) [t4r10.2]. Cancel and
+force close (the turn's, or a session close's) send the vendor interrupt
+through `TurnSender::write` and wait for terminal evidence until the
+deadline, else end with unknown cancellation or uncertain cleanup as C1 and
+C2 require; Core applies P7's cleanup gate before the next turn. The turn
+then awaits `boundary()` for `raw_end` under its deadline (unanswered: the
+span ends at the connection's proven durable offset and the terminal
+carries `raw_log.incomplete`), commits its terminal with that span and the
+cleanup evidence, and drops its `TurnWire`; readers, writer, queue and
+charge stay with the owner. Only the owner calls `finish`, asks Host to stop
+the server group and adopts tasks, and only at server retirement (idle or
+daemon shutdown) or on fatal connection loss (server exit, a latch, a Route
+failure that leaves the connection unusable); a running turn then fails
+with the connection's cause. `Drop` without
 `finish` aborts, adopts, and bumps a test-only `wire::fallback_drops()`
 counter that every normal test asserts is zero.
 
@@ -1349,7 +1359,9 @@ Q-R5-5. T3 design §7.6 (`t3/design.md:1414-1417`) and its quoted runtime row
 (`:1919`) are obsolete; no `event_end` exists. In the C1 method tables of
 `docs/specs/vendors/claude-code.md:59` and `opencode.md:461` [t4r5.13],
 "`status`, `wait`, `result`, `list`, `events`, `unsubscribe`, `logs`"
-becomes "`status`, `wait`, `result`, `list`, `events`, `logs`". Codex's
+becomes "`status`, `wait`, `result`, `list`, `events`, `logs`": only the C1
+method goes; OpenCode's own SSE subscription (`opencode.md:455`, "Subscribe
+SSE first"; `:460`'s "subscriptions") is unchanged [t4r10.5]. Codex's
 vendor method `thread/unsubscribe` (`codex.md:59`, `:87-88`, `:109`, `:232`,
 `:395`; `adapter-contract.md:366`; `via-api-v1.md:257`) is a lease release,
 not the removed C1 method, and is unchanged.
@@ -1859,8 +1871,10 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_events_page_filters_and_bounds`; `s1_c1_follow_and_unsubscribe_are_refused` | window, `types`, `turn`, `next_after` across filtered rows, `more`, the byte bound with a Store-level fixture; `follow: true` is `invalid_params`, `unsubscribe` `method_not_found` |
 | `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection is `invalid_params` |
 | `s1_c1_logs_end_cursor_resumes_while_running` [t4r5.12, t4r6.11] | a call before any byte is durable returns `r1.start`, and a later call from it returns the first bytes; on a running turn `next_cursor` is non-null at the current end and a later call from it returns only new bytes; after the terminal and seal it is `null` |
-| `s1_c1_logs_per_session_spans_bound_each_turn` [t4r7.3, t4r8.7, t4r8.8, t4r9.3, t4r9.4] | a per-session connection whose readers, writer and charge survive turn 1's end, carrying two turns, with session-level stdout and stderr staged but not yet durable when the second is submitted (raw worker stalled): a turn address returns exactly `[raw_start, raw_end)` and none of that earlier traffic; `r1.start` for turn 2 begins at its `raw_start`; a cursor below `raw_start` or beyond the span is `invalid_params`; a unit staged before turn 2's barrier but enqueued after it (reader held between `stage` and `submit`) is inside turn 2's span; a crash between submission and terminal leaves the open span readable to the session |
-| `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4, t4r9.1, t4r9.5] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`; an ordinary write begun just below the line that would commit above it is rolled back `NotCommitted` and leaves `page_count` at or below the line; a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health; the WAL growth of a maximal transaction on a near-ceiling store is recorded and at most the §6.9 bound |
+| `s1_c1_logs_per_session_spans_bound_each_turn` [t4r7.3, t4r8.7, t4r8.8, t4r9.3, t4r9.4, t4r10.4] | a per-session connection whose readers, writer and charge survive turn 1's end, carrying two turns; session-level stdout and stderr enqueued before turn 2's barrier become durable and the barrier answers; one unit staged before the barrier is held unenqueued across it (reader held between `stage` and `submit`) and then released: it lies inside turn 2's span; the raw worker is then stalled after submission with turn 2's later output enqueued: a turn address returns exactly the durable part of `[raw_start, raw_end)` and none of the earlier traffic; `r1.start` for turn 2 begins at its `raw_start`; a cursor below `raw_start` or beyond the span's durable end is `invalid_params`; a crash between submission and terminal leaves the open span readable to the session |
+| `s1_wire_per_session_cancel_and_force_close_keep_the_server` [t4r10.2] | on a per-session server (a test route keeping one fake process per session), turn 1 is cancelled (vendor acknowledges and ends it) and turn 2 is force-closed with the vendor silent past the deadline, then its session closed with `force`: each turn ends (`cancelled`; unknown cancellation with uncertain cleanup) with its span sealed at `raw_end` and its cleanup evidence in the terminal; the server's process group stays alive, Host receives no stop request, the connection stays unsealed with its charge held and no task adopted, P7's gate runs before turn 3, and turn 3 runs on the same connection; a `compile_fail` doctest shows a `TurnSender` has no `close`, `close_input` or `wait_exit` and a lent `&mut WireMessages` cannot `finish` |
+| `s1_wire_per_session_retirement_and_loss_finish_through_the_owner` [t4r10.2] | on the same test route, (a) daemon shutdown makes the owner call `finish`, Host stop the group and the connection seal (idle retirement is tested by the task that adds idle shutdown); (b) the server exiting mid-turn, and (c) a latch, fail the running turn with the connection's cause and finish through the owner, adopting a task held past the deadline; the charge is released only after the adopted set is joined; `wire::fallback_drops()` stays zero |
+| `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4, t4r9.1, t4r9.5, t4r10.1] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`; an ordinary write begun just below the line that would commit above it is rolled back `NotCommitted` and leaves `page_count` at or below the line; a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health; the WAL growth of a maximal event batch and of a terminal with many carried rows on a near-ceiling store is recorded for `via-d9o.2.3` (no bound asserted, Q-R9-1) [t4r10.1] |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket_and_frees_the_permit` | A31; A32, with `VIA_TEST_REPLY_WRITE_MS` |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` | four turns, 256 MiB stdout flood; daemon peak RSS < 256 MiB, growth < 32 MiB after the first 64 MiB, each anchor ≤ 32 MiB, sum < 384 MiB, `MemoryBudget` high-water ≤ 128 MiB, the SQLite cache's 8 MiB included [t4r7.1]; `daemon/status`, `status` and a `cancel` of another turn answer within 100 ms, including with its interrupt write blocked at `HoldStdin`; the flood turn ends `failed(overflow)` with `raw_log.incomplete` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent after filling the channel: `overflow` at the lowered stall with no further vendor byte |
