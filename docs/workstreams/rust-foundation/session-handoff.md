@@ -134,11 +134,16 @@ the historical checkpoint; its findings table is updated by this section.
   - the per-session and shared-server lifecycle moved to `via-4sw.3.2` and
     `via-5lr.3.2`.
 
-  Next is the Fable 5.1 high and Astra high critical review
-  (`scratchpad/reviews/t4/critical/`), then one consolidated report for the
-  owner. The loop is Sol high until SOUND, then Fable 5.1 high
-  and Astra high critical reviews, one consolidated report, then owner review
-  before slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  Fable 5.1 high and Astra high then gave critical reviews, and both said
+  "ready after named small changes". The consolidated report is
+  [t4/critical-review.md](t4/critical-review.md), with the reviews in
+  `t4/critical-review-{fable,astra}.md`. It lists eight required changes,
+  including memory-pool liveness: tokio's fair semaphore lets a waiting
+  acquire take every free permit. It also has recommended simplifications
+  (drop A34 for a receiver drop; completed final text only) and owner
+  questions, including the new N1–N5. **Waiting on the owner.** Next: one
+  Opus 5.5 high revision round, a Sol high review of that change set, the
+  merge of `wt/t4-0`, the spec amendments, then slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From

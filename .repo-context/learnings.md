@@ -67,3 +67,9 @@ in the design record (`docs/`), not here.
 - Codex review sandboxes (`-s read-only`) cannot open the Beads database. Paste
   the relevant Beads notes into the review brief rather than citing
   `bd show`.
+- `tokio::sync::Semaphore` is fair. A waiting `acquire`/`acquire_many`
+  immediately takes every free permit and receives each released one until it
+  is satisfied (tokio 1.53.1 `batch_semaphore.rs:397-445`, `:306-331`);
+  `try_acquire` then fails. On a shared memory pool, one waiter starves every
+  `try_acquire` caller. Take a whole reservation with `try_acquire_many`, and
+  never wait while holding permits.

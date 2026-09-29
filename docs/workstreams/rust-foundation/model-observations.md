@@ -36,6 +36,7 @@ whether the design had to be reinterpreted.
 | Step | Size | Rounds to SOUND | Pattern | Rule breaches | Notes |
 |---|---|---|---|---|---|
 | T4-0 rounds 5–15 (redesign against owner requirements) | design 1,803 → 2,295 → 1,907 lines | 11 Sol high rounds | Rounds 5–7: the exact memory and disk proofs grew each round and did not converge. After the owner approved coarse bounds (round 8), findings narrowed steadily. Round 12's seal (orchestrator's decision) caused one regression round and was withdrawn in round 14 | none | Applied every decision and reported each deviation with a reason. Its deviations were mostly safer or more exact forms (a charge kept until handoff; a single accounting point). It verified code and SQLite facts against source. The growth came from following exact-accounting decisions faithfully, not from invention |
+| T4-0 critical review (after Sol SOUND): Fable 5.1 high vs Astra high, same brief | about 1,200 words each | n/a | Both said "ready after named small changes". Fable found more simplifications (receiver drop instead of A34, completed-only final text, WAL latch) but got one mechanism wrong (`wait` refused by the Public lane; sockets bind first). Astra found the hold-and-wait memory stall. Neither found the tokio fair-semaphore permit hoarding; the orchestrator found it while checking Astra's claim. | none | A critical pass after SOUND still finds liveness gaps; check each claim against source |
 
 ## Early read (2026-09-28, three Sonnet workers on the Task 3 review)
 
