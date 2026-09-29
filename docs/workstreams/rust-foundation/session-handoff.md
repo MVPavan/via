@@ -121,14 +121,17 @@ the historical checkpoint; its findings table is updated by this section.
   `via-wt/t4-0` (branch `wt/t4-0`); then Astra high and Sol high design
   reviews, then implementation slices. T4-0 design rounds 1–4 are done
   (round 4 on `wt/t4-0` at `d75705d`, still UNSOUND from both reviewers;
-  round-4 reviews in `scratchpad/reviews/t4/`, not yet committed). The owner
-  is choosing the path: a last narrow round, full rounds, or a disk-first
-  simplification. The simplification also asks whether streaming text events
-  (`assistant.text`) need SQLite rows at all. On 2026-09-29 the owner renamed
+  round-4 reviews in `scratchpad/reviews/t4/`, not yet committed). On
+  2026-09-29 the owner approved [t4/requirements.md](t4/requirements.md)
+  (`8d557bf`): callers are programs, only lifecycle and safety events are
+  durable, and a progress snapshot plus per-step rows replace the detail event
+  stream. Round 5 (Opus 5.5 high, brief `t4/design-r5-brief.md` on `wt/t4-0`)
+  redesigns against it. The loop is Sol high until SOUND, then Fable 5.1 high
+  and Astra high critical reviews, one consolidated report, then owner review
+  before slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
-  design drafts on `wt/t4-0` still say "frame"; the next design round adopts
-  the new terms. From
+  design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From
   2026-09-28 new implementation slices use Sonnet 5.5
   (`implementer-sonnet` high, `implementer-sonnet-xhigh` for hard work;
   owner decision); from 2026-09-29 design-first steps go to Opus 5.5 high
