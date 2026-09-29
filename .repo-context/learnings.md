@@ -53,3 +53,23 @@ in the design record (`docs/`), not here.
   for every restatement of the old bound, and fix them in one pass. Record
   the change as a numbered amendment, not as a "clarification". T3 took
   four extra Sol confirmation rounds, each finding one more stale line.
+- Exact per-copy memory and per-write disk proofs did not converge in design
+  review. T4-0 rounds 5–7 grew from 1,803 to 2,295 lines, and each Sol round
+  found another uncharged copy or unpredictable SQLite growth. Coarse class
+  charges with a named refusal, admission-time disk checks with headroom, and
+  measured gates converged in seven rounds. Propose the coarse form, plus a
+  measurement task, before designing exact accounting.
+- When a review fix needs a new mechanism with its own states (T4-0's
+  raw-worker seal: truncation, a `Sealed` answer, recovery repair), first
+  restate the requirement narrowly. The seal caused a regression round.
+  "`logs` is bounded by the committed `high_water`, and loss is decided by
+  offsets" met the same need without new states.
+- Codex review sandboxes (`-s read-only`) cannot open the Beads database. Paste
+  the relevant Beads notes into the review brief rather than citing
+  `bd show`.
+- `tokio::sync::Semaphore` is fair. A waiting `acquire`/`acquire_many`
+  immediately takes every free permit and receives each released one until it
+  is satisfied (tokio 1.53.1 `batch_semaphore.rs:397-445`, `:306-331`);
+  `try_acquire` then fails. On a shared memory pool, one waiter starves every
+  `try_acquire` caller. Take a whole reservation with `try_acquire_many`, and
+  never wait while holding permits.

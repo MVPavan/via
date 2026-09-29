@@ -1,14 +1,18 @@
 # Task 4 requirements: events, progress and storage
 
-Status: draft for owner review (2026-09-29). It supersedes the "every event is
-durable and followable" assumption behind T4-0 rounds 1–4.
+Status: owner-approved (2026-09-29). Revised the same day after the critical
+review (`critical-review.md`); the revisions are marked **(owner,
+2026-09-29 r16)**. It supersedes the "every event is durable and followable"
+assumption behind T4-0 rounds 1–4.
 
 ## Decision
 
 VIA's callers are programs and model orchestrators. No human watches a turn
 live. A caller needs to know when a turn ends, the result, and which step the
 agent is on (so it can steer or cancel). For post-mortem detail it reads the
-raw log. VIA does not store or stream per-message detail.
+agent's own transcript and the turn's evidence folder. VIA does not store or
+stream per-message detail, and keeps no copy of vendor traffic **(owner,
+2026-09-29 r16)**.
 
 ## Terms
 
@@ -19,6 +23,9 @@ raw log. VIA does not store or stream per-message detail.
   accumulation.
 - **Event**: a durable record in SQLite with a per-session `seq` (R1).
 - **Event trace**: the ordered events of one turn.
+- **Evidence folder**: one folder per turn under VIA's state directory, holding
+  the agent's stderr, the message VIA failed to understand (if any) and the
+  vendor's own debug file where it has one (R8).
 
 ## Requirements
 
@@ -28,19 +35,24 @@ events, plus the envelope:
 - `turn.queued`, `turn.submitted`, `turn.started`, `turn.ended`, `turn.revised`;
 - `cancel.requested`, `cancel.settled`, `steer.delivered`;
 - `action.denied`, `vendor.request_declined`;
-- `process.exited`, `server.lost`, `raw_log.incomplete`, `warning`.
+- `process.exited`, `server.lost`, `warning`.
 
 Rule: an event is durable when crash recovery or the envelope depends on it.
+`raw_log.incomplete` is gone with the raw log **(owner, 2026-09-29 r16)**.
 
 **R2. Not stored or streamed.** `assistant.text`, `reasoning.summary`,
 `tool.started`, `tool.ended`, `usage.updated`, `file.changed` and
-`vendor.other` stop being events. The raw log keeps their exact bytes.
+`vendor.other` stop being events. The agent's own transcript keeps them.
 
 From a vendor message, VIA reads only what these requirements need:
 - the message type;
+- correlation IDs: vendor session or thread, vendor turn, tool call;
+- acceptance and identity evidence;
 - tool names;
 - usage numbers;
-- the terminal fields the envelope already carries.
+- the payloads of `action.denied`, `vendor.request_declined` and
+  `steer.delivered`;
+- final text, and the terminal fields the envelope already carries.
 
 It does not interpret tool inputs or outputs.
 
@@ -49,14 +61,18 @@ held in memory and updated as vendor messages arrive:
 
 | Field | Meaning |
 |---|---|
-| `current_step` | number of the step running now. It goes up by one when the model produces output after tool results, derived the same way for every vendor. |
+| `current_step` | VIA's own count of the step running now, labelled as VIA's. It goes up by one when the model produces output after tool results, derived the same way for every vendor. |
 | `phase` | `model` or `tools` |
 | `running_tools` | names of the tools running now; no inputs or outputs |
 | `last_activity_at` | time of the last vendor message |
-| `tokens` | approximate running total, updated once per step, labelled with its scope; about 95% accuracy is enough |
+| `tokens` | approximate running total, updated once per step, labelled with its scope; about 95% accuracy is the target |
 
-The snapshot ends with the turn. The envelope's `steps` and `usage` hold the
-final figures.
+Step counts and token totals are unproven for each vendor until that vendor's
+probe validates them against captured fixtures, including tool-only and
+parallel-tool steps. Until then a vendor's `tokens` may be `null` **(owner,
+2026-09-29 r16)**. The fake agent proves the mechanism.
+
+The snapshot ends with the turn. The envelope holds the final figures.
 
 **R4. Step history.** When a step ends, Core writes one row:
 - the row is `(session_id, turn, step, started_at, ended_at, tokens)`;
@@ -65,84 +81,112 @@ final figures.
 - there is no write per vendor message.
 
 A caller can read the step rows of any turn, running or finished. After a
-daemon crash, rows survive up to the last completed step. The step in progress
-is recoverable only from the raw log.
+daemon crash, rows survive up to the last committed step. The step in
+progress, and a step whose row commit was in flight, are missing from the
+history; the agent's transcript still has them.
 
 **R5. Caller interface.**
-- `wait` blocks until the turn ends.
-- `status` returns the progress snapshot and step history (R3, R4); callers
-  poll it.
+- `wait` blocks until the turn ends. It polls with backoff, not at a fixed
+  fast rate.
+- `status` returns the progress snapshot and step history (R3, R4) for one
+  moment of one turn; callers poll it.
 - `events` pages the durable events. There is no follow stream.
-- `logs` returns raw log excerpts, undecoded; the calling model reads vendor
-  JSON.
+- `logs` returns where the evidence is: the vendor session ID, the path of the
+  vendor's transcript, and the turn's evidence folder with its files. The
+  caller reads the files; VIA does not decode them **(owner, 2026-09-29 r16)**.
+- `list` pages sessions in creation order, newest first. Every row shows the
+  session's last-active time **(owner, 2026-09-29 r16)**.
 
-**R6. Envelope.** Unchanged in content. It still carries:
+**R6. Envelope.** It carries:
 - final text;
-- steps and usage (exact where the vendor reports it);
+- `steps`: the vendor's own step count, or `null` when the vendor reports
+  none. VIA's own count stays in `status` **(owner, 2026-09-29 r16)**;
+- `usage` (exact where the vendor reports it);
 - denied actions and declined requests;
-- cost and the raw log spans.
+- cost;
+- the evidence locations (R5 `logs`), in place of raw log spans.
 
-It keeps its 1 MiB accumulation bound.
+It keeps its 1 MiB accumulation bound. The terminal transaction that carries
+it may exceed runtime §8's 1 MiB transaction cap.
 
-**R7. Memory and disk bounds stay** for the parts that remain:
-- message splitting and its per-message cap;
-- the raw log;
-- the envelope accumulation;
-- blob files for large prompts;
-- the snapshot and the step rows.
+**R7. Bounds** **(owner, 2026-09-29 r16; replaces the pool and budget
+strategy of round 8)**.
+- **Memory is bounded by construction.** Every buffer has a fixed maximum
+  size, and the number of each kind of holder is fixed (running connections,
+  caller sockets). There is no memory pool, counter or memory setting. Flood
+  tests measure the worst case against an RSS gate.
+- **Caller requests.** One request line is at most 1 MiB. A larger prompt is
+  passed as a file path; VIA copies the file into its own storage in small
+  chunks.
+- **Disk.** There are no fixed size budgets.
+  - VIA stops admitting new work when free space on its state disk falls
+    below a floor, 5 GiB by default. Running turns finish, and their endings
+    are recorded.
+  - `daemon/status` warns when VIA's data grows past a size, 2 GiB by default.
+    Cleanup belongs to the retention task.
+  - A checkpoint policy bounds the WAL. At its limit, ordinary writes are
+    refused while checkpoints are retried; the Store is not latched unhealthy.
+- **Evidence files** have size caps (R8).
+- **Configuration.** The disk floor, the warning size and the WAL limit and
+  triggers are keys in a daemon config file with provisional defaults. The
+  daemon reads it at start, so a change takes effect at the next start;
+  invalid values refuse to start with a named error. C1 API limits are not
+  configurable. Task: `via-jm4.7.8.1`.
 
-Bounding strategy (owner decision 2026-09-29, after round 7 found exact
-accounting was not converging):
-- **Memory:** one 128 MiB pool. Each kind of buffer is charged a
-  conservative flat amount. A request that cannot be charged is refused with
-  a named overload error. The measured RSS gate verifies the whole.
-- **Disk:** SQLite and raw/blob files get separate hard budgets. These are
-  checked against actual file sizes when a turn is admitted, and admission
-  stops early to leave headroom for running turns. A checkpoint policy bounds
-  the WAL. Hitting the hard limit mid-turn fails that turn visibly.
-- **Shared-server `logs`:** Task 4 covers private connections only. The
-  per-session split of shared Codex and OpenCode raw data belongs to those
-  adapter tasks, with D4 session isolation as a fixed constraint.
+`via-d9o.2.3` measures memory and disk use in end-to-end testing and sets the
+defaults.
 
-`via-d9o.2.3` verifies these bounds thoroughly in end-to-end testing.
-
-Thresholds are configuration (owner decision 2026-09-29). Build the
-mechanisms, but do not fix the values until real use is measured:
-- Every memory and disk threshold is a key in a daemon config file, with
-  provisional defaults: pool size, class charges, disk budgets, headrooms,
-  and WAL limit and triggers.
-- The daemon reads the file at start, so a changed value takes effect at the
-  next daemon start. Invalid values refuse to start with a named error.
-- C1 API limits are not configurable.
-- A write may overshoot a disk budget by at most one bounded transaction.
-- Task: `via-jm4.7.8.1`.
+**R8. Evidence without a raw log** **(owner, 2026-09-29 r16; reverses D4's
+raw log, `docs/brainstorms/README.md` §15)**.
+- VIA reads the vendor stream live, keeps only what R1–R6 need, and discards
+  the rest. It writes no copy of vendor traffic.
+- The agent's stderr goes to a file in the turn's evidence folder, written
+  by the operating system.
+- When VIA cannot understand a vendor message, it writes that message,
+  capped, to the evidence folder, and the failure names the file.
+- Where the vendor offers a debug file (Claude `--debug-file`), VIA points it
+  into the evidence folder.
+- SQLite stores the vendor session ID, the vendor transcript path as a hint,
+  and the evidence folder path. The transcript is the vendor's file: VIA
+  neither parses nor deletes it.
+- Task 4 covers per-turn connections only (the fake, Claude). Evidence for
+  OpenCode's per-session server and Codex's shared server belongs to those
+  adapter tasks.
 
 ## Non-goals
 
 - Human live viewing.
 - A progress stream.
-- Decoding the raw log on request, or decoding raw logs from an older VIA
-  version.
+- A VIA copy of vendor traffic, or decoding vendor files on request.
 - Reporting changed files. The caller tracks file changes with git, using one
   worktree per concurrent agent.
-- Retention and pruning. Step rows, events, envelopes and raw logs are retired
-  together per session by a later retention task. Retiring a session's step
-  rows must be a single keyed delete.
+- Retention and pruning. Step rows, events, envelopes and evidence folders are
+  retired together per session by a later retention task. Retiring a
+  session's step rows must be a single keyed delete.
 
 ## Accepted costs
 
-- A late reader cannot page text chunks or tool calls. It reads the envelope,
-  the durable events, step rows and raw excerpts.
+- A late reader cannot page text chunks or tool calls from VIA. It reads the
+  envelope, the durable events, the step rows and the agent's own transcript.
+- If the vendor deletes its transcript, the conversation detail is gone.
+- Diagnosing a VIA decode failure relies on the saved message. The exact
+  traffic of successful turns is not kept; adapter development captures it
+  with test tooling.
+- Transcript paths follow each vendor's internal layout. VIA records them as
+  hints, and each vendor task confirms them.
+- Memory has no enforced ceiling; its worst case is measured, not guaranteed.
 - Step count and live tokens are approximate across vendors. The envelope holds
   exact usage where the vendor reports it.
 - This changes VIA API v1 before its first release: §3.7 `status`, §3.11
-  `events`, §6 event types, and §5 references to event `seq`.
+  `events`, §3.12 `logs`, `list` ordering, the request line cap, §6 event
+  types, and §5 references to event `seq`.
 
 ## Process
 
-1. Opus 5.5 high writes the design against these requirements, starting from
-   T4-0 round 4 and removing what no longer applies.
-2. Sol high reviews, and the loop repeats until SOUND.
-3. Fable 5.1 high and GPT-6 Astra high review critically; the orchestrator
-   consolidates one report.
-4. The owner reviews the report before implementation planning.
+1. Opus 5.5 high wrote the design against these requirements; Sol high
+   reviewed it until SOUND (round 15).
+2. Fable 5.1 high and GPT-6 Astra high reviewed it critically; the consolidated
+   report is `critical-review.md`.
+3. The owner reviewed the report and decided the r16 revisions above.
+4. Opus 5.5 high revises the design once (round 16); Sol high reviews it once.
+5. Then slice planning.

@@ -125,10 +125,35 @@ the historical checkpoint; its findings table is updated by this section.
   2026-09-29 the owner approved [t4/requirements.md](t4/requirements.md)
   (`8d557bf`): callers are programs, only lifecycle and safety events are
   durable, and a progress snapshot plus per-step rows replace the detail event
-  stream. Round 5 (Opus 5.5 high, brief `t4/design-r5-brief.md` on `wt/t4-0`)
-  redesigns against it. The loop is Sol high until SOUND, then Fable 5.1 high
-  and Astra high critical reviews, one consolidated report, then owner review
-  before slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  stream. Rounds 5–15 (Opus 5.5 high on `wt/t4-0`) redesigned Task 4 against these
+  requirements, and Sol high found the design SOUND at `778752c`
+  (`t4/review-r15-sol.md`). Along the way:
+  - the owner approved coarse memory and disk bounds (round 8);
+  - thresholds became daemon config read at start (round 9, `via-jm4.7.8.1`);
+  - end-to-end measurement was deferred to `via-d9o.2.3`;
+  - the per-session and shared-server lifecycle moved to `via-4sw.3.2` and
+    `via-5lr.3.2`.
+
+  Fable 5.1 high and Astra high then gave critical reviews, and both said
+  "ready after named small changes". The consolidated report is
+  [t4/critical-review.md](t4/critical-review.md), with the reviews in
+  `t4/critical-review-{fable,astra}.md`. It lists eight required changes,
+  including memory-pool liveness: tokio's fair semaphore lets a waiting
+  acquire take every free permit. It also has recommended simplifications
+  (drop A34 for a receiver drop; completed final text only) and owner
+  questions, including the new N1–N5. The owner then revised the
+  requirements (r16 marks in [t4/requirements.md](t4/requirements.md)):
+  - no VIA raw log: the agents keep their own transcripts, and VIA keeps a
+    per-turn evidence folder instead (D4 revised);
+  - no memory pool, since memory is bounded by construction;
+  - 1 MiB request lines, with a prompt file for larger prompts;
+  - a disk free-space floor instead of budgets;
+  - the vendor's own `steps` in the envelope;
+  - `list` in creation order, with `last_active_at` on each row.
+
+  Now: round 16 (Opus 5.5 high, [t4/design-r16-decisions.md](t4/design-r16-decisions.md)),
+  then one Sol high review, a report to the owner, the merge of `wt/t4-0`,
+  the spec amendments, and slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From
