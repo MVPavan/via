@@ -502,6 +502,7 @@ async fn s1_wire_burst_of_1040_lines_reaches_a_live_consumer()
 struct Panicking;
 
 impl AsyncRead for Panicking {
+    #[expect(clippy::panic, reason = "the injected task failure under test")]
     fn poll_read(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
