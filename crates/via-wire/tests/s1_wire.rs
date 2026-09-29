@@ -257,8 +257,28 @@ fn maximal_prefix(maximal: &[u8]) -> Vec<u8> {
 }
 
 /// A stdout whose first read blocks its thread until released: a task that
-/// cannot be aborted within its owner's join bound.
-struct Blocking(Option<std::sync::mpsc::Receiver<()>>);
+/// cannot be aborted within its owner's join bound. It signals `entered`
+/// once it is inside that read.
+struct Blocking {
+    release: Option<std::sync::mpsc::Receiver<()>>,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// A [`Blocking`] stdout, the sender that releases its read, and the
+/// signal that it entered the read.
+fn blocking() -> (
+    Blocking,
+    std::sync::mpsc::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (entered, inside) = tokio::sync::oneshot::channel();
+    let stdout = Blocking {
+        release: Some(blocked),
+        entered: Some(entered),
+    };
+    (stdout, release, inside)
+}
 
 impl AsyncRead for Blocking {
     fn poll_read(
@@ -266,7 +286,10 @@ impl AsyncRead for Blocking {
         _cx: &mut Context<'_>,
         _buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(release) = self.0.take() {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self.release.take() {
             let _ = release.recv();
         }
         Poll::Ready(Ok(()))
@@ -305,11 +328,11 @@ async fn s1_wire_finish_joins_and_hands_off_stragglers() -> Result<(), Box<dyn s
     assert!(matches!(write.await, Ok(SendOutcome::Indeterminate)));
 
     // A reader stuck inside a read: handed off, then joined as it ends.
-    let (release, blocked) = std::sync::mpsc::channel();
+    let (stdout, release, entered) = blocking();
     let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
-    let TestPipes { messages, input } = pipes(Blocking(Some(blocked)), stdin, folder.0.clone());
-    // Let the reader enter its read.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    // The reader is inside its read.
+    entered.await?;
     messages.finish(after(Duration::from_millis(400))).await;
     assert_eq!(input.stragglers(), 1);
     release.send(())?;
@@ -519,10 +542,10 @@ impl AsyncRead for Panicking {
 async fn s1_wire_cancelled_finish_hands_off_and_panics_are_counted()
 -> Result<(), Box<dyn std::error::Error>> {
     let folder = Scratch::new("cancelled-finish")?;
-    let (release, blocked) = std::sync::mpsc::channel();
+    let (stdout, release, entered) = blocking();
     let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
-    let TestPipes { messages, input } = pipes(Blocking(Some(blocked)), stdin, folder.0.clone());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    entered.await?;
     // The drain waits for the stuck reader; the caller gives up first.
     let cancelled = tokio::time::timeout(
         Duration::from_millis(100),
@@ -557,10 +580,10 @@ async fn s1_wire_cancelled_finish_hands_off_and_panics_are_counted()
 async fn s1_wire_cancelled_straggler_join_keeps_ownership() -> Result<(), Box<dyn std::error::Error>>
 {
     let folder = Scratch::new("cancelled-join")?;
-    let (release, blocked) = std::sync::mpsc::channel();
+    let (stdout, release, entered) = blocking();
     let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
-    let TestPipes { messages, input } = pipes(Blocking(Some(blocked)), stdin, folder.0.clone());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    entered.await?;
     messages.finish(after(Duration::from_millis(400))).await;
     assert_eq!(input.stragglers(), 1);
     // The shutdown join is cancelled while the reader is still stuck.
