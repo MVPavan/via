@@ -56,7 +56,7 @@ _Avoid_: step, run
 One model step inside a turn. Claude Code's `--max-turns` and `num_turns` count steps; VIA's `max_steps` maps to `--max-turns`.
 
 **Vendor message**:
-One message the agent sends VIA as JSON text: an NDJSON line on a CLI's stdout, a JSON-RPC notification from a vendor server, or an SSE event. It is the adapter's input. Wire splits the byte stream into messages and caps their size without reading them; the route decodes each one into a typed struct, and a message that fails to decode is a protocol failure.
+One message the agent sends VIA as JSON text: an NDJSON line on a CLI's stdout, a JSON-RPC notification from a vendor server, or an SSE event. It is the adapter's input. Wire splits the byte stream into messages and caps their size without decoding them; the route decodes each one into a typed struct. An unknown message type becomes a `vendor.other` event; a malformed known message is a protocol failure (adapter contract §1).
 _Avoid_: frame, vendor event
 
 **Event**:
