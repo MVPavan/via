@@ -549,3 +549,40 @@ async fn s1_wire_cancelled_finish_hands_off_and_panics_are_counted()
     assert_eq!(fallback_drops(), 1);
     Ok(())
 }
+
+/// Coding style §5, design §8.6 (T4-3 review r2): a runtime straggler join
+/// cancelled while a reader is still stuck keeps that task owned, so a
+/// later join still counts it and joins it once it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn s1_wire_cancelled_straggler_join_keeps_ownership() -> Result<(), Box<dyn std::error::Error>>
+{
+    let folder = Scratch::new("cancelled-join")?;
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(Blocking(Some(blocked)), stdin, folder.0.clone());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    messages.finish(after(Duration::from_millis(400))).await;
+    assert_eq!(input.stragglers(), 1);
+    // The shutdown join is cancelled while the reader is still stuck.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        input.join_stragglers(after(Duration::from_secs(10))),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the join ended while its reader was stuck"
+    );
+    assert_eq!(input.stragglers(), 1, "the cancelled join lost the task");
+    // A later shutdown still reports it, then joins it once it ends.
+    input
+        .join_stragglers(after(Duration::from_millis(100)))
+        .await;
+    assert_eq!(input.stragglers(), 1);
+    release.send(())?;
+    input.join_stragglers(after(Duration::from_secs(5))).await;
+    assert_eq!(input.stragglers(), 0);
+    assert_eq!(input.failed_joins(), 0);
+    assert_eq!(fallback_drops(), 0);
+    Ok(())
+}

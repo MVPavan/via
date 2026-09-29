@@ -544,19 +544,16 @@ impl Stragglers {
     }
 
     /// Joins every task that ends by `deadline`.
+    /// The sets are taken out while they are joined; the guard returns
+    /// every unjoined set, also when this future is cancelled.
     pub(crate) async fn join_until(&self, deadline: Deadline) {
-        let sets = std::mem::take(&mut *self.sets.lock().unwrap_or_else(PoisonError::into_inner));
-        let mut left = Vec::new();
-        for mut set in sets {
-            let _joined = timeout_at(deadline.instant(), self.join_all(&mut set)).await;
-            if !set.is_empty() {
-                left.push(set);
-            }
+        let mut joining = Joining {
+            owner: self,
+            sets: std::mem::take(&mut *self.sets.lock().unwrap_or_else(PoisonError::into_inner)),
+        };
+        for set in &mut joining.sets {
+            let _joined = timeout_at(deadline.instant(), self.join_all(set)).await;
         }
-        self.sets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(left);
     }
 
     /// Joins `tasks` until none is left, counting panics.
@@ -579,6 +576,26 @@ impl Stragglers {
         if joined.is_err_and(|error| error.is_panic()) {
             self.failed.fetch_add(1, Ordering::AcqRel);
         }
+    }
+}
+
+/// Straggler sets taken out for a join (coding style §5): dropped, on
+/// completion or on cancellation, it hands every set with a task left back
+/// to its owner.
+struct Joining<'a> {
+    owner: &'a Stragglers,
+    sets: Vec<JoinSet<()>>,
+}
+
+impl Drop for Joining<'_> {
+    fn drop(&mut self) {
+        let mut left = std::mem::take(&mut self.sets);
+        left.retain(|set| !set.is_empty());
+        self.owner
+            .sets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(left);
     }
 }
 
