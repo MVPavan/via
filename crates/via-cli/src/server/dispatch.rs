@@ -13,8 +13,8 @@ use tokio::{
 };
 use via_core::{
     ApiError, CancelParams, CloseParams, DaemonStatusParams, DaemonStopParams, Engine, HelloParams,
-    LogsParams, ReadParams, Receipted, ResumeParams, SessionReadParams, SpawnParams, SteerParams,
-    WaitParams,
+    LogsParams, ReadParams, Receipted, ResumeParams, SessionReadParams, SpawnParams, StatusParams,
+    SteerParams, WaitParams,
 };
 
 use super::Client;
@@ -247,6 +247,7 @@ async fn dispatch(
             .events(typed::<SessionReadParams>(params)?.session.as_str())
             .await?),
         "logs" => Ok(engine.logs(typed::<LogsParams>(params)?).await?),
+        "status" => Ok(engine.status(typed::<StatusParams>(params)?).await?),
         _ => Err(Refusal::from(ApiError {
             code: -32601,
             kind: "method_not_found",
