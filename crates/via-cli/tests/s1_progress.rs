@@ -849,6 +849,64 @@ fn s1_progress_unrepresentable_tokens_fail_protocol() -> TestResult {
     Ok(())
 }
 
+/// Review r2: a refused sample's `protocol` failure survives a daemon
+/// force. Core is held at `core.observations.pause` on the 2^63 sample
+/// while the daemon force-stops, so Route ends the turn under the force
+/// (the vendor is gone) before Core refuses the sample and orders its
+/// `protocol` stop: the turn reaches final shutdown's forced terminal,
+/// which commits it `failed(protocol)` with its `turn.ended`.
+#[test]
+fn s1_progress_unrepresentable_tokens_survive_a_forced_stop() -> TestResult {
+    const PAUSE: &str = "core.observations.pause";
+    let max = u64::try_from(i64::MAX)?;
+    let mut steps = vec![accepted(1)];
+    steps.extend(emits(&[text(1)]));
+    steps.push(json!({"action":"report_pids"}));
+    steps.extend(emits(&[usage(1, max + 1)]));
+    steps.push(json!({"action":"hang"}));
+    let setup = Setup::new(&script(1, "forced", &steps))?;
+    let evidence = setup.evidence("s1_progress_unrepresentable_forced")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            // Hits: the acceptance, the text, then the sample.
+            setup.arm(PAUSE, 3, "pause")?;
+            let _daemon = setup.start(evidence)?;
+            let pid = setup.daemon_pid(evidence)?;
+            let session = setup.session(evidence, "forced")?;
+            setup.ack(PAUSE, 3, "pause", pid)?;
+            let agent: u32 = fs::read_to_string(setup.sandbox.sync.join("agent.pid"))
+                .map_err(infra)?
+                .trim()
+                .parse()
+                .map_err(infra)?;
+            cli(
+                &setup.sandbox,
+                evidence,
+                "stop",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            // Route closed the vendor under the force while Core is held.
+            await_exit(agent)?;
+            setup.release(PAUSE, 3)?;
+            await_exit(pid)?;
+            let failed = setup.sandbox.count(&format!(
+                "SELECT count(*) FROM turns WHERE session_id='{session}' AND number=1 \
+                 AND state='failed' \
+                 AND json_extract(envelope,'$.failure.class')='protocol'"
+            ))?;
+            let ended = setup.sandbox.count(&format!(
+                "SELECT count(*) FROM events WHERE session_id='{session}' AND type='turn.ended'"
+            ))?;
+            check(failed == 1 && ended == 1, || {
+                format!("failed(protocol) {failed}, turn.ended {ended}")
+            })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ---------------------------------------------------------- tool bounds
 
 /// Design §2.4 rules 3 and 4, §13.2: 70 concurrent tool starts keep 64

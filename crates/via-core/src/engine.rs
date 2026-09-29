@@ -179,7 +179,8 @@ struct ForcedTurn {
     /// proved group absence; recovery can add to these, never retract them.
     close: RouteClose,
     /// The turn's stop order's cause, if any: an idle order ends the forced
-    /// turn `failed(deadline_idle)` (design §2).
+    /// turn `failed(deadline_idle)` (design §2), a `protocol` one
+    /// `failed(protocol)`.
     cause: Option<via_adapters::StopCause>,
 }
 
