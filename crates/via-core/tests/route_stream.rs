@@ -267,15 +267,14 @@ fn route_forwards_every_observation_in_order() {
     }
 }
 
-/// Writes the scenario 32 lines at a time: Wire's queue holds 64 messages
-/// and fails `overflow` on a burst past it (Task 4 design §8.2).
-const PACED: &str = "read -r start
-n=0
-while IFS= read -r line; do
-  printf '%s\\n' \"$line\"
-  n=$((n+1))
-  [ $((n % 32)) -ne 0 ] || sleep 0.05
-done < \"$VIA_FAKE_SCENARIO\"
+/// Writes the first 1,000 lines at once, then the rest: Wire's queue holds
+/// 1,024 messages (A47), and this child's current-thread runtime lets the
+/// reader take a whole burst before Route runs, so one burst of all
+/// 1,045 lines fails `overflow` by design (§8.2).
+const TWO_BURSTS: &str = "read -r start
+/usr/bin/head -n 1000 \"$VIA_FAKE_SCENARIO\"
+sleep 0.2
+/usr/bin/tail -n +1001 \"$VIA_FAKE_SCENARIO\"
 printf 'unterminated tail'
 exec sleep 30
 ";
@@ -283,8 +282,7 @@ exec sleep 30
 /// W4-H Sol 2: a force while Route waits for observation capacity (the
 /// consumer is not draining) still reaches Route's bounded force close and
 /// drain, and the turn ends `ForceStopped` well before its deadline. Task 4
-/// design §2.3: the channel holds 1,024 items, so the vendor sends 20 more,
-/// fewer than Wire's queue holds.
+/// design §2.3: the channel holds 1,024 items, so the vendor sends 20 more.
 #[test]
 fn force_while_forwarding_is_blocked_ends_the_turn() {
     let mut lines = vec![json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})];
@@ -296,7 +294,7 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
     let Some(root) = child_root() else {
         return run_child(
             "force_while_forwarding_is_blocked_ends_the_turn",
-            PACED,
+            TWO_BURSTS,
             &lines,
         );
     };

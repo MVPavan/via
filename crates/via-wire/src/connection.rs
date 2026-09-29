@@ -33,8 +33,8 @@ const UNDECODED_WRITE: Duration = Duration::from_secs(2);
 /// One stdout read (design §8.2).
 const READ_BYTES: usize = 64 * 1024;
 
-/// The message queue: at most 64 messages and 4 MiB (design §8.2).
-const QUEUE_MESSAGES: usize = 64;
+/// The message queue: at most 1,024 messages and 4 MiB (design §8.2, A47).
+const QUEUE_MESSAGES: usize = 1024;
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A streamed start writes its prompt in slices of at most 16 KiB, each
@@ -296,6 +296,11 @@ impl Io {
     #[cfg(feature = "test-failpoints")]
     pub(crate) fn discarded(&self) -> u64 {
         self.shared.discarded.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.shared.queued_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -1048,6 +1053,11 @@ pub mod testing {
         /// Bytes the reader discarded after a failure.
         pub fn discarded(&self) -> u64 {
             self.io.discarded()
+        }
+
+        /// Bytes of messages the reader queued and nobody received yet.
+        pub fn queued_bytes(&self) -> usize {
+            self.io.queued_bytes()
         }
 
         /// Tasks handed to the runtime and not yet ended.

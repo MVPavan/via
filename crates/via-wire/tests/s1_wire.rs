@@ -374,3 +374,126 @@ async fn futures_poll<F: Future + Unpin>(future: &mut F) -> Option<F::Output> {
     })
     .await
 }
+
+/// Waits until the reader has queued `bytes` bytes, or a failure latched.
+async fn queued(input: &via_wire::testing::TestInput, bytes: usize) {
+    let bound = Instant::now() + Duration::from_secs(10);
+    while input.queued_bytes() < bytes && input.failure().is_none() {
+        assert!(
+            Instant::now() < bound,
+            "queued {} of {bytes} bytes",
+            input.queued_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Waits until a failure latched.
+async fn latched(input: &via_wire::testing::TestInput) -> Option<via_wire::FailureCause> {
+    let bound = Instant::now() + Duration::from_secs(10);
+    while input.failure().is_none() && Instant::now() < bound {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    input.failure()
+}
+
+/// Design §8.2 (A47): with nobody consuming, the queue holds 1,024 small
+/// messages and the 1,025th fails `Reader(Overflow)`; large messages hit the
+/// 4 MiB byte cap first, well before 1,024.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_queue_holds_1024_messages_or_4_mib_then_overflows()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Count bound, in writes of 64 lines so no single read decides it.
+    let folder = Scratch::new("queue-count")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let line = |n: usize| format!("{n:07}\n").into_bytes();
+    for batch in 0..16 {
+        let bytes: Vec<u8> = (batch * 64..(batch + 1) * 64).flat_map(line).collect();
+        vendor.write_all(&bytes).await?;
+        queued(&input, (batch + 1) * 64 * 8).await;
+        assert_eq!(input.failure(), None, "after {} messages", (batch + 1) * 64);
+    }
+    assert_eq!(input.queued_bytes(), 1024 * 8);
+    vendor.write_all(&line(1024)).await?;
+    assert!(
+        matches!(
+            latched(&input).await,
+            Some(via_wire::FailureCause::Reader(WireFailure::Overflow))
+        ),
+        "the 1,025th message: {:?}",
+        input.failure()
+    );
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+
+    // Byte cap: four messages of 1 MiB − 1 fit 4 MiB; a fifth does not.
+    let folder = Scratch::new("queue-bytes")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let mut large = vec![b'b'; MAX_STDOUT_MESSAGE_BYTES - 2];
+    large.push(b'\n');
+    for count in 1..=4 {
+        vendor.write_all(&large).await?;
+        queued(&input, count * large.len()).await;
+        assert_eq!(input.failure(), None, "after {count} large messages");
+    }
+    vendor.write_all(&large).await?;
+    assert!(
+        matches!(
+            latched(&input).await,
+            Some(via_wire::FailureCause::Reader(WireFailure::Overflow))
+        ),
+        "the fifth large message: {:?}",
+        input.failure()
+    );
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(fallback_drops(), 0);
+    Ok(())
+}
+
+/// Design §8.2 (A47): a burst of 1,040 small lines written at once reaches a
+/// live consumer whole; at 64 messages the same burst failed a healthy turn
+/// `overflow` in 241 ms (T4-3 report).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_burst_of_1040_lines_reaches_a_live_consumer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = Scratch::new("burst")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes(stdout, stdin, folder.0.clone());
+    let sent: Vec<Vec<u8>> = (0..1040)
+        .map(|n| {
+            format!(
+                "{{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"text\":\"line {n}\"}}\n"
+            )
+            .into_bytes()
+        })
+        .collect();
+    let burst = sent.concat();
+    let writer = tokio::spawn(async move {
+        vendor.write_all(&burst).await?;
+        vendor.shutdown().await
+    });
+    let mut received = Vec::new();
+    let end = loop {
+        match messages.next_message().await {
+            Ok(Some(message)) => received.push(message.bytes().to_vec()),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    assert!(end.is_none(), "the burst failed: {end:?}");
+    assert_eq!(received, sent);
+    tokio::time::timeout(Duration::from_secs(10), writer).await???;
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.failure(), None);
+    assert_eq!(fallback_drops(), 0);
+    Ok(())
+}
