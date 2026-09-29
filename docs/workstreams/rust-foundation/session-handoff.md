@@ -166,9 +166,14 @@ the historical checkpoint; its findings table is updated by this section.
   `t4/reviews/T4-A-sol-r*.md`). The plan is [t4/plan.md](t4/plan.md)
   (`76001d0`; the old `t4/s1.md`–`s7.md` are superseded): T4-1 → (T4-2 ∥ T4-3)
   → T4-4 → T4-5 → (T4-6 ∥ T4-7) → Close → critic, Beads `via-jm4.7.8.3`–`.10`
-  with T4-7 = `.7.8.1`. **Now:** T4-1 in worktree `via-wt/t4-1` (branch
-  `wt/t4-1`). Ledger: `scratchpad/execution/t4-impl/progress.md`; worker
-  logs under `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  with T4-7 = `.7.8.1`. Merged and closed, each after Sol high SOUND in
+  three rounds (`t4/reviews/`, reports in `t4/reports/`): T4-1 (`795ddcb`),
+  T4-2 (`9574169`), T4-3 (`77415b9`). Gate at `c837490`: 304 passed / 1
+  skipped, failpoints 454 / 1, F08–F12 56. Amendment T4-A47 (orchestrator,
+  on T4-3 evidence): the Wire message queue holds 1,024 messages, not 64.
+  **Now:** T4-4 in worktree `via-wt/t4-4` (branch `wt/t4-4`). Ledger:
+  `scratchpad/execution/t4-impl/progress.md`; worker logs under
+  `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From
