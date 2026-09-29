@@ -345,7 +345,7 @@ fn s1_wire_route_services_cancel_while_stdin_is_held() -> TestResult {
 }
 
 /// F27 through the daemon: a text message written in three pieces cut
-/// inside multi-byte characters commits byte-exact; a later 2 MiB line
+/// inside multi-byte characters commits byte-exact; once it has, a 2 MiB line
 /// fails the turn `overflow` with its first 64 KiB saved and named.
 #[test]
 fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix() -> TestResult {
@@ -368,6 +368,7 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
             json!({"action":"emit_bytes","bytes":bytes[first..second]}),
             json!({"action":"gate","name":"two"}),
             json!({"action":"emit_bytes","bytes":bytes[second..]}),
+            json!({"action":"gate","name":"three"}),
             json!({"action":"emit_raw","text":huge}),
             json!({"action":"hang"}),
         ],
@@ -384,6 +385,17 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
                 thread::sleep(Duration::from_millis(50));
                 setup.sandbox.release_gate(gate)?;
             }
+            // The text commits before the huge line: a latched failure
+            // drops what is still in flight (design §8.5).
+            setup.sandbox.await_gate("three")?;
+            let committed_by = Instant::now() + Duration::from_secs(20);
+            while setup.committed(&session, "assistant.text")? < 1 {
+                check(Instant::now() < committed_by, || {
+                    "the split text never committed".to_owned()
+                })?;
+                thread::sleep(Duration::from_millis(10));
+            }
+            setup.sandbox.release_gate("three")?;
             let envelope = setup.wait(evidence, &session)?;
             setup.record(evidence, &envelope, &session)?;
             check(
