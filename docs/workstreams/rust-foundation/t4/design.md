@@ -1,9 +1,9 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 14)
+# Task 4 design: events, progress, storage and C1 conformance (round 15)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 14.
-It replaces rounds 1–4. Rounds 6–14 apply the orchestrator's decisions on
-Sol's round-5 to round-13 reviews (`design-r5-decisions.md` to
-`design-r13-decisions.md`), tagged `[t4r5.N]` to `[t4r13.N]`. The
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 15.
+It replaces rounds 1–4. Rounds 6–15 apply the orchestrator's decisions on
+Sol's round-5 to round-14 reviews (`design-r5-decisions.md` to
+`design-r14-decisions.md`), tagged `[t4r5.N]` to `[t4r14.N]`. The
 owner-approved [requirements](requirements.md) (R1–R7, the "Bounding
 strategy" and "Thresholds are configuration") are normative and override
 earlier design assumptions and spec text; every such conflict is an
@@ -11,7 +11,7 @@ amendment in §11. Round 8 replaces exact memory and disk accounting with the ow
 coarse bounds (§5, §6.9) and limits `logs` to private connections (§4.4);
 round 9 makes every threshold daemon config (§5.2); round 12 narrows Task 4
 to per-turn connections (§4.4). Round history and
-decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§18.
+decision maps: [reports/T4-0.md](reports/T4-0.md) §9–§19.
 This step writes no code and no tests; slices are re-planned after the
 owner's review (`s1.md`–`s7.md` are superseded).
 
@@ -688,10 +688,14 @@ fenced queue (`FencedQueue<T>`).
   owns the in-flight batch; on exit or unwind it sets `dead`, takes the
   queue, sends `WriterLost` to each sink once and fails every reply.
 - **Offsets** [t4r13.3]. [V] Today the worker assigns offsets at write
-  (`crates/via-store/src/runtime/raw.rs:126`, `:146`). Change: the
-  connection's `RawWriter` assigns each unit's offset and sends it under one
-  per-connection mutex, so offset order is enqueue order (`enqueued_end`);
-  the worker syncs in that order and raises the shared `durable_end`
+  (`crates/via-store/src/runtime/raw.rs:126`, `:146`). Change [t4r14.1]:
+  `Payload::stage` takes the unit's staging capacity first; then, under one
+  per-connection mutex, `RawWriter` assigns the offset (`enqueued_end`) and
+  enqueues with a nonblocking `try_send`, advancing `enqueued_end` only on
+  success, so offsets equal the worker's file positions with no gap and
+  nothing blocks under the lock. A refused send is a connection failure: a
+  full inbox `Raw(Raw)` with `raw_incomplete`, a closed one
+  `Raw(WriterLost)` (§7.4). The worker syncs in that order and raises the shared `durable_end`
   before sending acks, so ack observation order cannot affect it.
 - **Lookup.** [V] `read_raw_ref` scans the 45-byte index linearly
   (`raw.rs:154-212`). Entries are in increasing payload offset, so lookup is
@@ -1833,7 +1837,7 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 `Store::read_count()`, `store.read.delay_ms`, `store.rollback.fail`,
 `VIA_TEST_EVENT_STALL_MS`,
 `VIA_TEST_PARTIAL_LINE_MS`, `VIA_TEST_REPLY_WRITE_MS`,
-`wire::fallback_drops()`, `wire.ack.observe_delay` [t4r13.5],
+`wire::fallback_drops()`, `wire.ack.observe_delay` [t4r13.5], `raw.inbox.refuse` [t4r14.1],
 `blob.write.fail_after`,
 `Store::blob_chunk_reads()`, fake-agent steps `HoldStdin`, `ReportCwd`,
 `EchoPromptDigest` (`Emit`, `Gate` and `Flood`,
@@ -1860,7 +1864,7 @@ All under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_logs_pages_raw_bytes_by_cursor_and_isolates_sessions` [t4r11.1] | a 1 MiB control-character unit spans pages under 1 MiB each; a cursor for another session's connection, for another turn's connection under a turn address, or beyond a connection's end is `invalid_params`; after a crash mid-turn the turn's connection is readable and recovery seals it |
 | `s1_c1_logs_end_cursor_resumes_while_running` [t4r5.12, t4r6.11] | a call before any byte is durable returns `r1.start`, and a later call from it returns the first bytes; on a running turn `next_cursor` is non-null at the current end and a later call from it returns only new bytes; after the terminal and seal it is `null` |
 | `s1_store_disk_budgets_stop_admission_and_fail_visibly` [t4r7.2, t4r8.2–4, t4r9.1, t4r9.5, t4r10.1] | lowered budgets: above the SQLite admission line a spawn is `store_error` `not_committed`; an ordinary write begun just below the line that would commit above it is rolled back `NotCommitted` and leaves `page_count` at or below the line; a queued turn fails `store` at dispatch, and a running turn's step row is refused and the turn fails `store`, while its terminal, a session close and queued-turn cancellations commit from the headroom; a terminal forced to `SQLITE_FULL` is rolled back and reported `NotCommitted` (a failed rollback latches); a raw flood fails its turn with `raw_log.incomplete` and the counter equals the summed file lengths, index entries and headers included, after a failed write and after restart; a lowered budget below the store's size refuses start (`store_over_budget`); a WAL held above `wal.max` by a reader fails health; the WAL growth of a maximal event batch and of a terminal with many carried rows on a near-ceiling store is recorded for `via-d9o.2.3` (no bound asserted, Q-R9-1) [t4r10.1] |
-| `s1_raw_loss_by_offsets_and_logs_stop_at_high_water` [t4r13.5] | (a) the raw worker stalled (`Store::stall_raw_worker()`) with a stdout append enqueued at `finish`'s deadline: the terminal commits `high_water` = `durable_end` with `raw_log.incomplete`; resumed, the late bytes land past `high_water`, and `logs` and `raw_ref` resolution stop at it; (b) every unit durable when the barrier answers: `high_water` = `enqueued_end`, no flag; (c) acks observed out of order (`wire.ack.observe_delay` holds the stdout task's observation while a later stderr ack arrives): `high_water` and the flag match (a) and (b); (d) a failed open whose drain times out with an append queued: `WireError::Acquire` carries `high_water`, the terminal commits it with the flag; (e) a crash after the terminal commit, before and after the late append lands: restart keeps `high_water`, `logs` stops at it, and the byte counter equals the files' lengths |
+| `s1_raw_loss_by_offsets_and_logs_stop_at_high_water` [t4r13.5, t4r14.1] | (a) the raw worker stalled (`Store::stall_raw_worker()`) with a stdout append enqueued at `finish`'s deadline: the terminal commits `high_water` = `durable_end` with `raw_log.incomplete`; resumed, the late bytes land past `high_water`, and `logs` and `raw_ref` resolution stop at it; (b) every unit durable when the barrier answers: `high_water` = `enqueued_end`, no flag; (c) acks observed out of order (`wire.ack.observe_delay` holds the stdout task's observation while a later stderr ack arrives): `high_water` and the flag match (a) and (b); (d) a saturated inbox (`raw.inbox.refuse` makes `try_send` report full) [t4r14.1]: the reader does not block, the connection fails `Raw(Raw)` with `raw_log.incomplete`, `enqueued_end` is unchanged, and the accepted units' offsets equal their file positions; (e) a failed open whose drain times out with an append queued: `WireError::Acquire` carries `high_water`, the terminal commits it with the flag; (f) a crash after the terminal commit, before and after the late append lands: restart keeps `high_water`, `logs` stops at it, and the byte counter equals the files' lengths |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket_and_frees_the_permit` | A31; A32, with `VIA_TEST_REPLY_WRITE_MS` |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` | four turns, 256 MiB stdout flood; daemon peak RSS < 256 MiB, growth < 32 MiB after the first 64 MiB, each anchor ≤ 32 MiB, sum < 384 MiB, `MemoryBudget` high-water ≤ 128 MiB, the SQLite cache's 8 MiB included [t4r7.1]; `daemon/status`, `status` and a `cancel` of another turn answer within 100 ms, including with its interrupt write blocked at `HoldStdin`; the flood turn ends `failed(overflow)` with `raw_log.incomplete` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent after filling the channel: `overflow` at the lowered stall with no further vendor byte |
