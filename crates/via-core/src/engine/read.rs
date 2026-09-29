@@ -1,4 +1,5 @@
-//! Reads: address resolution, `result`, `wait`, `events` and `logs`.
+//! Reads: address resolution, `result`, `wait`, `events`, `logs` and
+//! `status`.
 
 use std::{sync::atomic::Ordering, time::Duration};
 
@@ -6,8 +7,15 @@ use serde_json::{Value, json};
 use via_store::{StoreClient, TerminalFacts};
 
 use super::{Engine, journal};
-use crate::api::DEFAULT_WAIT_MS;
-use crate::{ApiError, LogsParams, SessionId, TurnNumber, WaitParams, parse_address};
+use crate::api::{DEFAULT_WAIT_MS, FAKE_TOKEN_SCOPE, rfc3339};
+use crate::{ApiError, LogsParams, SessionId, StatusParams, TurnNumber, WaitParams, parse_address};
+
+/// `status` reply bound (Task 4 design §4.2): met by construction, checked
+/// by a debug assertion.
+const STATUS_MAX: usize = 1024 * 1024;
+
+/// `status` step page size without `limit` (C1 §3.7).
+const STATUS_DEFAULT_LIMIT: u32 = 100;
 
 impl Engine {
     /// Resolves a C1 address; a bare session names its latest turn.
@@ -193,6 +201,138 @@ impl Engine {
             "files": files,
         }))
     }
+}
+
+impl Engine {
+    /// C1 §3.7 `status` (Task 4 design §4.2, §11.3): one Public Store read
+    /// selects the turn and returns the durable members and a page of its
+    /// step rows; then, from memory, the published progress when the
+    /// selected turn is not terminal in that read and is the running one,
+    /// and `process.alive`.
+    pub async fn status(&self, params: StatusParams) -> Result<Value, ApiError> {
+        let limit = params.limit.unwrap_or(STATUS_DEFAULT_LIMIT);
+        if limit == 0 || limit > via_store::STATUS_STEPS {
+            return Err(ApiError::INVALID_PARAMS);
+        }
+        let after_step = params.after_step.unwrap_or(0);
+        let status = self
+            .store
+            .public()
+            .session_status(&params.session, params.turn, after_step, limit)
+            .await
+            .map_err(|error| ApiError::read(&error))?
+            .ok_or(ApiError::SESSION_NOT_FOUND)?;
+        if params.turn.is_some() && status.selected.is_none() {
+            return Err(ApiError::TURN_NOT_FOUND);
+        }
+        let progress = status
+            .selected
+            .as_ref()
+            .filter(|(_, state)| !terminal(state))
+            .and_then(|(turn, _)| self.slot(&params.session)?.progress(*turn))
+            .map(|progress| progress.to_value(FAKE_TOKEN_SCOPE));
+        let alive = self.adapter.live_armed(&status.unproven_anchors);
+        let value = status_value(
+            &params.session,
+            status,
+            after_step,
+            progress.as_ref(),
+            alive,
+        );
+        debug_assert!(
+            serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= STATUS_MAX),
+            "status exceeds STATUS_MAX"
+        );
+        Ok(value)
+    }
+}
+
+/// Whether a turn state is terminal.
+fn terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled" | "unknown")
+}
+
+/// Unix milliseconds as RFC 3339.
+fn unix_ms(ms: i64) -> String {
+    let since = std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0));
+    rfc3339(std::time::UNIX_EPOCH + since)
+}
+
+/// The C1 §3.7 `status` object from one Store read and the memory part.
+fn status_value(
+    session: &SessionId,
+    status: via_store::SessionStatus,
+    after_step: u32,
+    progress: Option<&Value>,
+    alive: bool,
+) -> Value {
+    let active_turn = status.active.map(|active| {
+        json!({
+            "n": active.turn,
+            "state": "running",
+            "phase": if active.accepted { "accepted" } else { "submitting" },
+            "started_at": active.submitted_at,
+            "last_event_seq": active.last_event_seq,
+            "cancel": active
+                .cancel_requested_at
+                .map(|at| json!({"requested_at": at})),
+        })
+    });
+    let queue: Vec<Value> = status
+        .queue
+        .into_iter()
+        .map(|queued| {
+            json!({"n": queued.turn, "op_key": queued.op_key, "queued_at": queued.queued_at,
+                "effective": queued.effective})
+        })
+        .collect();
+    let turns: Vec<Value> = status
+        .turns
+        .iter()
+        .map(|(turn, state)| {
+            if terminal(state) {
+                json!({"n": turn, "state": state, "revision": 0})
+            } else {
+                json!({"n": turn, "state": state})
+            }
+        })
+        .collect();
+    let steps = status.selected.as_ref().map(|(turn, _)| {
+        let items: Vec<Value> = status
+            .steps
+            .iter()
+            .map(|row| {
+                json!({"step": row.step, "started_at": unix_ms(row.started_ms),
+                    "ended_at": unix_ms(row.ended_ms), "tokens": row.tokens})
+            })
+            .collect();
+        let next_after = status.steps.last().map_or(after_step, |row| row.step);
+        json!({"turn": turn, "items": items, "next_after": next_after, "more": status.more})
+    });
+    json!({
+        "session_id": session,
+        "state": status.state,
+        "admission": status.admission,
+        "harness": status.harness,
+        "model": status.model,
+        "route": status.route,
+        "vendor_session_id": status.vendor_session_id,
+        "vendor_identity_verified": false,
+        "cwd": status.cwd,
+        "process": {
+            "alive": alive,
+            "cleanup": if status.cleanup_uncertain { "uncertain" } else { "quiescent" },
+            "idle_since": null,
+        },
+        "active_turn": active_turn,
+        "progress": progress,
+        "steps": steps,
+        "queue": queue,
+        "turns": turns,
+        "label": status.label,
+        "created_at": unix_ms(status.created_ms),
+        "updated_at": unix_ms(status.updated_ms),
+    })
 }
 
 /// The fixed evidence files present in `folder`, as `{name, bytes}`: one

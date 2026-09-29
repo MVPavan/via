@@ -24,7 +24,7 @@ mod stand_in_anchor;
 use serde_json::{Value, json};
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Deadline, FakeConfig, FakeObservation,
-    Observation, RouteError, RuntimeConfig, SessionId, ToolStatus, TurnNumber,
+    Observation, RouteError, RuntimeConfig, SessionId, TurnNumber,
 };
 use via_store::{SpawnRecord, Store};
 
@@ -163,6 +163,7 @@ impl Child {
                 TurnNumber::try_from(1).unwrap(),
                 "hello".to_owned(),
                 sender,
+                via_adapters::TurnActivity::new(tokio::time::Instant::now()),
                 deadline,
                 force,
                 tokio::sync::watch::channel(None).1,
@@ -213,10 +214,14 @@ fn route_forwards_every_observation_in_order() {
     let mut child = Child::open(&root);
     let (observed, result) = child.execute(TURN, |_, _, _| {});
     result.unwrap();
-    // Everything except the terminal, which travels in the route result.
+    // Everything except the terminal, which travels in the route result,
+    // and unknown messages, which send no observation (Task 4 design §2.3).
     let expected: Vec<&Value> = lines
         .iter()
-        .filter(|line| line["type"] != "terminal")
+        .filter(|line| {
+            ["accepted", "text", "tool_started", "tool_ended"]
+                .contains(&line["type"].as_str().unwrap())
+        })
         .collect();
     assert_eq!(observed.len(), expected.len());
     for (observation, line) in observed.iter().zip(expected) {
@@ -225,42 +230,27 @@ fn route_forwards_every_observation_in_order() {
                 assert_eq!(line["type"], "accepted");
                 assert_eq!(accepted.vendor_turn_id.as_str(), "fake-turn-1");
             }
-            FakeObservation::Data { observation } => {
-                match (observation, line["type"].as_str().unwrap()) {
-                    (Observation::AssistantText { text }, "text") => assert_eq!(text, "hi"),
-                    (
-                        Observation::ToolStarted {
-                            tool_id,
-                            name,
-                            input_summary,
-                        },
-                        "tool_started",
-                    ) => {
-                        assert_eq!(
-                            (tool_id.as_str(), name.as_str(), input_summary.as_str()),
-                            ("t", "sh", "ls")
-                        );
+            FakeObservation::Data {
+                observation: Observation::Progress(marks),
+            } => {
+                let started: Vec<(&str, &str)> = marks
+                    .tools_started
+                    .iter()
+                    .map(|(id, name)| (id.as_str(), name.as_str()))
+                    .collect();
+                let fields = (
+                    marks.model,
+                    started,
+                    marks.tools_ended.clone(),
+                    marks.usage.clone(),
+                );
+                match line["type"].as_str().unwrap() {
+                    "text" => assert_eq!(fields, (true, vec![], vec![], None)),
+                    "tool_started" => assert_eq!(fields, (false, vec![("t", "sh")], vec![], None)),
+                    "tool_ended" => {
+                        assert_eq!(fields, (false, vec![], vec!["t".to_owned()], None));
                     }
-                    (
-                        Observation::ToolEnded {
-                            status, exit_code, ..
-                        },
-                        "tool_ended",
-                    ) => {
-                        assert_eq!((*status, *exit_code), (ToolStatus::Completed, Some(0)));
-                    }
-                    (
-                        Observation::VendorOther {
-                            vendor_type,
-                            truncated,
-                            ..
-                        },
-                        kind,
-                    ) => {
-                        assert_eq!(vendor_type, kind);
-                        assert!(!truncated);
-                    }
-                    (other, kind) => panic!("{kind} became {other:?}"),
+                    kind => panic!("{kind} became {marks:?}"),
                 }
             }
         }
@@ -309,6 +299,7 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
             TurnNumber::try_from(1).unwrap(),
             "hello".to_owned(),
             sender,
+            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             deadline,
             force,
             tokio::sync::watch::channel(None).1,
@@ -379,6 +370,7 @@ fn post_arm_acquisition_deadline_keeps_its_cause() {
             TurnNumber::try_from(1).unwrap(),
             "hello".to_owned(),
             sender,
+            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
             force,
             tokio::sync::watch::channel(None).1,
@@ -426,6 +418,7 @@ fn stalled_acquisition_with_force(
             TurnNumber::try_from(1).unwrap(),
             "hello".to_owned(),
             sender,
+            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             Deadline::at(deadline),
             force,
             tokio::sync::watch::channel(None).1,

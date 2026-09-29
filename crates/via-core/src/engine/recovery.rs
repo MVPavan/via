@@ -432,6 +432,7 @@ impl Engine {
             accepted,
             first_failure: None,
             uncertain: None,
+            steps: super::progress::StepTracker::default(),
         };
         let cancel = self
             .settle_recovered(&mut record, reconciled, requested_at, settled)

@@ -89,27 +89,22 @@ fn terminal_and_unknown_notification_keep_their_distinct_evidence() {
         }
     ));
     let other = FakeMessage::decode(br#"{"type":"later","data":123}"#, turn).unwrap();
-    assert!(matches!(other, FakeMessage::UnknownNotification { .. }));
+    assert!(matches!(other, FakeMessage::Unknown { .. }));
     assert!(matches!(
         FakeMessage::decode(br#"{"type":"later","id":4}"#, turn),
         Err(RouteError::Protocol { .. })
     ));
 }
 
+/// Task 4 design §2.2: an unknown message keeps only its type tag; no
+/// part of its payload is copied.
 #[test]
-fn unknown_notification_payload_is_bounded_and_marks_loss() {
+fn unknown_notification_keeps_only_its_type_tag() {
     let turn = TurnNumber::try_from(1).unwrap();
     let input = format!(r#"{{"type":"later","text":"{}"}}"#, "é".repeat(12_000));
     let message = FakeMessage::decode(input.as_bytes(), turn).unwrap();
-    let FakeMessage::UnknownNotification {
-        raw_payload,
-        truncated,
-        ..
-    } = message
-    else {
+    let FakeMessage::Unknown { vendor_type } = message else {
         panic!("expected unknown notification");
     };
-    assert!(truncated);
-    assert!(raw_payload.len() <= via_routes::UNKNOWN_NOTIFICATION_BYTES);
-    assert!(raw_payload.is_char_boundary(raw_payload.len()));
+    assert_eq!(vendor_type, "later");
 }

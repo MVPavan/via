@@ -8,16 +8,17 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     AdapterError, AdmittedObservation, FakeAcceptanceObservation, FakeObservation,
-    FakeTerminalEvidence, Observation, RouteError, StopOrder, StopWatch, ToolStatus, WireCleanup,
+    FakeTerminalEvidence, Observation, RouteError, StopOrder, StopWatch, TurnActivity, WireCleanup,
 };
 use via_store::{
-    AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StoreError, SubmissionRecord,
-    TerminalExtras, TerminalRecord,
+    AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
+    SubmissionRecord, TerminalExtras, TerminalRecord,
 };
 
 use super::batch::AffectedTurn;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
+use super::progress::Progress;
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
 use super::resolve::{Queueing, ReadStreak};
 use super::stop::StopMode;
@@ -608,8 +609,8 @@ impl Engine {
         // Design §2 [r1.11]: both deadlines run from the submission clock.
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
-        let (route_stop, orders) = slot.start_running(turn, deadline.instant());
-        let mut record = new_record(slot, &session, turn);
+        let (mut record, activity, (route_stop, orders)) =
+            start_turn(slot, &session, turn, deadline.instant());
         let mut control = Control {
             slot,
             turn,
@@ -622,7 +623,7 @@ impl Engine {
         let driven = self
             .execute(
                 &mut record,
-                (prompt, &effective),
+                (prompt, &effective, activity),
                 (deadline, route_stop),
                 Box::new(capacity),
                 &mut control,
@@ -679,6 +680,10 @@ impl Engine {
             .filter(|_| terminal.state == "cancelled");
         // A terminal that did not commit reads `store_error` and latches.
         let _ = self.finish_with(started, (record, terminal), cause).await;
+        // Test builds: the terminal committed, `Running` not yet cleared
+        // (Task 4 design §4.2).
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.finish_running.pause").await;
         slot.finish_running(turn);
     }
 
@@ -1179,10 +1184,10 @@ impl Engine {
         committed.map_err(Unended::from)
     }
 
-    /// Drives the adapter under the turn deadline, committing each observation it
+    /// Drives the adapter under the turn deadline, handling each observation it
     /// reports in decode order before the adapter outcome is returned. A force stop
     /// reaches Route, which force-closes the group and drains its output first:
-    /// messages it read still commit.
+    /// messages it read are still handled.
     ///
     /// The turn's stop order reaches Route through `stop`; this loop observes
     /// it once (design §2), and orders the idle deadline itself when no
@@ -1190,7 +1195,7 @@ impl Engine {
     async fn execute(
         &self,
         record: &mut TurnRecord,
-        (prompt, effective): (String, &Effective),
+        (prompt, effective, activity): (String, &Effective, TurnActivity),
         (deadline, stop): (Deadline, StopWatch),
         capacity: via_adapters::CapacityToken,
         control: &mut Control<'_>,
@@ -1203,6 +1208,7 @@ impl Engine {
             record.turn,
             prompt,
             sink,
+            activity,
             deadline,
             self.signal.force.subscribe(),
             stop,
@@ -1229,7 +1235,7 @@ impl Engine {
                         // Test builds: Core holds before handling an observation.
                         #[cfg(feature = "test-failpoints")]
                         let _ = via_store::failpoint::hit_async("core.observations.pause").await;
-                        self.observe(record, effective, observation).await;
+                        self.observe(record, effective, control.slot, observation).await;
                     })
                     .await;
                     // Handled: its bytes return to the budget.
@@ -1286,7 +1292,7 @@ impl Engine {
         }
     }
 
-    /// Commits the observations still queued when `execute` completed, in
+    /// Handles the observations still queued when `execute` completed, in
     /// decode order. A failed write sends or upgrades the turn's order to
     /// cause `store`, as in the observation branch (design §7.2 row 5).
     async fn drain(
@@ -1301,7 +1307,8 @@ impl Engine {
             permit,
         }) = observed.try_recv()
         {
-            self.observe(record, effective, observation).await;
+            self.observe(record, effective, control.slot, observation)
+                .await;
             drop(permit);
             stop_for_store(record, control);
         }
@@ -1342,16 +1349,23 @@ impl Engine {
             .await;
     }
 
-    /// Commits one adapter observation at the next sequence, in decode order.
-    /// After the first Store failure the rest are dropped and the turn fails `store`.
+    /// Handles one adapter observation in decode order: commits the
+    /// acceptance at the next sequence, and folds progress marks into the
+    /// step tracker, publishing each change to `slot` (Task 4 design §2.4).
+    /// After the first Store failure no event commits and the turn fails
+    /// `store`; progress still folds, and its rows ride in the terminal.
     async fn observe(
         &self,
         record: &mut TurnRecord,
         effective: &Effective,
+        slot: &Slot,
         observation: FakeObservation,
     ) {
         match observation {
             FakeObservation::Accepted(observation) => {
+                if let Some(delta) = record.steps.accept() {
+                    slot.publish_progress(record.turn, &delta);
+                }
                 // Route admits one acceptance; a repeat would be deduplicated anyway.
                 if record.first_failure.is_some() || record.accepted.is_some() {
                     return;
@@ -1394,9 +1408,52 @@ impl Engine {
                     }
                 }
             }
-            FakeObservation::Data { observation } => {
-                self.commit_event(record, event_body(observation)).await;
+            FakeObservation::Data {
+                observation: Observation::Progress(marks),
+            } => {
+                let folded = record.steps.fold(&marks);
+                if let Some(row) = folded.row {
+                    // Design §3.2: a boundary publishes the new step first,
+                    // then commits the ended step's row.
+                    #[cfg(feature = "test-failpoints")]
+                    let _ = via_store::failpoint::hit_async("core.progress.publish").await;
+                    slot.publish_progress(record.turn, &folded.delta);
+                    self.commit_step(record, row).await;
+                } else {
+                    slot.publish_progress(record.turn, &folded.delta);
+                }
             }
+        }
+    }
+
+    /// Commits the row of a step that ended (Task 4 design §3.2) on the
+    /// Internal lane. After the turn's first failure the row is carried to
+    /// the terminal. A known `NotCommitted` becomes the first failure and
+    /// its row is carried; an uncertain outcome latches, and the row, which
+    /// may have committed, is not.
+    async fn commit_step(&self, record: &mut TurnRecord, row: StepRow) {
+        if record.first_failure.is_some() {
+            record.steps.carried.push(row);
+            return;
+        }
+        let committed = self
+            .store
+            .commit_steps(StepsRecord {
+                session_id: record.session.clone(),
+                turn: record.turn,
+                rows: vec![row],
+            })
+            .await;
+        if let Err(error) = committed {
+            let outcome = WriteOutcome::of(&error);
+            if outcome == WriteOutcome::NotCommitted {
+                record.steps.carried.push(row);
+            }
+            record.first_failure = Some(FailureNote {
+                site: FailureSite::Event,
+                outcome,
+            });
+            self.report_first_failure(record, false).await;
         }
     }
 
@@ -1464,7 +1521,11 @@ impl Engine {
                 .is_err()
         {
             self.unresolved.fail(session, turn, TurnState::Running);
-            slot.start_running(turn, tokio::time::Instant::now());
+            slot.start_running(
+                turn,
+                tokio::time::Instant::now(),
+                Progress::starting(turn.get()),
+            );
             slot.finish_running(turn);
             self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(SubmitFailure::Failed(WriteOutcome::Uncertain));
@@ -1620,6 +1681,9 @@ pub(super) fn ended_record(
     seq: u64,
 ) -> Result<TerminalRecord, ApiError> {
     let ended_at = rfc3339(SystemTime::now());
+    // Design §3.2: every terminal built from the record carries the rows it
+    // could not commit and the open step's.
+    let steps = record.steps.terminal_rows();
     let event = Event {
         seq,
         session_id: &started.session,
@@ -1661,7 +1725,7 @@ pub(super) fn ended_record(
         turn: started.turn,
         envelope,
         event,
-        steps: Vec::new(),
+        steps,
     })
 }
 
@@ -1728,19 +1792,40 @@ where
     commit.await
 }
 
-/// Meaningful progress resets the idle deadline (design §5 [r1.10]):
-/// acceptance, assistant text, and tool start and end. Unknown
-/// observations never do; the fake route declares no other progress.
+/// Meaningful progress resets the idle deadline (Task 4 design §2.6):
+/// acceptance, and a `progress` item with a `model` mark or a tool start or
+/// end. Usage-only items never do; unknown messages send no item.
 fn progress(observation: &FakeObservation) -> bool {
     match observation {
         FakeObservation::Accepted(_) => true,
-        FakeObservation::Data { observation, .. } => match observation {
-            Observation::AssistantText { .. }
-            | Observation::ToolStarted { .. }
-            | Observation::ToolEnded { .. } => true,
-            Observation::VendorOther { .. } => false,
-        },
+        FakeObservation::Data {
+            observation: Observation::Progress(marks),
+        } => marks.model || !marks.tools_started.is_empty() || !marks.tools_ended.is_empty(),
     }
+}
+
+/// A submitted turn's record, its activity clock and its `Running` entry
+/// (Task 4 design §2.4): the published progress and the activity clock
+/// share the step tracker's clock.
+fn start_turn(
+    slot: &Slot,
+    session: &SessionId,
+    turn: TurnNumber,
+    wall: tokio::time::Instant,
+) -> (
+    TurnRecord,
+    TurnActivity,
+    (StopWatch, watch::Receiver<Option<StopOrder>>),
+) {
+    let record = new_record(slot, session, turn);
+    let clock = record.steps.clock();
+    let activity = TurnActivity::new(clock.base());
+    let running = slot.start_running(
+        turn,
+        wall,
+        Progress::new(turn.get(), clock, activity.clone()),
+    );
+    (record, activity, running)
 }
 
 /// A turn's record before its first event: it writes at the slot's head.
@@ -1752,6 +1837,7 @@ fn new_record(slot: &Slot, session: &SessionId, turn: TurnNumber) -> TurnRecord 
         accepted: None,
         first_failure: None,
         uncertain: None,
+        steps: super::progress::StepTracker::default(),
     }
 }
 
@@ -1794,47 +1880,4 @@ pub(super) fn queued_cancellation(
         cancel_cause: cause.map(|(cause, _)| cause),
     };
     (started, record, terminal, extras)
-}
-
-/// Maps a normalized observation onto its C1 §6.1 event payload.
-fn event_body(observation: Observation) -> EventBody {
-    match observation {
-        Observation::AssistantText { text } => EventBody::AssistantText {
-            text,
-            is_final: false,
-        },
-        Observation::ToolStarted {
-            tool_id,
-            name,
-            input_summary,
-        } => EventBody::ToolStarted {
-            tool_id,
-            name,
-            input_summary,
-        },
-        Observation::ToolEnded {
-            tool_id,
-            status,
-            output_summary,
-            exit_code,
-        } => EventBody::ToolEnded {
-            tool_id,
-            status: match status {
-                ToolStatus::Completed => "completed",
-                ToolStatus::Failed => "failed",
-                ToolStatus::Cancelled => "cancelled",
-            },
-            output_summary,
-            exit_code,
-        },
-        Observation::VendorOther {
-            vendor_type,
-            payload,
-            truncated,
-        } => EventBody::VendorOther {
-            vendor_type,
-            payload,
-            truncated,
-        },
-    }
 }

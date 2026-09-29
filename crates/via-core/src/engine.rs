@@ -25,6 +25,7 @@ mod control;
 mod drive;
 mod journal;
 mod latch;
+mod progress;
 mod queue;
 mod read;
 mod receipt;
@@ -445,6 +446,9 @@ struct TurnRecord {
     first_failure: Option<FailureNote>,
     /// The event commit Store left uncertain, settled before `turn.ended`.
     uncertain: Option<UncertainEvent>,
+    /// The step tracker (Task 4 design §2.4) and the rows the terminal
+    /// carries (§3.2).
+    steps: progress::StepTracker,
 }
 
 /// A turn's first failed Store write: where it failed and whether it may

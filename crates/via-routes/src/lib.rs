@@ -1,18 +1,22 @@
 //! Routes own protocol messages and request pairing; they never choose vendor
 //! policy or supervise processes.
 
-use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use thiserror::Error;
 
 pub use via_wire::{
     AnchorCohort, CloseRequest, Deadline, ExitReport, OutboundMessage, SendOutcome, TurnNumber,
 };
 
-/// Maximum bytes retained for an unknown fake notification's raw payload.
-pub const UNKNOWN_NOTIFICATION_BYTES: usize = 16 * 1024;
+/// Task 4 design §2.2 rule 1: an ID, tool name, type tag, `stop_reason` or
+/// `vendor_code` longer than this is `protocol`.
+pub const SHORT_FIELD_MAX: usize = 1024;
 
-/// C2 A1 bound on one encoded observation payload. Text is split by Adapter;
-/// any other known payload above it fails the turn as a protocol error.
+/// Task 4 design §2.2: an unknown message's type tag is kept up to this.
+pub const UNKNOWN_TAG_MAX: usize = 256;
+
+/// C2 A1 bound on one encoded observation payload (Task 4 design §2.2
+/// rule 2).
 pub const MAX_OBSERVATION_BYTES: usize = 256 * 1024;
 
 /// The one prompt submission of a private fake connection. Wire streams it
@@ -91,19 +95,8 @@ pub enum TerminalStatus {
     Failed,
 }
 
-/// Fake tool completion status.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolStatus {
-    /// Tool completed.
-    Completed,
-    /// Tool failed.
-    Failed,
-    /// Tool was cancelled.
-    Cancelled,
-}
-
-/// A decoded fake notification or paired response.
+/// A decoded fake message (Task 4 design §2.2): only what progress, the
+/// acceptance and the terminal need; everything else is skipped unread.
 #[derive(Eq, PartialEq)]
 pub enum FakeMessage {
     /// Response to the only start request, paired by ID and vendor turn.
@@ -111,12 +104,11 @@ pub enum FakeMessage {
         /// Fake-scoped vendor turn identifier.
         vendor_turn_id: String,
     },
-    /// Incremental assistant text.
+    /// Model output: a `model` mark. Its text is not kept; final text comes
+    /// from the terminal message.
     Text {
         /// Fake-scoped vendor turn identifier.
         vendor_turn_id: String,
-        /// One text chunk; final text comes from the terminal message.
-        text: String,
     },
     /// Authoritative final fake output and vendor status.
     Terminal {
@@ -139,8 +131,6 @@ pub enum FakeMessage {
         tool_id: String,
         /// Tool name.
         name: String,
-        /// Bounded input summary.
-        input_summary: String,
     },
     /// A tool ended inside the turn.
     ToolEnded {
@@ -148,26 +138,23 @@ pub enum FakeMessage {
         vendor_turn_id: String,
         /// Vendor tool identifier.
         tool_id: String,
-        /// Vendor completion status.
-        status: ToolStatus,
-        /// Bounded output summary.
-        output_summary: String,
-        /// Exit code when present.
-        exit_code: Option<i32>,
+    },
+    /// A keyless usage sample: the tokens of one model call.
+    Usage {
+        /// Fake-scoped vendor turn identifier.
+        vendor_turn_id: String,
+        /// The call's total tokens.
+        total_tokens: u64,
     },
     /// Acknowledgement of receiving interrupt, not cancellation settlement.
     InterruptAck {
         /// Fake-scoped vendor turn identifier.
         vendor_turn_id: String,
     },
-    /// Unknown id-less notification, retained with an explicit truncation bit.
-    UnknownNotification {
-        /// Original unknown type tag.
+    /// An unknown id-less message: activity only.
+    Unknown {
+        /// Its type tag, at most [`UNKNOWN_TAG_MAX`] bytes.
         vendor_type: String,
-        /// Bounded UTF-8 prefix of the encoded message.
-        raw_payload: String,
-        /// Whether the payload prefix omitted bytes.
-        truncated: bool,
     },
 }
 
@@ -335,9 +322,8 @@ struct AcceptedFields {
 }
 
 #[derive(Deserialize)]
-struct TextFields {
+struct TurnFields {
     vendor_turn_id: String,
-    text: String,
 }
 
 #[derive(Deserialize)]
@@ -349,21 +335,23 @@ struct TerminalFields {
     vendor_code: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ToolStartedFields {
     vendor_turn_id: String,
     tool_id: String,
     name: String,
-    input_summary: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ToolEndedFields {
     vendor_turn_id: String,
     tool_id: String,
-    status: ToolStatus,
-    output_summary: String,
-    exit_code: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct UsageFields {
+    vendor_turn_id: String,
+    total_tokens: u64,
 }
 
 fn known<T: for<'de> Deserialize<'de>>(input: &[u8], turn: TurnNumber) -> Result<T, RouteError> {
@@ -373,14 +361,15 @@ fn known<T: for<'de> Deserialize<'de>>(input: &[u8], turn: TurnNumber) -> Result
     })
 }
 
-/// Refuses a known non-text payload whose encoded observation exceeds C2's bound.
-fn bounded_payload<T: Serialize>(fields: &T, turn: TurnNumber) -> Result<(), RouteError> {
-    match serde_json::to_vec(fields) {
-        Ok(encoded) if encoded.len() <= MAX_OBSERVATION_BYTES => Ok(()),
-        Ok(_) | Err(_) => Err(RouteError::Protocol {
+/// Design §2.2 rule 1: every kept short field is at most 1 KiB.
+fn short(fields: &[&str], turn: TurnNumber) -> Result<(), RouteError> {
+    if fields.iter().all(|field| field.len() <= SHORT_FIELD_MAX) {
+        Ok(())
+    } else {
+        Err(RouteError::Protocol {
             turn,
-            detail: "fake observation payload exceeds 256 KiB",
-        }),
+            detail: "fake short field exceeds 1 KiB",
+        })
     }
 }
 
@@ -401,8 +390,10 @@ fn require_vendor_turn(
 }
 
 impl FakeMessage {
-    /// Decodes one bounded fake message and validates its connection-local ID.
-    /// Caller still owns duplicate/order checks and the global JSON node budget.
+    /// Decodes one bounded fake message and validates its connection-local
+    /// ID (Task 4 design §2.2): UTF-8 and the structure limits first, then a
+    /// typed decode that skips every field it does not keep, then the short
+    /// field bound. Caller still owns duplicate and order checks.
     pub fn decode(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
         if input.len() > via_wire::MAX_STDOUT_MESSAGE_BYTES {
             return Err(RouteError::Protocol {
@@ -410,16 +401,22 @@ impl FakeMessage {
                 detail: "fake message exceeds wire cap",
             });
         }
-        let tag: Tag = known(input, turn)?;
-        if tag.kind.len() > 256 {
+        if std::str::from_utf8(input).is_err() {
             return Err(RouteError::Protocol {
                 turn,
-                detail: "fake type tag exceeds 256 bytes",
+                detail: "fake message is not UTF-8",
             });
         }
+        via_wire::json_limits::scan(input).map_err(|_| RouteError::Protocol {
+            turn,
+            detail: "fake message exceeds JSON structure limits",
+        })?;
+        let tag: Tag = known(input, turn)?;
+        short(&[&tag.kind], turn)?;
         let message = match tag.kind.as_str() {
             "accepted" => {
                 let fields: AcceptedFields = known(input, turn)?;
+                short(&[&fields.vendor_turn_id], turn)?;
                 if fields.id != 1 || !paired_vendor_turn(&fields.vendor_turn_id, turn) {
                     return Err(RouteError::Protocol {
                         turn,
@@ -431,38 +428,20 @@ impl FakeMessage {
                 }
             }
             "text" => {
-                let fields: TextFields = known(input, turn)?;
-                if !paired_vendor_turn(&fields.vendor_turn_id, turn) {
-                    return Err(RouteError::Protocol {
-                        turn,
-                        detail: "text belongs to another turn",
-                    });
-                }
+                let fields: TurnFields = known(input, turn)?;
+                short(&[&fields.vendor_turn_id], turn)?;
+                require_vendor_turn(&fields.vendor_turn_id, turn, "text belongs to another turn")?;
                 Self::Text {
                     vendor_turn_id: fields.vendor_turn_id,
-                    text: fields.text,
                 }
             }
-            "terminal" => {
-                let fields: TerminalFields = known(input, turn)?;
-                if !paired_vendor_turn(&fields.vendor_turn_id, turn) {
-                    return Err(RouteError::Protocol {
-                        turn,
-                        detail: "terminal belongs to another turn",
-                    });
-                }
-                Self::Terminal {
-                    vendor_turn_id: fields.vendor_turn_id,
-                    status: fields.status,
-                    final_text: fields.final_text,
-                    stop_reason: fields.stop_reason,
-                    vendor_code: fields.vendor_code,
-                }
-            }
+            "terminal" => Self::decode_terminal(input, turn)?,
             "tool_started" => Self::decode_tool_started(input, turn)?,
             "tool_ended" => Self::decode_tool_ended(input, turn)?,
+            "usage" => Self::decode_usage(input, turn)?,
             "interrupt_ack" => {
                 let fields: AcceptedFields = known(input, turn)?;
+                short(&[&fields.vendor_turn_id], turn)?;
                 if fields.id != 2 || !paired_vendor_turn(&fields.vendor_turn_id, turn) {
                     return Err(RouteError::Protocol {
                         turn,
@@ -473,63 +452,98 @@ impl FakeMessage {
                     vendor_turn_id: fields.vendor_turn_id,
                 }
             }
-            _ => Self::decode_unknown(input, turn, tag)?,
+            _ => Self::decode_unknown(tag, turn)?,
         };
         Ok(message)
     }
 
     fn decode_tool_started(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
         let fields: ToolStartedFields = known(input, turn)?;
+        short(
+            &[&fields.vendor_turn_id, &fields.tool_id, &fields.name],
+            turn,
+        )?;
         require_vendor_turn(
             &fields.vendor_turn_id,
             turn,
             "tool start belongs to another turn",
         )?;
-        bounded_payload(&fields, turn)?;
         Ok(Self::ToolStarted {
             vendor_turn_id: fields.vendor_turn_id,
             tool_id: fields.tool_id,
             name: fields.name,
-            input_summary: fields.input_summary,
         })
     }
 
     fn decode_tool_ended(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
         let fields: ToolEndedFields = known(input, turn)?;
+        short(&[&fields.vendor_turn_id, &fields.tool_id], turn)?;
         require_vendor_turn(
             &fields.vendor_turn_id,
             turn,
             "tool end belongs to another turn",
         )?;
-        bounded_payload(&fields, turn)?;
         Ok(Self::ToolEnded {
             vendor_turn_id: fields.vendor_turn_id,
             tool_id: fields.tool_id,
-            status: fields.status,
-            output_summary: fields.output_summary,
-            exit_code: fields.exit_code,
         })
     }
 
-    fn decode_unknown(input: &[u8], turn: TurnNumber, tag: Tag) -> Result<Self, RouteError> {
+    fn decode_usage(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
+        let fields: UsageFields = known(input, turn)?;
+        short(&[&fields.vendor_turn_id], turn)?;
+        require_vendor_turn(
+            &fields.vendor_turn_id,
+            turn,
+            "usage belongs to another turn",
+        )?;
+        Ok(Self::Usage {
+            vendor_turn_id: fields.vendor_turn_id,
+            total_tokens: fields.total_tokens,
+        })
+    }
+
+    /// An unknown message keeps only its type tag, at most 256 bytes; one
+    /// with an `id` would be an unanswerable request.
+    fn decode_unknown(tag: Tag, turn: TurnNumber) -> Result<Self, RouteError> {
         if tag.has_id {
             return Err(RouteError::Protocol {
                 turn,
                 detail: "unknown id-bearing fake message",
             });
         }
-        let raw = std::str::from_utf8(input).map_err(|_| RouteError::Protocol {
-            turn,
-            detail: "fake message is not UTF-8",
-        })?;
-        let mut end = raw.len().min(UNKNOWN_NOTIFICATION_BYTES);
-        while !raw.is_char_boundary(end) {
-            end -= 1;
+        if tag.kind.len() > UNKNOWN_TAG_MAX {
+            return Err(RouteError::Protocol {
+                turn,
+                detail: "fake type tag exceeds 256 bytes",
+            });
         }
-        Ok(Self::UnknownNotification {
+        Ok(Self::Unknown {
             vendor_type: tag.kind,
-            raw_payload: raw[..end].to_owned(),
-            truncated: end < raw.len(),
+        })
+    }
+
+    fn decode_terminal(input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
+        let fields: TerminalFields = known(input, turn)?;
+        short(
+            &[
+                &fields.vendor_turn_id,
+                &fields.stop_reason,
+                fields.vendor_code.as_deref().unwrap_or_default(),
+            ],
+            turn,
+        )?;
+        require_vendor_turn(
+            &fields.vendor_turn_id,
+            turn,
+            "terminal belongs to another turn",
+        )?;
+        Ok(Self::Terminal {
+            vendor_turn_id: fields.vendor_turn_id,
+            status: fields.status,
+            final_text: fields.final_text,
+            stop_reason: fields.stop_reason,
+            vendor_code: fields.vendor_code,
         })
     }
 }

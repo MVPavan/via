@@ -169,6 +169,7 @@ impl Child {
                 TurnNumber::try_from(1).unwrap(),
                 "hello".to_owned(),
                 sender,
+                via_adapters::TurnActivity::new(tokio::time::Instant::now()),
                 deadline,
                 force,
                 orders,

@@ -20,6 +20,7 @@ use via_store::{CancelCause, CloseIntent};
 
 use super::journal::Head;
 use super::lock;
+use super::progress::{Progress, ProgressDelta};
 use crate::api::{CloseMode, rfc3339};
 use crate::{ApiError, Deadline, TurnNumber};
 /// Most queued turns one session holds (C1 P6), also enforced by Store.
@@ -278,6 +279,8 @@ struct Running {
     stop: TurnStop,
     /// The turn's wall deadline, from the submission clock [r1.11].
     wall: tokio::time::Instant,
+    /// The published progress (Task 4 design §2.4).
+    progress: Progress,
 }
 
 /// Mutable dispatch state of one session.
@@ -474,6 +477,7 @@ impl Slot {
         &self,
         turn: TurnNumber,
         wall: tokio::time::Instant,
+        progress: Progress,
     ) -> (
         watch::Receiver<Option<StopOrder>>,
         watch::Receiver<Option<StopOrder>>,
@@ -490,8 +494,32 @@ impl Slot {
             settling: false,
             stop,
             wall,
+            progress,
         });
         receivers
+    }
+
+    /// Applies one step-tracker delta to the running turn's published
+    /// progress (Task 4 design §2.4), under the slot state mutex.
+    pub(super) fn publish_progress(&self, turn: TurnNumber, delta: &ProgressDelta) {
+        let mut state = lock(&self.state);
+        if let Some(running) = state
+            .running
+            .as_mut()
+            .filter(|running| running.turn == turn)
+        {
+            running.progress.apply(delta);
+        }
+    }
+
+    /// A copy of the running turn's published progress when it is `turn`'s
+    /// (Task 4 design §4.2), taken under the slot state mutex without a wait.
+    pub(super) fn progress(&self, turn: u32) -> Option<Progress> {
+        lock(&self.state)
+            .running
+            .as_ref()
+            .filter(|running| running.progress.turn() == turn)
+            .map(|running| running.progress.clone())
     }
 
     /// Issues the idle deadline's order (design §5) unless the turn is
