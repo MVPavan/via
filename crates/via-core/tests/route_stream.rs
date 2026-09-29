@@ -116,7 +116,7 @@ impl Child {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
-                prompt: "hello".to_owned(),
+                prompt: "hello".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
             }))

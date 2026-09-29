@@ -101,7 +101,7 @@ async fn running_turn(client: &StoreClient) {
             handle_hash: [7_u8; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
-            prompt: "p".to_owned(),
+            prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             initial_event: event("turn.queued", 1),
         })
@@ -209,7 +209,7 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
-                prompt: "p".to_owned(),
+                prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
             })
@@ -252,7 +252,7 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
-                prompt: "p".to_owned(),
+                prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
             })
@@ -262,7 +262,7 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
             .commit_resume(ResumeRecord {
                 session_id: session(),
                 turn: TurnNumber::try_from(2).unwrap(),
-                prompt: "p".to_owned(),
+                prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 event: event("turn.queued", 2),
                 operation: None,
@@ -346,7 +346,7 @@ fn read_seams_fail_only_their_reads() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
-                prompt: "p".to_owned(),
+                prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
             })

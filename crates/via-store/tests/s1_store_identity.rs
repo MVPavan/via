@@ -68,7 +68,7 @@ fn s1_store_identity_compares_length_and_sha256() {
                     handle_hash: [7_u8; 32],
                     receipt: json!({"state":"queued"}),
                     params: json!({"harness":"fake"}),
-                    prompt: "p".to_owned(),
+                    prompt: "p".into(),
                     effective: json!({"deadlines":{"wall_ms":1}}),
                     initial_event: event("turn.queued", 1, 1),
                 },
@@ -86,7 +86,7 @@ fn s1_store_identity_compares_length_and_sha256() {
             .commit_resume(ResumeRecord {
                 session_id: session.clone(),
                 turn: TurnNumber::try_from(2).unwrap(),
-                prompt: "q".to_owned(),
+                prompt: "q".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 event: event("turn.queued", 2, 2),
                 operation: Some(OperationRecord {

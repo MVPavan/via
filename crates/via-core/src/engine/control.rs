@@ -45,8 +45,8 @@ impl Engine {
         }
         let turn = self.cancel_target(&session, params.turn, snapshot.turns)?;
         let address = format!("{}/{}", session.as_str(), turn.get());
-        if let Some(envelope) = self.read_result(&session, turn).await? {
-            return Ok(reply(&address, &envelope, true));
+        if let Some(facts) = self.read_facts(&session, turn).await? {
+            return Ok(reply(&address, &facts.state, &facts.cancel, true));
         }
         if *lock(&self.signal.stop) == Some(StopMode::Force) {
             return Err(ApiError::DAEMON_STOPPING);
@@ -108,7 +108,7 @@ impl Engine {
                         .and_then(|outcome| *outcome);
                     queued_failure(outcome)?;
                     let envelope = self.await_terminal(&session, turn).await?;
-                    return Ok(reply(&address, &envelope, false));
+                    return Ok(reply_envelope(&address, &envelope, false));
                 }
                 CancelStep::Absent if !rechecked => {
                     // A receipt registers its turn under `admission` after its
@@ -119,7 +119,7 @@ impl Engine {
                 CancelStep::Absent => {
                     // Design §3.3 [r3.4]: the drop is not a terminal.
                     let envelope = self.await_terminal(&session, turn).await?;
-                    return Ok(reply(&address, &envelope, !acknowledged));
+                    return Ok(reply_envelope(&address, &envelope, !acknowledged));
                 }
             }
         }
@@ -206,12 +206,28 @@ fn requested(address: &str, requested_at: &str) -> Value {
     })
 }
 
-/// The C1 §3.5 result from a committed envelope.
-fn reply(address: &str, envelope: &Value, already_terminal: bool) -> Value {
+/// The C1 §3.5 result from a committed envelope `await_terminal` returned
+/// (T4-5 moves it to the terminal's facts).
+fn reply_envelope(address: &str, envelope: &Value, already_terminal: bool) -> Value {
+    reply(
+        address,
+        &envelope["state"],
+        &envelope["cancel"],
+        already_terminal,
+    )
+}
+
+/// The C1 §3.5 result from a committed terminal's `state` and `cancel`.
+fn reply(
+    address: &str,
+    state: &impl serde::Serialize,
+    cancel: &impl serde::Serialize,
+    already_terminal: bool,
+) -> Value {
     json!({
         "turn": address,
-        "state": envelope["state"],
+        "state": state,
         "already_terminal": already_terminal,
-        "cancel": envelope["cancel"],
+        "cancel": cancel,
     })
 }

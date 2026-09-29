@@ -4,14 +4,18 @@ use super::{
     AcceptanceRecord, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
     CommitOutcome, Connection, Duration, EventRecord, EvidenceRefs, EvidenceRoot,
     FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity, KeyedOperation, MetadataExt,
-    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, QueuedTurn,
-    ReadCorruption, ReceiptRecord, Receiver, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId,
-    SessionSnapshot, SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey,
-    SubmissionRecord, SubmitFailedRecord, TerminalExtras, TerminalRecord, TransactionBehavior,
-    TurnNumber, UnfinishedTurn, Value, check_schema_version, commit_anchor_identified,
-    commit_anchor_intent, commit_arm_intent, commit_group_absence, commit_vendor_facts,
-    count_unproven_anchors, fs, oneshot, params, read_anchor_cohort, read_anchor_owners,
-    read_anchor_records,
+    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, Prompt, QueuedTurn,
+    ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT, SessionId, SessionSnapshot,
+    SpawnKey, SpawnRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
+    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
+    commit_vendor_facts, count_unproven_anchors, fs, oneshot, params, read_anchor_cohort,
+    read_anchor_owners, read_anchor_records,
+};
+use crate::{
+    blob::{BlobRef, Blobs},
+    lanes::{DeadGuard, Lanes},
 };
 
 /// Classifies a SQLite error before `COMMIT`: corruption is `Corrupt`, which
@@ -30,8 +34,10 @@ pub(super) fn sql_error(error: rusqlite::Error) -> StoreError {
 }
 
 /// Classifies a failed `COMMIT` step (design §7.1): corruption is `Corrupt`,
-/// which always latches; any other failure leaves the outcome unknown, so it
-/// is `Uncertain`.
+/// which always latches. `SQLITE_FULL` (SQLite's unix VFS reports `ENOSPC`
+/// as it) rolls back and is known not committed (Task 4 design §5.3):
+/// `Write`, which [`settled`] turns `Uncertain` if the rollback failed. Any
+/// other failure leaves the outcome unknown, so it is `Uncertain`.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the map_err adapter receives the error by value"
@@ -41,7 +47,40 @@ pub(super) fn commit_error(error: rusqlite::Error) -> StoreError {
         Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) => {
             StoreError::Corrupt(error.to_string())
         }
+        Some(rusqlite::ErrorCode::DiskFull) => StoreError::Write(error.to_string()),
         _ => StoreError::Uncertain(error.to_string()),
+    }
+}
+
+/// A mutation's result once its transaction ended (Task 4 design §5.3): a
+/// failure that wrote nothing is known only if the transaction is rolled
+/// back. rusqlite rolls back a dropped transaction and ignores a failed
+/// rollback, so the writer checks: a connection still inside a transaction
+/// gets one more `ROLLBACK`, and if that fails too the outcome is
+/// `Uncertain`, which latches. The test-only `store.rollback.fail` point
+/// reports a failed rollback.
+fn settled<T>(conn: &Connection, result: Result<T, StoreError>) -> Result<T, StoreError> {
+    let error = match result {
+        Ok(value) => return Ok(value),
+        Err(
+            error @ (StoreError::Uncertain(_) | StoreError::WriterLost | StoreError::Corrupt(_)),
+        ) => return Err(error),
+        Err(error) => error,
+    };
+    #[cfg(feature = "test-failpoints")]
+    if crate::failpoint::hit("store.rollback.fail").is_err() {
+        return Err(StoreError::Uncertain(format!(
+            "rollback failed after: {error}"
+        )));
+    }
+    if conn.is_autocommit() {
+        return Err(error);
+    }
+    match conn.execute_batch("ROLLBACK") {
+        Ok(()) if conn.is_autocommit() => Err(error),
+        _ => Err(StoreError::Uncertain(format!(
+            "rollback failed after: {error}"
+        ))),
     }
 }
 
@@ -212,16 +251,30 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
     Ok(())
 }
 
+/// The SQLite thread's body (design §6.1, §6.3): serves the lanes in
+/// service order until the fence drains them. It runs under a
+/// [`DeadGuard`], so however it ends, unwinding included, the writer is
+/// marked dead and the request in hand and every queued one fail
+/// `WriterLost`.
 pub(super) fn writer_loop(
     mut conn: Connection,
-    receiver: &Receiver<Command>,
+    lanes: &Lanes,
     corruption: &ReadCorruption,
+    blobs: &Blobs,
 ) {
+    let mut guard = DeadGuard::new(lanes);
     let mut commits = 0_u32;
-    while let Ok(command) = receiver.recv() {
-        if matches!(command, Command::Shutdown) {
-            break;
+    while let Some(command) = lanes.pop() {
+        guard.in_flight = Some(command);
+        // Test-only `store.writer.before_serve`: a pause holds the request
+        // in hand; `fail_io` kills the writer with it (design §13.1).
+        #[cfg(feature = "test-failpoints")]
+        if crate::failpoint::hit("store.writer.before_serve").is_err() {
+            writer_died();
         }
+        let Some(command) = guard.in_flight.take() else {
+            continue;
+        };
         // Test-only `store.writer.lost`: the worker drops the request and its
         // reply unserved, as a writer that is gone would (design §7.1).
         #[cfg(feature = "test-failpoints")]
@@ -233,7 +286,7 @@ pub(super) fn writer_loop(
         let Some(command) = serve_read(&conn, command, corruption) else {
             continue;
         };
-        serve_write(&mut conn, command);
+        serve_write(&mut conn, command, blobs);
         commits += 1;
         if commits >= 1000 {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
@@ -241,6 +294,15 @@ pub(super) fn writer_loop(
         }
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    drop(guard);
+}
+
+/// Test builds: the writer thread dies, unwinding, as a failed SQLite
+/// thread would.
+#[cfg(feature = "test-failpoints")]
+#[expect(clippy::panic, reason = "the seam kills the writer thread")]
+fn writer_died() -> ! {
+    panic!("store.writer.before_serve: the writer died");
 }
 
 impl Command {
@@ -256,6 +318,7 @@ impl Command {
                 | Self::Predecessors(..)
                 | Self::NextSeq(..)
                 | Self::Result(..)
+                | Self::TerminalFacts(..)
                 | Self::CloseResult(..)
                 | Self::ClosingSessions(..)
                 | Self::Terminated(..)
@@ -284,6 +347,7 @@ impl Command {
             Self::Predecessors(..) => "store.read.corrupt.predecessors",
             Self::NextSeq(..) => "store.read.corrupt.next_seq",
             Self::Result(..) => "store.read.corrupt.result",
+            Self::TerminalFacts(..) => "store.read.corrupt.terminal_facts",
             Self::CloseResult(..) => "store.read.corrupt.close_result",
             Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
             Self::Terminated(..) => "store.read.corrupt.terminated",
@@ -313,7 +377,8 @@ impl Command {
             | Self::ArmIntent(..)
             | Self::VendorFacts(..)
             | Self::GroupAbsence(..)
-            | Self::Shutdown => return None,
+            | Self::VerifyBlobs(..)
+            | Self::SweepBlobs(..) => return None,
         })
     }
 }
@@ -382,6 +447,9 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         }
         Command::NextSeq(session, reply) => reply!(reply, read_next_seq(conn, &session)),
         Command::Result(session, turn, reply) => reply!(reply, read_result(conn, &session, turn)),
+        Command::TerminalFacts(session, turn, reply) => {
+            reply!(reply, read_terminal_facts(conn, &session, turn));
+        }
         Command::CloseResult(session, reply) => reply!(reply, read_close_result(conn, &session)),
         Command::ClosingSessions(after, limit, reply) => {
             reply!(reply, read_closing_sessions(conn, after.as_ref(), limit));
@@ -434,7 +502,8 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::ArmIntent(..)
         | Command::VendorFacts(..)
         | Command::GroupAbsence(..)
-        | Command::Shutdown) => return Some(command),
+        | Command::VerifyBlobs(..)
+        | Command::SweepBlobs(..)) => return Some(command),
     }
     None
 }
@@ -452,79 +521,99 @@ fn answer<T>(
     let _ = reply.send(result);
 }
 
-/// Serves one mutation command.
-fn serve_write(conn: &mut Connection, command: Command) {
+/// Serves one mutation command, or a blob check the thread runs before
+/// admission. Every mutation's result passes [`settled`] before its reply.
+fn serve_write(conn: &mut Connection, command: Command, blobs: &Blobs) {
+    if let Command::VerifyBlobs(reply) = command {
+        let _ = reply.send(verify_blobs(conn, blobs));
+        return;
+    }
+    if let Command::SweepBlobs(reply) = command {
+        let _ = reply.send(sweep_blobs(conn, blobs));
+        return;
+    }
+    #[cfg(feature = "test-failpoints")]
+    let full = full_seam(conn);
+    serve_mutation(conn, command);
+    #[cfg(feature = "test-failpoints")]
+    if full {
+        let _ = conn.pragma_update(None, "max_page_count", 4_294_967_294_i64);
+    }
+}
+
+/// Test builds: `fail_io` at `store.sqlite.full` caps the database at its
+/// current size for the next mutation, so a transaction that needs a new
+/// page meets a real `SQLITE_FULL` (design §5.3, §13.2). True when armed.
+#[cfg(feature = "test-failpoints")]
+fn full_seam(conn: &Connection) -> bool {
+    if crate::failpoint::hit("store.sqlite.full").is_ok() {
+        return false;
+    }
+    let Ok(pages) = conn.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0)) else {
+        return false;
+    };
+    conn.pragma_update(None, "max_page_count", pages).is_ok()
+}
+
+/// Serves one mutation command; its reply follows [`settled`].
+fn serve_mutation(conn: &mut Connection, command: Command) {
+    macro_rules! reply {
+        ($reply:expr, $result:expr) => {{
+            let result = $result;
+            send_commit($reply, settled(conn, result));
+        }};
+    }
+    macro_rules! journal {
+        ($reply:expr, $result:expr) => {{
+            let result = $result;
+            let _ = $reply.send(as_commit(settled(conn, result)));
+        }};
+    }
     match command {
-        Command::Spawn(record, key, reply) => {
-            send_commit(reply, commit_spawn(conn, record, key));
-        }
-        Command::Resume(record, reply) => {
-            send_commit(reply, commit_resume(conn, &record));
-        }
-        Command::Submission(record, reply) => {
-            send_commit(reply, commit_submission(conn, &record));
-        }
-        Command::Acceptance(record, reply) => {
-            send_commit(reply, commit_acceptance(conn, &record));
-        }
-        Command::Event(record, reply) => {
-            send_commit(reply, commit_event(conn, &record));
-        }
+        Command::Spawn(record, key, reply) => reply!(reply, commit_spawn(conn, record, key)),
+        Command::Resume(record, reply) => reply!(reply, commit_resume(conn, &record)),
+        Command::Submission(record, reply) => reply!(reply, commit_submission(conn, &record)),
+        Command::Acceptance(record, reply) => reply!(reply, commit_acceptance(conn, &record)),
+        Command::Event(record, reply) => reply!(reply, commit_event(conn, &record)),
         Command::Terminal(record, extras, reply) => {
-            send_commit(
+            reply!(
                 reply,
-                commit_terminal(conn, &record, &extras, None).map(drop),
+                commit_terminal(conn, &record, &extras, None).map(drop)
             );
         }
         Command::SessionClosed(session, closed, reply) => {
-            send_commit(reply, commit_session_closed(conn, &session, &closed));
+            reply!(reply, commit_session_closed(conn, &session, &closed));
         }
         Command::ClosingTerminal(record, closed, reply) => {
             let extras = TerminalExtras::default();
-            send_commit(
+            reply!(
                 reply,
-                commit_terminal(conn, &record, &extras, Some(&closed)),
+                commit_terminal(conn, &record, &extras, Some(&closed))
             );
         }
-        Command::Closing(record, reply) => {
-            send_commit(reply, commit_closing(conn, &record));
-        }
-        Command::Closed(record, reply) => {
-            send_commit(reply, commit_closed(conn, &record));
-        }
-        Command::SubmitFailed(record, reply) => {
-            send_commit(reply, commit_submit_failed(conn, &record));
-        }
+        Command::Closing(record, reply) => reply!(reply, commit_closing(conn, &record)),
+        Command::Closed(record, reply) => reply!(reply, commit_closed(conn, &record)),
+        Command::SubmitFailed(record, reply) => reply!(reply, commit_submit_failed(conn, &record)),
         Command::FailureResolution(record, reply) => {
-            send_commit(reply, commit_failure_resolution(conn, &record));
+            reply!(reply, commit_failure_resolution(conn, &record));
         }
         Command::AnchorIntent(intent, reply) => {
-            let _ = reply.send(as_commit(commit_anchor_intent(conn, &intent)));
+            journal!(reply, commit_anchor_intent(conn, &intent));
         }
         Command::AnchorIdentified(id, generation, version, identity, reply) => {
-            let _ = reply.send(as_commit(commit_anchor_identified(
-                conn,
-                &id,
-                &generation,
-                version,
-                &identity,
-            )));
+            journal!(
+                reply,
+                commit_anchor_identified(conn, &id, &generation, version, &identity)
+            );
         }
         Command::ArmIntent(id, generation, version, reply) => {
-            let _ = reply.send(as_commit(commit_arm_intent(
-                conn,
-                &id,
-                &generation,
-                version,
-            )));
+            journal!(reply, commit_arm_intent(conn, &id, &generation, version));
         }
         Command::VendorFacts(id, generation, pid, reply) => {
-            let _ = reply.send(as_commit(commit_vendor_facts(conn, &id, &generation, pid)));
+            journal!(reply, commit_vendor_facts(conn, &id, &generation, pid));
         }
-        Command::GroupAbsence(proof, reply) => {
-            let _ = reply.send(as_commit(commit_group_absence(conn, &proof)));
-        }
-        // `writer_loop` serves reads and Shutdown before any mutation.
+        Command::GroupAbsence(proof, reply) => journal!(reply, commit_group_absence(conn, &proof)),
+        // `writer_loop` serves reads first and `serve_write` the blob checks.
         Command::SpawnKey(..)
         | Command::Operation(..)
         | Command::KeyedOperation(..)
@@ -533,6 +622,7 @@ fn serve_write(conn: &mut Connection, command: Command) {
         | Command::NextSeq(..)
         | Command::Predecessors(..)
         | Command::Result(..)
+        | Command::TerminalFacts(..)
         | Command::CloseResult(..)
         | Command::ClosingSessions(..)
         | Command::Terminated(..)
@@ -545,8 +635,42 @@ fn serve_write(conn: &mut Connection, command: Command) {
         | Command::AnchorCohort(..)
         | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
-        | Command::Shutdown => {}
+        | Command::VerifyBlobs(..)
+        | Command::SweepBlobs(..) => {}
     }
+}
+
+/// Every blob a row names (design §6.5 recovery).
+fn referenced_blobs(conn: &Connection) -> Result<Vec<BlobRef>, StoreError> {
+    let mut statement = conn
+        .prepare("SELECT prompt_blob FROM turns WHERE prompt_blob IS NOT NULL")
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    rows.map(|row| {
+        let stored = row.map_err(sql_error)?;
+        BlobRef::decode(&stored).map_err(|_| StoreError::Corrupt("blob reference".to_owned()))
+    })
+    .collect()
+}
+
+/// Checks every referenced blob: a regular file of its recorded length and
+/// SHA-256, else `Corrupt`.
+fn verify_blobs(conn: &Connection, blobs: &Blobs) -> Result<(), StoreError> {
+    for blob in referenced_blobs(conn)? {
+        blobs.verify(&blob)?;
+    }
+    Ok(())
+}
+
+/// Unlinks every blob file no row names.
+fn sweep_blobs(conn: &Connection, blobs: &Blobs) -> Result<u64, StoreError> {
+    let referenced = referenced_blobs(conn)?
+        .into_iter()
+        .map(|blob| blob.id().to_owned())
+        .collect();
+    blobs.sweep(&referenced)
 }
 
 /// Replies to a Core lifecycle mutation after its transaction ended. The
@@ -693,9 +817,10 @@ fn commit_spawn(
         ],
     )
     .map_err(sql_error)?;
+    let (prompt, prompt_blob) = prompt_columns(&record.prompt);
     tx.execute(
-        "INSERT INTO turns(session_id,number,prompt,effective,state,queued_at,queued_seq) VALUES (?1,1,?2,?3,'queued',?4,1)",
-        params![record.session_id.as_str(), record.prompt, effective, queued_at],
+        "INSERT INTO turns(session_id,number,prompt,prompt_blob,effective,state,queued_at,queued_seq) VALUES (?1,1,?2,?3,?4,'queued',?5,1)",
+        params![record.session_id.as_str(), prompt, prompt_blob, effective, queued_at],
     )
     .map_err(sql_error)?;
     insert_event_row(&tx, &record.session_id, 1, &record.initial_event)?;
@@ -725,6 +850,14 @@ fn commit_spawn(
     Ok(ReceiptRecord {
         receipt: record.receipt,
     })
+}
+
+/// A prompt's `turns.prompt` and `turns.prompt_blob`: exactly one is set.
+fn prompt_columns(prompt: &Prompt) -> (Option<&str>, Option<String>) {
+    match prompt {
+        Prompt::Inline(text) => (Some(text), None),
+        Prompt::Blob(blob) => (None, Some(blob.encode())),
+    }
 }
 
 fn read_spawn_key(conn: &Connection, key: &str) -> Result<Option<StoredSpawnKey>, StoreError> {
@@ -783,12 +916,14 @@ fn commit_resume(conn: &mut Connection, record: &ResumeRecord) -> Result<(), Sto
     if queued >= SESSION_QUEUE_LIMIT {
         return Err(StoreError::Constraint("session queue is full"));
     }
+    let (prompt, prompt_blob) = prompt_columns(&record.prompt);
     tx.execute(
-        "INSERT INTO turns(session_id,number,prompt,effective,state,queued_at,queued_seq) VALUES (?1,?2,?3,?4,'queued',?5,?6)",
+        "INSERT INTO turns(session_id,number,prompt,prompt_blob,effective,state,queued_at,queued_seq) VALUES (?1,?2,?3,?4,?5,'queued',?6,?7)",
         params![
             session.as_str(),
             record.turn.get(),
-            record.prompt,
+            prompt,
+            prompt_blob,
             json(&record.effective)?,
             queued_at,
             queued_seq
@@ -940,15 +1075,22 @@ fn read_queued_turn(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<QueuedTurn>, StoreError> {
-    let row: Option<(String, String, Option<String>, i64)> = conn
+    /// Prompt, prompt blob, effective values, `queued_at`, `queued_seq`.
+    type Row = (Option<String>, Option<String>, String, Option<String>, i64);
+    let row: Option<Row> = conn
         .query_row(
-            "SELECT prompt,effective,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
+            "SELECT prompt,prompt_blob,effective,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
             params![session.as_str(), turn.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(prompt, effective, queued_at, queued_seq)| {
+    row.map(|(prompt, blob, effective, queued_at, queued_seq)| {
+        let prompt = match (prompt, blob) {
+            (Some(text), None) => Prompt::Inline(text),
+            (None, Some(blob)) => Prompt::Blob(BlobRef::decode(&blob)?),
+            _ => return Err(StoreError::CorruptEvidence),
+        };
         Ok(QueuedTurn {
             prompt,
             effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
@@ -971,18 +1113,22 @@ fn read_predecessors(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let envelope: Option<Option<String>> = conn
+    let latest: Option<u32> = conn
         .query_row(
-            "SELECT envelope FROM turns WHERE session_id=?1 AND number<?2 AND submitted_at IS NOT NULL ORDER BY number DESC LIMIT 1",
+            "SELECT number FROM turns WHERE session_id=?1 AND number<?2 AND submitted_at IS NOT NULL ORDER BY number DESC LIMIT 1",
             params![session.as_str(), turn.get()],
             |row| row.get(0),
         )
         .optional()
         .map_err(sql_error)?;
-    let last_submitted = envelope
-        .flatten()
-        .map(|envelope| serde_json::from_str(&envelope).map_err(|_| StoreError::CorruptEvidence))
-        .transpose()?;
+    let last_submitted = match latest {
+        Some(number) => read_terminal_facts(
+            conn,
+            session,
+            TurnNumber::try_from(number).map_err(|_| StoreError::CorruptEvidence)?,
+        )?,
+        None => None,
+    };
     Ok(Predecessors {
         unresolved,
         last_submitted,
@@ -1612,6 +1758,61 @@ fn read_result(
         .flatten();
     raw.map(|value| serde_json::from_str(&value).map_err(|_| StoreError::CorruptEvidence))
         .transpose()
+}
+
+/// A committed terminal's state and `cancel`, extracted by SQLite from the
+/// stored envelope (design §6.7): no value is built from it.
+fn read_terminal_facts(
+    conn: &Connection,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<Option<TerminalFacts>, StoreError> {
+    /// State, the type of `cancel`, and its four members.
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = conn
+        .query_row(
+            "SELECT json_extract(envelope,'$.state'),json_type(envelope,'$.cancel'),
+                json_extract(envelope,'$.cancel.outcome'),json_extract(envelope,'$.cancel.cleanup'),
+                json_extract(envelope,'$.cancel.requested_at'),json_extract(envelope,'$.cancel.settled_at')
+             FROM turns WHERE session_id=?1 AND number=?2 AND envelope IS NOT NULL",
+            params![session.as_str(), turn.get()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((state, kind, outcome, cleanup, requested_at, settled_at)) = row else {
+        return Ok(None);
+    };
+    let cancel = match kind.as_deref() {
+        None | Some("null") => None,
+        Some("object") => Some(TerminalCancel {
+            outcome: outcome.ok_or(StoreError::CorruptEvidence)?,
+            cleanup: cleanup.ok_or(StoreError::CorruptEvidence)?,
+            requested_at: requested_at.ok_or(StoreError::CorruptEvidence)?,
+            settled_at: settled_at.ok_or(StoreError::CorruptEvidence)?,
+        }),
+        Some(_) => return Err(StoreError::CorruptEvidence),
+    };
+    Ok(Some(TerminalFacts {
+        state: state.ok_or(StoreError::CorruptEvidence)?,
+        cancel,
+    }))
 }
 
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
