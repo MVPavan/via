@@ -1,6 +1,6 @@
-# Task 4 design: events, progress, storage and C1 conformance (round 17)
+# Task 4 design: events, progress, storage and C1 conformance (round 18)
 
-Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 17.
+Status: normative design for Task 4 (Bead `via-jm4.7.8`, step T4-0), round 18.
 Round 15 was SOUND at `778752c`. Round 16 applies the owner's revised
 [requirements](requirements.md) (marked "r16") and
 [`design-r16-decisions.md`](design-r16-decisions.md), tagged `[t4r16.N]`
@@ -8,10 +8,12 @@ Round 15 was SOUND at `778752c`. Round 16 applies the owner's revised
 owner's follow-up, decision 7). Round 17 fixes Sol's round-16 review
 ([review-r16-sol.md](review-r16-sol.md)) per
 [`design-r17-decisions.md`](design-r17-decisions.md), tagged `[t4r17.N]`
-for decision N (`[t4r17.10]` records the Claude usage evidence). Older tags
-mark reasoning that still stands. The requirements (R1–R8) override earlier design and spec
+for decision N (`[t4r17.10]` records the Claude usage evidence). Round 18
+applies two targeted fixes from [review-r17-sol.md](review-r17-sol.md) per
+[`design-r18-decisions.md`](design-r18-decisions.md), tagged `[t4r18.N]`.
+Older tags mark reasoning that still stands. The requirements (R1–R8) override earlier design and spec
 text; every conflict is an amendment in §12. Round history:
-[reports/T4-0.md](reports/T4-0.md) §9–§21. This step writes no code and no
+[reports/T4-0.md](reports/T4-0.md) §9–§22. This step writes no code and no
 tests.
 
 Round 16 removes VIA's raw log (R8: an evidence folder per turn takes its
@@ -394,8 +396,12 @@ C1 §3.7 as A26 amends it:
    `turn` param, else the running turn, else the latest) and returns the
    durable members (§11.3) and a page of that turn's committed step rows.
 2. Then, from memory: `progress` is the published `Progress` only if the
-   `Running` entry's turn is the selected turn, else `null`; and
-   `process.alive`.
+   selected turn is not terminal in that Store read and the `Running`
+   entry's turn is the selected turn, else `null` [t4r18.2]; and
+   `process.alive`. The drive clears `Running` only after the terminal
+   commit (`finish_with` then `finish_running`,
+   `crates/via-core/src/engine/drive.rs:698-701` [V]), so without the first condition a terminal turn could show stale
+   progress.
 
 So `progress` never describes another turn, and it is at least as new as the
 rows: Core publishes a boundary's progress before it enqueues that row
@@ -523,13 +529,14 @@ turn with its first 64 KiB saved (§7.3), never a silent cut.
 
 There are no size budgets, headrooms, page ceilings or byte counters.
 
-- **Admission.** For new work only (a `spawn` or `resume` whose key, if
-  any, is not stored, after the key lookup and before a prompt-file copy,
-  §10.4) and at a queued turn's dispatch, Core reads the free space of the
-  state directory's filesystem, `f_bavail × f_frsize` from
-  `rustix::fs::statvfs` (`rustix-1.1.5/src/fs/abs.rs:288` [V]; via-store
-  enables `rustix`'s `fs` feature, `crates/via-store/Cargo.toml:16` [V]), on
-  the blocking pool. Below `disk.free_floor` (5 GiB):
+- **Admission.** At a `spawn` or `resume` receipt and at a queued turn's
+  dispatch, Core reads the free space of the state directory's filesystem,
+  `f_bavail × f_frsize` from `rustix::fs::statvfs`
+  (`rustix-1.1.5/src/fs/abs.rs:288` [V]; via-store enables `rustix`'s `fs`
+  feature, `crates/via-store/Cargo.toml:16` [V]), on the blocking pool. A
+  receipt reads it before taking `admission` and applies it only to new work,
+  after the key lookup finds no key (§10.4) [t4r18.1]. Below
+  `disk.free_floor` (5 GiB):
   - a receipt is `admission_refused`, kind `disk_free_floor`, with
     `data.free_bytes` and `data.floor_bytes`, before any write; a keyed
     retry of a stored receipt is answered from its key first, as runtime
@@ -740,13 +747,16 @@ does its own I/O on the blocking pool (`spawn_blocking`, coding-style §5).
   unlinks a finished one after a commit known not to have happened (a lost
   discard is swept). `BlobReader::next_chunk()` returns at most 64 KiB. A
   row references a blob only after `finish`, in the same transaction.
-- **Replay comparison** (C1 byte-identical rule) [t4r17.1]. The identity
-  pass (§10.3) streams the incoming identity through a running SHA-256 and
-  length, and a retry matches when both equal the stored pair; there is no
-  byte-by-byte pass. The key lookup runs under `admission` (`receipt.rs:76`,
-  `:202` [V]) and comes first: a stored key is answered (receipt or
-  `idempotency_conflict`) with no blob written and no floor or WAL check
-  (§5.3, §5.4). Only new work writes a prompt blob.
+- **Replay comparison** (C1 byte-identical rule) [t4r17.1]. The incoming
+  identity is a running SHA-256 and length (§10.3), and a retry matches when
+  both equal the stored pair; there is no byte-by-byte pass. Every blob a
+  request needs is written and finished before `admission` is taken; under
+  `admission` (`receipt.rs:76`, `:202` [V]) the handler only looks up the
+  key, checks and commits [t4r18.1]. A stored key is answered (receipt or
+  `idempotency_conflict`) with no floor or WAL check (§5.3, §5.4); only new
+  work adopts its blob. A blob not adopted (a match, a conflict, a refusal,
+  a commit known not to have happened) is discarded after `admission` is
+  released.
 - **Dispatch load.** The dispatcher loads the prompt blob into an exact
   `String` with a running SHA-256 and UTF-8 check (a mismatch fails the turn
   as corrupt evidence) and moves it into the streamed start (§8.3), which
@@ -1103,41 +1113,50 @@ deadline, breaks silently on oversize (`:45-46`) and builds a whole-request
 Per line: (1) `json_limits::scan`; (2) the borrowed envelope `{jsonrpc, id,
 method, params}` as `&RawValue`, borrowed from the line
 (`serde_json-1.0.151/src/read.rs:637-652` [V]); (3) `id` checked and
-copied, `method` decoded; (4) for keyed calls the identity pass feeds the
-borrowed pieces around the handle span and, for `prompt_file`, around its
-value, which becomes the content's `"sha256:<64 hex>:<len>"` (§10.4), into a
-running SHA-256 and length; nothing is buffered [t4r17.1]; (5) the strict
-DTO decode; (6) the key lookup (§6.5); for new work only, a `prompt` over
-`INLINE_MAX` streams into a `BlobWriter`; (7) drop the line and decode
-buffers.
+copied, `method` decoded; (4) the strict DTO decode; (5) with no lock
+held, a `prompt` over `INLINE_MAX` streams into a `BlobWriter`, and a
+`prompt_file` is read once into one (§10.4); (6) for keyed calls, the
+identity: a running SHA-256 and length over the borrowed pieces around the
+handle span and, for `prompt_file`, around its value, which becomes the
+content's `"sha256:<64 hex>:<len>"` from step 5's pass [t4r18.1]; (7)
+under `admission`, the key lookup, the checks and the commit (§6.5); (8)
+drop the line and decode buffers.
 
 ### 10.4 Prompt file [t4r16.2]
 
-For a `spawn` or `resume` with `prompt_file` [t4r17.1]:
-- **A stored key** (a retry): steps 1–3 below read the file into a running
-  SHA-256 and length only, writing no blob, and the resulting identity is
-  compared with the stored one (§6.5): the stored receipt, or
-  `idempotency_conflict`. No floor check.
-- **New work:** the floor check (§5.3), then steps 1–5, under the
-  `admission` lock as today's receipt is; so a copy (at most 10 s) delays
-  other receipts, not reads or controls.
+For a `spawn` or `resume` with `prompt_file`, the file is read once, with
+no lock held, and that one pass gives both the blob and the identity, so
+the identity always matches the blob's bytes [t4r18.1]:
 
 1. The path must be absolute and at most 4096 bytes. The handler opens it
    read-only with `O_NONBLOCK` (a FIFO cannot block the open), on the
    blocking pool, then `fstat`s the handle: a regular file of at most
    16 MiB.
-2. It reads the file in 64 KiB chunks with a running SHA-256 and a
-   streaming UTF-8 check (a sequence split across chunks carries over),
-   under one 10 s bound for the whole read; for new work each chunk also
-   goes to a `BlobWriter`.
-3. After EOF it `fstat`s again. The copy is refused if the bytes read differ
-   from the first size or the size, `mtime` or `ctime` changed. So a file
-   that changed during the copy is refused, never stored torn; the blob is
-   self-consistent in any case, since it holds exactly the bytes hashed.
+2. It streams the file in 64 KiB chunks into a temporary `BlobWriter`, with
+   a running SHA-256 and a streaming UTF-8 check (a sequence split across
+   chunks carries over), under one 10 s bound for the whole pass.
+3. After EOF it `fstat`s again. The pass is refused if the bytes read differ
+   from the first size or the size, `mtime` or `ctime` changed, so a file
+   that changed during the pass is refused, never stored torn. Otherwise
+   `finish()` syncs the blob, and its length and SHA-256 complete the
+   identity (§10.3 step 6).
 4. A failure discards the blob and answers `invalid_params`, kind2
    `prompt_file`, `reason` one of `not_absolute`, `unreadable`,
    `not_regular`, `too_large`, `not_utf8`, `changed`, `timeout`.
-5. The prompt is the blob (`turns.prompt_blob`).
+5. Then the handler takes `admission` and looks up the key (§6.5). A
+   stored key returns its receipt, or `idempotency_conflict` if the
+   identity differs. New work applies the disk floor (§5.3) and `wal.max`
+   (§5.4), then commits the turn, which adopts the blob as
+   `turns.prompt_blob`. A blob not adopted is discarded after `admission`
+   is released.
+
+No file I/O runs under `admission`, so `close`
+(`crates/via-core/src/engine/close.rs:57` [V]) and daemon stop
+(`crates/via-core/src/engine/stop.rs:114` [V]), which take it, wait for no
+copy. A retry below the floor writes one temporary blob, then discards it;
+this is accepted, because the floor leaves gigabytes free. A file changed
+between two requests with the same key gives `idempotency_conflict`,
+because each request's identity comes from its own pass.
 
 The daemon runs as the caller's user behind a user-only socket, so reading a
 file that user can read grants nothing new; the path is not stored.
@@ -1307,7 +1326,7 @@ Before "`vendor_session_id` is nullable" add:
 > `status` describes one turn: the `turn` param, else the running turn, else
 > the latest. `progress` is an in-memory snapshot of that turn while it runs
 > in this daemon, read after `steps` without a Store round trip, and `null`
-> otherwise. `current_step` is VIA's count of model steps: 0 before the
+> otherwise, including as soon as the turn is terminal. `current_step` is VIA's count of model steps: 0 before the
 > vendor accepts the turn, 1 after, and one more each time the model
 > produces output after tool results, derived the same way for every vendor;
 > it equals the vendor's model calls only where that vendor's evidence shows
@@ -1493,7 +1512,7 @@ t3.
 |---|---|
 | C1 §1 (`:78`, `:83`) | "line length capped (Proposed 16 MiB)" becomes "line length capped at 1 MiB"; "The 16 MiB limit includes the line feed." becomes "The 1 MiB limit includes the line feed; a longer line gets `request_too_large` and the connection closes. A larger prompt is passed as `prompt_file` (§4)." |
 | C1 §4 (`:401`) | the `prompt` row's note becomes "exactly one of `prompt` and `prompt_file`"; add "\| `prompt_file` \| absolute path \| per turn \| a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length \|" |
-| RT §6 (`:727-734`) | after "…to honor C1's byte-identical rule." add "Store keeps an identity as its length and SHA-256, never its bytes; a retry matches when both are equal, and a prompt file's identity is computed from the file's content without storing it." [t4r17.1] |
+| RT §6 (`:727-734`) | after "…to honor C1's byte-identical rule." add "Store keeps an identity as its length and SHA-256, never its bytes; a retry matches when both are equal. A prompt file is read once, before the lookup and outside the admission lock, into a temporary blob whose length and SHA-256 enter the identity; the blob is adopted by new work and discarded otherwise." [t4r17.1, t4r18.1] |
 | C1 §3.2 (`:175`) | `[--prompt-file F|-]` stays; add "`--prompt-file F` sends `prompt_file` with `F` made absolute; `-` reads stdin into `prompt`." |
 | C1 §8.1 | add "\| -32020 \| `request_too_large` \| request line over 1 MiB; `data.max_bytes`; the connection closes \|"; the `admission_refused` row (`:687`) gains "Store read lane full; disk free space below the floor" |
 | C1 §5 (`:473-474`) | "A terminal envelope that cannot fit the 16 MiB socket response limit …" goes with A30's text |
@@ -1649,7 +1668,7 @@ every daemon scenario runs through `run_scenario` with an `Evidence`
 Under `#[cfg(feature = "test-failpoints")]`, added to
 `scripts/check-release-features.py`'s `POINTS`: `store.writer.before_serve`,
 `Lanes::peak(lane)`, `store.commit.step`, `core.observations.pause`,
-`core.progress.publish`, `Store::read_count()`, `store.read.delay_ms`,
+`core.progress.publish`, `core.finish_running.pause`, `Store::read_count()`, `store.read.delay_ms`,
 `store.rollback.fail`, `store.statvfs.free_bytes`, `core.data_size.walks`,
 `prompt_file.copy.pause`, `blob.write.fail_after`,
 `Store::blob_writes()`, `VIA_TEST_EVENT_STALL_MS`,
@@ -1669,7 +1688,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 |---|---|
 | `s1_progress_step_rule_counts_output_after_tool_results` | fake: text, tool_started, tool_ended, text, text, tool_started, tool_ended, text → `current_step` 3; rows 1–2 before the terminal, row 3 in it (`store.commit.step` barriers); envelope `steps` `null` |
 | `s1_progress_snapshot_adds_no_store_read`; `s1_c1_status_latency_under_bounded_store_delay` | `status` on a running turn and on an idle session make the same number of Store reads; with `store.read.delay_ms` = 200 it answers within 300 ms while the turn progresses (Q-R5-5) |
-| `s1_c1_status_progress_only_for_the_selected_turn` [t4r16.5.2] | with turn 2 running, `status --turn 1` has `progress: null` and turn 1's rows; `status` has turn 2's `progress`, whose `current_step` has no row; a step ended after the Store read (`core.progress.publish` held) appears on the next call; with `store.commit.step` held at a boundary, `status` shows the new `current_step` and no row for it, and once released the row appears while `current_step` is already past it [t4r17.4] |
+| `s1_c1_status_progress_only_for_the_selected_turn` [t4r16.5.2] | with turn 2 running, `status --turn 1` has `progress: null` and turn 1's rows; `status` has turn 2's `progress`, whose `current_step` has no row; a step ended after the Store read (`core.progress.publish` held) appears on the next call; with `store.commit.step` held at a boundary, `status` shows the new `current_step` and no row for it, and once released the row appears while `current_step` is already past it [t4r17.4]; with the drive held between the terminal commit and `finish_running` (`core.finish_running.pause`), `status` shows the terminal turn and its last row with `progress: null` [t4r18.2] |
 | `s1_progress_tokens_sum_per_step_and_label_scope` | two keyless samples in one step supersede, steps add; `tokens.scope` is the fake's declared scope |
 | `s1_progress_tools_overflow_and_untracked_end_count` | 70 concurrent tool starts: 64 names and `tools_overflow`; an untracked end then model output advances `current_step` and writes a row |
 | `s1_progress_unknown_messages_send_no_observation` | a flood of unknown messages sends no C2 item yet moves `last_activity_at` |
@@ -1689,7 +1708,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_store_full_disk_rolls_back_known` | `SQLITE_FULL` on an ordinary commit and on a terminal: rolled back, `NotCommitted`, no latch; `store.rollback.fail` latches |
 | `s1_store_wal_limit_refuses_only_new_work` [t4r16.3, t4r17.2] | lowered `wal.max` and an external reader holding a snapshot: a spawn is `store_error` `not_committed` `wal_full` and a queued turn fails `store` at dispatch; a running turn's step rows, `warning` event, cancel and terminal all commit and it ends normally; a keyed retry of a stored spawn returns its receipt; a close commits; health stays healthy; the reader closes, a write after 1 s retries `TRUNCATE` and writes resume; WAL growth while the reader holds is recorded for `via-d9o.2.3` (§16) |
 | `s1_c1_request_too_large_is_named_then_closes` [t4r16.2] | 1 MiB + 1 bytes: `request_too_large`, then close; exactly 1 MiB is served; a partial line times out alone |
-| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and writes no blob (`Store::blob_writes()`), also below a lowered floor; changed content is `idempotency_conflict` [t4r17.1]; an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
+| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` [t4r17.1, t4r18.1] | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and leaves no extra blob, also below a lowered floor; the file rewritten between two requests with the same key gives `idempotency_conflict`, and the stored blob still matches the stored identity; with `prompt_file.copy.pause` holding one copy, a `close` of another session and `daemon/status` answer within 100 ms; an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
 | `s1_c1_list_creation_order_and_last_active` [t4r16.4] | 250 sessions page newest first with no repeats while states change; a session created mid-scan never appears; `last_active_at` is the latest event's time and `since` filters on it; `l2.` is `invalid_params`; a filter matching one old session gives empty pages with a cursor, then it |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket` | A31; A32, including a peer that never reads the first byte [t4r16.5.5] |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once (four turns with 16 MiB prompts flooding maximal messages and filling observations; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
