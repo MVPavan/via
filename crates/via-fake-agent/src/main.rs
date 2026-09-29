@@ -70,6 +70,13 @@ enum Step {
     Stderr {
         bytes: u64,
     },
+    /// Holds stdin unread until gate `name` is released (Task 4 design
+    /// §13.1): as a script's first step it runs before the start request is
+    /// read, so a start larger than the pipe buffer blocks VIA's writer.
+    /// Elsewhere it is a plain gate.
+    HoldStdin {
+        name: String,
+    },
     ReportPids,
     SpawnGrandchild {
         name: String,
@@ -139,6 +146,15 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut input = BufReader::new(io::stdin());
     let mut grandchildren = Vec::new();
+    let held = scripts
+        .iter()
+        .find_map(|script| match script.steps.first() {
+            Some(Step::HoldStdin { name }) => Some(name.clone()),
+            _ => None,
+        });
+    if let Some(name) = &held {
+        gate(&sync_dir, name)?;
+    }
     let (start, script) = read_start(&mut input, scripts)?;
     let (input_tx, input_rx) = mpsc::sync_channel(8);
     thread::spawn(move || read_remaining(input, &input_tx));
@@ -155,7 +171,13 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Step::EmitRaw { text, stream } => write_bytes(stream, text.as_bytes())?,
             Step::EmitBytes { bytes, stream } => write_bytes(stream, &bytes)?,
-            Step::Gate { name } => gate(&sync_dir, &name)?,
+            // A hold that ran before the start request was read is done.
+            Step::Gate { name } | Step::HoldStdin { name }
+                if held.as_deref() != Some(name.as_str()) =>
+            {
+                gate(&sync_dir, &name)?;
+            }
+            Step::Gate { .. } | Step::HoldStdin { .. } => {}
             Step::ExpectRequest { expected } => {
                 let message = next_input(&input_rx)?;
                 read_interrupt(message, &expected, start.turn, &mut interrupt_seen)?;
