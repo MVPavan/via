@@ -325,8 +325,7 @@ four listeners and four SSE streams daemon-wide for OpenCode; a fifth session
 waits under Core admission or uses its remaining deadline. Do not evict a
 server with active/uncertain work to make space. Each live server has one VIA
 owner and one active top-level turn; owned vendor child-session metadata is
-bounded to 32 records and never admits another VIA owner. These caps consume
-the common daemon memory/process permits; they are not extra unbudgeted pools.
+bounded to 32 records and never admits another VIA owner.
 S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds.
 Production measurements must include four separate vendor processes (their
 memory is external to VIA's Rust buffers). No claim of equivalent sharing
@@ -556,9 +555,8 @@ observation maximum; 10 s event stall; independent bounded control/health.
 Set SSE line and assembled data-event limits to 16 MiB, HTTP headers to
 64 KiB, decoded response bodies to 16 MiB; reject oversized compressed output
 based on decoded bytes too. At most four OpenCode server instances, one SSE
-stream per server key, and one active prompt per session; server counts and
-buffers consume daemon-wide admission/memory permits, not a separate unlimited
-pool. S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. Reserve control capacity independent of reads/model work. Measure and
+stream per server key, and one active prompt per session.
+S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. Reserve control capacity independent of reads/model work. Measure and
 review total resource budgets with all three adapters before integration.
 
 The daemon's SSE dispatcher must not let one dedicated server/owner's saturated

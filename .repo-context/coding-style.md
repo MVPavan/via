@@ -216,7 +216,7 @@ the set.
 - Evidence folders and Store contents are private local data and may contain
   sensitive vendor output. Retention and export are explicit. Only
   separately sanitized copies become fixtures or shared reports; originals
-  stay local so their offsets remain valid.
+  stay local.
 
 ## 9. Naming and documentation
 

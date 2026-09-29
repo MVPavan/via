@@ -698,7 +698,7 @@ Append events, resulting state, envelope and next seq commit together.
 `turn.ended` is the final non-late event for that turn. Session events share
 the same dense sequence.
 
-Handle strings never enter batches, logs or stored identity bytes. Core hashes
+Handle strings never enter batches, logs or the stored identity. Core hashes
 them before persistence. Exact retry identity is the original validated C1
 params object byte slice with the top-level handle replaced by its fixed hash;
 the bounded parser tracks its byte range. Preserve all other bytes, including
@@ -1011,8 +1011,7 @@ payloads over 1 MiB use bounded chunks in a temporary Store-owned blob file
 synced before the atomic row references it; never keep all queued prompts in
 memory or split atomic receipt creation across commits. Blob paths are
 private relative IDs, checksum/length checked at recovery; unreferenced blobs
-are harmless. The same mechanism stores input identity bytes and large
-immutable effective params, for inline prompts over 256 KiB and for prompt
+are harmless. The same mechanism stores large immutable effective params, for inline prompts over 256 KiB and for prompt
 files, while keeping Store messages small. Load only the dispatched prompt,
 one per running turn. Outbound fake start may encode beyond 1 MiB; its input
 message ceiling is the 16 MiB prompt plus bounded JSON wrapper expansion, streamed
