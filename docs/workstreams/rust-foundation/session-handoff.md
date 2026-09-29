@@ -151,9 +151,16 @@ the historical checkpoint; its findings table is updated by this section.
   - the vendor's own `steps` in the envelope;
   - `list` in creation order, with `last_active_at` on each row.
 
-  Now: round 16 (Opus 5.5 high, [t4/design-r16-decisions.md](t4/design-r16-decisions.md)),
-  then one Sol high review, a report to the owner, the merge of `wt/t4-0`,
-  the spec amendments, and slice planning. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
+  Rounds 16–18 (Opus 5.5 high) applied the revisions and the owner's follow-up
+  (design-r16-decisions.md §7: simple first, measure later; `via.log`; a large
+  final text goes to a file; `wait` checks once per second). Sol high found
+  round 16 UNSOUND (7 findings) and round 17 UNSOUND (3), and round 18 SOUND
+  (`t4/review-r18-sol.md`). The design ([t4/design.md](t4/design.md), 1,775
+  lines, amendments A24–A46) is merged into `rust-foundation` (`f42c52c`).
+  Assumptions not yet observed are listed in design §16 and measured with
+  every adapter in `via-d9o.2.3`. **Next, after the owner's go-ahead:** apply
+  the spec amendments and the CONTEXT.md terms, then slice planning (Opus high;
+  the old `t4/s1.md`–`s7.md` are superseded). Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
   design drafts on `wt/t4-0` still say "frame"; round 5 adopts the new terms. From

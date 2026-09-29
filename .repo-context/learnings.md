@@ -73,3 +73,8 @@ in the design record (`docs/`), not here.
   `try_acquire` then fails. On a shared memory pool, one waiter starves every
   `try_acquire` caller. Take a whole reservation with `try_acquire_many`, and
   never wait while holding permits.
+- Before designing durability for data VIA passes through, check whether the
+  producer already keeps it. T4-0 spent rounds 12–15 on raw-log offsets and
+  loss tracking. A 2026-09-29 check showed Claude, Codex and OpenCode already
+  keep their conversations (transcripts, rollouts, SQLite). Dropping VIA's
+  copy removed the task's riskiest mechanism.
