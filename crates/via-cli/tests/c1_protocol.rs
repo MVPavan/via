@@ -235,6 +235,8 @@ fn c1_request_envelope_is_strict() -> TestResult {
         ("batch", false, r#"[{"jsonrpc":"2.0","id":7,"method":"daemon/status"}]"#.to_owned(), request, false),
         ("scalar request", false, "7".to_owned(), request, false),
         ("malformed JSON", false, "{".to_owned(), -32700, false),
+        // Design §10.2: depth 65 is refused before decoding (else invalid_params).
+        ("nesting past 64 levels", false, format!(r#"{{"jsonrpc":"2.0","id":7,"method":"daemon/status","params":{{"x":{}{}}}}}"#, "[".repeat(63), "]".repeat(63)), -32700, false),
         ("unknown method", false, request_line("describe", &json!({})), -32601, true),
         ("status params by position", false, request_line("daemon/status", &json!([])), params, true),
         ("status null params", false, r#"{"jsonrpc":"2.0","id":7,"method":"daemon/status","params":null}"#.to_owned(), params, true),

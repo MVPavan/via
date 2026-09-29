@@ -10,7 +10,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use via_store::{FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, QueuedTurn};
+use via_store::{FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, QueuedTurn, StoreClient};
 
 use super::drive::{ended_record, queued_cancellation};
 use super::journal;
@@ -68,22 +68,23 @@ impl Engine {
     }
 
     /// Step 1 of the batch (design §7.4): `None` when a read failed,
-    /// `Some(None)` when the turn already has a result, otherwise the rows of
-    /// its session's queued turns. The caller bounds the reads.
+    /// `Some(None)` when the turn already has a terminal, otherwise the rows
+    /// of its session's queued turns. The caller bounds the reads, which
+    /// `store` issues on the Latch lane.
     async fn batch_reads(
-        &self,
+        store: &StoreClient,
         session: &SessionId,
         number: TurnNumber,
         record: &mut TurnRecord,
         queued: &[TurnNumber],
     ) -> Option<Option<Vec<(TurnNumber, QueuedTurn)>>> {
-        if self.store.result(session, number).await.ok()?.is_some() {
+        if store.terminal_facts(session, number).await.ok()?.is_some() {
             return Some(None);
         }
-        journal::reconcile(&self.store, record).await.ok()?;
+        journal::reconcile(store, record).await.ok()?;
         let mut rows = Vec::with_capacity(queued.len());
         for turn in queued {
-            if let Some(row) = self.store.queued_turn(session, *turn).await.ok()? {
+            if let Some(row) = store.queued_turn(session, *turn).await.ok()? {
                 rows.push((*turn, row));
             }
         }
@@ -110,8 +111,11 @@ impl Engine {
         let read_by = deadline
             .instant()
             .min(tokio::time::Instant::now() + BATCH_READ);
+        // Design §6.2: the whole failure-resolution unit is on the Latch
+        // lane, one request at a time.
+        let latch = self.store.latch();
         // Step 1: the earlier outcome first; a read that fails skips the batch.
-        let reads = self.batch_reads(session, number, &mut record, &queued);
+        let reads = Self::batch_reads(&latch, session, number, &mut record, &queued);
         let (turns, rows): (Vec<TurnNumber>, Vec<QueuedTurn>) =
             match tokio::time::timeout_at(read_by, reads).await {
                 Ok(Some(Some(rows))) if rows.len() <= FAILURE_BATCH_CANCELLATIONS => {
@@ -146,7 +150,7 @@ impl Engine {
         let write = async {
             // A failed head read writes nothing; a corrupt one is reported
             // as corruption (design §7.1, T3-S5 round 1, decision 10).
-            let head = match shared.lock(&self.store, session).await {
+            let head = match shared.lock(&latch, session).await {
                 Ok(head) => head,
                 Err(error) => return Err(WriteOutcome::of_read(&error)),
             };
@@ -154,7 +158,7 @@ impl Engine {
             // A record that cannot be encoded writes nothing.
             let (batch, written) = build(affected, slot.as_deref(), queued, head.next())
                 .ok_or(WriteOutcome::NotCommitted)?;
-            let committed = self.store.commit_failure_resolution(batch).await;
+            let committed = latch.commit_failure_resolution(batch).await;
             match &committed {
                 Ok(()) => head.committed(written),
                 Err(error) if !WriteOutcome::of(error).head_unknown() => drop(head),

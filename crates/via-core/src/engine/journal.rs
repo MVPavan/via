@@ -16,8 +16,8 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord,
-    TerminalExtras, TerminalRecord,
+    BlobRef, EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord,
+    TerminalExtras, TerminalFacts, TerminalRecord,
 };
 
 use super::latch::{FailureSite, WriteOutcome};
@@ -66,12 +66,18 @@ pub(super) trait TurnJournal: Sync {
         &self,
         turns: Vec<(SessionId, TurnNumber)>,
     ) -> impl Future<Output = Result<Vec<(SessionId, TurnNumber)>, StoreError>> + Send;
-    /// Reads a committed terminal envelope, if any.
-    fn result(
+    /// Reads a committed terminal's facts, if any, without parsing its
+    /// envelope (design §6.7).
+    fn terminal_facts(
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> impl Future<Output = Result<Option<Value>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<TerminalFacts>, StoreError>> + Send;
+    /// Loads a queued turn's prompt blob with its checks (design §6.5).
+    fn load_prompt(
+        &self,
+        blob: &BlobRef,
+    ) -> impl Future<Output = Result<String, StoreError>> + Send;
     /// Reads a queued turn's prompt and `turn.queued` facts.
     fn queued_turn(
         &self,
@@ -129,12 +135,16 @@ impl TurnJournal for StoreClient {
         Self::terminated(self, turns).await
     }
 
-    async fn result(
+    async fn terminal_facts(
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Option<Value>, StoreError> {
-        Self::result(self, session, turn).await
+    ) -> Result<Option<TerminalFacts>, StoreError> {
+        Self::terminal_facts(self, session, turn).await
+    }
+
+    async fn load_prompt(&self, blob: &BlobRef) -> Result<String, StoreError> {
+        Self::load_prompt(self, blob).await
     }
 
     async fn queued_turn(
@@ -534,7 +544,7 @@ pub(super) async fn commit_terminal_with(
             retried,
         }),
         Err(error) if may_have_committed(&error) || matches!(error, StoreError::Corrupt(_)) => {
-            match journal.result(&session, turn).await {
+            match journal.terminal_facts(&session, turn).await {
                 Ok(Some(_)) => Ok(Durable {
                     uncertain: true,
                     closed: false,
@@ -608,12 +618,12 @@ pub(super) fn outcome_of(error: &ApiError) -> WriteOutcome {
 /// that looks still running.
 #[cfg(test)]
 pub(super) async fn read_result(
-    journal: &impl TurnJournal,
+    store: &StoreClient,
     unresolved: &Unresolved,
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<Value>, ApiError> {
-    let read = journal.result(session, turn).await;
+    let read = store.result(session, turn).await;
     settled_result(unresolved, session, turn, read)
 }
 
@@ -621,12 +631,12 @@ pub(super) async fn read_result(
 /// first, design §7.3): a durable result settles the turn; a turn whose
 /// terminal could not be made durable is `store_error` with its last
 /// committed state.
-pub(super) fn settled_result(
+pub(super) fn settled_result<T>(
     unresolved: &Unresolved,
     session: &SessionId,
     turn: TurnNumber,
-    read: Result<Option<Value>, StoreError>,
-) -> Result<Option<Value>, ApiError> {
+    read: Result<Option<T>, StoreError>,
+) -> Result<Option<T>, ApiError> {
     match read {
         Ok(Some(result)) => {
             unresolved.settle(session, turn);
@@ -634,7 +644,7 @@ pub(super) fn settled_result(
         }
         read => match unresolved.failed(session, turn) {
             Some(durable) => Err(ApiError::unpersisted(session, turn, durable)),
-            None => read.map_err(|_| ApiError::STORE),
+            None => read.map_err(|error| ApiError::read(&error)),
         },
     }
 }

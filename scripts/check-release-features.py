@@ -116,6 +116,13 @@ POINTS = [
     "store.read.corrupt.anchor_cohort",
     "store.read.corrupt.queued_turns",
     "store.read.corrupt.anchor_records",
+    # Task 4 T4-2 (design §6.1-§6.5, §6.7, §5.3): lanes, full disk, blobs.
+    "store.read.corrupt.terminal_facts",
+    "store.writer.before_serve",
+    "store.rollback.fail",
+    "store.sqlite.full",
+    "blob.write.fail_after",
+    "blob.step.stall",
     # Task 3 force row (design §6.8, §10): a recorded exit not yet returned.
     "wire.exit.observed",
     # Task 4 T4-3 (design §2.3, §8.6, §13.1): Core held before handling an

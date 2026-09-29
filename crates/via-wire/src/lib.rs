@@ -111,6 +111,7 @@ pub use runtime::{
 pub use split::{LineSplitter, Pushed};
 pub use via_host::{JournalSite, ReprobeReport};
 pub use via_store::StoreError;
+pub use via_store::json_limits;
 
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

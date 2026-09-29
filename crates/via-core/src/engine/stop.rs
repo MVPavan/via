@@ -3,12 +3,13 @@
 use std::{collections::HashSet, sync::atomic::Ordering, time::SystemTime};
 
 use via_adapters::{Cleanup, StopCause};
+use via_store::StoreClient;
 
 use std::sync::Arc;
 
 use super::batch::{self, AffectedTurn, FailureBatches};
 use super::drive::FORCE_CLOSE_REASON;
-use super::journal::Head;
+use super::journal::{self, Head};
 use super::latch::{
     ABORTED_JOIN, FINALIZE_RESERVE, FINALIZE_WRITE, FailureScope, FailureSite, WriteOutcome,
 };
@@ -368,7 +369,12 @@ impl Engine {
         let (outcome, cleanup) = stop_outcome(quiescent, forced);
         let mut record = turn.record;
         let cancel = self
-            .settle(&mut record, turn.requested_at, outcome, cleanup)
+            .settle_on(
+                &self.store.lifecycle(),
+                &mut record,
+                turn.requested_at,
+                (outcome, cleanup),
+            )
             .await;
         let mut terminal = Terminal {
             state,
@@ -415,8 +421,22 @@ impl Engine {
         outcome: &'static str,
         cleanup: &'static str,
     ) -> Cancel {
-        self.commit_event(record, EventBody::CancelSettled { outcome, cleanup })
-            .await;
+        self.settle_on(&self.store, record, requested_at, (outcome, cleanup))
+            .await
+    }
+
+    /// [`Self::settle`] with its event on `store`'s lane: final shutdown
+    /// commits on the Lifecycle lane (design §6.2).
+    async fn settle_on(
+        &self,
+        store: &StoreClient,
+        record: &mut TurnRecord,
+        requested_at: String,
+        (outcome, cleanup): (&'static str, &'static str),
+    ) -> Cancel {
+        let failed = record.first_failure.is_some();
+        journal::commit_event(store, record, EventBody::CancelSettled { outcome, cleanup }).await;
+        self.report_first_failure(record, failed).await;
         Cancel {
             outcome,
             cleanup,
@@ -543,10 +563,11 @@ impl Engine {
     /// fails counts the session as open. Read-only; Store's read reply
     /// reports corruption (design §7.1).
     async fn durably_open(&self, sessions: &[&SessionId]) -> usize {
+        let store = self.store.lifecycle();
         let mut open = 0;
         for session in sessions {
             if !matches!(
-                self.store.session_snapshot(session).await,
+                store.session_snapshot(session).await,
                 Ok(Some(snapshot)) if snapshot.closed
             ) {
                 open += 1;
@@ -557,7 +578,8 @@ impl Engine {
 
     /// Closes one session for the closure pass; true when it is durably closed.
     async fn close_forced(&self, session: &SessionId, admission: &Admission<'_>) -> bool {
-        let Ok(Some(snapshot)) = self.store.session_snapshot(session).await else {
+        let store = self.store.lifecycle();
+        let Ok(Some(snapshot)) = store.session_snapshot(session).await else {
             return false;
         };
         if snapshot.closed {
@@ -566,7 +588,7 @@ impl Engine {
         let Ok(next) = TurnNumber::try_from(snapshot.turns + 1) else {
             return false;
         };
-        if !matches!(self.store.predecessors(session, next).await, Ok(p) if !p.unresolved) {
+        if !matches!(store.predecessors(session, next).await, Ok(p) if !p.unresolved) {
             return false;
         }
         let head = self
@@ -574,7 +596,7 @@ impl Engine {
             .map_or_else(|| Head::new(None), |slot| Arc::clone(&slot.head));
         // A failed head read writes nothing; Store's read reply already
         // reported corruption (design §7.1, T3-S5 round 2, decision 11).
-        let Ok(guard) = head.lock(&self.store, session).await else {
+        let Ok(guard) = head.lock(&store, session).await else {
             return false;
         };
         let Ok(closed) = (Event {
@@ -590,7 +612,7 @@ impl Engine {
         .to_value() else {
             return false;
         };
-        match self.store.commit_session_closed(session, closed).await {
+        match store.commit_session_closed(session, closed).await {
             Ok(true) => {
                 guard.committed(1);
                 true
@@ -617,10 +639,11 @@ impl Engine {
     /// each one not known to have committed (a failed commit may still have).
     async fn unresolved_turns(&self, deadline: Deadline) -> usize {
         let turns = self.unresolved.turns();
+        let store = self.store.lifecycle();
         let mut unresolved = 0;
         for (session, turn) in turns {
             let read =
-                tokio::time::timeout_at(deadline.instant(), self.store.result(&session, turn));
+                tokio::time::timeout_at(deadline.instant(), store.terminal_facts(&session, turn));
             if let Ok(Ok(Some(_))) = read.await {
                 self.unresolved.resolve(&session, turn);
             } else {

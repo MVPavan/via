@@ -7,7 +7,8 @@ use std::{
 
 use serde_json::{Value, json};
 use via_store::{
-    OperationRecord, ResumeRecord, SessionSnapshot, SpawnKey, SpawnRecord, StoreError,
+    BLOB_CHUNK, BlobRef, INLINE_MAX, OperationRecord, Prompt, ResumeRecord, SessionSnapshot,
+    SpawnKey, SpawnRecord, StoreError,
 };
 
 use super::journal::{self, Head};
@@ -48,6 +49,36 @@ impl Engine {
         reply
     }
 
+    /// Design §6.5: a prompt over `INLINE_MAX` is written to a finished
+    /// blob before `admission` is taken, in 64 KiB chunks; a blob write that
+    /// fails is `not_committed` for the request, and its handle unlinks the
+    /// unfinished file.
+    async fn stage_prompt(&self, text: String) -> Result<(Prompt, Option<BlobRef>), ApiError> {
+        if text.len() <= INLINE_MAX {
+            return Ok((Prompt::Inline(text), None));
+        }
+        let not_committed = |_| WriteOutcome::NotCommitted.api_error();
+        let mut writer = self.store.blob_writer().await.map_err(not_committed)?;
+        for chunk in text.as_bytes().chunks(BLOB_CHUNK) {
+            if let Err(error) = writer.write(chunk).await {
+                writer.discard().await;
+                return Err(not_committed(error));
+            }
+        }
+        drop(text);
+        let blob = writer.finish().await.map_err(not_committed)?;
+        Ok((Prompt::Blob(blob.clone()), Some(blob)))
+    }
+
+    /// Design §6.5: a staged blob that no commit adopted (a replay, a
+    /// conflict, a refusal, a commit known not to have happened) is
+    /// discarded after `admission` is released.
+    async fn discard_unadopted(&self, pending: Option<BlobRef>) {
+        if let Some(blob) = pending {
+            self.store.discard_blob(blob).await;
+        }
+    }
+
     /// Commits a receipt before authorizing any process launch.
     ///
     /// A keyed retry is looked up before any admission check (runtime §6): the
@@ -55,8 +86,27 @@ impl Engine {
     /// receipt, anything else under the key is `idempotency_conflict`.
     pub async fn spawn(
         &self,
-        params: SpawnParams,
+        mut params: SpawnParams,
         raw_params: &str,
+    ) -> Result<Receipted, ApiError> {
+        let (prompt, mut pending) = self
+            .stage_prompt(std::mem::take(&mut params.prompt))
+            .await?;
+        let receipted = self
+            .spawn_admitted(params, prompt, raw_params, &mut pending)
+            .await;
+        self.discard_unadopted(pending).await;
+        receipted
+    }
+
+    /// `spawn` under `admission`: `pending` is taken by a commit that may
+    /// have happened, and left for discard otherwise.
+    async fn spawn_admitted(
+        &self,
+        params: SpawnParams,
+        prompt: Prompt,
+        raw_params: &str,
+        pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
         // Runtime §7: no new mutation, not even a keyed replay, after a failed write.
@@ -97,7 +147,7 @@ impl Engine {
         if params.harness != "fake" || !self.adapter.fake_available() {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }
-        if params.model != "fake" || params.prompt.is_empty() {
+        if params.model != "fake" || is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
         let effective = Effective::fake(&params.model, &params.per_turn().fake_overrides()?);
@@ -129,6 +179,7 @@ impl Engine {
         .to_value()?;
         #[cfg(test)]
         self.hold(&self.faults.hold_receipt).await;
+        let adopting = pending.take();
         let stored = self
             .store
             .commit_keyed_spawn(
@@ -138,13 +189,16 @@ impl Engine {
                     receipt: receipt.clone(),
                     params: json!({"harness":"fake","model":"fake"}),
                     effective: receipt["effective"].clone(),
-                    prompt: params.prompt,
+                    prompt,
                     initial_event,
                 },
                 key,
             )
             .await;
         if let Err(error) = self.receipt_reply(stored) {
+            if WriteOutcome::of(&error) == WriteOutcome::NotCommitted {
+                *pending = adopting;
+            }
             return Err(self.receipt_failed(&error, &admission));
         }
         let slot = Slot::new(Head::new(Some(2)));
@@ -160,8 +214,26 @@ impl Engine {
     /// turn `queued` with its `turn.queued` event before the receipt.
     pub async fn resume(
         &self,
-        params: ResumeParams,
+        mut params: ResumeParams,
         raw_params: &str,
+    ) -> Result<Receipted, ApiError> {
+        let (prompt, mut pending) = self
+            .stage_prompt(std::mem::take(&mut params.prompt))
+            .await?;
+        let receipted = self
+            .resume_admitted(params, prompt, raw_params, &mut pending)
+            .await;
+        self.discard_unadopted(pending).await;
+        receipted
+    }
+
+    /// `resume` under `admission`; `pending` as for `spawn_admitted`.
+    async fn resume_admitted(
+        &self,
+        params: ResumeParams,
+        prompt: Prompt,
+        raw_params: &str,
+        pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
         if self.store_failed() {
@@ -169,7 +241,7 @@ impl Engine {
         }
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.op_key.as_deref())?;
-        if params.prompt.is_empty() {
+        if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
         params.refuse_session_scope()?;
@@ -238,9 +310,9 @@ impl Engine {
         self.queue_turn(
             session,
             &snapshot,
-            (params.prompt, effective),
+            (prompt, effective),
             operation,
-            &admission,
+            (&admission, pending),
         )
         .await
     }
@@ -252,9 +324,9 @@ impl Engine {
         &self,
         session: SessionId,
         snapshot: &SessionSnapshot,
-        (prompt, effective): (String, Effective),
+        (prompt, effective): (Prompt, Effective),
         operation: Option<(String, via_store::Identity)>,
-        admission: &Admission<'_>,
+        (admission, pending): (&Admission<'_>, &mut Option<BlobRef>),
     ) -> Result<Receipted, ApiError> {
         let turn = TurnNumber::try_from(snapshot.turns + 1).map_err(|_| ApiError::STORE)?;
         let slot = self.slot_for(&session);
@@ -283,6 +355,7 @@ impl Engine {
             },
         }
         .to_value()?;
+        let adopting = pending.take();
         let committed = self
             .store
             .commit_resume(ResumeRecord {
@@ -303,12 +376,16 @@ impl Engine {
             // Store's same-transaction closing check: a refusal, not a
             // Store failure; nothing was written (design §4).
             Err(StoreError::Refused(_)) => {
+                *pending = adopting;
                 drop(head);
                 drop(slot);
                 self.retire(&session);
                 return Err(ApiError::SESSION_CLOSED);
             }
             Err(error) => {
+                if WriteOutcome::of(&error) == WriteOutcome::NotCommitted {
+                    *pending = adopting;
+                }
                 if WriteOutcome::of(&error).head_unknown() {
                     head.lost();
                 } else {
@@ -343,4 +420,9 @@ impl Engine {
         }
         Err(ApiError::UNSUPPORTED_VERB)
     }
+}
+
+/// An empty inline prompt; a blob holds more than `INLINE_MAX` bytes.
+fn is_empty(prompt: &Prompt) -> bool {
+    matches!(prompt, Prompt::Inline(text) if text.is_empty())
 }

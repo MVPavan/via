@@ -31,7 +31,7 @@ fn spawn(hash: [u8; 32]) -> SpawnRecord {
         handle_hash: hash,
         receipt: json!({"session_id":"s_7f3k9q2mzr4c","turn":"s_7f3k9q2mzr4c/1","state":"queued"}),
         params: json!({"harness":"fake"}),
-        prompt: "test prompt".to_owned(),
+        prompt: "test prompt".into(),
         effective: json!({"deadlines":{"wall_ms":1}}),
         initial_event: json!({"type":"turn.queued","seq":1,"turn":1,"at":"2026-01-01T00:00:00.000Z"}),
     }
@@ -395,7 +395,7 @@ fn a_ninth_queued_turn_is_refused_inside_the_receipt_transaction() {
     let resume = |turn: u32| via_store::ResumeRecord {
         session_id: session(),
         turn: TurnNumber::try_from(turn).unwrap(),
-        prompt: "p".to_owned(),
+        prompt: "p".into(),
         effective: json!({"deadlines":{"wall_ms":turn}}),
         event: json!({"type":"turn.queued","seq":turn,"at":at}),
         operation: None,
@@ -433,7 +433,7 @@ fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
     let second = via_store::ResumeRecord {
         session_id: session(),
         turn: TurnNumber::try_from(2).unwrap(),
-        prompt: "p".to_owned(),
+        prompt: "p".into(),
         effective: json!({"deadlines":{"wall_ms":2}}),
         event: json!({"type":"turn.queued","seq":2,"at":at}),
         operation: None,

@@ -2445,7 +2445,8 @@ fn batch_read_corruption(
 }
 
 /// T3-S5 round 2, decision 11 (design §7.1): SQLite corruption on the
-/// batch's result read (`batch.rs` step 1) latches.
+/// batch's result read (`batch.rs` step 1) latches. Task 4 §6.7: that read
+/// is now the terminal's facts, not its envelope.
 #[test]
 fn a_corrupt_result_read_in_the_batch_latches() {
     let Some(root) = child("a_corrupt_result_read_in_the_batch_latches") else {
@@ -2453,7 +2454,7 @@ fn a_corrupt_result_read_in_the_batch_latches() {
     };
     batch_read_corruption(
         &root,
-        "store.read.corrupt.result",
+        "store.read.corrupt.terminal_facts",
         |session| turn_one(session, true),
         false,
     );
