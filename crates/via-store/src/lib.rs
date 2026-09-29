@@ -146,6 +146,7 @@ pub enum CommitOutcome<T> {
 mod evidence;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint;
+pub mod json_limits;
 mod runtime;
 
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};

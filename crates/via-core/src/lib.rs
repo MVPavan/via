@@ -87,6 +87,8 @@ pub use engine::{
 /// for the daemon's own seams in `via-cli` (design §10).
 #[cfg(feature = "test-failpoints")]
 pub use via_store::failpoint;
+/// Design §10.2: the C1 reader scans each line before decoding it.
+pub use via_store::json_limits;
 
 /// Hidden executable entrypoint forwarded through the architecture layers.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {

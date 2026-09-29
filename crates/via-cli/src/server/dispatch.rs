@@ -46,8 +46,12 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
         if count > MAX_LINE || line.last() != Some(&b'\n') {
             break;
         }
-        let request = match serde_json::from_slice(&line) {
-            Ok(request) => parse_request(request),
+        // Design §10.2: depth and node limits before any value is built.
+        let request = match via_core::json_limits::scan(&line) {
+            Ok(_) => match serde_json::from_slice(&line) {
+                Ok(request) => parse_request(request),
+                Err(_) => Err((Value::Null, Refusal::from(PARSE_ERROR))),
+            },
             Err(_) => Err((Value::Null, Refusal::from(PARSE_ERROR))),
         };
         let (id, method, params) = match request {
