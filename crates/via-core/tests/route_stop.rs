@@ -234,7 +234,7 @@ fn an_order_set_before_launch_starts_nothing() {
     assert!(!child.sync("launched").exists());
 }
 
-/// Design §2 rule 3: after the start frame an order sends one interrupt; the
+/// Design §2 rule 3: after the start message an order sends one interrupt; the
 /// vendor's `interrupt_ack` is control evidence, not a protocol error, and
 /// its `interrupted` terminal ends the turn on the normal path.
 #[test]
@@ -362,7 +362,7 @@ fn a_raw_failure_reports_store_kind_raw() {
         );
     };
     let child = Child::open(&root);
-    // The first raw append is the start frame's stdin record.
+    // The first raw append is the start message's stdin record.
     child.arm("raw.append.fail", "fail_io");
     let failure =
         route_failure(child.execute(Duration::from_secs(10), watch::channel(None), |_, _| {}));
@@ -393,7 +393,7 @@ fn a_raw_failure_at_the_interrupt_write_reports_store_kind_raw() {
         );
     };
     let child = Child::open(&root);
-    // Raw appends: 1 the start frame (stdin), 2 the acceptance (stdout),
+    // Raw appends: 1 the start message (stdin), 2 the acceptance (stdout),
     // 3 the interrupt (stdin).
     child.arm_at("raw.append.fail", 3, "fail_io");
     let force_after = Duration::from_secs(6);

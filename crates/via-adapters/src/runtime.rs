@@ -317,7 +317,7 @@ async fn deliver(
 ) -> Result<(), ()> {
     for observation in normalize(message)? {
         let sent = tokio::select! {
-            // Capacity first: a draining Core still commits frames already read.
+            // Capacity first: a draining Core still commits messages already read.
             biased;
             sent = timeout_at(deadline.instant(), observations.send(observation)) => sent,
             () = forced(force) => return Err(()),

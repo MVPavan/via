@@ -352,7 +352,7 @@ pub(super) fn classify(
     }
 }
 
-/// Keeps the typed cause, cited frame, confirmed exit and raw completeness of a
+/// Keeps the typed cause, cited vendor message, confirmed exit and raw completeness of a
 /// failed drive.
 fn failed_terminal(error: AdapterError) -> Terminal {
     let message = error.to_string();

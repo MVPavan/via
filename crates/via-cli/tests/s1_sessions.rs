@@ -658,7 +658,7 @@ fn s1_f28_two_callers_drive_two_sessions_without_crosstalk() -> TestResult {
             }
             // Both first turns are running at once before either is released.
             // The fake is at its gate once it emitted acceptance; VIA commits
-            // `turn.started` from that stdout frame a moment later, so poll
+            // `turn.started` from that stdout message a moment later, so poll
             // (bounded) while both gates still hold.
             let running = |session: &str| -> Result<bool, ScenarioError> {
                 let deadline = Instant::now() + Duration::from_secs(10);

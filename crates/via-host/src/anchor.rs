@@ -94,7 +94,7 @@ async fn serve(
             break candidate;
         }
     };
-    protocol::write_frame(
+    protocol::write_message(
         &mut stream,
         &Reply::Ready {
             identity: identity.clone(),
@@ -105,7 +105,7 @@ async fn serve(
     let mut configured: Option<VendorConfig> = None;
     loop {
         let request = tokio::select! {
-            result = protocol::read_frame::<Request>(&mut stream, 65_536) => result?,
+            result = protocol::read_message::<Request>(&mut stream, 65_536) => result?,
             () = tokio::time::sleep_until(bootstrap_deadline) => return Ok(()),
             _ = terminate.recv() => return Ok(()),
         };
@@ -115,7 +115,7 @@ async fn serve(
                     return Err(io::Error::other("vendor paths must be absolute"));
                 }
                 configured = Some(vendor);
-                protocol::write_frame(&mut stream, &Reply::Configured, 1024).await?;
+                protocol::write_message(&mut stream, &Reply::Configured, 1024).await?;
             }
             Some(Request::Arm { generation })
                 if generation == bootstrap.generation && configured.is_some() =>
@@ -130,7 +130,7 @@ async fn serve(
                 if nonce.len() <= 64
                     && proof == protocol::challenge_proof(&bootstrap.marker, &nonce) =>
             {
-                protocol::write_frame(
+                protocol::write_message(
                     &mut stream,
                     &Reply::Challenge {
                         nonce,
@@ -141,7 +141,7 @@ async fn serve(
                 .await?;
             }
             Some(Request::Status { generation }) if generation == bootstrap.generation => {
-                protocol::write_frame(
+                protocol::write_message(
                     &mut stream,
                     &Reply::Status {
                         pid: None,
@@ -172,7 +172,7 @@ async fn armed(
     let mut poll = interval(Duration::from_millis(20));
     let mut exit = None;
     let mut controller = Some(stream);
-    let mut reader = protocol::FrameReader::new(1024);
+    let mut reader = protocol::ControlReader::new(1024);
     let mut verified_connection = true;
     let mut kill_at: Option<Instant> = None;
     // Set once cleanup begins: whether the vendor was then still live.
@@ -192,7 +192,7 @@ async fn armed(
                     Ok(Some(Request::Challenge { nonce, proof })) if nonce.len() <= 64 && proof == protocol::challenge_proof(&bootstrap.marker, &nonce) => {
                         let identity = current_identity(&bootstrap.marker)?;
                         let lost = match controller.as_mut() {
-                            Some(active) => protocol::write_frame(active, &Reply::Challenge { nonce, identity }, 1024).await.is_err(),
+                            Some(active) => protocol::write_message(active, &Reply::Challenge { nonce, identity }, 1024).await.is_err(),
                             None => true,
                         };
                         if !lost { verified_connection = true; }
@@ -201,7 +201,7 @@ async fn armed(
                     Ok(Some(Request::Status { generation })) if verified_connection && generation == bootstrap.generation => {
                         let (exit_code, exit_signal) = exit.map_or((None, None), |report: crate::ExitReport| (report.code, report.signal));
                         match controller.as_mut() {
-                            Some(active) => protocol::write_frame(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal }, 1024).await.is_err(),
+                            Some(active) => protocol::write_message(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal }, 1024).await.is_err(),
                             None => true,
                         }
                     }
@@ -220,7 +220,7 @@ async fn armed(
                         match controller.as_mut() {
                             // Runtime §11: the reply is lost; the stop still runs.
                             Some(_) if final_reply_lost().await => true,
-                            Some(active) => protocol::write_frame(active, &reply, 1024).await.is_err(),
+                            Some(active) => protocol::write_message(active, &reply, 1024).await.is_err(),
                             None => true,
                         }
                     }
@@ -290,7 +290,7 @@ async fn spawn_vendor(
     let spawn = command.spawn();
     let detach = detach_standard_streams();
     if detach.is_err() {
-        let _ = protocol::write_frame(
+        let _ = protocol::write_message(
             stream,
             &Reply::Error {
                 code: "PipeDetachFailed".into(),
@@ -304,7 +304,7 @@ async fn spawn_vendor(
     let child = match spawn {
         Ok(child) => child,
         Err(error) => {
-            let _ = protocol::write_frame(
+            let _ = protocol::write_message(
                 stream,
                 &Reply::Error {
                     code: "VendorSpawnFailed".into(),
@@ -318,7 +318,7 @@ async fn spawn_vendor(
     let vendor_pid = child
         .id()
         .ok_or_else(|| io::Error::other("missing vendor pid"))?;
-    if protocol::write_frame(stream, &Reply::Spawned { pid: vendor_pid }, 1024)
+    if protocol::write_message(stream, &Reply::Spawned { pid: vendor_pid }, 1024)
         .await
         .is_err()
     {

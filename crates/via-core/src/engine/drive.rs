@@ -1261,7 +1261,7 @@ impl Engine {
     /// Drives the adapter under the turn deadline, committing each observation it
     /// reports in decode order before the adapter outcome is returned. A force stop
     /// reaches Route, which force-closes the group and drains its output first:
-    /// frames it read still commit, and the raw log is complete or reported not.
+    /// messages it read still commit, and the raw log is complete or reported not.
     ///
     /// The turn's stop order reaches Route through `stop`; this loop observes
     /// it once (design §2), and orders the idle deadline itself when no

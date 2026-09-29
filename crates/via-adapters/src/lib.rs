@@ -1,5 +1,5 @@
 //! Adapters map canonical operations to vendor semantics and normalize events;
-//! they never frame bytes, own processes, or decide admission.
+//! they never split bytes into messages, own processes, or decide admission.
 
 use std::num::NonZeroU64;
 
@@ -175,7 +175,7 @@ pub struct FakeAcceptanceObservation {
     pub correlation: AcceptanceToken,
     /// Vendor-scoped turn ID.
     pub vendor_turn_id: VendorTurnId,
-    /// Exact accepted frame.
+    /// Exact accepted vendor message.
     pub raw_ref: RawRef,
 }
 
@@ -184,7 +184,7 @@ pub struct FakeAcceptanceObservation {
 pub enum Observation {
     /// Incremental assistant text, at most one C2 payload bound per piece.
     AssistantText {
-        /// Text in decode order; pieces of one vendor frame share its raw span.
+        /// Text in decode order; pieces of one vendor message share its raw span.
         text: String,
     },
     /// A tool started inside the turn.
@@ -222,11 +222,11 @@ pub enum Observation {
 pub enum FakeObservation {
     /// The paired acceptance, always before any other observation of the turn.
     Accepted(FakeAcceptanceObservation),
-    /// A data observation and the synced frame it came from.
+    /// A data observation and the synced vendor message it came from.
     Data {
         /// Normalized payload.
         observation: Observation,
-        /// Exact source frame.
+        /// Exact source vendor message.
         raw_ref: RawRef,
     },
 }
@@ -241,7 +241,7 @@ pub struct FakeTerminalEvidence {
     pub stop_reason: String,
     /// Optional vendor failure code.
     pub vendor_code: Option<String>,
-    /// Synced terminal frame.
+    /// Synced terminal vendor message.
     pub terminal_raw: RawRef,
     /// Independently confirmed vendor exit.
     pub exit: via_routes::ExitReport,

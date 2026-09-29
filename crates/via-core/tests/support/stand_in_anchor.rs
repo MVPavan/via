@@ -36,8 +36,8 @@ identity = {
     'pid_namespace': os.readlink('/proc/self/ns/pid'),
     'start_ticks': int(fields[19]), 'marker': bootstrap['marker'],
 }
-def send(frame):
-    control.write(json.dumps(frame).encode() + b'\n')
+def send(message):
+    control.write(json.dumps(message).encode() + b'\n')
     control.flush()
 def detach():
     null = os.open('/dev/null', os.O_RDWR)

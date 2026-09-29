@@ -115,7 +115,7 @@ fn read_three_lines(child: &mut SupervisedChild) -> TestResult<String> {
     for _ in 0..3 {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err("fake ended before terminal frame".into());
+            return Err("fake ended before terminal message".into());
         }
         transcript.push_str(&line);
     }
@@ -294,7 +294,7 @@ fn normal_reply_fixture_rejects_pipelined_second_start() -> TestResult {
 }
 
 #[test]
-fn normal_reply_fixture_rejects_partial_second_frame() -> TestResult {
+fn normal_reply_fixture_rejects_partial_second_message() -> TestResult {
     let dir = tempfile::tempdir()?;
     let script = json!({
         "expected_request":{"type":"start"},

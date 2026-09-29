@@ -543,12 +543,12 @@ enum Reprobed {
 
 struct ControlConnection {
     stream: UnixStream,
-    reader: protocol::FrameReader,
+    reader: protocol::ControlReader,
 }
 
 impl ControlConnection {
     async fn transact(&mut self, request: &Request, max: usize) -> io::Result<Reply> {
-        protocol::write_frame(&mut self.stream, request, max).await?;
+        protocol::write_message(&mut self.stream, request, max).await?;
         self.reader
             .read(&self.stream)
             .await?
@@ -567,7 +567,7 @@ impl ControlConnection {
         max: usize,
         deadline: Instant,
     ) -> io::Result<Reply> {
-        protocol::write_frame(&mut self.stream, request, max).await?;
+        protocol::write_message(&mut self.stream, request, max).await?;
         let late = || io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline");
         let reply = timeout_at(deadline, self.reader.read(&self.stream))
             .await
@@ -1096,14 +1096,14 @@ impl Host {
         drop(replaced);
         state.spawned = Some(anchor_id.clone());
         let mut stream = connect_anchor(&socket_path).await?;
-        let ready = protocol::read_frame::<Reply>(&mut stream, 1024)
+        let ready = protocol::read_message::<Reply>(&mut stream, 1024)
             .await?
             .ok_or(HostError::Protocol("anchor did not become ready"))?;
         let Reply::Ready {
             identity: wire_identity,
         } = ready
         else {
-            return Err(HostError::Protocol("unexpected anchor ready frame"));
+            return Err(HostError::Protocol("unexpected anchor ready message"));
         };
         let identity = wire_identity.into_public()?;
         verify_identity(&stream, &identity, anchor_process_id, &intent)?;
@@ -1116,7 +1116,7 @@ impl Host {
         // stop's snapshot, it is stopped at once (dropped: EOF before ARM).
         let control = Arc::new(Mutex::new(ControlConnection {
             stream,
-            reader: protocol::FrameReader::new(1024),
+            reader: protocol::ControlReader::new(1024),
         }));
         let stop = Arc::new(StopFacts::default());
         let registered = self.capacity.register(
@@ -2033,7 +2033,7 @@ async fn force_raised(signal: &mut watch::Receiver<Option<Instant>>) {
 /// in hand before then records no forced evidence, including a reply that was
 /// already waiting when the late task first polled it. The lock and the write are
 /// not bounded by it: the control's other holders each run under their own
-/// deadline, and a `Stop` frame is far smaller than the socket buffer.
+/// deadline, and a `Stop` message is far smaller than the socket buffer.
 /// `Stop` is idempotent and only shortens the anchor's deadline, so a second
 /// request through the same control owner changes nothing (runtime §5.1).
 async fn stop_through(
@@ -2367,7 +2367,7 @@ mod tests {
         let (ours, peer) = UnixStream::pair().expect("socket pair");
         let control = Arc::new(Mutex::new(ControlConnection {
             stream: ours,
-            reader: protocol::FrameReader::new(1024),
+            reader: protocol::ControlReader::new(1024),
         }));
         (control, peer)
     }
@@ -2377,7 +2377,7 @@ mod tests {
         matches!(
             tokio::time::timeout(
                 Duration::from_secs(2),
-                protocol::read_frame::<Request>(peer, 1024)
+                protocol::read_message::<Request>(peer, 1024)
             )
             .await,
             Ok(Ok(Some(Request::Stop { generation: sent, .. }))) if sent == generation
@@ -2437,7 +2437,7 @@ mod tests {
     #[tokio::test]
     async fn a_ready_reply_after_the_deadline_records_no_forced_evidence() {
         let (control, mut peer) = control_pair();
-        protocol::write_frame(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
+        protocol::write_message(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
             .await
             .expect("reply");
         control
@@ -2463,9 +2463,9 @@ mod tests {
         let (control, mut peer) = control_pair();
         let stop = StopFacts::default();
         let anchor = tokio::spawn(async move {
-            let sent = protocol::read_frame::<Request>(&mut peer, 1024).await;
+            let sent = protocol::read_message::<Request>(&mut peer, 1024).await;
             assert!(matches!(sent, Ok(Some(Request::Stop { .. }))));
-            protocol::write_frame(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
+            protocol::write_message(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
                 .await
                 .expect("reply");
             peer

@@ -17,7 +17,7 @@ use serde_json::Value;
 
 const SCRIPT_ENV: &str = "VIA_FAKE_SCENARIO";
 const SYNC_ENV: &str = "VIA_FAKE_SYNC_DIR";
-const MAX_INPUT_FRAME: u64 = 32 * 1024 * 1024;
+const MAX_INPUT_MESSAGE: u64 = 32 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,7 +106,7 @@ enum Stream {
 }
 
 enum InputEvent {
-    Frame(Value),
+    Message(Value),
     Eof,
     Error(String),
 }
@@ -152,8 +152,8 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
             Step::EmitBytes { bytes, stream } => write_bytes(stream, &bytes)?,
             Step::Gate { name } => gate(&sync_dir, &name)?,
             Step::ExpectRequest { expected } => {
-                let frame = next_input(&input_rx)?;
-                read_interrupt(frame, &expected, start.turn, &mut interrupt_seen)?;
+                let message = next_input(&input_rx)?;
+                read_interrupt(message, &expected, start.turn, &mut interrupt_seen)?;
             }
             Step::Flood {
                 text,
@@ -187,14 +187,14 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn read_frame<R: BufRead>(input: &mut R) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+fn read_message<R: BufRead>(input: &mut R) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
-    let read = Read::take(input, MAX_INPUT_FRAME + 1).read_until(b'\n', &mut bytes)?;
+    let read = Read::take(input, MAX_INPUT_MESSAGE + 1).read_until(b'\n', &mut bytes)?;
     if read == 0 {
         return Ok(None);
     }
-    if read as u64 > MAX_INPUT_FRAME || bytes.last() != Some(&b'\n') {
-        return Err("fake input frame exceeds bound or has no newline".into());
+    if read as u64 > MAX_INPUT_MESSAGE || bytes.last() != Some(&b'\n') {
+        return Err("fake input message exceeds bound or has no newline".into());
     }
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
@@ -204,7 +204,7 @@ fn read_start<R: BufRead>(
     input: &mut R,
     scripts: Vec<Script>,
 ) -> Result<(StartRequest, Script), Box<dyn std::error::Error>> {
-    let actual = read_frame(input)?.ok_or("request ended before expected message")?;
+    let actual = read_message(input)?.ok_or("request ended before expected message")?;
     let script = scripts
         .into_iter()
         .find(|script| contains_expected(&actual, &script.expected_request))
@@ -244,15 +244,15 @@ fn read_interrupt(
 
 fn read_remaining<R: BufRead>(mut input: R, sender: &SyncSender<InputEvent>) {
     loop {
-        let event = match read_frame(&mut input) {
-            Ok(Some(frame)) if frame["type"] == "start" => {
+        let event = match read_message(&mut input) {
+            Ok(Some(message)) if message["type"] == "start" => {
                 InputEvent::Error("duplicate start request".to_owned())
             }
-            Ok(Some(frame)) => InputEvent::Frame(frame),
+            Ok(Some(message)) => InputEvent::Message(message),
             Ok(None) => InputEvent::Eof,
             Err(error) => InputEvent::Error(error.to_string()),
         };
-        let terminal = !matches!(event, InputEvent::Frame(_));
+        let terminal = !matches!(event, InputEvent::Message(_));
         if sender.send(event).is_err() || terminal {
             break;
         }
@@ -261,7 +261,7 @@ fn read_remaining<R: BufRead>(mut input: R, sender: &SyncSender<InputEvent>) {
 
 fn next_input(receiver: &Receiver<InputEvent>) -> Result<Value, Box<dyn std::error::Error>> {
     match receiver.recv()? {
-        InputEvent::Frame(frame) => Ok(frame),
+        InputEvent::Message(message) => Ok(message),
         InputEvent::Eof => Err("request stream ended before scripted control".into()),
         InputEvent::Error(error) => Err(error.into()),
     }
@@ -281,9 +281,9 @@ fn finalize_input(
         match receiver.recv_timeout(remaining)? {
             InputEvent::Eof => return Ok(()),
             InputEvent::Error(error) => return Err(error.into()),
-            InputEvent::Frame(frame) => {
+            InputEvent::Message(message) => {
                 read_interrupt(
-                    frame,
+                    message,
                     &serde_json::json!({"type":"interrupt"}),
                     turn,
                     interrupt_seen,
@@ -397,7 +397,7 @@ fn ignore_term(sync_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_INPUT_FRAME, contains_expected, read_frame};
+    use super::{MAX_INPUT_MESSAGE, contains_expected, read_message};
     use serde_json::json;
     use std::io::{BufReader, Cursor};
 
@@ -419,11 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn input_frame_rejects_bytes_past_its_bound() -> Result<(), Box<dyn std::error::Error>> {
-        let mut bytes = vec![b'a'; usize::try_from(MAX_INPUT_FRAME)?];
+    fn input_message_rejects_bytes_past_its_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let mut bytes = vec![b'a'; usize::try_from(MAX_INPUT_MESSAGE)?];
         bytes.push(b'\n');
         let mut input = BufReader::new(Cursor::new(bytes));
-        assert!(read_frame(&mut input).is_err());
+        assert!(read_message(&mut input).is_err());
         Ok(())
     }
 }

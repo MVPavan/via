@@ -26,7 +26,7 @@ pub struct FakeRouteResult {
     pub stop_reason: String,
     /// Optional vendor failure code.
     pub vendor_code: Option<String>,
-    /// Raw reference to the terminal frame.
+    /// Raw reference to the terminal message.
     pub terminal_raw: RawRef,
     /// Host-confirmed vendor exit after stdin was half-closed; both fields
     /// are `None` when the wall deadline passed during finalization before
@@ -60,12 +60,12 @@ impl FakeRoute {
     /// force-closed and both pipes are drained under a separate cleanup bound.
     ///
     /// `force` set fails the turn [`RouteError::ForceStopped`]: before launch
-    /// nothing starts; after it, frames already read are still forwarded, then
+    /// nothing starts; after it, messages already read are still forwarded, then
     /// the same cleanup records every remaining vendor byte or reports the raw
     /// log incomplete. The daemon force overrides a stop order.
     ///
     /// `stop` is the turn's stop order (design §2): set before ARM, nothing
-    /// launches; after ARM but before the start frame, the group is
+    /// launches; after ARM but before the start message, the group is
     /// force-closed at once; after it, one interrupt is sent, a terminal still
     /// ends the turn normally, and at `force_at` without one the group is
     /// force-closed under `close_by`. Either stop is
@@ -283,7 +283,7 @@ impl FakeRoute {
     ) -> Result<Finished, Failed> {
         let turn = start.turn();
         let mut force = force.clone();
-        // Design §2 rule 2: after ARM, an order set before the start frame
+        // Design §2 rule 2: after ARM, an order set before the start message
         // is written: the start is not written and the group closes at once.
         if let Some(order) = stop.borrow().as_ref() {
             return Err(Failed::stopped(turn, order.close_by));
@@ -291,7 +291,7 @@ impl FakeRoute {
         let mut bytes = to_vec(&start).map_err(|_| protocol(turn, "cannot encode fake start"))?;
         bytes.push(b'\n');
         let sent = wire
-            .write_frame(&bytes, deadline)
+            .write_message(&bytes, deadline)
             .await
             .map_err(|error| Failed::from(wire_cause(turn, &error)))?;
         if sent != SendOutcome::Written {
@@ -394,7 +394,7 @@ impl FakeRoute {
                 Next::Woken => control.after_terminal()?,
                 Next::Eof => break,
                 Next::Unterminated => {
-                    return Err(protocol(turn, "fake stdout ended inside a frame").into());
+                    return Err(protocol(turn, "fake stdout ended inside a message").into());
                 }
             }
         }
@@ -424,7 +424,7 @@ enum Finished {
     Late(TerminalEvidence),
 }
 
-/// Route's side of a turn's stop order after the start frame was written.
+/// Route's side of a turn's stop order after the start message was written.
 struct Control {
     turn: TurnNumber,
     force: watch::Receiver<Option<tokio::time::Instant>>,
@@ -458,7 +458,7 @@ impl Control {
         }
         if !self.interrupted {
             self.interrupted = true;
-            let frame = format!(
+            let interrupt = format!(
                 "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
                 self.turn.get()
             );
@@ -466,7 +466,7 @@ impl Control {
             // raw evidence failure fails the connection (design §7.2 row 6):
             // the group is force-closed under `now + 3 s` and the cause keeps
             // its Store kind, so `WriterLost` and `Uncertain` still latch.
-            if let Err(error) = wire.write_frame(frame.as_bytes(), deadline).await
+            if let Err(error) = wire.write_message(interrupt.as_bytes(), deadline).await
                 && let Some(cause) = interrupt_failure(self.turn, &error)
             {
                 return Err(cause.into());
@@ -552,7 +552,7 @@ struct Failed {
 }
 
 impl Failed {
-    /// A failure proved by one synced frame.
+    /// A failure proved by one synced vendor message.
     fn cited(cause: RouteError, evidence: &RawRef) -> Self {
         Self {
             cause,
@@ -700,34 +700,34 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
 
 /// What the next read produced.
 enum Next {
-    /// One decoded frame with its synced raw span.
+    /// One decoded vendor message with its synced raw span.
     Message(RouteMessage),
     /// Both pipes reached EOF.
     Eof,
-    /// Stdout ended inside a frame; its bytes are in the raw log (F21).
+    /// Stdout ended inside a message; its bytes are in the raw log (F21).
     Unterminated,
     /// Route's wake ended the wait before any byte was read.
     Woken,
 }
 
-/// Reads and decodes the next synced frame.
+/// Reads and decodes the next synced vendor message.
 async fn next_message(
     wire: &mut WireConnection,
     turn: TurnNumber,
     deadline: Deadline,
 ) -> Result<Next, Failed> {
-    let frame = match wire.next_frame(deadline).await {
-        Ok(Some(frame)) => frame,
+    let message = match wire.next_message(deadline).await {
+        Ok(Some(message)) => message,
         Ok(None) => return Ok(Next::Eof),
         Err(WireError::Woken) => return Ok(Next::Woken),
-        Err(WireError::Frame(WireFailure::UnterminatedFrame)) => return Ok(Next::Unterminated),
+        Err(WireError::Message(WireFailure::UnterminatedMessage)) => return Ok(Next::Unterminated),
         Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
     };
-    let payload = FakeMessage::decode(frame.bytes(), turn)
-        .map_err(|cause| Failed::cited(cause, frame.raw_ref()))?;
+    let payload = FakeMessage::decode(message.bytes(), turn)
+        .map_err(|cause| Failed::cited(cause, message.raw_ref()))?;
     Ok(Next::Message(RouteMessage {
         payload,
-        raw_ref: frame.raw_ref().clone(),
+        raw_ref: message.raw_ref().clone(),
     }))
 }
 
@@ -743,7 +743,7 @@ async fn forward(
     force: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), Failed> {
     let sent = tokio::select! {
-        // Capacity first: a draining consumer still receives frames already read.
+        // Capacity first: a draining consumer still receives messages already read.
         biased;
         sent = timeout_at(deadline.instant(), observations.send(message)) => sent,
         () = forced(force) => return Err(RouteError::ForceStopped { turn }.into()),
@@ -836,7 +836,7 @@ fn interrupt_failure(turn: TurnNumber, error: &WireError) -> Option<RouteError> 
     match error {
         WireError::Raw(_)
         | WireError::RawDeadline
-        | WireError::Frame(WireFailure::RawStore | WireFailure::RawRangeMismatch) => {
+        | WireError::Message(WireFailure::RawStore | WireFailure::RawRangeMismatch) => {
             Some(wire_cause(turn, error))
         }
         WireError::Host(_)
@@ -845,9 +845,9 @@ fn interrupt_failure(turn: TurnNumber, error: &WireError) -> Option<RouteError> 
         | WireError::Cancelled
         | WireError::Woken
         | WireError::Acquire { .. }
-        | WireError::Frame(
-            WireFailure::FrameTooLarge
-            | WireFailure::UnterminatedFrame
+        | WireError::Message(
+            WireFailure::MessageTooLarge
+            | WireFailure::UnterminatedMessage
             | WireFailure::Overflow
             | WireFailure::Transport,
         ) => None,
@@ -879,20 +879,20 @@ fn wire_cause(turn: TurnNumber, error: &WireError) -> RouteError {
         }
         WireError::Cancelled => RouteError::ForceStopped { turn },
         WireError::Acquire { cause, .. } => wire_cause(turn, cause),
-        WireError::Frame(WireFailure::FrameTooLarge) => {
-            protocol(turn, "fake stdout line exceeds the 1 MiB frame cap")
+        WireError::Message(WireFailure::MessageTooLarge) => {
+            protocol(turn, "fake stdout line exceeds the 1 MiB message cap")
         }
-        WireError::Frame(WireFailure::UnterminatedFrame) => {
-            protocol(turn, "fake stdout ended inside a frame")
+        WireError::Message(WireFailure::UnterminatedMessage) => {
+            protocol(turn, "fake stdout ended inside a message")
         }
-        WireError::Frame(WireFailure::RawRangeMismatch | WireFailure::RawStore) => {
+        WireError::Message(WireFailure::RawRangeMismatch | WireFailure::RawStore) => {
             RouteError::Store {
                 turn,
                 kind: StoreFailure::Raw,
             }
         }
-        WireError::Frame(WireFailure::Overflow) => RouteError::Overflow { turn },
-        WireError::Frame(WireFailure::Transport)
+        WireError::Message(WireFailure::Overflow) => RouteError::Overflow { turn },
+        WireError::Message(WireFailure::Transport)
         | WireError::Io(_)
         | WireError::Host(_)
         | WireError::Woken => transport(turn),
@@ -1048,7 +1048,7 @@ mod tests {
             );
         }
         assert_eq!(
-            interrupt_failure(turn, &WireError::Frame(WireFailure::RawStore)),
+            interrupt_failure(turn, &WireError::Message(WireFailure::RawStore)),
             Some(RouteError::Store {
                 turn,
                 kind: StoreFailure::Raw
@@ -1061,7 +1061,7 @@ mod tests {
         for tolerated in [
             WireError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
             WireError::Cancelled,
-            WireError::Frame(WireFailure::Transport),
+            WireError::Message(WireFailure::Transport),
         ] {
             assert_eq!(interrupt_failure(turn, &tolerated), None);
         }

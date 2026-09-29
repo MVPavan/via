@@ -350,8 +350,8 @@ fn assert_dense(events: &[Value], session: &str, envelope: &Value) {
     );
 }
 
-/// Asserts that a raw reference is an exact stdout frame equal to `message`.
-fn assert_frame(sandbox: &Sandbox, reference: &Value, message: &Value) {
+/// Asserts that a raw reference is an exact stdout message equal to `message`.
+fn assert_message(sandbox: &Sandbox, reference: &Value, message: &Value) {
     let (code, bytes) = sandbox.raw_at(reference);
     assert_eq!(code, STDOUT, "{reference}");
     assert_eq!(bytes.last(), Some(&b'\n'), "{reference}");
@@ -405,13 +405,13 @@ fn observations_become_ordered_events_with_exact_raw_refs() {
         ]
     );
     assert_dense(&events, session, &envelope);
-    assert_frame(&sandbox, &events[2]["raw_ref"], &messages[0]);
+    assert_message(&sandbox, &events[2]["raw_ref"], &messages[0]);
 
     // Small text keeps its payload; oversized text is split in order at UTF-8
-    // boundaries, and every piece cites the one frame it came from.
+    // boundaries, and every piece cites the one message it came from.
     assert_eq!(events[3]["text"], "hello ");
     assert_eq!(events[3]["final"], false);
-    assert_frame(&sandbox, &events[3]["raw_ref"], &messages[1]);
+    assert_message(&sandbox, &events[3]["raw_ref"], &messages[1]);
     let mut joined = String::new();
     for piece in &events[4..6] {
         let payload = json!({"text":piece["text"],"final":piece["final"]});
@@ -420,17 +420,17 @@ fn observations_become_ordered_events_with_exact_raw_refs() {
         joined.push_str(piece["text"].as_str().unwrap());
     }
     assert_eq!(joined, big_text);
-    assert_frame(&sandbox, &events[4]["raw_ref"], &messages[2]);
+    assert_message(&sandbox, &events[4]["raw_ref"], &messages[2]);
 
     assert_eq!(events[6]["tool_id"], "t1");
     assert_eq!(events[6]["name"], "shell");
     assert_eq!(events[6]["input_summary"], "ls");
-    assert_frame(&sandbox, &events[6]["raw_ref"], &messages[3]);
+    assert_message(&sandbox, &events[6]["raw_ref"], &messages[3]);
     assert_eq!(events[7]["tool_id"], "t1");
     assert_eq!(events[7]["status"], "failed");
     assert_eq!(events[7]["output_summary"], "no such file");
     assert_eq!(events[7]["exit_code"], 2);
-    assert_frame(&sandbox, &events[7]["raw_ref"], &messages[4]);
+    assert_message(&sandbox, &events[7]["raw_ref"], &messages[4]);
 
     // Unknown payloads keep a bounded prefix with an explicit truncation marker.
     for (event, message, truncated) in [
@@ -441,11 +441,11 @@ fn observations_become_ordered_events_with_exact_raw_refs() {
         assert_eq!(event["truncated"], truncated, "{event}");
         let payload = event["payload"].as_str().unwrap();
         assert!(payload.len() <= 16 * 1024);
-        let (_, frame) = sandbox.raw_at(&event["raw_ref"]);
-        assert!(frame.starts_with(payload.as_bytes()));
-        assert_frame(&sandbox, &event["raw_ref"], message);
+        let (_, raw) = sandbox.raw_at(&event["raw_ref"]);
+        assert!(raw.starts_with(payload.as_bytes()));
+        assert_message(&sandbox, &event["raw_ref"], message);
     }
-    assert_frame(&sandbox, &events[10]["raw_ref"], &messages[6]);
+    assert_message(&sandbox, &events[10]["raw_ref"], &messages[6]);
 
     // The envelope's bounding span covers every cited reference.
     let spans = envelope["raw_spans"].as_array().unwrap();
@@ -504,7 +504,7 @@ fn failed_turn(steps: &[Value], class: &str) -> (Sandbox, Value, Vec<Value>) {
 }
 
 #[test]
-fn failure_class_protocol_cites_the_malformed_frame() {
+fn failure_class_protocol_cites_the_malformed_message() {
     let malformed = json!({"type":"text","vendor_turn_id":"fake-turn-1"});
     let (sandbox, envelope, events) = failed_turn(
         &[
@@ -515,7 +515,7 @@ fn failure_class_protocol_cites_the_malformed_frame() {
         "protocol",
     );
     assert_eq!(envelope["stop_reason"], "error");
-    assert_frame(&sandbox, &events.last().unwrap()["raw_ref"], &malformed);
+    assert_message(&sandbox, &events.last().unwrap()["raw_ref"], &malformed);
 }
 
 #[test]
@@ -530,7 +530,7 @@ fn failure_class_protocol_for_oversized_tool_payload() {
         "protocol",
     );
     assert!(events.iter().all(|event| event["type"] != "tool.started"));
-    assert_frame(&sandbox, &events.last().unwrap()["raw_ref"], &tool);
+    assert_message(&sandbox, &events.last().unwrap()["raw_ref"], &tool);
 }
 
 #[test]

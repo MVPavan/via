@@ -746,7 +746,7 @@ fn s1_f20_sigterm_ignored_escalates_to_kill() -> TestResult {
 
 /// F19 (design §5, §11 [r1.9, r1.10]): with no meaningful progress within
 /// `idle_ms` the turn is ordered to stop with cause `idle_deadline`; the
-/// vendor's `interrupted` ends it `failed(deadline_idle)`. Unknown frames and
+/// vendor's `interrupted` ends it `failed(deadline_idle)`. Unknown messages and
 /// stderr during the window do not reset the idle clock.
 #[test]
 fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
@@ -834,7 +834,7 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
     })?;
     check(
         events.iter().any(|event| event["type"] == "vendor.other"),
-        || "the unknown frames were not recorded".to_owned(),
+        || "the unknown messages were not recorded".to_owned(),
     )?;
 
     let (silent_session, _) =

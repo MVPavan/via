@@ -6,8 +6,8 @@ use tokio::{
 };
 
 use super::{
-    BoundedBytes, ConnectionId, Deadline, Frame, PrivateProcessSpec, SendOutcome, WireCleanup,
-    WireFailure,
+    BoundedBytes, ConnectionId, Deadline, PrivateProcessSpec, SendOutcome, VendorMessage,
+    WireCleanup, WireFailure,
 };
 use via_host::{
     AcquireFailure, AcquiredProcess, CleanupEvidence, ExitReceiver, Host, LaunchPipes, OwnedPipes,
@@ -277,9 +277,9 @@ pub enum WireError {
         /// A journal write had an uncertain outcome: the daemon must latch.
         journal_uncertain: bool,
     },
-    /// Frame contract failure.
-    #[error("vendor frame failure: {0:?}")]
-    Frame(WireFailure),
+    /// Vendor message contract failure.
+    #[error("vendor message failure: {0:?}")]
+    Message(WireFailure),
 }
 
 /// Exclusive transport for one private fake process and one raw connection.
@@ -382,14 +382,14 @@ impl WireConnection {
         })
     }
 
-    /// Writes one outbound frame and durably records only successfully written prefixes.
-    pub async fn write_frame(
+    /// Writes one input message and durably records only successfully written prefixes.
+    pub async fn write_message(
         &mut self,
-        frame: &[u8],
+        message: &[u8],
         deadline: Deadline,
     ) -> Result<SendOutcome, WireError> {
         let mut written = 0;
-        while written < frame.len() {
+        while written < message.len() {
             let Some(stdin) = self.stdin.as_mut() else {
                 return Ok(SendOutcome::NotWritten);
             };
@@ -397,7 +397,7 @@ impl WireConnection {
             let write = tokio::select! {
                 biased;
                 () = cancelled(&mut self.cancel) => return Err(WireError::Cancelled),
-                write = timeout_at(deadline.instant(), stdin.write(&frame[written..])) => write,
+                write = timeout_at(deadline.instant(), stdin.write(&message[written..])) => write,
             };
             let next = match write {
                 Ok(Ok(0)) => {
@@ -420,13 +420,13 @@ impl WireConnection {
             };
             self.record(
                 RawStream::Stdin,
-                frame[written..written + next].to_vec(),
+                message[written..written + next].to_vec(),
                 deadline,
             )
             .await?;
             written += next;
         }
-        // The whole frame (in S1 first the start carrying the prompt) is in the
+        // The whole input message (in S1 first the start carrying the prompt) is in the
         // vendor's stdin; nothing it answered is recorded yet.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::hit_async("wire.prompt.after_write")
@@ -447,25 +447,28 @@ impl WireConnection {
             .map_err(WireError::Io)
     }
 
-    /// Returns a frame only after Store has synced its exact raw bytes.
-    pub async fn next_frame(&mut self, deadline: Deadline) -> Result<Option<Frame>, WireError> {
+    /// Returns a message only after Store has synced its exact raw bytes.
+    pub async fn next_message(
+        &mut self,
+        deadline: Deadline,
+    ) -> Result<Option<VendorMessage>, WireError> {
         loop {
             if let Some(index) = self.buffered.iter().position(|byte| *byte == b'\n') {
                 // An oversized line stays buffered so the failure drain records it.
-                if index >= super::MAX_STDOUT_FRAME_BYTES {
-                    return Err(WireError::Frame(WireFailure::FrameTooLarge));
+                if index >= super::MAX_STDOUT_MESSAGE_BYTES {
+                    return Err(WireError::Message(WireFailure::MessageTooLarge));
                 }
                 let bytes: Vec<u8> = self.buffered.drain(..=index).collect();
-                let bounded = BoundedBytes::try_from_frame(bytes).map_err(WireError::Frame)?;
+                let bounded = BoundedBytes::try_from_message(bytes).map_err(WireError::Message)?;
                 let token = self
                     .record(RawStream::Stdout, bounded.as_bytes().to_vec(), deadline)
                     .await?;
-                return Frame::new(bounded, token.raw_ref().clone())
+                return VendorMessage::new(bounded, token.raw_ref().clone())
                     .map(Some)
-                    .map_err(WireError::Frame);
+                    .map_err(WireError::Message);
             }
-            if self.buffered.len() > super::MAX_STDOUT_FRAME_BYTES {
-                return Err(WireError::Frame(WireFailure::FrameTooLarge));
+            if self.buffered.len() > super::MAX_STDOUT_MESSAGE_BYTES {
+                return Err(WireError::Message(WireFailure::MessageTooLarge));
             }
             if self.stdout_eof && !self.buffered.is_empty() {
                 self.unterminated_stdout = true;
@@ -474,7 +477,7 @@ impl WireConnection {
             }
             if self.stdout_eof && self.stderr_eof {
                 return if self.unterminated_stdout {
-                    Err(WireError::Frame(WireFailure::UnterminatedFrame))
+                    Err(WireError::Message(WireFailure::UnterminatedMessage))
                 } else {
                     Ok(None)
                 };
@@ -483,8 +486,8 @@ impl WireConnection {
         }
     }
 
-    /// Records every remaining byte of both pipes, unframed, until both reach EOF or
-    /// the cleanup deadline. Used after a failure, when framing no longer decides
+    /// Records every remaining byte of both pipes, unsplit, until both reach EOF or
+    /// the cleanup deadline. Used after a failure, when message splitting no longer decides
     /// protocol meaning. A failed or expired append never stops the drain: later
     /// bytes are read and discarded until the same deadline, and the result says the
     /// raw log is incomplete.
@@ -528,7 +531,7 @@ impl WireConnection {
         deadline: Deadline,
     ) -> Result<DurableRaw, WireError> {
         if self.evidence == RawEvidence::Incomplete {
-            return Err(WireError::Frame(WireFailure::RawStore));
+            return Err(WireError::Message(WireFailure::RawStore));
         }
         let result = match timeout_at(deadline.instant(), self.raw.append(stream, bytes)).await {
             Ok(appended) => appended.map_err(WireError::Raw),
@@ -578,7 +581,7 @@ impl WireConnection {
         Ok(())
     }
 
-    /// Observes Host-confirmed vendor exit without treating a terminal frame as exit proof.
+    /// Observes Host-confirmed vendor exit without treating a terminal message as exit proof.
     pub async fn wait_exit(&mut self, deadline: Deadline) -> Result<super::ExitReport, WireError> {
         loop {
             // Copied out so no watch guard is held across the test seam's await.
@@ -601,7 +604,7 @@ impl WireConnection {
             changed
                 .map_err(|_| WireError::Deadline)?
                 // Host dropped its exit supervision: transport loss, not a deadline.
-                .map_err(|_| WireError::Frame(WireFailure::Transport))?;
+                .map_err(|_| WireError::Message(WireFailure::Transport))?;
         }
     }
 
