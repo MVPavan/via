@@ -592,15 +592,21 @@ impl WireConnection {
     }
 }
 
-/// Creates `path` (new, 0600) holding `bytes`. `create_new` is `O_EXCL`,
-/// which never follows a symlink.
+/// Creates `path` (new, 0600) holding `bytes`, then syncs it and its
+/// folder, so the failure message may name it (coding style §7 "Write
+/// order"). `create_new` is `O_EXCL`, which never follows a symlink.
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(bytes)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let folder = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("undecoded.bin has no folder"))?;
+    std::fs::File::open(folder)?.sync_all()
 }
 
 /// Host's evidence from a failed acquisition, as Wire passes it up.
@@ -738,5 +744,53 @@ mod shutdown_tests {
                 .failure
                 .is_some_and(|failure| failure.contains("journal"))
         );
+    }
+}
+
+#[cfg(test)]
+mod undecoded_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// A private scratch folder, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> std::io::Result<Scratch> {
+        let dir = std::env::temp_dir().join(format!(
+            "via-wire-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir(&dir)?;
+        Ok(Scratch(dir))
+    }
+
+    /// Coding style §7 "Write order": the file and its folder are synced
+    /// before the failure note names the file. A folder that can be written
+    /// but not opened for its sync makes the save fail.
+    #[test]
+    fn a_saved_undecoded_file_is_synced_with_its_folder() -> std::io::Result<()> {
+        let folder = scratch("synced")?;
+        let saved = folder.0.join("undecoded.bin");
+        write_new(&saved, b"head")?;
+        assert_eq!(std::fs::read(&saved)?, b"head");
+        std::fs::remove_file(&saved)?;
+        // Write and search only: the file can be created, the folder not
+        // opened to sync it.
+        std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o300))?;
+        let unsynced = write_new(&saved, b"head");
+        std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o700))?;
+        assert!(unsynced.is_err(), "an unsynced folder was reported saved");
+        Ok(())
     }
 }
