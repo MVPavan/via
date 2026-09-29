@@ -1279,6 +1279,12 @@ impl Store {
     pub fn blob_writes(&self) -> u64 {
         self.client.blobs.writes()
     }
+
+    /// Test builds: blob steps the Store still owns, after reaping ended ones.
+    #[cfg(feature = "test-failpoints")]
+    pub fn blob_tasks(&self) -> usize {
+        self.client.blobs.tasks.pending()
+    }
 }
 
 impl Drop for Store {
@@ -1288,6 +1294,16 @@ impl Drop for Store {
         self.client.lanes.fence();
         if let Some(join) = self.writer_join.take() {
             let _ = join.join();
+        }
+        // Owned blob steps (coding-style §5): a bounded wait, then the rest
+        // are reported as stragglers and left to end on their own.
+        let pending = self.client.blobs.tasks.drain(crate::blob::BLOB_DRAIN);
+        if pending > 0 {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "via store: {pending} blob task(s) still running at shutdown"
+            );
         }
     }
 }

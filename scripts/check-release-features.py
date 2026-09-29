@@ -122,6 +122,7 @@ POINTS = [
     "store.rollback.fail",
     "store.sqlite.full",
     "blob.write.fail_after",
+    "blob.step.stall",
     # Task 3 force row (design §6.8, §10): a recorded exit not yet returned.
     "wire.exit.observed",
 ]

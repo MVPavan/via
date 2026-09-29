@@ -65,7 +65,8 @@ fn text() -> String {
 
 /// A torn write: the second chunk's write fails and `discard` unlinks the
 /// unfinished file; a handle dropped unfinished unlinks its file too.
-async fn torn_writes_leave_no_file(client: &StoreClient, points: &Path, state: &Path) {
+async fn torn_writes_leave_no_file(store: &Store, points: &Path, state: &Path) {
+    let client = &store.client();
     fs::write(
         points.join("blob.write.fail_after.json"),
         json!({"token":TOKEN,"occurrence":2,"action":"fail_io"}).to_string(),
@@ -82,6 +83,10 @@ async fn torn_writes_leave_no_file(client: &StoreClient, points: &Path, state: &
     let mut dropped = client.blob_writer().await.unwrap();
     dropped.write(b"partial").await.unwrap();
     drop(dropped);
+    // The unlink is an owned blob step (review round 1): wait for it to end.
+    while store.blob_tasks() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
     assert!(blob_files(state).is_empty());
 }
 
@@ -98,7 +103,7 @@ fn s1_blob_torn_and_mismatched_blobs_are_refused_or_swept() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        torn_writes_leave_no_file(&client, points.path(), state).await;
+        torn_writes_leave_no_file(&store, points.path(), state).await;
 
         // A finished blob: 0600, exact bytes, referenced by a spawn.
         let text = text();
@@ -187,4 +192,65 @@ fn s1_blob_torn_and_mismatched_blobs_are_refused_or_swept() {
     });
     // Created: torn, dropped, text, invalid, spare, discarded.
     assert_eq!(store.blob_writes(), 6);
+}
+
+/// Review round 1 (coding-style §5 task ownership): a blob step stalled on
+/// the blocking pool fails its caller `Write` (the request's
+/// `not_committed`) at the 2 s bound, yet stays owned by the Store until
+/// it ends, and is reaped then. The file it created unowned is swept.
+/// Releases a paused point when dropped, so a failed assertion never
+/// leaves the runtime's drop waiting on the stalled blocking thread.
+struct Release(PathBuf);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"");
+    }
+}
+
+#[test]
+fn s1_blob_stalled_step_times_out_owned_until_reaped() {
+    let points = private_dir();
+    failpoint::activate(points.path(), TOKEN).unwrap();
+    let root = private_dir();
+    let state = root.path();
+    let store = Store::open(state).unwrap();
+    let client = store.client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    fs::write(
+        points.path().join("blob.step.stall.json"),
+        json!({"token":TOKEN,"occurrence":1,"action":"pause"}).to_string(),
+    )
+    .unwrap();
+    let release = Release(points.path().join("blob.step.stall.1.release"));
+    runtime.block_on(async {
+        let stalled = client.blob_writer().await;
+        assert!(
+            matches!(stalled, Err(StoreError::Write(_))),
+            "{:?}",
+            stalled.map(|_| ())
+        );
+    });
+    assert!(points.path().join("blob.step.stall.1.ack").exists());
+    // Timed out, not abandoned: the Store still owns the step.
+    assert_eq!(store.blob_tasks(), 1);
+    drop(release);
+    // Reaped once it ends (bounded wait on the task's own completion).
+    let mut reaped = false;
+    for _ in 0..2000 {
+        if store.blob_tasks() == 0 {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(reaped, "the finished step was never reaped");
+    // The step created its file after its caller gave up: nothing names it.
+    runtime.block_on(async {
+        assert_eq!(client.sweep_blobs().await.unwrap(), 1);
+    });
+    assert!(blob_files(state).is_empty());
 }
