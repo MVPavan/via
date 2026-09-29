@@ -346,7 +346,7 @@ earliest_seq, subscription?}`. Semantics:
   notification seq or the acknowledged initial-page cursor, not proof that
   the client read the bytes. Clients should retain their last received seq.
   Other `reason` values: `terminal`, `unsubscribed`, `closing`, `store_error`.
-  `event_end` is best-effort: finish any started NDJSON frame, attempt the
+  `event_end` is best-effort: finish any started NDJSON line, attempt the
   notice within one 2 s absolute writer deadline, then close on timeout.
   Subscription and outbox ownership is released within 2 s even for a peer
   that never reads. If several subscriptions fail together, the socket may
@@ -354,7 +354,7 @@ earliest_seq, subscription?}`. Semantics:
 - History pruned by retention: `history_pruned` error carrying
   `earliest_seq` when `after < earliest_seq - 1`.
 - `unsubscribe {subscription}` removes unsent entries, finishes any started
-  frame within the same 2 s bound, then queues `event_end:unsubscribed` before
+  line within the same 2 s bound, then queues `event_end:unsubscribed` before
   the reply. No event for that subscription is enqueued after the reply.
   Connection close drops its subscriptions immediately in memory. Terminal
   detection follows the scan even when its event type is filtered out.
@@ -543,7 +543,7 @@ For a delayed-init CLI such as Claude, `session.opened`/`session.reopened`
 is committed exactly once per connection generation only after matching
 vendor identity confirmation. Core atomically persists the confirmed ID and
 verification flag with that event, before any acceptance derived from the
-same frame. A pre-init startup/resume rejection emits neither event, even
+same message. A pre-init startup/resume rejection emits neither event, even
 when it echoes the expected UUID. Matching init confirms identity, not turn
 acceptance; prompt-associated evidence is still required.
 

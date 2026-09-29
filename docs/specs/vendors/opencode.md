@@ -72,7 +72,7 @@ a qualification gate (§2.1).
 Core owns turn admission, receipts,
 queues, Store and final states. The Adapter owns OpenCode semantics and the
 server key; Routes owns typed HTTP/SSE correlation; Wire owns sockets, HTTP
-framing/raw capture and bounded staging; Host exclusively starts/supervises
+message splitting/raw capture and bounded staging; Host exclusively starts/supervises
 the server through the reviewed anchor mechanism. SQLite in OpenCode is
 vendor-owned storage, never a second writer to VIA's Store.
 
@@ -144,7 +144,7 @@ that exact loopback origin. Disable HTTP redirects and proxies for this local
 client, including inherited proxy environment handling. Never put passwords
 in URLs, Store, manifests, traces, HTTP raw captures or command argv. Redact
 Authorization before HTTP metadata enters a raw log; retain vendor body bytes
-and framing evidence. VIA creates the password only in daemon memory and the
+and message-splitting evidence. VIA creates the password only in daemon memory and the
 owned server launch environment. That is a VIA handling rule, **not a claim
 that the vendor keeps it from descendants**; the source-backed exposure below
 precludes that assertion under the temporary exception. Restart cannot recover
@@ -521,7 +521,7 @@ event family described by the served schema as canonical; future/parallel
 `session.next.*` events are retained as bounded `vendor.other`, never a second
 text/tool/usage emission. Permission/question request aliases must be decoded
 and deduplicated by request ID even if represented in both event families.
-Source directory filtering and the observed default SSE frame are independently
+Source directory filtering and the observed default SSE message are independently
 required fixture cases. [Event handler](https://raw.githubusercontent.com/anomalyco/opencode/v1.18.32/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts).
 
 Map text deltas and authoritative part snapshots without appending the same
@@ -673,7 +673,7 @@ No credentials or generated server passwords may enter fixtures/reports.
 | OC03 full method path | Successful live spawn/result on a free model; background/wait, reads/events/logs and stdio expose same durable turn; close never deletes vendor history |
 | OC04 continuity | Two-turn context-dependent answer on the same free model, equal vendor ID, idle server restart over private DB; missing/mismatching ID refuses fresh-session substitution |
 | OC05 ambiguity | Crash before/after POST/204, lost HTTP reply, event acceptance before reply, duplicate IDs, incomplete assistant and HTTP-200 error; exactly one submission, no false completion |
-| OC06 correlation/framing | Cross-session interleaving, multiple assistant steps, delta+snapshot duplicates, default SSE event, partial UTF-8/multiline frames, unknown events/requests, late events and message parent mismatch; no leak/double terminal |
+| OC06 correlation/message splitting | Cross-session interleaving, multiple assistant steps, delta+snapshot duplicates, default SSE event, partial UTF-8/multiline SSE messages, unknown events/requests, late events and message parent mismatch; no leak/double terminal |
 | OC07 never-ask | Exact ordered create/readback rules; agent-before-session last-match precedence tested under hostile config; normal full-bound tools remain usable, question/plan tools denied. Real/fake request rejects under saturated observations; 404/error truthful; unknown effective policy prevents prompt |
 | OC08 control | Active tool abort with descendant liveness observations; tool refuses stop, lost abort response, late terminal; other VIA owner's dedicated server unaffected; queued-turn cancel sends no abort |
 | OC09 overload/loss | Four-server memory/listener/SSE limits and fifth-owner admission; flood/oversize/slow consumer, full lane, SSE disconnect, compression expansion; other owners and control progress, loss explicit; idle namespaces consume no listener; nonempty bounded suites |

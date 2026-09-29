@@ -57,7 +57,7 @@ resource wiring; no Adapter access to SQLite or credentials.
 Extend the typed route with only `initialize`, `thread_start`,
 `thread_resume`, `turn_start`, `turn_steer`, `turn_interrupt`,
 `thread_unsubscribe`, and typed server-request replies. A single connection
-task receives all frames; session drivers receive already correlated
+task receives all vendor messages; session drivers receive already correlated
 messages. No second transport framework, generic method registry or trait
 hierarchy is justified. Request IDs are connection-local monotonically
 allocated IDs with a distinct server-request direction; exhaustion retires
@@ -215,7 +215,7 @@ Each client response routes by request ID; each known notification routes
 by exact `threadId` and, where present, `turnId`. Server requests additionally
 carry their own request IDs. Install registrations before releasing a
 thread response to its driver. Bound pre-registration buffering by the
-existing 64-frame/4 MiB connection staging limit. Lookup includes retained
+existing 64-message/4 MiB connection staging limit. Lookup includes retained
 correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
@@ -257,9 +257,9 @@ turn-terminal payload may carry partial items (`itemsView`); absence from
 its `items` is not completion evidence. `error {willRetry:true}` is progress
 diagnostic, not a terminal failure. Core applies disposition precedence.
 
-Use runtime §8 limits unchanged: 1 MiB inbound frame including LF,
+Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
 64 KiB pipe buffers, 8 MiB raw staging/connection and 32 MiB globally,
-64 framed messages/4 MiB per connection, C2 1024 observations/4 MiB per
+64 messages/4 MiB per connection, C2 1024 observations/4 MiB per
 session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Large text splits on UTF-8 boundaries; unknown notifications
 become `vendor.other` retaining at most 16 KiB with explicit truncation.
@@ -267,9 +267,9 @@ No silent dropped lifecycle events. Large prompts are encoded using the
 runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
 
 One blocked session normalizer must not stop dispatch to other threads or
-the decline/control paths. Partition the existing Route framed-data staging
-into per-thread ingress lanes, each capped at 16 frames/1 MiB within the
-unchanged 64-frame/4 MiB connection aggregate; this adds no buffer tier.
+the decline/control paths. Partition the existing Route message staging
+into per-thread ingress lanes, each capped at 16 messages/1 MiB within the
+unchanged 64-message/4 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting
@@ -395,7 +395,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation/raw extraction stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
 | `codex_cleanup_60s` | With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; final completion settles early. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
-| `codex_bounds_overflow` | Exact boundary/excess frames, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood stays raw-only/bounded; distinguish normalized loss from actual raw gaps. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
+| `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood stays raw-only/bounded; distinguish normalized loss from actual raw gaps. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
 | `codex_usage_snapshot` | Repeated last/total and decreasing/reset counters never sum or become turn-scoped; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 

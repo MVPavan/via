@@ -78,7 +78,7 @@ the set.
   `#[serde(rename = "…")]` where they differ from Rust names (C1 event tags
   are dotted, e.g. `action.denied`). Types that mirror a vendor protocol
   keep the vendor's names.
-- Vendor input is untrusted: cap frame and line length and buffered bytes;
+- Vendor input is untrusted: cap message and line length and buffered bytes;
   never allocate from an unchecked vendor-supplied size.
 
 ## 4. Errors
@@ -129,7 +129,7 @@ the set.
   arithmetic.
 - **Cancellation boundaries.** At every `select!`, `timeout` or abort point,
   state what partial progress can remain and how it is cleaned up.
-  `write_all` and `read_exact` are not cancel-safe: keep framing state and
+  `write_all` and `read_exact` are not cancel-safe: keep message-splitting state and
   write offsets across cancellation, or close the connection before reuse.
   A timeout does not prove that a vendor action or Store write stopped;
   never retry an uncertain mutation automatically.
@@ -244,13 +244,13 @@ Confirmed by the owner, 2026-09-26.
   route code runs; only the vendor process is fake. Fakes:
   - validate the requests VIA sends;
   - replay recorded, sanitized transcripts;
-  - inject faults: hang, flood, crash, partial frames, vendor requests,
+  - inject faults: hang, flood, crash, partial messages, vendor requests,
     slowness;
   - advance through explicit synchronization points, never fixed sleeps.
   VIA therefore supports a configurable vendor binary path and state
   directory.
 - **Isolated tests only where they are sharper or much cheaper,** written
-  failure-first: property tests (`proptest`) for the byte framer; focused
+  failure-first: property tests (`proptest`) for the byte splitter; focused
   tests for the session/turn state machines, Store migrations and vendor
   message mapping.
 - **Every bug fix** starts with the smallest failing reproduction, written
