@@ -74,6 +74,18 @@ pub(super) struct ProgressDelta {
     tokens: Option<u64>,
 }
 
+/// The largest token count Store keeps (a step row's `tokens` is an
+/// SQLite integer): a sample or a step or turn sum past it is refused.
+const TOKENS_MAX: u64 = i64::MAX.unsigned_abs();
+
+/// A token count past [`TOKENS_MAX`]: the vendor's evidence cannot be
+/// represented, and the turn fails `protocol` (review r1).
+#[derive(Debug)]
+pub(super) struct Unrepresentable;
+
+/// A step's usage samples by key (the vendor's message ID, if any).
+type Samples = Vec<(Option<String>, u64)>;
+
 /// One folded item's result: the delta to publish and, at a step
 /// boundary, the row of the step that ended.
 pub(super) struct Folded {
@@ -93,11 +105,13 @@ pub(super) struct StepTracker {
     open: Vec<String>,
     overflow: bool,
     /// This step's usage samples by key.
-    usage: Vec<(Option<String>, u64)>,
+    usage: Samples,
     /// Samples under keys past the first 16.
     folded: u64,
     /// Tokens of completed steps, once any had a sample.
     tokens: Option<u64>,
+    /// An item was refused as [`Unrepresentable`].
+    unrepresentable: bool,
     pub(super) carried: Vec<StepRow>,
 }
 
@@ -120,6 +134,7 @@ impl StepTracker {
             usage: Vec::new(),
             folded: 0,
             tokens: None,
+            unrepresentable: false,
             carried: Vec::new(),
         }
     }
@@ -144,23 +159,29 @@ impl StepTracker {
     }
 
     /// Rules 2–4 for one message's marks: its `model` mark applies before
-    /// its tool starts, then ends; usage folds into the step.
-    pub(super) fn fold(&mut self, marks: &ProgressMarks) -> Folded {
+    /// its tool starts, then ends; usage folds into the step. A sample that
+    /// would take a count past [`TOKENS_MAX`] refuses the whole item before
+    /// any change, so no row is built from it.
+    pub(super) fn fold(&mut self, marks: &ProgressMarks) -> Result<Folded, Unrepresentable> {
+        let boundary = marks.model && self.results_since_output && self.current >= 1;
+        let sampled = self
+            .sample(boundary, marks.usage.as_ref())
+            .inspect_err(|_| {
+                self.unrepresentable = true;
+            })?;
         let mut delta = ProgressDelta::default();
         let mut row = None;
-        if marks.model && self.results_since_output && self.current >= 1 {
+        if boundary {
             // A step boundary: the step ends now and the next starts.
             let now = self.clock.unix_ms(marks.at);
+            let step = self.step_tokens();
             row = Some(StepRow {
                 step: self.current,
                 started_ms: self.started_ms,
                 ended_ms: now,
-                tokens: self.step_tokens(),
+                tokens: step,
             });
-            self.tokens = match (self.tokens, self.step_tokens()) {
-                (total, None) => total,
-                (total, Some(step)) => Some(total.unwrap_or(0).saturating_add(step)),
-            };
+            self.tokens = self.completed_after(boundary);
             self.current = self.current.saturating_add(1);
             self.started_ms = now;
             self.results_since_output = false;
@@ -188,19 +209,74 @@ impl StepTracker {
                 delta.ended.push(index);
             }
         }
-        if let Some((key, total)) = &marks.usage {
-            if let Some(entry) = self.usage.iter_mut().find(|(known, _)| known == key) {
-                entry.1 = *total;
-            } else if self.usage.len() < USAGE_KEYS {
-                self.usage.push((key.clone(), *total));
-            } else {
-                self.folded = self.folded.saturating_add(*total);
-            }
+        if let Some((usage, folded)) = sampled {
+            self.usage = usage;
+            self.folded = folded;
         }
         delta.current_step = self.current;
         delta.overflow = self.overflow;
         delta.tokens = self.tokens;
-        Folded { delta, row }
+        Ok(Folded { delta, row })
+    }
+
+    /// The step's usage once `sample` applies (after the boundary, if
+    /// any), checked so the step's sum and the turn's stay within
+    /// [`TOKENS_MAX`]; `None` without a sample.
+    fn sample(
+        &self,
+        boundary: bool,
+        sample: Option<&(Option<String>, u64)>,
+    ) -> Result<Option<(Samples, u64)>, Unrepresentable> {
+        let Some((key, total)) = sample else {
+            return Ok(None);
+        };
+        let (mut usage, mut folded) = if boundary {
+            (Vec::new(), 0)
+        } else {
+            (self.usage.clone(), self.folded)
+        };
+        if let Some(entry) = usage.iter_mut().find(|(known, _)| known == key) {
+            entry.1 = *total;
+        } else if usage.len() < USAGE_KEYS {
+            usage.push((key.clone(), *total));
+        } else {
+            folded = folded.checked_add(*total).ok_or(Unrepresentable)?;
+        }
+        let step = usage
+            .iter()
+            .try_fold(folded, |sum, (_, total)| sum.checked_add(*total))
+            .ok_or(Unrepresentable)?;
+        let turn = self
+            .completed_after(boundary)
+            .unwrap_or(0)
+            .checked_add(step)
+            .ok_or(Unrepresentable)?;
+        if turn > TOKENS_MAX {
+            return Err(Unrepresentable);
+        }
+        Ok(Some((usage, folded)))
+    }
+
+    /// Tokens of completed steps once a boundary, if `boundary`, ends the
+    /// open step. Every accepted fold kept the turn's sum within
+    /// [`TOKENS_MAX`], so this cannot overflow.
+    fn completed_after(&self, boundary: bool) -> Option<u64> {
+        match (self.tokens, boundary.then(|| self.step_tokens()).flatten()) {
+            (total, None) => total,
+            (total, Some(step)) => Some(total.unwrap_or(0).saturating_add(step)),
+        }
+    }
+
+    /// The turn's tokens for the envelope (C1 §5 `usage`): completed steps
+    /// and the open one, `None` without a sample.
+    pub(super) fn turn_tokens(&self) -> Option<u64> {
+        self.completed_after(true)
+    }
+
+    /// Whether an item was refused as [`Unrepresentable`]: the turn fails
+    /// `protocol`.
+    pub(super) fn unrepresentable(&self) -> bool {
+        self.unrepresentable
     }
 
     /// The step's tokens: the sum over its keys, `None` without a sample.
@@ -340,7 +416,7 @@ mod tests {
     ) -> Vec<u32> {
         let mut rows = Vec::new();
         for item in items {
-            let folded = tracker.fold(item);
+            let folded = tracker.fold(item).unwrap();
             progress.apply(&folded.delta);
             rows.extend(folded.row.map(|row| row.step));
         }
@@ -424,5 +500,37 @@ mod tests {
         assert_eq!(rows, [1]);
         assert_eq!(progress.tokens, Some(142));
         assert_eq!(tracker.terminal_rows().last().unwrap().tokens, None);
+        run(&mut tracker, &mut progress, &[usage(None, 8)]);
+        // The envelope's total: completed steps and the open one.
+        assert_eq!(tracker.turn_tokens(), Some(150));
+    }
+
+    /// Review r1: a sample above `i64::MAX`, or a step or turn sum past it,
+    /// is refused before any row is built and leaves the tracker as it was.
+    #[tokio::test]
+    async fn unrepresentable_tokens_are_refused_before_any_row() {
+        let (mut tracker, _) = fresh();
+        let max = u64::try_from(i64::MAX).unwrap();
+        assert!(tracker.fold(&usage(None, max + 1)).is_err());
+        assert!(tracker.unrepresentable());
+        assert_eq!(tracker.step_tokens(), None);
+        assert!(tracker.fold(&usage(None, max)).is_ok());
+        // A second key would take the step's sum past `i64::MAX`.
+        assert!(tracker.fold(&usage(Some("m"), 1)).is_err());
+        assert_eq!(tracker.step_tokens(), Some(max));
+        assert!(tracker.fold(&marks(false, &[], &["x"])).is_ok());
+        // Output after results with a sample: step 2's sample would take
+        // the turn past `i64::MAX`, so step 1's row is not built.
+        let over = ProgressMarks {
+            model: true,
+            usage: Some((None, 1)),
+            ..marks(false, &[], &[])
+        };
+        assert!(tracker.fold(&over).is_err());
+        assert_eq!(tracker.current, 1);
+        assert_eq!(tracker.turn_tokens(), Some(max));
+        // Without the sample the boundary still folds.
+        assert!(tracker.fold(&marks(true, &[], &[])).unwrap().row.is_some());
+        assert_eq!(tracker.turn_tokens(), Some(max));
     }
 }

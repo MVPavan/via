@@ -255,6 +255,9 @@ pub enum StopCause {
     IdleDeadline,
     /// The turn's own Store write failed (design §7.2 row 5).
     Store,
+    /// Core refused the vendor's evidence as unrepresentable (a token
+    /// count past `i64::MAX`): the turn fails `protocol`.
+    Protocol,
 }
 
 /// A stop order for one submitted turn (design §2). Core owns the cause and

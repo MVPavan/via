@@ -23,7 +23,7 @@ use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, rfc3339};
+use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
 use crate::{ApiError, Cleanup, Deadline, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
@@ -481,6 +481,8 @@ impl Engine {
             timestamps,
             None,
             (queued_seq, seq),
+            // The crashed daemon's samples are gone with it.
+            Usage::UNAVAILABLE,
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(

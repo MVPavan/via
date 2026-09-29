@@ -744,7 +744,8 @@ fn s1_c1_status_progress_only_for_the_selected_turn() -> TestResult {
 // ------------------------------------------------------------- tokens
 
 /// Design §2.4, §13.2: two keyless usage samples in one step supersede;
-/// steps add; `tokens.scope` is the fake's declared `usage.tokens`.
+/// steps add; `tokens.scope` is the fake's declared `usage.tokens`, `turn`.
+/// The envelope's `usage` reports the turn's total, the sum of its rows.
 #[test]
 fn s1_progress_tokens_sum_per_step_and_label_scope() -> TestResult {
     let mut steps = vec![accepted(1)];
@@ -765,7 +766,7 @@ fn s1_progress_tokens_sum_per_step_and_label_scope() -> TestResult {
                 .unwrap_or_default()
                 .to_owned();
             let scope = receipt["capabilities"]["usage"]["tokens"].clone();
-            check(scope.is_string(), || format!("receipt: {receipt}"))?;
+            check(scope == "turn", || format!("receipt: {receipt}"))?;
             setup.sandbox.await_gate("hold")?;
             let status = setup.status_until(evidence, &session, &[], "step 3", |status| {
                 page_steps(status) == [1, 2]
@@ -778,15 +779,74 @@ fn s1_progress_tokens_sum_per_step_and_label_scope() -> TestResult {
                 || format!("tokens: {status}"),
             )?;
             setup.sandbox.release_gate("hold")?;
-            setup.wait(evidence, &format!("{session}/1"))?;
+            let envelope = setup.wait(evidence, &format!("{session}/1"))?;
+            let rows = setup.rows(&session, 1)?;
+            check(rows == [(1, Some(120)), (2, Some(50)), (3, None)], || {
+                format!("rows: {rows:?}")
+            })?;
+            let sum: i64 = rows.iter().filter_map(|(_, tokens)| *tokens).sum();
             check(
-                setup.rows(&session, 1)? == [(1, Some(120)), (2, Some(50)), (3, None)],
-                || "rows".to_owned(),
+                envelope["usage"]
+                    == json!({"input_tokens":null,"cached_input_tokens":null,
+                        "output_tokens":null,"reasoning_output_tokens":null,
+                        "total_tokens":sum,"scope":"turn","provenance":"reported"}),
+                || format!("usage: {envelope}"),
             )
         },
         |evidence| setup.collect(evidence),
     );
     report.require_pass()
+}
+
+/// Review r1: a token count Store cannot hold fails the turn `protocol`
+/// before any row is built, and `turn.ended` commits: a sample of 2^63,
+/// and a sample that takes the turn's sum past `i64::MAX`. The vendor
+/// hangs, so Core's stop ends the turn.
+#[test]
+fn s1_progress_unrepresentable_tokens_fail_protocol() -> TestResult {
+    let max = u64::try_from(i64::MAX)?;
+    let hang = json!({"action":"hang"});
+    let mut sample = vec![accepted(1)];
+    sample.extend(emits(&[text(1), usage(1, max + 1)]));
+    sample.push(hang.clone());
+    let mut sum = vec![accepted(1)];
+    sum.extend(emits(&[text(1), usage(1, max)]));
+    sum.extend(tool_round(1, "a", "shell"));
+    sum.extend(emits(&[text(1), usage(1, 1)]));
+    sum.push(hang);
+    for (name, steps, rows) in [
+        ("sample", sample, vec![(1, None)]),
+        ("sum", sum, vec![(1, Some(i64::MAX)), (2, None)]),
+    ] {
+        let setup = Setup::new(&script(1, name, &steps))?;
+        let evidence = setup.evidence(&format!("s1_progress_unrepresentable_{name}"))?;
+        let report = run_scenario(
+            evidence,
+            |evidence| {
+                let _daemon = setup.start(evidence)?;
+                let receipt = setup.spawn(evidence, name)?;
+                let session = receipt["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let envelope = setup.wait(evidence, &format!("{session}/1"))?;
+                check(
+                    envelope["state"] == "failed" && envelope["failure"]["class"] == "protocol",
+                    || format!("{name}: {envelope}"),
+                )?;
+                let types = setup.event_types(evidence, &session)?;
+                check(
+                    types.last().is_some_and(|last| last == "turn.ended"),
+                    || format!("{name}: {types:?}"),
+                )?;
+                let committed = setup.rows(&session, 1)?;
+                check(committed == rows, || format!("{name} rows: {committed:?}"))
+            },
+            |evidence| setup.collect(evidence),
+        );
+        report.require_pass()?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------- tool bounds

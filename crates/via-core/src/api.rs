@@ -984,8 +984,9 @@ pub(crate) struct UsageSupport {
 }
 
 /// The fake route's declared `capabilities.usage.tokens`, which labels
-/// `status` `progress.tokens` (Task 4 design §2.4).
-pub(crate) const FAKE_TOKEN_SCOPE: &str = "unavailable";
+/// `status` `progress.tokens` (Task 4 design §2.4) and the envelope's
+/// `usage`: its samples are exact per turn by construction (§2.5).
+pub(crate) const FAKE_TOKEN_SCOPE: &str = "turn";
 
 /// C1 §4.1 capabilities, stating only what this build actually does.
 #[derive(Serialize)]
@@ -1203,7 +1204,8 @@ pub(crate) struct Failure {
     pub(crate) retryable: bool,
 }
 
-/// C1 §5 `usage`: every count `null` while provenance is `unavailable`.
+/// C1 §5 `usage`: every count `null` while provenance is `unavailable`;
+/// a route that reports only a total fills `total_tokens`.
 #[derive(Serialize)]
 pub(crate) struct Usage {
     input_tokens: Option<u64>,
@@ -1225,6 +1227,20 @@ impl Usage {
         scope: "turn",
         provenance: "unavailable",
     };
+
+    /// The fake route's figure: the turn's summed samples under its declared
+    /// scope, reported; unavailable without a sample.
+    pub(crate) fn fake(total: Option<u64>) -> Self {
+        match total {
+            Some(total) => Self {
+                total_tokens: Some(total),
+                scope: FAKE_TOKEN_SCOPE,
+                provenance: "reported",
+                ..Self::UNAVAILABLE
+            },
+            None => Self::UNAVAILABLE,
+        }
+    }
 }
 
 #[derive(Serialize)]

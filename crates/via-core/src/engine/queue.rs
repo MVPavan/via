@@ -112,13 +112,16 @@ impl TurnStop {
     }
 
     /// Attaches `order`, or coalesces it into the one already attached: the
-    /// first `requested_at` and cause stay, a `store` cause overrides, and
+    /// first `requested_at` and cause stay, a `store` cause overrides, a
+    /// `protocol` cause overrides any but `store`, and
     /// the earlier `force_at` and `close_by` win (design §2).
     fn attach(&self, order: StopOrder) {
         self.order.send_modify(|current| match current {
             Some(existing) => {
-                if order.cause == StopCause::Store {
-                    existing.cause = StopCause::Store;
+                if order.cause == StopCause::Store
+                    || (order.cause == StopCause::Protocol && existing.cause != StopCause::Store)
+                {
+                    existing.cause = order.cause;
                 }
                 if order.force_at.instant() < existing.force_at.instant() {
                     existing.force_at = order.force_at;
@@ -147,6 +150,8 @@ pub(super) enum StopSpec {
     Idle,
     /// The turn's own write did not commit (design §7.2 row 5).
     Store,
+    /// Core refused the vendor's evidence (review r1): stops as `Store`.
+    Protocol,
 }
 
 impl StopSpec {
@@ -172,10 +177,15 @@ impl StopSpec {
                     force_at + CLOSE_ALLOWANCE,
                 )
             }
-            Self::Store => {
+            Self::Store | Self::Protocol => {
                 let close_by = now + CLOSE_ALLOWANCE;
                 let close_by = wall.map_or(close_by, |wall| close_by.min(wall + CLOSE_ALLOWANCE));
-                (StopCause::Store, now, close_by.max(now))
+                let cause = if matches!(self, Self::Store) {
+                    StopCause::Store
+                } else {
+                    StopCause::Protocol
+                };
+                (cause, now, close_by.max(now))
             }
             Self::Close { mode, deadline } => {
                 let force_at = match mode {
@@ -560,6 +570,16 @@ impl Slot {
     /// slot state, like every other attach [s2-r1.1]. Wakes: an order
     /// attached.
     pub(super) fn store_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
+        self.failure_order(turn, now, StopSpec::Store);
+    }
+
+    /// As [`Self::store_order`], with cause `protocol`: Core refused the
+    /// turn's vendor evidence (review r1).
+    pub(super) fn protocol_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
+        self.failure_order(turn, now, StopSpec::Protocol);
+    }
+
+    fn failure_order(&self, turn: TurnNumber, now: tokio::time::Instant, spec: StopSpec) {
         let issued = {
             let state = lock(&self.state);
             match state
@@ -569,11 +589,9 @@ impl Slot {
             {
                 Some(running) => {
                     let requested_at = rfc3339(std::time::SystemTime::now());
-                    running.stop.attach(StopSpec::Store.order(
-                        requested_at,
-                        now,
-                        Some(running.wall),
-                    ));
+                    running
+                        .stop
+                        .attach(spec.order(requested_at, now, Some(running.wall)));
                     true
                 }
                 None => false,

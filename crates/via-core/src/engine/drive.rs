@@ -26,7 +26,7 @@ use super::terminal::{dispose, terminal_envelope};
 use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
-use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, rfc3339};
+use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -119,6 +119,9 @@ struct Control<'a> {
     /// The turn's first failed write sent or upgraded its order to cause
     /// `store` (design §7.2 row 5).
     stored: bool,
+    /// An unrepresentable token count sent or upgraded its order to cause
+    /// `protocol` (review r1).
+    refused: bool,
     /// When the idle deadline strikes; disarmed once any order exists.
     idle_at: Option<tokio::time::Instant>,
     /// The turn's frozen idle budget.
@@ -617,6 +620,7 @@ impl Engine {
             orders,
             observed: false,
             stored: false,
+            refused: false,
             idle_at: Some(origin + effective.idle()),
             idle: effective.idle(),
         };
@@ -670,6 +674,10 @@ impl Engine {
                 self.settle(&mut record, requested_at, outcome, cleanup)
                     .await,
             );
+        }
+        if record.steps.unrepresentable() {
+            // Refused after `execute` returned, when no order could reach it.
+            terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
         }
         if record.first_failure.is_some() {
             // Acceptance or an observation could not be recorded after dispatch.
@@ -1342,6 +1350,7 @@ impl Engine {
             orders,
             observed: false,
             stored: false,
+            refused: false,
             idle_at: None,
             idle: Duration::ZERO,
         };
@@ -1411,7 +1420,11 @@ impl Engine {
             FakeObservation::Data {
                 observation: Observation::Progress(marks),
             } => {
-                let folded = record.steps.fold(&marks);
+                // A refused item changes nothing; the run loop stops the
+                // turn `protocol` (review r1).
+                let Ok(folded) = record.steps.fold(&marks) else {
+                    return;
+                };
                 if let Some(row) = folded.row {
                     // Design §3.2: a boundary publishes the new step first,
                     // then commits the ended step's row.
@@ -1684,6 +1697,7 @@ pub(super) fn ended_record(
     // Design §3.2: every terminal built from the record carries the rows it
     // could not commit and the open step's.
     let steps = record.steps.terminal_rows();
+    let usage = Usage::fake(record.steps.turn_tokens());
     let event = Event {
         seq,
         session_id: &started.session,
@@ -1718,6 +1732,7 @@ pub(super) fn ended_record(
         timestamps,
         duration_ms,
         (started.first_seq, seq),
+        usage,
     );
     let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
     Ok(TerminalRecord {
@@ -1732,8 +1747,16 @@ pub(super) fn ended_record(
 /// Design §7.2 row 5: the turn's first write that did not commit stops it
 /// with cause `store`, once; later events are dropped and its terminal is
 /// the resolution write. An uncertain one latches instead, and the latch's
-/// force stops the turn.
+/// force stops the turn. A token count the tracker refused stops it with
+/// cause `protocol`, once (review r1).
 fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
+    if !control.refused && record.steps.unrepresentable() {
+        // Review r1: the vendor reported a token count Store cannot hold.
+        control.refused = true;
+        control
+            .slot
+            .protocol_order(control.turn, tokio::time::Instant::now());
+    }
     if !control.stored
         && record
             .first_failure

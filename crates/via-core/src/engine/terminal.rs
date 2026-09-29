@@ -31,6 +31,7 @@ pub(super) fn terminal_envelope(
     timestamps: Timestamps,
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
+    usage: Usage,
 ) -> Envelope {
     let plan = RoutePlan::fake();
     let mut warnings = plan.warnings();
@@ -72,7 +73,7 @@ pub(super) fn terminal_envelope(
         denied_actions: [],
         auto_declined_requests: [],
         steps: None,
-        usage: Usage::UNAVAILABLE,
+        usage,
         cost: Cost::UNAVAILABLE,
         timestamps,
         duration_ms,
@@ -154,7 +155,7 @@ pub(super) fn dispose(
     let requested = match cause {
         StopCause::Cancel => Some(CancelCause::Cancel),
         StopCause::Close => Some(CancelCause::Close),
-        StopCause::IdleDeadline | StopCause::Store => None,
+        StopCause::IdleDeadline | StopCause::Store | StopCause::Protocol => None,
     };
     match outcome {
         Ok(evidence) => {
@@ -164,6 +165,10 @@ pub(super) fn dispose(
             let stop = match (interrupted, cause) {
                 (_, StopCause::Store) => {
                     terminal.fail(FailureClass::Store, STORE_STOP);
+                    ("requested", cleanup)
+                }
+                (_, StopCause::Protocol) => {
+                    terminal.fail(FailureClass::Protocol, TOKENS_STOP);
                     ("requested", cleanup)
                 }
                 (true, StopCause::Cancel | StopCause::Close) => {
@@ -197,6 +202,10 @@ pub(super) fn dispose(
 
 /// Message of a turn stopped because its own Store write failed.
 const STORE_STOP: &str = "a turn event could not be recorded";
+
+/// Message of a turn whose vendor reported a token count past `i64::MAX`
+/// (review r1).
+pub(super) const TOKENS_STOP: &str = "the vendor reported a token count that cannot be represented";
 
 /// C1 §3.5 cleanup word.
 fn cleanup_word(quiescent: bool) -> &'static str {
@@ -247,8 +256,12 @@ fn stopped(
     let launched = route.launched;
     let forced = route.forced;
     let mut terminal = failed_terminal(AdapterError::Route(route));
-    if cause == StopCause::Store {
-        terminal.fail(FailureClass::Store, STORE_STOP);
+    if matches!(cause, StopCause::Store | StopCause::Protocol) {
+        if cause == StopCause::Store {
+            terminal.fail(FailureClass::Store, STORE_STOP);
+        } else {
+            terminal.fail(FailureClass::Protocol, TOKENS_STOP);
+        }
         return Disposed {
             terminal,
             stop: Some((outcome, cleanup)),
@@ -273,7 +286,7 @@ fn stopped(
                 cancel_cause: None,
             }
         }
-        StopCause::Cancel | StopCause::Close | StopCause::Store => {
+        StopCause::Cancel | StopCause::Close | StopCause::Store | StopCause::Protocol => {
             terminal.failure = None;
             let stop = if !launched {
                 // Nothing launched: stopped before the vendor could act.

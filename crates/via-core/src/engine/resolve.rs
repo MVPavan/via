@@ -23,7 +23,7 @@ use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::Slot;
 use super::terminal::terminal_envelope;
 use super::{Engine, FailureNote, Terminal, TurnRecord, failure};
-use crate::api::{Event, EventBody, FailureClass, Timestamps, rfc3339};
+use crate::api::{Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
 use crate::{SessionId, TurnNumber};
 
 /// The failure message of a turn whose frozen row cannot be parsed.
@@ -408,6 +408,7 @@ pub(super) async fn commit_submit_failed(
         timestamps,
         None,
         (queueing.queued_seq, ended_seq),
+        Usage::UNAVAILABLE,
     );
     let envelope = serde_json::to_value(&envelope).map_err(|_| SubmitFailed::Encode)?;
     let committed = store
