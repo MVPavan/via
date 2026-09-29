@@ -92,6 +92,7 @@ impl WireRuntime {
         let mut summary = summarize_shutdown(self.host.shutdown(deadline, turns).await);
         self.stragglers.join_until(deadline).await;
         summary.pending_tasks += self.stragglers.pending();
+        summary.failed_tasks += self.stragglers.failed();
         summary
     }
 
@@ -433,9 +434,11 @@ pub struct WireShutdown {
     pub anchors: usize,
     /// Reconciled anchors without positive absence proof.
     pub uncertain_anchors: usize,
-    /// Host-owned child/status tasks not joined by the bounded deadline.
+    /// Host-owned child/status tasks and connection tasks not joined by the
+    /// bounded deadline.
     pub pending_tasks: usize,
-    /// Host-owned tasks that panicked, were cancelled or failed their child wait.
+    /// Host-owned tasks that panicked, were cancelled or failed their child
+    /// wait, and connection tasks that panicked.
     pub failed_tasks: usize,
     /// Bounded description of the deadline, Store or recovery failure, if any.
     pub failure: Option<String>,

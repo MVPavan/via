@@ -497,3 +497,54 @@ async fn s1_wire_burst_of_1040_lines_reaches_a_live_consumer()
     assert_eq!(fallback_drops(), 0);
     Ok(())
 }
+
+/// A stdout whose first read panics: a connection task that fails.
+struct Panicking;
+
+impl AsyncRead for Panicking {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        panic!("injected reader panic");
+    }
+}
+
+/// Design §8.6, coding style §5 (T4-3 review r1): a `finish` cancelled
+/// while it drains still hands its tasks to the runtime, through the `Drop`
+/// fallback; and a connection task that panics is counted as a failed join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn s1_wire_cancelled_finish_hands_off_and_panics_are_counted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = Scratch::new("cancelled-finish")?;
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(Blocking(Some(blocked)), stdin, folder.0.clone());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The drain waits for the stuck reader; the caller gives up first.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        messages.finish(after(Duration::from_secs(10))),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "finish ended while its reader was stuck"
+    );
+    assert_eq!(fallback_drops(), 1, "the cancelled finish took no fallback");
+    assert_eq!(input.stragglers(), 1, "the stuck reader has no owner");
+    release.send(())?;
+    input.join_stragglers(after(Duration::from_secs(5))).await;
+    assert_eq!(input.stragglers(), 0);
+    assert_eq!(input.failed_joins(), 0);
+
+    // A reader that panics: `finish` joins it and counts the failure.
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(Panicking, stdin, folder.0.clone());
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    assert_eq!(input.failed_joins(), 1);
+    assert_eq!(fallback_drops(), 1);
+    Ok(())
+}

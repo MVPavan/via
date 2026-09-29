@@ -461,18 +461,24 @@ impl WireMessages {
     /// `deadline − 250 ms`; then set the stop signal, abort, and join until
     /// `deadline`. A task still unjoined moves to the runtime, which joins
     /// it as it ends and reports it at shutdown.
+    /// A `finish` cancelled before its handoff leaves `finished` unset, so
+    /// `Drop` hands the tasks over instead.
     pub async fn finish(mut self, deadline: Deadline) {
-        self.finished = true;
         self.shared.request_close(&self.control);
         let drain_by = deadline
             .instant()
             .checked_sub(FINISH_JOIN)
             .unwrap_or_else(|| deadline.instant());
-        let _drained = timeout_at(drain_by, join_all(&mut self.tasks)).await;
+        let _drained = timeout_at(drain_by, self.stragglers.join_all(&mut self.tasks)).await;
         self.stop.send_replace(true);
         self.tasks.abort_all();
-        let _joined = timeout_at(deadline.instant(), join_all(&mut self.tasks)).await;
+        let _joined = timeout_at(
+            deadline.instant(),
+            self.stragglers.join_all(&mut self.tasks),
+        )
+        .await;
         self.stragglers.adopt(std::mem::take(&mut self.tasks));
+        self.finished = true;
     }
 }
 
@@ -507,52 +513,73 @@ pub fn fallback_drops() -> usize {
 
 /// Connection tasks that missed their owner's join bound (design §8.6,
 /// coding style §5): the runtime keeps them, joins them as they end and
-/// reports the rest at shutdown.
+/// reports the rest at shutdown. It also counts connection tasks whose join
+/// reported a panic; a task aborted by its owner's bound is the designed
+/// end, not a failure.
 #[derive(Clone, Default)]
-pub(crate) struct Stragglers(Arc<StdMutex<Vec<JoinSet<()>>>>);
+pub(crate) struct Stragglers {
+    sets: Arc<StdMutex<Vec<JoinSet<()>>>>,
+    failed: Arc<AtomicUsize>,
+}
 
 impl Stragglers {
     pub(crate) fn adopt(&self, tasks: JoinSet<()>) {
-        let mut sets = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sets = self.sets.lock().unwrap_or_else(PoisonError::into_inner);
         if !tasks.is_empty() {
             sets.push(tasks);
         }
-        reap(&mut sets);
+        self.reap(&mut sets);
     }
 
     /// Tasks not yet ended.
     pub(crate) fn pending(&self) -> usize {
-        let mut sets = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        reap(&mut sets);
+        let mut sets = self.sets.lock().unwrap_or_else(PoisonError::into_inner);
+        self.reap(&mut sets);
         sets.iter().map(JoinSet::len).sum()
+    }
+
+    /// Connection tasks whose join reported a panic.
+    pub(crate) fn failed(&self) -> usize {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// Joins every task that ends by `deadline`.
     pub(crate) async fn join_until(&self, deadline: Deadline) {
-        let sets = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        let sets = std::mem::take(&mut *self.sets.lock().unwrap_or_else(PoisonError::into_inner));
         let mut left = Vec::new();
         for mut set in sets {
-            let _joined = timeout_at(deadline.instant(), join_all(&mut set)).await;
+            let _joined = timeout_at(deadline.instant(), self.join_all(&mut set)).await;
             if !set.is_empty() {
                 left.push(set);
             }
         }
-        self.0
+        self.sets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(left);
     }
-}
 
-fn reap(sets: &mut Vec<JoinSet<()>>) {
-    for set in sets.iter_mut() {
-        while set.try_join_next().is_some() {}
+    /// Joins `tasks` until none is left, counting panics.
+    async fn join_all(&self, tasks: &mut JoinSet<()>) {
+        while let Some(joined) = tasks.join_next().await {
+            self.record(joined);
+        }
     }
-    sets.retain(|set| !set.is_empty());
-}
 
-async fn join_all(tasks: &mut JoinSet<()>) {
-    while tasks.join_next().await.is_some() {}
+    fn reap(&self, sets: &mut Vec<JoinSet<()>>) {
+        for set in sets.iter_mut() {
+            while let Some(joined) = set.try_join_next() {
+                self.record(joined);
+            }
+        }
+        sets.retain(|set| !set.is_empty());
+    }
+
+    fn record(&self, joined: Result<(), tokio::task::JoinError>) {
+        if joined.is_err_and(|error| error.is_panic()) {
+            self.failed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Both halves of an open connection (design §8.1).
@@ -1063,6 +1090,11 @@ pub mod testing {
         /// Tasks handed to the runtime and not yet ended.
         pub fn stragglers(&self) -> usize {
             self.stragglers.pending()
+        }
+
+        /// Connection tasks whose join reported a panic.
+        pub fn failed_joins(&self) -> usize {
+            self.stragglers.failed()
         }
 
         /// Joins handed-over tasks that end by `deadline`.
