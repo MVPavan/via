@@ -81,7 +81,8 @@ struct Pipeline {
 ///
 /// The deadline is the one [`Bound`] taken when entry began (design §7.4).
 /// An entry that had not returned by it (`entry.expired`) is never clean:
-/// the fence may be unset, so the pipeline's start drain proves nothing. Idle clients close at once, or when the
+/// the fence may be unset, so the pipeline's start drain proves nothing.
+/// Idle clients close at once, or when the
 /// latch's diagnostic window ends; a client already serving a request (such
 /// as a `wait`) delivers it after the final records commit. Only daemon main
 /// takes the incomplete exit. Unjoined tasks are aborted and reported, a
