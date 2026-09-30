@@ -532,18 +532,42 @@ fn failure_class_process_exited_after_acceptance() -> TestResult {
     })
 }
 
+/// S1-runtime2 fix round 2 (C1 §7.6 row 3, §7.5): a decoded `completed`
+/// terminal is `completed` even when the vendor then exits 5; the exit
+/// stays independent evidence (runtime §11.2 checks the fake's exit
+/// separately).
 #[test]
-fn failure_class_process_exited_after_completed_terminal() -> TestResult {
+fn a_completed_terminal_then_a_failed_exit_is_completed() -> TestResult {
     evidenced(|| {
-        let (_, envelope, _) = failed_turn(
-            &[
-                emit(ACCEPTED),
-                emit(TERMINAL),
-                json!({"action":"exit","code":5}),
-            ],
-            "process_exited",
-        );
+        let sandbox = Sandbox::new(&[
+            emit(ACCEPTED),
+            emit(TERMINAL),
+            json!({"action":"exit","code":5}),
+        ]);
+        let envelope = sandbox.spawn_turn();
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["final_text"], "done", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
         assert_eq!(envelope["exit"]["code"], 5, "{envelope}");
+        Ok(())
+    })
+}
+
+/// S1-runtime2 fix round 2 (C1 §7.6 row 3, design §2 rule 3 [r1.23]): a
+/// vendor that reports `completed` with `"done"` and then lives past the
+/// wall deadline is force-closed by Route's late path; the turn stays
+/// `completed` with its final text, and the forced exit (a signal) stays
+/// evidence, never `failed(process_exited)`.
+#[test]
+fn a_completed_terminal_whose_vendor_outlives_the_wall_is_completed() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&[emit(ACCEPTED), emit(TERMINAL), json!({"action":"hang"})]);
+        let session = sandbox.spawn_background(&["--wall-ms", "2000"]);
+        let envelope = sandbox.await_result(&session, Duration::from_secs(30));
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["final_text"], "done", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
+        assert!(envelope["exit"]["signal"].is_u64(), "{envelope}");
         Ok(())
     })
 }

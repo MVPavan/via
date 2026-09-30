@@ -20,7 +20,7 @@ use via_store::{
     TerminalExtras, TerminalFacts, TerminalRecord,
 };
 
-use super::latch::{FailureSite, WriteOutcome};
+use super::latch::{FailureSite, Signal, WriteOutcome};
 use super::{Accepted, FailureNote, TurnRecord, lock};
 use crate::api::{Event, EventBody, ReceiptOutcome, rfc3339};
 use crate::{ApiError, SessionId, TurnNumber, TurnState};
@@ -469,30 +469,42 @@ pub(super) async fn reconcile(
     }
 }
 
-/// A terminal record that is durable. `uncertain` when Store reported an
-/// unknown outcome and only the read-back found it: the commit itself was
-/// uncertain, which latches Store failure (runtime §7), while the committed
-/// result stays readable. `closed` when a requested `session.closed` is known
+/// A terminal record that is durable. `uncertain` carries the commit's typed
+/// outcome (`Uncertain` or `Corrupt`) when Store reported a failure that may
+/// have written and only the read-back found it: the commit itself failed,
+/// which latches Store failure (runtime §7), while the committed result
+/// stays readable. `closed` when a requested `session.closed` is known
 /// written; Store refuses it while another turn of the session is unfinished.
 /// `retried` when the first attempt was not committed and the one
 /// same-sequence retry committed (design §7.2 rows 7 and 9).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Durable {
-    pub(super) uncertain: bool,
+    pub(super) uncertain: Option<WriteOutcome>,
     pub(super) closed: bool,
     pub(super) retried: bool,
 }
 
 /// Commits the terminal record (and `closed`, if any, atomically with it); an
 /// uncertain failure is settled by reading back the durable result. A
-/// failure carries its outcome in `commit_outcome` ([`outcome_of`]).
+/// failure carries the typed outcome the failure hook classifies.
 pub(super) async fn commit_terminal(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
-) -> Result<Durable, ApiError> {
-    commit_terminal_with(journal, record, closed, TerminalExtras::default(), false).await
+) -> Result<Durable, Unended> {
+    commit_terminal_with(
+        journal,
+        record,
+        closed,
+        TerminalExtras::default(),
+        (false, None),
+    )
+    .await
 }
+
+/// Bound on the read-back that settles a terminal commit that may have
+/// written (runtime §7: no outcome resolution within 2 s leaves it unknown).
+const READ_BACK: Duration = Duration::from_secs(2);
 
 /// [`commit_terminal`] with the terminal's `extras` (design §4, §10). A
 /// cancellation's cause never rides with a force closure: the two are
@@ -504,17 +516,23 @@ pub(super) async fn commit_terminal(
 /// attempts, so no other writer takes the sequence in between; test builds
 /// can pause before the retry at `core.retry.before`. The retry is the
 /// resolution write: its failure is returned as the terminal's.
+///
+/// A failure that may have written, or SQLite corruption, latches: with
+/// `latch`, its phase one runs before the read-back (runtime §7), so
+/// admission and dispatch stop at once. The read-back is bounded by
+/// [`READ_BACK`] and keeps a committed result it finds. The commit's typed
+/// outcome is returned either way.
 pub(super) async fn commit_terminal_with(
     journal: &impl TurnJournal,
     record: TerminalRecord,
     closed: Option<Value>,
     extras: TerminalExtras,
-    retry: bool,
-) -> Result<Durable, ApiError> {
+    (retry, latch): (bool, Option<&Signal>),
+) -> Result<Durable, Unended> {
     let (session, turn) = (record.session_id.clone(), record.turn);
     let plain = extras.cancel_cause.is_none();
     if closed.is_some() && !plain {
-        return Err(ApiError::RECEIPT_NOT_COMMITTED);
+        return Err(ApiError::RECEIPT_NOT_COMMITTED.into());
     }
     let again = retry.then(|| {
         (
@@ -537,23 +555,37 @@ pub(super) async fn commit_terminal_with(
         retried = true;
         committed = attempt(journal, record, closed, extras).await;
     }
-    match committed {
-        Ok(closed) => Ok(Durable {
-            uncertain: false,
-            closed,
+    let error = match committed {
+        Ok(closed) => {
+            return Ok(Durable {
+                uncertain: None,
+                closed,
+                retried,
+            });
+        }
+        Err(error) => error,
+    };
+    let outcome = WriteOutcome::of(&error);
+    if outcome == WriteOutcome::NotCommitted {
+        return Err(ApiError::RECEIPT_NOT_COMMITTED.into());
+    }
+    if let Some(latch) = latch {
+        latch.fail_pending();
+    }
+    // Test builds: the latch's phase one ran, the read-back not yet.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_store::failpoint::hit_async("core.terminal.read_back").await;
+    let read = tokio::time::timeout(READ_BACK, journal.terminal_facts(&session, turn)).await;
+    match read {
+        Ok(Ok(Some(_))) => Ok(Durable {
+            uncertain: Some(outcome),
+            closed: false,
             retried,
         }),
-        Err(error) if may_have_committed(&error) || matches!(error, StoreError::Corrupt(_)) => {
-            match journal.terminal_facts(&session, turn).await {
-                Ok(Some(_)) => Ok(Durable {
-                    uncertain: true,
-                    closed: false,
-                    retried,
-                }),
-                Ok(None) | Err(_) => Err(ApiError::RECEIPT_UNKNOWN),
-            }
-        }
-        Err(_) => Err(ApiError::RECEIPT_NOT_COMMITTED),
+        Ok(Ok(None) | Err(_)) | Err(_) => Err(Unended {
+            error: ApiError::RECEIPT_UNKNOWN,
+            outcome,
+        }),
     }
 }
 

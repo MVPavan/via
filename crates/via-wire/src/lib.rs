@@ -111,6 +111,9 @@ pub use runtime::{
 pub use split::{LineSplitter, Pushed};
 pub use via_host::{JournalSite, ReprobeReport};
 pub use via_store::StoreError;
+/// Test builds only: the named failpoint controller, for the layers above.
+#[cfg(feature = "test-failpoints")]
+pub use via_store::failpoint;
 pub use via_store::json_limits;
 
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.

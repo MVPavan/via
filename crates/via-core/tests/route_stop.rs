@@ -370,6 +370,281 @@ fn a_decoded_terminal_survives_wall_expiry_in_finalization() {
     assert_eq!(evidence.cleanup, Cleanup::Quiescent);
 }
 
+/// S1 critic r2 finding 2 (design §2 rule 3 [r1.23], Task 4 design §2.3):
+/// a terminal Route decoded but had not yet handed over when the wall
+/// deadline passed is delivered before the late result returns, so its
+/// final text reaches Core, with the late force close's evidence. See
+/// [`held_terminal`].
+#[test]
+fn a_held_terminal_is_delivered_after_wall_expiry() {
+    let name = "a_held_terminal_is_delivered_after_wall_expiry";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script(false));
+    };
+    let run = held_terminal(&Child::open(&root), true, None);
+    let evidence = run.outcome.unwrap();
+    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
+    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
+    assert_eq!(run.text, "done", "a completed turn lost its final text");
+}
+
+/// S1-runtime2 fix rounds 1 and 2 (design §2 rules 3 and 4): the late
+/// path's delivery is delivery-only. The daemon force, raised once Route
+/// acknowledged the late path with the terminal held
+/// (`routes.late.entered`) and before anything is drained, does not drop
+/// the terminal: its final text reaches Core, and the result is
+/// `ForceStopped` with the late close's evidence, never `Overflow`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_force_during_late_delivery_keeps_the_held_terminal() {
+    let name = "a_force_during_late_delivery_keeps_the_held_terminal";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script(false));
+    };
+    let run = held_terminal(&Child::open(&root), true, Some(Late::Force));
+    assert!(run.late_entered, "the late path was not taken");
+    let failure = route_failure(run.outcome);
+    assert!(
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(
+        failure.cleanup,
+        Some(via_adapters::WireCleanup::Quiescent),
+        "{failure:?}"
+    );
+    assert!(failure.forced, "{failure:?}");
+    assert_eq!(
+        run.text, "done",
+        "the forced late delivery dropped the terminal"
+    );
+}
+
+/// S1-runtime2 fix round 2: the connection latch, set while Route holds
+/// the terminal on the late path, does not drop it either. After Route
+/// acknowledged the late path, the vendor writes a 2 MiB line; its write
+/// returning (`wrote`) proves the reader passed the 1 MiB message bound,
+/// which latches. Only then is the late path released and the channel
+/// drained: the terminal is delivered and returned `completed` with the
+/// late close's evidence.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_latch_during_late_delivery_keeps_the_held_terminal() {
+    let name = "a_latch_during_late_delivery_keeps_the_held_terminal";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script(true));
+    };
+    let run = held_terminal(&Child::open(&root), true, Some(Late::Latch));
+    assert!(run.late_entered, "the late path was not taken");
+    let evidence = run.outcome.unwrap();
+    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
+    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
+    assert_eq!(
+        run.text, "done",
+        "the latched late delivery dropped the terminal"
+    );
+}
+
+/// S1 critic r2 finding 2, S1-runtime2 fix round 2 (design §2 rule 3,
+/// runtime §5.2): a held terminal that cannot reach the hop by the late
+/// path's one absolute deadline is a delivery failure, `Overflow`, never
+/// `Deadline` nor a completion. The force close ran meanwhile under the
+/// same deadline: its evidence is kept. The late path is proven taken by
+/// its acknowledgement (`routes.late.entered`).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_undelivered_held_terminal_is_not_a_completion() {
+    let name = "an_undelivered_held_terminal_is_not_a_completion";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script(false));
+    };
+    let run = held_terminal(&Child::open(&root), false, Some(Late::Release));
+    assert!(run.late_entered, "the late path was not taken");
+    let failure = route_failure(run.outcome);
+    assert!(
+        matches!(failure.cause, RouteError::Overflow { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(
+        failure.cleanup,
+        Some(via_adapters::WireCleanup::Quiescent),
+        "{failure:?}"
+    );
+    assert!(failure.forced, "{failure:?}");
+    assert_eq!(run.text, "");
+}
+
+/// What the test does once Route acknowledges the late path
+/// (`routes.late.entered`, paused), before it releases it.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone, Copy, PartialEq)]
+enum Late {
+    /// Nothing.
+    Release,
+    /// Raises the daemon force.
+    Force,
+    /// Lets the vendor write the line that latches the connection, and
+    /// waits until it was read.
+    Latch,
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+#[derive(Clone, Copy, PartialEq)]
+enum Late {}
+
+/// Acts on the late path's acknowledgement; true once Route may be
+/// released.
+#[cfg(feature = "test-failpoints")]
+fn late_act(
+    child: &Child,
+    forcing: &watch::Sender<Option<tokio::time::Instant>>,
+    late: Late,
+    latch_asked: &mut bool,
+) -> bool {
+    match late {
+        Late::Release => true,
+        Late::Force => {
+            forcing.send_replace(Some(tokio::time::Instant::now()));
+            true
+        }
+        Late::Latch => {
+            if !*latch_asked {
+                *latch_asked = true;
+                fs::write(child.sync("latch"), b"").unwrap();
+            }
+            child.sync("wrote").exists()
+        }
+    }
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+fn late_act(
+    _: &Child,
+    _: &watch::Sender<Option<tokio::time::Instant>>,
+    late: Late,
+    _: &mut bool,
+) -> bool {
+    match late {}
+}
+
+/// The acceptance, 1,025 texts and the terminal, then a live vendor. With
+/// `latch` it first waits for `latch`, then writes a 2 MiB line without a
+/// newline and creates `wrote`.
+fn held_terminal_script(latch: bool) -> String {
+    let latch = if latch {
+        "while [ ! -f \"$VIA_FAKE_SYNC_DIR/latch\" ]; do sleep 0.01; done\n\
+         head -c 2097152 /dev/zero | tr '\\0' x\n\
+         touch \"$VIA_FAKE_SYNC_DIR/wrote\"\n"
+    } else {
+        ""
+    };
+    format!(
+        "read -r start\nprintf '%s\\n' '{ACCEPTED}'\ni=0\n\
+         while [ \"$i\" -lt 1025 ]; do\n\
+         printf '%s\\n' '{{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"text\":\"x\"}}'\n\
+         i=$((i+1))\ndone\n\
+         printf '%s\\n' '{{\"type\":\"terminal\",\"vendor_turn_id\":\"fake-turn-1\",\"status\":\"completed\",\"final_text\":\"done\",\"stop_reason\":\"end_turn\"}}'\n\
+         {latch}exec sleep 60\n"
+    )
+}
+
+/// One [`held_terminal`] run.
+struct HeldRun {
+    outcome: Outcome,
+    /// The final text Core received.
+    text: String,
+    /// Route acknowledged the late path.
+    #[cfg_attr(
+        not(feature = "test-failpoints"),
+        expect(
+            dead_code,
+            reason = "only the failpoint tests take the late path's seam"
+        )
+    )]
+    late_entered: bool,
+}
+
+/// Runs [`held_terminal_script`] under a 3 s wall deadline and drains
+/// nothing before it: the acceptance and 1,023 texts fill Core's 1,024-item
+/// channel, the Adapter's delivery holds the 1,024th text, the hop of one
+/// the 1,025th, and Route holds the terminal. With `late`, Route pauses at
+/// `routes.late.entered`; once it acknowledged, the test acts, releases it
+/// and then drains, if `drain`. Without, it drains from the deadline, if
+/// `drain`.
+fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
+    #[cfg(feature = "test-failpoints")]
+    if late.is_some() {
+        child.arm("routes.late.entered", "pause");
+    }
+    let (sender, mut receiver) = via_adapters::observation_channel();
+    let expiry = tokio::time::Instant::now() + Duration::from_secs(3);
+    let (forcing, forced) = watch::channel(None);
+    let (_order, orders) = watch::channel(None);
+    let points = child.root.join("points");
+    child.runtime.block_on(async {
+        let execute = child.adapter.execute(
+            SessionId::try_from(SESSION).unwrap(),
+            TurnNumber::try_from(1).unwrap(),
+            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
+            sender,
+            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
+            Deadline::at(expiry),
+            forced,
+            orders,
+            Box::new(()),
+        );
+        tokio::pin!(execute);
+        let mut text = String::new();
+        let mut collect = |observation: FakeObservation| {
+            if let FakeObservation::Data {
+                observation: Observation::FinalText(piece),
+            } = observation
+            {
+                text.push_str(&piece);
+            }
+        };
+        let mut draining = false;
+        let mut late_entered = false;
+        // Late path: waiting for Route's acknowledgement, then (latch only)
+        // for the vendor's write.
+        let mut waiting = late;
+        let mut latch_asked = false;
+        let outcome = loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(expiry), if drain && late.is_none() && !draining => {
+                    draining = true;
+                }
+                () = tokio::time::sleep(Duration::from_millis(5)), if waiting.is_some() => {
+                    if !late_entered {
+                        late_entered = points.join("routes.late.entered.1.ack").exists();
+                        if !late_entered {
+                            continue;
+                        }
+                    }
+                    if let Some(late) = waiting
+                        && !late_act(child, &forcing, late, &mut latch_asked)
+                    {
+                        continue;
+                    }
+                    fs::write(points.join("routes.late.entered.1.release"), b"").unwrap();
+                    waiting = None;
+                    draining = drain;
+                }
+                Some(admitted) = receiver.recv(), if draining => collect(admitted.observation),
+                outcome = &mut execute => break outcome,
+            }
+        };
+        while let Ok(admitted) = receiver.try_recv() {
+            collect(admitted.observation);
+        }
+        HeldRun {
+            outcome,
+            text,
+            late_entered,
+        }
+    })
+}
+
 /// Design §7.2 row 3: an anchor intent that is not committed starts no
 /// process; Route reports `Store` with kind `NotCommitted`, not launched and
 /// with no anchor intent.
