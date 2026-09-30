@@ -551,9 +551,11 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     };
     drop(started);
     let served = served.join().map_err(|_| "the serving probe panicked")?;
-    let trace = fs::read_to_string(evidence.dir.join("daemon.trace"))?;
-    let summary = trace
+    // Task 4 design §7.6: the shutdown summary is the child's `via.log` line.
+    let log = fs::read_to_string(state.join("via.log"))?;
+    let summary = log
         .lines()
+        .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find_map(|line| line.get("daemon_shutdown").cloned())
         .unwrap_or(Value::Null);

@@ -181,6 +181,8 @@ impl Engine {
             mut pending,
             content,
         } = self.stage_prompt(source).await?;
+        // Task 4 design §5.3: read before `admission`, applied only to new work.
+        let free = self.free_space().await;
         let receipted = match key
             .map(|key| {
                 retry_identity(raw_params, &hash, content.as_deref())
@@ -189,7 +191,7 @@ impl Engine {
             .transpose()
         {
             Ok(key) => {
-                self.spawn_admitted(params, (prompt, cwd), (hash, key), &mut pending)
+                self.spawn_admitted(params, (prompt, cwd), (hash, key, free), &mut pending)
                     .await
             }
             Err(error) => Err(error),
@@ -204,7 +206,7 @@ impl Engine {
         &self,
         params: SpawnParams,
         (prompt, cwd): (Prompt, String),
-        (hash, key): ([u8; 32], Option<SpawnKey>),
+        (hash, key, free): ([u8; 32], Option<SpawnKey>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
@@ -228,6 +230,8 @@ impl Engine {
                 Err(ApiError::IDEMPOTENCY_CONFLICT)
             };
         }
+        // No key was found: the floor applies to this new work (§5.3).
+        self.floor_admits(free.as_ref())?;
         if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -236,7 +240,11 @@ impl Engine {
         if params.harness != "fake" || !self.adapter.fake_available() {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }
-        if params.model != "fake" || is_empty(&prompt) {
+        // Task 4 design §4.6: the fake offers one model.
+        if params.model != "fake" {
+            return Err(ApiError::UNKNOWN_MODEL);
+        }
+        if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
         let effective = Effective::fake(&params.model, &params.per_turn().fake_overrides()?);
@@ -291,8 +299,13 @@ impl Engine {
             if WriteOutcome::of(&error) == WriteOutcome::NotCommitted {
                 *pending = adopting;
             }
+            // Task 4 design §5.4: refused before `BEGIN`; not a Store failure.
+            if matches!(error, StoreError::WalFull) {
+                return Err(ApiError::WAL_FULL);
+            }
             return Err(self.receipt_failed(&error, &admission));
         }
+        self.session_opened();
         let slot = Slot::new(Head::new(Some(2)));
         lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
         self.receipted(&session, turn, &slot);
@@ -318,6 +331,8 @@ impl Engine {
             mut pending,
             content,
         } = self.stage_prompt(source).await?;
+        // Task 4 design §5.3: read before `admission`, applied only to new work.
+        let free = self.free_space().await;
         let receipted = match key
             .map(|key| {
                 retry_identity(raw_params, &hash, content.as_deref())
@@ -326,7 +341,7 @@ impl Engine {
             .transpose()
         {
             Ok(operation) => {
-                self.resume_admitted(params, prompt, (hash, operation), &mut pending)
+                self.resume_admitted(params, prompt, (hash, operation, free), &mut pending)
                     .await
             }
             Err(error) => Err(error),
@@ -340,7 +355,11 @@ impl Engine {
         &self,
         params: ResumeParams,
         prompt: Prompt,
-        (hash, operation): ([u8; 32], Option<(String, via_store::Identity)>),
+        (hash, operation, free): (
+            [u8; 32],
+            Option<(String, via_store::Identity)>,
+            Option<FreeSpace>,
+        ),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
@@ -383,6 +402,8 @@ impl Engine {
                 Err(ApiError::IDEMPOTENCY_CONFLICT)
             };
         }
+        // No key was found: the floor applies to this new work (§5.3).
+        self.floor_admits(free.as_ref())?;
         // Design §4: a closing session refuses `resume`, from Store's gate
         // or, after an uncertain `Closing`, from memory.
         if snapshot.closed || snapshot.closing || lock(&self.closing).contains(&session) {
@@ -482,6 +503,15 @@ impl Engine {
                 self.retire(&session);
                 return Err(ApiError::SESSION_CLOSED);
             }
+            // Task 4 design §5.4: refused before `BEGIN` at `wal.max`;
+            // nothing was written, and it is not a Store failure.
+            Err(StoreError::WalFull) => {
+                *pending = adopting;
+                drop(head);
+                drop(slot);
+                self.retire(&session);
+                return Err(ApiError::WAL_FULL);
+            }
             Err(error) => {
                 if WriteOutcome::of(&error) == WriteOutcome::NotCommitted {
                     *pending = adopting;
@@ -529,6 +559,10 @@ fn is_empty(prompt: &Prompt) -> bool {
         Prompt::Blob(blob) => blob.is_empty(),
     }
 }
+
+/// A receipt's free-space read (Task 4 design §5.3); `None` with the
+/// floor off.
+type FreeSpace = Result<u64, StoreError>;
 
 /// Design §10.4: the whole prompt-file pass ends within this bound.
 const PROMPT_FILE_PASS: std::time::Duration = std::time::Duration::from_secs(10);

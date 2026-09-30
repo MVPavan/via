@@ -1,11 +1,6 @@
 //! Final shutdown: joins daemon main's owned work and decides the exit.
 
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use serde_json::json;
 use tokio::{
@@ -148,8 +143,9 @@ pub(super) async fn final_shutdown(
         "blob_tasks":blob_tasks,
         "disposition":if clean {"clean"} else {"incomplete"},
     }});
-    // Best-effort bounded diagnostic; the exit status is the authoritative result.
-    let _ = writeln!(io::stderr().lock(), "{summary}");
+    // Best-effort bounded diagnostic; the exit status is the authoritative
+    // result. One `via.log` line (Task 4 design §7.6).
+    super::log::line(format!("{summary}\n").as_bytes());
     if clean { 0 } else { 4 }
 }
 

@@ -4,7 +4,10 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -25,6 +28,9 @@ const SCHEMA_VERSION: i64 = 6;
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
 pub const ENVELOPE_MAX: usize = 1024 * 1024;
+
+/// Bound on one free-space read or data-size walk (Task 4 design §5.3).
+const DISK_STEP: Duration = Duration::from_secs(2);
 
 /// Most events one Store request carries (runtime §8, A30).
 const TRANSACTION_EVENTS: usize = 128;
@@ -95,6 +101,11 @@ pub enum StoreError {
     /// nothing was written, and it is not a Store failure.
     #[error("Store refused: {0}")]
     Refused(&'static str),
+    /// A `spawn` or `resume` receipt refused before `BEGIN` while the WAL
+    /// is at `wal.max` (Task 4 design §5.4): nothing was written, and it is
+    /// not a Store failure.
+    #[error("Store WAL is at its limit: new work is refused")]
+    WalFull,
 }
 
 impl StoreError {
@@ -104,7 +115,7 @@ impl StoreError {
             Self::Write(_) | Self::Constraint(_) | Self::Refused(_) => StoreFailureKind::Write,
             Self::Uncertain(_) | Self::WriterLost => StoreFailureKind::UncertainCommit,
             Self::CorruptEvidence => StoreFailureKind::CorruptEvidence,
-            Self::NotEnqueued => StoreFailureKind::Quota,
+            Self::NotEnqueued | Self::WalFull => StoreFailureKind::Quota,
             Self::Corrupt(_) => StoreFailureKind::Corrupt,
         }
     }
@@ -121,7 +132,8 @@ impl StoreError {
             | Self::Constraint(_)
             | Self::CorruptEvidence
             | Self::NotEnqueued
-            | Self::Refused(_) => CommitOutcome::NotCommitted(self.kind()),
+            | Self::Refused(_)
+            | Self::WalFull => CommitOutcome::NotCommitted(self.kind()),
         }
     }
 }
@@ -762,6 +774,8 @@ impl ReadCorruption {
 pub struct Store {
     client: StoreClient,
     writer_join: Option<JoinHandle<()>>,
+    /// Sessions not closed when the Store opened (Task 4 design §11.2).
+    open_sessions: u64,
     /// Read by the SQLite worker; set once by [`Store::on_read_corruption`].
     read_corruption: ReadCorruption,
     /// Released after `Drop` joined the workers: the last field.
@@ -798,6 +812,10 @@ pub struct StoreClient {
     lane: Lane,
     evidence: EvidenceRoot,
     blobs: Blobs,
+    /// The State directory, whose filesystem the disk floor reads (§5.3).
+    state: Arc<Path>,
+    /// Set by the SQLite thread while the WAL is at `wal.max` (§5.4).
+    wal_full: Arc<AtomicBool>,
 }
 
 /// One request for the SQLite writer.
@@ -1311,6 +1329,16 @@ impl Store {
     /// A lock taken for another State directory is refused before the Store
     /// is read: it excludes no writer here.
     pub fn open_locked(state: &Path, lock: StoreLock) -> Result<Self, StoreError> {
+        Self::open_with_limits(state, lock, WalLimits::default())
+    }
+
+    /// [`Store::open_locked`] with the WAL thresholds of daemon config
+    /// (Task 4 design §5.4, §5.5).
+    pub fn open_with_limits(
+        state: &Path,
+        lock: StoreLock,
+        wal: WalLimits,
+    ) -> Result<Self, StoreError> {
         validate_state(state)?;
         if directory_identity(state)? != lock.state {
             return Err(StoreError::Open(format!(
@@ -1370,14 +1398,25 @@ impl Store {
         .map_err(|error| StoreError::Open(error.to_string()))?;
         fs::set_permissions(&db, fs::Permissions::from_mode(0o600))
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        configure(&mut conn, created)?;
+        configure(&mut conn, created, &wal)?;
+        // Design §11.2: `Sessions.open` is seeded from the sessions not closed.
+        let open_sessions = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE state != 'closed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| StoreError::Open(error.to_string()))?;
+        let wal_full = Arc::new(AtomicBool::new(false));
+        let mut wal = disk::Wal::new(wal, &db, Arc::clone(&wal_full));
+        wal.opened(&conn);
         let lanes = Arc::new(Lanes::default());
         let read_corruption = ReadCorruption::default();
         let observer = read_corruption.clone();
         let (writer_lanes, writer_blobs) = (Arc::clone(&lanes), blobs.clone());
         let writer_join = thread::Builder::new()
             .name("via-store-sqlite".to_owned())
-            .spawn(move || writer_loop(conn, &writer_lanes, &observer, &writer_blobs))
+            .spawn(move || writer_loop(conn, &writer_lanes, &observer, &writer_blobs, wal))
             .map_err(|error| StoreError::Open(error.to_string()))?;
         Ok(Self {
             client: StoreClient {
@@ -1385,8 +1424,11 @@ impl Store {
                 lane: Lane::Internal,
                 evidence: EvidenceRoot::new(state),
                 blobs,
+                state: Arc::from(state),
+                wal_full,
             },
             writer_join: Some(writer_join),
+            open_sessions: u64::try_from(open_sessions).unwrap_or(0),
             read_corruption,
             _lock: lock,
         })
@@ -1399,6 +1441,12 @@ impl Store {
     /// first, when one is already registered.
     pub fn on_read_corruption(&self, observer: impl Fn() + Send + Sync + 'static) -> bool {
         self.read_corruption.0.set(Box::new(observer)).is_ok()
+    }
+
+    /// Sessions whose state was not `closed` when the Store opened (Task 4
+    /// design §11.2): the seed of Core's `Sessions.open` tally.
+    pub fn open_sessions(&self) -> u64 {
+        self.open_sessions
     }
 
     /// Returns a bounded, cloneable client for Core lifecycle operations.
@@ -1504,6 +1552,40 @@ impl StoreClient {
         work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
         self.blobs.tasks.run(work).await
+    }
+
+    /// Whether the WAL is at `wal.max` (Task 4 design §5.4): new work is
+    /// refused, and a queued turn fails `store` at its dispatch.
+    pub fn wal_full(&self) -> bool {
+        self.wal_full.load(Ordering::Acquire)
+    }
+
+    /// The free space of the State directory's filesystem (§5.3), read by
+    /// one owned step on the blocking pool within 2 s.
+    pub async fn free_bytes(&self) -> Result<u64, StoreError> {
+        let state = Arc::clone(&self.state);
+        self.disk_step(move || disk::free_bytes(&state)).await
+    }
+
+    /// The apparent length of VIA's data under the State directory (§5.3),
+    /// one walk by an owned step on the blocking pool within 2 s.
+    pub async fn data_bytes(&self) -> Result<u64, StoreError> {
+        let state = Arc::clone(&self.state);
+        self.disk_step(move || disk::data_bytes(&state)).await
+    }
+
+    /// Runs `work` as an owned blob step (coding-style §5) answered within
+    /// [`DISK_STEP`]; one that overran stays owned until it ends.
+    async fn disk_step<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let deadline = tokio::time::Instant::now() + DISK_STEP;
+        match self.blobs.tasks.run_until(deadline, work).await? {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(StoreError::Write(format!("disk step: {error}"))),
+            None => Err(StoreError::Write("disk step exceeded 2 s".to_owned())),
+        }
     }
 
     /// Copies a caller's prompt file into a new finished blob in one pass
@@ -2183,7 +2265,10 @@ impl ProcessJournal {
 }
 
 mod anchor;
+mod disk;
 mod sql;
+
+pub use disk::{PAGE_BYTES, WalLimits};
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
@@ -2229,6 +2314,8 @@ mod tests {
             lane: Lane::Internal,
             evidence: EvidenceRoot::new(root.path()),
             blobs: Blobs::open(root.path()).expect("blobs"),
+            state: Arc::from(root.path()),
+            wal_full: Arc::default(),
         };
         let latch = client.latch();
         let journal = ProcessJournal {

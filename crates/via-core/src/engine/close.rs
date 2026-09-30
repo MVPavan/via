@@ -407,6 +407,8 @@ impl Engine {
         match committed {
             Ok(ClosedOutcome::Closed(result)) => {
                 head.committed(1);
+                // Task 4 design §11.2: a closed-now answer.
+                self.session_closed();
                 Ok(ClosedOutcome::Closed(result))
             }
             Ok(ClosedOutcome::Unfinished) => Ok(ClosedOutcome::Unfinished),

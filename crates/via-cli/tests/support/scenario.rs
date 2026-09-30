@@ -175,6 +175,17 @@ pub(crate) fn collect_available(
             .backup_store(&store)
             .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
     }
+    // The daemon's own trace after startup (Task 4 design §7.6).
+    for name in ["via.log", "via.log.1"] {
+        let log = state.join(name);
+        if log.is_file() {
+            let bytes = std::fs::read(&log)
+                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+            evidence
+                .write(name, &bytes)
+                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+        }
+    }
     let folders = state.join("evidence");
     if folders.is_dir() {
         evidence
