@@ -459,13 +459,22 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
     // exits without joining it (`main` shuts the runtime down in the
     // background).
     let mut copies = tokio::task::JoinSet::new();
+    // A failed stdin read, recorded before the write side is shut: the
+    // daemon's EOF that ends the stdout copy follows it, so the failure is
+    // seen however the two copies' completions are ordered.
+    let stdin_failed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let failed = std::sync::Arc::clone(&stdin_failed);
     copies.spawn_blocking(move || {
-        let read = copy_stdin(&mut to_daemon);
+        if let Err(error) = copy_stdin(&mut to_daemon) {
+            *failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        }
         // EOF or a failed read: the daemon sees the end of the requests,
         // so its side ends too. Safe to ignore: a daemon that already
         // closed the connection has nothing to shut.
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
-        Copied::Stdin(read)
+        Copied::Stdin
     });
     copies.spawn_blocking(move || {
         let mut stdout = io::stdout().lock();
@@ -475,16 +484,18 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
     // The daemon's side ending ends the proxy, whatever stdin is doing: at
     // once when writing stdout failed; a failed stdin read is reported
     // once the replies are forwarded.
-    let mut stdin_failed = None;
     while let Some(copied) = copies.join_next().await {
         match copied? {
             Copied::Stdout(Ok(())) => break,
             Copied::Stdout(Err(error)) => bail!("writing stdout: {error}"),
-            Copied::Stdin(Ok(())) => {}
-            Copied::Stdin(Err(error)) => stdin_failed = Some(error),
+            Copied::Stdin => {}
         }
     }
-    if let Some(error) = stdin_failed {
+    let failed = stdin_failed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(error) = failed {
         bail!("reading stdin: {error}");
     }
     Ok(0)
@@ -492,8 +503,8 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
 
 /// How one of `serve --stdio`'s two copies ended.
 enum Copied {
-    /// Stdin to the daemon: EOF, or the failed stdin read.
-    Stdin(io::Result<()>),
+    /// Stdin to the daemon: EOF, or the failed stdin read (recorded apart).
+    Stdin,
     /// The daemon to stdout: the daemon's EOF, or the failed stdout write.
     Stdout(io::Result<()>),
 }
