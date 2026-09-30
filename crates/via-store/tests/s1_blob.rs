@@ -119,6 +119,7 @@ fn s1_blob_torn_and_mismatched_blobs_are_refused_or_swept() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
+                label: None,
                 prompt: Prompt::Blob(blob.clone()),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),

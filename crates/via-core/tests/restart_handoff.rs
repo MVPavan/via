@@ -163,6 +163,7 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
                     .result(&format!("{}/{turn}", session.as_str()))
                     .await
                     .unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
                 assert_eq!(envelope["state"], "completed", "{envelope}");
             }
         }
@@ -231,6 +232,7 @@ fn starts_beyond_the_channel_spill_into_the_pending_set_and_all_run() {
                 .result(&format!("{}/1", session.as_str()))
                 .await
                 .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
             assert_eq!(envelope["state"], "completed", "{envelope}");
         }
         assert_eq!(engine.active(), 0);

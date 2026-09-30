@@ -1,14 +1,15 @@
 //! Receipts: `spawn`, `resume`, the queued-turn commit and `steer`.
 
 use std::{
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     time::SystemTime,
 };
 
 use serde_json::{Value, json};
 use via_store::{
-    BLOB_CHUNK, BlobRef, INLINE_MAX, OperationRecord, Prompt, ResumeRecord, SessionSnapshot,
-    SpawnKey, SpawnRecord, StoreError,
+    BLOB_CHUNK, BlobRef, INLINE_MAX, OperationRecord, Prompt, PromptFileError, ResumeRecord,
+    SessionSnapshot, SpawnKey, SpawnRecord, StoreError,
 };
 
 use super::journal::{self, Head};
@@ -16,7 +17,8 @@ use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
 use super::{Admission, Engine, Receipted, lock};
 use crate::api::{
-    Capabilities, Effective, Event, EventBody, Receipt, RoutePlan, TurnReceipt, retry_key, rfc3339,
+    Capabilities, Effective, Event, EventBody, Named, PATH_MAX, PromptSource, Receipt, RoutePlan,
+    TurnReceipt, retry_key, rfc3339,
 };
 use crate::{
     ApiError, ResumeParams, SessionId, SpawnParams, SteerParams, TurnNumber, hash_handle,
@@ -49,15 +51,47 @@ impl Engine {
         reply
     }
 
-    /// Design §6.5: a prompt over `INLINE_MAX` is written to a finished
-    /// blob before `admission` is taken, in 64 KiB chunks; a blob write that
-    /// fails is `not_committed` for the request, and its handle unlinks the
-    /// unfinished file.
-    async fn stage_prompt(&self, text: String) -> Result<(Prompt, Option<BlobRef>), ApiError> {
-        if text.len() <= INLINE_MAX {
-            return Ok((Prompt::Inline(text), None));
-        }
+    /// Design §6.5, §10.4: a turn's prompt, staged with no lock held. An
+    /// inline prompt over `INLINE_MAX` is written to a finished blob in
+    /// 64 KiB chunks; a prompt file is copied into one in a single pass,
+    /// which also gives its content token `sha256:<64 hex>:<len>` for the
+    /// retry identity. A blob write that fails is `not_committed` for the
+    /// request, and its handle unlinks the unfinished file.
+    async fn stage_prompt(&self, source: PromptSource) -> Result<Staged, ApiError> {
         let not_committed = |_| WriteOutcome::NotCommitted.api_error();
+        let text = match source {
+            PromptSource::Inline(text) => text,
+            PromptSource::File(path) => {
+                if path.len() > PATH_MAX {
+                    return Err(ApiError::prompt_file("unreadable"));
+                }
+                if !Path::new(&path).is_absolute() {
+                    return Err(ApiError::prompt_file("not_absolute"));
+                }
+                let deadline = tokio::time::Instant::now() + PROMPT_FILE_PASS;
+                let blob = self
+                    .store
+                    .copy_prompt_file(PathBuf::from(path), deadline)
+                    .await
+                    .map_err(|error| match error {
+                        PromptFileError::Refused(reason) => ApiError::prompt_file(reason),
+                        PromptFileError::Store(_) => WriteOutcome::NotCommitted.api_error(),
+                    })?;
+                let content = content_token(&blob);
+                return Ok(Staged {
+                    prompt: Prompt::Blob(blob.clone()),
+                    pending: Some(blob),
+                    content: Some(content),
+                });
+            }
+        };
+        if text.len() <= INLINE_MAX {
+            return Ok(Staged {
+                prompt: Prompt::Inline(text),
+                pending: None,
+                content: None,
+            });
+        }
         let mut writer = self.store.blob_writer().await.map_err(not_committed)?;
         for chunk in text.as_bytes().chunks(BLOB_CHUNK) {
             if let Err(error) = writer.write(chunk).await {
@@ -67,7 +101,11 @@ impl Engine {
         }
         drop(text);
         let blob = writer.finish().await.map_err(not_committed)?;
-        Ok((Prompt::Blob(blob.clone()), Some(blob)))
+        Ok(Staged {
+            prompt: Prompt::Blob(blob.clone()),
+            pending: Some(blob),
+            content: None,
+        })
     }
 
     /// Design §6.5: a staged blob that no commit adopted (a replay, a
@@ -79,22 +117,79 @@ impl Engine {
         }
     }
 
+    /// Design §11.1: the session's `cwd`, checked on the blocking pool with
+    /// no lock held: at most 4096 bytes, absolute and an existing
+    /// directory. An omitted `cwd` is the fake's configured default.
+    async fn session_cwd(&self, cwd: Option<String>) -> Result<String, ApiError> {
+        let invalid = |message| {
+            ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("cwd") },
+                message,
+            )
+        };
+        let Some(cwd) = cwd else {
+            return self
+                .adapter
+                .fake_cwd()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"));
+        };
+        if cwd.len() > PATH_MAX || !Path::new(&cwd).is_absolute() {
+            return Err(invalid(
+                "cwd must be an absolute path of at most 4096 bytes",
+            ));
+        }
+        let path = PathBuf::from(&cwd);
+        let directory = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        })
+        .await
+        .unwrap_or(false);
+        if directory {
+            Ok(cwd)
+        } else {
+            Err(invalid("cwd is not an existing directory"))
+        }
+    }
+
     /// Commits a receipt before authorizing any process launch.
     ///
-    /// A keyed retry is looked up before any admission check (runtime §6): the
-    /// same key, handle and byte-identical `raw_params` replay the stored
-    /// receipt, anything else under the key is `idempotency_conflict`.
+    /// Design §10.3: the prompt is staged, the `cwd` checked and the retry
+    /// identity streamed with no lock held; under `admission` a keyed retry
+    /// is looked up before any admission check (runtime §6): the same key,
+    /// handle and byte-identical `raw_params` (a prompt file by its
+    /// content) replay the stored receipt, anything else under the key is
+    /// `idempotency_conflict`.
     pub async fn spawn(
         &self,
         mut params: SpawnParams,
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
-        let (prompt, mut pending) = self
-            .stage_prompt(std::mem::take(&mut params.prompt))
-            .await?;
-        let receipted = self
-            .spawn_admitted(params, prompt, raw_params, &mut pending)
-            .await;
+        let source = params.take_prompt()?;
+        params.check_session_members()?;
+        let hash = hash_handle(&params.handle)?;
+        let key = retry_key(params.idempotency_key.as_deref())?.map(str::to_owned);
+        let cwd = self.session_cwd(params.cwd.take()).await?;
+        let Staged {
+            prompt,
+            mut pending,
+            content,
+        } = self.stage_prompt(source).await?;
+        let receipted = match key
+            .map(|key| {
+                retry_identity(raw_params, &hash, content.as_deref())
+                    .map(|identity| SpawnKey { key, identity })
+            })
+            .transpose()
+        {
+            Ok(key) => {
+                self.spawn_admitted(params, (prompt, cwd), (hash, key), &mut pending)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         self.discard_unadopted(pending).await;
         receipted
     }
@@ -104,8 +199,8 @@ impl Engine {
     async fn spawn_admitted(
         &self,
         params: SpawnParams,
-        prompt: Prompt,
-        raw_params: &str,
+        (prompt, cwd): (Prompt, String),
+        (hash, key): ([u8; 32], Option<SpawnKey>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
@@ -113,32 +208,22 @@ impl Engine {
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        let hash = hash_handle(&params.handle)?;
-        let key = match retry_key(params.idempotency_key.as_deref())? {
-            Some(key) => {
-                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
-                if let Some(stored) = self
-                    .store
-                    .spawn_key(key)
-                    .await
-                    .map_err(|_| ApiError::STORE)?
-                {
-                    return if stored.identity == identity {
-                        Ok(Receipted {
-                            receipt: stored.receipt,
-                            enqueued: None,
-                        })
-                    } else {
-                        Err(ApiError::IDEMPOTENCY_CONFLICT)
-                    };
-                }
-                Some(SpawnKey {
-                    key: key.to_owned(),
-                    identity,
+        if let Some(key) = &key
+            && let Some(stored) = self
+                .store
+                .spawn_key(&key.key)
+                .await
+                .map_err(|_| ApiError::STORE)?
+        {
+            return if stored.identity == key.identity {
+                Ok(Receipted {
+                    receipt: stored.receipt,
+                    enqueued: None,
                 })
-            }
-            None => None,
-        };
+            } else {
+                Err(ApiError::IDEMPOTENCY_CONFLICT)
+            };
+        }
         if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);
         }
@@ -187,7 +272,10 @@ impl Engine {
                     session_id: session.clone(),
                     handle_hash: hash,
                     receipt: receipt.clone(),
-                    params: json!({"harness":"fake","model":"fake"}),
+                    // Design §11.1 (A14): the frozen session parameters.
+                    params: json!({"harness":"fake","model":"fake","cwd":cwd,
+                        "allow_untested":params.allow_untested}),
+                    label: params.label,
                     effective: receipt["effective"].clone(),
                     prompt,
                     initial_event,
@@ -211,18 +299,34 @@ impl Engine {
     }
 
     /// C1 §3.3: authenticates, replays a keyed retry, then commits the next
-    /// turn `queued` with its `turn.queued` event before the receipt.
+    /// turn `queued` with its `turn.queued` event before the receipt. The
+    /// prompt is staged and the identity streamed with no lock held.
     pub async fn resume(
         &self,
         mut params: ResumeParams,
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
-        let (prompt, mut pending) = self
-            .stage_prompt(std::mem::take(&mut params.prompt))
-            .await?;
-        let receipted = self
-            .resume_admitted(params, prompt, raw_params, &mut pending)
-            .await;
+        let source = params.take_prompt()?;
+        let hash = hash_handle(&params.handle)?;
+        let key = retry_key(params.op_key.as_deref())?.map(str::to_owned);
+        let Staged {
+            prompt,
+            mut pending,
+            content,
+        } = self.stage_prompt(source).await?;
+        let receipted = match key
+            .map(|key| {
+                retry_identity(raw_params, &hash, content.as_deref())
+                    .map(|identity| (key, identity))
+            })
+            .transpose()
+        {
+            Ok(operation) => {
+                self.resume_admitted(params, prompt, (hash, operation), &mut pending)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         self.discard_unadopted(pending).await;
         receipted
     }
@@ -232,15 +336,13 @@ impl Engine {
         &self,
         params: ResumeParams,
         prompt: Prompt,
-        raw_params: &str,
+        (hash, operation): ([u8; 32], Option<(String, via_store::Identity)>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        let hash = hash_handle(&params.handle)?;
-        let key = retry_key(params.op_key.as_deref())?;
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
@@ -261,28 +363,22 @@ impl Engine {
         {
             return Err(ApiError::INVALID_HANDLE);
         }
-        let operation = match key {
-            Some(key) => {
-                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
-                let stored = self
-                    .store
-                    .operation(&session, key)
-                    .await
-                    .map_err(|_| ApiError::STORE)?;
-                if let Some(stored) = stored {
-                    return if stored.identity == identity {
-                        Ok(Receipted {
-                            enqueued: None,
-                            receipt: stored.result,
-                        })
-                    } else {
-                        Err(ApiError::IDEMPOTENCY_CONFLICT)
-                    };
-                }
-                Some((key.to_owned(), identity))
-            }
-            None => None,
-        };
+        if let Some((key, identity)) = &operation
+            && let Some(stored) = self
+                .store
+                .operation(&session, key)
+                .await
+                .map_err(|_| ApiError::STORE)?
+        {
+            return if stored.identity == *identity {
+                Ok(Receipted {
+                    enqueued: None,
+                    receipt: stored.result,
+                })
+            } else {
+                Err(ApiError::IDEMPOTENCY_CONFLICT)
+            };
+        }
         // Design §4: a closing session refuses `resume`, from Store's gate
         // or, after an uncertain `Closing`, from memory.
         if snapshot.closed || snapshot.closing || lock(&self.closing).contains(&session) {
@@ -422,7 +518,32 @@ impl Engine {
     }
 }
 
-/// An empty inline prompt; a blob holds more than `INLINE_MAX` bytes.
+/// An empty prompt: an empty inline text, or an empty prompt file's blob.
 fn is_empty(prompt: &Prompt) -> bool {
-    matches!(prompt, Prompt::Inline(text) if text.is_empty())
+    match prompt {
+        Prompt::Inline(text) => text.is_empty(),
+        Prompt::Blob(blob) => blob.is_empty(),
+    }
+}
+
+/// Design §10.4: the whole prompt-file pass ends within this bound.
+const PROMPT_FILE_PASS: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A staged turn prompt: what the commit stores, the blob it adopts, and a
+/// prompt file's content token for the retry identity.
+struct Staged {
+    prompt: Prompt,
+    pending: Option<BlobRef>,
+    content: Option<String>,
+}
+
+/// A prompt file's content token (design §10.3): `sha256:<64 hex>:<len>`.
+fn content_token(blob: &BlobRef) -> String {
+    use std::fmt::Write as _;
+    let mut token = String::from("sha256:");
+    for byte in blob.sha256() {
+        let _ = write!(token, "{byte:02x}");
+    }
+    let _ = write!(token, ":{}", blob.len());
+    token
 }

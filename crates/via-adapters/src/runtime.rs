@@ -145,6 +145,11 @@ impl AdapterRuntime {
         self.fake.is_available()
     }
 
+    /// The fake route's default session working directory (design §11.1).
+    pub fn fake_cwd(&self) -> &std::path::Path {
+        self.fake.default_cwd()
+    }
+
     /// Runs one submitted fake turn and delivers every observation to Core
     /// in decode order (Task 4 design §2.3, §9). Route hands one message at
     /// a time over a hop of one; its delivery acquires the items' bytes of
@@ -154,7 +159,8 @@ impl AdapterRuntime {
     /// overflow and still performs its cleanup. Each message's arrival
     /// moves `activity` (design §2.4), unknown types included. `force` set force-closes the
     /// turn through Route (C2 Close(Force)). `stop` is the turn's stop
-    /// order, passed through to Route (design §2).
+    /// order, passed through to Route (design §2). The agent runs in the
+    /// session's frozen `cwd` (design §11.1).
     #[expect(
         clippy::too_many_arguments,
         reason = "each argument is a distinct input of the one turn"
@@ -163,7 +169,7 @@ impl AdapterRuntime {
         &self,
         session_id: SessionId,
         turn: TurnNumber,
-        prompt: String,
+        (prompt, cwd): (String, std::path::PathBuf),
         observations: ObservationSink,
         activity: TurnActivity,
         deadline: Deadline,
@@ -177,7 +183,7 @@ impl AdapterRuntime {
         };
         let mut process = self
             .fake
-            .process_spec(owner)
+            .process_spec(owner, &cwd)
             .map_err(|_| AdapterError::Unavailable)?;
         // Host owns the connection slot for the group's life (design §11).
         process.capacity = Some(capacity);

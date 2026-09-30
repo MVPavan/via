@@ -135,22 +135,22 @@ impl Sandbox {
         .unwrap()
     }
 
-    /// Starts one background fake turn and returns its session id.
-    fn spawn_background(&self) -> String {
-        let output = self.run(
-            &[
-                "spawn",
-                "--harness",
-                "fake",
-                "--model",
-                "fake",
-                "--prompt",
-                "hello",
-                "--background",
-                "--json",
-            ],
-            Duration::from_secs(10),
-        );
+    /// Starts one background fake turn with `extra` flags and returns its
+    /// session id.
+    fn spawn_background(&self, extra: &[&str]) -> String {
+        let mut args = vec![
+            "spawn",
+            "--harness",
+            "fake",
+            "--model",
+            "fake",
+            "--prompt",
+            "hello",
+            "--background",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let output = self.run(&args, Duration::from_secs(10));
         let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
         receipt["session_id"].as_str().unwrap().to_owned()
     }
@@ -476,7 +476,8 @@ fn failure_class_vendor_error_keeps_vendor_code() {
 #[test]
 fn failure_class_deadline_wall_after_hang() {
     let sandbox = Sandbox::new(&[emit(ACCEPTED), json!({"action":"hang"})]);
-    let session = sandbox.spawn_background();
+    // The fake's default wall is C1's hour (A3): the test sets its own.
+    let session = sandbox.spawn_background(&["--wall-ms", "30000"]);
     let envelope = sandbox.await_result(&session, Duration::from_secs(45));
     assert_eq!(envelope["state"], "failed", "{envelope}");
     assert_eq!(envelope["failure"]["class"], "deadline_wall", "{envelope}");

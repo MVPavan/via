@@ -1,4 +1,10 @@
-use std::{env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner};
 
@@ -50,9 +56,17 @@ impl FakeConfig {
         self.binary.is_some()
     }
 
+    /// The working directory a session that names none is frozen with
+    /// (Task 4 design §11.1): the daemon's own at startup.
+    pub fn default_cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// The fake agent's launch, in the session's frozen `cwd`.
     pub(crate) fn process_spec(
         &self,
         owner: ProcessOwner,
+        cwd: &Path,
     ) -> Result<PrivateProcessSpec, &'static str> {
         let (Some(binary), Some(scenario), Some(sync_dir)) =
             (&self.binary, &self.scenario, &self.sync_dir)
@@ -72,7 +86,7 @@ impl FakeConfig {
         Ok(PrivateProcessSpec {
             program: binary.clone(),
             args: Vec::new(),
-            cwd: self.cwd.clone(),
+            cwd: cwd.to_path_buf(),
             env,
             owner,
             // Wire creates the turn's evidence folder and names the file in it.

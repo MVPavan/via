@@ -200,6 +200,9 @@ struct Started {
     queued_at: String,
     /// Sequence of the turn's `turn.queued`, the envelope's `first_seq`.
     first_seq: u64,
+    /// The session's frozen `cwd`, the envelope's `cwd` (design §11.1);
+    /// `None` where the terminal's writer does not read it.
+    cwd: Option<String>,
     /// Submission time and clock; `None` for a turn cancelled while queued.
     submitted: Option<(String, Instant)>,
     /// The turn's absolute evidence folder, once submitted (Task 4 design

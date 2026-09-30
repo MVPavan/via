@@ -56,6 +56,7 @@ impl Fixture {
                 handle_hash: [7_u8; 32],
                 receipt: serde_json::json!({"session_id":"s_0123456789ab","state":"queued"}),
                 params: serde_json::json!({"harness":"fake"}),
+                label: None,
                 prompt: "fixture".into(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
                 initial_event: serde_json::json!({"seq":1,"turn":1,"type":"turn.queued","at":"2026-01-01T00:00:00.000Z"}),

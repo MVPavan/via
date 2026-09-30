@@ -111,6 +111,7 @@ impl Child {
                 handle_hash: [7_u8; 32],
                 receipt: serde_json::json!({"state":"queued"}),
                 params: serde_json::json!({"harness":"fake"}),
+                label: None,
                 prompt: "hello".into(),
                 effective: serde_json::json!({"deadlines":{"wall_ms":1}}),
                 initial_event: serde_json::json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
@@ -167,7 +168,7 @@ impl Child {
             let execute = self.adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
                 TurnNumber::try_from(1).unwrap(),
-                "hello".to_owned(),
+                ("hello".to_owned(), self.adapter.fake_cwd().to_path_buf()),
                 sender,
                 via_adapters::TurnActivity::new(tokio::time::Instant::now()),
                 deadline,

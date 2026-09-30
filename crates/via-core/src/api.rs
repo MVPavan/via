@@ -6,12 +6,17 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use via_store::json_limits::{self, Shape};
 
 use crate::{SessionId, TurnNumber, TurnState};
 
 /// Strict C1 §3.2 parameters for creating a fake session and its first turn.
+/// Free-form members are kept as their raw text (`Box<RawValue>`) and
+/// inspected only by [`json_limits::shape`] and [`json_limits::string_list`]
+/// (Task 4 design §10.2): no value is built from a peer's bytes.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnParams {
@@ -19,25 +24,42 @@ pub struct SpawnParams {
     pub harness: String,
     /// Explicit model name.
     pub model: String,
-    /// User prompt delivered once after submission intent commits.
-    pub prompt: String,
+    /// Inline prompt; exactly one of `prompt` and `prompt_file`.
+    #[serde(default, deserialize_with = "given")]
+    pub prompt: Option<String>,
+    /// Absolute path of a prompt file, copied at receipt (design §10.4).
+    #[serde(default, deserialize_with = "given")]
+    pub prompt_file: Option<String>,
     /// Caller-owned 256-bit bearer handle.
     pub handle: String,
     /// C1 P4 retry key: the same key, handle and params replay the receipt.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    effort: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    bound: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    output_schema: Option<Value>,
+    /// Session working directory (design §11.1); the fake's default when omitted.
+    #[serde(default, deserialize_with = "given")]
+    pub cwd: Option<String>,
+    /// Caller's session label, at most [`LABEL_MAX`] bytes.
+    #[serde(default, deserialize_with = "given")]
+    pub label: Option<String>,
+    /// Immutable session policy (C1 P13).
+    #[serde(default)]
+    pub allow_untested: bool,
+    #[serde(default, deserialize_with = "raw")]
+    instructions: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    require: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    effort: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    bound: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    output_schema: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "nullable")]
     deadlines: Option<Nullable<DeadlineParams>>,
-    #[serde(default, deserialize_with = "present")]
-    max_steps: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    vendor: Option<Value>,
+    #[serde(default, deserialize_with = "raw")]
+    max_steps: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    vendor: Option<Box<RawValue>>,
 }
 
 /// Strict C1 §3.3 `resume` parameters. Session-scope members are accepted
@@ -49,52 +71,67 @@ pub struct ResumeParams {
     pub session: SessionId,
     /// Caller-owned bearer handle.
     pub handle: String,
-    /// The new turn's prompt.
-    pub prompt: String,
+    /// The new turn's inline prompt; exactly one of `prompt` and `prompt_file`.
+    #[serde(default, deserialize_with = "given")]
+    pub prompt: Option<String>,
+    /// Absolute path of the new turn's prompt file (design §10.4).
+    #[serde(default, deserialize_with = "given")]
+    pub prompt_file: Option<String>,
     /// C1 §3 retry key: the same key and params replay the turn receipt.
     #[serde(default)]
     pub op_key: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    effort: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    bound: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    output_schema: Option<Value>,
+    #[serde(default, deserialize_with = "raw")]
+    effort: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    bound: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    output_schema: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "nullable")]
     deadlines: Option<Nullable<DeadlineParams>>,
-    #[serde(default, deserialize_with = "present")]
-    max_steps: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    vendor: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    harness: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    model: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    allow_untested: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    instructions: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    cwd: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    require: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    label: Option<Value>,
+    #[serde(default, deserialize_with = "raw")]
+    max_steps: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    vendor: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    harness: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    model: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    allow_untested: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    instructions: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    cwd: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    require: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    label: Option<Box<RawValue>>,
 }
 
-/// C1 §4 `deadlines` as sent: `{wall_ms?, idle_ms?}`.
+/// C1 §4 `deadlines` as sent: `{wall_ms?, idle_ms?}`. A present member is
+/// a number; a nested `null` is `invalid_params` (A9).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeadlineParams {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "given")]
     wall_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "given")]
     idle_ms: Option<u64>,
 }
 
-/// Keeps an explicit `null` distinct from an omitted member: `Some(Null)`.
-fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(deserializer).map(Some)
+/// A present member's raw text, `null` included: `Some("null")` is kept
+/// distinct from an omitted member.
+fn raw<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+/// A present member that is not typed "or null": `null` is refused.
+fn given<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 /// A present typed member: an explicit `null`, or its value.
@@ -103,7 +140,7 @@ enum Nullable<T> {
     Given(T),
 }
 
-/// Like [`present`] for a typed member, keeping an explicit `null`.
+/// Like [`raw`] for a typed member, keeping an explicit `null`.
 fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<Nullable<T>>, D::Error> {
@@ -115,12 +152,12 @@ fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 
 /// The C1 §4 per-turn parameters of one `spawn` or `resume`, as sent.
 pub(crate) struct PerTurn<'a> {
-    effort: Option<&'a Value>,
-    bound: Option<&'a Value>,
-    output_schema: Option<&'a Value>,
+    effort: Option<&'a RawValue>,
+    bound: Option<&'a RawValue>,
+    output_schema: Option<&'a RawValue>,
     deadlines: Option<&'a Nullable<DeadlineParams>>,
-    max_steps: Option<&'a Value>,
-    vendor: Option<&'a Value>,
+    max_steps: Option<&'a RawValue>,
+    vendor: Option<&'a RawValue>,
 }
 
 /// What a turn sets for itself on the fake route; anything else inherits.
@@ -129,29 +166,101 @@ pub(crate) struct Overrides {
     idle_ms: Option<u64>,
 }
 
+/// Longest `label` (C1 §4), in bytes.
+pub(crate) const LABEL_MAX: usize = 120;
+
+/// Longest `cwd` or `prompt_file` path (design §10.4, §11.1), in bytes.
+pub(crate) const PATH_MAX: usize = 4096;
+
+/// Longest C1 request line, its line feed included (design §5.2, A39).
+pub const REQUEST_LINE_MAX: usize = 1024 * 1024;
+
+/// Where a turn's prompt comes from (C1 §4): exactly one of `prompt` and
+/// `prompt_file`.
+pub(crate) enum PromptSource {
+    Inline(String),
+    File(String),
+}
+
+/// Takes the one prompt source a request gave; both or neither is
+/// `invalid_params`.
+fn prompt_source(
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+) -> Result<PromptSource, ApiError> {
+    match (prompt, prompt_file) {
+        (Some(text), None) => Ok(PromptSource::Inline(text)),
+        (None, Some(path)) => Ok(PromptSource::File(path)),
+        _ => Err(ApiError::naming(
+            ApiError::INVALID_PARAMS,
+            &const { Named::field("prompt") },
+            "exactly one of prompt and prompt_file is required",
+        )),
+    }
+}
+
 impl SpawnParams {
     pub(crate) fn per_turn(&self) -> PerTurn<'_> {
         PerTurn {
-            effort: self.effort.as_ref(),
-            bound: self.bound.as_ref(),
-            output_schema: self.output_schema.as_ref(),
+            effort: self.effort.as_deref(),
+            bound: self.bound.as_deref(),
+            output_schema: self.output_schema.as_deref(),
             deadlines: self.deadlines.as_ref(),
-            max_steps: self.max_steps.as_ref(),
-            vendor: self.vendor.as_ref(),
+            max_steps: self.max_steps.as_deref(),
+            vendor: self.vendor.as_deref(),
         }
+    }
+
+    /// Takes the turn's prompt source out of the parameters.
+    pub(crate) fn take_prompt(&mut self) -> Result<PromptSource, ApiError> {
+        prompt_source(self.prompt.take(), self.prompt_file.take())
+    }
+
+    /// Design §11.1: checks the session members without I/O: `label` at
+    /// most [`LABEL_MAX`] bytes, `instructions` refused by the fake, and
+    /// each `require`d verb met by [`Capabilities::fake`], the first unmet
+    /// one refused by name.
+    pub(crate) fn check_session_members(&self) -> Result<(), ApiError> {
+        if self
+            .label
+            .as_ref()
+            .is_some_and(|label| label.len() > LABEL_MAX)
+        {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("label") },
+                "label is longer than 120 bytes",
+            ));
+        }
+        if self.instructions.is_some() {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::fake("instructions") },
+                "instructions is unsupported on route fake",
+            ));
+        }
+        if let Some(require) = &self.require {
+            Capabilities::fake().require(require)?;
+        }
+        Ok(())
     }
 }
 
 impl ResumeParams {
     pub(crate) fn per_turn(&self) -> PerTurn<'_> {
         PerTurn {
-            effort: self.effort.as_ref(),
-            bound: self.bound.as_ref(),
-            output_schema: self.output_schema.as_ref(),
+            effort: self.effort.as_deref(),
+            bound: self.bound.as_deref(),
+            output_schema: self.output_schema.as_deref(),
             deadlines: self.deadlines.as_ref(),
-            max_steps: self.max_steps.as_ref(),
-            vendor: self.vendor.as_ref(),
+            max_steps: self.max_steps.as_deref(),
+            vendor: self.vendor.as_deref(),
         }
+    }
+
+    /// Takes the turn's prompt source out of the parameters.
+    pub(crate) fn take_prompt(&mut self) -> Result<PromptSource, ApiError> {
+        prompt_source(self.prompt.take(), self.prompt_file.take())
     }
 
     /// C1 §3.3/§4: session-scope parameters, `allow_untested` included, are
@@ -209,11 +318,15 @@ impl PerTurn<'_> {
     /// ([`Capabilities::fake`]). Omitted values inherit. C1 §1 lets only
     /// members typed "or null" be null: a null `output_schema` or
     /// `max_steps` is accepted (`output_schema: null` clears, which on this
-    /// route is already the state); a null `effort`, `bound` or `deadlines`
-    /// is `invalid_params`.
+    /// route is already the state); a null `effort`, `bound` or `deadlines`,
+    /// or a nested null in `deadlines` (A9), is `invalid_params`.
     pub(crate) fn fake_overrides(&self) -> Result<Overrides, ApiError> {
-        let given = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
-        let null = |value: Option<&Value>| value.is_some_and(Value::is_null);
+        let given = |value: Option<&RawValue>| {
+            value.is_some_and(|value| json_limits::shape(value.get()) != Shape::Null)
+        };
+        let null = |value: Option<&RawValue>| {
+            value.is_some_and(|value| json_limits::shape(value.get()) == Shape::Null)
+        };
         if null(self.effort) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
@@ -258,14 +371,7 @@ impl PerTurn<'_> {
             ));
         }
         // Only `{}` or empty per-harness objects: the fake declares no options.
-        let empty = |value: &Value| {
-            value.as_object().is_some_and(|options| {
-                options
-                    .values()
-                    .all(|harness| harness.as_object().is_some_and(serde_json::Map::is_empty))
-            })
-        };
-        if self.vendor.is_some_and(|vendor| !empty(vendor)) {
+        if self.vendor.is_some_and(|vendor| !no_vendor_options(vendor)) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
                 &const { Named::fake("vendor") },
@@ -307,6 +413,23 @@ impl PerTurn<'_> {
             wall_ms: deadlines.wall_ms,
             idle_ms: deadlines.idle_ms,
         })
+    }
+}
+
+/// Whether `vendor` is an object whose every member is an empty object:
+/// options for no harness. Each member is inspected by its shape only.
+fn no_vendor_options(vendor: &RawValue) -> bool {
+    match json_limits::shape(vendor.get()) {
+        Shape::Object { empty: true } => true,
+        Shape::Object { empty: false } => {
+            serde_json::from_str::<std::collections::BTreeMap<String, &RawValue>>(vendor.get())
+                .is_ok_and(|options| {
+                    options.values().all(|harness| {
+                        json_limits::shape(harness.get()) == (Shape::Object { empty: true })
+                    })
+                })
+        }
+        Shape::Null | Shape::Bool | Shape::Number | Shape::String | Shape::Array { .. } => false,
     }
 }
 
@@ -487,6 +610,9 @@ pub struct ApiError {
     pub commit_outcome: Option<ReceiptOutcome>,
     /// The refused request member and route, named in `data`.
     pub named: Option<&'static Named>,
+    /// Why a named member was refused (`data.reason`), such as a prompt
+    /// file's (design §10.4).
+    pub reason: Option<&'static str>,
 }
 
 /// A refused request member (`data.field`) and, when a route's capabilities
@@ -501,7 +627,7 @@ pub struct Named {
 
 impl Named {
     /// A member refused regardless of route.
-    const fn field(field: &'static str) -> Self {
+    pub(crate) const fn field(field: &'static str) -> Self {
         Self { field, route: None }
     }
 
@@ -603,11 +729,54 @@ impl ApiError {
                 data["route"] = json!(route);
             }
         }
+        if let Some(reason) = self.reason {
+            data["reason"] = json!(reason);
+        }
+        if self.code == Self::REQUEST_TOO_LARGE.code {
+            // Design §10.1: the named kind tells a program to use `prompt_file`.
+            data["max_bytes"] = json!(REQUEST_LINE_MAX);
+            data["use"] = json!("prompt_file");
+        }
         data
     }
 
+    /// Design §10.4 step 4: a prompt file refused by `reason`.
+    pub(crate) fn prompt_file(reason: &'static str) -> Self {
+        Self {
+            kind2: Some("prompt_file"),
+            reason: Some(reason),
+            message: "prompt_file refused",
+            ..Self::INVALID_PARAMS
+        }
+    }
+
+    /// Design §10.1 (A39): a request line over [`REQUEST_LINE_MAX`] bytes;
+    /// the connection closes after this reply.
+    pub const REQUEST_TOO_LARGE: Self = Self {
+        code: -32020,
+        kind: "request_too_large",
+        message: "request line over 1 MiB; pass a large prompt as prompt_file",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: None,
+    };
+
+    /// C1 §8.1: a `require`d capability the route does not meet.
+    pub const MISSING_CAPABILITY: Self = Self {
+        code: -32007,
+        kind: "missing_capability",
+        message: "a required capability is not met",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: None,
+    };
+
     /// A refusal naming the member (and route) in `named`.
-    fn naming(base: Self, named: &'static Named, message: &'static str) -> Self {
+    pub(crate) fn naming(base: Self, named: &'static Named, message: &'static str) -> Self {
         Self {
             message,
             named: Some(named),
@@ -624,6 +793,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// A caller handle did not authorize a mutation.
     pub const INVALID_HANDLE: Self = Self {
@@ -634,6 +804,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The selected route has no such control capability.
     pub const UNSUPPORTED_VERB: Self = Self {
@@ -644,6 +815,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The fake route is not configured or selected.
     pub const HARNESS_UNAVAILABLE: Self = Self {
@@ -654,6 +826,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The daemon accepted a stop and admits no new work.
     pub const DAEMON_STOPPING: Self = Self {
@@ -664,6 +837,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// Active sessions refuse a plain stop (C1 §3.14).
     pub const SESSIONS_ACTIVE: Self = Self {
@@ -674,6 +848,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The daemon already retains its bound of turns without a durable terminal.
     pub const TURNS_AT_CAPACITY: Self = Self {
@@ -684,6 +859,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// A C1 read found the Store's Public lane full (Task 4 design §6.1):
     /// nothing was read, and the Store did not fail.
@@ -695,6 +871,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
@@ -705,6 +882,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// A bound the route cannot enforce (C1 §4.2).
     pub const BOUND_UNSUPPORTED: Self = Self {
@@ -715,6 +893,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
@@ -725,6 +904,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// A wait deadline elapsed while the turn remains active.
     pub const WAIT_TIMEOUT: Self = Self {
@@ -735,6 +915,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The requested session is absent.
     pub const SESSION_NOT_FOUND: Self = Self {
@@ -745,6 +926,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The session is closed or closing.
     pub const SESSION_CLOSED: Self = Self {
@@ -755,6 +937,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The session exists but has no such turn.
     pub const TURN_NOT_FOUND: Self = Self {
@@ -765,6 +948,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The session already holds its bound of queued turns (C1 P6).
     pub const QUEUE_FULL: Self = Self {
@@ -775,6 +959,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// The daemon already holds its bound of queued turns (runtime §8).
     pub const QUEUED_AT_CAPACITY: Self = Self {
@@ -785,6 +970,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// Store refused `Closed` twice while a turn of the closing session was
     /// still queued or running (design §4 dispatcher step 6).
@@ -796,6 +982,7 @@ impl ApiError {
         kind2: None,
         commit_outcome: None,
         named: None,
+        reason: None,
     };
     /// A retry key was reused with another handle or other params (C1 P4).
     pub const IDEMPOTENCY_CONFLICT: Self = Self {
@@ -806,6 +993,7 @@ impl ApiError {
         kind2: Some("idempotency_conflict"),
         commit_outcome: None,
         named: None,
+        reason: None,
     };
 }
 
@@ -868,61 +1056,101 @@ pub(crate) fn retry_key(key: Option<&str>) -> Result<Option<&str>, ApiError> {
     }
 }
 
-/// Exact retry identity (C1 P4, runtime §6): the original params object's
-/// bytes with the top-level `handle` value replaced by its hash. Every other
-/// byte, whitespace and member order included, is kept, so only a
-/// byte-identical retry matches. Duplicate top-level members are refused.
-pub fn retry_identity(raw_params: &str, handle_hash: &[u8; 32]) -> Result<Vec<u8>, ApiError> {
+/// Exact retry identity (C1 P4, runtime §6; Task 4 design §10.3): the
+/// original params object's bytes with the top-level `handle` value
+/// replaced by its hash and, for a prompt file, the top-level `prompt_file`
+/// value replaced by `prompt_file`'s content token
+/// `"sha256:<64 hex>:<len>"`. Every other byte, whitespace and member order
+/// included, is kept, so only a byte-identical retry matches. The identity
+/// is streamed: a running SHA-256 and length over the borrowed pieces
+/// around those spans, never a copy. Duplicate top-level members are
+/// refused.
+pub fn retry_identity(
+    raw_params: &str,
+    handle_hash: &[u8; 32],
+    prompt_file: Option<&str>,
+) -> Result<via_store::Identity, ApiError> {
     use std::collections::HashSet;
 
     use serde::de::{Deserializer, MapAccess, Visitor};
-    use serde_json::value::RawValue;
 
-    /// The byte range of the top-level `handle` value within the params text.
-    struct Handle(Option<(usize, usize)>);
+    /// The byte ranges of the top-level `handle` and `prompt_file` values
+    /// within the params text.
+    #[derive(Default)]
+    struct Spans {
+        handle: Option<(usize, usize)>,
+        prompt_file: Option<(usize, usize)>,
+    }
 
     struct Members<'a>(&'a str);
 
     impl<'de> Visitor<'de> for Members<'de> {
-        type Value = Handle;
+        type Value = Spans;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a params object")
         }
 
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Handle, A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Spans, A::Error> {
             let mut seen = HashSet::new();
-            let mut handle = None;
+            let mut spans = Spans::default();
             while let Some((key, value)) = map.next_entry::<String, &'de RawValue>()? {
-                if key == "handle" {
-                    let start = (value.get().as_ptr() as usize)
-                        .checked_sub(self.0.as_ptr() as usize)
-                        .ok_or_else(|| serde::de::Error::custom("handle outside params"))?;
-                    handle = Some((start, start + value.get().len()));
+                let start = (value.get().as_ptr() as usize)
+                    .checked_sub(self.0.as_ptr() as usize)
+                    .ok_or_else(|| serde::de::Error::custom("member outside params"))?;
+                let span = Some((start, start + value.get().len()));
+                match key.as_str() {
+                    "handle" => spans.handle = span,
+                    "prompt_file" => spans.prompt_file = span,
+                    _ => {}
                 }
                 if !seen.insert(key) {
                     return Err(serde::de::Error::custom("duplicate params member"));
                 }
             }
-            Ok(Handle(handle))
+            Ok(spans)
         }
     }
 
     let mut deserializer = serde_json::Deserializer::from_str(raw_params);
-    let Handle(handle) = deserializer
+    let spans = deserializer
         .deserialize_map(Members(raw_params))
         .map_err(|_| ApiError::INVALID_PARAMS)?;
     deserializer.end().map_err(|_| ApiError::INVALID_PARAMS)?;
-    let (start, end) = handle.ok_or(ApiError::INVALID_PARAMS)?;
-    let mut identity = Vec::with_capacity(raw_params.len());
-    identity.extend_from_slice(&raw_params.as_bytes()[..start]);
-    identity.push(b'"');
-    for byte in handle_hash {
-        identity.extend_from_slice(format!("{byte:02x}").as_bytes());
+    let handle = spans.handle.ok_or(ApiError::INVALID_PARAMS)?;
+    let mut hex = [0_u8; 66];
+    hex[0] = b'"';
+    hex[65] = b'"';
+    for (index, byte) in handle_hash.iter().enumerate() {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        hex[1 + index * 2] = DIGITS[usize::from(byte >> 4)];
+        hex[2 + index * 2] = DIGITS[usize::from(byte & 15)];
     }
-    identity.push(b'"');
-    identity.extend_from_slice(&raw_params.as_bytes()[end..]);
-    Ok(identity)
+    let content = prompt_file.map(|content| format!("\"{content}\""));
+    let mut replaced = vec![(handle, &hex[..])];
+    match (spans.prompt_file, &content) {
+        (Some(span), Some(content)) => replaced.push((span, content.as_bytes())),
+        (None, None) => {}
+        _ => return Err(ApiError::INVALID_PARAMS),
+    }
+    replaced.sort_by_key(|((start, _), _)| *start);
+    let bytes = raw_params.as_bytes();
+    let mut hasher = Sha256::new();
+    let mut len = 0_u64;
+    let mut at = 0;
+    for ((start, end), with) in replaced {
+        for piece in [&bytes[at..start], with] {
+            hasher.update(piece);
+            len += piece.len() as u64;
+        }
+        at = end;
+    }
+    hasher.update(&bytes[at..]);
+    len += (bytes.len() - at) as u64;
+    Ok(via_store::Identity {
+        len,
+        sha256: hasher.finalize().into(),
+    })
 }
 
 pub(crate) fn new_session_id() -> Result<SessionId, ApiError> {
@@ -945,10 +1173,9 @@ pub(crate) fn new_session_id() -> Result<SessionId, ApiError> {
 
 /// The only route this build can plan.
 pub(crate) const FAKE_ROUTE: &str = "fake";
-/// Wall deadline of a fake turn that neither sets nor inherits one. C1 §4's
-/// default is 3 600 000 ms; the fake route keeps 30 s so a hung fake turn in
-/// a test that sets nothing ends in bounded time.
-pub(crate) const FAKE_WALL_MS: u64 = 30_000;
+/// C1 §4 `deadlines.wall_ms` default (A3), for a fake turn that neither
+/// sets nor inherits one.
+pub(crate) const DEFAULT_WALL_MS: u64 = 3_600_000;
 /// C1 §4 `deadlines.idle_ms` default (design §5).
 pub(crate) const DEFAULT_IDLE_MS: u64 = 600_000;
 
@@ -1000,6 +1227,45 @@ pub(crate) struct Capabilities {
 }
 
 impl Capabilities {
+    /// C1 §4.1 `require` (design §11.1): `require` is a list of verb names,
+    /// each met only by `native` support unless written `verb:partial`,
+    /// which `partial` support also meets. The first unmet verb is
+    /// `missing_capability` naming it; anything else is `invalid_params`.
+    pub(crate) fn require(&self, require: &RawValue) -> Result<(), ApiError> {
+        let invalid = || {
+            ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("require") },
+                "require is a list of verb names",
+            )
+        };
+        let listed = json_limits::string_list(require.get()).ok_or_else(invalid)?;
+        for name in &listed {
+            // A verb met natively also meets `verb:partial`.
+            let verb = name.strip_suffix(":partial").unwrap_or(name);
+            let (named, support): (&'static Named, Support) = match verb {
+                "spawn" => (&const { Named::fake("spawn") }, self.verbs.spawn),
+                "resume" => (&const { Named::fake("resume") }, self.verbs.resume),
+                "steer" => (&const { Named::fake("steer") }, self.verbs.steer),
+                "cancel" => (&const { Named::fake("cancel") }, self.verbs.cancel),
+                "close" => (&const { Named::fake("close") }, self.verbs.close),
+                _ => return Err(invalid()),
+            };
+            let met = match support {
+                Support::Native => true,
+                Support::Unsupported { .. } => false,
+            };
+            if !met {
+                return Err(ApiError::naming(
+                    ApiError::MISSING_CAPABILITY,
+                    named,
+                    "a required verb is not supported natively on route fake",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The fake route: one prompt, one turn, no controls, bounds or usage.
     pub(crate) fn fake() -> Self {
         let unsupported = |reason| Support::Unsupported { reason };
@@ -1054,7 +1320,7 @@ impl Effective {
             effort: None,
             bound: None,
             deadlines: Deadlines {
-                wall_ms: overrides.wall_ms.unwrap_or(FAKE_WALL_MS),
+                wall_ms: overrides.wall_ms.unwrap_or(DEFAULT_WALL_MS),
                 idle_ms: overrides.idle_ms.unwrap_or(DEFAULT_IDLE_MS),
             },
             max_steps: None,
@@ -1504,25 +1770,50 @@ mod tests {
 
     /// C1 P4 / runtime §6: identity is the params bytes with only the handle
     /// value replaced by its hash; whitespace and member order are kept.
+    /// Design §10.3: it is streamed over the borrowed pieces, and equals
+    /// the length and SHA-256 of those bytes.
     #[test]
     fn retry_identity_keeps_every_byte_but_the_handle() {
         let hash = [0xab; 32];
         let raw = r#"{"prompt": "p","handle":"h_secret" ,"model":"fake"}"#;
-        let identity = String::from_utf8(retry_identity(raw, &hash).unwrap()).unwrap();
-        assert_eq!(
-            identity,
-            format!(
-                r#"{{"prompt": "p","handle":"{}" ,"model":"fake"}}"#,
-                "ab".repeat(32)
-            )
+        let expected = format!(
+            r#"{{"prompt": "p","handle":"{}" ,"model":"fake"}}"#,
+            "ab".repeat(32)
         );
-        assert!(!identity.contains("h_secret"));
+        let identity = retry_identity(raw, &hash, None).unwrap();
+        assert_eq!(identity, via_store::Identity::of(expected.as_bytes()));
         let respaced = r#"{"prompt":"p","handle":"h_secret" ,"model":"fake"}"#;
-        assert_ne!(
-            retry_identity(respaced, &hash).unwrap(),
-            identity.as_bytes()
+        assert_ne!(retry_identity(respaced, &hash, None).unwrap(), identity);
+        assert_ne!(retry_identity(raw, &[0; 32], None).unwrap(), identity);
+    }
+
+    /// Design §10.3 [t4r18.1]: a prompt file contributes its content's
+    /// `"sha256:<hex>:<len>"` in place of its path, wherever the members
+    /// stand; every other byte is kept.
+    #[test]
+    fn retry_identity_puts_the_prompt_file_content_in_place_of_its_path() {
+        let hash = [0x01; 32];
+        let content = format!("sha256:{}:3", "cd".repeat(32));
+        for raw in [
+            r#"{"prompt_file":"/tmp/p.txt","handle":"h_x","model":"fake"}"#,
+            r#"{"model":"fake", "handle" : "h_x","prompt_file":  "/tmp/p.txt" }"#,
+        ] {
+            let expected = raw
+                .replace("h_x", &"01".repeat(32))
+                .replace("/tmp/p.txt", &content);
+            assert_eq!(
+                retry_identity(raw, &hash, Some(&content)).unwrap(),
+                via_store::Identity::of(expected.as_bytes()),
+                "{raw}"
+            );
+        }
+        let one = r#"{"prompt_file":"/a","handle":"h"}"#;
+        let other = r#"{"prompt_file":"/b","handle":"h"}"#;
+        assert_eq!(
+            retry_identity(one, &hash, Some(&content)).unwrap(),
+            retry_identity(other, &hash, Some(&content)).unwrap(),
+            "the path is not part of the identity"
         );
-        assert_ne!(retry_identity(raw, &[0; 32]).unwrap(), identity.as_bytes());
     }
 
     /// C1 §3: `idempotency_key` and `op_key` are 1–64 printable ASCII
@@ -1565,7 +1856,7 @@ mod tests {
             r#"{"handle":"h"} trailing"#,
         ] {
             assert_eq!(
-                retry_identity(raw, &hash).unwrap_err().kind,
+                retry_identity(raw, &hash, None).unwrap_err().kind,
                 "invalid_params",
                 "{raw}"
             );

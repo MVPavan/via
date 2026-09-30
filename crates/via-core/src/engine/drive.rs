@@ -1,6 +1,7 @@
 //! Turn driving: submission, adapter execution, event commits and the terminal commit.
 
 use std::{
+    path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime},
 };
@@ -580,6 +581,37 @@ impl Engine {
     /// after a force stop. The turn's stop channels move from its claim into
     /// this loop, which observes its order, keeps its idle deadline and marks
     /// it `settling` once `execute` returned (design §2, §5).
+    /// A submitted turn's start facts, and the directory it runs in: the
+    /// session's frozen `cwd` (design §11.1), or the fake's default for a
+    /// session frozen without one.
+    fn started(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        queued: QueuedTurn,
+        (submitted, clock): (SystemTime, Instant),
+    ) -> (Started, PathBuf) {
+        let cwd = queued
+            .cwd
+            .map_or_else(|| self.adapter.fake_cwd().to_path_buf(), PathBuf::from);
+        let started = Started {
+            session: session.clone(),
+            turn,
+            queued_at: queued.queued_at,
+            first_seq: queued.queued_seq,
+            cwd: cwd.to_str().map(str::to_owned),
+            submitted: Some((rfc3339(submitted), clock)),
+            folder: Some(
+                self.store
+                    .evidence()
+                    .path(session, turn)
+                    .display()
+                    .to_string(),
+            ),
+        };
+        (started, cwd)
+    }
+
     async fn run(
         &self,
         slot: &Slot,
@@ -595,20 +627,7 @@ impl Engine {
             submitted,
             clock,
         } = submission;
-        let started = Started {
-            session: session.clone(),
-            turn,
-            queued_at: queued.queued_at,
-            first_seq: queued.queued_seq,
-            submitted: Some((rfc3339(submitted), clock)),
-            folder: Some(
-                self.store
-                    .evidence()
-                    .path(&session, turn)
-                    .display()
-                    .to_string(),
-            ),
-        };
+        let (started, cwd) = self.started(&session, turn, queued, (submitted, clock));
         // Design §2 [r1.11]: both deadlines run from the submission clock.
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
@@ -627,7 +646,7 @@ impl Engine {
         let driven = self
             .execute(
                 &mut record,
-                (prompt, &effective, activity),
+                (prompt, cwd, &effective, activity),
                 (deadline, route_stop),
                 Box::new(capacity),
                 &mut control,
@@ -1203,7 +1222,7 @@ impl Engine {
     async fn execute(
         &self,
         record: &mut TurnRecord,
-        (prompt, effective, activity): (String, &Effective, TurnActivity),
+        (prompt, cwd, effective, activity): (String, PathBuf, &Effective, TurnActivity),
         (deadline, stop): (Deadline, StopWatch),
         capacity: via_adapters::CapacityToken,
         control: &mut Control<'_>,
@@ -1214,7 +1233,7 @@ impl Engine {
         let mut execute = Box::pin(self.adapter.execute(
             record.session.clone(),
             record.turn,
-            prompt,
+            (prompt, cwd),
             sink,
             activity,
             deadline,
@@ -1728,7 +1747,7 @@ pub(super) fn ended_record(
         started.turn,
         terminal,
         record.accepted,
-        started.folder.clone(),
+        (started.cwd.clone(), started.folder.clone()),
         timestamps,
         duration_ms,
         (started.first_seq, seq),
@@ -1880,6 +1899,7 @@ pub(super) fn queued_cancellation(
         turn,
         queued_at: queued.queued_at,
         first_seq: queued.queued_seq,
+        cwd: queued.cwd,
         submitted: None,
         folder: None,
     };

@@ -53,6 +53,7 @@ async fn spawn(client: &StoreClient, id: &str) {
             handle_hash: [7_u8; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
+            label: None,
             prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             initial_event: event("turn.queued", 1),
@@ -382,7 +383,12 @@ fn submit_failed_commits_submission_and_terminal_atomically() {
             envelope: json!({"state":"failed","failure":{"class":"store"}}),
         };
         client.commit_submit_failed(record()).await.unwrap();
-        let result = client.result(&session(), turn(1)).await.unwrap().unwrap();
+        let result = client
+            .result_text(&session(), turn(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let result: Value = serde_json::from_str(result.get()).unwrap();
         assert_eq!(result["failure"]["class"], "store");
         assert_eq!(client.next_seq(&session()).await.unwrap(), Some(4));
         assert!(client.commit_submit_failed(record()).await.is_err());
@@ -503,7 +509,7 @@ fn failure_resolution_batch_is_one_bounded_transaction() {
         for number in 1..=8 {
             assert!(
                 client
-                    .result(&session(), turn(number))
+                    .result_text(&session(), turn(number))
                     .await
                     .unwrap()
                     .is_some()
@@ -540,7 +546,13 @@ fn failure_resolution_refuses_a_primary_turn_that_is_not_running() {
             "{refused:?}"
         );
         assert_eq!(client.next_seq(&session()).await.unwrap(), Some(3));
-        assert!(client.result(&session(), turn(1)).await.unwrap().is_none());
+        assert!(
+            client
+                .result_text(&session(), turn(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
     });
 }
 
@@ -583,7 +595,7 @@ fn failure_resolution_refuses_a_partial_cancellation_set() {
         for number in 1..=3 {
             assert!(
                 client
-                    .result(&session(), turn(number))
+                    .result_text(&session(), turn(number))
                     .await
                     .unwrap()
                     .is_none()

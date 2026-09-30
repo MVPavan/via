@@ -16,8 +16,10 @@ use crate::api::{
 use crate::{SessionId, TurnNumber};
 
 /// Assembles the C1 §5 envelope; `events` runs from the turn's `turn.queued` to
-/// its `turn.ended`, other turns' events of the session included. `folder`
-/// is the turn's absolute evidence folder, `None` for a turn never submitted.
+/// its `turn.ended`, other turns' events of the session included. `cwd` is
+/// the session's frozen working directory (design §11.1), `None` where the
+/// caller did not read it; `folder` is the turn's absolute evidence folder,
+/// `None` for a turn never submitted.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -27,7 +29,7 @@ pub(super) fn terminal_envelope(
     turn: TurnNumber,
     terminal: Terminal,
     accepted: Option<Accepted>,
-    folder: Option<String>,
+    (cwd, folder): (Option<String>, Option<String>),
     timestamps: Timestamps,
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
@@ -66,7 +68,7 @@ pub(super) fn terminal_envelope(
         warnings,
         plan,
         vendor_session_id: None,
-        cwd: None,
+        cwd,
         bound: Bound::NONE,
         final_text: terminal.final_text,
         structured_output: None,

@@ -108,6 +108,9 @@ impl ReadStreak {
 pub(super) struct Queueing {
     pub(super) queued_at: String,
     pub(super) queued_seq: u64,
+    /// The session's frozen `cwd` when the queued row was read (design
+    /// §11.1); `None` when the queueing comes from the event history.
+    pub(super) cwd: Option<String>,
 }
 
 impl From<&QueuedTurn> for Queueing {
@@ -115,6 +118,7 @@ impl From<&QueuedTurn> for Queueing {
         Self {
             queued_at: queued.queued_at.clone(),
             queued_seq: queued.queued_seq,
+            cwd: queued.cwd.clone(),
         }
     }
 }
@@ -404,7 +408,7 @@ pub(super) async fn commit_submit_failed(
         terminal,
         None,
         // Never submitted to a vendor: no evidence folder (design §7.1).
-        None,
+        (queueing.cwd, None),
         timestamps,
         None,
         (queueing.queued_seq, ended_seq),

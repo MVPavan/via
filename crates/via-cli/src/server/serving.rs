@@ -242,6 +242,8 @@ impl Main {
 
 /// Admits one accepted connection whose peer is this user into `clients`:
 /// daemon main's serving and final shutdown's diagnostic window (§7.4).
+/// A connection past the 32 socket slots is closed without bytes (design
+/// §10.1); its task holds the slot until it ends.
 pub(super) fn admit(
     clients: &mut JoinSet<anyhow::Result<()>>,
     accepted: std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
@@ -253,7 +255,15 @@ pub(super) fn admit(
     };
     match stream.peer_cred() {
         Ok(peer) if peer.uid() == rustix::process::geteuid().as_raw() => {
-            clients.spawn(handle_client(stream, client.clone()));
+            let Ok(slot) = Arc::clone(&client.sockets).try_acquire_owned() else {
+                return;
+            };
+            let client = client.clone();
+            clients.spawn(async move {
+                let served = handle_client(stream, client).await;
+                drop(slot);
+                served
+            });
         }
         // Another user's peer, or an unreadable credential: closed unserved.
         Ok(_) | Err(_) => {}
@@ -269,6 +279,7 @@ pub(super) const NOT_IDLE: ApiError = ApiError {
     kind2: None,
     commit_outcome: None,
     named: None,
+    reason: None,
 };
 
 fn plain_stop() -> DaemonStopParams {

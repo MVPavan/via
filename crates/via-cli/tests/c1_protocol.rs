@@ -227,8 +227,8 @@ fn c1_request_envelope_is_strict() -> TestResult {
         ("numeric jsonrpc", false, r#"{"jsonrpc":2.0,"id":7,"method":"daemon/status"}"#.to_owned(), request, true),
         ("object id", false, r#"{"jsonrpc":"2.0","id":{"n":7},"method":"daemon/status"}"#.to_owned(), request, false),
         ("boolean id", false, r#"{"jsonrpc":"2.0","id":true,"method":"daemon/status"}"#.to_owned(), request, false),
-        ("fractional id", false, r#"{"jsonrpc":"2.0","id":7.5,"method":"daemon/status"}"#.to_owned(), request, false),
-        ("null id", false, r#"{"jsonrpc":"2.0","id":null,"method":"daemon/status"}"#.to_owned(), request, false),
+        // A null or fractional id is served (C1 A31;
+        // `s1_c1_request_id_over_256_bytes_is_invalid_request`).
         ("notification", false, r#"{"jsonrpc":"2.0","method":"daemon/status"}"#.to_owned(), request, false),
         ("non-string method", false, r#"{"jsonrpc":"2.0","id":7,"method":5}"#.to_owned(), request, true),
         ("unknown envelope member", false, r#"{"jsonrpc":"2.0","id":7,"method":"daemon/status","extra":true}"#.to_owned(), request, true),

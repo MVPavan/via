@@ -624,7 +624,9 @@ pub(super) async fn read_result(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<Value>, ApiError> {
-    let read = store.result(session, turn).await;
+    let read = store.result_text(session, turn).await.map(|text| {
+        text.map(|text| serde_json::from_str(text.get()).expect("a stored envelope is JSON"))
+    });
     settled_result(unresolved, session, turn, read)
 }
 

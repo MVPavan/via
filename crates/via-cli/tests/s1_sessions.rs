@@ -1261,9 +1261,10 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
                 return Err(failure("a refused request committed a turn"));
             }
             // Nullable members accept null (`output_schema: null` clears);
-            // empty values pass.
+            // empty values pass. A nested null in `deadlines` is refused
+            // (A9, `s1_c1_wall_default_and_nested_null_deadlines`).
             let nulls = json!({"output_schema":null,"max_steps":null,
-                "vendor":{},"deadlines":{"wall_ms":null,"idle_ms":null}});
+                "vendor":{},"deadlines":{}});
             let mut params = spawn_base.clone();
             params["prompt"] = json!("n1");
             let mut resumed = resume_base.clone();
@@ -1283,7 +1284,7 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
             )?;
             // Nothing given or inherited: the fake route's default wall deadline.
             for receipt in [&null_spawn, &null_resume] {
-                if receipt["effective"] != fake_effective(30_000) {
+                if receipt["effective"] != fake_effective(3_600_000) {
                     return Err(failure(format!("null values changed effective: {receipt}")));
                 }
             }

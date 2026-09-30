@@ -308,6 +308,7 @@ impl Engine {
         Ok(Queueing {
             queued_at,
             queued_seq,
+            cwd: None,
         })
     }
 
@@ -471,12 +472,16 @@ impl Engine {
             terminal,
             record.accepted,
             // A recovered turn was submitted: its folder was named then.
-            Some(
-                self.store
-                    .evidence()
-                    .path(&session, turn)
-                    .display()
-                    .to_string(),
+            // Its session's `cwd` is not read here (design §11.1).
+            (
+                None,
+                Some(
+                    self.store
+                        .evidence()
+                        .path(&session, turn)
+                        .display()
+                        .to_string(),
+                ),
             ),
             timestamps,
             None,

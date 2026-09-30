@@ -267,6 +267,8 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
         "VIA_TEST_CONNECTION_SLOTS",
         "VIA_TEST_IDLE_EXIT_MS",
         "VIA_TEST_CLIENT_VERSION",
+        "VIA_TEST_PARTIAL_LINE_MS",
+        "VIA_TEST_REPLY_WRITE_MS",
     ] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
@@ -422,6 +424,62 @@ fn transact(
         bail!("daemon response ID mismatch");
     }
     Ok(reply)
+}
+
+/// `via serve --stdio` (C1 §1): forwards bytes unchanged between stdio and
+/// the daemon socket, starting the daemon when none listens. It says no
+/// `hello` itself; its parent does. Stdin's end shuts the socket's write
+/// side; the proxy ends when the daemon's side ends.
+pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
+    let paths = paths()?;
+    let socket = paths.runtime.join("via.sock");
+    let mut starter = Starter::new();
+    let stream = loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                starter.check()?;
+                starter.advance(&paths)?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
+    // Listening: the pipe is dropped and later daemon writes fail silently.
+    starter.starting = None;
+    let mut to_daemon = stream.try_clone()?;
+    let mut from_daemon = stream;
+    // Blocking copies: a stdin read cannot be cancelled, and the process
+    // exits without joining it (`main` shuts the runtime down in the
+    // background).
+    let mut copies = tokio::task::JoinSet::new();
+    copies.spawn_blocking(move || {
+        // Safe to ignore: a failed write means the daemon closed the
+        // connection, which the other copy sees as its end.
+        if io::copy(&mut io::stdin().lock(), &mut to_daemon).is_ok() {
+            let _ = to_daemon.shutdown(std::net::Shutdown::Write);
+        }
+        io::Result::Ok(false)
+    });
+    copies.spawn_blocking(move || {
+        let mut stdout = io::stdout().lock();
+        io::copy(&mut from_daemon, &mut stdout)?;
+        stdout.flush()?;
+        io::Result::Ok(true)
+    });
+    // The daemon's side ending ends the proxy, whatever stdin is doing.
+    while let Some(copied) = copies.join_next().await {
+        if copied?? {
+            break;
+        }
+    }
+    Ok(0)
 }
 
 /// Refuses a socket whose listener is not `uid` before any protocol byte (and
