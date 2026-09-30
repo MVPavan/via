@@ -133,20 +133,6 @@ impl Setup {
     fn folder(&self, session: &str) -> PathBuf {
         self.sandbox.state.join("evidence").join(session).join("1")
     }
-
-    /// The daemon's pid, as `daemon status` reports it.
-    fn daemon_pid(&self, evidence: &Evidence) -> Result<u32, ScenarioError> {
-        let status = cli(
-            &self.sandbox,
-            evidence,
-            "daemon_status",
-            &["daemon", "status", "--json"],
-        )?;
-        status["pid"]
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or_else(|| failure(format!("daemon status has no pid: {status}")))
-    }
 }
 
 /// The envelope's named file: its path is `final_text.txt` in the turn's
@@ -332,8 +318,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 .arm("core.finish_running.pause", 1, "pause")
                 .map_err(infra)?;
             let session = {
-                let _daemon = setup.start(evidence)?;
-                let pid = setup.daemon_pid(evidence)?;
+                let daemon = setup.start(evidence)?;
+                // The child's own pid, which readiness confirmed serves the socket.
+                let pid = daemon.pid();
                 let session = setup.spawn(evidence, "crashed")?;
                 setup
                     .failpoints

@@ -396,19 +396,11 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
     let report = run_scenario(
         evidence,
         |evidence| {
-            let _daemon = Daemon::start_with(&sandbox, evidence, |command| {
+            let daemon = Daemon::start_with(&sandbox, evidence, |command| {
                 failpoints.activate(command);
             })?;
-            let status = cli(
-                &sandbox,
-                evidence,
-                "daemon_status",
-                &["daemon", "status", "--json"],
-            )?;
-            let pid = status["pid"]
-                .as_u64()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .ok_or_else(|| failure(format!("no daemon pid: {status}")))?;
+            // The child's own pid, which readiness confirmed serves the socket.
+            let pid = daemon.pid();
             // Elapsed time only: the daemon settles before its baseline.
             thread::sleep(Duration::from_millis(300));
             let baseline = status_kib(pid, "VmRSS:").ok_or_else(|| infra("no daemon VmRSS"))?;
@@ -501,13 +493,15 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 .unwrap_or(0);
             let peak = peak_hwm.max(peak_sampled);
             let first = 64 * MIB;
-            let before = samples
+            // RSS at the threshold: the last sample (in time order) before
+            // 64 MiB is flooded, not the highest before it, so any later rise
+            // counts against the 32 MiB growth bound.
+            let at_first = samples
                 .daemon
                 .iter()
-                .filter(|sample| sample.flooded < first)
-                .map(|sample| sample.rss_kib)
-                .max()
-                .unwrap_or(baseline);
+                .rev()
+                .find(|sample| sample.flooded < first)
+                .map_or(baseline, |sample| sample.rss_kib);
             let after = samples
                 .daemon
                 .iter()
@@ -525,7 +519,7 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
             let metrics = json!({
                 "baseline_kib": baseline, "peak_kib": peak, "peak_hwm_kib": peak_hwm,
                 "peak_sampled_kib": peak_sampled, "samples": samples.daemon.len(),
-                "limit_kib": SUM_MIB * 1024 * 5 / 4, "rss_before_64_mib_kib": before,
+                "limit_kib": SUM_MIB * 1024 * 5 / 4, "rss_at_64_mib_kib": at_first,
                 "rss_after_64_mib_kib": after, "flooded_bytes": flooded,
                 "anchors": samples.anchors.len(), "anchor_peak_kib": anchor_peak,
                 "maximal_lines": lines, "slowest_control_ms": slowest.as_millis(),
@@ -579,8 +573,8 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 peak.saturating_sub(baseline) <= SUM_MIB * 1024 * 5 / 4,
                 || format!("peak RSS less baseline is over 1.25 × the §5.1 sum: {metrics}"),
             )?;
-            check(after.saturating_sub(before) < 32 * 1024, || {
-                format!("RSS grew 32 MiB or more after the first 64 MiB: {metrics}")
+            check(after.saturating_sub(at_first) < 32 * 1024, || {
+                format!("RSS grew 32 MiB or more over its value at 64 MiB flooded: {metrics}")
             })?;
             check(
                 !samples.anchors.is_empty() && anchor_peak <= 32 * 1024,
