@@ -197,7 +197,7 @@ On tip `2d57e98` (code), in the worktree:
   same, measured on a copy of the base from `git archive`. Hundreds of such
   anchors from older worktrees are running on this host. I SIGKILLed only
   this worktree's leftovers and my base copy's, and `ps` then showed none
-  from `/data/codes/via-wt/s1-io`.
+  from the S1-io worktree.
 - **Disclosure.** While clearing my leftovers, one `kill` (SIGTERM) matched
   every `deps/s1_host-*` anchor on the host, including stale ones from other
   worktrees. Most ignored it, and two exited. I did not record which two.
@@ -304,7 +304,7 @@ missed, and the anchor then stayed paused for good.
 10 s, then removes it. There is no kill.
 
 **Counts** (`pgrep -f -- '--exact anchor_entry'`, limited to
-`/data/codes/via-wt/s1-io/target/`, 10 s after each run of the `via-host`
+the worktree's `target/`, 10 s after each run of the `via-host`
 failpoint suite):
 
 | | start | after run 1 | after run 2 |

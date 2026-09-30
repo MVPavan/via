@@ -1,7 +1,7 @@
 # T4-0 design round 5 brief: redesign against the owner's requirements
 
 Worker: `implementer-high` (Opus 5.5 high; owner decision 2026-09-29).
-Worktree `/data/codes/via-wt/t4-0`, branch `wt/t4-0`. This step writes **no
+Worktree of branch `wt/t4-0`. This step writes **no
 production code and no tests**, and does not edit `docs/specs/`.
 
 ## Why this round exists
