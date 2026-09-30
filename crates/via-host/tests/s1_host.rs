@@ -1531,6 +1531,44 @@ fn early_stops_are_concurrent() {
     });
 }
 
+/// S1 critic finding 5: a live Host collects each finished turn's reaper
+/// and exit poll, and prunes its dropped control, as later turns begin; the
+/// registries stay bounded instead of growing per turn.
+#[test]
+fn live_service_collects_finished_turn_tasks() {
+    const TURNS: usize = 6;
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        for _ in 0..TURNS {
+            let acquired = host
+                .acquire(fixture.spec("/bin/true", &[]), within(4))
+                .await
+                .unwrap();
+            let close = acquired
+                .control
+                .close(CloseRequest {
+                    mode: CloseMode::Graceful,
+                    deadline: within(3),
+                })
+                .await;
+            assert!(
+                matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+                "{close:?}"
+            );
+            drop(acquired);
+        }
+        // At most this turn's and the previous turn's two tasks and control.
+        let (tasks, controls) = host.tracked();
+        assert!(
+            tasks <= 4 && controls <= 2,
+            "{tasks} tasks and {controls} controls tracked after {TURNS} turns"
+        );
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
+    });
+}
+
 /// A fresh `stderr.log` name per spec: Host creates it exclusively.
 fn next_stderr() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
