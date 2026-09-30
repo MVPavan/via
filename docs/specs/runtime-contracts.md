@@ -123,15 +123,14 @@ impl FakeRoute {
     pub fn new(config: RuntimeConfig, resources: RuntimeResources)
         -> Result<Self, RouteError>;
     // Task 1 entrypoint; C2 still owns acceptance/observation delivery.
+    // The per-turn stop watch carries cancel, close and the idle deadline.
     pub fn execute(&self, connection_id: ConnectionId, process: PrivateProcessSpec,
-                   start: FakeStart, deadline: Deadline)
+                   start: FakeStart, deadline: Deadline, stop: StopWatch)
         -> impl Future<Output = Result<FakeRouteResult, RouteError>> + Send;
     pub fn open(spec: RouteOpen, cx: RouteCx)
         -> impl Future<Output = Result<RouteSession, RouteError>> + Send;
     pub fn start(&self, input: FakeStart, deadline: Deadline)
         -> impl Future<Output = Result<FakeAcceptance, RouteError>> + Send;
-    pub fn interrupt(&self, deadline: Deadline)
-        -> impl Future<Output = Result<FakeInterrupt, RouteError>> + Send;
     pub fn close(&self, request: CloseRequest)
         -> impl Future<Output = CloseReport> + Send;
     pub fn health(&self) -> RouteHealth;
@@ -146,6 +145,9 @@ text, terminal, tool-start/tool-end, interrupt acknowledgement and bounded
 unknown notification. Known malformed messages become protocol errors. The
 test-only scenario selection is separate from the prompt. No shell snippets
 or untyped universal method map cross C3.
+
+`FakeRoute::execute` with a per-turn stop watch supersedes the separate
+`interrupt` entrypoint (amendment A12 in the Task 3 design).
 
 There is one start awaiting acceptance per private connection. Route assigns
 the protocol request ID and pairs a response once; unsolicited or duplicate
@@ -465,6 +467,12 @@ arm intent without vendor facts is evidence of possible launch, not evidence
 of either launch or non-launch. The 5 s pre-ARM timer is not restarted by
 Configure, failed storage or reconnect.
 
+Recovery reconnects (Challenge, Status, `Stop`) only to an anchor whose
+durable phase is `arm_intent`. A pre-ARM anchor (`intent`, `identified`)
+serves only its bootstrap controller. Recovery opens no control connection
+to it and proves cleanup by the absence predicate (§5.2) after its EOF exit
+(amendment A20 in the Task 3 design).
+
 The control protocol is a closed enum of `Challenge`, `Configure`, `Arm`,
 `Stop`, `Status` and replies. Configure is accepted once, before ARM, only
 on the original bootstrap controller connection; its validated argv/env/cwd
@@ -778,7 +786,10 @@ connecting to an existing daemon, the CLI completes hello, reads
 `daemon/status` and compares its expected Store path with `store_path` by
 filesystem identity of parent directories plus the fixed filename, not
 textual path alone. On mismatch, exit 4 with a local configuration error;
-do not stop that daemon or silently use its Store. Explicit protocol clients
+do not stop that daemon or silently use its Store. A version-mismatched
+client whose Store matches may request the idle-only stop of C1 §1 (a plain
+`daemon/stop` that only daemon main's idle predicate accepts). On a Store
+mismatch the daemon is never stopped (amendment A13 in the Task 3 design). Explicit protocol clients
 choose a socket and can inspect status themselves. No new handshake field is
 needed. Diagnostics may contain paths but no handles or vendor payloads.
 
@@ -825,7 +836,11 @@ both for daemon lifetime and never unlink either inode. Only after both
 locks and directory checks succeed may startup replace stale `via.sock` or
 mutate/open Store. The second lock prevents distinct runtime roots from
 opening one state root as competing writers. Lock conflict refuses startup
-without deletion/takeover. Shutdown retains §5/§6 flush/join then lock
+without deletion/takeover. A daemon whose `daemon.lock` attempt meets
+contention exits 75; a `store.lock` conflict exits 4. The CLI's
+auto-start retries a 75 exit within a 15 s startup budget and shows the
+daemon's startup stderr for other failures (amendment A3 in the Task 3
+design). Shutdown retains §5/§6 flush/join then lock
 release order. Do not bulk-delete anchor sockets at startup.
 
 Default paths still form one per-user daemon. Explicit state/runtime pairs
@@ -908,22 +923,46 @@ A result that cannot persist keeps F12's named `store_error` and
 
 ## 7. F12: persistent Store failure and crash reconciliation
 
-First SQLite/state write failure or uncertain Store commit latches daemon health to
-`StoreFailed`, broadcasts through a reserved watch channel and stops admission
-and dispatch immediately. A watcher is independent of Store's work queue.
-A global Store failure
-cleans up every active connection. No Store task silently swallows failure.
+A Store write has one of three outcomes:
 
-| Caller situation | Required response |
-|---|---|
-| Unacknowledged spawn/resume | `store_error`; include `commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain; a timeout never proves absence |
-| Already receipted wait/result for affected nonterminal turn | `store_error` with session/turn, `durable_state` from last known commit, `terminal_persisted:false`; no invented envelope |
-| Durable terminal result readable after failure | Return that committed result, not a fabricated new failure |
-| New mutation or dispatch | Refuse `store_error`; authenticated cancel/close may still initiate best-effort cleanup but return `store_error` if their result cannot commit |
-| `daemon/status` | In-memory `health:store_failed`, bounded failure kind and affected IDs; no prompts, payloads or handle |
+- **committed**;
+- **not committed**, when SQLite rolled the transaction back, or the
+  request was never enqueued because the writer's queue was full;
+- **uncertain**, when the error came from the commit step, the writer
+  thread is gone (its queue is disconnected or a reply was dropped), or the
+  2 s operation watchdog expired. An uncertain write latches.
 
-Core makes one best-effort failure-resolution batch for each affected active
-turn: `failed(store)`, real cleanup evidence, plus queued cancellations. It
+A write that is not committed is scoped to the request or turn that made
+it. A receipt fails with `store_error` and `commit_outcome:
+not_committed`. A turn's first failed write stops that turn: no further
+agent I/O is started for it, and the turn ends `failed(store)` with its
+cleanup evidence through one resolution write. A natural terminal that
+did not commit is retried once. Other requests, turns and sessions are
+unaffected.
+
+Core latches daemon health to `StoreFailed` when any write's outcome is
+uncertain, when a turn's resolution write or terminal retry fails in any
+way, or when SQLite reports corruption. The latch broadcasts through a
+reserved watch channel and stops admission and dispatch immediately. A
+watcher is independent of Store's work queue.
+
+A latched Store failure cleans up every active connection. No Store task
+silently swallows failure.
+
+| Caller situation | Write not committed (scoped) | Latched |
+|---|---|---|
+| Unacknowledged spawn/resume | `store_error`, `commit_outcome: not_committed`; a keyed retry may succeed | `store_error`; `commit_outcome: unknown` and `retry: same_key_only` when uncertain; a timeout never proves absence |
+| Receipted turn whose own write failed | the turn ends `failed(store)` with cleanup evidence, except that a natural terminal whose one retry commits keeps its result, and a dispatcher-owned queued cancellation whose retry commits stays `cancelled`; `wait` and `result` return that envelope | `store_error` with session/turn, `durable_state` from the last known commit, `terminal_persisted:false`; no invented envelope |
+| Durable terminal result readable after failure | return it | return that committed result, not a fabricated new failure |
+| Other mutations and dispatch | unaffected | refuse with `store_error`; `cancel` and `close` return `store_error`, and the latch's force stop performs cleanup |
+| `daemon/status` | `health: healthy`; `store_failure` reports the latest failure and its scope | `health: store_failed`, which is sticky; `store_failure` reports the latest recorded failure and its scope; no prompts, payloads or handle |
+
+This scoping is amendment A14 in the Task 3 design; its §7.2 lists the
+scoped cases.
+
+On the latched path: Core makes one best-effort failure-resolution batch
+for each affected active turn: `failed(store)`, real cleanup evidence, plus
+queued cancellations. It
 uses a reserved Store slot if the writer is usable. If storage remains failed,
 record the attempt only in bounded memory/diagnostics; do not queue infinite
 retries, claim success, or overwrite an earlier committed vendor result.
@@ -932,8 +971,8 @@ persist despite an error; no contradictory second batch is issued until
 that transaction is resolved by the writer. No transaction outcome resolution
 within 2 s means skip the failure write, keep health failed, and clean up.
 
-Host independently starts stopping private groups using §5 on failure
-notification, without waiting for Store. Its bound is 3 s from the instant
+On the latched path: Host independently starts stopping private groups
+using §5 on failure notification, without waiting for Store. Its bound is 3 s from the instant
 the failure is raised, not from when a Host task first runs, and no later
 step grants a fresh allowance. Once the failure is raised, Host sends no
 new ARM from a launch that has not passed its ARM gate. A launch already
@@ -949,9 +988,11 @@ proves absence. The runtime does not promise that a group is gone within
 3 s: the anchor may be slow, and a write to an anchor socket the kernel
 will not accept bytes on cannot be completed (amendment A23 in the Task 3
 design). Drain reads until EOF/deadline.
-The daemon remains available for diagnostic/read requests for at most 5 s
-after the latching failure (`failed_at`), attempts Store flush and task
-joins within a total 10 s shutdown bound measured from that failure (§6.2), then exits 4. No successful graceful-stop result
+
+On the latched path: the daemon remains available for diagnostic/read
+requests for at most 5 s after the latching failure (`failed_at`), attempts
+Store flush and task joins within a total 10 s shutdown bound measured from
+that failure (§6.2), then exits 4. No successful graceful-stop result
 is returned for failed flush/join. Synchronous disk I/O can hang in the kernel:
 it cannot be cancelled by a Rust timeout. Retain/report the unjoined thread;
 the outer process supervisor enforces the process-exit bound in tests. The
