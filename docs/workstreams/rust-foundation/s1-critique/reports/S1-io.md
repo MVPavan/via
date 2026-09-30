@@ -1,7 +1,9 @@
 # S1-io report: Host control exchanges, live task collection, draining reader
 
-**Status: DONE_WITH_CONCERNS.** Fixes S1 critic findings 4, 5 and 6
-(`reviews/S1-critic-r1.md`), Bead `via-jm4.7.9.2`. Branch `wt/s1-io`, cut
+**Status: DONE** after fix round 1 (see its section; round 0 was
+DONE_WITH_CONCERNS). Fixes S1 critic findings 4, 5 and 6
+(`reviews/S1-critic-r1.md`), Bead `via-jm4.7.9.2`, and in fix round 1 the
+Sol r1 review findings and bead `via-jm4.19`. Branch `wt/s1-io`, cut
 from `rust-foundation` at `7370e0e`. Logs: `scratchpad/s1/io/`.
 
 ## Commits
@@ -10,7 +12,12 @@ from `rust-foundation` at `7370e0e`. Logs: `scratchpad/s1/io/`.
 | --- | --- | --- |
 | `0e26f84` | 6 | `fix(wire)`: the stdout reader keeps draining while the prefix save runs |
 | `2d57e98` | 4, 5 | `fix(host)`: control exchanges retire their stream; live Host collects tasks |
-| (this commit) | — | this report |
+| `2ff2495` | — | this report, round 0 |
+| `e8d4281` | r1 finding 1 | `fix(host)`: keep only forced facts no close report handed off |
+| `d851b3d` | r1 finding 2 | `test(host)`: the busy-lock regression waits for polls that met the lock |
+| `ebba854` | r1 decision 3 | `fix(host)`: a retired control is shut down so the anchor cleans up on EOF |
+| `eefe624` | via-jm4.19 | `test(host)`: the s1_host fixture releases paused anchors before cleanup |
+| (this commit) | — | this report, fix round 1 |
 
 ## Finding 4: control exchanges are never abandoned on a reused stream
 
@@ -167,7 +174,8 @@ On tip `2d57e98` (code), in the worktree:
   extracted exit poll registers through the new `HostTasks::track`, so
   splitting them would have needed an intermediate state. The commit message
   names both findings.
-- **A retired control cannot stop its group actively.** A `close` after
+- **A retired control cannot stop its group actively** (resolved in fix
+  round 1, decision 3: retirement now shuts the control down). A `close` after
   retirement writes no `Stop`, so it only waits for absence. The group then
   ends when the control is dropped (the anchor's EOF cleanup) or through
   reconciliation, and the close can report `Uncertain`. Before this change,
@@ -179,7 +187,8 @@ On tip `2d57e98` (code), in the worktree:
   This covers `stop_through` past its deadline in early stop and row-4
   cleanup. Its exit supervision then ends, and those paths are already
   stopping the turn.
-- **Pre-existing anchor leak in `via-host` `s1_host` tests** (not a
+- **Pre-existing anchor leak in `via-host` `s1_host` tests** (fixed in fix
+  round 1, bead `via-jm4.19`; not a
   regression). Each run of the `via-host` failpoint suite leaves 4 test
   anchors alive: base `7370e0e` 4, then 8 after two runs, and this branch the
   same, measured on a copy of the base from `git archive`. Hundreds of such
@@ -190,3 +199,138 @@ On tip `2d57e98` (code), in the worktree:
   every `deps/s1_host-*` anchor on the host, including stale ones from other
   worktrees. Most ignored it, and two exited. I did not record which two.
   None of the remaining anchors belongs to `s1-core` or `s1-specs`.
+
+## Fix round 1 (Sol high r1: UNSOUND)
+
+Review: `scratchpad/execution/s1-critic/review-s1-io-sol-r1.md`. The
+orchestrator's decisions 1–5 are taken in order. Logs are under
+`scratchpad/s1/io/r1-*`.
+
+### Decision 1: `HostTasks::forced` stays bounded
+
+**Readers of `forced`.** One reader, `reconcile_page`, sets
+`RecoveryReport.forced` from it. That value is used in three places:
+- **`Host::shutdown` (`reconcile_turns`).** It aggregates the value per turn,
+  only for the turns Core passes, which are its unresolved turns. Core reads
+  it in `stop.rs` as `recovered_forced`, next to `turn.close.forced`.
+- **`recover_page` at startup recovery.** It runs on a fresh Host, so the
+  only facts are the ones its own reconciliation `Stop`s add.
+- **`recover_cohort_page` (reprobe).** It covers only prior-daemon anchors,
+  again with only reconciliation's own facts.
+
+A fact that a control's close put into its `CloseReport.forced` already
+reaches Core as `route.forced`, then `RouteClose.forced`, then
+`ForcedTurn.close.forced`. Nothing needs it Host-wide afterwards.
+
+**Rule.**
+- `StopFacts` has a new `reported` flag, set when a close report carries
+  `forced`.
+- `prune_controls` moves a pruned control's fact into `forced` only when no
+  close report handed it off.
+- During live service, unhanded facts come only from early stop, which runs
+  once per daemon force and is bounded by the live controls at that moment.
+- No new lifecycle mechanism was needed.
+- The row-4 insert (`VendorFacts` commit failure) predates this chunk and is
+  unchanged. It fires only on a journal commit failure, and it also hands the
+  fact over in `AcquireFailure.forced`.
+
+**Test.** `live_service_collects_finished_turn_tasks` now also runs six
+forced turns (`/bin/sleep 60`, close `Force`, asserting `close.forced`). It
+counts the set through `Host::tracked()`, which is now
+`(tasks, controls, forced)`.
+- RED (`r1-f1-red.log`): "2 tasks, 1 controls and 5 forced facts tracked
+  after 6 graceful and 6 forced turns".
+- GREEN (`r1-f1-green.log`): 0 facts.
+
+### Decision 2: the busy-lock test proves contention
+
+`supervise_exit` now counts, in unit-test builds only (`#[cfg(test)]`
+static `BUSY_SKIPS`), each tick that found the control busy. The test keeps
+the lock until three ticks have met it, however late the poll first runs,
+then releases it and expects the exit. The 400 ms sleep is gone.
+- RED on the old poll (`r1-f2-red-old-poll.log`): I temporarily restored the
+  `7370e0e` poll body, recording a meeting where it met the held lock. Result:
+  "supervision stopped polling the held lock". The old poll meets the lock
+  once, waits 100 ms and ends. A single meeting is not enough: the old poll
+  passes when the lock is freed within its 100 ms wait, which is why the test
+  requires three.
+- GREEN (`r1-f2-green.log`).
+
+### Decision 3: a retired control is shut down
+
+- `ControlConnection::retire` sets the flag and shuts the stream down for
+  writing (`AsyncWriteExt::shutdown`). The anchor then reads control EOF and
+  starts its post-ARM own-group cleanup (runtime §5.1, `anchor.rs` ~229).
+- `transact` and `transact_by` call it on every error or missing reply. A
+  late reply that was read still completes the exchange.
+- The exit poll calls it when a `Status` exchange fails or times out.
+- A control left retired by a cancelled exchange is shut down by the next
+  `begin`, or by `close` straight after its cancelled `Stop` if the lock is
+  free.
+- `ProcessControl` stays, so `close` proves absence through the journal.
+  EOF sets no `StopFacts`, so it adds no forced evidence.
+
+Tests:
+- The unit test `a_status_reply_past_its_bound_retires_the_control` now
+  asserts that the peer reads EOF after retirement.
+- The new integration test
+  `a_retired_control_is_shut_down_and_the_anchor_cleans_up_on_eof` stops the
+  real anchor with `SIGSTOP`. It stops answering `Status`, and the 1 s bound
+  retires the control. After `SIGCONT` (sent through a drop guard), a `Force`
+  close sends no `Stop`, proves `GroupAbsent` with `forced == false`, and the
+  group is gone.
+- RED (`r1-d3-red.log`): "the anchor saw no control EOF", and
+  `CloseReport { cleanup: Uncertain(Deadline), forced: false, .. }`.
+- GREEN (`r1-d3-green.log`): 70/70 via-host tests pass.
+
+### Decision 4
+
+No change: a `Stop` whose reply missed its deadline still retires the
+control, and now also shuts it down.
+
+### Bead via-jm4.19: `s1_host` anchor leak
+
+**Cause.** `Fixture::drop` removed the fixture folder while an anchor paused
+at a failpoint (for example `host.anchor.before_eof_cleanup`) still polled
+it for its release file. A release written just before the drop could be
+missed, and the anchor then stayed paused for good.
+
+**Fix.** Drop now writes a release file for every entered point (each
+`*.ack`). It keeps the folder until no live process has a
+`VIA_HOST_TEST_CONFIG` under this fixture's `anchors` folder, bounded at
+10 s, then removes it. There is no kill.
+
+**Counts** (`pgrep -f -- '--exact anchor_entry'`, limited to
+`/data/codes/via-wt/s1-io/target/`, 10 s after each run of the `via-host`
+failpoint suite):
+
+| | start | after run 1 | after run 2 |
+| --- | --- | --- | --- |
+| before, `ebba854` (`r1-leak-before.log`) | 0 | 4 | 8 |
+| after, fixture fix (`r1-leak-after.log`) | 0 | 0 | 0 |
+
+After the full gate and the two extra failpoint runs, the count was 0 and no
+process from this worktree was running. The before-fix leftovers were killed
+by process group, only those under this worktree's target path.
+
+### Gates, fix round 1
+
+On `eefe624`, `gate.sh` exit 0 (`r1-gate.log`):
+
+| Check | Result |
+| --- | --- |
+| fmt, both clippy runs, deny, layer check | pass |
+| workspace suite | 334 passed, 1 skipped |
+| failpoint suite, run 1 of 3 | 536 passed, 1 skipped |
+| `s1_f(08\|09\|10\|12)_` | 56 passed |
+| release build and feature check | pass |
+| scenario selector × 5 | 86 passed each time |
+| failpoint suite, runs 2 and 3 (`r1-failpoints-2.log`, `-3.log`) | 536 passed, 1 skipped each |
+
+### Round-1 concerns
+
+- The busy-skip counter is a process-wide `#[cfg(test)]` static. Under
+  `cargo test`, other tests share it, but only this test holds a control
+  busy under `supervise_exit`. nextest runs each test in its own process.
+- The fixture's `/proc` scan is Linux-only, as the `s1_host` suite already
+  is.
