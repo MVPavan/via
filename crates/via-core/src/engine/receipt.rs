@@ -334,14 +334,18 @@ impl Engine {
 
     /// C1 §3.3: authenticates, replays a keyed retry, then commits the next
     /// turn `queued` with its `turn.queued` event before the receipt. The
-    /// prompt is staged and the identity streamed with no lock held.
+    /// prompt is staged and the identity streamed with no lock held, after
+    /// the session and its handle ([`Self::authenticate_existing`]): a wrong
+    /// or missing handle does no prompt-file I/O and writes no blob.
     pub async fn resume(
         &self,
         mut params: ResumeParams,
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
+        let (hash, _) = self
+            .authenticate_existing(&params.session, params.handle.as_deref())
+            .await?;
         let source = params.take_prompt()?;
-        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
         let key = retry_key(params.op_key.as_deref())?.map(str::to_owned);
         let Staged {
             prompt,
@@ -358,7 +362,7 @@ impl Engine {
             .transpose()
         {
             Ok(operation) => {
-                self.resume_admitted(params, prompt, (hash, operation, free), &mut pending)
+                self.resume_admitted(params, prompt, (operation, free), &mut pending)
                     .await
             }
             Err(error) => Err(error),
@@ -372,11 +376,7 @@ impl Engine {
         &self,
         params: ResumeParams,
         prompt: Prompt,
-        (hash, operation, free): (
-            [u8; 32],
-            Option<(String, via_store::Identity)>,
-            Option<FreeSpace>,
-        ),
+        (operation, free): (Option<(String, via_store::Identity)>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
         let admission = self.admission.lock().await;
@@ -395,14 +395,6 @@ impl Engine {
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
-        if !self
-            .store
-            .authenticate(&session, &hash)
-            .await
-            .map_err(|_| ApiError::STORE)?
-        {
-            return Err(ApiError::INVALID_HANDLE);
-        }
         if let Some((key, identity)) = &operation
             && let Some(stored) = self
                 .store
@@ -551,19 +543,13 @@ impl Engine {
         })
     }
 
-    /// Authenticates before reporting fake's unsupported mutation capability.
+    /// The session and its handle ([`Self::authenticate_existing`]), then
+    /// the latch, then fake's unsupported mutation capability.
     pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
+        self.authenticate_existing(&params.session, params.handle.as_deref())
+            .await?;
         if self.store_failed() {
             return Err(ApiError::STORE);
-        }
-        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
-        if !self
-            .store
-            .authenticate(&params.session, &hash)
-            .await
-            .map_err(|_| ApiError::STORE)?
-        {
-            return Err(ApiError::INVALID_HANDLE);
         }
         Err(ApiError::UNSUPPORTED_VERB)
     }

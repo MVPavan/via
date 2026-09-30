@@ -2144,7 +2144,9 @@ fn s1_close_stalled_read_bounds_final_shutdown_entry() -> TestResult {
         let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
         check(stopping["stopping"] == true, || stopping.to_string())?;
         sandbox.ack(&daemon, before, 1, "pause")?;
-        let next = sandbox.next_hit(stall)?;
+        // The close's first two reads (the session and its handle, F15)
+        // come before `admission`; its third, the snapshot, holds it.
+        let next = sandbox.next_hit(stall)? + 2;
         sandbox.arm(stall, next, "pause")?;
         let status = thread::scope(|scope| -> TestResult<ExitStatus> {
             let close = scope.spawn(|| {

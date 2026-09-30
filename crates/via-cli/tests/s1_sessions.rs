@@ -1461,10 +1461,38 @@ fn s1_params_keyed_retry_replays_identical_effective() -> TestResult {
 
 /// F15: on every existing-session mutation (`resume`, `steer`, `cancel`,
 /// `close`), a wrong handle and a missing one are both `invalid_handle`,
-/// and the Store and the session's `status` are unchanged. On the fake,
-/// `steer` checks the handle before its capability, so neither reaches
-/// `unsupported_verb`.
+/// and the Store, the blobs and the session's `status` are unchanged. The
+/// precedence is the session's existence, then the handle, then the rest:
+/// a nonexistent session is `session_not_found` whatever the handle; a
+/// `resume` with a wrong handle is refused before its prompt file is read
+/// (an unreadable one is not `invalid_params`) or stored as a blob; on the
+/// fake, `steer` never reaches `unsupported_verb`.
+/// Every file under the State's `blobs/`, sorted.
+fn blob_files(state: &std::path::Path) -> Result<Vec<String>, ScenarioError> {
+    let mut names = Vec::new();
+    let mut dirs = vec![state.join("blobs")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.map_err(infra)?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                names.push(path.display().to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one F15 scenario keeps every verb, handle and state check together"
+)]
 fn s1_f15_wrong_or_missing_handle_is_invalid_handle_with_no_state_change() -> TestResult {
     let sandbox = Sandbox::new(&fixture(&[turn_script(1, "f15", Some("hold_f15"))]))?;
     let evidence = Evidence::new("s1_f15_invalid_handle", &sandbox.fake, &sandbox.fixture)?;
@@ -1505,30 +1533,52 @@ fn s1_f15_wrong_or_missing_handle_is_invalid_handle_with_no_state_change() -> Te
                     &["status", &session, "--json"],
                 )
             };
-            let before = (daemon::store_dump(&sandbox.state)?, status()?);
+            let blobs = || blob_files(&sandbox.state);
+            let root = sandbox.state.parent().ok_or_else(|| infra("no root"))?;
+            let readable = root.join("f15-prompt.txt");
+            std::fs::write(&readable, b"a prompt that must not be stored").map_err(infra)?;
+            let unreadable = root.join("f15-missing.txt");
+            let before = (daemon::store_dump(&sandbox.state)?, status()?, blobs()?);
             let mut raw = Raw::open(&sandbox)?;
             let mut id = 10;
-            for (verb, params) in [
-                ("resume", json!({"session":session,"prompt":"f15b"})),
-                ("steer", json!({"session":session,"text":"late"})),
-                ("cancel", json!({"session":session})),
-                ("close", json!({"session":session,"mode":"force"})),
+            let absent = "s_0000000000zz";
+            let cases = |session: &str| {
+                [
+                    ("resume", json!({"session":session,"prompt":"f15b"})),
+                    (
+                        "resume",
+                        json!({"session":session,"prompt_file":readable.display().to_string()}),
+                    ),
+                    (
+                        "resume",
+                        json!({"session":session,"prompt_file":unreadable.display().to_string()}),
+                    ),
+                    ("steer", json!({"session":session,"text":"late"})),
+                    ("cancel", json!({"session":session})),
+                    ("close", json!({"session":session,"mode":"force"})),
+                ]
+            };
+            for (target, kind) in [
+                (session.as_str(), "invalid_handle"),
+                (absent, "session_not_found"),
             ] {
-                for handle in [None, Some(OTHER_HANDLE)] {
-                    let mut params = params.clone();
-                    if let Some(handle) = handle {
-                        params["handle"] = json!(handle);
-                    }
-                    id += 1;
-                    let reply = raw.exchange(&request(id, verb, &params))?;
-                    if reply["error"]["data"]["kind"] != "invalid_handle" {
-                        return Err(failure(format!(
-                            "{verb} with handle {handle:?}: expected invalid_handle, got {reply}"
-                        )));
+                for (verb, params) in cases(target) {
+                    for handle in [None, Some(OTHER_HANDLE)] {
+                        let mut params = params.clone();
+                        if let Some(handle) = handle {
+                            params["handle"] = json!(handle);
+                        }
+                        id += 1;
+                        let reply = raw.exchange(&request(id, verb, &params))?;
+                        if reply["error"]["data"]["kind"] != kind {
+                            return Err(failure(format!(
+                                "{verb} {params} with handle {handle:?}: expected {kind}, got {reply}"
+                            )));
+                        }
                     }
                 }
             }
-            let after = (daemon::store_dump(&sandbox.state)?, status()?);
+            let after = (daemon::store_dump(&sandbox.state)?, status()?, blobs()?);
             if after != before {
                 return Err(failure(format!(
                     "a refused mutation changed state: {before:?} then {after:?}"

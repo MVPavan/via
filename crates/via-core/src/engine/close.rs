@@ -19,7 +19,7 @@ use super::queue::{CLOSE_ALLOWANCE, CloseOrder, CloseWatch, Owner, Slot, Sweep};
 use super::stop::StopMode;
 use super::{Admission, Engine, lock};
 use crate::api::{DEFAULT_CLOSE_DEADLINE_MS, Event, EventBody, retry_key, rfc3339};
-use crate::{ApiError, CloseMode, CloseParams, Deadline, SessionId, hash_handle, retry_identity};
+use crate::{ApiError, CloseMode, CloseParams, Deadline, SessionId, retry_identity};
 
 /// Reason recorded on a `close`'s `session.closed` (C1 §7.1).
 const CLOSE_REASON: &str = "close";
@@ -44,7 +44,10 @@ impl Engine {
     /// C1 §3.6 `close`: design §4's admission step under `admission`, then
     /// the caller waits, holding no lock, for the close attempt's outcome.
     pub async fn close(&self, params: CloseParams, raw_params: &str) -> Result<Value, ApiError> {
-        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
+        let session = params.session;
+        let (hash, _) = self
+            .authenticate_existing(&session, params.handle.as_deref())
+            .await?;
         let key = retry_key(params.op_key.as_deref())?;
         let deadline_ms = params.deadline_ms.unwrap_or(DEFAULT_CLOSE_DEADLINE_MS);
         if deadline_ms == 0 {
@@ -53,7 +56,6 @@ impl Engine {
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(deadline_ms))
             .ok_or(ApiError::INVALID_PARAMS)?;
-        let session = params.session;
         let admission = self.admission.lock().await;
         // Step 1: after the latch the reply is `store_error` [O1.D13].
         if self.store_failed() {
@@ -65,14 +67,6 @@ impl Engine {
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
-        if !self
-            .store
-            .authenticate(&session, &hash)
-            .await
-            .map_err(|_| ApiError::STORE)?
-        {
-            return Err(ApiError::INVALID_HANDLE);
-        }
         // Step 2: `op_key` replay. Only a committed result and an attempt in
         // progress bypass the fence [r3.1, r4.1].
         let operation = match key {
