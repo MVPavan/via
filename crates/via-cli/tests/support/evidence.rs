@@ -17,6 +17,10 @@ pub(crate) struct Evidence {
     fake_binary: PathBuf,
     fixture: PathBuf,
     finalized: bool,
+    /// Cleared by a scenario that, by design, opens no Store and runs no
+    /// turn: `finish` then requires neither the Store's backup, envelopes
+    /// and events nor a turn's evidence folder, and the summary says so.
+    pub(crate) store_expected: bool,
 }
 
 impl Evidence {
@@ -45,6 +49,7 @@ impl Evidence {
             fake_binary: fake_binary.to_owned(),
             fixture: fixture.to_owned(),
             finalized: false,
+            store_expected: true,
         })
     }
 
@@ -84,20 +89,24 @@ impl Evidence {
         ) {
             return Err("invalid scenario outcome".into());
         }
-        let required = [
-            "envelopes.ndjson",
-            "events.ndjson",
-            "daemon.trace",
-            "cleanup.json",
-            "store.sqlite3",
-        ];
+        let required: &[&str] = if self.store_expected {
+            &[
+                "envelopes.ndjson",
+                "events.ndjson",
+                "daemon.trace",
+                "cleanup.json",
+                "store.sqlite3",
+            ]
+        } else {
+            &["daemon.trace", "cleanup.json"]
+        };
         let missing: Vec<_> = required
             .iter()
             .filter(|name| !self.dir.join(name).exists())
             .copied()
             .collect();
         let mut missing = missing;
-        if fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
+        if self.store_expected && fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
             missing.push("evidence/*");
         }
         let final_outcome = outcome;
@@ -134,7 +143,7 @@ impl Evidence {
         // The default harness has no feature switches. The runtime failpoint
         // owner adds feature reporting with the controller in its increment.
         let features: Vec<&str> = Vec::new();
-        Ok(json!({
+        let mut summary = json!({
             "scenario":self.scenario,
             "outcome":outcome,
             "detail":detail,
@@ -152,7 +161,11 @@ impl Evidence {
             "fake_binary_sha256":sha256(&self.fake_binary)?,
             "fixture_sha256":sha256(&self.fixture)?,
             "normalization_version":1,
-        }))
+        });
+        if !self.store_expected {
+            summary["store_expected"] = json!(false);
+        }
+        Ok(summary)
     }
 
     fn write_manifest(&self) -> EvidenceResult {

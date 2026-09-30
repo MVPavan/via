@@ -1,7 +1,10 @@
 //! Reads: address resolution, `result`, `wait`, `events`, `logs` and
 //! `status`.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -110,7 +113,7 @@ impl Engine {
     /// at most `timeout_ms` (C1 §3.8), then `wait_timeout`.
     ///
     /// Design §4.1 [t4r16.7.7]: it checks the turn's terminal facts on the
-    /// Public lane at once and then once per second, and reads the envelope
+    /// Public lane at once and then a second after each check, and reads the envelope
     /// with `result_text` only once the turn is terminal: 32 waiters make
     /// 32 reads per second, and a turn's end is seen at most 1 s late.
     /// Once final shutdown committed its last record, a result still
@@ -125,7 +128,6 @@ impl Engine {
         let public = self.store.public();
         let mut checked = false;
         let mut registered = false;
-        let mut check_at = tokio::time::Instant::now();
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
@@ -150,7 +152,9 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.wait.registered").await;
             }
-            check_at += WAIT_CHECK;
+            // A second after this read ended: a slow read is not caught up
+            // by back-to-back reads (§4.1).
+            let check_at = tokio::time::Instant::now() + WAIT_CHECK;
             tokio::time::sleep_until(deadline.min(check_at)).await;
         }
     }
@@ -239,8 +243,9 @@ impl Engine {
 
     /// C1 §3.12 `logs` (Task 4 design §4.4): where the addressed turn's
     /// evidence is, or for a session its running turn's, else its latest
-    /// submitted one's. Each fixed file name is `stat`ed once on the
-    /// blocking pool, without following a symlink; no file is opened.
+    /// submitted one's. Each fixed file name is `stat`ed once, in one owned
+    /// blob step answered within 2 s (coding-style §5), without following a
+    /// symlink; no file is opened.
     pub async fn logs(&self, params: LogsParams) -> Result<Value, ApiError> {
         let (session, turn) = params.address()?;
         let refs = self
@@ -255,12 +260,21 @@ impl Engine {
             .evidence_dir
             .map(|dir| self.store.evidence().absolute(&dir));
         // A failed `lstat` is a failed evidence read: `store_error`, as for
-        // the Store read above.
+        // the Store read above; so is a diagnostic permit not available.
         let files = match folder.clone() {
-            Some(folder) => tokio::task::spawn_blocking(move || evidence_files(&folder))
-                .await
-                .map_err(|_| ApiError::STORE)?
-                .map_err(|_| ApiError::STORE)?,
+            Some(folder) => {
+                let permit = Arc::clone(&self.diagnostics)
+                    .try_acquire_owned()
+                    .map_err(|_| ApiError::STORE)?;
+                self.store
+                    .blocking_step(move || {
+                        // Released when the checks end, even after 2 s.
+                        let _permit = permit;
+                        evidence_files(&folder)
+                    })
+                    .await
+                    .map_err(|_| ApiError::STORE)?
+            }
             None => Vec::new(),
         };
         Ok(json!({

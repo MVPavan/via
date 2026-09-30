@@ -23,12 +23,10 @@ use super::{BoundedBytes, Deadline, SendOutcome, VendorMessage, WireFailure};
 use crate::runtime::{WireCloseReport, WireError, wire_cleanup};
 use crate::split::{LineSplitter, Pushed};
 use via_host::{ExitReceiver, ProcessControl};
+use via_store::BlobTasks;
 
 /// The prefix of an undecoded message VIA keeps (design §7.3).
 pub const UNDECODED_BYTES: usize = 64 * 1024;
-
-/// Bound on writing `undecoded.bin` (design §7.3).
-const UNDECODED_WRITE: Duration = Duration::from_secs(2);
 
 /// One stdout read (design §8.2).
 const READ_BYTES: usize = 64 * 1024;
@@ -132,6 +130,8 @@ enum Control {
 /// The note of the first undecoded message kept, and where it goes.
 struct Undecoded {
     folder: PathBuf,
+    /// The Store's owned blob steps, which run the file's write.
+    tasks: BlobTasks,
     claimed: AtomicBool,
     note: StdMutex<Option<String>>,
 }
@@ -184,8 +184,9 @@ impl Shared {
 
     /// Writes the first 64 KiB of a message VIA cannot decode to the turn's
     /// `undecoded.bin` (design §7.3): the first message only, `create_new`,
-    /// one write on the blocking pool bounded by 2 s. `what` describes the
-    /// message; the note names the file or the error. Nothing fails here.
+    /// one owned blob step answered within 2 s (coding-style §5): one that
+    /// overran stays owned until it ends. `what` describes the message; the
+    /// note names the file or the error. Nothing fails here.
     async fn keep_undecoded(&self, bytes: &[u8], what: &str) {
         let undecoded = &self.undecoded;
         if undecoded.claimed.swap(true, Ordering::AcqRel) {
@@ -195,12 +196,13 @@ impl Shared {
         let prefix = bytes[..bytes.len().min(UNDECODED_BYTES)].to_vec();
         let kept = prefix.len();
         let target = path.clone();
-        let write = tokio::task::spawn_blocking(move || write_new(&target, &prefix));
-        let note = match tokio::time::timeout(UNDECODED_WRITE, write).await {
-            Ok(Ok(Ok(()))) => format!("{what}; first {kept} in {}", path.display()),
-            Ok(Ok(Err(error))) => format!("{what}; not saved: {error}"),
-            Ok(Err(error)) => format!("{what}; not saved: {error}"),
-            Err(_) => format!("{what}; not saved: the write outlived 2 s"),
+        let note = match undecoded
+            .tasks
+            .run(move || write_new(&target, &prefix))
+            .await
+        {
+            Ok(()) => format!("{what}; first {kept} in {}", path.display()),
+            Err(error) => format!("{what}; not saved: {error}"),
         };
         *undecoded
             .note
@@ -634,7 +636,7 @@ pub(crate) fn open(
     pipes: via_host::OwnedPipes,
     control: ProcessControl,
     exits: ExitReceiver,
-    folder: PathBuf,
+    folder: (PathBuf, BlobTasks),
     waits: Waits,
     stragglers: &Stragglers,
 ) -> WireConnection {
@@ -652,7 +654,7 @@ pub(crate) fn open(
 pub(crate) fn connect<R, W>(
     stdout: R,
     stdin: W,
-    folder: PathBuf,
+    (folder, tasks): (PathBuf, BlobTasks),
     waits: Waits,
     stragglers: &Stragglers,
 ) -> (Io, WireMessages)
@@ -671,6 +673,7 @@ where
         close_sent: AtomicBool::new(false),
         undecoded: Undecoded {
             folder,
+            tasks,
             claimed: AtomicBool::new(false),
             note: StdMutex::new(None),
         },
@@ -1035,8 +1038,8 @@ pub mod testing {
     use tokio::sync::watch;
 
     use super::{
-        Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers, Waits, WireError,
-        WireMessages, connect,
+        BlobTasks, Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers, Waits,
+        WireError, WireMessages, connect,
     };
 
     /// A connection's message half and its input, over test pipes.
@@ -1051,6 +1054,7 @@ pub mod testing {
     pub struct TestInput {
         io: Io,
         stragglers: Stragglers,
+        tasks: BlobTasks,
     }
 
     /// Starts a connection's tasks over `stdout` and `stdin`, keeping any
@@ -1066,10 +1070,15 @@ pub mod testing {
             force: watch::channel(None).1,
             wake: watch::channel(0).1,
         };
-        let (io, messages) = connect(stdout, stdin, folder, waits, &stragglers);
+        let tasks = BlobTasks::default();
+        let (io, messages) = connect(stdout, stdin, (folder, tasks.clone()), waits, &stragglers);
         TestPipes {
             messages,
-            input: TestInput { io, stragglers },
+            input: TestInput {
+                io,
+                stragglers,
+                tasks,
+            },
         }
     }
 
@@ -1102,6 +1111,12 @@ pub mod testing {
         /// Bytes of messages the reader queued and nobody received yet.
         pub fn queued_bytes(&self) -> usize {
             self.io.queued_bytes()
+        }
+
+        /// Owned blob steps still running, such as a held `undecoded.bin`
+        /// write.
+        pub fn blob_tasks(&self) -> usize {
+            self.tasks.outstanding()
         }
 
         /// Tasks handed to the runtime and not yet ended.

@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashSet,
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -77,9 +77,10 @@ impl Limits {
     }
 }
 
-/// One data-size walk's result (design §5.3).
+/// One data-size walk's result (design §5.3); `None` for a walk that
+/// failed or overran its 2 s step.
 pub(super) struct DataSize {
-    bytes: u64,
+    bytes: Option<u64>,
     measured_at: String,
     at: tokio::time::Instant,
 }
@@ -193,9 +194,18 @@ impl Engine {
     /// now, and VIA's data size from a walk at most 60 s old. A call that
     /// finds the cached walk absent or older recomputes it on the blocking
     /// pool; concurrent calls wait on the one walk and share its result. A
-    /// value that cannot be read is `null`; a failed walk keeps the last one.
+    /// value that cannot be read is `null`; a walk that fails or overruns
+    /// is cached as `null` too, so at most one walk starts per minute
+    /// whatever its outcome (§15). Both reads are diagnostic steps: each
+    /// needs one of the Engine's two diagnostic permits, and without one
+    /// its value is `null` (a walk's for its minute).
     pub async fn storage(&self) -> Value {
-        let free = self.store.free_bytes().await.ok();
+        // A diagnostic step (round 2): with no permit the free space is
+        // not read and reports `null`.
+        let free = match Arc::clone(&self.diagnostics).try_acquire_owned() {
+            Ok(permit) => self.store.free_bytes(permit).await.ok(),
+            Err(_) => None,
+        };
         let data = {
             let mut cached = self.data_size.lock().await;
             let fresh = cached
@@ -206,17 +216,20 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.data_size.walks").await;
                 let measured_at = rfc3339(SystemTime::now());
-                if let Ok(bytes) = self.store.data_bytes().await {
-                    *cached = Some(DataSize {
-                        bytes,
-                        measured_at,
-                        at: tokio::time::Instant::now(),
-                    });
-                }
+                // A walk with no diagnostic permit counts as failed.
+                let bytes = match Arc::clone(&self.diagnostics).try_acquire_owned() {
+                    Ok(permit) => self.store.data_bytes(permit).await.ok(),
+                    Err(_) => None,
+                };
+                *cached = Some(DataSize {
+                    bytes,
+                    measured_at,
+                    at: tokio::time::Instant::now(),
+                });
             }
             cached
                 .as_ref()
-                .map(|size| (size.bytes, size.measured_at.clone()))
+                .and_then(|size| Some((size.bytes?, size.measured_at.clone())))
         };
         let floor = self.limits.free_floor;
         json!({
@@ -234,7 +247,8 @@ impl Engine {
         if self.limits.free_floor == 0 {
             return None;
         }
-        Some(self.store.free_bytes().await)
+        // Turn-critical: outside the diagnostics cap.
+        Some(self.store.free_bytes(()).await)
     }
 
     /// Applies a receipt's free-space read to new work, after the key

@@ -1540,7 +1540,7 @@ impl Store {
             client: StoreClient {
                 lanes,
                 lane: Lane::Internal,
-                evidence: EvidenceRoot::new(state),
+                evidence: EvidenceRoot::new(state, blobs.tasks.clone()),
                 blobs,
                 state: Arc::from(state),
                 wal_full,
@@ -1679,17 +1679,27 @@ impl StoreClient {
     }
 
     /// The free space of the State directory's filesystem (§5.3), read by
-    /// one owned step on the blocking pool within 2 s.
-    pub async fn free_bytes(&self) -> Result<u64, StoreError> {
+    /// one owned step on the blocking pool within 2 s. `held`, such as the
+    /// caller's permit, is dropped when the read ends.
+    pub async fn free_bytes(&self, held: impl Send + 'static) -> Result<u64, StoreError> {
         let state = Arc::clone(&self.state);
-        self.disk_step(move || disk::free_bytes(&state)).await
+        self.disk_step(move || {
+            let _held = held;
+            disk::free_bytes(&state)
+        })
+        .await
     }
 
     /// The apparent length of VIA's data under the State directory (§5.3),
-    /// one walk by an owned step on the blocking pool within 2 s.
-    pub async fn data_bytes(&self) -> Result<u64, StoreError> {
+    /// one walk by an owned step on the blocking pool within 2 s. `held`,
+    /// such as the caller's permit, is dropped when the walk ends.
+    pub async fn data_bytes(&self, held: impl Send + 'static) -> Result<u64, StoreError> {
         let state = Arc::clone(&self.state);
-        self.disk_step(move || disk::data_bytes(&state)).await
+        self.disk_step(move || {
+            let _held = held;
+            disk::data_bytes(&state)
+        })
+        .await
     }
 
     /// Runs `work` as an owned blob step (coding-style §5) answered within
@@ -2460,7 +2470,7 @@ mod tests {
         let client = StoreClient {
             lanes: Arc::clone(&lanes),
             lane: Lane::Internal,
-            evidence: EvidenceRoot::new(root.path()),
+            evidence: EvidenceRoot::new(root.path(), crate::BlobTasks::default()),
             blobs: Blobs::open(root.path()).expect("blobs"),
             state: Arc::from(root.path()),
             wal_full: Arc::default(),

@@ -162,7 +162,8 @@ impl Engine {
     ///
     /// Design §10.3: the prompt is staged, the `cwd` checked and the retry
     /// identity streamed with no lock held; under `admission` a keyed retry
-    /// is looked up before any admission check (runtime §6): the same key,
+    /// is looked up before any admission check, the `cwd` check's result
+    /// included (runtime §6): the same key,
     /// handle and byte-identical `raw_params` (a prompt file by its
     /// content) replay the stored receipt, anything else under the key is
     /// `idempotency_conflict`.
@@ -175,7 +176,9 @@ impl Engine {
         params.check_session_members()?;
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.idempotency_key.as_deref())?.map(str::to_owned);
-        let cwd = self.session_cwd(params.cwd.take()).await?;
+        // Checked with no lock held, applied only to new work: a keyed
+        // replay comes before any current-state check (runtime §6).
+        let cwd = self.session_cwd(params.cwd.take()).await;
         let Staged {
             prompt,
             mut pending,
@@ -200,12 +203,37 @@ impl Engine {
         receipted
     }
 
+    /// A keyed spawn's stored receipt, under `admission` before any
+    /// admission check (runtime §6); another identity under the key is
+    /// `idempotency_conflict`. `None` when there is no key or none stored.
+    async fn spawn_replay(&self, key: Option<&SpawnKey>) -> Result<Option<Receipted>, ApiError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .store
+            .spawn_key(&key.key)
+            .await
+            .map_err(|_| ApiError::STORE)?
+        else {
+            return Ok(None);
+        };
+        if stored.identity == key.identity {
+            Ok(Some(Receipted {
+                receipt: stored.receipt,
+                enqueued: None,
+            }))
+        } else {
+            Err(ApiError::IDEMPOTENCY_CONFLICT)
+        }
+    }
+
     /// `spawn` under `admission`: `pending` is taken by a commit that may
     /// have happened, and left for discard otherwise.
     async fn spawn_admitted(
         &self,
         params: SpawnParams,
-        (prompt, cwd): (Prompt, String),
+        (prompt, cwd): (Prompt, Result<String, ApiError>),
         (hash, key, free): ([u8; 32], Option<SpawnKey>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
@@ -214,23 +242,12 @@ impl Engine {
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        if let Some(key) = &key
-            && let Some(stored) = self
-                .store
-                .spawn_key(&key.key)
-                .await
-                .map_err(|_| ApiError::STORE)?
-        {
-            return if stored.identity == key.identity {
-                Ok(Receipted {
-                    receipt: stored.receipt,
-                    enqueued: None,
-                })
-            } else {
-                Err(ApiError::IDEMPOTENCY_CONFLICT)
-            };
+        if let Some(replayed) = self.spawn_replay(key.as_ref()).await? {
+            return Ok(replayed);
         }
-        // No key was found: the floor applies to this new work (§5.3).
+        // No key was found: the `cwd` check and the floor apply to this new
+        // work (§5.3).
+        let cwd = cwd?;
         self.floor_admits(free.as_ref())?;
         if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);

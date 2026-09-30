@@ -145,7 +145,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let store_lock =
         StoreLock::acquire(&paths.state).map_err(|error| anyhow::anyhow!("store lock: {error}"))?;
     // Task 4 design §7.6: after both locks, before the Store opens.
-    log::open(&paths.state).context("open via.log")?;
+    log::open(&paths.state).map_err(|error| anyhow::anyhow!("open via.log: {error}"))?;
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.runtime.join("anchors"))?;
     let socket = paths.runtime.join("via.sock");

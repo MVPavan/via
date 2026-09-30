@@ -176,15 +176,43 @@ fn await_event(
     }
 }
 
+/// Milliseconds since the Unix epoch of a VIA timestamp
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC).
+fn unix_ms(at: &str) -> Option<i64> {
+    let number = |range: std::ops::Range<usize>| at.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second, milli) = (
+        number(11..13)?,
+        number(14..16)?,
+        number(17..19)?,
+        number(20..23)?,
+    );
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let of_era = shifted - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let of_cycle = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_cycle - 719_468;
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + milli)
+}
+
 /// Design §7.1, §7.5, §13.2: the fake writes 1 MiB to its stderr. The
 /// operating system writes it to `stderr.log`, which holds exactly those
 /// bytes; the bytes are not progress, so the idle deadline still strikes one
-/// budget after acceptance. `logs` lists the file with its size, `folder`
+/// budget after acceptance. Proven by the daemon's and the file's own
+/// timestamps (A50): the idle order comes less than one budget after the
+/// bytes landed, which a reset by them would forbid. `logs` lists the file with its size, `folder`
 /// absolute, `transcript` and `vendor_session_id` `null`, and the envelope's
 /// `evidence` equals it.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario proves the stderr file, the idle order and the logs listing"
+)]
 fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
     const STDERR: usize = 1024 * 1024;
+    const IDLE_MS: i64 = 1500;
     let steps = vec![
         accepted(1),
         json!({"action":"gate","name":"quiet"}),
@@ -198,6 +226,9 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
         evidence,
         |evidence| {
             let _daemon = Daemon::start(&sandbox, evidence)?;
+            // The realtime clock against the monotonic one, across the
+            // window the daemon's and the file's timestamps fall in.
+            let clocks = (std::time::SystemTime::now(), Instant::now());
             let session = spawn(&sandbox, evidence, "stderr", &["--idle-ms", "1500"])?;
             sandbox.await_gate("quiet")?;
             let accepted_at = Instant::now();
@@ -206,6 +237,10 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
             sandbox.release_gate("quiet")?;
             await_event(&sandbox, evidence, &session, "cancel.requested")?;
             let ordered_after = accepted_at.elapsed();
+            let wall = std::time::SystemTime::now()
+                .duration_since(clocks.0)
+                .map_or(i128::MIN, |elapsed| elapsed.as_millis().cast_signed());
+            let stepped = (wall - clocks.1.elapsed().as_millis().cast_signed()).abs() > 100;
             let envelope = wait(&sandbox, evidence, "wait", &format!("{session}/1"))?;
             let listed = logs(&sandbox, evidence, "logs", &session)?;
             record(&sandbox, evidence, &[&envelope], &[&session])?;
@@ -213,11 +248,57 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
                 envelope["state"] == "failed" && envelope["failure"]["class"] == "deadline_idle",
                 || format!("idle envelope: {envelope}"),
             )?;
-            // Stderr as progress would have moved the order past 2.3 s.
-            check(ordered_after < Duration::from_millis(2200), || {
-                format!("the idle order came {ordered_after:?} after acceptance")
-            })?;
             let expected = folder(&sandbox, &session, 1);
+            let landed = fs::metadata(expected.join("stderr.log"))
+                .and_then(|metadata| metadata.modified())
+                .map_err(infra)?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(infra)?;
+            let landed = i64::try_from(landed.as_millis()).map_err(infra)?;
+            let lifecycle = events(&sandbox, evidence, "events_idle", &session)?;
+            let at = |kind: &str| {
+                lifecycle
+                    .iter()
+                    .find(|event| event["type"] == kind)
+                    .and_then(|event| event["at"].as_str())
+                    .and_then(unix_ms)
+                    .ok_or_else(|| failure(format!("no {kind} time in {lifecycle:?}")))
+            };
+            let (started, ordered) = (at("turn.started")?, at("cancel.requested")?);
+            evidence
+                .write(
+                    "idle_timing.json",
+                    json!({"idle_ms":IDLE_MS,"started_to_order_ms":ordered - started,
+                        "started_to_stderr_ms":landed - started,
+                        "stderr_to_order_ms":ordered - landed,
+                        "test_clock_ordered_after_ms":ordered_after.as_millis(),
+                        "realtime_clock_stepped":stepped})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .map_err(infra)?;
+            if stepped {
+                // The realtime clock stepped inside the window (seen on
+                // WSL), so its timestamps cannot be compared: the order is
+                // judged on the monotonic clock instead. Stderr as progress
+                // would have put it past 800 ms + one budget.
+                check(ordered_after < Duration::from_millis(2300), || {
+                    format!("the idle order came {ordered_after:?} after acceptance")
+                })?;
+            } else {
+                // The bytes landed inside the idle window, before the order.
+                check(started < landed && landed < ordered, || {
+                    format!("stderr landed at {landed}, outside {started}..{ordered}")
+                })?;
+                // Stderr as progress would have put the order a whole budget
+                // after the bytes.
+                check(ordered - landed < IDLE_MS, || {
+                    format!(
+                        "the idle order came {} ms after the stderr bytes: they reset idle",
+                        ordered - landed
+                    )
+                })?;
+            }
             let written = fs::read(expected.join("stderr.log")).map_err(infra)?;
             check(written == stderr_bytes(STDERR), || {
                 format!("stderr.log holds {} bytes, not the fake's", written.len())
@@ -501,12 +582,16 @@ fn s1_c1_logs_selects_the_turn_and_never_reads_files() -> TestResult {
 /// Positive evidence for this case: the child served its own socket, then
 /// left through its idle exit (status 0, a clean `idle` shutdown summary);
 /// readiness reported exactly that exit; the sandbox never got a socket or
-/// a Store, which any daemon started there would create.
+/// a Store, which any daemon started there would create. By design no
+/// Store opens in the sandbox and no turn runs, so the evidence declares
+/// neither (T4-fix, Close finding 1): it holds the probe results, the
+/// readiness message and the child's shutdown summary.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     let sandbox = Sandbox::new(&script(1, "unused", &[]))?;
-    let evidence = Evidence::new("s1_evidence_readiness", &sandbox.fake, &sandbox.fixture)?;
+    let mut evidence = Evidence::new("s1_evidence_readiness", &sandbox.fake, &sandbox.fixture)?;
+    evidence.store_expected = false;
     let elsewhere = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
@@ -517,60 +602,88 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     for dir in [&state, &runtime] {
         daemon::private_dir(dir)?;
     }
-    // Observes the child serving its own socket, over a direct connection.
-    let served = {
-        let runtime = runtime.clone();
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                if let Some(pid) = daemon::serving_pid(&runtime) {
-                    return Some(pid);
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
-    let started = Daemon::start_with(&sandbox, &evidence, |command| {
-        command.env("VIA_STATE_DIR", &state);
-        command.env("VIA_RUNTIME_DIR", &runtime);
-        command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
-    });
-    let socket = sandbox.runtime.join("via.sock").exists();
-    let store = sandbox.state.join("store.sqlite3").exists();
-    // Stops a daemon the probe may have started; refused when there is none.
-    sandbox.run(
-        &["daemon", "stop", "--force", "--json"],
-        Duration::from_secs(20),
-    )?;
-    let reported = match &started {
-        Err(error) => error.to_string(),
-        Ok(_) => "ready".to_owned(),
-    };
-    drop(started);
-    let served = served.join().map_err(|_| "the serving probe panicked")?;
-    // Task 4 design §7.6: the shutdown summary is the child's `via.log` line.
-    let log = fs::read_to_string(state.join("via.log"))?;
-    let summary = log
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find_map(|line| line.get("daemon_shutdown").cloned())
-        .unwrap_or(Value::Null);
-    let idle_exit = summary["mode"] == "idle" && summary["disposition"] == "clean";
-    if reported != "fail: daemon exited before readiness: exit status: 0"
-        || served.is_none()
-        || !idle_exit
-        || socket
-        || store
-    {
-        return Err(format!(
-            "readiness reported {reported:?}; child served {served:?}; \
-             shutdown {summary}; sandbox socket {socket}, Store {store}"
-        )
-        .into());
-    }
-    Ok(())
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            // Observes the child serving its own socket, over a direct
+            // connection.
+            let served = {
+                let runtime = runtime.clone();
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if let Some(pid) = daemon::serving_pid(&runtime) {
+                            return Some(pid);
+                        }
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            let started = Daemon::start_with(&sandbox, evidence, |command| {
+                command.env("VIA_STATE_DIR", &state);
+                command.env("VIA_RUNTIME_DIR", &runtime);
+                command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
+            });
+            let socket = sandbox.runtime.join("via.sock").exists();
+            let store = sandbox.state.join("store.sqlite3").exists();
+            // Stops a daemon the probe may have started; refused when there
+            // is none.
+            let stop = sandbox
+                .run(
+                    &["daemon", "stop", "--force", "--json"],
+                    Duration::from_secs(20),
+                )
+                .map_err(infra)?;
+            let reported = match &started {
+                Err(error) => error.to_string(),
+                Ok(_) => "ready".to_owned(),
+            };
+            drop(started);
+            let served = served
+                .join()
+                .map_err(|_| infra("the serving probe panicked"))?;
+            // Task 4 design §7.6: the shutdown summary is the child's
+            // `via.log` line.
+            let log = fs::read_to_string(state.join("via.log")).map_err(infra)?;
+            let summary = log
+                .lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|line| line.get("daemon_shutdown").cloned())
+                .unwrap_or(Value::Null);
+            evidence
+                .write(
+                    "readiness.json",
+                    json!({"reported":reported,"child_served_pid":served,
+                        "sandbox_socket":socket,"sandbox_store":store,
+                        "stop_exit":stop.status.code(),
+                        "stop_stdout":String::from_utf8_lossy(&stop.stdout)})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .map_err(infra)?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            let idle_exit = summary["mode"] == "idle" && summary["disposition"] == "clean";
+            check(
+                reported == "fail: daemon exited before readiness: exit status: 0"
+                    && served.is_some()
+                    && idle_exit
+                    && !socket
+                    && !store,
+                || {
+                    format!(
+                        "readiness reported {reported:?}; child served {served:?}; \
+                         shutdown {summary}; sandbox socket {socket}, Store {store}"
+                    )
+                },
+            )
+        },
+        |_| Ok(()),
+    );
+    report.require_pass()
 }

@@ -869,6 +869,97 @@ fn s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served() -> TestRes
     report.require_pass()
 }
 
+/// Design §4.1 (T4-fix; Fable F4): a slow read does not make `wait` catch
+/// up. With every Store read delayed 800 ms (`store.read.delay_ms`), the
+/// next check is a second after the last read ended, so a 5 s wait makes
+/// at most four reads: the turn-existence read and terminal-facts reads at
+/// about 0, 2.6 and 4.4 s. A check scheduled from the loop's start runs
+/// the missed checks back to back and makes seven. Slower reads only make
+/// fewer, so the bound holds under load.
+#[test]
+fn s1_c1_wait_after_a_slow_read_keeps_its_cadence() -> TestResult {
+    let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
+    let evidence = setup.evidence("s1_c1_wait_cadence")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            hits::count(&setup.dir, READ_DELAY).map_err(infra)?;
+            let _daemon = setup.start(evidence, &[])?;
+            let receipt = cli(
+                &setup.sandbox,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hold",
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = receipt["session_id"]
+                .as_str()
+                .ok_or_else(|| failure(format!("spawn: {receipt}")))?
+                .to_owned();
+            setup.sandbox.await_gate("hold")?;
+            let mut waiter = Conn::open(&setup.sandbox)?;
+            // Each read from the next one on is delayed and acknowledged.
+            let first = hits::hits(&setup.dir, READ_DELAY).map_err(infra)? + 1;
+            setup
+                .failpoints
+                .arm(READ_DELAY, first, "delay_persist:800")
+                .map_err(infra)?;
+            let reply = waiter.exchange(&line(
+                &json!(1),
+                "wait",
+                &json!({"address":format!("{session}/1"),"timeout_ms":5000}),
+            ))?;
+            let mut used = 0;
+            while setup
+                .dir
+                .join(format!("{READ_DELAY}.{}.ack", first + used))
+                .exists()
+            {
+                used += 1;
+            }
+            evidence
+                .write("wait_reads.txt", used.to_string().as_bytes())
+                .map_err(infra)?;
+            check(is_error(&reply, -32016, "wait_timeout"), || {
+                format!("bounded wait: {reply}")
+            })?;
+            check((2..=4).contains(&used), || {
+                format!("a 5 s wait with 800 ms reads made {used} Store reads, at most 4")
+            })?;
+            setup.failpoints.disarm(READ_DELAY).map_err(infra)?;
+            setup.sandbox.release_gate("hold")?;
+            let envelope = cli(
+                &setup.sandbox,
+                evidence,
+                "wait_end",
+                &[
+                    "wait",
+                    &format!("{session}/1"),
+                    "--timeout-ms",
+                    "30000",
+                    "--json",
+                ],
+            )?;
+            check(envelope["state"] == "completed", || {
+                format!("the held turn: {envelope}")
+            })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- prompt file
 
 fn spawn_file(path: &str, key: Option<&str>) -> Value {
@@ -1424,6 +1515,65 @@ fn s1_c1_cwd_is_frozen_applied_and_reported() -> TestResult {
                 )?;
             }
             Ok(())
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Runtime §6, Task 4 design §5.3 (T4-fix; Astra 3): a keyed replay comes
+/// before any check on current state. A keyed spawn in a temporary `cwd`
+/// runs to completion; with the directory removed, the identical request
+/// still returns the original receipt, while an unkeyed spawn with the
+/// removed `cwd` is `invalid_params` naming `cwd`.
+#[test]
+fn s1_c1_keyed_spawn_replays_after_its_cwd_is_removed() -> TestResult {
+    let setup = Setup::new(&json!({"scripts":[any_prompt(&[])]}))?;
+    let evidence = setup.evidence("s1_c1_keyed_cwd_replay")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = setup.start(evidence, &[])?;
+            let work = setup.root.join("gone");
+            daemon::private_dir(&work).map_err(infra)?;
+            let cwd = work.to_str().ok_or_else(|| infra("path"))?.to_owned();
+            let keyed = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,
+                "cwd":cwd,"idempotency_key":"keyed-cwd-replay"});
+            let mut conn = Conn::open(&setup.sandbox)?;
+            let first = conn.exchange(&line(&json!(1), "spawn", &keyed))?;
+            let session = first["result"]["session_id"]
+                .as_str()
+                .ok_or_else(|| failure(format!("keyed spawn: {first}")))?
+                .to_owned();
+            let envelope = setup.wait(evidence, "wait_keyed", &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("keyed turn: {envelope}")
+            })?;
+            fs::remove_dir(&work).map_err(infra)?;
+            let replay = conn.exchange(&line(&json!(2), "spawn", &keyed))?;
+            evidence
+                .write(
+                    "receipts.json",
+                    json!({"first":first,"replay":replay})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(
+                replay.get("result").is_some() && replay["result"] == first["result"],
+                || format!("the replay after the cwd went: {replay}; first {first}"),
+            )?;
+            let mut unkeyed = keyed.clone();
+            unkeyed
+                .as_object_mut()
+                .ok_or_else(|| infra("params"))?
+                .remove("idempotency_key");
+            let refused = conn.exchange(&line(&json!(3), "spawn", &unkeyed))?;
+            check(
+                is_error(&refused, -32602, "invalid_params")
+                    && refused["error"]["data"]["field"] == "cwd",
+                || format!("an unkeyed spawn in the removed cwd: {refused}"),
+            )
         },
         |evidence| setup.collect(evidence),
     );

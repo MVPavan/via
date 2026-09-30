@@ -4,7 +4,7 @@ use tokio::sync::watch;
 use super::{Deadline, PrivateProcessSpec, WireCleanup, WireFailure};
 use crate::connection::{self, Stragglers, Waits, WireConnection, cancelled};
 use via_host::{AcquireFailure, AcquiredProcess, CleanupEvidence, Host, LaunchPipes};
-use via_store::{EvidenceRoot, RuntimeResources};
+use via_store::{BlobTasks, EvidenceRoot, RuntimeResources};
 
 /// How long an acquisition may still finish once its caller is cancelled: a
 /// normal one does, so its group is force-closed and proved absent; a stalled
@@ -53,8 +53,9 @@ impl WireRuntime {
     }
 
     /// Opens one private connection for the turn `spec.owner` names. First
-    /// the turn's evidence folder is created on the blocking pool (design
-    /// §7.2); a failure there is [`WireError::Evidence`] and nothing is
+    /// the turn's evidence folder is created by an owned blob step (design
+    /// §7.2); a failure, an overrun of 2 s or a refusal at the cap there is
+    /// [`WireError::Evidence`] and nothing is
     /// acquired. Host then creates `stderr.log` in it for the vendor.
     /// Once `signals.force` is set, waits for vendor input, output or exit
     /// end with [`WireError::Cancelled`]. A failed acquisition is
@@ -66,16 +67,19 @@ impl WireRuntime {
         signals: WireSignals,
     ) -> Result<WireConnection, WireError> {
         let root = self.evidence.clone();
+        let tasks = self.evidence.blob_tasks().clone();
         let (session, turn) = (spec.owner.session_id.clone(), spec.owner.turn);
-        let folder = tokio::task::spawn_blocking(move || root.create_turn(&session, turn))
+        // An owned blob step (coding-style §5): answered within 2 s, and
+        // still counted at final shutdown if it overran or its caller ended.
+        let folder = tasks
+            .run(move || root.create_turn(&session, turn))
             .await
-            .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?
-            .map_err(WireError::Evidence)?;
+            .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?;
         spec.stderr_path = folder.join("stderr.log");
         Box::pin(open(
             &self.host,
             spec,
-            folder,
+            (folder, tasks),
             deadline,
             (signals, &self.stragglers),
         ))
@@ -285,7 +289,7 @@ pub enum WireError {
 async fn open(
     host: &Host,
     spec: PrivateProcessSpec,
-    folder: std::path::PathBuf,
+    (folder, tasks): (std::path::PathBuf, BlobTasks),
     deadline: Deadline,
     (signals, stragglers): (WireSignals, &Stragglers),
 ) -> Result<WireConnection, WireError> {
@@ -345,7 +349,12 @@ async fn open(
         wake,
     };
     Ok(connection::open(
-        pipes, control, exits, folder, waits, stragglers,
+        pipes,
+        control,
+        exits,
+        (folder, tasks),
+        waits,
+        stragglers,
     ))
 }
 

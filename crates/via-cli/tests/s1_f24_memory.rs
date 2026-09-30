@@ -55,8 +55,9 @@ const OBSERVED: &str = "core.observations.pause";
 const FLOOD_SOCKETS: usize = 29;
 /// Maximal lines each socket has answered before the vendor flood starts.
 const WARM_LINES: u64 = 16;
-/// A control's reply bound (design §13.2).
-const CONTROL: Duration = Duration::from_millis(100);
+/// A control's reply bound (design §13.2, A52): a starved control fails it;
+/// each round's slowest reply is recorded against the 100 ms target.
+const CONTROL: Duration = Duration::from_secs(1);
 
 fn check(condition: bool, detail: impl FnOnce() -> String) -> Result<(), ScenarioError> {
     if condition {

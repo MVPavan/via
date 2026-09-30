@@ -635,3 +635,89 @@ async fn s1_wire_cancelled_straggler_join_keeps_ownership() -> Result<(), Box<dy
     assert_eq!(fallback_drops(), 0);
     Ok(())
 }
+
+/// Writes a paused point's release file when dropped, so a failed
+/// assertion never leaves the runtime waiting on the held blocking thread.
+struct Release(PathBuf);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"");
+    }
+}
+
+/// Polls `done` every 5 ms until it holds or `within` passes.
+async fn eventually(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+
+/// T4-fix (coding-style §5, design §7.3; Astra 1, Fable F3): the
+/// `undecoded.bin` write is an owned blob step. Held past its 2 s bound
+/// (`blob.step.stall`), the note says "not saved", yet the step is still
+/// owned and counted until it ends, then reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_held_undecoded_write_stays_owned() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "s1-wire-held-undecoded-token";
+    let points = Scratch::new("points")?;
+    std::fs::set_permissions(&points.0, std::fs::Permissions::from_mode(0o700))?;
+    via_store::failpoint::activate(&points.0, TOKEN)?;
+    std::fs::write(
+        points.0.join("blob.step.stall.json"),
+        format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause"}}"#),
+    )?;
+    let release = Release(points.0.join("blob.step.stall.1.release"));
+    let folder = Scratch::new("held")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(64 * 1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes(stdout, stdin, folder.0.clone());
+    let writer = tokio::spawn(async move {
+        vendor
+            .write_all(&vec![b'h'; MAX_STDOUT_MESSAGE_BYTES + 1])
+            .await?;
+        vendor.shutdown().await
+    });
+    let failure = messages.next_message().await.err();
+    assert!(
+        matches!(
+            failure,
+            Some(WireError::Message(WireFailure::MessageTooLarge))
+        ),
+        "{failure:?}"
+    );
+    let mut note = None;
+    assert!(
+        eventually(Duration::from_secs(10), || {
+            note = input.take_undecoded();
+            note.is_some()
+        })
+        .await,
+        "no undecoded note"
+    );
+    assert!(
+        note.as_deref()
+            .is_some_and(|note| note.contains("not saved")),
+        "{note:?}"
+    );
+    assert!(points.0.join("blob.step.stall.1.ack").exists());
+    // Answered at its bound, not abandoned: the step is still owned.
+    assert_eq!(input.blob_tasks(), 1);
+    drop(release);
+    assert!(
+        eventually(Duration::from_secs(10), || input.blob_tasks() == 0).await,
+        "the finished step was never reaped"
+    );
+    tokio::time::timeout(Duration::from_secs(10), writer).await???;
+    messages.finish(after(Duration::from_secs(3))).await;
+    Ok(())
+}

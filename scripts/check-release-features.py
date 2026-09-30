@@ -150,6 +150,8 @@ POINTS = [
     # data-size walk, counted.
     "store.statvfs.free_bytes",
     "core.data_size.walks",
+    # T4-fix (design §5.3): a data-size walk held past its 2 s step.
+    "store.data_size.walk",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

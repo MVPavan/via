@@ -115,7 +115,9 @@ fn valid_id(id: &str) -> bool {
 /// stays owned until it ends; the cap bounds how many blocking threads a
 /// stalled filesystem can hold. Four dispatch loads (§5.1) plus a dozen
 /// concurrent receipt or discard steps; each healthy step is one 64 KiB
-/// write or one sync, so the cap is rarely reached except by a stall.
+/// write or one sync, or a turn folder's short step (its creation, its
+/// `undecoded.bin`, a `logs` `lstat`), so the cap is rarely reached except
+/// by a stall.
 const BLOB_TASKS: usize = 16;
 
 /// How long `Store::drop` waits for owned blob steps, within final
@@ -158,7 +160,7 @@ impl BlobTasks {
     /// Runs one blob step, owned by this set, and waits for its result at
     /// most [`BLOB_IO`]. A step that overran keeps running to its end,
     /// owning what it was given; the caller's request is not committed.
-    pub(crate) async fn run<T: Send + 'static>(
+    pub async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
