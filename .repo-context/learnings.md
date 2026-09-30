@@ -78,3 +78,26 @@ in the design record (`docs/`), not here.
   loss tracking. A 2026-09-29 check showed Claude, Codex and OpenCode already
   keep their conversations (transcripts, rollouts, SQLite). Dropping VIA's
   copy removed the task's riskiest mechanism.
+- Test harness readiness must never use a command that can start a daemon.
+  The Task 4 harness polled `via daemon status`, which auto-starts one. A
+  rival daemon then won `daemon.lock`, and about six scenarios failed
+  depending on load. Probe the socket directly and match the pid of the
+  daemon the test started (`crates/via-cli/tests/support/daemon.rs`
+  `serving_pid`).
+- Wall-clock bounds in scenario tests fail under a parallel suite without
+  any defect. Examples: 181 ms against 100 ms, a 2.7 s WSL realtime-clock
+  step, and 115 ms against 100 ms with the test running alone. Prove "does
+  not block" by order (the reply arrives while the blocker is still held)
+  or by counts (failpoint hits), and record latencies as evidence. Where a
+  bound must stay, set it well above normal jitter so only real starvation
+  fails it (Task 4 A50, A52).
+- A bounded shared pool needs a cap per kind of work, not just an owner per
+  task. Once Task 4 owned every blocking step through the Store's 16-slot
+  pool, `daemon/status` walks and `logs` checks could fill the pool and
+  refuse turn-critical steps. Every CLI command sends `daemon/status`. Give
+  optional work its own small permit count inside the shared pool (Task 4
+  T4-fix: 2 diagnostic permits).
+- Floods in tests must pace on observed consumption. The Wire reader never
+  waits for its consumer, so more than 1,024 unconsumed messages overflow by
+  design (A47). A test that wrote 1,040 lines in one burst failed 64 of 240
+  runs under parallel stress.

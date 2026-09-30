@@ -159,7 +159,52 @@ Added during implementation:
 | The Wire queue (A47) holds 1,024 messages; a vendor burst above that fails the turn `overflow` | measured vendor burst sizes (`via-d9o.2.3`) |
 | The envelope's lists have no producer on the fake route; they are exercised through a test hook | a route produces denials or declines |
 
-## 7. Next
+## 7. Critic round
 
-The Astra high and Fable 5.1 high critical reviews of the whole epic
-(`via-jm4.7.8.10`), then the fixes they confirm, then the epic closes.
+Astra high and Fable 5.1 high reviewed `76001d0..7790912` once each,
+independently (`t4/reviews/T4-critic-astra.md`, `T4-critic-fable.md`). Both
+said UNSOUND. The orchestrator checked every finding against the code and
+decided each one:
+
+| Finding | Source | Decision |
+|---|---|---|
+| A data-size walk over 2 s is started again by every `daemon/status`, one per CLI command, and fills the 16 blob-step slots | Astra 5, Fable F1 | fixed: cached `null` for its minute |
+| `undecoded.bin` write, evidence-folder creation and `logs` checks are `spawn_blocking` with no owner | Astra 1, Fable F3 | fixed: owned, capped Store blob steps |
+| A keyed `spawn` replay is refused once its `cwd` is gone | Astra 3 | fixed: the `cwd` result applies only to new work |
+| A FIFO `daemon.json` or `via.log` hangs startup | Astra 4 | fixed: non-blocking open, regular file required |
+| `wait` catches up with a burst of reads after a slow read | Fable F4 | fixed: next check a second after the last read |
+| Wall-clock assertions in two scenarios | Fable F2, Astra | fixed: count and daemon-order proofs (A50 extended) |
+| The start-up blob sweep holds every referenced blob id in memory | Astra 2 | recorded in §15; revisit with retention (`via-jm4.18`) |
+| F24 does not fill the observation budgets together with the other holders | Astra 6 | recorded as A51 and in §15; the bound is proven separately, at most 16 MiB |
+| The test-build overrides are duplicated | Fable F5 | not fixed: a shared helper would cross the layer graph |
+
+T4-fix (`via-jm4.7.8.12`, merge `0e0e37d`) took three Sol high rounds:
+- r1 found that owned `logs` steps could fill the shared pool and refuse
+  turn work, so diagnostics (`logs`, the data walk and the status free
+  read) now hold at most 2 of the 16 slots;
+- r2 found the status free read still uncapped;
+- r3 was SOUND.
+
+The round also added A52: F24 fails a control reply slower than 1 s and
+records the slowest reply against the 100 ms target, because one run that
+ran alone took 115 ms without starvation. Close finding 1 is fixed: the
+readiness scenario finalizes its evidence.
+
+Merged gate at `8aaf377` (`scratchpad/t4/merge-t4-fix/`):
+
+| Check | Result |
+|---|---|
+| default nextest | 330 passed |
+| failpoint suite | 529 passed (3 runs) |
+| F08–F12 | 56 passed |
+| Task 4 selector | 85 passed (10 of 10 runs) |
+| release markers | none of 116 present |
+
+## 8. Result
+
+Task 4 (`via-jm4.7.8`) is complete. The open items are outside it:
+- `via-jm4.15` and `via-jm4.16` (pre-existing flakes);
+- `via-jm4.18` (retention);
+- `via-jm4.19` (test runs leak host anchors, found during this round);
+- `via-d9o.2` (the evidence audit of the Task 2–3 scenarios);
+- `via-d9o.2.3` (measurements with real vendors).

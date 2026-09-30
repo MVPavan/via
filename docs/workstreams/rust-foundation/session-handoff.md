@@ -178,10 +178,19 @@ the historical checkpoint; its findings table is updated by this section.
   `.repo-context/verification.md` and wrote
   [t4/reports/T4-close.md](t4/reports/T4-close.md): gate 330 / 1,
   failpoints 521 / 1, F08–F12 56, Task 4 selector 77 (10 of 10 runs).
-  **Now:** the critic reviews (`.7.8.10`), Astra high (tmux window
-  `critic-astra`) and Fable 5.1 high, on `76001d0..7790912`; then fix the
-  confirmed findings and Close finding 1, re-verify, and close epic
-  `.7.8`. Ledger: `scratchpad/execution/t4-impl/progress.md`; worker logs under
+  The critic round (`.7.8.10`) followed. Astra high and Fable 5.1 high
+  (`t4/reviews/T4-critic-*.md`) both said UNSOUND. T4-fix (`.7.8.12`, merge
+  `0e0e37d`, Sol high r3 SOUND) fixed seven confirmed findings: a data walk
+  that overruns is cached; diagnostics hold at most 2 of the 16 blob slots;
+  evidence steps are owned; a keyed replay no longer needs its `cwd`; a FIFO
+  config or log no longer hangs startup; `wait` keeps its cadence; latencies
+  are proven by order. It added A51 (what F24 fills) and A52 (F24's 1 s
+  control bound). Merged gate: failpoints 529 (3 of 3 runs), Task 4 selector
+  85 (10 of 10). **Task 4 epic `via-jm4.7.8` is closed**
+  ([t4/reports/T4-close.md](t4/reports/T4-close.md) §7–§8). Follow-ups:
+  `via-jm4.19` (test runs leak host anchors; 17 orphans from Task 3 were
+  still running on 2026-09-30, awaiting the owner's go-ahead to stop them),
+  `via-jm4.15`, `.16`, `.18`, `via-d9o.2`, `via-d9o.2.3`. Ledger: `scratchpad/execution/t4-impl/progress.md`; worker logs under
   `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
