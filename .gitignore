@@ -10,3 +10,6 @@ scratchpad/
 
 # Rust build output
 target/
+
+# bd 1.3.0 lock files (never delete while bd runs)
+*.gate.lock*
