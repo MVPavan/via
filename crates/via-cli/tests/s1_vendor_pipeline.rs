@@ -69,9 +69,9 @@ fn step_block() -> TestResult<String> {
     Ok(block)
 }
 
-/// Model output (Core is held on it), then `first` step blocks of three
-/// progress items each, gate `burst`, `second` more blocks; then the vendor
-/// reports its pid and falls silent.
+/// Model output (Core is held on it), gate `flood`, then `first` step
+/// blocks of three progress items each, gate `burst`, `second` more blocks;
+/// then the vendor reports its pid and falls silent.
 fn blocks_then_silence(prompt: &str, first: u64, second: u64) -> TestResult<Value> {
     let block = step_block()?;
     Ok(script(
@@ -79,6 +79,7 @@ fn blocks_then_silence(prompt: &str, first: u64, second: u64) -> TestResult<Valu
         &[
             accepted(),
             json!({"action":"emit","message":text("first")}),
+            json!({"action":"gate","name":"flood"}),
             json!({"action":"flood","text":block,"count":first}),
             json!({"action":"gate","name":"burst"}),
             json!({"action":"flood","text":block,"count":second}),
@@ -278,7 +279,9 @@ fn stopped(pid: &str) -> bool {
 
 /// Holds Core at its first model output, lets the stall fail the turn,
 /// then releases Core: every observation admitted before the stall is
-/// handled. The vendor's second burst follows once Route took the first
+/// handled. The vendor's first burst starts once Core holds the model
+/// output (Route took every message before it); the second follows once
+/// Route took the first
 /// (its arrivals stopped moving the activity clock), so the Wire queue of
 /// 1,024 messages never overflows (A47). Returns the turn's step rows and
 /// the envelope.
@@ -295,6 +298,10 @@ fn held_turn(
         .failpoints
         .wait_ack(PAUSE, 2, "pause", pid, Duration::from_secs(20))
         .map_err(failure)?;
+    // Route took `accepted` and the model output, so the first burst's
+    // 1,023 messages fit the Wire queue however late Route takes them.
+    setup.sandbox.await_gate("flood")?;
+    setup.sandbox.release_gate("flood")?;
     setup.sandbox.await_gate("burst")?;
     setup.activity_settled(evidence, &session)?;
     setup.sandbox.release_gate("burst")?;
