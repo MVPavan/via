@@ -135,13 +135,21 @@ impl Paths {
         Ok(capture)
     }
 
-    /// Starts `via spawn --background` without waiting: its reply may never come.
-    fn spawn_pending(&self, evidence: &Evidence, name: &str, prompt: &str) -> PendingClient {
+    /// Starts `via spawn --background` without waiting: its reply may never
+    /// come. `extra` arguments, such as an idempotency key, follow.
+    fn spawn_pending(
+        &self,
+        evidence: &Evidence,
+        name: &str,
+        prompt: &str,
+        extra: &[&str],
+    ) -> PendingClient {
         let stdout = evidence.dir.join(format!("{name}.stdout"));
         let stderr = evidence.dir.join(format!("{name}.stderr"));
         let mut command = self.command();
         command
             .args(spawn_args(prompt))
+            .args(extra)
             .env("VIA_HANDLE", HANDLE)
             .stdin(Stdio::null());
         let child = File::create(&stdout)
@@ -165,14 +173,16 @@ impl Paths {
         Ok(store)
     }
 
-    /// Row counts of every table a spawn writes, read in one transaction.
-    fn counts(&self) -> Result<[i64; 4], ScenarioError> {
+    /// Row counts of every table a spawn writes, read in one transaction:
+    /// sessions, turns, events, anchors and spawn keys.
+    fn counts(&self) -> Result<[i64; 5], ScenarioError> {
         let mut store = self.store()?;
         let tx = store.transaction().map_err(infra)?;
-        let mut counts = [0; 4];
-        for (count, table) in counts
-            .iter_mut()
-            .zip(["sessions", "turns", "events", "anchors"])
+        let mut counts = [0; 5];
+        for (count, table) in
+            counts
+                .iter_mut()
+                .zip(["sessions", "turns", "events", "anchors", "spawn_keys"])
         {
             *count = tx
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -715,22 +725,24 @@ fn error_kind(stderr: &[u8]) -> Option<String> {
     error["data"]["kind"].as_str().map(str::to_owned)
 }
 
-/// F8: a crash while `spawn`'s transaction holds every row but has not
-/// committed leaves no session, turn, handle hash or event, before and after
-/// restart; the caller never received a receipt.
+/// F8: a crash while a keyed `spawn`'s transaction holds every row but has
+/// not committed leaves no session, turn, handle hash, event or spawn key,
+/// before and after restart; the caller never received a receipt. After
+/// restart the same key creates exactly one whole session, turn and launch.
 #[test]
 fn s1_f08_crash_inside_spawn_write_leaves_nothing() -> TestResult {
     scenario(
         "s1_f08_crash_inside_spawn_write",
-        &reply_steps("after"),
+        &f08_and_after(),
         |paths, evidence| {
             let point = "store.spawn.before_commit";
+            let key = ["--idempotency-key", "f08-key"];
             arm(paths, point, "pause")?;
             let mut daemon = Daemon::start(paths, evidence, "crashed")?;
-            let client = paths.spawn_pending(evidence, "spawn-crashed", "f08");
+            let client = paths.spawn_pending(evidence, "spawn-crashed", "f08", &key);
             acknowledged(paths, evidence, point, "pause", &daemon)?;
             let paused = paths.counts()?;
-            check(paused == [0; 4], || {
+            check(paused == [0; 5], || {
                 format!("uncommitted spawn visible while paused: {paused:?}")
             })?;
             daemon.kill()?;
@@ -742,12 +754,34 @@ fn s1_f08_crash_inside_spawn_write_leaves_nothing() -> TestResult {
             drop(daemon);
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let recovered = paths.counts()?;
-            check(recovered == [0; 4], || {
+            check(recovered == [0; 5], || {
                 format!("partial spawn survived the crash: {recovered:?}")
             })?;
+            let mut retry = spawn_args("f08").to_vec();
+            retry.extend(key);
+            let mut command = paths.command();
+            command.args(&retry).env("VIA_HANDLE", HANDLE);
+            let capture = run_command(&mut command, Duration::from_secs(15)).map_err(infra)?;
+            evidence
+                .write("spawn-retried.stdout", &capture.stdout)
+                .map_err(infra)?;
+            let receipt = json_line(&capture.stdout)?;
+            let session = paths.only_session()?;
+            check(receipt["session_id"] == session.as_str(), || {
+                format!("the keyed retry's receipt is not the session: {receipt}")
+            })?;
+            let envelope = t2c_wait(paths, evidence, &format!("{session}/1"))?;
+            let counts = paths.counts()?;
+            check(
+                envelope["state"] == "completed"
+                    && counts[..2] == [1, 1]
+                    && counts[3..] == [1, 1]
+                    && paths.anchors_for(&session)? == 1,
+                || format!("the keyed retry is not one whole run: {envelope} {counts:?}"),
+            )?;
             completes_normally(paths, evidence)?;
-            check(paths.counts()?[0] == 1, || {
-                "post-recovery Store holds more than the new session".to_owned()
+            check(paths.counts()?[0] == 2, || {
+                "post-recovery Store holds more than the two new sessions".to_owned()
             })
         },
     )
@@ -766,7 +800,7 @@ fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
             let point = "store.spawn.after_commit";
             arm(paths, point, "crash")?;
             let mut daemon = Daemon::start(paths, evidence, "crashed")?;
-            let client = paths.spawn_pending(evidence, "spawn-crashed", "f08");
+            let client = paths.spawn_pending(evidence, "spawn-crashed", "f08", &[]);
             acknowledged(paths, evidence, point, "crash", &daemon)?;
             daemon.wait_crash()?;
             let (status, stdout, _) = client.finish()?;
@@ -830,7 +864,7 @@ fn runs_once_after_restart(
 /// (prompt kept) and only `turn.queued` at seq 1, and no process was started.
 fn check_whole_queued_session(paths: &Paths) -> Result<(), ScenarioError> {
     let counts = paths.counts()?;
-    check(counts == [1, 1, 1, 0], || {
+    check(counts == [1, 1, 1, 0, 0], || {
         format!("spawn rows are not whole: {counts:?}")
     })?;
     let session = paths.only_session()?;
@@ -872,7 +906,7 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
             let point = "store.commit.reply_lost";
             arm(paths, point, "fail_io")?;
             let mut daemon = Daemon::start(paths, evidence, "latched")?;
-            let client = paths.spawn_pending(evidence, "spawn-lost", "f08");
+            let client = paths.spawn_pending(evidence, "spawn-lost", "f08", &[]);
             acknowledged(paths, evidence, point, "fail_io", &daemon)?;
             let (status, stdout, stderr) = client.finish()?;
             let error: Value = serde_json::from_slice(&stderr).unwrap_or_default();

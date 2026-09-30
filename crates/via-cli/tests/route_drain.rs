@@ -496,3 +496,28 @@ fn failure_class_deadline_wall_after_hang() {
     assert_eq!(tail[1]["cleanup"], envelope["cancel"]["cleanup"]);
     assert_eq!(tail[2]["cancel"], envelope["cancel"], "{}", tail[2]);
 }
+
+/// F27: a vendor message that is not valid UTF-8 fails the turn with the
+/// route's decode failure, `protocol`, and `undecoded.bin` holds the
+/// message's bytes exactly, as the agent wrote them.
+#[test]
+fn failure_class_protocol_for_a_message_that_is_not_utf8() {
+    let mut line = br#"{"type":"text","vendor_turn_id":"fake-turn-1","text":""#.to_vec();
+    line.extend_from_slice(&[0xff, 0xfe, b'"', b'}', b'\n']);
+    let (sandbox, envelope, _) = failed_turn(
+        &[
+            emit(ACCEPTED),
+            json!({"action":"emit_bytes","bytes":line}),
+            emit(TERMINAL),
+        ],
+        "protocol",
+    );
+    assert_eq!(envelope["stop_reason"], "error", "{envelope}");
+    assert!(failure_text(&envelope).contains("not UTF-8"), "{envelope}");
+    let session = envelope["session_id"].as_str().unwrap();
+    assert_eq!(sandbox.evidence_file(session, "undecoded.bin"), line);
+    assert!(
+        failure_text(&envelope).contains(&format!("{session}/1/undecoded.bin")),
+        "{envelope}"
+    );
+}

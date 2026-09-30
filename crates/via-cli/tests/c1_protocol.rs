@@ -249,7 +249,28 @@ fn c1_request_envelope_is_strict() -> TestResult {
             ..case(name, line, code, kind_of(code))
         })
         .collect();
-    let failures = run_cases(&sandbox, cases);
+    let mut failures = run_cases(&sandbox, cases);
+    // F5: a valid request before `hello` is refused with the handshake
+    // error and changes nothing; the connection then completes `hello`.
+    let mut connection = Connection::open(&sandbox)?;
+    let spawn = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE});
+    let refused = connection.exchange(&request_line("spawn", &spawn))?;
+    if refused["id"] != 7
+        || refused["error"]["code"] != -32000
+        || refused["error"]["data"]["kind"] != "handshake_required"
+        || refused.get("result").is_some()
+    {
+        failures.push(format!("spawn before hello: {refused}"));
+    }
+    connection.hello()?;
+    let sessions: i64 = rusqlite::Connection::open_with_flags(
+        sandbox.state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?
+    .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+    if sessions != 0 {
+        failures.push(format!("spawn before hello left {sessions} sessions"));
+    }
     drop(daemon);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
