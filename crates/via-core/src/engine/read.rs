@@ -260,9 +260,7 @@ impl Engine {
             .map_err(|error| ApiError::read(&error))?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
         let number = refs.turn.ok_or(ApiError::TURN_NOT_FOUND)?;
-        let folder = refs
-            .evidence_dir
-            .map(|dir| self.store.evidence().absolute(&dir));
+        let folder = refs.evidence_dir.map(|dir| self.store.evidence_path(&dir));
         // A failed `lstat` is a failed evidence read: `store_error`, as for
         // the Store read above; so is a diagnostic permit not available.
         let files = match folder.clone() {
