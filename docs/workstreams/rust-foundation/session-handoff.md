@@ -188,8 +188,8 @@ the historical checkpoint; its findings table is updated by this section.
   control bound). Merged gate: failpoints 529 (3 of 3 runs), Task 4 selector
   85 (10 of 10). **Task 4 epic `via-jm4.7.8` is closed**
   ([t4/reports/T4-close.md](t4/reports/T4-close.md) §7–§8). Follow-ups:
-  `via-jm4.19` (test runs leak host anchors; 17 orphans from Task 3 were
-  still running on 2026-09-30, awaiting the owner's go-ahead to stop them),
+  `via-jm4.19` (test runs leak host anchors; the 15 orphans left by Task 3
+  worktrees were stopped on 2026-09-30 at the owner's request),
   `via-jm4.15`, `.16`, `.18`, `via-d9o.2`, `via-d9o.2.3`. Ledger: `scratchpad/execution/t4-impl/progress.md`; worker logs under
   `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
@@ -205,6 +205,27 @@ the historical checkpoint; its findings table is updated by this section.
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session
   `via` (window `main`; Sol reviews open their own windows). The cloud
   sessions are archived, so no branch watcher runs.
+- **Final S1 critique (`via-jm4.7.9`, claimed).** From 2026-09-30 reviews
+  and critiques run on Codex `gpt-6.1-sol` at high effort (owner). Round 1
+  at `7370e0e`: **S1 NOT ACCEPTABLE** although every gate passed
+  ([s1-critique/reviews/S1-critic-r1.md](s1-critique/reviews/S1-critic-r1.md)).
+  The orchestrator confirmed all 13 findings against the code. Fix chunks,
+  each on Opus 5.5 medium (`implementer`) with a Sol high review:
+  - `.9.1` S1-core (`wt/s1-core`): final-shutdown entry inside the 10 s
+    bound, the §7.3 read streak for dispatcher cancellations, disconnected
+    `wait`s release their slot, `wait` deadlines bound reads, startup
+    failure drops Store off the Tokio workers;
+  - `.9.2` S1-io (`wt/s1-io`): Host control exchanges never reused
+    mid-flight, live Host task collection, the Wire reader drains during a
+    prefix save;
+  - `.9.3` S1-specs (`wt/s1-specs`): T3 design §12 amendments A1–A23 never
+    reached the specs; apply them;
+  - `.9.4` S1-contract, after S1-core merges: a missing handle is
+    `invalid_handle`, the missing scenario assertions, evidence `features`,
+    and the evidence harness for the Task 2–3 daemon scenarios (the
+    `via-d9o.2` gap blocks S1 acceptance under `verification.md`).
+  Briefs and ledger: `scratchpad/execution/s1-critic/`; logs under
+  `scratchpad/s1/<chunk>/`; reports go to `s1-critique/reports/`.
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
