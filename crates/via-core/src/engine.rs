@@ -23,6 +23,7 @@ mod batch;
 mod close;
 mod control;
 mod drive;
+mod final_text;
 mod journal;
 mod latch;
 mod progress;
@@ -46,6 +47,8 @@ use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
 pub use status::{Connections, DaemonCounts};
 pub use stop::{EngineShutdown, FinalEntry, StopMode};
+#[cfg(feature = "test-failpoints")]
+pub use terminal::envelope_at_maximum;
 
 /// A committed receipt and, when this request created or adopted the turn,
 /// that turn, now queued with its session's dispatcher. A replayed retry
@@ -470,7 +473,11 @@ struct Terminal {
     failure: Option<Failure>,
     stop_reason: &'static str,
     vendor_stop_reason: Option<String>,
-    final_text: String,
+    /// The final text inline; `None` once it went to `final_text.txt`,
+    /// whether or not the file is named (design §6.4).
+    final_text: Option<String>,
+    /// The durable `final_text.txt` holding a longer final text (design §6.4).
+    final_text_file: Option<crate::api::FinalTextFile>,
     exit: Option<Exit>,
     warnings: Vec<Warning>,
     cancel: Option<Cancel>,
@@ -485,10 +492,12 @@ impl Terminal {
     }
 }
 
+/// A C1 §8.2 failure; its message is cut to 2 KiB encoded at a character
+/// boundary (Task 4 design §6.4).
 fn failure(class: FailureClass, message: String, vendor_code: Option<String>) -> Failure {
     Failure {
         class,
-        message,
+        message: crate::api::failure_message(message),
         vendor_code,
         retryable: false,
     }

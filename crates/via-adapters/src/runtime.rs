@@ -11,7 +11,7 @@ use crate::{
     AcceptanceToken, Cleanup, Deadline, FakeAcceptanceObservation, FakeConfig, FakeObservation,
     FakeTerminalEvidence, Observation, ProcessOwner, ProgressMarks, ReprobeReport, RouteError,
     RouteFailure, RuntimeConfig, RuntimeResources, SessionId, StopWatch, TurnActivity, TurnNumber,
-    VendorTerminalStatus, VendorTurnId,
+    VendorTerminalStatus, VendorTurnId, final_text_pieces,
 };
 use via_routes::{
     FakeMessage, FakeRoute, FakeRouteResult, RouteMessage, TerminalStatus, TurnStart, WireRecovery,
@@ -422,19 +422,40 @@ fn item_cost(strings: &[&str]) -> usize {
         .sum::<usize>()
 }
 
-/// Delivers one Route message (design §2.3): builds its observation, if
-/// any, acquires the item's byte cost, then sends it with the permit. The
-/// pending delivery owns one stall deadline, set at its first block; at the
-/// deadline it gives up. The terminal travels in the route result.
+/// Delivers one Route message (design §2.3): builds its observations and
+/// sends each in order. The terminal message gives its completed final
+/// text as `final_text` pieces, all before the route result, which is the
+/// vendor terminal.
 async fn deliver(
     message: RouteMessage,
     at: tokio::time::Instant,
     sink: ObservationSink,
     stall: Duration,
 ) -> Result<(), Undelivered> {
+    if let FakeMessage::Terminal { final_text, .. } = &message.payload {
+        for piece in final_text_pieces(final_text) {
+            let observation = FakeObservation::Data {
+                observation: Observation::FinalText(piece.to_owned()),
+            };
+            send(observation, &sink, stall).await?;
+        }
+        return Ok(());
+    }
     let Some(observation) = normalize(message, at)? else {
         return Ok(());
     };
+    send(observation, &sink, stall).await
+}
+
+/// Sends one observation: acquires the item's byte cost, then sends it
+/// with the permit. Each item owns one stall deadline, set at its first
+/// block, so the bound restarts once an item is accepted; at the deadline
+/// it gives up.
+async fn send(
+    observation: FakeObservation,
+    sink: &ObservationSink,
+    stall: Duration,
+) -> Result<(), Undelivered> {
     let mut stall_at = None;
     let wanted = u32::try_from(observation_cost(&observation)).map_err(|_| Undelivered)?;
     let permit = match Arc::clone(&sink.budget).try_acquire_many_owned(wanted) {
@@ -508,8 +529,9 @@ fn normalize(
             usage: Some((None, total_tokens)),
             ..empty
         }),
-        // Route rejects interrupt acknowledgements; the terminal is the route
-        // result; an unknown message is activity only.
+        // Route rejects interrupt acknowledgements; the terminal's final
+        // text is sent by `deliver`, its status is the route result; an
+        // unknown message is activity only.
         FakeMessage::Terminal { .. }
         | FakeMessage::InterruptAck { .. }
         | FakeMessage::Unknown { .. } => None,
@@ -534,6 +556,9 @@ fn observation_cost(observation: &FakeObservation) -> usize {
             }
             item_cost(&strings)
         }
+        FakeObservation::Data {
+            observation: Observation::FinalText(text),
+        } => item_cost(&[text]),
     }
 }
 
@@ -545,7 +570,6 @@ fn normalize_terminal(result: FakeRouteResult) -> FakeTerminalEvidence {
     };
     FakeTerminalEvidence {
         status,
-        final_text: result.final_text,
         stop_reason: result.stop_reason,
         vendor_code: result.vendor_code,
         exit: result.exit,

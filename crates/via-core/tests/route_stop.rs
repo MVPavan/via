@@ -19,8 +19,8 @@ use std::{
 use tokio::sync::watch;
 use via_adapters::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, Deadline, FakeConfig,
-    FakeObservation, FakeTerminalEvidence, RouteError, RouteFailure, RuntimeConfig, SessionId,
-    StopCause, StopOrder, StoreFailure, TurnNumber, VendorTerminalStatus,
+    FakeObservation, FakeTerminalEvidence, Observation, RouteError, RouteFailure, RuntimeConfig,
+    SessionId, StopCause, StopOrder, StoreFailure, TurnNumber, VendorTerminalStatus,
 };
 use via_store::{SpawnRecord, Store, failpoint};
 
@@ -348,11 +348,25 @@ fn a_decoded_terminal_survives_wall_expiry_in_finalization() {
         );
     };
     let child = Child::open(&root);
+    // The final text arrives as `final_text` pieces before the terminal
+    // (Task 4 design §2.3).
+    let mut text = String::new();
     let evidence = child
-        .execute(Duration::from_secs(2), watch::channel(None), |_, _| {})
+        .execute(
+            Duration::from_secs(2),
+            watch::channel(None),
+            |_, observation| {
+                if let FakeObservation::Data {
+                    observation: Observation::FinalText(piece),
+                } = observation
+                {
+                    text.push_str(piece);
+                }
+            },
+        )
         .unwrap();
     assert_eq!(evidence.status, VendorTerminalStatus::Completed);
-    assert_eq!(evidence.final_text, "done");
+    assert_eq!(text, "done");
     assert_eq!(evidence.cleanup, Cleanup::Quiescent);
 }
 

@@ -2,3 +2,10 @@
 fail-fast = false
 status-level = "fail"
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Task 4 T4-6 F24 (design §5.1, §13.2): the memory gate drives every holder
+# of the daemon at its maximum and samples its RSS, so it runs alone: it
+# neither disturbs nor is disturbed by timing-bound scenarios.
+[[profile.default.overrides]]
+filter = 'test(/^s1_f24_flood_/)'
+threads-required = "num-test-threads"

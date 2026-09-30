@@ -18,8 +18,6 @@ use via_wire::{
 pub struct FakeRouteResult {
     /// Vendor terminal status.
     pub status: TerminalStatus,
-    /// Authoritative final text.
-    pub final_text: String,
     /// Vendor stop reason retained verbatim.
     pub stop_reason: String,
     /// Optional vendor failure code.
@@ -774,10 +772,11 @@ impl Phase {
     }
 }
 
-/// Terminal fields retained for the route result.
+/// Terminal fields retained for the route result. The final text is not
+/// among them: the Adapter sends it as `final_text` observations from the
+/// terminal message itself (Task 4 design §2.3).
 struct TerminalEvidence {
     status: TerminalStatus,
-    final_text: String,
     stop_reason: String,
     vendor_code: Option<String>,
 }
@@ -791,7 +790,6 @@ impl TerminalEvidence {
     ) -> FakeRouteResult {
         FakeRouteResult {
             status: self.status,
-            final_text: self.final_text,
             stop_reason: self.stop_reason,
             vendor_code: self.vendor_code,
             exit,
@@ -805,13 +803,11 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
     match &message.payload {
         FakeMessage::Terminal {
             status,
-            final_text,
             stop_reason,
             vendor_code,
             ..
         } => Some(TerminalEvidence {
             status: *status,
-            final_text: final_text.clone(),
             stop_reason: stop_reason.clone(),
             vendor_code: vendor_code.clone(),
         }),

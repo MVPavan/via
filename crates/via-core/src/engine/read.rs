@@ -5,11 +5,14 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
-use via_store::{StoreClient, TerminalFacts};
+use via_store::{EventsRead, PAGE_MAX, StoreClient, TerminalFacts};
 
 use super::{Engine, journal};
 use crate::api::{DEFAULT_WAIT_MS, FAKE_TOKEN_SCOPE, rfc3339};
-use crate::{ApiError, LogsParams, SessionId, StatusParams, TurnNumber, WaitParams, parse_address};
+use crate::{
+    ApiError, EventsParams, ListParams, LogsParams, SessionId, StatusParams, TurnNumber,
+    WaitParams, parse_address,
+};
 
 /// `status` reply bound (Task 4 design §4.2): met by construction, checked
 /// by a debug assertion.
@@ -173,19 +176,65 @@ impl Engine {
         }
     }
 
-    /// Reads the first bounded page of durable canonical events.
-    pub async fn events(&self, session: &str) -> Result<Value, ApiError> {
-        let id = SessionId::try_from(session).map_err(|_| ApiError::INVALID_PARAMS)?;
-        let events = self
+    /// C1 §3.11 `events` (Task 4 design §4.3): one Public Store read of the
+    /// window after `after`, filtered by `turn` and `types`; the events
+    /// array Store wrote is placed in the reply as it is, never parsed.
+    /// `earliest_seq` is 1: nothing is pruned.
+    pub async fn events(&self, params: EventsParams) -> Result<Box<RawValue>, ApiError> {
+        let read = self
             .store
             .public()
-            .events(&id, 1, 1000)
+            .events_page(params.query()?)
             .await
             .map_err(|error| ApiError::read(&error))?;
-        let next_after = events.last().map_or(0, |event| event.seq);
-        Ok(
-            json!({"events":events.into_iter().map(|event| event.event).collect::<Vec<_>>(),"next_after":next_after,"more":false}),
-        )
+        let page = match read {
+            EventsRead::Page(page) => page,
+            EventsRead::SessionNotFound => return Err(ApiError::SESSION_NOT_FOUND),
+            EventsRead::TurnNotFound => return Err(ApiError::TURN_NOT_FOUND),
+        };
+        let reply = format!(
+            r#"{{"events":{},"next_after":{},"more":{},"earliest_seq":1}}"#,
+            page.events, page.next_after, page.more
+        );
+        debug_assert!(reply.len() <= PAGE_MAX, "an events page exceeds PAGE_MAX");
+        RawValue::from_string(reply).map_err(|_| ApiError::STORE)
+    }
+
+    /// C1 §3.10 `list` (Task 4 design §4.5, §6.8): one Public Store read of
+    /// at most 1000 sessions below the cursor, newest first; the page's
+    /// bound holds by construction, checked by a debug assertion.
+    pub async fn list(&self, params: ListParams) -> Result<Value, ApiError> {
+        let page = self
+            .store
+            .public()
+            .list_page(params.query()?)
+            .await
+            .map_err(|error| ApiError::read(&error))?;
+        let sessions: Vec<Value> = page
+            .sessions
+            .into_iter()
+            .map(|summary| {
+                json!({
+                    "session_id": summary.session_id,
+                    "state": summary.state,
+                    "admission": summary.admission,
+                    "harness": summary.harness,
+                    "model": summary.model,
+                    "label": summary.label,
+                    "created_at": unix_ms(summary.created_ms),
+                    "last_active_at": unix_ms(summary.last_active_ms),
+                })
+            })
+            .collect();
+        let value = json!({
+            "sessions": sessions,
+            "next_cursor": page.next.map(|ord| format!("l3.{ord}")),
+        });
+        debug_assert!(
+            serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= PAGE_MAX),
+            "a list page exceeds PAGE_MAX"
+        );
+        Ok(value)
     }
 
     /// C1 §3.12 `logs` (Task 4 design §4.4): where the addressed turn's

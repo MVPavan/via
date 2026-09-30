@@ -25,9 +25,10 @@ enum Command {
     Close(CloseArgs),
     Result(ReadArgs),
     Wait(WaitArgs),
-    Events(ReadArgs),
+    Events(EventsArgs),
     Logs(ReadArgs),
     Status(StatusArgs),
+    List(ListArgs),
     /// Proxies C1 between stdio and the daemon socket, unchanged.
     Serve {
         #[arg(long, required = true)]
@@ -275,6 +276,40 @@ struct StatusArgs {
     json: bool,
 }
 
+/// C1 §3.11 `via events <session|turn> [--after SEQ] [--limit N] [--types T,…]`.
+#[derive(Args)]
+struct EventsArgs {
+    address: String,
+    #[arg(long)]
+    after: Option<u64>,
+    #[arg(long)]
+    limit: Option<u32>,
+    #[arg(long, value_delimiter = ',')]
+    types: Option<Vec<String>>,
+    #[arg(long)]
+    json: bool,
+}
+
+/// C1 §3.10 `via list [--state S] [--harness H] [--label L] [--since T]
+/// [--limit N] [--cursor C]`.
+#[derive(Args)]
+struct ListArgs {
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long)]
+    harness: Option<String>,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    limit: Option<u32>,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args)]
 struct ReadArgs {
     address: String,
@@ -381,9 +416,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             client::call("result", &json!({"address":args.address}), true, true)
         }
         Command::Wait(args) => wait(&args),
-        Command::Events(args) => {
-            client::call("events", &json!({"session":args.address}), true, true)
-        }
+        Command::Events(args) => events(args),
+        Command::List(args) => list(args),
         Command::Logs(args) => logs(&args.address),
         Command::Status(args) => status(&args),
         Command::Serve { .. } => client::serve_stdio().await,
@@ -482,6 +516,47 @@ fn logs(address: &str) -> anyhow::Result<i32> {
         "session"
     };
     client::call("logs", &json!({member: address}), true, true)
+}
+
+/// `via events` (C1 §3.11): a session or a turn address, and the page's
+/// window and filter.
+fn events(args: EventsArgs) -> anyhow::Result<i32> {
+    let member = if args.address.contains('/') {
+        "turn"
+    } else {
+        "session"
+    };
+    let mut params = json!({member: args.address});
+    if let Some(after) = args.after {
+        params["after"] = Value::from(after);
+    }
+    if let Some(limit) = args.limit {
+        params["limit"] = Value::from(limit);
+    }
+    if let Some(types) = args.types {
+        params["types"] = Value::from(types);
+    }
+    client::call("events", &params, true, true)
+}
+
+/// `via list` (C1 §3.10): one page of session summaries.
+fn list(args: ListArgs) -> anyhow::Result<i32> {
+    let mut params = json!({});
+    for (member, value) in [
+        ("state", args.state),
+        ("harness", args.harness),
+        ("label", args.label),
+        ("since", args.since),
+        ("cursor", args.cursor),
+    ] {
+        if let Some(value) = value {
+            params[member] = Value::from(value);
+        }
+    }
+    if let Some(limit) = args.limit {
+        params["limit"] = Value::from(limit);
+    }
+    client::call("list", &params, true, true)
 }
 
 /// `via cancel` (C1 §3.5).

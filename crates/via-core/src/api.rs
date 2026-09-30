@@ -169,6 +169,15 @@ pub(crate) struct Overrides {
 /// Longest `label` (C1 §4), in bytes.
 pub(crate) const LABEL_MAX: usize = 120;
 
+/// Longest `bound`, encoded (Task 4 design §6.4).
+const BOUND_MAX: usize = 32 * 1024;
+
+/// Longest `vendor`, encoded (design §6.4).
+const VENDOR_MAX: usize = 16 * 1024;
+
+/// Longest `model` or `effort`, encoded (design §6.4).
+const SHORT_MEMBER_MAX: usize = 1024;
+
 /// Longest `cwd` or `prompt_file` path (design §10.4, §11.1), in bytes.
 pub(crate) const PATH_MAX: usize = 4096;
 
@@ -221,6 +230,16 @@ impl SpawnParams {
     /// each `require`d verb met by [`Capabilities::fake`], the first unmet
     /// one refused by name.
     pub(crate) fn check_session_members(&self) -> Result<(), ApiError> {
+        // Design §6.4: the envelope's members a caller sizes, refused at
+        // receipt over their maxima.
+        if via_adapters::encoded_text_len(&self.model) + 2 > SHORT_MEMBER_MAX {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("model") },
+                "model is longer than 1 KiB encoded",
+            ));
+        }
+        self.per_turn().check_sizes()?;
         if self
             .label
             .as_ref()
@@ -314,6 +333,41 @@ impl ResumeParams {
 }
 
 impl PerTurn<'_> {
+    /// Design §6.4: a `bound` over 32 KiB, a `vendor` over 16 KiB or an
+    /// `effort` over 1 KiB encoded is `invalid_params` naming the member,
+    /// before any route rule.
+    fn check_sizes(&self) -> Result<(), ApiError> {
+        let members = [
+            (
+                self.bound,
+                BOUND_MAX,
+                &const { Named::field("bound") },
+                "bound is longer than 32 KiB encoded",
+            ),
+            (
+                self.vendor,
+                VENDOR_MAX,
+                &const { Named::field("vendor") },
+                "vendor is longer than 16 KiB encoded",
+            ),
+            (
+                self.effort,
+                SHORT_MEMBER_MAX,
+                &const { Named::field("effort") },
+                "effort is longer than 1 KiB encoded",
+            ),
+        ];
+        match members
+            .into_iter()
+            .find(|(value, max, ..)| value.is_some_and(|value| value.get().len() > *max))
+        {
+            Some((_, _, named, message)) => {
+                Err(ApiError::naming(ApiError::INVALID_PARAMS, named, message))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Validates the values against the fake route's capabilities
     /// ([`Capabilities::fake`]). Omitted values inherit. C1 §1 lets only
     /// members typed "or null" be null: a null `output_schema` or
@@ -321,6 +375,7 @@ impl PerTurn<'_> {
     /// route is already the state); a null `effort`, `bound` or `deadlines`,
     /// or a nested null in `deadlines` (A9), is `invalid_params`.
     pub(crate) fn fake_overrides(&self) -> Result<Overrides, ApiError> {
+        self.check_sizes()?;
         let given = |value: Option<&RawValue>| {
             value.is_some_and(|value| json_limits::shape(value.get()) != Shape::Null)
         };
@@ -523,14 +578,6 @@ pub struct ReadParams {
     pub address: String,
 }
 
-/// Strict C1 session-address parameters for the current `events`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionReadParams {
-    /// Session whose durable history is read.
-    pub session: SessionId,
-}
-
 /// Strict C1 §3.7 `status` parameters (Task 4 A26): the turn defaults to
 /// the running turn, else the latest; `limit` is 1 to 1000, default 100.
 #[derive(Deserialize)]
@@ -573,6 +620,225 @@ impl LogsParams {
             },
             (Some(_), Some(_)) | (None, None) => Err(ApiError::INVALID_PARAMS),
         }
+    }
+}
+
+/// The durable event types (Task 4 design §2.1): the names `events`'
+/// `types` filter accepts.
+const EVENT_TYPES: [&str; 16] = [
+    "session.opened",
+    "session.reopened",
+    "session.closed",
+    "turn.queued",
+    "turn.submitted",
+    "turn.started",
+    "turn.ended",
+    "turn.revised",
+    "cancel.requested",
+    "cancel.settled",
+    "steer.delivered",
+    "action.denied",
+    "vendor.request_declined",
+    "process.exited",
+    "server.lost",
+    "warning",
+];
+
+/// An `events` `types` filter: the distinct durable types named, however
+/// often each is repeated. Each name is matched as it is decoded, so a
+/// long list builds no string; a name that is no durable type is
+/// `invalid_params`.
+pub(crate) struct EventTypes([bool; EVENT_TYPES.len()]);
+
+impl EventTypes {
+    /// The named types, in [`EVENT_TYPES`] order.
+    pub(crate) fn names(&self) -> Vec<String> {
+        EVENT_TYPES
+            .iter()
+            .zip(self.0)
+            .filter(|(_, named)| *named)
+            .map(|(name, _)| (*name).to_owned())
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for EventTypes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// One name, matched without being kept.
+        struct Known(usize);
+
+        impl<'de> Deserialize<'de> for Known {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct Name;
+                impl serde::de::Visitor<'_> for Name {
+                    type Value = Known;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a durable event type")
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Known, E> {
+                        EVENT_TYPES
+                            .iter()
+                            .position(|known| *known == name)
+                            .map(Known)
+                            .ok_or_else(|| E::custom("not a durable event type"))
+                    }
+                }
+                deserializer.deserialize_str(Name)
+            }
+        }
+
+        struct Names;
+        impl<'de> serde::de::Visitor<'de> for Names {
+            type Value = EventTypes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a list of durable event types")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<EventTypes, A::Error> {
+                let mut named = [false; EVENT_TYPES.len()];
+                let mut any = false;
+                while let Some(Known(index)) = seq.next_element()? {
+                    named[index] = true;
+                    any = true;
+                }
+                if !any {
+                    return Err(serde::de::Error::custom("types names no event type"));
+                }
+                Ok(EventTypes(named))
+            }
+        }
+        deserializer.deserialize_seq(Names)
+    }
+}
+
+/// Strict C1 §3.11 `events` parameters (Task 4 design §4.3): exactly one of
+/// a session or a turn address; `follow` is an unknown field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsParams {
+    /// The session whose events are read.
+    #[serde(default)]
+    pub session: Option<SessionId>,
+    /// A turn address `<session_id>/<turn>`: only that turn's events.
+    #[serde(default)]
+    pub turn: Option<String>,
+    /// The page starts after this sequence; 0 by default.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Most events returned: 200 by default, 1 to 1000.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    types: Option<EventTypes>,
+}
+
+impl EventsParams {
+    /// The Store query the parameters name.
+    pub(crate) fn query(self) -> Result<via_store::EventsQuery, ApiError> {
+        let (session, turn) = LogsParams {
+            session: self.session,
+            turn: self.turn,
+        }
+        .address()?;
+        let limit = self.limit.unwrap_or(200);
+        if limit == 0 || limit > 1000 {
+            return Err(ApiError::INVALID_PARAMS);
+        }
+        Ok(via_store::EventsQuery {
+            session,
+            turn,
+            after: self.after.unwrap_or(0),
+            limit,
+            types: self
+                .types
+                .as_ref()
+                .map(EventTypes::names)
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// Strict C1 §3.10 `list` parameters (Task 4 design §4.5, §6.8).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListParams {
+    /// Only sessions in this state: `active`, `idle` or `closed`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Only sessions of this harness.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// Only sessions with this label.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Only sessions whose latest durable event is at or after this time.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Most sessions returned: 50 by default, 1 to 200.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The previous page's `next_cursor`, `l3.<ord>`.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+impl ListParams {
+    /// The Store query the parameters name; a cursor other than `l3.`
+    /// and decimal digits, or a bad filter, is `invalid_params`.
+    pub(crate) fn query(self) -> Result<via_store::ListQuery, ApiError> {
+        let before = match self.cursor.as_deref() {
+            None => None,
+            Some(cursor) => {
+                let digits = cursor.strip_prefix("l3.").ok_or(ApiError::INVALID_PARAMS)?;
+                if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(ApiError::INVALID_PARAMS);
+                }
+                Some(
+                    digits
+                        .parse::<u64>()
+                        .map_err(|_| ApiError::INVALID_PARAMS)?,
+                )
+            }
+        };
+        if self
+            .state
+            .as_deref()
+            .is_some_and(|state| !matches!(state, "active" | "idle" | "closed"))
+            || self
+                .harness
+                .as_ref()
+                .is_some_and(|harness| harness.len() > SHORT_MEMBER_MAX)
+            || self
+                .label
+                .as_ref()
+                .is_some_and(|label| label.len() > LABEL_MAX)
+        {
+            return Err(ApiError::INVALID_PARAMS);
+        }
+        let since_ms = self
+            .since
+            .as_deref()
+            .map(via_store::at_ms)
+            .transpose()
+            .map_err(|_| ApiError::INVALID_PARAMS)?;
+        let limit = self.limit.unwrap_or(50);
+        if limit == 0 || limit > 200 {
+            return Err(ApiError::INVALID_PARAMS);
+        }
+        Ok(via_store::ListQuery {
+            before,
+            state: self.state,
+            harness: self.harness,
+            label: self.label,
+            since_ms,
+            limit,
+        })
     }
 }
 
@@ -1391,6 +1657,11 @@ pub(crate) struct Warning {
 }
 
 impl Warning {
+    /// The warning's stable code.
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+
     /// C1 §3.5: a settled cancel whose group absence is unproved.
     pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self {
         code: "cancel_cleanup_uncertain",
@@ -1559,6 +1830,187 @@ pub(crate) struct VendorFields {
     pub(crate) turn_id: Option<String>,
 }
 
+/// Longest inline `final_text`, encoded with its quotes (Task 4 design
+/// §6.4): a longer text goes to `final_text.txt`.
+pub(crate) const FINAL_TEXT_INLINE: usize = 256 * 1024;
+
+/// Longest `failure.message`, encoded (design §6.4).
+const FAILURE_MESSAGE_MAX: usize = 2 * 1024;
+
+/// Entries an envelope list keeps (design §6.4).
+const LIST_KEPT: usize = 1000;
+
+/// Longest envelope list entry, encoded (design §6.4).
+const ENTRY_MAX: usize = 256;
+
+/// The longest prefix of `text` whose escaped JSON encoding, quotes
+/// excluded, is at most `max` bytes: cut at a character boundary.
+pub(crate) fn cut_encoded(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (at, character) in text.char_indices() {
+        let mut buffer = [0_u8; 4];
+        used += via_adapters::encoded_text_len(character.encode_utf8(&mut buffer));
+        if used > max {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// A `failure.message` cut to 2 KiB encoded at a character boundary.
+pub(crate) fn failure_message(mut message: String) -> String {
+    let kept = cut_encoded(&message, FAILURE_MESSAGE_MAX).len();
+    message.truncate(kept);
+    message
+}
+
+/// C1 §5 `final_text_file`: the durable `final_text.txt` holding a final
+/// text longer than [`FINAL_TEXT_INLINE`] (design §6.4).
+#[derive(Clone, Serialize)]
+pub(crate) struct FinalTextFile {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) truncated: bool,
+}
+
+/// C1 §5 `denied_actions` entry: an action the vendor's own bound denied.
+#[derive(Clone, Serialize)]
+pub(crate) struct DeniedAction {
+    kind: &'static str,
+    target: String,
+    reason: String,
+    at: String,
+    event_seq: u64,
+}
+
+/// C1 §5 `auto_declined_requests` entry: a vendor request VIA declined.
+#[derive(Clone, Serialize)]
+pub(crate) struct AutoDeclined {
+    vendor_method: String,
+    summary: String,
+    blocking: bool,
+    at: String,
+    event_seq: u64,
+}
+
+/// An envelope list entry whose two free strings are cut to fit
+/// [`ENTRY_MAX`]; the event it cites keeps the full payload.
+pub(crate) trait ListEntry: Serialize {
+    fn free(&mut self) -> (&mut String, &mut String);
+}
+
+impl ListEntry for DeniedAction {
+    fn free(&mut self) -> (&mut String, &mut String) {
+        (&mut self.target, &mut self.reason)
+    }
+}
+
+impl ListEntry for AutoDeclined {
+    fn free(&mut self) -> (&mut String, &mut String) {
+        (&mut self.vendor_method, &mut self.summary)
+    }
+}
+
+/// One envelope list (design §6.4): the first 1,000 entries, each at most
+/// 256 bytes encoded, and the count of all.
+pub(crate) struct Kept<T> {
+    entries: Vec<T>,
+    total: u64,
+}
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            total: 0,
+        }
+    }
+}
+
+impl<T: ListEntry> Kept<T> {
+    /// Counts `entry` and keeps it, cut to fit, while fewer than 1,000 are
+    /// kept.
+    #[cfg_attr(
+        not(feature = "test-failpoints"),
+        expect(dead_code, reason = "the fake route reports no denials or declines")
+    )]
+    pub(crate) fn push(&mut self, mut entry: T) {
+        self.total += 1;
+        if self.entries.len() >= LIST_KEPT {
+            return;
+        }
+        let (first, second) = entry.free();
+        let (first_text, second_text) = (std::mem::take(first), std::mem::take(second));
+        let fixed = serde_json::to_vec(&entry).map_or(ENTRY_MAX, |bytes| bytes.len());
+        let room = ENTRY_MAX.saturating_sub(fixed);
+        let first_kept = cut_encoded(&first_text, room / 2);
+        let first_used = via_adapters::encoded_text_len(first_kept);
+        let second_kept = cut_encoded(&second_text, room - first_used);
+        let (first, second) = entry.free();
+        first_kept.clone_into(first);
+        second_kept.clone_into(second);
+        self.entries.push(entry);
+    }
+
+    /// The kept entries and the total.
+    pub(crate) fn into_parts(self) -> (Vec<T>, u64) {
+        (self.entries, self.total)
+    }
+}
+
+/// Test builds only: members at their design §6.4 maxima, for
+/// [`crate::envelope_at_maximum`].
+#[cfg(feature = "test-failpoints")]
+pub(crate) mod maxima {
+    use serde_json::{Value, json};
+
+    use super::{AutoDeclined, Bound, DeniedAction, Warning};
+
+    /// An object whose encoding is `bytes` long.
+    pub(crate) fn object_of(bytes: usize) -> Value {
+        json!({"pad":"p".repeat(bytes - r#"{"pad":""}"#.len())})
+    }
+
+    /// `bound` with both sides at 32 KiB encoded.
+    pub(crate) fn bound() -> Bound {
+        Bound {
+            requested: Some(object_of(32 * 1024)),
+            effective: Some(object_of(32 * 1024)),
+            inherited: false,
+        }
+    }
+
+    /// A warning with a 1 KiB message; its strings live for the process.
+    pub(crate) fn warning(code: String) -> Warning {
+        Warning {
+            code: Box::leak(code.into_boxed_str()),
+            message: Box::leak("w".repeat(1024).into_boxed_str()),
+        }
+    }
+
+    /// A denial whose free strings are `bytes` long each.
+    pub(crate) fn denied(bytes: usize, at: &str, event_seq: u64) -> DeniedAction {
+        DeniedAction {
+            kind: "file_write",
+            target: "\u{1}".repeat(bytes),
+            reason: "r".repeat(bytes),
+            at: at.to_owned(),
+            event_seq,
+        }
+    }
+
+    /// A decline whose free strings are `bytes` long each.
+    pub(crate) fn declined(bytes: usize, at: &str, event_seq: u64) -> AutoDeclined {
+        AutoDeclined {
+            vendor_method: "m".repeat(bytes),
+            summary: "\u{e9}".repeat(bytes / 2),
+            blocking: true,
+            at: at.to_owned(),
+            event_seq,
+        }
+    }
+}
+
 /// C1 §5 terminal result envelope.
 #[derive(Serialize)]
 pub(crate) struct Envelope {
@@ -1581,10 +2033,15 @@ pub(crate) struct Envelope {
     pub(crate) vendor_session_id: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) bound: Bound,
-    pub(crate) final_text: String,
+    /// Inline up to [`FINAL_TEXT_INLINE`] encoded; `null` when the text is
+    /// in `final_text_file`.
+    pub(crate) final_text: Option<String>,
+    pub(crate) final_text_file: Option<FinalTextFile>,
     pub(crate) structured_output: Option<Value>,
-    pub(crate) denied_actions: [Value; 0],
-    pub(crate) auto_declined_requests: [Value; 0],
+    pub(crate) denied_actions: Vec<DeniedAction>,
+    pub(crate) auto_declined_requests: Vec<AutoDeclined>,
+    pub(crate) denied_actions_total: u64,
+    pub(crate) auto_declined_requests_total: u64,
     pub(crate) steps: Option<u64>,
     pub(crate) usage: Usage,
     pub(crate) cost: Cost,

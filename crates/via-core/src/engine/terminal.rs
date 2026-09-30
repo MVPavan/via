@@ -10,8 +10,8 @@ use via_store::CancelCause;
 use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
-    Bound, Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, Requested, RoutePlan,
-    Timestamps, Usage, VendorFields, Warning,
+    AutoDeclined, Bound, Cost, DeniedAction, Envelope, EventRange, EvidenceRef, Exit, FailureClass,
+    Kept, Requested, RoutePlan, Timestamps, Usage, VendorFields, Warning,
 };
 use crate::{SessionId, TurnNumber};
 
@@ -45,7 +45,13 @@ pub(super) fn terminal_envelope(
     {
         warnings.push(Warning::CANCEL_CLEANUP_UNCERTAIN);
     }
-    Envelope {
+    // Design §6.4: one entry per code; a repeated code keeps its first.
+    let mut codes = std::collections::HashSet::new();
+    warnings.retain(|warning| codes.insert(warning.code()));
+    let (denied_actions, denied_actions_total) = Kept::<DeniedAction>::default().into_parts();
+    let (auto_declined_requests, auto_declined_requests_total) =
+        Kept::<AutoDeclined>::default().into_parts();
+    let envelope = Envelope {
         api_version: 1,
         session_id: session.clone(),
         turn: turn.get(),
@@ -71,9 +77,12 @@ pub(super) fn terminal_envelope(
         cwd,
         bound: Bound::NONE,
         final_text: terminal.final_text,
+        final_text_file: terminal.final_text_file,
         structured_output: None,
-        denied_actions: [],
-        auto_declined_requests: [],
+        denied_actions,
+        auto_declined_requests,
+        denied_actions_total,
+        auto_declined_requests_total,
         steps: None,
         usage,
         cost: Cost::UNAVAILABLE,
@@ -94,7 +103,14 @@ pub(super) fn terminal_envelope(
         vendor: VendorFields {
             turn_id: accepted.map(|accepted| accepted.vendor_turn_id),
         },
-    }
+    };
+    // Design §6.4: every member has a fixed maximum, so the envelope fits
+    // `ENVELOPE_MAX` by construction; there is no refusal path.
+    debug_assert!(
+        serde_json::to_vec(&envelope).is_ok_and(|bytes| bytes.len() <= via_store::ENVELOPE_MAX),
+        "an envelope exceeds ENVELOPE_MAX"
+    );
+    envelope
 }
 
 /// Maps a typed route cause onto C1 §7.6 state, §8.2 class and stop reason.
@@ -360,7 +376,9 @@ pub(super) fn classify(
         failure,
         stop_reason,
         vendor_stop_reason: Some(evidence.stop_reason),
-        final_text: evidence.final_text,
+        // The drive sets the text it accumulated from `final_text` pieces.
+        final_text: Some(String::new()),
+        final_text_file: None,
         exit: Some(Exit {
             code: evidence.exit.code,
             signal: evidence.exit.signal,
@@ -390,7 +408,8 @@ fn failed_terminal(error: AdapterError) -> Terminal {
         failure: class.map(|class| failure(class, message, None)),
         stop_reason,
         vendor_stop_reason: None,
-        final_text: String::new(),
+        final_text: Some(String::new()),
+        final_text_file: None,
         exit: route
             .as_ref()
             .and_then(|route| route.exit)
@@ -415,6 +434,104 @@ fn canonical_stop_reason(vendor: &str) -> &'static str {
         "error" => "error",
         _ => "other",
     }
+}
+
+/// Test builds only (Task 4 design §6.4, §13.2): the encoded envelope with
+/// every member at its maximum, through the same assembly as a turn's:
+/// `denied` denials and `declined` declines whose free strings are
+/// `entry_bytes` long, the failure message twice its maximum and every
+/// warning code repeated.
+#[cfg(feature = "test-failpoints")]
+pub fn envelope_at_maximum(
+    denied: u64,
+    declined: u64,
+    entry_bytes: usize,
+) -> Result<String, crate::ApiError> {
+    use crate::api::{Cancel, FINAL_TEXT_INLINE, FinalTextFile, maxima};
+    let bad = |_| crate::ApiError::STORE;
+    let session = SessionId::try_from("s_zzzzzzzzzzzz").map_err(bad)?;
+    let turn = TurnNumber::try_from(u32::MAX).map_err(bad)?;
+    let at = "9999-12-31T23:59:59.999Z";
+    let short = |fill: &str| fill.repeat(1024);
+    let path = "/".repeat(4096);
+    let mut warnings = Vec::new();
+    for code in (0..9).chain(0..9) {
+        warnings.push(maxima::warning(format!("warning_code_{code}")));
+    }
+    let terminal = Terminal {
+        state: "cancelled",
+        failure: Some(failure(
+            FailureClass::VendorError,
+            "\u{1}".repeat(4096),
+            Some(short("c")),
+        )),
+        stop_reason: "interrupted",
+        vendor_stop_reason: Some(short("v")),
+        // Both the inline text and a named file: more than a turn carries.
+        final_text: Some("a".repeat(FINAL_TEXT_INLINE - 2)),
+        final_text_file: Some(FinalTextFile {
+            path: path.clone(),
+            bytes: u64::MAX,
+            truncated: true,
+        }),
+        exit: Some(Exit {
+            code: Some(i32::MIN),
+            signal: Some(i32::MIN),
+        }),
+        warnings,
+        cancel: Some(Cancel {
+            outcome: "acknowledged",
+            cleanup: "uncertain",
+            requested_at: at.to_owned(),
+            settled_at: at.to_owned(),
+        }),
+    };
+    let accepted = Accepted {
+        at: at.to_owned(),
+        vendor_turn_id: short("t"),
+    };
+    let timestamps = Timestamps {
+        queued_at: at.to_owned(),
+        submitted_at: Some(at.to_owned()),
+        accepted_at: Some(at.to_owned()),
+        ended_at: at.to_owned(),
+    };
+    let mut envelope = terminal_envelope(
+        &session,
+        turn,
+        terminal,
+        Some(accepted),
+        (Some(path.clone()), Some(path)),
+        timestamps,
+        Some(u64::MAX),
+        (1, u64::MAX - 1),
+        Usage::fake(Some(u64::MAX)),
+    );
+    envelope.model = Requested {
+        requested: "m".repeat(1022),
+        resolved: "m".repeat(1022),
+    };
+    envelope.effort = Requested {
+        requested: Some("e".repeat(1022)),
+        resolved: Some("e".repeat(1022)),
+    };
+    envelope.bound = maxima::bound();
+    envelope.vendor_options = maxima::object_of(16 * 1024);
+    envelope.vendor_session_id = Some(short("s"));
+    let mut denied_list = Kept::default();
+    for index in 0..denied {
+        denied_list.push(maxima::denied(entry_bytes, at, index + 1));
+    }
+    let mut declined_list = Kept::default();
+    for index in 0..declined {
+        declined_list.push(maxima::declined(entry_bytes, at, index + 1));
+    }
+    (envelope.denied_actions, envelope.denied_actions_total) = denied_list.into_parts();
+    (
+        envelope.auto_declined_requests,
+        envelope.auto_declined_requests_total,
+    ) = declined_list.into_parts();
+    serde_json::to_string(&envelope).map_err(|_| crate::ApiError::STORE)
 }
 
 #[cfg(test)]

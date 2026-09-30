@@ -65,6 +65,13 @@ fn run_child(name: &str) {
     assert!(status.success(), "{name} child failed: {status}");
 }
 
+/// The session's first 1000 durable events as one `events` page.
+async fn events_page(engine: &Engine, session: &via_core::SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session": session, "limit": 1000})).unwrap();
+    let page = engine.events(params).await.unwrap();
+    serde_json::from_str(page.get()).unwrap()
+}
+
 fn open(root: &Path) -> Engine {
     Engine::open(
         &root.join("state"),
@@ -124,7 +131,7 @@ fn force_before_dispatch_cancels_the_queued_turn_without_submission() {
             "{envelope}"
         );
 
-        let page = engine.events(session.as_str()).await.unwrap();
+        let page = events_page(&engine, &session).await;
         let events: Vec<Value> = page["events"].as_array().unwrap().clone();
         let types: Vec<&str> = events
             .iter()
@@ -292,7 +299,7 @@ fn force_over_stand_in_within(
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
         let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
-        let events = engine.events(session.as_str()).await.unwrap()["events"]
+        let events = events_page(&engine, &session).await["events"]
             .as_array()
             .unwrap()
             .clone();

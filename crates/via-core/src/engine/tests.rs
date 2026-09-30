@@ -145,9 +145,16 @@ async fn dispatch(engine: &Engine, session: &SessionId) {
         .unwrap();
 }
 
+/// The session's first 1000 durable events as one `events` page.
+async fn events_page(engine: &Engine, session: &SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session": session, "limit": 1000})).unwrap();
+    let page = engine.events(params).await.unwrap();
+    serde_json::from_str(page.get()).unwrap()
+}
+
 /// The session's durable event types, checking that sequences are dense.
 async fn event_types(engine: &Engine, session: &SessionId) -> Vec<String> {
-    let page = engine.events(session.as_str()).await.unwrap();
+    let page = events_page(engine, session).await;
     let events = page["events"].as_array().unwrap();
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["seq"], json!(index + 1), "dense seq: {page}");
@@ -492,7 +499,7 @@ fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
                 "session.closed",
             ]
         );
-        let page = engine.events(session.as_str()).await.unwrap();
+        let page = events_page(&engine, &session).await;
         assert_eq!(page["events"][6]["reason"], "daemon_stop_force");
         for n in 1..=3 {
             let envelope = engine
@@ -863,7 +870,7 @@ fn force_during_the_last_cancellation_is_closed_by_the_closure_pass() {
         assert!(report.is_clean(), "{report:?}");
         let types = event_types(&engine, &session).await;
         assert_eq!(types.last().map(String::as_str), Some("session.closed"));
-        let page = engine.events(session.as_str()).await.unwrap();
+        let page = events_page(&engine, &session).await;
         let events = page["events"].as_array().unwrap();
         assert_eq!(events.last().unwrap()["reason"], "daemon_stop_force");
     });
@@ -2188,7 +2195,8 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             )),
             stop_reason: "error",
             vendor_stop_reason: None,
-            final_text: String::new(),
+            final_text: Some(String::new()),
+            final_text_file: None,
             exit: None,
             warnings: Vec::new(),
             cancel: None,
@@ -2399,7 +2407,8 @@ fn store_terminal() -> super::Terminal {
         )),
         stop_reason: "error",
         vendor_stop_reason: None,
-        final_text: String::new(),
+        final_text: Some(String::new()),
+        final_text_file: None,
         exit: None,
         warnings: Vec::new(),
         cancel: None,

@@ -17,6 +17,7 @@ use via_store::{
 };
 
 use super::batch::AffectedTurn;
+use super::final_text::FinalText;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::progress::Progress;
@@ -27,7 +28,9 @@ use super::terminal::{dispose, terminal_envelope};
 use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
-use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::api::{
+    Cancel, Effective, Event, EventBody, FailureClass, FinalTextFile, Timestamps, Usage, rfc3339,
+};
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -127,6 +130,8 @@ struct Control<'a> {
     idle_at: Option<tokio::time::Instant>,
     /// The turn's frozen idle budget.
     idle: Duration,
+    /// The final text's pieces so far (design §6.4).
+    final_text: FinalText,
 }
 
 /// What the dispatcher does after one step.
@@ -636,6 +641,7 @@ impl Engine {
             refused: false,
             idle_at: Some(origin + effective.idle()),
             idle: effective.idle(),
+            final_text: FinalText::new(),
         };
         let driven = self
             .execute(
@@ -688,6 +694,9 @@ impl Engine {
                     .await,
             );
         }
+        let text_failed = self
+            .settle_final_text(&mut control, &mut record, &mut terminal)
+            .await;
         if record.steps.unrepresentable() {
             // Refused after `execute` returned, when no order could reach it.
             terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
@@ -695,6 +704,9 @@ impl Engine {
         if record.first_failure.is_some() {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
+        }
+        if text_failed {
+            terminal.fail(FailureClass::Store, "the final text could not be written");
         }
         let cause = disposed
             .cancel_cause
@@ -1256,7 +1268,7 @@ impl Engine {
                         // Test builds: Core holds before handling an observation.
                         #[cfg(feature = "test-failpoints")]
                         let _ = via_store::failpoint::hit_async("core.observations.pause").await;
-                        self.observe(record, effective, control.slot, observation).await;
+                        self.observe(record, effective, control, observation).await;
                     })
                     .await;
                     // Handled: its bytes return to the budget.
@@ -1328,8 +1340,7 @@ impl Engine {
             permit,
         }) = observed.try_recv()
         {
-            self.observe(record, effective, control.slot, observation)
-                .await;
+            self.observe(record, effective, control, observation).await;
             drop(permit);
             stop_for_store(record, control);
         }
@@ -1366,6 +1377,7 @@ impl Engine {
             refused: false,
             idle_at: None,
             idle: Duration::ZERO,
+            final_text: FinalText::new(),
         };
         self.drain(record, effective, &mut control, &mut observed)
             .await;
@@ -1380,9 +1392,10 @@ impl Engine {
         &self,
         record: &mut TurnRecord,
         effective: &Effective,
-        slot: &Slot,
+        control: &mut Control<'_>,
         observation: FakeObservation,
     ) {
+        let slot = control.slot;
         match observation {
             FakeObservation::Accepted(observation) => {
                 if let Some(delta) = record.steps.accept() {
@@ -1449,6 +1462,54 @@ impl Engine {
                     slot.publish_progress(record.turn, &folded.delta);
                 }
             }
+            FakeObservation::Data {
+                observation: Observation::FinalText(piece),
+            } => {
+                // Design §6.4: inline up to 256 KiB encoded, else the file;
+                // a failed file step fails the turn `store` as a known
+                // `NotCommitted` does (§3.2).
+                let address = (&record.session, record.turn);
+                if control
+                    .final_text
+                    .push(&self.store, address, &piece)
+                    .await
+                    .is_err()
+                {
+                    self.final_text_failed(record).await;
+                }
+            }
+        }
+    }
+
+    /// Makes the final text's file durable before the terminal names it
+    /// (design §6.4) and puts the text in `terminal`; whether a file step
+    /// failed, which the caller turns into `failed(store)`.
+    async fn settle_final_text(
+        &self,
+        control: &mut Control<'_>,
+        record: &mut TurnRecord,
+        terminal: &mut Terminal,
+    ) -> bool {
+        let text = std::mem::replace(&mut control.final_text, FinalText::new())
+            .settle()
+            .await;
+        terminal.final_text = text.inline;
+        terminal.final_text_file = text.file.map(|file| FinalTextFile {
+            path: file.path.display().to_string(),
+            bytes: file.bytes,
+            truncated: file.truncated,
+        });
+        if text.failed {
+            self.final_text_failed(record).await;
+        }
+        text.failed
+    }
+
+    /// Records a failed final-text file step as the turn's first failure, a
+    /// known `NotCommitted`, and reports it (design §6.4).
+    async fn final_text_failed(&self, record: &mut TurnRecord) {
+        if record.first_failure.is_none() {
+            self.event_failed(record, WriteOutcome::NotCommitted).await;
         }
     }
 
@@ -1837,6 +1898,9 @@ fn progress(observation: &FakeObservation) -> bool {
         FakeObservation::Data {
             observation: Observation::Progress(marks),
         } => marks.model || !marks.tools_started.is_empty() || !marks.tools_ended.is_empty(),
+        FakeObservation::Data {
+            observation: Observation::FinalText(_),
+        } => false,
     }
 }
 
@@ -1903,7 +1967,8 @@ pub(super) fn queued_cancellation(
         failure: None,
         stop_reason: "interrupted",
         vendor_stop_reason: None,
-        final_text: String::new(),
+        final_text: Some(String::new()),
+        final_text_file: None,
         exit: None,
         warnings: Vec::new(),
         cancel: cause.as_ref().map(|(_, requested_at)| Cancel {
