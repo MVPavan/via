@@ -370,6 +370,13 @@ impl Engine {
             slot.rollback(turn);
             return Step::Next;
         }
+        // Task 4 design §5.3, §5.4: below the free-space floor or at
+        // `wal.max`, the turn fails `store` before submission; no agent I/O,
+        // so the connection slot is released first.
+        if let Some(message) = self.dispatch_refusal().await {
+            drop(connection);
+            return self.fail_at_dispatch(slot, session, turn, message).await;
+        }
         #[cfg(test)]
         if self.faults.hold_after_grant.load(Ordering::Acquire) {
             self.faults.granted.notify_one();
@@ -907,6 +914,10 @@ impl Engine {
         self.unresolved.resolve(session, turn);
         self.queued.fetch_sub(1, Ordering::AcqRel);
         self.active.fetch_sub(1, Ordering::AcqRel);
+        if durable.closed {
+            // Task 4 design §11.2: a closed-now answer.
+            self.session_closed();
+        }
         if durable.uncertain {
             // The terminal is durable, but the commit itself was uncertain:
             // a Store failure, so the restart handoff fails startup (§10).
@@ -1063,6 +1074,10 @@ impl Engine {
         held: Option<&super::Admission<'_>>,
         (first, last): (FailureSite, FailureSite),
     ) {
+        if matches!(finished, Ok(durable) if durable.closed) {
+            // Task 4 design §11.2: a closed-now answer.
+            self.session_closed();
+        }
         let failed = match finished {
             Ok(durable) if durable.uncertain => Some((first, WriteOutcome::Uncertain)),
             Ok(durable) if durable.retried => Some((first, WriteOutcome::NotCommitted)),

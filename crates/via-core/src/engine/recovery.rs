@@ -54,6 +54,16 @@ impl Engine {
     /// daemon admits requests only after this succeeds. A queued turn without
     /// submission intent stays queued.
     pub async fn recover(&self) -> Result<usize, String> {
+        self.recover_logged(|_, _| {}).await
+    }
+
+    /// [`Self::recover`], calling `on_turn` for each turn it resolves as
+    /// `unknown` before resolving it: the daemon logs one warning per turn
+    /// with its session and turn (Task 4 design §7.6).
+    pub async fn recover_logged(
+        &self,
+        mut on_turn: impl FnMut(&SessionId, TurnNumber) + Send,
+    ) -> Result<usize, String> {
         // Design §6.5: every referenced blob is checked, then unreferenced
         // ones (a lost discard, a crash before adoption) are unlinked.
         let store_error = |error| format!("store_error: {error}");
@@ -74,6 +84,7 @@ impl Engine {
             // Each resolution commits or fails recovery, so the next read
             // never returns the same turn again.
             for turn in turns {
+                on_turn(&turn.session_id, turn.turn);
                 self.recover_turn(turn, &reconciled)
                     .await
                     .map_err(|error| format!("store_error: {}", error.kind))?;

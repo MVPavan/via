@@ -847,6 +847,129 @@ impl ListParams {
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusParams {}
 
+/// Strict C1 §3.1 `describe` parameters (Task 4 design §4.6): at least one
+/// of `harness` and `model`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeParams {
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    bound: Option<Box<RawValue>>,
+    #[serde(default)]
+    require: Option<Box<RawValue>>,
+    #[serde(default)]
+    vendor: Option<Box<RawValue>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "the fake route is untested either way; it changes no refusal"
+    )]
+    allow_untested: bool,
+}
+
+impl DescribeParams {
+    /// The fake route's plan (C1 §3.1), from [`Capabilities::fake`] with no
+    /// process and no write: a model other than `fake` is `unknown_model`,
+    /// a harness other than `fake` (or no fake agent) `harness_unavailable`.
+    /// What the route cannot do for the given `bound`, `vendor` or
+    /// `require` is listed in `refusals`, each by member and kind.
+    pub(crate) fn describe(&self, fake_available: bool) -> Result<Value, ApiError> {
+        if self.harness.is_none() && self.model.is_none() {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("model") },
+                "describe takes a harness or a model",
+            ));
+        }
+        if self
+            .harness
+            .as_deref()
+            .is_some_and(|harness| harness != "fake")
+            || !fake_available
+        {
+            return Err(ApiError::HARNESS_UNAVAILABLE);
+        }
+        if self.model.as_deref().is_some_and(|model| model != "fake") {
+            return Err(ApiError::UNKNOWN_MODEL);
+        }
+        if self
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.len() > PATH_MAX || !std::path::Path::new(cwd).is_absolute())
+        {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                &const { Named::field("cwd") },
+                "cwd must be an absolute path of at most 4096 bytes",
+            ));
+        }
+        let capabilities = Capabilities::fake();
+        let mut refusals = Vec::new();
+        let mut refuse = |error: ApiError| match error.named {
+            Some(named) if named.route.is_some() => {
+                refusals.push(json!({"field":named.field,"kind":error.kind,
+                    "message":error.message}));
+                Ok(())
+            }
+            _ => Err(error),
+        };
+        let per_turn = PerTurn {
+            effort: None,
+            bound: self.bound.as_deref(),
+            output_schema: None,
+            deadlines: None,
+            max_steps: None,
+            vendor: self.vendor.as_deref(),
+        };
+        if let Err(error) = per_turn.fake_overrides() {
+            refuse(error)?;
+        }
+        if let Some(require) = &self.require
+            && let Err(error) = capabilities.require(require)
+        {
+            refuse(error)?;
+        }
+        let plan = RoutePlan::fake();
+        let mut described = json!({"harness":"fake",
+            "model":{"requested":self.model,"resolved":"fake"},
+            "capabilities":capabilities,"effective_bound":null,
+            "refusals":refusals,"warnings":plan.warnings()});
+        if let (Some(described), Value::Object(plan)) = (described.as_object_mut(), json!(plan)) {
+            described.extend(plan);
+        }
+        Ok(described)
+    }
+}
+
+/// Strict C1 §3.13 `models` parameters (Task 4 design §4.6).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsParams {
+    #[serde(default)]
+    harness: Option<String>,
+}
+
+impl ModelsParams {
+    /// The fake's one model; none for another harness.
+    pub(crate) fn models(&self) -> Value {
+        let models = if self
+            .harness
+            .as_deref()
+            .is_none_or(|harness| harness == "fake")
+        {
+            json!([{"model":"fake","harness":"fake","aliases":[],"source":"builtin"}])
+        } else {
+            json!([])
+        };
+        json!({ "models": models })
+    }
+}
+
 /// Strict C1 §3.14 `daemon/stop` parameters; `drain` and `force` exclude each other.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -879,6 +1002,18 @@ pub struct ApiError {
     /// Why a named member was refused (`data.reason`), such as a prompt
     /// file's (design §10.4).
     pub reason: Option<&'static str>,
+    /// The free space and the floor of a `disk_free_floor` refusal
+    /// (`data.free_bytes`, `data.floor_bytes`; Task 4 design §5.3).
+    pub floor: Option<Box<FreeFloor>>,
+}
+
+/// A `disk_free_floor` refusal's numbers (Task 4 design §5.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreeFloor {
+    /// Free space of the State directory's filesystem, in bytes.
+    pub free_bytes: u64,
+    /// The configured `disk.free_floor`, in bytes.
+    pub floor_bytes: u64,
 }
 
 /// A refused request member (`data.field`) and, when a route's capabilities
@@ -998,6 +1133,10 @@ impl ApiError {
         if let Some(reason) = self.reason {
             data["reason"] = json!(reason);
         }
+        if let Some(floor) = &self.floor {
+            data["free_bytes"] = json!(floor.free_bytes);
+            data["floor_bytes"] = json!(floor.floor_bytes);
+        }
         if self.code == Self::REQUEST_TOO_LARGE.code {
             // Design §10.1: the named kind tells a program to use `prompt_file`.
             data["max_bytes"] = json!(REQUEST_LINE_MAX);
@@ -1027,6 +1166,42 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
+    };
+
+    /// C1 §8.1: a model the harness does not offer (Task 4 design §4.6).
+    pub const UNKNOWN_MODEL: Self = Self {
+        code: -32010,
+        kind: "unknown_model",
+        message: "unknown model",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: None,
+        floor: None,
+    };
+
+    /// Design §5.3 (A42): free space on the State directory's filesystem is
+    /// below `disk.free_floor`; new work is refused before any write.
+    pub(crate) fn disk_free_floor(free_bytes: u64, floor_bytes: u64) -> Self {
+        Self {
+            message: "free disk space is below the floor",
+            kind2: Some("disk_free_floor"),
+            floor: Some(Box::new(FreeFloor {
+                free_bytes,
+                floor_bytes,
+            })),
+            ..Self::STORE_QUEUE_FULL
+        }
+    }
+
+    /// Design §5.4 (A42): the WAL is at `wal.max`; the receipt was refused
+    /// before `BEGIN`, known not committed.
+    pub const WAL_FULL: Self = Self {
+        message: "the Store WAL is at its limit; new work is refused",
+        kind2: Some("wal_full"),
+        ..Self::RECEIPT_NOT_COMMITTED
     };
 
     /// C1 §8.1: a `require`d capability the route does not meet.
@@ -1039,6 +1214,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
 
     /// A refusal naming the member (and route) in `named`.
@@ -1060,6 +1236,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// A caller handle did not authorize a mutation.
     pub const INVALID_HANDLE: Self = Self {
@@ -1071,6 +1248,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The selected route has no such control capability.
     pub const UNSUPPORTED_VERB: Self = Self {
@@ -1082,6 +1260,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The fake route is not configured or selected.
     pub const HARNESS_UNAVAILABLE: Self = Self {
@@ -1093,6 +1272,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The daemon accepted a stop and admits no new work.
     pub const DAEMON_STOPPING: Self = Self {
@@ -1104,6 +1284,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// Active sessions refuse a plain stop (C1 §3.14).
     pub const SESSIONS_ACTIVE: Self = Self {
@@ -1115,6 +1296,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The daemon already retains its bound of turns without a durable terminal.
     pub const TURNS_AT_CAPACITY: Self = Self {
@@ -1126,6 +1308,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// A C1 read found the Store's Public lane full (Task 4 design §6.1):
     /// nothing was read, and the Store did not fail.
@@ -1138,6 +1321,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The Store cannot establish or read the required durable state.
     pub const STORE: Self = Self {
@@ -1149,6 +1333,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// A bound the route cannot enforce (C1 §4.2).
     pub const BOUND_UNSUPPORTED: Self = Self {
@@ -1160,6 +1345,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
@@ -1171,6 +1357,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// A wait deadline elapsed while the turn remains active.
     pub const WAIT_TIMEOUT: Self = Self {
@@ -1182,6 +1369,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The requested session is absent.
     pub const SESSION_NOT_FOUND: Self = Self {
@@ -1193,6 +1381,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The session is closed or closing.
     pub const SESSION_CLOSED: Self = Self {
@@ -1204,6 +1393,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The session exists but has no such turn.
     pub const TURN_NOT_FOUND: Self = Self {
@@ -1215,6 +1405,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The session already holds its bound of queued turns (C1 P6).
     pub const QUEUE_FULL: Self = Self {
@@ -1226,6 +1417,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// The daemon already holds its bound of queued turns (runtime §8).
     pub const QUEUED_AT_CAPACITY: Self = Self {
@@ -1237,6 +1429,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// Store refused `Closed` twice while a turn of the closing session was
     /// still queued or running (design §4 dispatcher step 6).
@@ -1249,6 +1442,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
     /// A retry key was reused with another handle or other params (C1 P4).
     pub const IDEMPOTENCY_CONFLICT: Self = Self {
@@ -1260,6 +1454,7 @@ impl ApiError {
         commit_outcome: None,
         named: None,
         reason: None,
+        floor: None,
     };
 }
 

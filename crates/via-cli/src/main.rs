@@ -29,6 +29,10 @@ enum Command {
     Logs(ReadArgs),
     Status(StatusArgs),
     List(ListArgs),
+    /// The route one set of parameters would take (Task 4 design §4.6).
+    Describe(DescribeArgs),
+    /// The models each harness offers (Task 4 design §4.6).
+    Models(ModelsArgs),
     /// Proxies C1 between stdio and the daemon socket, unchanged.
     Serve {
         #[arg(long, required = true)]
@@ -76,6 +80,37 @@ struct SpawnArgs {
     turn: TurnArgs,
     #[arg(long)]
     background: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DescribeArgs {
+    #[arg(long)]
+    harness: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    bound: Option<String>,
+    #[arg(long = "allow-dir", requires = "bound")]
+    allow_dirs: Vec<String>,
+    #[arg(long, requires = "bound")]
+    network: bool,
+    /// Verbs the route must support, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    require: Vec<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    allow_untested: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ModelsArgs {
+    #[arg(long)]
+    harness: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -420,8 +455,41 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::List(args) => list(args),
         Command::Logs(args) => logs(&args.address),
         Command::Status(args) => status(&args),
+        Command::Describe(args) => describe(args),
+        Command::Models(args) => {
+            let mut params = json!({});
+            if let Some(harness) = args.harness {
+                params["harness"] = Value::String(harness);
+            }
+            client::call("models", &params, true, true)
+        }
         Command::Serve { .. } => client::serve_stdio().await,
     }
+}
+
+/// `via describe` (Task 4 design §4.6): writes nothing.
+fn describe(args: DescribeArgs) -> anyhow::Result<i32> {
+    let mut params = json!({});
+    if let Some(harness) = args.harness {
+        params["harness"] = Value::String(harness);
+    }
+    if let Some(model) = args.model {
+        params["model"] = Value::String(model);
+    }
+    if let Some(mode) = args.bound {
+        params["bound"] =
+            json!({"mode":mode,"extra_write_dirs":args.allow_dirs,"network":args.network});
+    }
+    if !args.require.is_empty() {
+        params["require"] = json!(args.require);
+    }
+    if let Some(cwd) = args.cwd {
+        params["cwd"] = json!(absolute(&cwd)?);
+    }
+    if args.allow_untested {
+        params["allow_untested"] = Value::Bool(true);
+    }
+    client::call("describe", &params, true, true)
 }
 
 /// `via spawn` (C1 §3.2): foreground waits for the envelope.

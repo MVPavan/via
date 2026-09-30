@@ -622,6 +622,8 @@ impl Engine {
         match store.commit_session_closed(session, closed).await {
             Ok(true) => {
                 guard.committed(1);
+                // Task 4 design §11.2: a closed-now answer.
+                self.session_closed();
                 true
             }
             // Store found the session closed or a turn unfinished: nothing written.

@@ -20,9 +20,10 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use via_core::{
-    ApiError, CancelParams, CloseParams, DaemonStatusParams, DaemonStopParams, Engine,
-    EventsParams, HelloParams, ListParams, LogsParams, REQUEST_LINE_MAX, ReadParams, Receipted,
-    ResumeParams, SpawnParams, StatusParams, SteerParams, WaitParams, json_limits,
+    ApiError, CancelParams, CloseParams, DaemonStatusParams, DaemonStopParams, DescribeParams,
+    Engine, EventsParams, HelloParams, ListParams, LogsParams, ModelsParams, REQUEST_LINE_MAX,
+    ReadParams, Receipted, ResumeParams, SpawnParams, StatusParams, SteerParams, WaitParams,
+    json_limits,
 };
 
 use super::Client;
@@ -245,13 +246,20 @@ async fn stop_request(
     id: &RawValue,
     stop: &Notify,
 ) -> bool {
+    let mut force = false;
     let mode = match typed::<DaemonStopParams>(params) {
-        Ok(params) => engine.request_stop(&params).await.map_err(Refusal::from),
+        Ok(params) => {
+            force = params.force;
+            engine.request_stop(&params).await.map_err(Refusal::from)
+        }
         Err(refusal) => Err(refusal),
     };
     let (reply, accepted) = if let Err(refusal) = mode {
         (failure(id, &error_data(refusal)), false)
     } else {
+        if force {
+            tracing::warn!("forced stop accepted");
+        }
         stop.notify_one();
         (stopping(id), true)
     };
@@ -316,12 +324,19 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
                 &json!({"daemon_version":crate::client::binary_version(),"pid":std::process::id(),
                 "socket_path":socket_path,"store_path":store_path,"health":engine.health(),
                 "store_failure":engine.store_failure_status(),
-                "sessions":{"idle":0,"active":counts.active,"closing":counts.closing},
+                "started_at":engine.started_at(),
+                "sessions":{"idle":counts.idle,"active":counts.active,"closing":counts.closing},
                 "connections":{"limit":connections.limit,"in_use":connections.in_use,
                     "held_unproven":connections.held_unproven},
-                "servers":[]}),
+                "servers":[],
+                // Task 4 design §5.3, §5.5 (A37).
+                "limits":engine.limits().to_value(),
+                "storage":engine.storage().await}),
             )
         }
+        // Task 4 design §4.6: nothing is written.
+        "describe" => raw(&engine.describe(&typed::<DescribeParams>(params)?)?),
+        "models" => raw(&engine.models(&typed::<ModelsParams>(params)?)),
         "spawn" | "resume" => {
             // Core enqueues the new turn with its session's dispatcher under
             // admission; a replayed retry enqueues nothing. The retry
@@ -367,6 +382,7 @@ const METHOD_NOT_FOUND: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
 const HANDSHAKE_REQUIRED: ApiError = ApiError {
@@ -378,6 +394,7 @@ const HANDSHAKE_REQUIRED: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
 const VERSION_MISMATCH: ApiError = ApiError {
@@ -389,6 +406,7 @@ const VERSION_MISMATCH: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
 const PARSE_ERROR: ApiError = ApiError {
@@ -400,6 +418,7 @@ const PARSE_ERROR: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
 const INVALID_REQUEST: ApiError = ApiError {
@@ -411,18 +430,18 @@ const INVALID_REQUEST: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
-/// A request error plus the optional C1 `data.kind2` refinement.
+/// A request error; its C1 `data.kind2` refinement is the error's own.
 #[derive(Clone)]
 struct Refusal {
     error: ApiError,
-    kind2: Option<&'static str>,
 }
 
 impl From<ApiError> for Refusal {
     fn from(error: ApiError) -> Self {
-        Self { error, kind2: None }
+        Self { error }
     }
 }
 
@@ -538,11 +557,13 @@ fn parse_request(line: &[u8]) -> Result<Parsed<'_>, (Option<&RawValue>, Refusal)
 /// unknown_field` (C1 §8.1).
 fn typed<T: DeserializeOwned>(params: &str) -> Result<T, Refusal> {
     serde_json::from_str(params).map_err(|error| Refusal {
-        error: ApiError::INVALID_PARAMS,
-        kind2: error
-            .to_string()
-            .starts_with("unknown field")
-            .then_some("unknown_field"),
+        error: ApiError {
+            kind2: error
+                .to_string()
+                .starts_with("unknown field")
+                .then_some("unknown_field"),
+            ..ApiError::INVALID_PARAMS
+        },
     })
 }
 
@@ -550,11 +571,8 @@ fn typed<T: DeserializeOwned>(params: &str) -> Result<T, Refusal> {
 /// `{"code", "message", "data"}` inside `{"data": …}` so callers can add
 /// members to `data`.
 fn error_data(refusal: Refusal) -> Value {
-    let Refusal { error, kind2 } = refusal;
-    let mut data = error.data();
-    if let Some(kind2) = kind2 {
-        data["kind2"] = json!(kind2);
-    }
+    let Refusal { error } = refusal;
+    let data = error.data();
     json!({"code":error.code,"message":error.message,"data":data})
 }
 

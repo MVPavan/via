@@ -45,7 +45,7 @@ use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
-pub use status::{Connections, DaemonCounts};
+pub use status::{Connections, DaemonCounts, Limits};
 pub use stop::{EngineShutdown, FinalEntry, StopMode};
 #[cfg(feature = "test-failpoints")]
 pub use terminal::envelope_at_maximum;
@@ -121,6 +121,18 @@ pub struct Engine {
     /// removed when its future ends or is dropped (design §6.8 step 3).
     /// Final shutdown settles nothing of a session still here.
     dispatching: StdMutex<HashSet<SessionId>>,
+    /// Daemon config's disk and WAL thresholds, read once at start
+    /// (Task 4 design §5.5).
+    limits: Limits,
+    /// When this Engine opened (design §11.2), as `daemon/status` reports it.
+    started_at: String,
+    /// `Sessions.open` (design §11.2): sessions not closed, seeded from the
+    /// Store at open, +1 at each spawn receipt and −1 at each closed-now
+    /// Store answer.
+    open_sessions: AtomicUsize,
+    /// The data-size walk's cached result (design §5.3); the async mutex
+    /// shares one walk among concurrent `daemon/status` calls.
+    data_size: tokio::sync::Mutex<Option<status::DataSize>>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -248,35 +260,48 @@ impl Engine {
     }
 
     /// [`Engine::open`] under `lock`, the `store.lock` daemon main took
-    /// before any State mutation (runtime §6.1); the Store holds it.
+    /// before any State mutation (runtime §6.1); the Store holds it. The
+    /// thresholds are daemon config's (Task 4 design §5.5).
     pub fn open_locked(
         state: &Path,
         runtime: &Path,
         fake: FakeConfig,
         binary: PathBuf,
-        lock: StoreLock,
+        (lock, limits): (StoreLock, Limits),
     ) -> Result<Self, String> {
-        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT, Some(lock))
+        Self::open_with(
+            state,
+            runtime,
+            fake,
+            binary,
+            DAEMON_QUEUE_LIMIT,
+            Some((lock, limits)),
+        )
     }
 
     /// `open` with the dispatcher-start channel's capacity, which unit tests
-    /// lower, and the `store.lock` already taken, if any.
+    /// lower, and the `store.lock` already taken with daemon config's
+    /// thresholds, if any; without them the defaults apply.
     fn open_with(
         state: &Path,
         runtime: &Path,
         fake: FakeConfig,
         binary: PathBuf,
         start_capacity: usize,
-        lock: Option<StoreLock>,
+        locked: Option<(StoreLock, Limits)>,
     ) -> Result<Self, String> {
         // Test builds only: the named failpoints activate before any Store write.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::activate_from_environment()?;
-        let owner = match lock {
-            Some(lock) => Store::open_locked(state, lock),
+        let limits = locked
+            .as_ref()
+            .map_or_else(Limits::default, |(_, limits)| *limits);
+        let owner = match locked {
+            Some((lock, limits)) => Store::open_with_limits(state, lock, limits.wal),
             None => Store::open(state),
         }
         .map_err(|error| error.to_string())?;
+        let open_sessions = usize::try_from(owner.open_sessions()).unwrap_or(usize::MAX);
         // Design §7.1 (T3-S5 round 2, decision 11): SQLite corruption on any
         // read reaches the failure hook at Store's read reply, before any
         // read of recovery or of the Engine.
@@ -322,6 +347,10 @@ impl Engine {
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),
             dispatching: StdMutex::new(HashSet::new()),
+            limits,
+            started_at: crate::api::rfc3339(std::time::SystemTime::now()),
+            open_sessions: AtomicUsize::new(open_sessions),
+            data_size: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             faults: Faults::default(),
         })

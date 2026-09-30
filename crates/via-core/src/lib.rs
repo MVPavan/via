@@ -5,7 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use via_adapters::FakeConfig;
 pub use via_adapters::{AcceptanceToken, CancelOutcome, Cleanup, StartOutcome};
-pub use via_store::{CommitOutcome, Deadline, SessionId, StoreLock, TurnNumber};
+pub use via_store::{
+    CommitOutcome, Deadline, PAGE_BYTES, SessionId, StoreLock, TurnNumber, WalLimits,
+};
 
 /// Strict parameters for C1's mandatory first `hello` request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,7 +85,7 @@ mod engine;
 #[cfg(feature = "test-failpoints")]
 pub use engine::envelope_at_maximum;
 pub use engine::{
-    Connections, DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff,
+    Connections, DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff, Limits,
     Receipted, StopMode,
 };
 
@@ -106,6 +108,7 @@ pub use api::{
     SpawnParams, StatusParams, SteerParams, Unpersisted, WaitParams, hash_handle, parse_address,
     retry_identity,
 };
+pub use api::{DescribeParams, FreeFloor, ModelsParams};
 
 impl Serialize for C1TurnState {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

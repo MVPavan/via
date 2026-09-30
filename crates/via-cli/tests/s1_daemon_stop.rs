@@ -195,7 +195,6 @@ impl Paths {
 struct Daemon<'a> {
     child: Child,
     paths: &'a Paths,
-    trace: PathBuf,
     cleanup: PathBuf,
     crash_snapshot: Option<Vec<outer_cleanup::AnchorRow>>,
 }
@@ -211,6 +210,7 @@ impl<'a> Daemon<'a> {
         evidence: &Evidence,
         configure: impl FnOnce(&mut Command),
     ) -> Result<Self, ScenarioError> {
+        // Startup lines only: later ones go to `via.log` (Task 4 design §7.6).
         let trace = evidence.dir.join("daemon.trace");
         let mut command = paths.command();
         configure(&mut command);
@@ -222,7 +222,6 @@ impl<'a> Daemon<'a> {
         let mut daemon = Self {
             child: command.spawn().map_err(infra)?,
             paths,
-            trace,
             cleanup: evidence.dir.join("cleanup.json"),
             crash_snapshot: None,
         };
@@ -256,11 +255,12 @@ impl<'a> Daemon<'a> {
         }
     }
 
-    /// The daemon's final bounded shutdown summary line.
+    /// The daemon's final bounded shutdown summary line: the last in
+    /// `via.log` (Task 4 design §7.6).
     fn summary(&self) -> Result<Value, ScenarioError> {
-        let trace = fs::read_to_string(&self.trace).map_err(infra)?;
-        trace
-            .lines()
+        let log = fs::read_to_string(self.paths.state.join("via.log")).map_err(infra)?;
+        log.lines()
+            .rev()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find_map(|line| line.get("daemon_shutdown").cloned())
             .ok_or_else(|| fail("daemon wrote no final shutdown summary"))

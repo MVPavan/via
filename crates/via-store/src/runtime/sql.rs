@@ -1,5 +1,6 @@
 //! SQLite migration and single-writer transaction implementation.
 
+use super::disk::{PAGE_BYTES, Wal, WalLimits};
 use super::{
     AcceptanceRecord, ActiveTurn, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
     CommitOutcome, Connection, Duration, EventRecord, EventsPage, EventsQuery, EventsRead,
@@ -217,8 +218,15 @@ const SCHEMA_V6: &str = "CREATE TABLE sessions (
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
-/// first mutation, the journal-mode switch.
-pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), StoreError> {
+/// first mutation, the journal-mode switch. The checkpoint policy is
+/// `wal`'s (Task 4 design §5.4): a passive checkpoint after
+/// `checkpoint_bytes` of growth, in whole pages, and a WAL cut to
+/// `checkpoint_bytes` when it resets (`journal_size_limit`).
+pub(super) fn configure(
+    conn: &mut Connection,
+    created: bool,
+    wal: &WalLimits,
+) -> Result<(), StoreError> {
     conn.busy_timeout(Duration::from_millis(250))
         .map_err(|error| StoreError::Open(error.to_string()))?;
     let version: i64 = conn
@@ -242,6 +250,14 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
         "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;",
     )
     .map_err(|error| StoreError::Open(error.to_string()))?;
+    let pages = i64::try_from(wal.checkpoint_bytes / PAGE_BYTES)
+        .map_err(|error| StoreError::Open(error.to_string()))?;
+    let limit =
+        i64::try_from(wal.checkpoint_bytes).map_err(|error| StoreError::Open(error.to_string()))?;
+    conn.execute_batch(&format!(
+        "PRAGMA wal_autocheckpoint={pages}; PRAGMA journal_size_limit={limit};"
+    ))
+    .map_err(|error| StoreError::Open(error.to_string()))?;
     if version == 0 {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -257,15 +273,16 @@ pub(super) fn configure(conn: &mut Connection, created: bool) -> Result<(), Stor
 /// service order until the fence drains them. It runs under a
 /// [`DeadGuard`], so however it ends, unwinding included, the writer is
 /// marked dead and the request in hand and every queued one fail
-/// `WriterLost`.
+/// `WriterLost`. Every mutation passes `wal`'s policy (Task 4 design
+/// §5.4) before and after it.
 pub(super) fn writer_loop(
     mut conn: Connection,
     lanes: &Lanes,
     corruption: &ReadCorruption,
     blobs: &Blobs,
+    mut wal: Wal,
 ) {
     let mut guard = DeadGuard::new(lanes);
-    let mut commits = 0_u32;
     while let Some(command) = lanes.pop() {
         guard.in_flight = Some(command);
         // Test-only `store.writer.before_serve`: a pause holds the request
@@ -295,12 +312,11 @@ pub(super) fn writer_loop(
         let Some(command) = serve_read(&conn, command, corruption) else {
             continue;
         };
+        let Some(command) = wal.admit(&conn, command) else {
+            continue;
+        };
         serve_write(&mut conn, command, blobs);
-        commits += 1;
-        if commits >= 1000 {
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
-            commits = 0;
-        }
+        wal.committed(&conn);
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     drop(guard);

@@ -280,6 +280,7 @@ pub(super) const NOT_IDLE: ApiError = ApiError {
     commit_outcome: None,
     named: None,
     reason: None,
+    floor: None,
 };
 
 fn plain_stop() -> DaemonStopParams {

@@ -17,7 +17,9 @@
 //! on then fails (design §10), each acknowledged under its own occurrence.
 //! The action `delay` carries `"value"`, milliseconds the hit waits before
 //! the point continues (Task 4 design §13.1 `store.read.delay_ms`); it may
-//! also persist.
+//! also persist. The action `value` carries `"value"` too, a number the
+//! point reports in place of the one it would read ([`value`], §13.1
+//! `store.statvfs.free_bytes`); it may persist.
 //!
 //! A process VIA spawns without its environment, such as Host's anchor, is
 //! activated with the daemon's directory and token through [`activate`].
@@ -51,6 +53,8 @@ enum Action {
     FailIo,
     /// Waits the command's `value` milliseconds, then continues.
     Delay,
+    /// Reports the command's `value` to a [`value`] point.
+    Value,
 }
 
 impl Action {
@@ -60,6 +64,7 @@ impl Action {
             Self::Crash => "crash",
             Self::FailIo => "fail_io",
             Self::Delay => "delay",
+            Self::Value => "value",
         }
     }
 }
@@ -71,6 +76,7 @@ enum Act {
     Crash,
     FailIo,
     Delay(Duration),
+    Value(u64),
 }
 
 #[derive(Deserialize)]
@@ -79,20 +85,23 @@ struct Command {
     token: String,
     occurrence: u64,
     action: Action,
-    /// With `fail_io` or `delay` only: act on every hit from `occurrence` on.
+    /// With `fail_io`, `delay` or `value` only: act on every hit from
+    /// `occurrence` on.
     #[serde(default)]
     persist: bool,
-    /// With `delay` only, and required there: milliseconds to wait.
+    /// With `delay` or `value` only, and required there: milliseconds to
+    /// wait, or the value to report.
     #[serde(default)]
     value: Option<u64>,
 }
 
 impl Command {
-    /// Whether the command's shape is valid: `persist` only with `fail_io`
-    /// or `delay`, and `value` exactly with `delay`.
+    /// Whether the command's shape is valid: `persist` only with `fail_io`,
+    /// `delay` or `value`, and `value` exactly with `delay` or `value`.
     fn valid(&self) -> bool {
-        (!self.persist || matches!(self.action, Action::FailIo | Action::Delay))
-            && (self.value.is_some() == (self.action == Action::Delay))
+        let valued = matches!(self.action, Action::Delay | Action::Value);
+        (!self.persist || valued || self.action == Action::FailIo)
+            && (self.value.is_some() == valued)
     }
 
     fn act(&self) -> Act {
@@ -101,6 +110,7 @@ impl Command {
             Action::Crash => Act::Crash,
             Action::FailIo => Act::FailIo,
             Action::Delay => Act::Delay(Duration::from_millis(self.value.unwrap_or(0))),
+            Action::Value => Act::Value(self.value.unwrap_or(0)),
         }
     }
 }
@@ -271,7 +281,8 @@ pub fn hit(point: &'static str) -> io::Result<()> {
         return Ok(());
     };
     match controller.enter(point)? {
-        None => Ok(()),
+        // A value is for [`value`] points; elsewhere the point continues.
+        None | Some((_, Act::Value(_))) => Ok(()),
         Some((_, Act::Crash)) => std::process::abort(),
         Some((_, Act::FailIo)) => Err(injected(point)),
         Some((_, Act::Delay(delay))) => {
@@ -295,7 +306,8 @@ pub async fn hit_async(point: &'static str) -> io::Result<()> {
         return Ok(());
     };
     match controller.enter(point)? {
-        None => Ok(()),
+        // A value is for [`value`] points; elsewhere the point continues.
+        None | Some((_, Act::Value(_))) => Ok(()),
         Some((_, Act::Crash)) => std::process::abort(),
         Some((_, Act::FailIo)) => Err(injected(point)),
         Some((_, Act::Delay(delay))) => {
@@ -308,6 +320,33 @@ pub async fn hit_async(point: &'static str) -> io::Result<()> {
                 tokio::time::sleep(POLL).await;
             }
             Ok(())
+        }
+    }
+}
+
+/// Enters `point` for a value it reports in place of the one it would
+/// read: `Some` when a `value` command is armed for this hit. Other actions
+/// act as at [`hit`]; an acknowledgement that cannot be written is the
+/// point's error.
+pub fn value(point: &'static str) -> io::Result<Option<u64>> {
+    let Some(controller) = controller() else {
+        return Ok(None);
+    };
+    match controller.enter(point)? {
+        Some((_, Act::Value(value))) => Ok(Some(value)),
+        None => Ok(None),
+        Some((_, Act::Crash)) => std::process::abort(),
+        Some((_, Act::FailIo)) => Err(injected(point)),
+        Some((_, Act::Delay(delay))) => {
+            thread::sleep(delay);
+            Ok(None)
+        }
+        Some((occurrence, Act::Pause)) => {
+            let release = controller.release_path(point, occurrence);
+            while !released(&release) {
+                thread::sleep(POLL);
+            }
+            Ok(None)
         }
     }
 }
