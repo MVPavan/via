@@ -232,3 +232,194 @@ After the runs, no process from this worktree's `target/` was left
   a fixed 10–15 s. `stop_daemons` has 10 s in place of 20 s, as runtime
   §11.2 requires. A slow shutdown under load now shows up as incomplete
   cleanup, not a pass.
+
+## Fix round 1
+
+**Status: DONE_WITH_CONCERNS.** Review:
+`scratchpad/execution/s1-critic/review-s1-evidence2-sol-r1.md` (Sol r1),
+findings 1–5 and its "Out of scope, noticed" item, all accepted by the
+coordinator. The owner's added scope, a sweep of the whole class, is
+recorded below. Commit `d809c9a`.
+
+### Changes and RED → GREEN
+
+1. **One deadline across guard and sandbox teardown (r1 finding 1).**
+   `evidenced::Teardown` holds a scenario's final-teardown deadline and the
+   cleanup failures its guards record.
+   - The deadline is begun by the first guard that drops a *live* daemon,
+     or else by the sandbox's drop. The sandbox's exit proof
+     (`stop_daemons(runtime, state, &teardown, stop)`) and anchor cleanup
+     (`park`/`collect`) share it.
+   - The API makes the mid-test/final distinction explicit:
+     - A deliberate mid-test stop lets the daemon exit through the guard's
+       bounded `exit` first. An exited guard's drop never begins teardown.
+     - Every sandbox `start` (`s1_turn_control`, `s1_lifecycle`,
+       `s1_store_failure`, `c1_protocol`) refuses once teardown began. A
+       live daemon dropped mid-test and then restarted therefore fails
+       loudly instead of shortening the teardown. No existing test hit this.
+   - `route_drain` has no guard, so it passes a fresh `Teardown::new()`.
+   - `stop_within` was removed. Tests use `Teardown::with_budget`.
+
+   Regression:
+   `evidence_collector::collector_sandbox_teardown_shares_the_guards_deadline`.
+   - A guard phase begins a 1 s teardown and uses 700 ms of it.
+   - The sandbox's anchor cleanup must then find its group, gone only at
+     1.3 s, unproven.
+   - A recorded unreaped child must fail the exit proof.
+   - RED: with `stop_daemons` restarting the budget, the scenario passed
+     (`r1-item1-red.log`). GREEN: `r1-item1-green.log`.
+2. **Bounded anchor connect (r1 finding 2).** `outer_cleanup::connect_by`
+   opens a nonblocking `rustix` socket and retries `EAGAIN` (full backlog)
+   every 10 ms until the deadline, then returns `TimedOut`. Linux does not
+   report `EINPROGRESS` for Unix sockets. It then switches the socket back
+   to blocking for the bounded exchange. No new dependency: `rustix` with
+   `net` was already a dev-dependency.
+
+   Regression: `outer_cleanup_connect_is_bounded_by_the_deadline`. A
+   listener with backlog 0 is filled; `connect_by` must return `TimedOut`
+   within 5 s for a 300 ms deadline. RED: the round-0 blocking connect was
+   still blocked at 5 s (`r1-items23-red.log`). The C1 guard's connect
+   limitation stays as recorded.
+3. **Whole exchanges bounded (r1 finding 3).** `outer_cleanup::exchange`
+   wraps the stream in `Bounded`. Before every underlying `read`/`write`,
+   it sets the socket timeout to the time left, and it fails with
+   `TimedOut` once that is zero. A reply completed after the deadline is
+   none. The anchor `transact` and the C1 guard's `stop_by` (`hello`, then
+   `daemon/stop`) both use it.
+
+   Regression: `outer_cleanup_exchange_is_bounded_as_a_whole`. A peer
+   trickles its reply one byte every 40 ms, against a 300 ms deadline.
+   RED: the round-0 per-call timeouts accepted the complete reply
+   (`r1-items23-red.log`).
+4. **Reaps never block (r1 finding 4).** Every reap now polls `try_wait`:
+   - `evidenced::reap_by(child, deadline)` is used by `run_within` and by
+     the guards in `c1_protocol`, `s1_turn_control`, `s1_lifecycle` and
+     `s1_store_failure`. The kill's reap gets min(1 s, time left). A child
+     still unreaped is recorded through `Teardown::failed` and fails the
+     exit proof, so nothing is collected and the sandbox is kept.
+   - `scenario::run_command` gives a killed child at most 1 s, then
+     returns an error.
+   - `s1_crash_points::PendingClient` does the same.
+
+   An uninterruptible (D-state) child cannot be forced cheaply, so this has
+   no regression. The code path is the same `try_wait` loop the other
+   deadline tests exercise.
+5. **F19/F24 probe order (r1 finding 5).** `absent_within(boundary, bound,
+   probe)` (in `s1_turn_control` and `s1_vendor_pipeline`) probes first,
+   then timestamps, and enforces the bound before accepting absence. The
+   checked measurement is still recorded as evidence.
+
+   Regressions: `s1_f19_absence_after_the_bound_fails` and
+   `s1_f24_absence_after_the_bound_fails`. A probe that resumes 100 ms
+   after a 50 ms bound and finds the process gone must fail. RED: both
+   round-0 orders accepted it (`r1-item5-red.log`). No injectable clock or
+   probe hook existed, so the loop was factored into this helper.
+6. **`Evidence::drop` keeps the outcome (the out-of-scope item).** `finish`
+   records `(outcome, detail)` as soon as the outcome is validated. If
+   finalization then fails partway, the drop fallback writes that outcome
+   and detail, with `evidence_complete: false`, an `evidence_failure` and
+   any `cleanup_failure`. A panic before any outcome still writes
+   `infrastructure_failure`.
+
+   Regression: `a_finalization_failure_keeps_the_outcome`. Hashing a
+   missing fake binary fails `finish("timeout", ...)`. RED: the summary
+   said `infrastructure_failure` (`r1-item6-red.log`).
+
+Other changes:
+- `outer_cleanup::verify` now records any teardown that finished after its
+  deadline as `unverified` (`deadline_exceeded: true`). This also covers an
+  overrun in an earlier phase, and a scenario with no anchors.
+- The evidenced collector now runs the anchor cleanup before the Store
+  backup and evidence copies, so those copies use none of the teardown
+  budget.
+
+Updated test:
+`evidence_collector::collector_launched_turn_without_its_folder_fails_the_evidence`.
+Its synthetic Store now has the committed anchor schema, because the
+collector reads the anchors first. Its assertion is unchanged.
+
+### Sweep (owner scope)
+
+Line numbers are at `d809c9a`, `crates/via-cli/tests/`.
+
+**Teardown operations, and how each is bounded:**
+
+| Site | Operation | Bound |
+|---|---|---|
+| `support/outer_cleanup.rs:256` `connect_by` | anchor connect | nonblocking; `EAGAIN` retried until the deadline |
+| `support/outer_cleanup.rs:287` `exchange`/`Bounded` | anchor and C1-guard reads and writes | time left before each syscall; none after the deadline; a late completion is none. `flush` is a no-op. |
+| `support/outer_cleanup.rs:344` `observe_absence` | group query and sleep | sleep ≤ min(20 ms, time left); `ESRCH` after the deadline is `esrch_after_deadline` |
+| `support/outer_cleanup.rs:64` `snapshot` | SQLite read | busy timeout of 1 s (no deadline parameter). An overrun is recorded by `verify`'s late check (line 108). |
+| `support/outer_cleanup.rs:104` `verify` | the whole anchor phase | completion after the deadline is `unverified` |
+| `support/evidenced.rs:160` `stop_daemons`/`prove_exit` | process scan, stop, lock polls, 10 ms sleeps | the shared teardown deadline; a proof completed after it is an error |
+| `support/evidenced.rs:292` `run_within` | stop CLI child | the budget, then a kill; the reap polls until the deadline; an unreaped killed child is a zombie, not counted as alive |
+| `support/evidenced.rs:311` `reap_by` | reap | `try_wait` polling until the deadline |
+| `support/evidenced.rs:460` `store_evidence` | anchor cleanup, then backup and copies | cleanup runs on the shared deadline; the copies are evidence collection, not cleanup, and run after it |
+| `support/scenario.rs:55` `run_command` | CLI child during teardown | the caller's timeout (min(2 s, time left) in guards); a killed child gets ≤ 1 s, polled |
+| `support/daemon.rs:237` `Daemon::drop` | stop, exit wait, kill and reap, anchors | one deadline: stop ≤ 2 s, exit ≤ time left − 1 s, reap ≤ min(1 s, time left) (`reap`, line 225, checks at least once), anchors by the deadline; unreaped goes to `direct_child.reaped: false` |
+| `s1_recovery.rs:405`, `s1_crash_points.rs:472`, `s1_daemon_stop.rs:270` `Daemon::drop` | same phases | same deadline pattern (round 0), plus the bounded `run_command` reap |
+| `s1_prompt_to_result.rs:50` `Daemon::drop` and the cleanup closure at `:707` | stop, reap loops, socket wait, anchors | one deadline each; loops check the time before each sleep |
+| `s1_crash_points.rs:338` `PendingClient::drop` | client kill and reap | ≤ 1 s polled (`wait_child`); a client, not a daemon, so it does not take part in the teardown deadline |
+| `c1_protocol.rs:80`, `route_drain.rs:205`, `s1_turn_control.rs:122`, `s1_lifecycle.rs:153`, `s1_store_failure.rs:140` `Sandbox::drop` | exit proof and collection | the shared `Teardown` (item 1) |
+| `c1_protocol.rs:172`, `s1_turn_control.rs:464`, `s1_lifecycle.rs:599`, `s1_store_failure.rs:602` `Daemon::drop` | stop, exit wait, kill, reap | the shared `Teardown`; an unreaped child is recorded |
+| `c1_protocol.rs:107` `stop_by` | C1 connect | **not bounded**: the recorded C1-connect limitation, kept by instruction. Its exchanges are bounded. |
+
+**No bound needed:**
+- Local file writes of `cleanup.json`, the summary, the manifest and the
+  report (`write_all`, `sync_all`, `fs::write`). They are local filesystem
+  I/O, with no peer that can stall them.
+- `support/evidence.rs` `sha256sum`/`git`/`rustc` `output()` calls
+  (lines 235, 310, 318). These are evidence finalization after cleanup has
+  completed and been recorded, not teardown.
+- `support/failpoints.rs` and `support/hits.rs`, and the body helpers in
+  `support/daemon.rs` (`Raw`, readiness, `await_gate`). These are scenario
+  body only.
+- The per-file `collect` closures (`s1_bounds`, `s1_c1_reads`,
+  `s1_progress`, `s1_c1_intake`, `s1_daemon_config`, `s1_f24_memory`) and
+  `collect_available`. They make read-only Store reads and read the
+  cleanup record after the guard wrote it, and no cleanup claim depends on
+  their timing.
+- The in-body `finish`/`verify_anchors` checks in `s1_turn_control`,
+  `s1_lifecycle`, `s1_store_failure` and `s1_daemon_stop`. They are
+  scenario assertions after an explicit exit, with their own bounds.
+
+**Residual:** `/proc/<pid>/environ` reads in `scan_processes`
+(`support/evidenced.rs:336`) have no timeout API. A read blocked on a
+target's memory lock is not bounded. The process scan is re-checked
+against the deadline after each pass, so a slow pass is still recorded as
+an overrun.
+
+**Outcome preservation.** Only `support/evidence.rs` writes `summary.json`:
+- `finish` records the caller's outcome, with failures beside it;
+- the `Drop` fallback keeps the outcome `finish` began with (item 6);
+- only an invalid outcome, or a panic before `finish`, writes
+  `infrastructure_failure`, because no originating result exists then.
+
+`evidenced` and `run_scenario` pass the originating outcome (round 0).
+
+### Gates (fix round 1)
+
+Logs in `scratchpad/s1/evidence2/`: `r1-gate.log`,
+`r1-failpoints-run2.log` and `r1-failpoints-run3.log`.
+
+| Check | Result |
+|---|---|
+| fmt; Clippy default and failpoints | pass |
+| Default nextest | 351 passed, 1 skipped |
+| `cargo deny`; layers | pass |
+| Failpoint nextest, 3 runs | 558 passed, 1 skipped each |
+| F08/F09/F10/F12 selector | 58 passed |
+| Release build and `check-release-features.py` | pass: 649 nodes, 106 points ignored, 0 of 117 markers |
+| Task 4 selector, 5 repeats | 89 passed each time |
+
+Gate exit 0. No process from this worktree was left afterwards.
+
+### Concerns
+
+- A live daemon dropped mid-test that is *not* followed by a restart still
+  begins the final teardown early. Such a scenario would find less
+  teardown time at its end, which is recorded as incomplete cleanup, not
+  hidden. No current test does this.
+- Two failure paths have no regression, because they cannot be forced
+  cheaply: the D-state reap and an overrunning `/proc` read. Both are
+  recorded, not proven.
