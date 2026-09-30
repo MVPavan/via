@@ -614,6 +614,109 @@ pub struct StoredEvent {
     pub event: Value,
 }
 
+/// Largest `events` or `list` page, encoded (design §4.3, §6.8).
+pub const PAGE_MAX: usize = 1024 * 1024;
+
+/// Room [`PAGE_MAX`] leaves for a page's members besides its array.
+const PAGE_WRAPPER: usize = 512;
+
+/// Most sequence numbers one `events` page scans, and most sessions one
+/// `list` page examines (design §4.3, §6.8).
+const PAGE_SCAN: u64 = 1000;
+
+/// An `events` page request (design §4.3): the window `after < seq ≤
+/// after + 1000`, the `turn` and `types` predicates and the match limit.
+#[derive(Clone, Debug)]
+pub struct EventsQuery {
+    /// The session whose events are read.
+    pub session: SessionId,
+    /// Only this turn's events; `None` reads the whole session.
+    pub turn: Option<TurnNumber>,
+    /// The page starts after this sequence.
+    pub after: u64,
+    /// Most events returned, 1 to 1000.
+    pub limit: u32,
+    /// Only these event types; empty reads every type.
+    pub types: Vec<String>,
+}
+
+/// One `events` page (design §4.3).
+#[derive(Clone, Debug)]
+pub struct EventsPage {
+    /// The events as one JSON array text, the stored documents in `seq`
+    /// order; at most [`PAGE_MAX`] less the page's other members.
+    pub events: String,
+    /// The last sequence scanned; the next page's `after`.
+    pub next_after: u64,
+    /// Whether events after `next_after` exist, read in the same request.
+    pub more: bool,
+}
+
+/// What an `events` read found.
+#[derive(Clone, Debug)]
+pub enum EventsRead {
+    /// The page.
+    Page(EventsPage),
+    /// The session does not exist.
+    SessionNotFound,
+    /// The session exists but the addressed turn does not.
+    TurnNotFound,
+}
+
+/// A `list` page request (design §6.8): sessions whose `ord` is below
+/// `before`, newest first, with filters applied to each row in order.
+#[derive(Clone, Debug)]
+pub struct ListQuery {
+    /// Only sessions created before this ordinal; `None` starts at the newest.
+    pub before: Option<u64>,
+    /// Only sessions in this state.
+    pub state: Option<String>,
+    /// Only sessions of this harness.
+    pub harness: Option<String>,
+    /// Only sessions with this label.
+    pub label: Option<String>,
+    /// Only sessions whose latest durable event is at or after this Unix ms.
+    pub since_ms: Option<i64>,
+    /// Most sessions returned, 1 to 200.
+    pub limit: u32,
+}
+
+/// One session in a `list` page (design §4.5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    /// The session.
+    pub session_id: SessionId,
+    /// `active`, `idle` or `closed`.
+    pub state: String,
+    /// `open` or `closing`.
+    pub admission: String,
+    /// The frozen harness.
+    pub harness: String,
+    /// The frozen model, if any.
+    pub model: Option<String>,
+    /// The caller's label, if any.
+    pub label: Option<String>,
+    /// Creation time, Unix ms.
+    pub created_ms: i64,
+    /// Time of the latest durable event, Unix ms.
+    pub last_active_ms: i64,
+}
+
+/// One `list` page (design §6.8).
+#[derive(Clone, Debug)]
+pub struct ListPage {
+    /// Matching sessions, newest first.
+    pub sessions: Vec<SessionSummary>,
+    /// The `ord` of the last session examined; `None` once the oldest was.
+    pub next: Option<u64>,
+}
+
+/// Parses a C1 time, strictly `YYYY-MM-DDTHH:MM:SS.mmmZ` as events carry
+/// it, to Unix milliseconds (design §6.6); anything else is `Constraint`.
+pub fn at_ms(at: &str) -> Result<i64, StoreError> {
+    sql::at_ms(at)
+}
+
 /// Where a turn's evidence is (design §4.4, §6.7): the selected turn, its
 /// folder relative to the State directory (`None` for a turn never
 /// submitted) and the session's vendor identity and transcript hint.
@@ -895,6 +998,8 @@ pub(crate) enum Command {
         u32,
         oneshot::Sender<Result<Vec<StoredEvent>, StoreError>>,
     ),
+    EventsPage(EventsQuery, oneshot::Sender<Result<EventsRead, StoreError>>),
+    ListPage(ListQuery, oneshot::Sender<Result<ListPage, StoreError>>),
     EvidenceRefs(
         SessionId,
         Option<TurnNumber>,
@@ -1059,6 +1164,19 @@ impl Command {
             | Self::EvidenceRefs(session, _, _)
             | Self::Authenticate(session, _, _) => (session.as_str().len(), 0, 0),
             Self::Status(query, _) => (query.session.as_str().len(), 0, 0),
+            Self::EventsPage(query, _) => (
+                query.session.as_str().len() + query.types.iter().map(String::len).sum::<usize>(),
+                0,
+                0,
+            ),
+            Self::ListPage(query, _) => (
+                [&query.state, &query.harness, &query.label]
+                    .iter()
+                    .map(|member| member.as_ref().map_or(0, String::len))
+                    .sum(),
+                0,
+                0,
+            ),
             Self::Steps(record, _) => (
                 record.session_id.as_str().len() + 32 * record.rows.len(),
                 0,
@@ -1886,6 +2004,26 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
+    /// Reads one `events` page (design §4.3) in one read.
+    pub async fn events_page(&self, query: EventsQuery) -> Result<EventsRead, StoreError> {
+        if query.limit == 0 || query.limit > 1000 {
+            return Err(StoreError::Constraint("event page limit must be 1 to 1000"));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::EventsPage(query, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads one `list` page (design §6.8) in one read.
+    pub async fn list_page(&self, query: ListQuery) -> Result<ListPage, StoreError> {
+        if query.limit == 0 || query.limit > 200 {
+            return Err(StoreError::Constraint("list page limit must be 1 to 200"));
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ListPage(query, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
     /// Returns at most 1000 turns that have submission intent but no terminal.
     pub async fn unfinished_turns(&self) -> Result<Vec<UnfinishedTurn>, StoreError> {
         let (reply, receive) = oneshot::channel();
@@ -1997,6 +2135,16 @@ impl StoreClient {
         let (reply, receive) = oneshot::channel();
         self.send(Command::EvidenceRefs(session_id.clone(), turn, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Creates the turn's `final_text.txt` in its evidence folder (design
+    /// §6.4) for the drive to append the final text to.
+    pub async fn final_text_file(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<crate::FinalTextFile, StoreError> {
+        crate::FinalTextFile::create(&self.evidence, self.blobs.tasks.clone(), session, turn).await
     }
 
     /// The evidence root, for making a stored folder absolute; no I/O.

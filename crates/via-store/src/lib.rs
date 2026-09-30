@@ -147,6 +147,7 @@ mod blob;
 mod evidence;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint;
+mod final_text;
 pub mod json_limits;
 mod lanes;
 mod runtime;
@@ -155,17 +156,19 @@ pub use blob::{
     BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX, PROMPT_MAX, PromptFileError,
 };
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
+pub use final_text::{FINAL_TEXT_FILE_MAX, FinalTextFile, FinalTextRef};
 pub use lanes::{Lane, Lanes};
 
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, ActiveTurn, AnchorCohort, AnchorIdentity, AnchorIntent,
     AnchorIntentReceipt, AnchorOwner, AnchorPhase, AnchorRecord, CancelCause, CloseIntent,
-    ClosedOutcome, ClosedRecord, ClosingRecord, ENVELOPE_MAX, EventRecord, EvidenceRefs,
-    FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, GroupAbsenceRecord, KeyedOperation,
-    OperationRecord, OperationVerb, Predecessors, ProcessJournal, Prompt, QueuedSummary,
-    QueuedTurn, ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, STATUS_ANCHORS,
-    STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS, SessionSnapshot, SessionStatus, SpawnKey,
+    ClosedOutcome, ClosedRecord, ClosingRecord, ENVELOPE_MAX, EventRecord, EventsPage, EventsQuery,
+    EventsRead, EvidenceRefs, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord,
+    GroupAbsenceRecord, KeyedOperation, ListPage, ListQuery, OperationRecord, OperationVerb,
+    PAGE_MAX, Predecessors, ProcessJournal, Prompt, QueuedSummary, QueuedTurn, ReceiptRecord,
+    ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE,
+    STATUS_STEPS, STATUS_TURNS, SessionSnapshot, SessionStatus, SessionSummary, SpawnKey,
     SpawnRecord, StepRow, StepsRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent,
     StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras,
-    TerminalFacts, TerminalRecord, UnfinishedTurn,
+    TerminalFacts, TerminalRecord, UnfinishedTurn, at_ms,
 };

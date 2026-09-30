@@ -2,17 +2,18 @@
 
 use super::{
     AcceptanceRecord, ActiveTurn, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
-    CommitOutcome, Connection, Duration, EventRecord, EvidenceRefs, EvidenceRoot,
-    FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity, KeyedOperation, MetadataExt,
-    OperationRecord, OperationVerb, OptionalExtension, Path, Predecessors, Prompt, QueuedSummary,
-    QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT, STATUS_ANCHORS,
-    STATUS_QUEUE, STATUS_TURNS, SessionId, SessionSnapshot, SessionStatus, SpawnKey, SpawnRecord,
-    StatusQuery, StepRow, StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
-    TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
-    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, count_unproven_anchors, fs, oneshot, params, read_anchor_cohort,
-    read_anchor_owners, read_anchor_records,
+    CommitOutcome, Connection, Duration, EventRecord, EventsPage, EventsQuery, EventsRead,
+    EvidenceRefs, EvidenceRoot, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity,
+    KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord, OperationVerb,
+    OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors, Prompt,
+    QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT,
+    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionId, SessionSnapshot, SessionStatus,
+    SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow, StepsRecord, StoreError,
+    StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
+    TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn,
+    Value, check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
+    commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs, oneshot, params,
+    read_anchor_cohort, read_anchor_owners, read_anchor_records,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -331,6 +332,8 @@ impl Command {
                 | Self::ClosingSessions(..)
                 | Self::Terminated(..)
                 | Self::Events(..)
+                | Self::EventsPage(..)
+                | Self::ListPage(..)
                 | Self::EvidenceRefs(..)
                 | Self::Status(..)
                 | Self::Authenticate(..)
@@ -361,6 +364,8 @@ impl Command {
             Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
             Self::Terminated(..) => "store.read.corrupt.terminated",
             Self::Events(..) => "store.read.corrupt.events",
+            Self::EventsPage(..) => "store.read.corrupt.events_page",
+            Self::ListPage(..) => "store.read.corrupt.list",
             Self::EvidenceRefs(..) => "store.read.corrupt.logs",
             Self::Status(..) => "store.read.corrupt.status",
             Self::Authenticate(..) => "store.read.corrupt.authenticate",
@@ -471,6 +476,8 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         Command::Events(session, from, limit, reply) => {
             reply!(reply, read_events(conn, &session, from, limit));
         }
+        Command::EventsPage(query, reply) => reply!(reply, read_events_page(conn, &query)),
+        Command::ListPage(query, reply) => reply!(reply, read_list_page(conn, &query)),
         Command::EvidenceRefs(session, turn, reply) => {
             reply!(reply, read_evidence_refs(conn, &session, turn));
         }
@@ -643,6 +650,8 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::ClosingSessions(..)
         | Command::Terminated(..)
         | Command::Events(..)
+        | Command::EventsPage(..)
+        | Command::ListPage(..)
         | Command::EvidenceRefs(..)
         | Command::Status(..)
         | Command::Authenticate(..)
@@ -1988,6 +1997,186 @@ fn read_events(
         });
     }
     Ok(events)
+}
+
+/// `events`' one read (design §4.3): the window `after < seq ≤ after +
+/// 1000` with `turn` and `types` as SQL predicates, stopping at `limit`
+/// matches or before [`PAGE_MAX`], each row's borrowed length checked
+/// before it is copied; the array is written as one JSON text. The writer
+/// serves it alone, so the head is read in the same state.
+fn read_events_page(conn: &Connection, query: &EventsQuery) -> Result<EventsRead, StoreError> {
+    let session = query.session.as_str();
+    let next_seq: Option<i64> = conn
+        .query_row(
+            "SELECT next_seq FROM sessions WHERE id=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(next_seq) = next_seq else {
+        return Ok(EventsRead::SessionNotFound);
+    };
+    let head = u64::try_from(next_seq - 1).map_err(|_| StoreError::CorruptEvidence)?;
+    let turn = query.turn.map(TurnNumber::get);
+    if let Some(number) = turn {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM turns WHERE session_id=?1 AND number=?2",
+                params![session, number],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if exists.is_none() {
+            return Ok(EventsRead::TurnNotFound);
+        }
+    }
+    let too_large = || StoreError::Constraint("event sequence too large");
+    let end = query.after.saturating_add(PAGE_SCAN);
+    let after = i64::try_from(query.after).map_err(|_| too_large())?;
+    let last = i64::try_from(end).unwrap_or(i64::MAX);
+    let types = if query.types.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&query.types).map_err(|_| too_large())?)
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT seq,event FROM events WHERE session_id=?1 AND seq>?2 AND seq<=?3
+               AND (?4 IS NULL OR turn=?4)
+               AND (?5 IS NULL OR type IN (SELECT value FROM json_each(?5)))
+             ORDER BY seq LIMIT ?6",
+        )
+        .map_err(sql_error)?;
+    let mut rows = statement
+        .query(params![session, after, last, turn, types, query.limit])
+        .map_err(sql_error)?;
+    let mut events = String::from("[");
+    let mut count = 0_u32;
+    let mut last_returned = None;
+    let mut first_left_out = None;
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let seq: i64 = row.get(0).map_err(sql_error)?;
+        let seq = u64::try_from(seq).map_err(|_| StoreError::CorruptEvidence)?;
+        let event = row
+            .get_ref(1)
+            .map_err(sql_error)?
+            .as_str()
+            .map_err(|_| StoreError::CorruptEvidence)?;
+        // The array's comma and closing bracket, and the page's members.
+        if events.len() + event.len() + 2 > PAGE_MAX - PAGE_WRAPPER {
+            debug_assert!(count > 0, "the first match always fits a page");
+            first_left_out = Some(seq);
+            break;
+        }
+        if count > 0 {
+            events.push(',');
+        }
+        events.push_str(event);
+        count += 1;
+        last_returned = Some(seq);
+    }
+    events.push(']');
+    let next_after = match (first_left_out, last_returned) {
+        (Some(left_out), _) => left_out - 1,
+        (None, Some(returned)) if count == query.limit => returned,
+        _ => end.min(head).max(query.after),
+    };
+    Ok(EventsRead::Page(EventsPage {
+        events,
+        next_after,
+        more: next_after < head,
+    }))
+}
+
+/// `list`'s one read (design §6.8): at most 1000 sessions below `before`
+/// by `ord`, newest first, the filters applied to each row in order,
+/// stopping at `limit` matches or before [`PAGE_MAX`] (a row's borrowed
+/// length checked before its summary is built). `next` is the last
+/// examined `ord`, `None` once the oldest session was examined.
+fn read_list_page(conn: &Connection, query: &ListQuery) -> Result<ListPage, StoreError> {
+    /// A summary's encoded members besides its variable text.
+    const SUMMARY_FIXED: usize = 192;
+    /// Most bytes one text byte encodes to (`\u0001`).
+    const ESCAPED: usize = 6;
+    let before = match query.before {
+        Some(before) => {
+            i64::try_from(before).map_err(|_| StoreError::Constraint("list cursor too large"))?
+        }
+        None => i64::MAX,
+    };
+    let oldest: Option<i64> = conn
+        .query_row("SELECT min(ord) FROM sessions", [], |row| row.get(0))
+        .map_err(sql_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id,state,admission,harness,json_extract(params,'$.model'),label,
+                created_ms,updated_ms,ord
+             FROM sessions WHERE ord<?1 ORDER BY ord DESC LIMIT 1000",
+        )
+        .map_err(sql_error)?;
+    let mut rows = statement.query([before]).map_err(sql_error)?;
+    let mut sessions = Vec::new();
+    let mut bytes = 0_usize;
+    let mut examined = None;
+    let text = |row: &rusqlite::Row<'_>, index: usize| -> Result<Option<String>, StoreError> {
+        row.get(index).map_err(sql_error)
+    };
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let mut borrowed = 0;
+        for index in 0..6 {
+            if let rusqlite::types::ValueRef::Text(value) = row.get_ref(index).map_err(sql_error)? {
+                borrowed += value.len();
+            }
+        }
+        let size = SUMMARY_FIXED + ESCAPED * borrowed;
+        if bytes + size > PAGE_MAX - PAGE_WRAPPER {
+            break;
+        }
+        let ord: i64 = row.get(8).map_err(sql_error)?;
+        examined = Some(ord);
+        let state: String = row.get(1).map_err(sql_error)?;
+        let harness: String = row.get(3).map_err(sql_error)?;
+        let label = text(row, 5)?;
+        let updated_ms: i64 = row.get(7).map_err(sql_error)?;
+        let matches = query.state.as_ref().is_none_or(|wanted| *wanted == state)
+            && query
+                .harness
+                .as_ref()
+                .is_none_or(|wanted| *wanted == harness)
+            && query
+                .label
+                .as_ref()
+                .is_none_or(|wanted| label.as_ref() == Some(wanted))
+            && query.since_ms.is_none_or(|since| updated_ms >= since);
+        if !matches {
+            continue;
+        }
+        let id: String = row.get(0).map_err(sql_error)?;
+        bytes += size;
+        sessions.push(SessionSummary {
+            session_id: SessionId::try_from(id.as_str())
+                .map_err(|_| StoreError::CorruptEvidence)?,
+            state,
+            admission: row.get(2).map_err(sql_error)?,
+            harness,
+            model: text(row, 4)?,
+            label,
+            created_ms: row.get(6).map_err(sql_error)?,
+            last_active_ms: updated_ms,
+        });
+        if sessions.len() == query.limit as usize {
+            break;
+        }
+    }
+    let next = match examined {
+        Some(ord) if Some(ord) != oldest => {
+            Some(u64::try_from(ord).map_err(|_| StoreError::CorruptEvidence)?)
+        }
+        _ => None,
+    };
+    Ok(ListPage { sessions, next })
 }
 
 /// Design §4.4, §6.7: the addressed turn, or the session's running turn,
