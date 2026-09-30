@@ -46,7 +46,14 @@ fn evidence_collector_backs_up_live_wal_and_verifies_manifest() -> Result<(), Bo
     let value: String = backup.query_row("SELECT value FROM evidence", [], |row| row.get(0))?;
     assert_eq!(value, "committed");
     assert!(artifact.join("sha256.manifest").is_file());
-    assert!(artifact.join("summary.json").is_file());
+    // Finding 8: the summary names the `via-cli` features this binary has.
+    let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
+    let features: &[&str] = if cfg!(feature = "test-failpoints") {
+        &["test-failpoints"]
+    } else {
+        &[]
+    };
+    assert_eq!(summary["features"], serde_json::json!(features));
     let stderr = artifact.join("evidence/s_01/1/stderr.log");
     let original = fs::read(&stderr)?;
     fs::write(&stderr, b"tampered")?;

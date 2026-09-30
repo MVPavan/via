@@ -140,9 +140,13 @@ impl Evidence {
     fn summary(&self, outcome: &str, detail: &str, missing: &[&str]) -> EvidenceResult<Value> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let status = command_output("git", &["status", "--porcelain"], &workspace)?;
-        // The default harness has no feature switches. The runtime failpoint
-        // owner adds feature reporting with the controller in its increment.
-        let features: Vec<&str> = Vec::new();
+        // The `via-cli` features this test binary, and so its `via`, was
+        // built with; `test-failpoints` is the one there is.
+        let features: &[&str] = if cfg!(feature = "test-failpoints") {
+            &["test-failpoints"]
+        } else {
+            &[]
+        };
         let mut summary = json!({
             "scenario":self.scenario,
             "outcome":outcome,
