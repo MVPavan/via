@@ -63,3 +63,17 @@ slice plan and design revision rounds) go to Opus 5.5 high
 xhigh for hard work). The T4-0 round-2 revision already under way on Sonnet
 finishes; any later design round goes to Opus. The comparison continues on
 the implementation slices.
+
+## Opus 5.5 medium, S1 critique fixes (2026-09-30; reviews GPT-6.1 Sol high)
+
+| Chunk | Rounds to SOUND | Findings by round | Rule breaches |
+|---|---|---|---|
+| S1-specs (docs) | 3 | r1: 1 important, 1 minor (unconditional-latch wording left in 6 places); r2: 1 important, 1 minor | none |
+| S1-core | 2, then a limitation | r1: 1 important (vacuous wait-deadline test); r2: 1 important in the orchestrator's prescribed mechanism (pipelined bytes), recorded as a limitation | none |
+| S1-io | 3 | r1: 2 important (unbounded forced set; sleep-based test); r2: 3 important (live facts pruned; hidden 2 s timer; a pre-existing cache, recorded as a limitation) | an over-broad SIGTERM matched other worktrees' anchors, which the worker disclosed |
+| S1-contract | 3 (r3 minors checked by the orchestrator) | r1: 1 blocker (pre-existing auth order), 3 important (false pass, socket ≠ exit, over-waiver) plus 1 rejected; r2: 3 important (harness truthfulness); r3: 2 minor | one `git checkout -- <file>` to undo its own temporary mutation |
+
+- **Production fixes:** they were right at the owning layer on the first attempt in every chunk. No round came back UNSOUND on a production mechanism the brief named. The one mechanism gap came from the orchestrator's brief.
+- **Tests:** the main source of rounds. First drafts proved less than claimed: vacuous, sleep-based, or relying on a hidden timer. The failure-first rule caught them only after review.
+- **New harness code:** the evidence wrapper for 106 tests took three rounds of truthfulness probing.
+- **Scope growth:** each review's whole-chunk pass surfaced pre-existing issues. The owner then set the review-scope rule in `cloud-and-local.md`: diff-only chunk reviews, and one independent critique at the end of large work.

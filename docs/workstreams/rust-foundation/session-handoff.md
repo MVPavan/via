@@ -209,23 +209,22 @@ the historical checkpoint; its findings table is updated by this section.
   and critiques run on Codex `gpt-6.1-sol` at high effort (owner). Round 1
   at `7370e0e`: **S1 NOT ACCEPTABLE** although every gate passed
   ([s1-critique/reviews/S1-critic-r1.md](s1-critique/reviews/S1-critic-r1.md)).
-  The orchestrator confirmed all 13 findings against the code. Fix chunks,
-  each on Opus 5.5 medium (`implementer`) with a Sol high review:
-  - `.9.1` S1-core (`wt/s1-core`): final-shutdown entry inside the 10 s
-    bound, the §7.3 read streak for dispatcher cancellations, disconnected
-    `wait`s release their slot, `wait` deadlines bound reads, startup
-    failure drops Store off the Tokio workers;
-  - `.9.2` S1-io (`wt/s1-io`): Host control exchanges never reused
-    mid-flight, live Host task collection, the Wire reader drains during a
-    prefix save;
-  - `.9.3` S1-specs (`wt/s1-specs`): T3 design §12 amendments A1–A23 never
-    reached the specs; apply them;
-  - `.9.4` S1-contract, after S1-core merges: a missing handle is
-    `invalid_handle`, the missing scenario assertions, evidence `features`,
-    and the evidence harness for the Task 2–3 daemon scenarios (the
-    `via-d9o.2` gap blocks S1 acceptance under `verification.md`).
-  Briefs and ledger: `scratchpad/execution/s1-critic/`; logs under
-  `scratchpad/s1/<chunk>/`; reports go to `s1-critique/reports/`.
+  All 13 findings were confirmed and fixed in four chunks (Opus 5.5 medium,
+  Sol high reviews; reports in `s1-critique/reports/`), all merged:
+  S1-specs `4d210df` (Task 3 amendments A1–A23 reached the specs), S1-core
+  `af036af`, S1-io `4eb02c2` (also the via-host anchor leak), S1-contract
+  `78d1f9b` (F15 precedence, missing assertions, truthful evidence for all
+  237 daemon scenarios; also closed `via-jm4.15`). Two findings became Task 4
+  design §15 limitations (a pipelined-then-disconnected `wait`; Host's row-4
+  forced cache). Merged gate at `60d81fe`: default 343 / 1, failpoints 549 / 1
+  (3 runs), F08–F12 58, Task 4 selector 88 (10 of 10), every daemon scenario
+  pass and complete, no leftover processes. **Owner review rule (2026-09-30):**
+  chunk reviews stay on the diff, pre-existing issues become beads, minor
+  fixes are checked by the orchestrator, and each large piece of work ends
+  with one independent critique from scratch
+  ([cloud-and-local.md](cloud-and-local.md)). Next: critic round 2 from
+  scratch at the integrated tip, then record the stable shared interfaces
+  and close `.7.9`. Ledger: `scratchpad/execution/s1-critic/progress.md`.
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
