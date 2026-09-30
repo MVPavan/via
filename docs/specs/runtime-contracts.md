@@ -3,6 +3,10 @@
 Status: **design for Sol-high review**, 2026-09-26; Bead `via-jm4.7.1`.
 These are implementation decisions proposed within the approved S1 scope,
 not measured runtime results. Dependent code waits for the review gate.
+Amended 2026-09-30 by the adapter design's AR1 and AR3–AR6 and its AD20
+report delivery ([adapter design](../workstreams/rust-foundation/adapters/design.md)
+§3.5, revision 9); leftover detection (AR2) is pending an owner decision
+(adapter design, conflict 4).
 Authority: [S1 plan](../workstreams/rust-foundation/s1-plan.md) §4,
 [C1](via-api-v1.md), [C2](adapter-contract.md),
 [invariants](../../.repo-context/invariants.md), and
@@ -33,8 +37,10 @@ Three limits on these guarantees must remain visible:
 2. A blocked peer cannot be guaranteed a reply. The daemon closes the socket
    after the 10 s reply deadline; the caller retries the read.
 3. Group signalling covers processes that remain in the VIA-owned group.
-   Escaped descendants and uninterruptible kernel waits prevent an absolute
-   all-descendants-gone guarantee. Report uncertainty, never false quiescence.
+   Quiescence is group-scoped (plus, on server routes, the vendor's reported
+   tool items; C2 §2 Interrupt), not an all-descendants guarantee: escaped
+   descendants and uninterruptible kernel waits remain possible. Report
+   uncertainty, never false quiescence.
 
 ## 2. Owners, types and task lifetime
 
@@ -49,8 +55,9 @@ CLI -> Core -> Adapters -> Routes -> Wire -> Host
 
 Public lower-layer contract types are re-exported through the immediate
 parent's public facade where needed. Re-exporting is not permission to give
-Core a process or pipe handle. C1 DTOs and canonical lifecycle types live in
-Core; C2 operation/observation types live in Adapters; Core converts them.
+Core a process or pipe handle. Types an adapter produces (capabilities,
+route plan, refusal, observations, class hints) are `via-adapters` DTOs;
+Core keeps C1 request, envelope and event DTOs and converts them.
 Store defines storage DTOs and shared durable IDs (`SessionId`, `TurnNumber`,
 `ConnectionId`, `ProcessId`). These types contain no Core dependency
 or business transitions. Core serializes validated C1 payloads into bounded
@@ -71,8 +78,8 @@ its own clean/incomplete policy (§6.2).
 
 | Owner | Resources and hidden complexity | Explicit upper-layer surface |
 |---|---|---|
-| Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, progress snapshots | C1 requests and committed DTOs |
-| Adapter | Fake protocol mapping and normalizer; C2 observation queue | Observations, control results, health |
+| Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, progress snapshots | C1 request, envelope and event DTOs |
+| Adapter | Per-harness protocol mapping and normalizer; C2 observation queue | `via-adapters` DTOs (capabilities, route plan, refusal, observations, class hints), turn end results, health |
 | Route | Fake protocol parsing, start correlation, command serialization | Typed fake requests/messages |
 | Wire | Pipe reader/writer tasks, byte message splitting, evidence files | Vendor messages, transport health |
 | Host | Child handle, process group/identity, reap and escalation timers | Exclusive pipe endpoints, verified exit/cleanup |
@@ -98,9 +105,10 @@ Methods implemented asynchronously use `fn -> impl Future + Send`; handles
 own bounded command senders, not resource mutexes held across `.await`.
 All `Deadline` values wrap `tokio::time::Instant`; wall timestamps are separate.
 Task 1 construction uses one Wire-defined `RuntimeConfig` (`anchor_binary`,
-`anchor_dir`), re-exported through Route/Adapter; fake fixture settings stay
-Adapter-owned. The constructor chain is
-`AdapterRuntime::new(config, resources)` →
+`anchor_dir`), re-exported through Route/Adapter; per-harness and fake
+fixture settings stay Adapter-owned in `AdapterConfig` (§11.1). The
+constructor chain is
+`AdapterSet::new(config, runtime_config, resources)` →
 `FakeRoute::new(runtime_config, resources)` →
 `WireRuntime::new(runtime_config, resources)` →
 `Host::new(journal, anchor_binary, anchor_dir)`. Only Wire splits resources.
@@ -137,6 +145,10 @@ impl FakeRoute {
 }
 pub struct RouteMessage { pub payload: FakeMessage }
 ```
+
+The route result and each server route's close and loss paths carry Host's
+`CloseReport.leftovers` (§5) upward unchanged, to the adapter's `TurnEnd` or
+driver `CloseReport` (C2 §4.2).
 
 `FakeStart` contains synthetic vendor session/turn IDs and prompt; the fake
 fixture validates these and emits an explicit acceptance message before
@@ -298,6 +310,9 @@ impl WireMessages {
 }
 ```
 
+Wire's close report (`WireCloseReport`) carries Host's `leftovers` unchanged
+(§5, C2 §4.2).
+
 The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
 `WireRuntime::open_connection` creates the turn's evidence folder
@@ -388,6 +403,20 @@ Host starts argv arrays with explicit cwd and an environment from the fake
 allow-list (`PATH` only if required, explicit test variables and vendor VIA
 marker). It never inherits the complete daemon environment. Wire exclusively
 owns vendor pipes. Host control bypasses data and SQLite queues.
+
+**Leftover report (C2 §4.2).** Host's `CloseReport` gains
+`leftovers: Option<LeftoverReport>`, produced after Host's close of the
+connection completes, within its existing bound (unchanged), and ready
+before its destination commits. VIA never signals or manages leftovers.
+Detection is pending an owner decision (adapter design, conflict 4); until
+it is decided, `leftovers` is `null`.
+
+**Non-turn owners (AR6).** `ProcessOwner {session_id, turn}` and the Store
+`anchors` table (which references `turns`) fit per-turn processes only. A
+persistent server's anchor has no turn owner. The Codex and OpenCode slices
+design a non-turn owner (server or session) with its Store schema, evidence
+folder, admission, recovery and shutdown, in `crates/via-store`,
+`crates/via-host` and `crates/via-wire`.
 
 ### 5.1 Group anchor: selected design, native proof required
 
@@ -534,7 +563,10 @@ This is an atomic kernel absence observation, not a racy process-list census.
 An original member still in the group keeps it present. Reuse that is already
 visible gives a present/permission result and conservatively remains uncertain;
 a group created after an absence observation does not resurrect the former
-group. Escaped descendants remain outside the stated containment boundary.
+group. Escaped descendants remain outside the stated containment boundary:
+they are not part of cleanup, they are the agent's responsibility, and they
+are reported only as leftovers where a destination exists (C2 §2 Interrupt,
+§4.2).
 Permission/namespace failures cannot be turned into absence. Retry only this
 read-only probe, at most every 20 ms until the existing cleanup deadline;
 never retry a mutation. Quiescent is committed only after the absence proof.
@@ -644,6 +676,11 @@ recovery, `ArmIntent` and process/connection records. Each includes expected rec
 and expected next seq where applicable. Store performs compare-and-set plus
 constraint checks atomically; conflicting batches do not partially succeed.
 Core owns the proposed transition; Store never guesses it from vendor text.
+The session-close batch (`commit_closed`) carries its `ClosedRecord`'s
+leftover report (C2 §4.2, C1 §5) into the `session.closed` event, the
+stored `close_result` and the close operation's result, in the existing
+JSON columns and atomically with the close, so a keyed replay returns the
+same report; the `anchors` table is unchanged.
 `ReadQuery` is a closed enum of C1 retrieval needs, not arbitrary SQL.
 
 Open refuses unknown `user_version`, an unreadable/corrupt Store, failed WAL
@@ -781,7 +818,12 @@ syntax inside override values.
 
 Auto-start passes the resolved state/runtime paths explicitly in the new
 daemon's environment with its other approved bootstrap settings, without
-copying the client environment or passing these values to vendors. When
+copying the client environment or passing these values to vendors.
+Auto-start also forwards each name in `via-adapters`' fixed `BOOTSTRAP_ENV`
+that is set in the client (`HOME`, `PATH`, `LANG`, `USER`, `LOGNAME`,
+`XDG_RUNTIME_DIR` and the three `VIA_FAKE_*` names). The values are read
+once by `AdapterConfig`, never logged or stored, and reach a vendor only
+through that adapter's allow-list. No credential variable is listed. When
 connecting to an existing daemon, the CLI completes hello, reads
 `daemon/status` and compares its expected Store path with `store_path` by
 filesystem identity of parent directories plus the fixed filename, not
@@ -796,7 +838,7 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL (§8); adapter-owned `harnesses` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -881,6 +923,7 @@ Without `drain` or `force`, a stop with active turns is refused
 - **Drain** keeps serving reads while accepted turns finish under their own
   existing work deadlines; the drain phase gets no invented 10 s deadline.
   When accepted and active work has settled, final shutdown begins.
+- Daemon shutdown produces no leftover report (C2 §4.2 limitation).
 
 Final shutdown has **one absolute 10 s deadline** covering client closes,
 Host control closes, anchor reconciliation, task joins, final durable
@@ -1008,20 +1051,22 @@ is still unwritable, startup fails; it does not dispatch from an uncommitted
 recovery view. There is no fabricated persistent Store-failure marker when
 the filesystem could not persist one. Durable intent plus conservative
 recovery provides safety even if the last in-memory failure reason is lost.
+Daemon-crash recovery produces no leftover report: recovered turns carry
+`leftovers: null` (C2 §4.2 limitation).
 
 ## 8. Bounds and scheduling
 
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
-data-size warning, WAL limit and checkpoint triggers; see the end of this
-section) are configurable; C1, C2 and every other limit here are fixed
-(T4-A37). All
+data-size warning, WAL limit and checkpoint triggers, and the adapter-owned
+`harnesses` settings; see the end of this section) are configurable; C1, C2
+and every other limit here are fixed (T4-A37). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
-| Active private connections | 4 daemon-wide (one vendor + one anchor each) | Queue eligible work; do not create a child until a slot is reserved |
+| Active private connections | Four live connections daemon-wide (per-turn process or persistent server, each with its anchor); a slot is reserved only for a new connection (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
 | OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process admission, not extra pools. S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. |
 | OpenCode vendor child-session metadata | 32 records per live server; one active top-level turn per owner | Refuse excess child metadata without routing it to another owner; idle namespaces retain durable identity but no listener or server memory |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
@@ -1033,8 +1078,8 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
 | Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
-| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
-| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
+| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
+| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Read, count and discard traffic as for pipes (§4: no copy of vendor traffic); only the bounded decode-failure evidence is written, never a Basic `Authorization` header or credential; route by owned server generation and vendor session/message IDs |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
 | C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
@@ -1086,10 +1131,19 @@ The disk free-space floor, the data-size warning, the WAL limit and its
 checkpoint triggers are keys of `daemon.json` in the state directory, with
 provisional defaults. The daemon reads it once at start; a change takes
 effect at the next start, and an invalid file refuses to start with a named
-error. C1, C2, memory and the other runtime §8 limits are not configurable.
+error. The optional `harnesses` member is passed unparsed to `via-adapters`'
+`AdapterConfig` (adapter design §5.4): `harnesses.<name>.binary` (an absolute
+path; the default is a `PATH` lookup) and
+`harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents,
+instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
+`true`; C2 §6.2, AD13). It is read at daemon start like the other keys; a
+change applies to sessions spawned after the next start, and each session
+freezes its settings at spawn. It holds no credentials and no limits.
+C1, C2, memory and the other runtime §8 limits are not configurable.
 The Codex shared server's lanes and tool metadata are fixed buffers counted
-per server by the Codex task, which measures 32 loaded leases and four
-active turns against the RSS gate.
+per server by the Codex task, which measures 32 loaded leases and the
+maximum concurrent active turns that per-connection admission allows (C2
+§3; up to one per leased session) against the RSS gate.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the frozen server key and vendor
 semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
@@ -1139,6 +1193,9 @@ macOS linkage gate. No design text here claims those live gates have passed.
 
 The anchored process lifetime (§5), evidence folder (§4), numerical limits
 and F12 policy are material decisions for this packet's independent review.
+The adapter design's runtime amendments (AR1, AR3–AR6 and AD20's report
+delivery) are applied in place in §§2–8 and §11.1. AR2 and its rows in this
+table wait for the owner's leftover-detection decision (conflict 4).
 No P7/P11/P13 or A2–A8 vendor decision is made here. No change to the approved
 dependency graph, one-route invariant or credential boundary is requested.
 
@@ -1154,8 +1211,9 @@ no fixed sleeps determine correctness. Time tolerances measure OS behavior.
 
 Default-gate fake configuration works without `test-failpoints`. The three
 paths below select an external stand-in process and scenario; they do not
-activate VIA's pause/crash/`fail_io` controller. Read them once at daemon
-startup into only the fake adapter's explicit launch configuration.
+activate VIA's pause/crash/`fail_io` controller. `via-adapters`'
+`AdapterConfig` reads them once at daemon startup into only the fake
+adapter's explicit launch configuration. The names and rules are unchanged.
 
 | Variable | Consumer and meaning |
 |---|---|

@@ -14,8 +14,13 @@ implementation develops.
    record terms status per adapter (not a gate).
    Source: `docs/brainstorms/README.md` §7; `docs/workstreams/handoff.md`.
 2. **One route per session.** The route chosen at spawn serves every later
-   turn and verb in that session. The adapter version also stays fixed. Source:
-   `docs/brainstorms/README.md` §15 (D5).
+   turn and verb in that session. A session's stored state is used only by an
+   adapter version that declares that state compatible: resume or reopen under
+   an incompatible adapter version is refused, and a compatible resume
+   advances the session's recorded adapter version. Each turn records the
+   adapter version that ran it. Source: `docs/brainstorms/README.md` §15
+   (D5); owner decision OD5c, 2026-09-30
+   (`docs/workstreams/rust-foundation/adapters/design.md` AD12).
 3. **Declared verbs, named refusals.** Each adapter declares each verb
    (`native`, `partial` with semantics, `unsupported`); unsupported verbs are
    refused by name. Never fake a verb: process kill is not graceful cancel, a

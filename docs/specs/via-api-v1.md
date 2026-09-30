@@ -1,7 +1,10 @@
 # VIA API v1 (contract C1)
 
-Status: draft 2, 2026-09-26; the owner approved the S1 set on 2026-09-26
-(see Decisions below). Public contract between
+Status: draft 3, 2026-09-30; the owner approved the S1 set on 2026-09-26
+(see Decisions below). Draft 3 applies the adapter design's amendments
+AC1–AC10 ([adapter design](../workstreams/rust-foundation/adapters/design.md)
+§3.4, revision 9); leftover detection is pending an owner decision (adapter
+design, conflict 4). Public contract between
 callers and VIA; implemented by L1 (`via-cli`, server half) over L2
 (`via-core`). Inputs: `docs/brainstorms/README.md` §15
 (authoritative), review `docs/brainstorms/reviews/contract-specs-astra-r1.md`,
@@ -14,8 +17,8 @@ decision; **Proposed** = drafted here, listed in §10.
 
 **Shape.** JSON-RPC 2.0, newline-delimited, over the daemon's user-only Unix
 socket; `via serve --stdio` proxies the same messages. Entities: **session**
-(one conversation, one vendor session, one route and adapter version for
-life) and **turn** (one prompt → one envelope), addressed `s_7f3/2`. The
+(one conversation, one vendor session, one route for life; a compatible
+resume advances its recorded adapter version, C2 §1 rule 2) and **turn** (one prompt → one envelope), addressed `s_7f3/2`. The
 caller generates the session's handle; the daemon stores only its hash.
 
 **First-release scope (owner, 2026-09-26):** Claude Code, Codex and OpenCode;
@@ -70,7 +73,7 @@ decided in the slice that needs them, after re-probing.
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
 | P11 | Codex owned stdio server key is `(codex, observed_binary_version, config_hash)` without bound; `config_hash` includes VIA-controlled startup/environment configuration, not credentials. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode keys include the full effective bound, VIA owner session and durable private namespace; no cross-owner server sharing or live-session migration. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §2 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
-| P13 | Version gate: tested sets or ranges per route (Claude initially exactly `{2.1.283}`); outside them version status is `untested` and bound-bearing spawn/resume are refused unless immutable session policy `allow_untested` is true. Read/cleanup verbs remain available | as reviewed in `docs/specs/vendors/claude-code.md` §10 |
+| P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
 
 ## 1. Scope, transport, versioning
 
@@ -175,7 +178,12 @@ Params: `harness?`, `model?` (one required), `bound?`, `require?`,
  "refusals":[],"warnings":[]}
 ```
 
-Never starts a process or server (Q5). Errors: `unknown_model`,
+Never starts a process or server (Q5). `vendor_version` is the last version
+seen for the resolved binary identity, or `null`; `version_status` is
+`tested` (in the adapter's `checked` set), `untested` (not yet checked by the
+maintainers, warning `vendor_version_untested`) or `refused` (a cached
+handshake-check failure on something VIA relies on). Every vendor version is
+supported by default (P13, C2 §5). Errors: `unknown_model`,
 `harness_unavailable`, `invalid_params`.
 
 ### 3.2 `spawn` — new session and turn 1
@@ -207,10 +215,9 @@ bound of unresolved turns (runtime contract §8), `spawn` is refused
 turn failed to persist its terminal. Idempotency (P4): same key + same handle
 hash + byte-identical params → the stored receipt; different handle or
 params → `invalid_params` with `kind: idempotency_conflict`.
-`allow_untested` is included in that exact retry identity. It waives only
-the tested-version restriction, never unsupported bounds, protocol validation,
-required capabilities, identity continuity, never-ask policy or executable-
-version consistency.
+`allow_untested` is included in that exact retry identity. It is accepted,
+stored and has no effect: every version is supported unless refused for
+breakage, which it cannot waive (P13).
 
 ### 3.3 `resume` — add a turn
 
@@ -224,7 +231,11 @@ warnings}`. Effective values are frozen at acceptance (§7.3). A given
 `bound` is re-validated against the route (D7), recorded on this turn, and
 inherited by later turns; nothing changes it silently (D5). Errors:
 `session_not_found`, `session_closed` (also while closing), `invalid_handle`,
-`queue_full`, `bound_unsupported`, `unsupported_verb`, `admission_refused`.
+`queue_full`, `bound_unsupported`, `unsupported_verb`, `admission_refused`,
+`harness_unavailable` (including `data.reason: adapter_version` when the
+stored adapter version is not compatible with the running adapter).
+A compatible resume advances the session's recorded `adapter_version` to the
+running adapter's version at that turn's `turn.started` commit.
 
 ### 3.4 `steer` — input into the active turn
 
@@ -252,8 +263,13 @@ Params: `session`, `handle`, `turn?`, `force_after_ms?` (Proposed default
 side effects are known to have stopped: `quiescent` (private process group
 absence positively proved under §7.5, or the vendor reported every tool
 item of the turn completed),
-`uncertain` (acknowledged but not provable), `pending` (still waiting for
-tool completion or the cleanup deadline). For Codex, the matching
+`uncertain` (stopping not provable, whether the stop was acknowledged or
+only requested), `pending` (still waiting for
+tool completion or the cleanup deadline). `pending` exists only before the
+cleanup deadline; a settled result is `quiescent` or `uncertain`. OS
+group-absence evidence covers the agent's own group; descendants outside it
+that no vendor item tracks are not part of cleanup and are reported in
+`leftovers` (§5). For Codex, the matching
 `turn/completed:interrupted` acknowledges cancel; the interrupt RPC response
 alone does not. With open tools, the turn remains nonterminal while cleanup
 is `pending` until `min(acknowledged_at + 60 s, turn.wall_deadline)`. If
@@ -261,7 +277,9 @@ the wall budget has expired, settle `uncertain` immediately. On tool
 quiescence or that deadline, commit one `cancelled` envelope with cleanup
 `quiescent` or `uncertain`. At uncertainty, warn `cancel_cleanup_uncertain`;
 a successor may dispatch with `predecessor_cleanup_uncertain`. No
-acknowledgement by the control deadline gives outcome `unknown`. Late tool
+acknowledgement by the order's `force_at` on a shared server gives state and
+outcome `unknown`, with no kill; a private process follows §7.6's
+private-process force row. Late tool
 completion remains late evidence and does not rewrite that envelope. Codex P2/P2b: after
 `interrupted` the tool's `sleep 120` ran to the 60 s poll limit;
 `command/exec/terminate` does not apply to agent-started tools and
@@ -281,7 +299,10 @@ CLI: `via close <session> [--mode graceful|force] [--deadline-ms N] [--op-key K]
 Sets the admission gate `closing` (new `resume` → `session_closed`),
 cancels the active turn, drops queued turns as `cancelled`, closes the
 vendor session (`close(mode, deadline)` down to Host, D7), then sets
-`closed`. Result `{session_id, state: "closed", cancelled_turns, cleanup}`.
+`closed`. Result `{session_id, state: "closed", cancelled_turns, cleanup,
+leftovers}`; `leftovers` (§5) is always present and non-null only when this
+close stopped the session's server, where a keyed replay returns the stored
+report; otherwise `null`.
 Idempotent; a second `close` during closing waits for the first. A close
 whose `session.closed` commit is refused a second time because turns of the
 session are unfinished replies `admission_refused` ([Task 3 design](../workstreams/rust-foundation/t3/design.md) §4 step 6).
@@ -295,7 +316,10 @@ Params: `session`, `turn?` (default the running turn, else the latest),
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"untested",
+ "inherit":{"hooks":"off","mcp_servers":"unknown","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"unknown"},
+ "warnings":[{"code":"vendor_version_untested","message":"…"},{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
+ "vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
              "tokens":{"total":18200,"scope":"vendor_interval"}},
@@ -337,6 +361,17 @@ after a Store write of uncertain outcome (runtime §7).
 `process.alive` is true only on positive evidence that the vendor process
 is live; `process.cleanup` is `uncertain` when any process group of the
 session lacks a proof of absence, else `quiescent` (T4-A23).
+
+`adapter_version` is the session's recorded adapter version, advanced by a
+compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
+from the described turn's instance handshake (`vendor_version` null before
+any handshake; C2 §5). `inherit` holds the effective state (`on`, `off` or
+`unknown`) of each inherited-configuration category, frozen at spawn
+(C2 §6.2). `warnings` repeats the standing warnings:
+`vendor_version_untested` while the described turn's `version_status` is
+`untested`, and
+`config_switch_unverified` with `data.categories` while any effective state
+differs from the verified requested state.
 
 `vendor_session_id` is nullable and contains only the last confirmed vendor
 ID. `vendor_identity_verified` is false until the current connection
@@ -456,10 +491,10 @@ only after positive cleanup, joins and durable records, otherwise 4
 
 | Parameter | Type | Scope | Notes |
 |---|---|---|---|
-| `harness` | `claude`, `codex`, `opencode`, `acp:<agent>` | session | optional if `model` resolves |
+| `harness` | `claude`, `codex`, `opencode`, `acp:<agent>`, `fake` | session | optional if `model` resolves; `fake` is a test double, available only with runtime §11.1's fixture configuration |
 | `model` | string | session (P5) | `resolved` reported in the envelope |
-| `allow_untested` | bool, default false | session | immutable after spawn; describe may request a route plan using it; applies only to tested-version restriction (P13) |
-| `effort` | `low`…`max` or vendor value | per turn | unknown values refused |
+| `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive |
+| `effort` | `low`…`max` or vendor value | per turn | unknown values refused; a vendor value that can be judged only against a discovered catalog is refused at submission, `failed(submit_failed)` with `failure.data.field:"effort"`; no vendor turn starts (C2 §5) |
 | `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial) |
 | `prompt` | string | per turn | exactly one of `prompt` and `prompt_file` |
 | `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length |
@@ -554,7 +589,7 @@ cut at a character boundary.
  "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1","version_status":"tested",
  "vendor_session_id":"0192f…","cwd":"/work/repo",
  "bound":{"requested":{…},"effective":{…},"inherited":true},
- "final_text":"","final_text_file":null,"structured_output":null,
+ "final_text":"","final_text_file":null,"structured_output":null,"leftovers":null,
  "denied_actions":[{"kind":"command","target":"curl …","reason":"network disabled","at":"…","event_seq":41}],
  "auto_declined_requests":[{"vendor_method":"item/tool/requestUserInput","summary":"2 questions","blocking":true,"at":"…","event_seq":52}],
  "denied_actions_total":1,"auto_declined_requests_total":1,
@@ -570,13 +605,13 @@ cut at a character boundary.
 
 | Field | Meaning |
 |---|---|
-| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable}` (§8.2) |
+| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed` and has `reason` (`"invalid_param"` or `"handshake_refused"`) and, with `invalid_param`, `field` (the C1 parameter name). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
 | `denied_actions` | actions the vendor's own bound denied (D3): `file_write`, `command`, `network`, `other` |
 | `auto_declined_requests` | vendor requests VIA declined (D3) |
-| `usage` | `scope` ∈ `turn` (verified per-turn), `session_cumulative`, `vendor_interval` (numbers reported, interval not verified); `provenance` `reported`/`unavailable` |
+| `usage` | `scope` ∈ `turn` (verified per-turn), `session_cumulative`, `vendor_interval` (numbers reported, interval not verified); `provenance` `reported`/`unavailable`. `turn` sums the model calls of the vendor session the turn ran in; delegated sub-agent sessions may be excluded (OpenCode task sessions are) |
 | `steps` | the vendor's own count of model steps in the turn (Claude `num_turns`), or `null` when the vendor reports none; VIA's count is only in `status` `progress` (§3.7) |
 | `events` | `{first_seq, last_seq, count}` of the turn's durable events (§6.1) |
 | `final_text_file` | `{path, bytes, truncated}` when the final text is in `final_text.txt`, else `null` |
@@ -584,7 +619,8 @@ cut at a character boundary.
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `deprecated` |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
+| `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Detection is pending an owner decision (adapter design, conflict 4); until it is decided, `leftovers` is `null` |
 
 ## 6. Durable events
 
@@ -602,14 +638,14 @@ envelope except through §7.6.
 
 | Type | Payload | Committed by |
 |---|---|---|
-| `session.opened` / `session.closed` / `session.reopened` | `route`, confirmed `vendor_session_id`, `vendor_version` / `reason` / `route`, confirmed `vendor_session_id`, `vendor_version`, `reason` | Core |
+| `session.opened` / `session.closed` / `session.reopened` | `route`, confirmed `vendor_session_id`, `vendor_version` / `reason`, `leftovers` (§5; non-null only when the close stopped the server) / `route`, confirmed `vendor_session_id`, `vendor_version`, `reason` | Core |
 | `turn.queued` / `turn.submitted` / `turn.started` | `queue_position` / `attempt` / `effective` | Core |
 | `turn.ended` | `state`, `failure?`, `stop_reason`, `cancel?` | **Core only** |
 | `turn.revised` | `revision`, `from_state`, `state`, `evidence` | Core |
 | `action.denied`, `vendor.request_declined` | as envelope lists; `blocking` on declines | Adapter |
 | `steer.delivered` | `delivery` | Adapter |
 | `cancel.requested` / `cancel.settled` | — / `outcome`, `cleanup` | Core |
-| `warning` | `code`, `message` | either |
+| `warning` | `code`, `message`, `data?` (structured, bounded; `config_switch_unverified` carries `data.categories: [{category, requested, effective}]`, §5) | either |
 | `process.exited`, `server.lost` | `code`, `signal` / `key` | Core (from Host) |
 
 Events are durable records only: an event exists when crash recovery or the
@@ -657,7 +693,7 @@ and the next `resume` reopens the vendor session (`session.reopened`).
 | — | `queued` | accepted, committed |
 | `queued` | `running/submitting` | dispatch: Core commits `submitted_at` **before** any vendor I/O (coding-style §7) |
 | `running/submitting` | `running/accepted` | vendor acceptance committed (`accepted_at`) |
-| `running/submitting` | `failed` (`submit_failed`) | vendor rejected the submission with a definite error |
+| `running/submitting` | `failed` (`submit_failed`) | the submission was rejected before acceptance, by the vendor with a definite error or by the adapter before any vendor submission |
 | `queued` | `cancelled` | cancel, close, predecessor `unknown` (P6) |
 | `running` | `completed` / `failed` / `cancelled` / `unknown` | §7.6 disposition |
 | `unknown` | terminal | late evidence (§7.6), never a resend |
@@ -716,7 +752,8 @@ identity, generation and pgid > 1 (runtime contract §5.2). `Ok`, `EPERM`,
 other errors or namespace mismatch do not prove absence. Positive group
 absence can make cleanup `quiescent`; it cannot prove vendor terminal state,
 protocol acknowledgement, forced outcome or reaping, and the restarted turn
-remains `unknown`. A stdio-attached shared server dies with the daemon (P3);
+remains `unknown`. Group absence covers only that group; recovered turns
+carry `leftovers: null`. A stdio-attached shared server dies with the daemon (P3);
 that does not prove its submitted work had no effect.
 
 ### 7.6 Disposition table (evidence → resolution, first matching row wins)
@@ -767,7 +804,7 @@ queued cancellation whose retry commits stays `cancelled`.
 | -32006 | `unsupported_verb` | |
 | -32007 | `missing_capability` | `require` not met |
 | -32008 | `bound_unsupported` | combination or route (§4.2), incl. bound change on a bound-keyed server (P11) |
-| -32009 | `harness_unavailable` | binary missing, version refused (P13), server failed to start |
+| -32009 | `harness_unavailable` | binary missing, handshake check refused (C2 §5, `data.reason: handshake_refused`), server failed to start, or the stored adapter version is not compatible (`data.reason: adapter_version`) |
 | -32010 | `unknown_model` | |
 | -32011 | `queue_full` | |
 | -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response; Store read lane full; disk free space below the floor |
@@ -789,7 +826,7 @@ receipt. An unkeyed caller must not resend the request.
 | Class | Meaning | Set by |
 |---|---|---|
 | `deadline_wall`, `deadline_idle` | Core deadline | Core |
-| `submit_failed` | vendor rejected the submission before acceptance | Core (from adapter observation) |
+| `submit_failed` | the submission was rejected before acceptance, either by the vendor or by the adapter before any vendor submission (a failed handshake check, or a parameter the discovered catalog rejects; C2 §5); `failure.data` names the adapter-side reason | Core (from adapter rejection or observation) |
 | `resume_mismatch` | vendor returned a different or fresh session | Adapter observation |
 | `vendor_error` | vendor turn failure; `vendor_code` keeps the vendor's code | Adapter |
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |
@@ -800,7 +837,8 @@ receipt. An unkeyed caller must not resend the request.
 | `daemon_restart`, `store` | §7.5; Store write failed after dispatch | Core |
 
 Adapters never commit a class; they report observations and Core commits
-(C2 §4). `max_steps` reached with a normal result is `completed` with
+(C2 §4). A vendor failure after acceptance is `failed` with the vendor's
+class; `submit_failed` is only before acceptance; HTTP 401/403 → `auth`. `max_steps` reached with a normal result is `completed` with
 `stop_reason: max_steps`.
 
 ## 9. Security notes
@@ -835,14 +873,16 @@ Adapters never commit a class; they report observations and Core commits
 Confirmed by review (Astra): Q2 VIA validates
 structured output; Q3 `wait` = latest turn at acceptance; Q4 15-minute
 process shutdown, configurable; Q5 catalog-only `describe`. D9 stays open.
-Owner, 2026-09-26: P12 approved as written; P7/P11 and P13 are resolved by
+Owner, 2026-09-26: P12 approved as written; P7/P11 are resolved by
 the reviewed Codex and Claude vendor packets. Vendor live gates remain open.
+Owner, 2026-09-30 (OD1): P13's version rule supersedes the 2026-09-26 P13
+approval.
 
 | # | Question | Recommendation / alternatives |
 |---|---|---|
 | P7 | Codex pending cleanup | reviewed §3.5/§7.3 rule: settle at `min(acknowledged_at + 60 s, wall_deadline)`; do not add `--after-uncertain` |
 | P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation awaits enforcement proof; OpenCode key includes full bound, owning VIA session and durable private namespace, refusing bound changes or cross-owner sharing |
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
-| P13 | version gate | tested sets/ranges + immutable `allow_untested`; Claude initial set exactly `{2.1.283}` |
+| P13 | version rule | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) |
 | Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |
 | Q7 | Channel sizes (C2 A1 limits) | as written, fixed; disk and WAL thresholds are daemon config (runtime §8) |

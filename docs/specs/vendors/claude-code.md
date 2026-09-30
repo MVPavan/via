@@ -7,11 +7,16 @@ This is a design, not implementation or release-conformance evidence. Authority:
 [release goal](../../workstreams/rust-foundation/goal.md).
 Shared-contract changes in §10 are proposals for the coordinator to integrate
 after review; this document does not silently override those contracts.
+Amended 2026-09-30 by the adapter design's VC1–VC12
+([adapter design](../../workstreams/rust-foundation/adapters/design.md) §3.6,
+revision 9, from the live re-probe of Claude Code 2.1.285).
 
 ## 1. Evidence and decisions
 
-The inspected binary reported **2.1.283** on 2026-09-26. The only qualified
-candidate version is that exact version; there is no tested compatibility range.
+The inspected binary reported **2.1.283** on 2026-09-26; the re-probe of
+2026-09-30 observed **2.1.285** after an automatic update. There is no exact
+version set: the version rule is C2 §5 (owner OD1), and each launch reports
+its own version in init `claude_code_version` (§3).
 The private evidence packet is
 `scratchpad/execution/rust-foundation-release/claude-evidence/evidence.md`,
 `conformance-report.md`, and `conformance.json` in that directory. Case IDs
@@ -27,7 +32,7 @@ For this contract, an observed field wins over a shorthand in earlier research.
 
 | Decision | Resolution | Evidence / remaining gate |
 |---|---|---|
-| A2 / P13 | Exact-version gate; untested opt-in never waives a known unsupported bound or failed handshake | C0; §3 and proposed shared wording §10 |
+| A2 / P13 | Version rule (owner OD1, C2 §5): every version is supported; `untested` warns until the maintainers' live check; only a failed handshake check refuses; `allow_untested` has no effect | C0; re-probe D1 (2.1.283 → 2.1.285); §3 |
 | A3 / Q6 | `steer` unsupported; `cancel` partial `aborts_tools_then_result`, requiring `interrupt_receipt_v1` | C3 busy input merged into one result; C7 receipt plus abort terminal |
 | A6 | Auto-decline deadline 5 s on independent control path; fail closed if a safe reply cannot be encoded | C4 proves one permission-denial path, not every request family |
 | B8 | One private process per VIA turn, persistent vendor UUID; apply effective schema/steps/effort/bound on every launch | C1/C2 fresh-process continuity, schema replace/clear; C3 step reset |
@@ -49,7 +54,7 @@ FIFO, deadlines, retries, state and final envelope. No new crate or SDK route.
 | C1 surface | Mapping / owner |
 |---|---|
 | `hello`, `daemon/status`, `daemon/stop` | Existing Core/daemon behavior; force/drain reaches Claude through C2 controls |
-| `describe` | Pure adapter plan from HostProbe snapshot, no vendor process or file write; report unknown/stale version honestly (§3) |
+| `describe` | Pure adapter plan, no vendor process or file write; bundled catalog; the last version seen from an init for this binary identity, else `null`/`untested` (§3) |
 | `models` | Bundled versioned catalog with `source: bundled`; explicit Claude model identifiers pass as vendor identifiers, never claim account entitlement |
 | `spawn` | Core durable receipt then submission intent; allocate expected UUID; launch private Claude and send one prompt |
 | `resume` | Core FIFO; next process uses exact stored UUID with `--resume`; never `--continue`, name search, fork, or replacement session |
@@ -88,7 +93,7 @@ acceptance derived from the same message. The confirmation observation carries
 connection identity so old/late messages cannot verify a later launch. A pre-init
 startup/resume rejection never confirms identity or emits either event, even if
 its error result echoes the expected UUID. Logical open must still return to
-permit StartTurn; these delayed events do not delay the original VIA receipt.
+permit the first `run_turn`; these delayed events do not delay the original VIA receipt.
 
 The process remains open during the turn so interrupt messages can be sent. After
 its terminal, close stdin, await exit and settle group cleanup before another
@@ -101,7 +106,7 @@ as rejection evidence, never proof that resume succeeded.
 
 ## 3. Capabilities, version and preflight
 
-Candidate capability snapshot for 2.1.283, subject to implementation/live gates:
+Candidate capability snapshot (observed on 2.1.283 and 2.1.285; capabilities belong to the adapter version), subject to implementation/live gates:
 
 | Surface | Declaration | Qualification |
 |---|---|---|
@@ -110,7 +115,7 @@ Candidate capability snapshot for 2.1.283, subject to implementation/live gates:
 | cancel | partial: `aborts_tools_then_result` | Requires live init capability and matching receipt plus abort terminal |
 | instructions | native | Append frozen session instructions through the system-prompt option; exact recipe test required |
 | output_schema | native | C2 replace and clear succeeded; Core still validates actual output |
-| effort | native | Direct `--effort` mapping for model-supported values; per-model catalog/probe gate remains |
+| effort | native | Direct `--effort` mapping; VIA validates against `{low, medium, high, xhigh, max}` before launch (§4); effort is not observable |
 | max_steps | partial: `agentic_turn_limit` | `--max-turns N`, not tool-call count; C3 observed `num_turns:2` when limit was 1 |
 | bounds | `full` only while B1 remains open | Never-ask is separate from sandboxing; §4's exact full recipe must be qualified |
 | network_control | false | `network:false` always `bound_unsupported` |
@@ -124,23 +129,22 @@ capabilities. Since this check may follow submission, fail/clean up conservative
 and retain possible-submission facts; a failed handshake is not safe retry proof.
 No prompt is sent a second time to obtain capabilities.
 
-Parse the complete vendor version, including any prerelease/build qualifier;
-only exactly `2.1.283` is tested. Missing/unparseable/newer/older versions are
-`untested`, never guessed from an executable filename. Candidate capabilities
-remain visible with a warning. Without `allow_untested`, refuse spawn/resume
-because both carry an effective bound, including inherited `full`. Existing
-read/control/cleanup APIs remain available. With opt-in, require all normal
-protocol, bound, never-ask and identity checks. A failed handshake is `refused`.
+Version (C2 §5; owner OD1). Every Claude Code version is supported by
+default. Check init `claude_code_version` on every launch, parsing the
+complete version including any prerelease/build qualifier, never guessed from
+an executable filename. A version in the adapter's `checked` set (versions the
+maintainers' cheap live check passed) is `tested`; any other is `untested`,
+with warning `vendor_version_untested`, and proceeds. Only a failed handshake
+check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
+echo, the tool list) refuses the instance. Init follows the prompt line, so
+the turn fails `protocol` with no resend, and the refusal is cached per C2 §5.
+`allow_untested` is accepted and stored but has no effect. There is no frozen
+executable identity: a binary changed between turns is not refused, and each
+launch reports its own version.
 
-`describe` reads a cached HostProbe version/identity only. An absent or stale
-snapshot yields `vendor_version:null`, `version_status:untested`, and an explicit
-warning. Bounded `--version` discovery belongs to daemon harness discovery or
-mutation preflight, not describe. Before each launch compare executable identity
-and version with the session's frozen values; changed binaries require a named
-refusal, never an automatic upgrade of an existing session. Replacing a binary
-between check and launch remains checked against init's `claude_code_version`;
-if it differs after submission, stop without replay. Fresh sessions can opt into
-a new untested version; opt-in does not migrate an old session.
+`describe` starts nothing: it reports the last version seen from an init for
+this binary identity, or `vendor_version:null` and `version_status:untested`.
+There is no HostProbe `--version` discovery; the bundled catalog is kept.
 
 ## 4. Launch and canonical parameters
 
@@ -169,16 +173,16 @@ an unexpected execution surface without detection (§8).
 
 | Canonical field | Mapping |
 |---|---|
-| model | Frozen `--model`; record actual init model as resolved identity; catalog aliases retain their provenance |
+| model | Frozen `--model`; init `model` is a resolved identity only for aliases (a full model name is echoed unresolved); catalog aliases retain their provenance |
 | instructions | Frozen text via `--append-system-prompt`; for large values use Host-managed private temporary file plus `--append-system-prompt-file`, never reread a mutable caller file on resume; remove after child reads/exits through owned cleanup |
-| effort | Optional `--effort VALUE`, exact model-supported values; unknown value rejected, never rounded or silently omitted |
+| effort | Optional `--effort VALUE`. Claude ignores an unknown effort with only a stderr warning, so VIA validates against `{low, medium, high, xhigh, max}` (help 2.1.285) before launch and refuses others `invalid_params`; never rounded or silently omitted. Effort is not observable |
 | output_schema | Non-null validated object serialized into `--json-schema`; null omits flag; C2 proves schema replacement and removal on the same UUID |
 | max_steps | Positive N maps one-to-one to `--max-turns N`; null omits it. C1's effective receipt retains N and capability semantics `agentic_turn_limit` |
 | bound | Validate every turn; only `full, network:true` presently eligible. No temporary escalation or fallback on failure |
 | extra_write_dirs | Validated existing absolute directories passed through `--add-dir`; no broader bound implied; workspace semantics remain §8-gated |
 | deadlines | Core absolute Instants forwarded; never implement wall/idle with `--max-turns` |
 
-Resolve CLI model/effort support from the pinned catalog plus vendor rejection;
+Resolve CLI model support from the bundled catalog plus vendor rejection;
 documentation lists model-dependent effort levels, which is not evidence every
 model accepts all levels. Instructions/effort with model families absent from
 the small live packet remain mandatory qualification cases, not unsupported
@@ -199,6 +203,22 @@ Claude itself reads its existing login. Do not inspect auth files. Optional
 auth/continuity tests and a recorded environment-name list; never copy config or
 credentials into a new HOME to make tests pass. `--bare` is not the default
 because its auth behavior differs from this evidenced login route.
+
+Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe
+("verified" means seen live):
+
+| Category (default) | Switch and evidence | Effective state with the default |
+|---|---|---|
+| hooks (off) | Settings-file hooks are ignored under `--restricted` (help; **unverified**); plugin hooks **unverified**; `--safe-mode` also drops prompt config, so it is not a per-category switch | `unknown`, warns |
+| MCP servers (off) | `--strict-mcp-config`: **verified** (`mcp_servers:0`) | `off` |
+| plugins (on) | Loaded (2) even under `--restricted`; no per-category switch known | `on` (init inventory) |
+| skills (on) | Loaded (18); `--disable-slash-commands` (help; **unverified**) | `on` (init inventory) |
+| agents (on) | Loaded (5); no switch known | `on` (init inventory) |
+| instruction files (on) | CLAUDE.md is not in init; inventory unavailable; no per-category switch | `unknown`, warns |
+
+Init lists plugins, skills, agents, slash commands and MCP servers (verified);
+that inventory is recorded in the turn's evidence folder. Qualify the hook,
+plugin, skill and agent switches in `via-p98.3.4`.
 
 No free-form vendor options in this first recipe. Reject unknown Claude vendor
 keys with `invalid_params`; recognized reserved keys use
@@ -225,7 +245,10 @@ does not exercise a separately correlated lifecycle-receipt path: use the first
 prompt-associated assistant/tool message or terminal as acceptance evidence.
 Do not use generic system noise, thinking-token estimates or a successful pipe
 write as acceptance. A sole terminal can establish acceptance and then terminal
-in one ordered observation batch. Pre-init startup rejection remains rejection.
+in one ordered observation batch; a post-init result for the prompt line is
+acceptance evidence. Pre-init startup rejection remains rejection. A
+vendor-synthetic API-error message (`is_api_error_message:true`,
+`model:"<synthetic>"`) is never acceptance, progress or final text.
 
 | Incoming traffic | Normalized behavior |
 |---|---|
@@ -233,9 +256,9 @@ in one ordered observation batch. Pre-init startup rejection remains rejection.
 | `assistant.message.content` text | `progress` with `model`; final text comes from `result`, sent as completed C2 `final_text` pieces of at most 256 KiB encoded before the terminal |
 | assistant `tool_use` | `progress` with `model` and `tools_started (id, name)`; retain the open-item set |
 | user `tool_result` | `progress` with `tools_ended (tool ID)`; error/refusal remains error; unmatched IDs are protocol evidence |
-| `message.usage` | `progress` `usage` keyed by message ID (unprobed) |
-| `system/permission_denied` | `action.denied`; deduplicate matching terminal `permission_denials` by tool-use ID |
-| `result` | Validate session, normalize terminal only once, report text/structured output/denials/accounting before `turn.vendor_terminal` |
+| `message.usage` | not reported: assistant snapshots are partial (c9a output 6 vs 177; c1a 3 vs 156); usage comes from the `result.usage` turn aggregate |
+| `system/permission_denied` | `action.denied`; deduplicate matching terminal `permission_denials` by tool-use ID; an entry caused by VIA's decline is suppressed (§6) |
+| `result` | Validate session, normalize terminal only once, report text/denials before the turn ends; the terminal (structured output, usage aggregate, cost, vendor data) is retained in the turn's end result (C2 §4.1) |
 | unknown notification | no observation; moves the turn's activity time; cannot advance lifecycle or the idle timer |
 | malformed known message / contradictory duplicate result | Protocol health failure; never invent a second terminal |
 | stderr | written by the operating system to the turn's evidence folder; never read, parsed or used to reset idle |
@@ -246,12 +269,19 @@ retain their original connection/turn correlation and cannot leak to a later
 process for the same session.
 
 Terminal mapping: `success/is_error:false` → Completed; Core independently
-validates any requested structured output (including missing output), yielding
-`structured_output_invalid` on failure. `error_max_turns` with `max_turns` →
+validates any requested structured output: output present but invalid yields
+`structured_output_invalid`; a requested schema with no output keeps the
+`completed` result and adds warning `structured_output_missing` (C1 §5). `error_max_turns` with `max_turns` →
 Failed, class hint `budget_exceeded`, stop reason `max_steps`; the raw vendor code
 is retained. This is not a normal successful max-steps stop. After VIA interrupt,
 the qualified receipt plus `error_during_execution/aborted_tools` → Interrupted.
-Other errors → Failed `vendor_error`, except exact fixture-backed auth/rate-limit/
+Classify on `is_error`, `terminal_reason`, `api_error_status` and the
+synthetic `error` code, never on `subtype` (a `success` subtype can carry
+`is_error:true`): `authentication_failed` or HTTP 401/403 → Failed `auth`;
+`model_not_found` → Failed `vendor_error` with that `vendor_code`. A vendor
+failure after acceptance and before model output is a Failed terminal with
+vendor code, class hint and `detail`, never `submit_failed` (C2 §2). Other
+errors → Failed `vendor_error`, except exact fixture-backed auth/rate-limit/
 context/budget codes; never infer classes from free-text substrings. Host exit
 without terminal and uncertain transport loss follow C1 §7.6, not fabricated
 Claude result messages.
@@ -264,11 +294,12 @@ other vendor failure maps `error`; unknown success reasons map `other` with the
 verbatim vendor reason. Core owns deadline override. Raw message tool calls do
 not override the terminal result's success flag.
 
-`usage` is per-result/turn; preserve input/output/cache categories separately,
-with no double-counted totals. `total_cost_usd` is reported session cumulative;
+`result.usage` is the turn aggregate (C2 §5 usage) and supersedes any
+assistant snapshot; preserve input/output/cache categories separately, with no
+double-counted totals. `total_cost_usd` → `cost {scope: session_cumulative}`;
 raw C1a/C1b/C1c values increased across resumed processes while output-token
-counts were 159, 162, 44. No subtraction into a per-turn billing claim. Preserve
-`modelUsage.costBasis` and vendor provenance when present. Missing values stay
+counts were 159, 162, 44. No subtraction into a per-turn billing claim.
+`fallback_credit` and `modelUsage.costBasis` go to `vendor`. Missing values stay
 unavailable, not zero. Unexpected counter resets produce a warning and retain
 the reported value; do not invent monotonic corrections or estimates.
 
@@ -287,9 +318,14 @@ pinned error response for a request carrying a request ID is:
 {"type":"control_response","response":{"subtype":"error","request_id":"REQUEST_ID","error":"VIA declines unsupported control request"}}
 ```
 
-This outbound decline shape is **not verified by C4** (no incoming control request
-was observed). It requires fixture/official-protocol confirmation and the
-qualification gate in §9 before claiming complete A6 implementation. Do not send
+This error reply was live-verified on 2.1.285 with
+`--permission-prompt-tool stdio` (re-probe c11b), but that recipe is unused:
+never-ask stays on `--permission-prompts none` (K6), where Claude reports
+denials in `permission_denials` and no control request was observed. An
+action denied because VIA declined a request produces only
+`vendor.request_declined`; the matching `permission_denials` entry,
+correlated by `tool_use_id`, is suppressed (C2 §7 item 9). The decline code
+remains for unknown control requests. Do not send
 an invented permission-allow response. When no safe encoding exists, fail the
 connection and request private cleanup within the same 5 s deadline, reporting
 the unanswered request and protocol failure; do not claim a delivered decline.
@@ -308,7 +344,12 @@ silent drops, unbounded result collection or hidden vendor-process queue.
 
 ## 7. Interrupt, close and recovery
 
-Send through the independent control lane:
+Cancel (and the wall's cleanup step, C2 §4.1) sends the interrupt through
+the independent control lane, then closes stdin, then follows S1's close:
+graceful, then the hard stop (the anchor's own-group stop) at the stop
+order's bound. The interrupt stops what is still in Claude's parent tree;
+stdin EOF alone does not stop an active tool, so EOF never replaces the
+interrupt. VIA sends nothing else.
 
 ```json
 {"type":"control_request","request_id":"UNIQUE_ID","request":{"subtype":"interrupt"}}
@@ -328,15 +369,21 @@ without terminal, or ordinary completion racing cancel yields no acknowledged
 cancellation. `still_queued` is retained diagnostically; nonempty means a protocol
 contradiction for this one-input-per-process route and must not trigger replay.
 
-Cleanup is independent: open tools → Pending; all tracked tools ended may prove
-tool-item quiescence under C2, with that provenance. Process cleanup is Quiescent
-only with Host's positive group-absence proof. C7's vanished Bash/sleep snapshot
-supports the sampled case, not all descendants or future tools. A terminal
-result alone never proves child absence. Group escape limitations remain public.
+Cleanup is independent and keeps its meaning (C2 §2 Interrupt): Quiescent
+only with Host's `GroupAbsent` proof for Claude's own group; `Pending` only
+until the S1 process bound. A tool that ended never shortens the wait. The
+re-probe (c7) found Bash as its own session leader and `sleep` as its own
+group leader, reachable only by a parent-pid walk: such descendants are
+outside the group, are the agent's responsibility, and are reported as
+leftovers (C2 §4.2), never part of cleanup. A SIGKILL of Claude leaves every
+tool running; those are leftovers too. A terminal result alone never proves
+child absence. Group escape limitations remain public.
 Do not dispatch the next turn until Core permits it under the cleanup gate.
 
-Graceful close closes stdin only on this private connection and waits through
-the absolute deadline. A running turn first follows the appropriate Core
+Close is per turn: stdin EOF after the result, then S1's close. Early EOF
+with no active tool completes the turn (c10), and EOF does not stop an active
+tool, so a running turn is interrupted first. Graceful close closes stdin only
+on this private connection and waits through the absolute deadline. A running turn first follows the appropriate Core
 drain/cancel policy; close does not manufacture a cancel acknowledgement. At the
 deadline request cleanup through Route/Wire/Host's verified anchor. `Forced`
 requires Host evidence that the anchor issued force; quiescence and reaping are
@@ -403,19 +450,19 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 
 | Test name | Original failure / decisive assertion |
 |---|---|
-| `claude_preflight_pure_version` | describe creates no process/file; absent/stale cached version is untested; exact 2.1.283 only; untested opt-in cannot waive bound/protocol/identity refusal |
+| `claude_preflight_pure_version` | describe creates no process/file; no version seen gives `null`/`untested`; a version outside `checked` warns and proceeds; a failed permission-mode echo or missing `interrupt_receipt_v1` fails `protocol` with no resend and is cached for that recipe digest only; `allow_untested` has no effect |
 | `claude_reserved_options` | Every normalized alias for owned flags/settings/env is refused before vendor I/O; no arbitrary argv |
 | `claude_lazy_init_acceptance` | Logical open returns with internal expected UUID, public ID null/verified false and no opened event; init emitted only after input cannot deadlock; matching init confirms identity/opened but is not acceptance; sole successful terminal confirms before one acceptance token; pre-init rejection echoes UUID without confirming or opening |
 | `claude_identity_resume` | Same UUID across three children; historical confirmed ID remains visible with verified false during reopening; matching init/non-rejection result commits one reopened event and verified true; late prior-generation message cannot confirm; mismatch/missing-session rejection never reopens or creates fresh; no duplicate input after loss |
 | `claude_fifo_busy_input` | Queue two VIA turns while fake tool runs; first process receives exactly one user message; second starts only after terminal/cleanup; vendor queue count has no authority |
-| `claude_schema_replace_clear` | Disjoint schemas A/B and null across same UUID; actual structured output validated by Core; missing/invalid output fails; launch rejection never recreates session |
+| `claude_schema_replace_clear` | Disjoint schemas A/B and null across same UUID; actual structured output validated by Core; present-but-invalid output fails `structured_output_invalid`; missing output keeps `completed` with warning `structured_output_missing`; launch rejection never recreates session |
 | `claude_agentic_step_limit` | N=1 terminal error_max_turns maps failed/budget_exceeded/max_steps even with num_turns=2; N=2 on resume succeeds; null clears flag; N counts agentic iterations, not tool calls |
 | `claude_instructions_effort` | Frozen instruction bytes reapplied after source file changes; explicit model-supported effort preserved on resume; invalid effort refused; large argv budget error before prompt |
-| `claude_never_ask` | Denied action settles; live permission_denied and terminal denials deduplicated; unknown request refusal or fail-closed action completes within 5 s while normal observations are full |
+| `claude_never_ask` | Denied action settles; live permission_denied and terminal denials deduplicated (c4: one denial); a decline-caused denial is suppressed (c11b: one decline, zero denials); unknown request refusal or fail-closed action completes within 5 s while normal observations are full |
 | `claude_interrupt_pairing` | Correct nested receipt then abort terminal acknowledges; wrong IDs, missing terminal, late response, natural-success race and duplicate cancel never falsely acknowledge |
 | `claude_cleanup_not_ack` | Receipt/terminal with open tool stays pending; child surviving leader exit not quiescent; anchor force not acknowledgement; group absence provenance required |
 | `claude_recovery_no_submit` | Crash after intent/before acceptance, accepted crash and survivor: zero replay messages; verified anchor cleanup only; unverified anchor never signalled; recovered turn unknown |
-| `claude_normalizer_accounting` | Repeated assistant block not doubled; denial dedup; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, absent fields and counter reset |
+| `claude_normalizer_accounting` | Repeated assistant block not doubled; the `result.usage` aggregate supersedes partial assistant snapshots; denial dedup; synthetic API-error message never progress; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, `fallback_credit` in vendor, absent fields and counter reset |
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
 | `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn; SIGTERM-only is a negative case |
@@ -430,22 +477,14 @@ zero tests serve as acceptance. Keep network and credentials out of default CI.
 
 ## 10. Exact shared-contract amendments proposed for integration
 
-1. **C1 §4 canonical parameters and C2 DescribeRequest/SessionSpec:** add
-   `allow_untested: bool = false` to describe and spawn, immutable session policy
-   thereafter. CLI `--allow-untested` maps to it; resume inherits it and attempts
-   to change it are `invalid_params` as session scope. Include it in idempotency
-   equivalence. “This flag waives only the tested-version restriction. It never
-   waives unsupported bounds, protocol validation, required capabilities,
-   identity continuity, never-ask policy or executable-version consistency.”
-2. **C1 P13 and C2 A2/§5:** replace “tested ranges” with “tested version sets or
-   ranges declared per route; Claude's initial set is exactly `{2.1.283}`”.
-   Add: “Bound-bearing spawn and resume include inherited/full bounds. Read and
-   cleanup operations are not disabled by an untested-version warning.”
-3. **C2 describe row / HostProbe:** replace direct `claude --version` on describe
-   with “cached HostProbe executable/version observation; unknown or stale cache
-   is untested. Bounded version discovery runs outside describe during harness
-   discovery or mutation preflight; no model prompt is used.”
-4. **C2 open_session/SessionDriver; C1 §3.8 status and §6.1 session events:** add
+1. **Superseded** (owner OD1, 2026-09-30): `allow_untested` stays in C1 as
+   immutable session policy and idempotency identity, but has no effect
+   (C1 §4, C2 §5).
+2. **Superseded** (owner OD1, 2026-09-30): C1 P13 and C2 A2/§5 now carry the
+   version rule; there is no exact version set.
+3. **Superseded** (adapter design VC10): `describe` reports the last version
+   seen from an init; there is no HostProbe `--version` discovery.
+4. **C2 open_session/SessionDriver; C1 §3.7 status and §6.1 session events:** add
    internal `VendorIdentity { expected_id, confirmed_id: Option<VendorSessionId>,
    verified: bool }`, scoped to the current connection generation, and persist
    through Core. “A CLI whose init follows input may open logically with an
@@ -463,8 +502,9 @@ zero tests serve as acceptance. Keep network and credentials out of default CI.
    UUID. The VIA receipt/session exists independently of vendor confirmation.
    Every init/result ID is checked; mismatch fails `resume_mismatch` without
    replacement or resend. No pre-input identity-verification guarantee is made.”
-   Acceptance still requires prompt-associated evidence, not init. Other routes
-   that confirm during open can return confirmed/verified identity immediately.
+   Acceptance still requires prompt-associated evidence, not init. (Adapter
+   design AD3 since made `open_session` logical on every route: identity is
+   confirmed in the first `run_turn`, never during open; C2 §2.)
 5. **C2 §6.2 Claude process/start rows:** replace per-session reuse/restart-on-change
    with “one private process per VIA turn; persistent same vendor UUID; apply
    effective parameters at every launch; Core retains all queued inputs”.

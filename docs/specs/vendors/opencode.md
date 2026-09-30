@@ -16,6 +16,9 @@ Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md),
 [credential/platform invariants](../../../.repo-context/invariants.md).
 This packet resolves proposed B4/B7/A4/A8/P11 mappings where evidence permits;
 unverified behavior remains an explicit test gate, not an invented refusal.
+Amended 2026-09-30 by the adapter design's VO1–VO18
+([adapter design](../../workstreams/rust-foundation/adapters/design.md) §3.6,
+revision 9, from the live re-probe of OpenCode 1.18.32).
 
 ## 1. Evidence boundary
 
@@ -72,7 +75,8 @@ a qualification gate (§2.1).
 Core owns turn admission, receipts,
 queues, Store and final states. The Adapter owns OpenCode semantics and the
 server key; Routes owns typed HTTP/SSE correlation; Wire owns sockets, HTTP
-message splitting/raw capture and bounded staging; Host exclusively starts/supervises
+message splitting and bounded staging (no copy of vendor traffic beyond
+bounded decode-failure evidence, runtime §4); Host exclusively starts/supervises
 the server through the reviewed anchor mechanism. SQLite in OpenCode is
 vendor-owned storage, never a second writer to VIA's Store.
 
@@ -113,11 +117,9 @@ A changed bound on resume is `bound_unsupported` before vendor I/O.
 Nonempty `extra_write_dirs` with `full` is deterministically rejected as
 `invalid_params` before any namespace allocation, process or request: it has
 no confinement meaning in this route. There is no cross-directory or
-cross-VIA-session shared event bus. Keep the existing server-route control
-semantics: cancel/close does not acquire a new right to force-kill a server
-merely because this revision dedicates it to one VIA session. Server shutdown
-is a separate zero-reference
-idle or daemon-shutdown operation with its own Host evidence.
+cross-VIA-session shared event bus. Cancel never kills the server. The
+dedicated server stops in three ways, each with its own Host evidence: a C1
+`close` of its session (§6), idle retirement, and daemon shutdown.
 
 ### Listener and authentication
 
@@ -142,9 +144,10 @@ Use `OPENCODE_SERVER_USERNAME=opencode` and a nonempty generated
 `OPENCODE_SERVER_PASSWORD`; HTTP Basic authentication goes only in headers to
 that exact loopback origin. Disable HTTP redirects and proxies for this local
 client, including inherited proxy environment handling. Never put passwords
-in URLs, Store, manifests, traces, HTTP raw captures or command argv. Redact
-Authorization before HTTP metadata enters a raw log; retain vendor body bytes
-and HTTP message-boundary evidence (content length, chunk and SSE delimiters). VIA creates the password only in daemon memory and the
+in URLs, Store, manifests, traces, HTTP raw captures or command argv. VIA
+keeps no copy of vendor traffic (runtime §4): responses and events are read,
+counted and discarded after decoding, and the bounded decode-failure
+evidence never includes a Basic `Authorization` header. VIA creates the password only in daemon memory and the
 owned server launch environment. That is a VIA handling rule, **not a claim
 that the vendor keeps it from descendants**; the source-backed exposure below
 precludes that assertion under the temporary exception. Restart cannot recover
@@ -283,6 +286,27 @@ silent model/provider substitution. `provider_profile_id` above is an anonymous
 policy identity, not a user identity or a hash of credentials. A future optional
 vendor-login profile would require explicit selection, a distinct key/epoch and
 separate evidence; implementing it is outside this first no-login recipe.
+The free catalog changes remotely with no binary change, so the maintainers'
+live check re-verifies the model.
+
+Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
+The worktree resolves to the git root. `.claude/skills` found from there load
+despite `--pure`, add `external_directory: allow`, and cannot be switched off.
+Record the resolved worktree and the `GET /skill` inventory per session.
+Project `opencode.json` is ignored (verified).
+
+| Category (default) | Switch and evidence | Effective state with the default |
+|---|---|---|
+| hooks (off) | none loaded: private profile; not switchable to on | `off` |
+| MCP servers (off) | none: private profile; not switchable to on | `off` |
+| plugins (on) | private profile, none from the user; not switchable to on | `off`, cannot inherit, warns |
+| skills (on) | worktree `.claude/skills` (40) load despite `--pure`; not switchable off (`skill: deny` is unqualified inference) | `on` (`GET /skill`) |
+| agents (on) | private profile plus VIA's generated agent; not switchable to on | `off` (only VIA's agent, `GET /agent`), warns |
+| instruction files (on) | absence inferred only | `unknown`, warns |
+
+Inventory sources are `GET /skill`, `GET /agent` and `GET /config` (called in
+the re-probe). Qualify the instruction-file state and each row in
+`via-4sw.3.4`.
 
 Pinned sources explain why every root is private: authentication is found under
 the vendor data root; `OPENCODE_DB` redirects only the session database; project
@@ -335,29 +359,32 @@ OC-SEC-1 disposition and selected-control proof remain required despite these ca
 ## 3. Capabilities, bounds and version gate
 
 This table is the **target declaration after its tests pass**, not today's
-tested capability matrix. Pin tested range to exactly 1.18.32 initially; no
-semver range inference. No-model protocol evidence alone does not make the
-complete adapter tested. `describe` reads installed/catalog metadata without
-starting a process, server or writing files; version discovery occurs during
-explicit harness discovery/startup and is cached. No hidden `--version`
-subprocess inside the no-process `describe` path. Unknown/changed binary
-identity invalidates that cache; actual startup health must match the pin.
-A2/P13 use `untested` plus explicit `allow_untested` for bound-bearing calls;
-handshake/schema failure is `harness_unavailable`. `allow_untested` never
-bypasses credential, never-ask or unsupported-bound validation.
+tested capability matrix. The version rule is C2 §5 (owner OD1): authenticated
+health reports the running server's version; a version outside the adapter's
+`checked` set is `untested` and warns; only a demonstrated handshake breakage
+(for example a permission readback that differs from the value VIA sent)
+refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
+cached per C2 §5. The server key keeps `exact_vendor_version`, so a new
+version starts a new server. No-model protocol evidence alone does not make
+the complete adapter tested. `describe` stays process-free: it reads
+installed/catalog metadata and the last version seen for this binary
+identity, without starting a process, server or writing files. No hidden
+`--version` subprocess inside the no-process `describe` path.
+`allow_untested` is accepted and stored but has no effect; it never bypasses
+credential, never-ask or unsupported-bound validation.
 
 | Surface | Planned support and mapping | Evidence gate |
 |---|---|---|
 | Spawn / resume | native create + same vendor session prompt | Vendor free-model result/two-turn continuity observed; actual VIA qualification remains |
-| Steer | unsupported: no demonstrated active-turn injection verb; sending another prompt is not steer | No busy-prompt emulation |
+| Steer | unsupported: a v1 busy prompt merges into the running turn, and v2 `delivery:"steer"` runs a separate conversation (C2 A3) | No busy-prompt emulation; `require steer` → `missing_capability` naming `opencode-serve` |
 | Cancel | native abort request/acknowledgement with separate cleanup certainty | One vendor sleep-child abort observed; VIA/sibling/escaped-descendant cases remain; idle `true` is insufficient |
-| Close | native logical detach; active work follows existing server-route cancel/close policy | No destructive session DELETE and no unreviewed force-kill capability |
+| Close | native: cancel active work, then dispose the session's owned server (§6); history preserved | No destructive session DELETE; the only kill is S1's bounded hard stop after dispose |
 | Instructions | native `system` sent from frozen session instructions on every turn | Persisted user message + live semantics check |
-| Output schema | native `format:{type:"json_schema",schema,retryCount:0}`; null means explicit `{type:"text"}` | Validate C1 schema first; live structured response/missing/error cases |
-| Effort | native only for a model's verified exact `variant` mapping | Unknown canonical/vendor value refused; no assumption that every model has low/medium/high |
+| Output schema | unsupported on 1.18.32 (the vendor's `format` read defect, below); plain turns omit `format` entirely | Revisit when a release containing the upstream fix passes a cheap live check |
+| Effort | native only for a model's verified exact `variant` mapping. `variant` is accepted silently by the vendor, so canonical values without a mapping are refused in `plan`, and the `variant` is checked against the server's `/provider` readback inside `run_turn` before `prompt_async`; a mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` (C2 §5) | No assumption that every model has low/medium/high |
 | Max steps | unsupported on this pinned route; explicit non-null request refused before dispatch | C1 §4.1 permits per-parameter unsupported status; refusal proof below |
 | Recovery | unsupported live rejoin after daemon restart (P12) | Active turns remain unknown unless independent evidence supports C1 terminal mapping |
-| Usage / cost | reported `vendor_interval` until measured; missing values unavailable | Never infer turn scope from empty-session zeros |
+| Usage / cost | keyed assistant samples summed, scope `turn`; child task sessions excluded (§7); missing values unavailable | Never infer turn scope from empty-session zeros |
 
 **A4 decision candidate:** only `full` with `network:true`. Refuse
 `read_only`, `workspace_write` and every `network:false` request before server
@@ -368,6 +395,17 @@ The exact never-ask candidate below allows ordinary full-bound actions and
 denies interactive question/plan-mode prompts; reject any remaining request
 for approval or interactive input as §5 specifies. OC-SEC-1 control qualification still gates using
 these tools; permission rules do not solve credential inheritance.
+
+**`format` read defect (K8).** On 1.18.32 a message-list read fails when its
+page includes a format-bearing message **and** has no next cursor;
+`format:{type:"text"}` fails the same way. Plain turns therefore omit
+`format`, and reconciliation reads use cursored pages or single-message GETs
+of assistants. The defect is reported upstream (sst/opencode#26929, #40169;
+fix PR #37541); track it and file nothing.
+
+A task child session's permission array lacks the parent's `*: allow`
+(inference: allow comes from the global config), so keep the generated
+global config never-ask-safe.
 
 ### Exact permission payload and precedence gate
 
@@ -452,12 +490,12 @@ model, variant, system, format, session/message identity, `--auto`,
 | C1/C2 operation | Vendor operation / local behavior |
 |---|---|
 | `hello`, `describe`, `models` | VIA metadata/catalog; model discovery on a previously owned authenticated server can use `GET /provider`, keeping only public model/capability fields |
-| `open_session` / spawn | Subscribe SSE first; `POST /session?directory=<cwd>` with explicit model/agent and full-bound never-ask permission policy; persist returned `ses…` ID before prompt |
-| `StartTurn` | One `POST /session/{id}/prompt_async` with frozen request below; HTTP 204 is vendor dispatch acceptance, never completion |
-| Resume / idle reopen | Reuse recorded namespace + exact vendor ID; `GET /session/{id}` verifies identity/directory; then one new StartTurn. Missing/mismatching ID fails, never silently create/fork |
-| Steer | Named unsupported-verb refusal, no vendor request |
+| `open_session` / spawn | Logical: no vendor I/O (C2 §2). In the first `run_turn` of a connection generation: subscribe SSE first. With no stored vendor ID (initial creation), `POST /session?directory=<cwd>` with explicit model/agent and full-bound never-ask permission policy, and confirm and persist the returned `ses…` ID before the prompt. With a stored ID (resume or idle reopen), follow the Resume / idle reopen row instead; never create |
+| `run_turn` submission | One `POST /session/{id}/prompt_async` with frozen request below; HTTP 204 is vendor dispatch acceptance, never completion, and does not validate the model |
+| Resume / idle reopen | Reuse recorded namespace + exact vendor ID; `GET /session/{id}` verifies identity/directory; then one new submission. Missing/mismatching ID fails, never silently create/fork |
+| Steer | Named unsupported-verb refusal, no vendor request (§3) |
 | Interrupt / cancel | `POST /session/{id}/abort`; interpret active cancellation evidence as §6 |
-| Close | Cancel/drain according to mode/deadline, release session driver/subscriptions/reference; preserve vendor session/DB |
+| Close | Cancel/drain according to mode/deadline, then `POST /instance/dispose` and S1's hard stop (§6); release session driver/subscriptions; preserve vendor session/DB; commit the close result |
 | `status`, `wait`, `result`, `list`, `events`, `logs` | Core's durable VIA state/event/evidence APIs. Vendor reads are observations, not an alternate public state source |
 | `daemon/status`, `daemon/stop` | Core registry and reviewed shutdown; Host stops only VIA-owned server groups during whole-server shutdown |
 
@@ -469,8 +507,8 @@ unknown IDs cannot route into another session's stream or result.
 
 Before submission, Core persists the canonical turn/submission intent. The
 driver allocates one unique caller `messageID` accepted by the pinned schema
-and retains its mapping to the VIA session/turn while alive. Wire's outbound
-raw evidence records the request; C2 acceptance subsequently carries the
+and retains its mapping to the VIA session/turn while alive. C2 acceptance
+carries the
 message ID as vendor-turn correlation for Core to persist. No Adapter Store
 access or new pre-submission callback is implied. Recovery without a committed
 mapping remains P12 unknown rather than reconstructing/resending a prompt.
@@ -492,18 +530,49 @@ after dispatch is ambiguous. An HTTP 200 assistant error in synchronous
 evidence is not success; the production route remains async.
 
 Each assistant must match session ID and `parentID` of the submitted user
-message. Multiple assistant messages/steps may belong to one turn; intermediate
-`finish:"tool-calls"`, a step-finish part or idle status alone is not a VIA
-terminal. Candidate terminal requires correlated completed assistant/error,
-no further active continuation for that input, and reconciled session state.
-Use `GET /session/{id}/message/{messageID}` or bounded message pagination to
-reconcile parts and assistant parents. Keep Core's one-active-turn gate; never
-send queued prompts while a previous turn or cleanup is unresolved. Missing
-completion metadata, a status-map omission or an incomplete assistant produces
-continued waiting/unknown at deadline, never invented final text.
+message. Multiple assistant messages/steps may belong to one turn. Keep Core's
+one-active-turn gate; never send queued prompts while a previous turn or
+cleanup is unresolved. An uncorrelated `session.error` is attributed to the
+single in-flight turn, which the one-active-turn gate and no v2 use
+guarantee. Terminal recognition has **three separate steps: acknowledgement,
+terminal, cleanup.**
+
+0. **Acknowledgement** (cancel only). After VIA's `POST /abort` for the
+   in-flight turn, the first `session.error` with `MessageAbortedError` for
+   the session, together with the session's idle, is the acknowledgement.
+   The adapter records that instant when both have been seen, whatever the
+   assistant or tool state, and ends the turn `Interrupted` at once; C1 P7
+   applies from that instant (C2 §4.1). Later assistant and tool updates for
+   the turn are cleanup evidence or late observations, never a precondition.
+   In the re-probe the abort error, then idle, arrived before the tool's and
+   the assistant's final updates.
+1. **Terminal** (always, including while step 0 waits). After the session
+   returns to idle following this turn's acceptance, the adapter reconciles
+   by repeated reads (200 ms apart, cursored pages or single-message GETs,
+   §3) until every assistant whose `parentID` is the turn's user message is
+   completed. Tool-part state is not part of terminal evidence. Shapes:
+   (a) `finish:"stop"` → `Completed`, `EndTurn`. (b) `finish:"tool-calls"`
+   with a tool part in `status:error` from a VIA permission reject, then
+   idle → `Completed`, `Other`, with the decline recorded. (c) An assistant
+   `error` → `Failed`, class per §7. (d) No assistant created, with an
+   uncorrelated `session.error` → `Failed`, `vendor_code` from the error
+   name or stack, `vendor_error`. **Races with a cancel:** whichever of steps
+   0 and 1 completes first decides. A natural `Completed` or `Failed`
+   terminal completed with no `MessageAbortedError` seen is retained as that
+   terminal, and Core disposes it as S1 does (`completed`/`failed`,
+   `cancel.outcome: requested`; C1 §7.6 natural rows). Recognition is
+   bounded by the wall deadline; at the wall, C2 §4.1's path applies (the
+   driver sends `POST /abort` within S1's cleanup bound). No text is
+   invented.
+2. **Cleanup,** only after `Interrupted`: reads continue until no tool part
+   of the turn is `pending` or `running`, bounded by
+   `min(ack + tool_grace, wall)` (C2 §4.1), not by `close_by`; unresolved at
+   the bound → `Uncertain` (§6).
 
 Source handles prompt submission asynchronously and exposes bounded pagination
-through `limit`/`before` and `X-Next-Cursor`. Set `limit=100`, never zero (zero
+through `limit`/`before` and `X-Next-Cursor`; the `format` read defect (§3)
+means reconciliation never relies on a final uncursored page that includes a
+format-bearing message. Set `limit=100`, never zero (zero
 means unbounded in the pinned handler); cap each decoded response at 16 MiB
 and reconciliation to the turn deadline and 1,000 pages. Cursor cycles, oversized
 responses or exhausted bounds are explicit incomplete/protocol outcomes.
@@ -521,6 +590,11 @@ event family described by the served schema as canonical; future/parallel
 `session.next.*` events are activity only, never a second
 text/tool/usage emission. Permission/question request aliases must be decoded
 and deduplicated by request ID even if represented in both event families.
+The re-probe observed these types, each mapped or known-ignored:
+`plugin.added`, `catalog.updated`, `reference.updated`,
+`integration.updated`, `file.watcher.updated`, `session.diff`,
+`permission.*`, `session.error`, `session.status` `retry` (activity only;
+429 retries are internal) and `session.next.*`.
 Source directory filtering and the observed default SSE message are independently
 required fixture cases. [Event handler](https://raw.githubusercontent.com/anomalyco/opencode/v1.18.32/packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts).
 
@@ -543,8 +617,9 @@ Never-ask control path: `permission.asked` →
 session permission endpoint is not the primary mapping. All declines get
 `vendor.request_declined`; observed action denials get `action.denied` with
 accurate provenance, not an invented denial merely because a prompt was sent.
-Reply within the minimum of remaining operation budget and 1 s via the
-independent control lane. Duplicate request IDs coalesce. A 404 reply means
+Reply within the minimum of remaining operation budget and 5 s via the
+independent control lane (C2 A6). A decline-caused denial is correlated by
+`callID` and produces only `vendor.request_declined`. Duplicate request IDs coalesce. A 404 reply means
 the request is no longer present, not proof of a successful rejection. An
 unknown interactive request or failed decline triggers session abort and
 explicit protocol/control failure; it must not hang or be auto-approved.
@@ -564,45 +639,53 @@ queue stall another server/owner. Dispatch with
 nonblocking per-session admission; when a session exhausts its lane, quarantine
 that session immediately, retain its original turn correlation, and deliver
 overflow/loss through reserved sticky health/control. Continue other sessions
-and control messages. Subsequent quarantined data remains raw-only; its missing
-normalized sequence is explicit and never resumed as complete. Do not allocate
+and control messages. Subsequent quarantined data is read, counted and
+discarded (C2 §4); its missing normalized sequence is explicit and never
+resumed as complete. Do not allocate
 a spill queue or block other server parsers for the 10 s session deadline.
 The 32 records per server are owned vendor child-session/correlation metadata,
-not 32 independently admitted VIA sessions. If global metadata/control/raw
+not 32 independently admitted VIA sessions. If global metadata/control
 capacity is exhausted, fail affected connections explicitly. OC09 must flood
 owner A's dedicated server while owner B completes and abort responses
 arrive before advancing fake time to the stall deadline.
 
 SSE disconnect has no proven durable replay guarantee. Do not reconnect with
-`Last-Event-ID` and pretend events/raw bytes were recovered. Mark affected
-streams incomplete, stop new dispatch, preserve raw evidence and use bounded
-status/message reads only to classify terminal/unknown outcomes. Fail the
-server connection explicitly when exact log capture cannot keep up; its
-owner receives honest loss evidence. One session's cancel never
+`Last-Event-ID` and pretend events were recovered. Mark affected
+streams incomplete, stop new dispatch and use bounded status/message reads
+only to classify terminal/unknown outcomes. Fail the server connection
+explicitly when bounded reading cannot keep up; its owner receives honest
+loss evidence. One session's cancel never
 kills the server as a backpressure workaround. No server-internal unbounded
 queue is counted as VIA's bounded memory; slow-consumer tests measure the
 actual vendor behavior and document that external-process limitation.
 
 ## 6. Abort, cleanup, continuity and recovery
 
-An HTTP 200 `true` from abort is command acknowledgement only. With an active
-turn, combine it with correlated interrupted/error terminal evidence before
-claiming cancel completion. `MessageAbortedError` after VIA interrupt supports
-interrupted outcome; unsolicited abort is reported as vendor evidence, not
-invented VIA cancellation. Track all observed tool items: open items are
-`pending`; missing/uncertain observations or tools surviving abort are
-`uncertain`. Only complete, evidenced tool completion supports quiescence;
-an abort Boolean, idle map or socket closure does not. Active-tool live
-descendant tests must establish whether terminal tool records are sufficient
-for this pinned route; until then never promote aborted-tool metadata to proof
-that external side effects stopped.
+Cancel, and the wall's cleanup step (C2 §4.1), send only
+`POST /session/{id}/abort`. An HTTP 200 `true` from abort is command
+acknowledgement only (it is returned even for an unknown session).
+Acknowledgement is §4's step 0: `MessageAbortedError` plus idle. Unsolicited
+abort is reported as vendor evidence, not invented VIA cancellation. Cleanup
+is §4's step 2 and keeps its meaning (C2 §2 Interrupt): every reported tool
+item of the turn ended within the P7 window, else `uncertain`. An aborted
+tool part reports `completed` and counts as ended. Abort and dispose kill only
+the tool's own group: tools run in their own group and survived a
+server-group SIGKILL, reparented, and setsid or double-fork descendants
+survive abort. Such descendants are outside cleanup, are the agent's
+responsibility, and are reported as leftovers only where a destination
+exists (C2 §4.2). An abort Boolean, idle map or socket closure never proves
+quiescence.
 
-Preserve the reviewed server-route behavior: the driver does not ask Host to
-kill the server for cancel/force-close merely because the server is now
-dedicated. At the deadline return unknown cancellation
-or uncertain cleanup as C1/C2 require. Core applies P7's cleanup gate before
-the next turn. Close detaches logical ownership and preserves vendor history;
-`DELETE /session/{id}` is not a close implementation. Cancel of an undispatched
+Cancel never asks Host to kill the server: at the deadline return unknown
+cancellation or uncertain cleanup as C1/C2 require. A C1 `close` has one
+lifecycle: cancel active work under the rule above; then
+`POST /instance/dispose` of the session's owned server; then, if the server
+has not exited, S1's hard stop within the close bound (the server has no
+SIGTERM handler); preserve the private DB and vendor history
+(`DELETE /session/{id}` is not a close implementation); commit the close
+result and `session.closed`, which carry `leftovers` (C2 §4.2; `null` while
+detection is pending). Idle retirement stops the server the same way but
+has no close result and reports nothing. Cancel of an undispatched
 queued turn is Core-local and sends no abort for the currently running turn.
 
 Idle re-open starts only a new VIA-owned same-key server over the retained DB,
@@ -614,7 +697,8 @@ After daemon crash, in-flight work follows P12 `unknown`; no optional live
 rejoin is introduced. Generated HTTP password is intentionally unavailable
 after restart, so recovery uses Host anchor records for old-process cleanup,
 not credentials extracted from its environment. Server death observed while
-the original daemon is supervising informs C1 `server_lost`; restart recovery
+the original daemon is supervising is `failed(server_lost)` (C2 §4.1), with
+one shared leftover report; restart recovery
 still follows P12 for submitted/accepted turns and never fabricates a known
 outcome from a subsequently dead server. Start a replacement only
 after exclusive namespace ownership and prior-generation cleanup are verified.
@@ -624,33 +708,36 @@ unverified server is an orphan, not a server to attach to or signal numerically.
 ## 7. Usage, errors and observations
 
 Served schema contains assistant token/cost fields and step-finish token/cost
-fields; source does not substitute for measuring their accounting intervals.
-Use one ledger of authoritative assistant snapshots keyed by message ID;
-replace repeated snapshots, do not sum them with step-finish payloads. Retain
-step data as vendor evidence for reconciliation. Until two turns plus a
-multi-step turn prove intervals, canonical token/cost scope is
-`vendor_interval`, provenance `reported`, warning `usage_interval_unverified`.
+fields. One assistant message is created per model call; its token snapshot is
+a usage sample keyed by message ID (C2 §5 usage): a repeated snapshot
+supersedes the earlier one, and the samples of the turn's assistants sum.
+Do not sum them with step-finish payloads. `input` excludes cache-read. Child
+task sessions fall outside the parent's totals and are excluded (C1 §5
+`usage`). Token scope is `turn`, provenance `reported`. Retain step data as
+vendor evidence for reconciliation.
 Never derive cost from token price tables or interpret missing values as zero.
 Invalid/nonfinite/negative counts or costs produce protocol/accounting warning
-and unavailable canonical values with raw evidence. Cache-read maps to cached
+and unavailable canonical values, with the reported value kept in bounded
+vendor data. Cache-read maps to cached
 input only after inclusion semantics are measured; preserve cache-write
 separately in vendor data. Session totals must not be relabelled turn totals.
 Two successful single-step free turns now provide measured observations:
 each assistant's step-finish exactly duplicates its assistant token/cost fields,
 so adding both would double count. Component sums matched totals 11,197 and 11,261;
 the second included cache-read 11,136 and both reported cost 0. This supports the
-one-ledger rule on those samples only. Multi-step intervals, cache/billing
-inclusion and broader cost scope remain unproven; preserve vendor_interval and
-the warning until that proof. Empty-session zeros, failed requests and zero
+one-ledger rule on those samples only. Cache/billing inclusion and broader
+cost scope remain unproven. Empty-session zeros, failed requests and zero
 free-model cost do not establish paid billing semantics.
 [Message representation](https://raw.githubusercontent.com/anomalyco/opencode/v1.18.32/packages/opencode/src/session/message-v2.ts).
 
-Adapter class hints: explicit `ProviderAuthError` or another pinned, verified
-unauthorized vendor subtype → auth. HTTP status alone does not establish that
-class: ambiguous 401/403 and the observed HTTP-200 assistant `APIError` carrying
-403 `FreeTierError` map to `vendor_error`, preserving the structured vendor
-code/status. Do not infer login failure, quota or paid entitlement from a
-status code. A 429 maps to rate_limit only with matching provider evidence;
+Adapter class hints: explicit `ProviderAuthError`, or an HTTP 401 or 403 in
+a vendor error (`APIError 401|403`, including the observed HTTP-200
+assistant `APIError` carrying 403 `FreeTierError`) → auth (C2 §6.2),
+preserving the structured vendor code/status. Do not infer quota or paid
+entitlement from a status code. `APIError 429` → rate_limit after the
+vendor's 5 internal retries (activity only);
+`UnknownError` and `ProviderModelNotFoundError` → vendor_error;
+`MessageAbortedError` after VIA abort → `Interrupted`;
 `ContextOverflowError` → context_exceeded; `MessageOutputLengthError` →
 vendor_error unless a verified finish maps a supported stop reason;
 `StructuredOutputError` → vendor_error + missing/schema diagnostics;
@@ -671,17 +758,17 @@ No credentials or generated server passwords may enter fixtures/reports.
 
 | Case | Required observation |
 |---|---|
-| OC01 ownership/auth/port | Occupied port and unrelated server remain untouched; no unauthenticated fallback, redirects or proxy credential leak; bad health/version refused; actual owned listener on Linux; corresponding macOS qualification deferred under owner delegation |
+| OC01 ownership/auth/port | Occupied port and unrelated server remain untouched; no unauthenticated fallback, redirects or proxy credential leak; bad health refused; an unchecked version warns and proceeds; actual owned listener on Linux; corresponding macOS qualification deferred under owner delegation |
 | OC02 private state/config | Allocate/persist one namespace per VIA owner before vendor creation; repeated spawn/resume/restart loads it; two otherwise identical sessions never share namespace/process/password. Missing/mismatched mapping fails before I/O. Ordinary vendor session DB unchanged; private HOME/all XDG roots including DATA and DB persist under anonymous profile. Hostile ambient saved-auth/config synthetic fixtures never select login; unexpected private auth-state presence refuses without reading contents. Restart retains no-login identity; generated policy and actual VIA route still require proof |
 | OC03 full method path | Successful live spawn/result on a free model; background/wait, reads/events/logs and stdio expose same durable turn; close never deletes vendor history |
 | OC04 continuity | Two-turn context-dependent answer on the same free model, equal vendor ID, idle server restart over private DB; missing/mismatching ID refuses fresh-session substitution |
-| OC05 ambiguity | Crash before/after POST/204, lost HTTP reply, event acceptance before reply, duplicate IDs, incomplete assistant and HTTP-200 error; exactly one submission, no false completion |
+| OC05 ambiguity | Crash before/after POST/204, lost HTTP reply, event acceptance before reply, duplicate IDs, incomplete assistant (repeated reconciliation reads until completed) and HTTP-200 error; VO1 shapes (a)–(d), terminal recognition independent of tool parts; exactly one submission, no false completion |
 | OC06 correlation/message splitting | Cross-session interleaving, multiple assistant steps, delta+snapshot duplicates, default SSE event, partial UTF-8/multiline SSE messages, unknown events/requests, late events and message parent mismatch; no leak/double terminal |
-| OC07 never-ask | Exact ordered create/readback rules; agent-before-session last-match precedence tested under hostile config; normal full-bound tools remain usable, question/plan tools denied. Real/fake request rejects under saturated observations; 404/error truthful; unknown effective policy prevents prompt |
-| OC08 control | Active tool abort with descendant liveness observations; tool refuses stop, lost abort response, late terminal; other VIA owner's dedicated server unaffected; queued-turn cancel sends no abort |
+| OC07 never-ask | Exact ordered create/readback rules; agent-before-session last-match precedence tested under hostile config; normal full-bound tools remain usable, question/plan tools denied. Real/fake request rejects within 5 s under saturated observations; 404/error truthful; unknown effective policy prevents prompt |
+| OC08 control | Active tool abort with descendant liveness observations; acknowledgement on abort error plus idle with the final assistant and tool updates delayed past `force_at` → `Interrupted`; cancel racing a natural completion or failure keeps the natural terminal; wall expiry sends `POST /abort` before return; cleanup reads bounded by `min(ack + tool_grace, wall)` (60 s grace), not `close_by`, and settled per C2 §2 Interrupt; server close sends `POST /instance/dispose` then S1's hard stop; tool refuses stop, lost abort response, late terminal; other VIA owner's dedicated server unaffected; queued-turn cancel sends no abort |
 | OC09 overload/loss | Four-server memory/listener/SSE limits and fifth-owner admission; flood/oversize/slow consumer, full lane, SSE disconnect, compression expansion; other owners and control progress, loss explicit; idle namespaces consume no listener; nonempty bounded suites |
 | OC10 recovery | Server/daemon death during accepted work, unknown state no resend, verified anchor cleanup, namespace lock and password rollover; no attachment to unrelated survivor |
-| OC11 parameters/usage | Instructions/format clearing, invalid variants, pre-I/O unsupported max_steps refusal and null/omitted acceptance, multi-step usage scopes; nonempty full-bound extra_write_dirs deterministically invalid_params before allocation/I/O. ProviderAuthError→auth; FreeTierError/ambiguous403→vendor_error with exact code; no entitlement inference |
+| OC11 parameters/usage | Instructions clearing; `format` omitted on plain turns and `output_schema` refused; invalid variants → `failed(submit_failed)` with `failure.data.field:"effort"` and no `prompt_async`; pre-I/O unsupported max_steps refusal and null/omitted acceptance, multi-step usage scopes; nonempty full-bound extra_write_dirs deterministically invalid_params before allocation/I/O. ProviderAuthError and 401/403 → auth (t18); 429 → rate_limit (t19); no entitlement inference |
 | OC12 credential boundary | Selected temporary exception is explicit; test correct/wrong/missing and other-owner Basic Auth, exact server/namespace ownership, password rotation, and no generated secret in VIA argv/Store/keys/diagnostics/transport captures. Synthetic credentials only; tests emit Boolean leak checks, not secrets. Never read/copy/log actual user/provider credentials. Inherited instance-password presence is an accepted limitation, not a failed scrub test or proof of same-user isolation |
 
 OC-SEC-1's material exception has owner authority; scoped Sol review and the
@@ -723,8 +810,10 @@ These are proposed changes, not edits applied by this worker:
    unconditional full-bound extra-directory refusal and no session migration,
    after Sol disposition. No owner may join another owner's server even if
    every other key field matches. C2
-   OpenCode usage remains vendor_interval until measured; no live capability
-   is marked tested merely from this schema packet.
+   OpenCode usage (superseded by adapter design VO6): keyed assistant samples
+   sum with scope `turn`, child task sessions excluded; billing and cost
+   scope remain unmeasured. No live capability is marked tested merely from
+   this schema packet.
 4. **C2 reserved keys / params:** adopt the empty vendor allowlist and reserve
    auth/listener/storage/config/agent/model/session fields. Record the
    pinned max_steps unsupported capability and Core pre-I/O invalid_params
