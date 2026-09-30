@@ -350,11 +350,15 @@ impl HostTasks {
         self.failed += failed;
     }
 
-    /// Drops the records of controls whose stream is gone, keeping their
-    /// forced-stop facts.
+    /// Drops the records of controls whose stream is gone. A forced-stop
+    /// fact that no close report handed to the control's owner moves to
+    /// `forced`, where shutdown's reconciliation still reads it; a handed-off
+    /// one is already the owner's, so live service keeps no fact per turn.
     fn prune_controls(&mut self) {
         for control in &self.controls {
-            if control.stop.forced.load(Ordering::Acquire) {
+            if control.stop.forced.load(Ordering::Acquire)
+                && !control.stop.reported.load(Ordering::Acquire)
+            {
                 self.forced.insert(control.generation.clone());
             }
         }
@@ -395,6 +399,8 @@ struct TrackedControl {
 struct StopFacts {
     /// The verified anchor reported that Host's stop stopped a live vendor.
     forced: AtomicBool,
+    /// A close report carried `forced` to the control's owner.
+    reported: AtomicBool,
 }
 
 /// The Host journal write that failed (design §7.2 rows 3, 4 and 12).
@@ -972,16 +978,21 @@ impl Host {
         live + ledger.acquiring.len()
     }
 
-    /// Test builds: how many owned tasks and live-control records Host
-    /// still tracks, as `(tasks, controls)`.
+    /// Test builds: how many owned tasks, live-control records and
+    /// Host-wide forced-stop facts Host still keeps, as
+    /// `(tasks, controls, forced)`.
     #[cfg(feature = "test-failpoints")]
     #[doc(hidden)]
-    pub fn tracked(&self) -> (usize, usize) {
+    pub fn tracked(&self) -> (usize, usize, usize) {
         let tasks = self
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (tasks.running.len(), tasks.controls.len())
+        (
+            tasks.running.len(),
+            tasks.controls.len(),
+            tasks.forced.len(),
+        )
     }
 
     /// Positive evidence that a vendor of one of `anchors` is live (Task 4
@@ -1918,12 +1929,16 @@ impl ProcessControl {
             ),
         };
         self.capacity.settle(&self.anchor_id, &cleanup);
+        // The anchor repeats `stopped_live` on every Stop; an earlier early
+        // stop's reply counts too (design §6.8 [r5.4]).
+        let forced = forced || self.stop.forced.load(Ordering::Acquire);
+        if forced {
+            self.stop.reported.store(true, Ordering::Release);
+        }
         CloseReport {
             cleanup,
             vendor_exit: *self.exit.borrow(),
-            // The anchor repeats `stopped_live` on every Stop; an earlier
-            // early stop's reply counts too (design §6.8 [r5.4]).
-            forced: forced || self.stop.forced.load(Ordering::Acquire),
+            forced,
             journal_uncertain,
         }
     }

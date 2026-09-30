@@ -1533,22 +1533,31 @@ fn early_stops_are_concurrent() {
 
 /// S1 critic finding 5: a live Host collects each finished turn's reaper
 /// and exit poll, and prunes its dropped control, as later turns begin; the
-/// registries stay bounded instead of growing per turn.
+/// registries stay bounded instead of growing per turn. S1-io review r1
+/// finding 1: forced turns too, whose forced-stop fact their close already
+/// handed to the owner, leave no Host-wide fact behind.
 #[test]
 fn live_service_collects_finished_turn_tasks() {
     const TURNS: usize = 6;
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        for _ in 0..TURNS {
+        for turn in 0..2 * TURNS {
+            let forced = turn >= TURNS;
+            let (program, mode) = if forced {
+                ("/bin/sleep", CloseMode::Force)
+            } else {
+                ("/bin/true", CloseMode::Graceful)
+            };
+            let args: &[&str] = if forced { &["60"] } else { &[] };
             let acquired = host
-                .acquire(fixture.spec("/bin/true", &[]), within(4))
+                .acquire(fixture.spec(program, args), within(4))
                 .await
                 .unwrap();
             let close = acquired
                 .control
                 .close(CloseRequest {
-                    mode: CloseMode::Graceful,
+                    mode,
                     deadline: within(3),
                 })
                 .await;
@@ -1556,13 +1565,15 @@ fn live_service_collects_finished_turn_tasks() {
                 matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
                 "{close:?}"
             );
+            assert_eq!(close.forced, forced, "{close:?}");
             drop(acquired);
         }
         // At most this turn's and the previous turn's two tasks and control.
-        let (tasks, controls) = host.tracked();
+        let (tasks, controls, facts) = host.tracked();
         assert!(
-            tasks <= 4 && controls <= 2,
-            "{tasks} tasks and {controls} controls tracked after {TURNS} turns"
+            tasks <= 4 && controls <= 2 && facts == 0,
+            "{tasks} tasks, {controls} controls and {facts} forced facts tracked \
+             after {TURNS} graceful and {TURNS} forced turns"
         );
         let report = host.shutdown(within(3), &[]).await;
         assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
