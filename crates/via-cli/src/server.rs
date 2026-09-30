@@ -263,7 +263,9 @@ async fn serve_bound(
 }
 
 /// Opens the Engine off the Tokio workers and commits crash recovery before
-/// the first request is accepted (C1 §7.5).
+/// the first request is accepted (C1 §7.5). On a recovery or handoff
+/// failure the Engine is dropped on the blocking pool, and awaited:
+/// Store's drop joins its writer thread (coding-style §5).
 async fn open_engine(
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
@@ -279,6 +281,20 @@ async fn open_engine(
         .await?
         .map_err(anyhow::Error::msg)?,
     );
+    match recover(&engine).await {
+        Ok(()) => Ok(engine),
+        Err(error) => {
+            // Safe to ignore: a drop that panicked changes nothing about
+            // the startup error returned.
+            let _ = tokio::task::spawn_blocking(move || drop(engine)).await;
+            Err(error)
+        }
+    }
+}
+
+/// Startup's crash recovery, resumed paging bound and queued-turn handoff,
+/// before admission (C1 §7.5, design §8, §10).
+async fn recover(engine: &Engine) -> anyhow::Result<()> {
     // Task 4 design §7.6: one warning per turn, naming it.
     let recovered = engine
         .recover_logged(|session, turn| {
@@ -308,7 +324,7 @@ async fn open_engine(
             "handed off queued turns left by an earlier daemon"
         );
     }
-    Ok(engine)
+    Ok(())
 }
 
 /// Runs one session's dispatcher, which drives its turns independently of
