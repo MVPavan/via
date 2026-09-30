@@ -869,6 +869,97 @@ fn s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served() -> TestRes
     report.require_pass()
 }
 
+/// Design §4.1 (T4-fix; Fable F4): a slow read does not make `wait` catch
+/// up. With every Store read delayed 800 ms (`store.read.delay_ms`), the
+/// next check is a second after the last read ended, so a 5 s wait makes
+/// at most four reads: the turn-existence read and terminal-facts reads at
+/// about 0, 2.6 and 4.4 s. A check scheduled from the loop's start runs
+/// the missed checks back to back and makes seven. Slower reads only make
+/// fewer, so the bound holds under load.
+#[test]
+fn s1_c1_wait_after_a_slow_read_keeps_its_cadence() -> TestResult {
+    let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
+    let evidence = setup.evidence("s1_c1_wait_cadence")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            hits::count(&setup.dir, READ_DELAY).map_err(infra)?;
+            let _daemon = setup.start(evidence, &[])?;
+            let receipt = cli(
+                &setup.sandbox,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hold",
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = receipt["session_id"]
+                .as_str()
+                .ok_or_else(|| failure(format!("spawn: {receipt}")))?
+                .to_owned();
+            setup.sandbox.await_gate("hold")?;
+            let mut waiter = Conn::open(&setup.sandbox)?;
+            // Each read from the next one on is delayed and acknowledged.
+            let first = hits::hits(&setup.dir, READ_DELAY).map_err(infra)? + 1;
+            setup
+                .failpoints
+                .arm(READ_DELAY, first, "delay_persist:800")
+                .map_err(infra)?;
+            let reply = waiter.exchange(&line(
+                &json!(1),
+                "wait",
+                &json!({"address":format!("{session}/1"),"timeout_ms":5000}),
+            ))?;
+            let mut used = 0;
+            while setup
+                .dir
+                .join(format!("{READ_DELAY}.{}.ack", first + used))
+                .exists()
+            {
+                used += 1;
+            }
+            evidence
+                .write("wait_reads.txt", used.to_string().as_bytes())
+                .map_err(infra)?;
+            check(is_error(&reply, -32016, "wait_timeout"), || {
+                format!("bounded wait: {reply}")
+            })?;
+            check((2..=4).contains(&used), || {
+                format!("a 5 s wait with 800 ms reads made {used} Store reads, at most 4")
+            })?;
+            setup.failpoints.disarm(READ_DELAY).map_err(infra)?;
+            setup.sandbox.release_gate("hold")?;
+            let envelope = cli(
+                &setup.sandbox,
+                evidence,
+                "wait_end",
+                &[
+                    "wait",
+                    &format!("{session}/1"),
+                    "--timeout-ms",
+                    "30000",
+                    "--json",
+                ],
+            )?;
+            check(envelope["state"] == "completed", || {
+                format!("the held turn: {envelope}")
+            })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- prompt file
 
 fn spawn_file(path: &str, key: Option<&str>) -> Value {

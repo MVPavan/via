@@ -110,7 +110,7 @@ impl Engine {
     /// at most `timeout_ms` (C1 §3.8), then `wait_timeout`.
     ///
     /// Design §4.1 [t4r16.7.7]: it checks the turn's terminal facts on the
-    /// Public lane at once and then once per second, and reads the envelope
+    /// Public lane at once and then a second after each check, and reads the envelope
     /// with `result_text` only once the turn is terminal: 32 waiters make
     /// 32 reads per second, and a turn's end is seen at most 1 s late.
     /// Once final shutdown committed its last record, a result still
@@ -125,7 +125,6 @@ impl Engine {
         let public = self.store.public();
         let mut checked = false;
         let mut registered = false;
-        let mut check_at = tokio::time::Instant::now();
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
@@ -150,7 +149,9 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.wait.registered").await;
             }
-            check_at += WAIT_CHECK;
+            // A second after this read ended: a slow read is not caught up
+            // by back-to-back reads (§4.1).
+            let check_at = tokio::time::Instant::now() + WAIT_CHECK;
             tokio::time::sleep_until(deadline.min(check_at)).await;
         }
     }
