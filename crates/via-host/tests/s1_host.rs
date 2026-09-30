@@ -175,8 +175,46 @@ impl Fixture {
 }
 
 impl Drop for Fixture {
+    /// A paused anchor waits for its release file in `points`: removing the
+    /// folder first would hide the file, and the anchor would stay paused
+    /// after the test (bead via-jm4.19). Every point entered is released,
+    /// and the folder is kept until this fixture's anchors have exited,
+    /// within a bound.
     fn drop(&mut self) {
+        if let Ok(entries) = fs::read_dir(&self.points) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(occurrence) = name.strip_suffix(".ack") {
+                    let _ = fs::write(self.points.join(format!("{occurrence}.release")), b"");
+                }
+            }
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while self.anchors_alive() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    /// Whether a live process was started with a bootstrap of this
+    /// fixture: an anchor's environment names its config under `anchors`.
+    fn anchors_alive(&self) -> bool {
+        let marker = format!(
+            "VIA_HOST_TEST_CONFIG={}/",
+            self.root.join("anchors").to_string_lossy()
+        );
+        let Ok(processes) = fs::read_dir("/proc") else {
+            return false;
+        };
+        processes.flatten().any(|process| {
+            fs::read(process.path().join("environ")).is_ok_and(|environ| {
+                environ
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry.starts_with(marker.as_bytes()))
+            })
+        })
     }
 }
 
