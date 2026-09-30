@@ -4,6 +4,12 @@
 //! waits on durable rows, fake gates, failpoint acknowledgements or process
 //! exit; a sleep only lets time pass, never orders two events.
 
+#[path = "support/daemon.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; this file uses the direct status probe"
+)]
+mod daemon;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
@@ -12,6 +18,17 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/scenario.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; the daemon module uses part of it"
+)]
+mod scenario;
+#[expect(
+    dead_code,
+    reason = "shared support; the daemon module uses part of it"
+)]
+mod support;
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -196,16 +213,10 @@ impl Sandbox {
             if let Some(status) = daemon.child.try_wait()? {
                 return Err(format!("daemon exited before readiness: {status}").into());
             }
-            // Never let the readiness probe auto-start a second daemon: one
-            // could win `daemon.lock` over the child.
-            if self.runtime.join("via.sock").exists() {
-                let status = self.run(&["daemon", "status", "--json"])?;
-                if status.status.success()
-                    && serde_json::from_slice::<Value>(&status.stdout)
-                        .is_ok_and(|value| value["pid"] == daemon.child.id())
-                {
-                    return Ok(daemon);
-                }
+            // A direct probe: never auto-starts a second daemon, which could
+            // win `daemon.lock` over the child, even over a stale socket file.
+            if daemon::serving_pid(&self.runtime) == Some(daemon.child.id()) {
+                return Ok(daemon);
             }
             if Instant::now() >= deadline {
                 return Err("daemon readiness deadline elapsed".into());

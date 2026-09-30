@@ -69,23 +69,33 @@ Fix. The readiness probe now sends `hello` and `daemon/status` over a direct
 socket connection (`Raw`, which never auto-starts). It accepts only a status
 whose `pid` equals the child's pid (`support/daemon.rs`). `s1_lifecycle.rs`
 already uses this pattern ("readiness never auto-starts another daemon"). Two
-other private copies of the unguarded probe had the same race and now wait
-for the socket and match the pid, the pattern `s1_crash_points.rs`,
-`s1_recovery.rs` and `s1_daemon_stop.rs` already use:
+other private copies of the unguarded probe had the same race:
 `s1_prompt_to_result.rs` `start_daemon` (in the selector:
 `s1_c1_events_receipt_and_envelope_shapes`) and `s1_turn_control.rs`
-`Sandbox::start`.
+`Sandbox::start`. Round 1 gave them a socket-exists guard and a pid match.
+Review round 1 showed that this was not enough (see §2.1), and both now use
+the direct probe.
 
 Regression test: `s1_evidence_harness_readiness_never_starts_a_daemon`
 (`crates/via-cli/tests/s1_evidence.rs`, failpoint builds). The harness child
 serves another deployment and idle-exits after 3 s, so the sandbox's socket
-never appears. The test requires that readiness reports the child's exit and
-that no daemon appears in the sandbox. It is deterministic:
+never appears. The test is deterministic. Since review round 1 it requires
+positive evidence for this case:
 
-- RED, with the old `support/daemon.rs`:
-  `Error: "readiness: child exit reported false, sandbox socket true"`
-  (`scratchpad/t4/flake/repro/regression-red.log`).
-- GREEN: `1 test run: 1 passed` (`regression-green.log`).
+- a direct probe saw the child serving its own socket;
+- readiness reported exactly
+  `fail: daemon exited before readiness: exit status: 0`;
+- the child's trace holds a clean `idle` shutdown summary;
+- the sandbox has neither a socket nor a Store, which any daemon started
+  there would create.
+
+An unrelated startup failure therefore no longer passes the test. Results:
+
+- RED, with the old CLI probe restored in `support/daemon.rs`:
+  `readiness reported "ready"; child served Some(3799579); … sandbox socket
+  true, Store true` (`scratchpad/t4/flake/r3/regression-red.log`; the round-1
+  form is in `repro/regression-red.log`).
+- GREEN: `1 test run: 1 passed` (`r3/regression-green.log`).
 
 ### 1.2 `serve --stdio` could exit 0 after a failed stdin read (product bug)
 
@@ -217,6 +227,41 @@ files (`spawn`, `wait`, `status`, and the `daemon status` evidence call in
 against a daemon already proven to be the child and do not rely on
 auto-start.
 
+### 2.1 Review round 1: the last CLI probes, and the audit
+
+The reviewer found the problem. In `s1_prompt_to_result.rs` `start_daemon`
+and `s1_turn_control.rs` `Sandbox::start`, the socket-exists guard still
+passed a stale socket, or one removed before the CLI connected. The CLI
+then auto-started a rival daemon. The pid match prevented false readiness
+but not the rival. Both now use `daemon::serving_pid(runtime) == child pid`
+and include `support/daemon.rs` (`s1_turn_control.rs` also includes
+`support/scenario.rs` and `support/mod.rs`, which it needs).
+
+Audit of `crates/via-cli/tests/` for auto-starting CLI calls that can run
+before the harness's own daemon is proven serving:
+
+- Every harness readiness path now uses a direct connection:
+  - `support/daemon.rs`, `s1_prompt_to_result.rs`, `s1_turn_control.rs`,
+    `s1_crash_points.rs`, `s1_recovery.rs` and `s1_daemon_stop.rs` use
+    `serving_pid` with a pid match;
+  - `s1_lifecycle.rs` and `s1_store_failure.rs` use their own `Raw`
+    `daemon/status`;
+  - `c1_protocol.rs` uses a raw connect.
+- `Daemon::spawn` without readiness (`s1_recovery.rs`, `s1_crash_points.rs`)
+  is followed only by failpoint acknowledgements, child exit or a later
+  `wait_ready`, never by a CLI call.
+- The other `via daemon status` calls either run after readiness against
+  the proven child (`s1_turn_control.rs`, `s1_recovery.rs`, and the
+  `daemon_pid` or `settled` loops in `s1_progress.rs`, `s1_c1_intake.rs`
+  and `s1_vendor_pipeline.rs`) or test CLI auto-start or startup refusal
+  on purpose, so they stay:
+  - `s1_lifecycle.rs`: `s1_f01_concurrent_auto_start_one_daemon`, the F4
+    version-mismatch `other_version` call, the late client after the idle
+    exit, the unsafe runtime-directory variants, and
+    `s1_silent_peer_before_hello_is_bounded_by_the_startup_budget`;
+  - `c1_protocol.rs:408`: `c1_client_refuses_daemon_socket_of_another_uid`,
+    which is root-only.
+
 ## 3. Verification
 
 The 20-run record, on the final tree (`scratchpad/t4/flake/final2/`): 20 of
@@ -255,5 +300,16 @@ Logs are in `scratchpad/t4/flake/r2/`.
   passed.
 - The selector, 10 runs: all 10 exited 0, each with 60 passed.
 - Gate G, all exit 0 (`r2/gate.log`): the default suite ran 321 tests with
+  321 passed and 1 skipped; the failpoint suite ran 502 with 502 passed and
+  1 skipped; the `s1_f(08|09|10|12)_` selector ran 56 with 56 passed.
+
+### 3.2 Review round 1 verification
+
+Logs are in `scratchpad/t4/flake/r3/`.
+
+- The changed files, `-E 'binary(s1_evidence) | binary(s1_prompt_to_result)
+  | binary(s1_turn_control)'`, 5 runs: each had 42 tests and all 42 passed.
+- The selector, 10 runs: each had 60 tests and all 60 passed.
+- Gate G, all exit 0 (`r3/gate.log`): the default suite ran 321 tests with
   321 passed and 1 skipped; the failpoint suite ran 502 with 502 passed and
   1 skipped; the `s1_f(08|09|10|12)_` selector ran 56 with 56 passed.

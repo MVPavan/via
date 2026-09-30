@@ -498,6 +498,10 @@ fn s1_c1_logs_selects_the_turn_and_never_reads_files() -> TestResult {
 /// appears; an auto-starting probe would start a second daemon in the
 /// sandbox, without the child's failpoints, and report it ready. Under
 /// parallel runs that second daemon won `daemon.lock` from the child.
+/// Positive evidence for this case: the child served its own socket, then
+/// left through its idle exit (status 0, a clean `idle` shutdown summary);
+/// readiness reported exactly that exit; the sandbox never got a socket or
+/// a Store, which any daemon started there would create.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
@@ -513,24 +517,58 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     for dir in [&state, &runtime] {
         daemon::private_dir(dir)?;
     }
+    // Observes the child serving its own socket, over a direct connection.
+    let served = {
+        let runtime = runtime.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(pid) = daemon::serving_pid(&runtime) {
+                    return Some(pid);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
     let started = Daemon::start_with(&sandbox, &evidence, |command| {
         command.env("VIA_STATE_DIR", &state);
         command.env("VIA_RUNTIME_DIR", &runtime);
         command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
     });
     let socket = sandbox.runtime.join("via.sock").exists();
+    let store = sandbox.state.join("store.sqlite3").exists();
     // Stops a daemon the probe may have started; refused when there is none.
     sandbox.run(
         &["daemon", "stop", "--force", "--json"],
         Duration::from_secs(20),
     )?;
-    let exited =
-        matches!(&started, Err(error) if error.to_string().contains("exited before readiness"));
+    let reported = match &started {
+        Err(error) => error.to_string(),
+        Ok(_) => "ready".to_owned(),
+    };
     drop(started);
-    if !exited || socket {
-        return Err(
-            format!("readiness: child exit reported {exited}, sandbox socket {socket}").into(),
-        );
+    let served = served.join().map_err(|_| "the serving probe panicked")?;
+    let trace = fs::read_to_string(evidence.dir.join("daemon.trace"))?;
+    let summary = trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|line| line.get("daemon_shutdown").cloned())
+        .unwrap_or(Value::Null);
+    let idle_exit = summary["mode"] == "idle" && summary["disposition"] == "clean";
+    if reported != "fail: daemon exited before readiness: exit status: 0"
+        || served.is_none()
+        || !idle_exit
+        || socket
+        || store
+    {
+        return Err(format!(
+            "readiness reported {reported:?}; child served {served:?}; \
+             shutdown {summary}; sandbox socket {socket}, Store {store}"
+        )
+        .into());
     }
     Ok(())
 }

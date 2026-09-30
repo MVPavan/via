@@ -1,5 +1,11 @@
 //! First S1 process-boundary scenario. Activate when the runtime spine lands.
 
+#[path = "support/daemon.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; this file uses the direct status probe"
+)]
+mod daemon;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]
@@ -163,23 +169,11 @@ fn start_daemon<'a>(
                 "daemon exited before readiness: {status}"
             )));
         }
-        // Never let the readiness probe auto-start a second daemon: one
-        // could win `daemon.lock` over the child.
-        if cx.runtime.join("via.sock").exists() {
-            let capture = cx
-                .run(&["daemon", "status", "--json"], Duration::from_secs(1))
-                .map_err(infra)?;
-            if capture.timed_out {
-                return Err(ScenarioError::Timeout("daemon status timed out".to_owned()));
-            }
-            if capture.status.success()
-                && let Ok(value) = serde_json::from_slice::<Value>(&capture.stdout)
-                && value["daemon_version"].is_string()
-                && value["pid"] == daemon.child.id()
-            {
-                daemon.ready = true;
-                return Ok(daemon);
-            }
+        // A direct probe: never auto-starts a second daemon, which could
+        // win `daemon.lock` over the child, even over a stale socket file.
+        if daemon::serving_pid(cx.runtime) == Some(daemon.child.id()) {
+            daemon.ready = true;
+            return Ok(daemon);
         }
         if Instant::now() >= deadline {
             return Err(ScenarioError::Timeout(
