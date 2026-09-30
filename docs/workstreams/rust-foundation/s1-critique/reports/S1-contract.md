@@ -504,3 +504,119 @@ self-tests. All are `pass` with `evidence_complete: true`; none is
 **Leaked processes.** The known `via-host` `s1_host` `anchor_entry`
 processes leaked again, 5 of them. I SIGKILLed them; no process from this
 worktree remains.
+
+## Fix round 2 (Sol high r2: UNSOUND)
+
+All three findings concern `crates/via-cli/tests/support/evidenced.rs`.
+All three were accepted and fixed in `9c6a610`. Logs are under
+`scratchpad/s1/contract/r2-*` in the main checkout.
+
+### Finding 1: exit is proved by the process, not by the socket or locks
+
+`stop_daemons` no longer depends on `hello`. It identifies every daemon
+by its process: any live, non-zombie `/proc` entry whose environment
+holds `VIA_RUNTIME_DIR=<runtime>` or `VIA_STATE_DIR=<state>`.
+
+This departs from the suggested mechanism, which was to record a pid when
+first seen serving, or the harness child's pid. It is deliberate and
+strictly covers more:
+- Every daemon of a sandbox carries one of these variables. That holds
+  for the harness's own children (`command()` sets both) and for the
+  daemons the CLI auto-starts (`spawn_daemon` passes both after
+  `env_clear`).
+- Anchors (`__via_host_anchor`, spawned with `env_clear`) and vendors do
+  not carry them, so outer cleanup still owns those.
+- A daemon that never answered `hello`, or that exited before it bound its
+  socket, is still found.
+- No per-sandbox recording is needed, including in `route_drain`, which
+  has no child.
+- Pid reuse cannot produce a false match: a reused pid would also need the
+  sandbox's path in its environment.
+
+The proof now runs in this order:
+1. While any such process is alive, `stop` runs once.
+2. Every such process must exit.
+3. Both locks must be free.
+
+An unreadable `/proc` is an error, so the sandbox is kept and the scenario
+is recorded as `infrastructure_failure`, as before.
+
+### Finding 2: one absolute budget
+
+`stop_daemons` (20 s) is `stop_within(runtime, state, budget, stop)`. The
+`stop` callback now receives the budget left:
+- The CLI-based stops use the new `evidenced::run_within(command,
+  budget)`, which kills and reaps the CLI when the budget elapses. That
+  replaces the helpers' 60 s and the CLI's 30 s reply wait.
+  - This applies to `s1_store_failure`, `s1_turn_control`, `s1_lifecycle`
+    and `route_drain`.
+  - It also removes `route_drain`'s `run`, which panicked on timeout
+    inside `Drop`. `route_drain` gained a `command()` builder for this.
+- `c1_protocol` sets each exchange's socket timeouts to the time left
+  before it runs.
+
+A proof that completes after the deadline is rejected: "the exit proof
+exceeded its budget".
+
+### Finding 3: every launched turn's folder is checked
+
+`store_evidence` now calls `launched_turns_have_folders` unconditionally.
+A missing folder fails collection, which records `infrastructure_failure`
+on a passing body.
+
+### Harness self-tests (`evidence_collector.rs`)
+
+The self-tests use the `collector_` prefix, so the completeness count
+excludes them:
+- `collector_exit_proof_needs_the_process_gone_not_only_the_locks`:
+  - A `sleep` process carries the sandbox's runtime and has no socket or
+    lock. That is the shape Sol reproduced: a daemon after it released
+    its locks.
+  - The proof fails and names its pid. After the process is reaped, the
+    proof passes.
+- `collector_exit_proof_budget_includes_the_stop`:
+  - `stop` receives at most the budget.
+  - `stop` kills the process, then overruns the budget. The proof is
+    rejected even though the exit was proved.
+- `collector_launched_turn_without_its_folder_is_an_infrastructure_failure`:
+  - It sets up two anchored turns and only one folder, with folders
+    required. `park` goes through `evidenced`, which returns an error
+    naming `s_a/2`.
+  - The summary is `infrastructure_failure`.
+
+**RED.** I ran the finding-3 self-test against the old conditional,
+restored with Edit and then undone (`r2-selftest-red-f3.log`), and it
+failed.
+- It failed on the message assertion: the old code skipped the folder
+  check. It then failed later, at the cleanup snapshot of the minimal
+  test schema, not at the missing folder.
+- The finding-1 and finding-2 tests use `stop_within` and its budgeted
+  `stop`, which did not exist before, so they cannot run against the old
+  code. On the old logic, finding 1's fixture passes: no socket, so no
+  `hello`, and no lock files, so both count as free. That is exactly
+  Sol's reproduction.
+- GREEN: `r2-selftest-green.log`, 7 of 7.
+
+### Fix-round-2 gate (tip `9c6a610`)
+
+The log is `r2-gate.log`.
+- `gate exit 0`.
+- `nextest --workspace`: 337 passed, 1 skipped.
+- Failpoint suite: 540 passed, 1 skipped, 3 times: the gate's run plus 2
+  extra runs.
+- F08/F09/F10/F12 selector: 58 passed.
+- Gate selector, 3 repeats: 87 of 87 each time.
+
+**Evidence completeness** (`r2-summary-check.log`). There are 1097 new
+summaries across 237 scenarios, excluding the `runner_*` and `collector_*`
+self-tests:
+- All are `pass` with `evidence_complete: true`; none is
+  `infrastructure_failure`.
+- 1025 were built with `test-failpoints` and 72 without.
+
+This means the unconditional folder check found no launched turn without
+its folder anywhere in the suite.
+
+**Leaked processes.** The known `s1_host` `anchor_entry` processes leaked
+again, 6 of them. I SIGKILLed them by explicit pid; no process from this
+worktree remains.
