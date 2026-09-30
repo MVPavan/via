@@ -25,6 +25,16 @@ pub(crate) struct Evidence {
     /// evidence folder: `finish` then waives only `evidence/*`; the
     /// collector checks that every launched turn still has its folder.
     pub(crate) folders_expected: bool,
+    /// Why proving cleanup failed, if it did: recorded beside the
+    /// scenario's outcome, never in its place; failures accumulate.
+    cleanup_failure: Option<String>,
+    /// Why collecting the State's evidence failed, if it did: recorded
+    /// beside the outcome and any cleanup failure (S1-evidence2 fix round
+    /// 2, finding 6).
+    pub(crate) collection_failure: Option<String>,
+    /// The scenario's outcome and detail, once `finish` began: a
+    /// finalization that fails partway keeps them in the fallback artifact.
+    finishing: Option<(String, String)>,
 }
 
 impl Evidence {
@@ -55,6 +65,9 @@ impl Evidence {
             finalized: false,
             store_expected: true,
             folders_expected: true,
+            cleanup_failure: None,
+            collection_failure: None,
+            finishing: None,
         })
     }
 
@@ -87,6 +100,16 @@ impl Evidence {
         copy_tree(root, &self.dir.join("evidence"))
     }
 
+    /// Records that proving cleanup failed: `finish` then keeps the
+    /// scenario's outcome, marks the evidence incomplete and fails. Each
+    /// failure is kept beside the earlier ones.
+    pub(crate) fn cleanup_failed(&mut self, detail: String) {
+        accumulate(&mut self.cleanup_failure, detail);
+    }
+
+    /// Finalizes the artifact with the scenario's own `outcome` (runtime
+    /// §11.2): missing required evidence and a recorded cleanup failure are
+    /// added beside it, never in its place, and make finalization fail.
     pub(crate) fn finish(mut self, outcome: &str, detail: &str) -> EvidenceResult<PathBuf> {
         if !matches!(
             outcome,
@@ -94,6 +117,7 @@ impl Evidence {
         ) {
             return Err("invalid scenario outcome".into());
         }
+        self.finishing = Some((outcome.to_owned(), detail.to_owned()));
         let required: &[&str] = if self.store_expected {
             &[
                 "envelopes.ndjson",
@@ -117,14 +141,20 @@ impl Evidence {
         {
             missing.push("evidence/*");
         }
-        // Missing required evidence is an infrastructure failure, whatever
-        // the scenario itself concluded.
-        let final_outcome = if missing.is_empty() {
-            outcome
-        } else {
-            "infrastructure_failure"
-        };
-        let summary = self.summary(final_outcome, detail, &missing)?;
+        let mut evidence_failure = (!missing.is_empty())
+            .then(|| format!("missing required evidence: {}", missing.join(", ")));
+        if let Some(collection) = self.collection_failure.clone() {
+            accumulate(&mut evidence_failure, collection);
+        }
+        let failures: Vec<&str> = [&evidence_failure, &self.cleanup_failure]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut summary = self.summary(outcome, detail, &missing)?;
+        summary["evidence_complete"] = json!(failures.is_empty());
+        summary["evidence_failure"] = json!(evidence_failure);
+        summary["cleanup_failure"] = json!(self.cleanup_failure);
         fs::write(
             self.dir.join("summary.json"),
             serde_json::to_vec_pretty(&summary)?,
@@ -132,22 +162,25 @@ impl Evidence {
         fs::write(
             self.dir.join("REPORT.md"),
             format!(
-                "# {}\n\nOutcome: `{final_outcome}`. {detail}\n\nMissing evidence: {}.\n",
+                "# {}\n\nOutcome: `{outcome}`. {detail}\n\nEvidence complete: {}.\n\n\
+                 Missing evidence: {}.\n\nCleanup failure: {}.\n",
                 self.scenario,
+                if failures.is_empty() { "yes" } else { "no" },
                 if missing.is_empty() {
                     "none".to_owned()
                 } else {
                     missing.join(", ")
-                }
+                },
+                self.cleanup_failure.as_deref().unwrap_or("none"),
             ),
         )?;
         self.write_manifest()?;
         self.verify_manifest()?;
         self.finalized = true;
-        if missing.is_empty() {
+        if failures.is_empty() {
             Ok(self.dir.clone())
         } else {
-            Err(format!("missing required evidence: {}", missing.join(", ")).into())
+            Err(failures.join("; ").into())
         }
     }
 
@@ -166,7 +199,6 @@ impl Evidence {
             "outcome":outcome,
             "detail":detail,
             "missing_evidence":missing,
-            "evidence_complete":missing.is_empty(),
             "seed":0,
             "via_version":env!("CARGO_PKG_VERSION"),
             "git_commit":command_output("git", &["rev-parse", "HEAD"], &workspace)?.trim(),
@@ -220,18 +252,47 @@ impl Evidence {
 }
 
 impl Drop for Evidence {
+    /// A best-effort artifact when `finish` did not complete: the scenario's
+    /// outcome, if `finish` began with one, with the evidence failure beside
+    /// it (runtime §11.2); otherwise, a crash or panic before any outcome,
+    /// `infrastructure_failure`.
     fn drop(&mut self) {
         if !self.finalized {
-            // Best-effort crash/panic artifact; the gate treats it as infrastructure failure.
-            let summary = json!({"scenario":self.scenario,"outcome":"infrastructure_failure","detail":"scenario did not finalize evidence"});
+            let (outcome, detail) = self.finishing.clone().unwrap_or_else(|| {
+                (
+                    "infrastructure_failure".to_owned(),
+                    "scenario did not finalize evidence".to_owned(),
+                )
+            });
+            let summary = json!({
+                "scenario":self.scenario,
+                "outcome":outcome,
+                "detail":detail,
+                "evidence_complete":false,
+                "evidence_failure":"evidence finalization did not complete",
+                "collection_failure":self.collection_failure,
+                "cleanup_failure":self.cleanup_failure,
+            });
             let _ = fs::write(self.dir.join("summary.json"), summary.to_string());
             let _ = fs::write(
                 self.dir.join("REPORT.md"),
-                "Scenario did not finalize evidence; see summary.json.\n",
+                format!(
+                    "# {}\n\nOutcome: `{outcome}`. {detail}\n\nEvidence complete: no \
+                     (evidence finalization did not complete); see summary.json.\n",
+                    self.scenario
+                ),
             );
             let _ = self.write_manifest();
         }
     }
+}
+
+/// Adds `detail` beside the failure already in `slot`, if any.
+fn accumulate(slot: &mut Option<String>, detail: String) {
+    *slot = Some(match slot.take() {
+        Some(earlier) => format!("{earlier}; {detail}"),
+        None => detail,
+    });
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> EvidenceResult {

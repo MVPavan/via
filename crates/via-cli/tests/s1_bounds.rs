@@ -23,9 +23,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, failure, infra, request};
+use daemon::{Daemon, Raw, Sandbox, TestResult, cli, collect_available, failure, infra, request};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -224,7 +224,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
         evidence,
         |evidence| {
             {
-                let _daemon = setup.start(evidence)?;
+                let daemon = setup.start(evidence)?;
                 let session = setup.spawn(evidence, "inline")?;
                 let envelope = setup.wait(evidence, &session)?;
                 check(
@@ -266,6 +266,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 )?;
                 let bytes = named_file(&setup, &session, &envelope, &capped)?;
                 check(bytes == FILE_MAX - 1, || format!("capped at {bytes} bytes"))?;
+                // A deliberate intermediate shutdown before the next start
+                // (S1-evidence2 fix round 2, finding 8).
+                daemon.shutdown()?;
             }
 
             // A write cut inside a character, then an error.
@@ -274,7 +277,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 .arm("final_text.write.short", 1, "fail_io")
                 .map_err(infra)?;
             {
-                let _daemon = setup.start(evidence)?;
+                let daemon = setup.start(evidence)?;
                 let session = setup.spawn(evidence, "short")?;
                 let envelope = setup.wait(evidence, &session)?;
                 check(
@@ -288,6 +291,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 check(bytes > 0 && bytes < short.len(), || {
                     format!("the cut file holds {bytes} bytes")
                 })?;
+                // A deliberate intermediate shutdown before the next start
+                // (S1-evidence2 fix round 2, finding 8).
+                daemon.shutdown()?;
             }
             setup
                 .failpoints
@@ -300,7 +306,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 .arm("final_text.write.fail", 1, "fail_io")
                 .map_err(infra)?;
             {
-                let _daemon = setup.start(evidence)?;
+                let daemon = setup.start(evidence)?;
                 let session = setup.spawn(evidence, "unwritten")?;
                 let envelope = setup.wait(evidence, &session)?;
                 check(
@@ -314,6 +320,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 check(bytes == 0, || {
                     format!("the unwritten file holds {bytes} bytes")
                 })?;
+                // A deliberate intermediate shutdown before the next start
+                // (S1-evidence2 fix round 2, finding 8).
+                daemon.shutdown()?;
             }
             setup
                 .failpoints
@@ -326,7 +335,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 .arm("final_text.sync.fail", 1, "fail_io")
                 .map_err(infra)?;
             {
-                let _daemon = setup.start(evidence)?;
+                let daemon = setup.start(evidence)?;
                 let session = setup.spawn(evidence, "synced")?;
                 let envelope = setup.wait(evidence, &session)?;
                 check(
@@ -336,6 +345,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                         && envelope["final_text_file"].is_null(),
                     || format!("sync-failure envelope: {envelope}"),
                 )?;
+                // A deliberate intermediate shutdown before the next start
+                // (S1-evidence2 fix round 2, finding 8).
+                daemon.shutdown()?;
             }
             setup
                 .failpoints
@@ -365,6 +377,9 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
                 let pid = rustix::process::Pid::from_raw(i32::try_from(pid).map_err(infra)?)
                     .ok_or_else(|| infra("daemon pid 0"))?;
                 rustix::process::kill_process(pid, rustix::process::Signal::KILL).map_err(infra)?;
+                // Reaps the killed daemon, which may still be exiting: an
+                // intermediate shutdown (S1-evidence2 fix round 2, finding 8).
+                daemon.shutdown()?;
                 session
             };
             setup
@@ -582,5 +597,5 @@ fn collect(evidence: &Evidence, sandbox: &Sandbox) -> Result<(), ScenarioError> 
     evidence
         .write("events.ndjson", events.as_bytes())
         .map_err(infra)?;
-    collect_available(evidence, &sandbox.state)
+    collect_available(evidence, &sandbox.state, &sandbox.teardown)
 }

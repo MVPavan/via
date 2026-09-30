@@ -3,7 +3,6 @@
 use std::any::Any;
 use std::error::Error;
 use std::io::{Read, Seek};
-use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
@@ -20,7 +19,7 @@ pub(crate) enum ScenarioError {
 }
 
 impl ScenarioError {
-    fn outcome(&self) -> &'static str {
+    pub(crate) fn outcome(&self) -> &'static str {
         match self {
             Self::Failure(_) => "fail",
             Self::Timeout(_) => "timeout",
@@ -28,7 +27,7 @@ impl ScenarioError {
         }
     }
 
-    fn detail(&self) -> &str {
+    pub(crate) fn detail(&self) -> &str {
         match self {
             Self::Failure(detail) | Self::Timeout(detail) | Self::Infrastructure(detail) => detail,
         }
@@ -41,17 +40,47 @@ impl std::fmt::Display for ScenarioError {
     }
 }
 
+/// Typed, so `evidenced` keeps a body's timeout or infrastructure failure
+/// (runtime §11.2).
+impl Error for ScenarioError {}
+
 pub(crate) struct Captured {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) timed_out: bool,
+    /// Failures beside the captured outcome, never in its place: a killed
+    /// child not reaped by the bound (its status is then a synthetic
+    /// SIGKILL), or output that could not be read back.
+    pub(crate) attached: Vec<String>,
 }
 
+impl Captured {
+    /// The attached failures, as a suffix for an error detail.
+    pub(crate) fn notes(&self) -> String {
+        if self.attached.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.attached.join("; "))
+        }
+    }
+}
+
+/// Runs `command` to exit within `timeout`, an absolute bound taken on
+/// entry that covers its run and, if it is killed, its reap: the child is
+/// killed at the bound less a reap reserve (at most 1 s, at most a quarter
+/// of the bound) and polled until the bound, never waited on blocking
+/// (S1-evidence2 fix round 2, findings 5 and 11). A timed-out child keeps
+/// its outcome, `timed_out`, whatever happens next: one still unreaped at
+/// the bound gets a synthetic SIGKILL status and an attached reap failure,
+/// and output that cannot be read back is attached, not returned as an
+/// error. Temporary-file creation and spawn run inside the bound's time
+/// but cannot be interrupted (recorded limitation).
 pub(crate) fn run_command(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<Captured, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -59,29 +88,64 @@ pub(crate) fn run_command(
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
     let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
+    let reserve = Duration::from_secs(1).min(timeout / 4);
+    let kill_at = deadline.checked_sub(reserve).unwrap_or(deadline);
+    let mut attached = Vec::new();
     let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (status, false);
+        let observed = child.try_wait();
+        let now = Instant::now();
+        match observed {
+            Ok(Some(status)) if now <= kill_at => break (status, false),
+            Ok(None) if now < kill_at => thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                attached.push(format!("child {}: {error}", child.id()));
+                break (kill_and_poll(&mut child, deadline, &mut attached), true);
+            }
+            Ok(_) => break (kill_and_poll(&mut child, deadline, &mut attached), true),
         }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            break (child.wait()?, true);
-        }
-        thread::sleep(Duration::from_millis(5));
     };
-    stdout.rewind()?;
-    stderr.rewind()?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    let mut read = |file: &mut std::fs::File, name: &str| {
+        let mut bytes = Vec::new();
+        if let Err(error) = file.rewind().and_then(|()| file.read_to_end(&mut bytes)) {
+            attached.push(format!("{name} unreadable: {error}"));
+        }
+        bytes
+    };
+    let stdout = read(&mut stdout, "stdout");
+    let stderr = read(&mut stderr, "stderr");
     Ok(Captured {
         status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout,
+        stderr,
         timed_out,
+        attached,
     })
+}
+
+/// Kills `child` and polls its reap until `deadline`: its status, or a
+/// synthetic SIGKILL with the reap failure attached.
+fn kill_and_poll(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    attached: &mut Vec<String>,
+) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    let _ = child.kill();
+    loop {
+        let observed = child.try_wait();
+        let late = Instant::now() > deadline;
+        match observed {
+            Ok(Some(status)) if !late => return status,
+            Ok(None) if !late => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                attached.push(format!(
+                    "killed child {} was not reaped by the bound",
+                    child.id()
+                ));
+                return ExitStatus::from_raw(9);
+            }
+        }
+    }
 }
 
 pub(crate) struct ScenarioReport {
@@ -108,7 +172,10 @@ impl ScenarioReport {
     }
 }
 
-pub(crate) fn run_scenario<A, C>(evidence: Evidence, action: A, cleanup: C) -> ScenarioReport
+/// Runs `action`, then `cleanup`, and finalizes `evidence` with the
+/// action's own outcome (runtime §11.2): a cleanup failure is recorded
+/// beside it, never in its place, and leaves the evidence incomplete.
+pub(crate) fn run_scenario<A, C>(mut evidence: Evidence, action: A, cleanup: C) -> ScenarioReport
 where
     A: FnOnce(&Evidence) -> Result<(), ScenarioError>,
     C: FnOnce(&Evidence) -> Result<(), ScenarioError>,
@@ -116,30 +183,29 @@ where
     let artifact = evidence.dir.clone();
     let action_result = catch_unwind(AssertUnwindSafe(|| action(&evidence)));
     let cleanup_result = catch_unwind(AssertUnwindSafe(|| cleanup(&evidence)));
-    let error = match action_result {
-        Ok(Err(error)) => Some(error),
-        Err(payload) => Some(ScenarioError::Failure(format!(
-            "scenario assertion panicked: {}",
-            panic_message(payload.as_ref())
-        ))),
-        Ok(Ok(())) => match &cleanup_result {
-            Ok(Err(error)) => Some(error.clone()),
-            Err(payload) => Some(ScenarioError::Infrastructure(format!(
-                "cleanup panicked: {}",
+    let (outcome, mut detail) = match action_result {
+        Ok(Err(error)) => (error.outcome(), error.detail().to_owned()),
+        Err(payload) => (
+            "fail",
+            format!(
+                "scenario assertion panicked: {}",
                 panic_message(payload.as_ref())
-            ))),
-            Ok(Ok(())) => None,
-        },
+            ),
+        ),
+        Ok(Ok(())) => ("pass", "scenario completed".to_owned()),
     };
-    let (outcome, mut detail) = match error {
-        Some(error) => (error.outcome(), error.detail().to_owned()),
-        None => ("pass", "scenario completed".to_owned()),
+    let cleanup_failure = match cleanup_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(payload) => Some(format!(
+            "cleanup panicked: {}",
+            panic_message(payload.as_ref())
+        )),
     };
-    if let Ok(Err(cleanup_error)) = &cleanup_result
-        && outcome != "pass"
-    {
+    if let Some(failure) = cleanup_failure {
         detail.push_str("; cleanup: ");
-        detail.push_str(cleanup_error.detail());
+        detail.push_str(&failure);
+        evidence.cleanup_failed(failure);
     }
     let finalization = evidence.finish(outcome, &detail);
     let evidence_complete = finalization.is_ok();
@@ -163,61 +229,4 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     } else {
         "non-string panic"
     }
-}
-
-pub(crate) fn collect_available(
-    evidence: &Evidence,
-    state: &std::path::Path,
-) -> Result<(), ScenarioError> {
-    let store = state.join("store.sqlite3");
-    if store.is_file() {
-        evidence
-            .backup_store(&store)
-            .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-    }
-    // The daemon's own trace after startup (Task 4 design §7.6).
-    for name in ["via.log", "via.log.1"] {
-        let log = state.join(name);
-        if log.is_file() {
-            let bytes = std::fs::read(&log)
-                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-            evidence
-                .write(name, &bytes)
-                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-        }
-    }
-    let folders = state.join("evidence");
-    if folders.is_dir() {
-        evidence
-            .copy_evidence(&folders)
-            .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-    }
-    let cleanup_path = evidence.dir.join("cleanup.json");
-    let cleanup: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(cleanup_path)
-            .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?,
-    )
-    .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-    let permissions = std::fs::metadata(evidence.dir.join("cleanup.json"))
-        .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?
-        .permissions();
-    if permissions.mode() & 0o077 != 0 {
-        return Err(ScenarioError::Infrastructure(
-            "cleanup evidence is not private".to_owned(),
-        ));
-    }
-    if cleanup.get("direct_child").is_some() && cleanup["direct_child"]["reaped"] != true {
-        return Err(ScenarioError::Infrastructure(
-            "direct daemon child was not reaped".to_owned(),
-        ));
-    }
-    let anchors = &cleanup["anchors"];
-    let proven_absent = anchors["status"] == "quiescent" && anchors["absence_proven"] == true;
-    let proven_none = anchors["status"] == "no_anchors" && anchors["inventory_committed"] == true;
-    if !proven_absent && !proven_none {
-        return Err(ScenarioError::Infrastructure(
-            "private anchor cleanup remains unverified".to_owned(),
-        ));
-    }
-    Ok(())
 }

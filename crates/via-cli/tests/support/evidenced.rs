@@ -12,9 +12,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::outer_cleanup;
+use crate::scenario::ScenarioError;
 use crate::support::evidence::Evidence;
 
 type EvidencedResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -24,9 +25,6 @@ struct Parked {
     evidence: Evidence,
     /// The sandbox directory, kept until the summary hashed its fixture.
     root: PathBuf,
-    /// Why proving the daemons' exit, collecting the State or proving
-    /// cleanup failed, if it did.
-    collected: Result<(), String>,
     /// Whether every daemon was proved gone, so the sandbox may be removed.
     exited: bool,
 }
@@ -37,32 +35,35 @@ thread_local! {
 }
 
 /// Runs a scenario test's body, then finalizes the evidence of every
-/// sandbox it created with the body's outcome: `pass`, `fail` for an error
-/// or a panic, or `infrastructure_failure` when a passing body's State could
-/// not be collected or its cleanup proved. A panic is resumed afterwards.
+/// sandbox it created with the body's own outcome (runtime §11.2): `pass`,
+/// the category of a typed [`ScenarioError`] (`fail`, `timeout` or
+/// `infrastructure_failure`), returned or raised with `panic_any`, or
+/// `fail` for any other error or panic.
+/// A State that could not be collected or a cleanup not proved is recorded
+/// beside that outcome and fails the test. A panic is resumed afterwards.
 pub(crate) fn evidenced<T>(body: impl FnOnce() -> EvidencedResult<T>) -> EvidencedResult<T> {
     INSIDE.set(true);
     let result = catch_unwind(AssertUnwindSafe(body));
     INSIDE.set(false);
     let (outcome, detail) = match &result {
         Ok(Ok(_)) => ("pass", "scenario completed".to_owned()),
-        Ok(Err(error)) => ("fail", error.to_string()),
-        Err(payload) => (
-            "fail",
-            format!("scenario panicked: {}", panic_message(payload.as_ref())),
-        ),
+        Ok(Err(error)) => match error.downcast_ref::<ScenarioError>() {
+            Some(typed) => (typed.outcome(), typed.detail().to_owned()),
+            None => ("fail", error.to_string()),
+        },
+        // A helper that cannot return an error raises a typed one with
+        // `panic_any`, so its timeout stays a timeout.
+        Err(payload) => match payload.downcast_ref::<ScenarioError>() {
+            Some(typed) => (typed.outcome(), typed.detail().to_owned()),
+            None => (
+                "fail",
+                format!("scenario panicked: {}", panic_message(payload.as_ref())),
+            ),
+        },
     };
     let mut incomplete = Vec::new();
     for parked in PARKED.take() {
         let artifact = parked.evidence.dir.clone();
-        let (outcome, detail) = match &parked.collected {
-            Ok(()) => (outcome, detail.clone()),
-            Err(error) if outcome == "pass" => ("infrastructure_failure", error.clone()),
-            Err(error) => (outcome, format!("{detail}; collection: {error}")),
-        };
-        if let Err(error) = parked.collected {
-            incomplete.push(format!("{}: {error}", artifact.display()));
-        }
         if let Err(error) = parked.evidence.finish(outcome, &detail) {
             incomplete.push(format!("{}: {error}", artifact.display()));
         }
@@ -94,32 +95,42 @@ pub(crate) fn open(fake: &Path, fixture: &Path) -> EvidencedResult<Evidence> {
     Evidence::new(&name, fake, fixture)
 }
 
-/// Collects the sandbox at `root`, State `state`, into `evidence` and
-/// parks it for [`evidenced`]; called by the sandbox's drop with
-/// [`stop_daemons`]'s proof that every daemon exited. Without that proof
-/// nothing is collected, the scenario is an infrastructure failure and the
-/// sandbox is kept. `expected` says what the scenario must hold: a
+/// Records the sandbox's cleanup, then collects the sandbox at `root`,
+/// State `state`, into `evidence` and parks it for [`evidenced`]; called by
+/// the sandbox's drop with [`stop_daemons`]'s proof that every daemon
+/// exited. The cleanup runs and is recorded first, independently of the
+/// evidence (runtime §11.2, S1-evidence2 fix round 2 finding 6): the exit
+/// proof, the guards' records and failures, and the outer anchor cleanup
+/// with only the time left before the teardown's deadline, as
+/// `cleanup.json`, even when the exit proof failed. The evidence copies
+/// follow; failures of either are recorded beside the scenario's outcome,
+/// never replacing it or each other. A sandbox whose daemons were not
+/// proved gone is kept. `expected` says what the scenario must hold: a
 /// scenario with no Store by design clears `store`; one whose turns launch
 /// no vendor clears only `folders`, so the Store, envelopes, events and
 /// cleanup stay required and a launched turn must still have its folder.
+/// Neither waiver ever waives the cleanup proof.
 pub(crate) fn park(
     mut evidence: Evidence,
     root: PathBuf,
     state: &Path,
     expected: Expected,
-    exited: Result<(), String>,
+    exited: Exited,
 ) {
     evidence.store_expected = expected.store;
     evidence.folders_expected = expected.folders;
-    let proved = exited.is_ok();
-    let collected = exited
-        .map_err(|error| format!("daemon exit unproven, nothing collected: {error}"))
-        .and_then(|()| collect(&evidence, &root, state).map_err(|error| error.to_string()));
+    let proved = exited.proof.is_ok();
+    for failure in cleanup(&evidence, state, exited) {
+        evidence.cleanup_failed(failure);
+    }
+    let collected = collect(&evidence, &root, state);
+    if !collected.is_empty() {
+        evidence.collection_failure = Some(collected.join("; "));
+    }
     PARKED.with_borrow_mut(|parked| {
         parked.push(Parked {
             evidence,
             root,
-            collected,
             exited: proved,
         });
     });
@@ -142,84 +153,85 @@ pub(crate) struct Expected {
 /// `VIA_STATE_DIR=<state>` in its environment, the one the harness gave its
 /// child or the one the CLI gives the daemon it starts; anchors and vendors
 /// are started with a cleared environment. While one is alive, `stop` runs
-/// once with the budget left, then each must exit, and then neither
-/// `daemon.lock` nor `store.lock` may still be held. The whole proof,
-/// `stop` included, has one budget, and a proof that completes after it
-/// elapsed is not accepted. Children the test started are reaped by their
-/// own guards first.
+/// once, as the ordinary stop, with a deadline at most
+/// [`outer_cleanup::ORDINARY_STOP`] away (runtime §11.2), returning its
+/// record and any cleanup failure; then each must exit, and then neither
+/// `daemon.lock` nor `store.lock` may still be held. The whole proof has
+/// what is left of the scenario's final `teardown`: begun by the first
+/// guard that tore its daemon down, or here, and shared with [`park`]'s
+/// anchor cleanup; a proof completed after it is not accepted. The guards'
+/// records and failures travel with the proof to `cleanup.json`.
 pub(crate) fn stop_daemons(
     runtime: &Path,
     state: &Path,
-    stop: impl FnOnce(Duration),
-) -> Result<(), String> {
-    stop_within(runtime, state, Duration::from_secs(20), stop)
+    teardown: &outer_cleanup::Teardown,
+    stop: impl FnOnce(Instant) -> (Value, Option<String>),
+) -> Exited {
+    let deadline = teardown.begin();
+    let proof = prove_exit(runtime, state, deadline, |by| {
+        let (record, failure) = stop(by);
+        teardown.record(json!({"generation":"sandbox_stop","stop":record}), failure);
+    });
+    let (_, failures) = teardown.report();
+    Exited {
+        proof,
+        deadline,
+        teardown: teardown.summary(),
+        failures,
+    }
 }
 
-/// [`stop_daemons`] with budget `budget`.
-pub(crate) fn stop_within(
+/// A sandbox teardown's exit proof, the deadline taken at its entry, its
+/// guards' records ([`outer_cleanup::Teardown::summary`]) and their
+/// cleanup failures.
+pub(crate) struct Exited {
+    pub(crate) proof: Result<(), String>,
+    pub(crate) deadline: Instant,
+    pub(crate) teardown: Value,
+    pub(crate) failures: Vec<String>,
+}
+
+fn prove_exit(
     runtime: &Path,
     state: &Path,
-    budget: Duration,
-    stop: impl FnOnce(Duration),
+    deadline: Instant,
+    stop: impl FnOnce(Instant),
 ) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
     let mut stop = Some(stop);
     loop {
         let alive = sandbox_processes(runtime, state)?;
         if alive.is_empty() {
             break;
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if outer_cleanup::left(deadline).is_zero() {
             return Err(format!("sandbox processes {alive:?} did not exit"));
         }
         if let Some(stop) = stop.take() {
-            stop(left);
+            stop(deadline.min(Instant::now() + outer_cleanup::ORDINARY_STOP));
         } else {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(deadline)));
         }
     }
     for lock in [runtime.join("daemon.lock"), state.join("store.lock")] {
         loop {
-            match fs::File::open(&lock) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            let held = match fs::File::open(&lock) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(format!("{}: {error}", lock.display())),
-                Ok(file) if file.try_lock().is_ok() => break,
-                Ok(_) => {}
+                Ok(file) => file.try_lock().is_err(),
+            };
+            if !held {
+                break;
             }
             if Instant::now() >= deadline {
                 return Err(format!("{} is still held", lock.display()));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(deadline)));
         }
     }
     if Instant::now() > deadline {
-        return Err(format!("the exit proof exceeded its {budget:?} budget"));
+        return Err("the exit proof exceeded the teardown deadline".to_owned());
     }
     Ok(())
-}
-
-/// Runs `command`, its output discarded, for at most `budget`: killed and
-/// reaped when the budget elapses. A sandbox's `stop` for [`stop_daemons`].
-pub(crate) fn run_within(command: &mut std::process::Command, budget: Duration) {
-    use std::process::Stdio;
-    let deadline = Instant::now() + budget;
-    let Ok(mut child) = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    while matches!(child.try_wait(), Ok(None)) {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let _ = child.wait();
 }
 
 /// The live (not zombie) processes whose environment names the sandbox's
@@ -281,10 +293,12 @@ pub(crate) fn scan_processes(
                 }
             },
         };
+        // Only a vanished process or a zombie has exited; unreadable
+        // process state is uncertainty (S1-evidence2 fix round 2, finding 13).
         if environ
             .split(|byte| *byte == 0)
             .any(|variable| marks.iter().any(|mark| variable == mark.as_slice()))
-            && !exited(pid)
+            && !crate::process::exited(pid)?
         {
             alive.push(pid);
         }
@@ -292,18 +306,108 @@ pub(crate) fn scan_processes(
     Ok(alive)
 }
 
-/// Whether `pid` has exited: gone, or a zombie awaiting its reaper.
-fn exited(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-        stat.rsplit_once(") ")
-            .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X'))
-    })
+/// The sandbox's cleanup record, `cleanup.json`, written before any
+/// evidence is collected: the exit proof, the guards' teardown records and
+/// failures, and the outer cleanup of every committed anchor by the
+/// teardown's deadline (runtime §11.2). Returns every cleanup failure. A
+/// Store present is always snapshotted and verified, whatever the
+/// scenario's evidence waivers; its absence proves no anchor only when no
+/// Store was expected and the deadline has not passed.
+fn cleanup(evidence: &Evidence, state: &Path, exited: Exited) -> Vec<String> {
+    let Exited {
+        proof,
+        deadline,
+        teardown,
+        failures: teardown_failures,
+    } = exited;
+    let mut failures = Vec::new();
+    let exit_proof = match proof {
+        Ok(()) => json!({"status":"proven"}),
+        Err(error) => {
+            failures.push(format!("daemon exit unproven: {error}"));
+            json!({"status":"unproven","reason":error})
+        }
+    };
+    failures.extend(teardown_failures);
+    let store = state.join("store.sqlite3");
+    let anchors = if store.is_file() {
+        outer_cleanup::anchors_by(&store, None, deadline)
+    } else if Instant::now() > deadline {
+        json!({"status":"unverified","absence_proven":false,"deadline_exceeded":true,
+            "reason":"no Store, observed after the teardown deadline"})
+    } else if evidence.store_expected {
+        json!({"status":"unverified","absence_proven":false,
+            "reason":"the expected Store is missing"})
+    } else {
+        json!({"status":"no_store"})
+    };
+    if !(outer_cleanup::anchors_proven(&anchors) || anchors["status"] == "no_store") {
+        failures.push(format!(
+            "outer cleanup is unverified: {}",
+            anchors["status"]
+        ));
+    }
+    let report = json!({
+        "exit_proof":exit_proof,
+        "teardown":teardown,
+        "anchors":anchors,
+    });
+    if let Err(error) = evidence.write("cleanup.json", report.to_string().as_bytes()) {
+        failures.push(format!("cleanup.json not written: {error}"));
+    }
+    failures
 }
 
 /// The daemons' stderr traces (`<root>/daemon*.trace`), `via.log`, the
-/// Store's backup, envelopes and events, the turns' evidence folders and a
-/// verified outer cleanup of every committed anchor.
-fn collect(evidence: &Evidence, root: &Path, state: &Path) -> EvidencedResult {
+/// turns' evidence folders and the Store's backup, envelopes and events,
+/// collected after the cleanup was recorded; every step runs, and each
+/// failure is returned. A scenario with no Store by design records a Store
+/// it cannot read, say a corrupt one it made, in `store_evidence.json`
+/// instead of failing.
+fn collect(evidence: &Evidence, root: &Path, state: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+    match daemon_traces(root) {
+        Ok(trace) => {
+            if let Err(error) = evidence.write("daemon.trace", &trace) {
+                failures.push(format!("daemon.trace: {error}"));
+            }
+        }
+        Err(error) => failures.push(format!("daemon traces: {error}")),
+    }
+    for name in ["via.log", "via.log.1"] {
+        let log = state.join(name);
+        if log.is_file()
+            && let Err(error) = fs::read(&log)
+                .map_err(Into::into)
+                .and_then(|bytes| evidence.write(name, &bytes))
+        {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    let folders = state.join("evidence");
+    if folders.is_dir()
+        && let Err(error) = evidence.copy_evidence(&folders)
+    {
+        failures.push(format!("evidence folders: {error}"));
+    }
+    let store = state.join("store.sqlite3");
+    if store.is_file()
+        && let Err(error) = store_evidence(evidence, &store)
+    {
+        if evidence.store_expected {
+            failures.push(format!("store evidence: {error}"));
+        } else {
+            let note = json!({"status":"not_collected","reason":error.to_string()});
+            if let Err(error) = evidence.write("store_evidence.json", note.to_string().as_bytes()) {
+                failures.push(format!("store_evidence.json: {error}"));
+            }
+        }
+    }
+    failures
+}
+
+/// The daemons' stderr traces, `<root>/daemon*.trace`, in name order.
+fn daemon_traces(root: &Path) -> EvidencedResult<Vec<u8>> {
     let mut traces: Vec<PathBuf> = fs::read_dir(root)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -321,52 +425,15 @@ fn collect(evidence: &Evidence, root: &Path, state: &Path) -> EvidencedResult {
     for path in traces {
         trace.extend(fs::read(path)?);
     }
-    evidence.write("daemon.trace", &trace)?;
-    for name in ["via.log", "via.log.1"] {
-        let log = state.join(name);
-        if log.is_file() {
-            evidence.write(name, &fs::read(log)?)?;
-        }
-    }
-    let folders = state.join("evidence");
-    if folders.is_dir() {
-        evidence.copy_evidence(&folders)?;
-    }
-    let store = state.join("store.sqlite3");
-    let anchors = match (store.is_file(), evidence.store_expected) {
-        (false, _) => json!({"status":"no_store"}),
-        (true, true) => store_evidence(evidence, &store)?,
-        // No turn by design: a Store that cannot be read, say a corrupt one
-        // the scenario made, is recorded, not required.
-        (true, false) => store_evidence(evidence, &store)
-            .unwrap_or_else(|error| json!({"status":"not_collected","reason":error.to_string()})),
-    };
-    evidence.write(
-        "cleanup.json",
-        json!({ "anchors": anchors }).to_string().as_bytes(),
-    )?;
-    let proven = (anchors["status"] == "quiescent" && anchors["absence_proven"] == true)
-        || (anchors["status"] == "no_anchors" && anchors["inventory_committed"] == true)
-        || (!evidence.store_expected
-            && (anchors["status"] == "no_store" || anchors["status"] == "not_collected"));
-    if proven {
-        Ok(())
-    } else {
-        Err(format!("outer cleanup is unverified: {}", anchors["status"]).into())
-    }
+    Ok(trace)
 }
 
-/// The Store's backup, envelopes and events, and the outer cleanup of
-/// every committed anchor (runtime §11.2), as `cleanup.json`'s anchors.
-fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult<serde_json::Value> {
+/// The Store's backup, envelopes and events, and a check that every
+/// launched turn has its folder.
+fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult {
     evidence.backup_store(store)?;
     write_rows(evidence, store)?;
-    launched_turns_have_folders(evidence, store)?;
-    let rows = outer_cleanup::snapshot(store)?;
-    Ok(outer_cleanup::verify(
-        &rows,
-        Instant::now() + Duration::from_secs(10),
-    ))
+    launched_turns_have_folders(evidence, store)
 }
 
 /// Every turn that launched a vendor (it has an anchor) has its evidence

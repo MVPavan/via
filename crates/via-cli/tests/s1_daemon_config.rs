@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use daemon::{Daemon, Sandbox, TestResult, cli, failure, infra};
+use daemon::{Daemon, Sandbox, TestResult, cli, collect_available, failure, infra};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -317,7 +317,7 @@ impl Setup {
         evidence
             .write("events.ndjson", events.as_bytes())
             .map_err(infra)?;
-        collect_available(evidence, &self.sandbox.state)
+        collect_available(evidence, &self.sandbox.state, &self.sandbox.teardown)
     }
 
     /// One completed turn of `prompt`, so the scenario leaves an evidence
@@ -444,7 +444,7 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
             check(status["limits"] == defaults(), || {
                 format!("a running daemon re-read daemon.json: {}", status["limits"])
             })?;
-            drop(daemon);
+            daemon.shutdown()?;
             let daemon = setup.start(evidence)?;
             let status = setup.daemon_status(evidence, "status_lowered")?;
             // `checkpoint_bytes` applies as whole 4 KiB pages.
@@ -452,7 +452,7 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
                 status["limits"] == limits(MIB, 2048, 5 * MIB, 1_052_000 / 4096 * 4096, 7),
                 || format!("lowered after a restart: {}", status["limits"]),
             )?;
-            drop(daemon);
+            daemon.shutdown()?;
 
             let runtime = &setup.sandbox.runtime;
             let state = &setup.sandbox.state;
@@ -703,8 +703,9 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
                 .failpoints
                 .wait_ack(point, 1, "crash", pid, Duration::from_secs(10))
                 .map_err(infra)?;
-            // Reaps the crashed daemon.
-            drop(crashed);
+            // Reaps the crashed daemon: an intermediate shutdown, since it
+            // may still be exiting (S1-evidence2 fix round 2, finding 8).
+            crashed.shutdown()?;
             setup.failpoints.disarm(point).map_err(infra)?;
             let trace = evidence.dir.join("daemon.trace");
             let recovered = setup.start(evidence)?;
@@ -733,7 +734,7 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
             wait_until("the summary", Duration::from_secs(15), || {
                 Ok(setup.via_log().contains("daemon_shutdown"))
             })?;
-            drop(recovered);
+            recovered.shutdown()?;
             let log = setup.via_log();
             let after = fs::read(&trace).map_err(infra)?;
             let last = log.lines().last().unwrap_or_default();
@@ -888,7 +889,7 @@ fn s1_store_disk_floor_refuses_new_work_only() -> TestResult {
                 format!("close below the floor: {closed}")
             })?;
             drop(conn);
-            drop(daemon);
+            daemon.shutdown()?;
 
             // Started below the floor: reads are served, new work refused.
             let _daemon = setup.start(evidence)?;
@@ -958,7 +959,7 @@ fn s1_store_data_size_warning_is_cached() -> TestResult {
                 .ok_or_else(|| failure(format!("{receipt}")))?
                 .to_owned();
             setup.wait(evidence, "wait_blob", &turn)?;
-            drop(daemon);
+            daemon.shutdown()?;
             fs::write(setup.sandbox.state.join("via.log.1"), b"rotated lines\n").map_err(infra)?;
             setup.config(r#"{"disk":{"warn_size":1024}}"#)?;
             hits::count(&setup.dir, WALKS).map_err(infra)?;
@@ -1322,7 +1323,7 @@ fn s1_store_wal_limit_holds_across_a_restart() -> TestResult {
             drain(&setup, (&session, "grow", PER), (0, ROUNDS))?;
             let envelope = setup.wait(evidence, "wait_grow", &format!("{session}/1"))?;
             check(envelope["state"] == "completed", || format!("{envelope}"))?;
-            drop(daemon);
+            daemon.shutdown()?;
             let held = setup.wal_len();
             check(held >= 4 * MIB, || {
                 format!("the WAL held across the restart is {held} bytes")
@@ -1481,7 +1482,7 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
             )?;
             drop(conn);
             drop(closing);
-            drop(daemon);
+            daemon.shutdown()?;
 
             // Seeded at restart from the sessions not closed.
             let _daemon = setup.start(evidence)?;

@@ -2,12 +2,13 @@
 //! drop records verified cleanup evidence, CLI calls and a raw C1 connection.
 
 use std::error::Error;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,19 @@ pub(crate) fn failure(detail: impl Into<String>) -> ScenarioError {
     ScenarioError::Failure(detail.into())
 }
 
+/// An I/O error: a typed timeout when a socket timeout elapsed, else an
+/// infrastructure failure.
+pub(crate) fn io(error: std::io::Error) -> ScenarioError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        ScenarioError::Timeout(format!("C1 exchange timed out: {error}"))
+    } else {
+        infra(error)
+    }
+}
+
 /// Creates a directory and proves it is private (0700) before any use.
 pub(crate) fn private_dir(path: &Path) -> TestResult {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -42,9 +56,15 @@ pub(crate) fn assert_private(path: &Path) -> TestResult {
     Ok(())
 }
 
-/// One isolated daemon deployment: private state, runtime and fake sync dirs.
+/// One isolated daemon deployment: private state, runtime and fake sync
+/// dirs, and the scenario's one final teardown (runtime §11.2), which every
+/// daemon guard of the sandbox records into.
 pub(crate) struct Sandbox {
     _root: tempfile::TempDir,
+    pub(crate) teardown: outer_cleanup::Teardown,
+    /// Daemon generations started so far, naming each one's trace header
+    /// and cleanup report.
+    generations: AtomicUsize,
     pub(crate) via: PathBuf,
     pub(crate) fake: PathBuf,
     pub(crate) fixture: PathBuf,
@@ -80,6 +100,8 @@ impl Sandbox {
         fs::write(&fixture_path, serde_json::to_vec(fixture)?)?;
         Ok(Self {
             _root: root,
+            teardown: outer_cleanup::Teardown::new(),
+            generations: AtomicUsize::new(0),
             via,
             fake,
             fixture: fixture_path,
@@ -163,11 +185,18 @@ pub(crate) fn store_dump(state: &Path) -> Result<String, ScenarioError> {
     Ok(dump)
 }
 
-/// The daemon child; dropping it force-stops, reaps and records cleanup.
+/// The daemon child of one generation. Dropping it is the scenario's final
+/// teardown of it; [`Daemon::shutdown`] is a deliberate intermediate one
+/// before a restart. Either force-stops, reaps and records the generation
+/// (runtime §11.2) in `cleanup-<generation>.json` and the sandbox's
+/// teardown, which [`collect_available`] validates as a whole.
 pub(crate) struct Daemon<'a> {
     child: Child,
     sandbox: &'a Sandbox,
-    cleanup_path: PathBuf,
+    generation: usize,
+    report: PathBuf,
+    /// Set once [`Daemon::shutdown`] tore it down.
+    torn_down: bool,
 }
 
 impl<'a> Daemon<'a> {
@@ -176,25 +205,39 @@ impl<'a> Daemon<'a> {
     }
 
     /// [`Self::start`] with extra daemon environment, such as failpoint
-    /// activation or a lowered test bound.
+    /// activation or a lowered test bound. No daemon starts once the
+    /// scenario's final teardown began: a live daemon dropped mid-test
+    /// fails loudly instead of shortening that teardown. Each generation
+    /// appends to `daemon.trace` under its own header.
     pub(crate) fn start_with(
         sandbox: &'a Sandbox,
         evidence: &Evidence,
         configure: impl FnOnce(&mut Command),
     ) -> Result<Self, ScenarioError> {
+        if sandbox.teardown.begun() {
+            return Err(infra("a daemon started after the final teardown began"));
+        }
+        let generation = sandbox.generations.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut trace = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(evidence.dir.join("daemon.trace"))
+            .map_err(infra)?;
+        writeln!(trace, "=== daemon generation {generation} ===").map_err(infra)?;
         let mut command = sandbox.command();
         configure(&mut command);
         command
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(evidence.dir.join("daemon.trace")).map_err(infra)?);
-        let daemon = Self {
+            .stderr(trace);
+        let mut daemon = Self {
             child: command.spawn().map_err(infra)?,
             sandbox,
-            cleanup_path: evidence.dir.join("cleanup.json"),
+            generation,
+            report: evidence.dir.join(format!("cleanup-{generation}.json")),
+            torn_down: false,
         };
-        let mut daemon = daemon;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = daemon.child.try_wait().map_err(infra)? {
@@ -203,13 +246,14 @@ impl<'a> Daemon<'a> {
             // A direct connection: an auto-starting `via daemon status`
             // would start a second daemon, without the child's failpoints,
             // that can win `daemon.lock` over the child.
-            if serving_pid(&sandbox.runtime) == Some(daemon.pid()) {
-                return Ok(daemon);
-            }
-            if Instant::now() >= deadline {
+            let ready = serving_pid(&sandbox.runtime) == Some(daemon.pid());
+            if Instant::now() > deadline {
                 return Err(ScenarioError::Timeout(
                     "daemon readiness deadline elapsed".to_owned(),
                 ));
+            }
+            if ready {
+                return Ok(daemon);
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -221,69 +265,116 @@ impl<'a> Daemon<'a> {
         self.child.id()
     }
 
-    fn reap(&mut self, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => return false,
-            }
+    /// A deliberate intermediate shutdown before a restart, with its own
+    /// runtime §11.2 bound: the final teardown has not begun, so the next
+    /// generation may start. Recorded like the final one; a daemon that
+    /// needed a kill is a timeout, any other cleanup failure an
+    /// infrastructure failure.
+    pub(crate) fn shutdown(mut self) -> Result<(), ScenarioError> {
+        let record = self.tear_down(Instant::now() + outer_cleanup::TEARDOWN);
+        if record["direct_child"]["kill"] != "not_needed" {
+            return Err(ScenarioError::Timeout(format!(
+                "the daemon did not exit after its force-stop: {record}"
+            )));
         }
-        false
+        if record["failures"]
+            .as_array()
+            .is_some_and(|failures| !failures.is_empty())
+        {
+            return Err(infra(format!("intermediate shutdown incomplete: {record}")));
+        }
+        Ok(())
+    }
+
+    /// Tears this generation down by `deadline` and records it.
+    fn tear_down(&mut self, deadline: Instant) -> Value {
+        self.torn_down = true;
+        let sandbox = self.sandbox;
+        sandbox.teardown.daemon_generation(
+            &self.generation.to_string(),
+            deadline,
+            &mut self.child,
+            Some((&sandbox.state.join("store.sqlite3"), None)),
+            Some(&self.report),
+            |by| {
+                outer_cleanup::run_within(
+                    sandbox
+                        .command()
+                        .args(["daemon", "stop", "--force", "--json"]),
+                    by,
+                )
+            },
+        )
     }
 }
 
 impl Drop for Daemon<'_> {
+    /// The scenario's final teardown of this generation (runtime §11.2):
+    /// the drop, of a live or an exited daemon, begins or joins the one
+    /// teardown deadline, which bounds the force-stop (at most 2 s), the
+    /// exit wait, the kill's 1 s reap and the anchor cleanup. A deliberate
+    /// stop before a restart is [`Daemon::shutdown`].
     fn drop(&mut self) {
-        let was_alive = matches!(self.child.try_wait(), Ok(None));
-        let mut stop = "not_attempted";
-        if was_alive {
-            stop = match self.sandbox.run(
-                &["daemon", "stop", "--force", "--json"],
-                Duration::from_secs(2),
-            ) {
-                Ok(capture) if capture.timed_out => "timed_out",
-                Ok(capture) if capture.status.success() => "accepted",
-                Ok(_) => "refused",
-                Err(_) => "unavailable",
-            };
+        if self.torn_down {
+            return;
         }
-        let mut kill = "not_needed";
-        let mut reaped = self.reap(Duration::from_secs(12));
-        if !reaped {
-            kill = if self.child.kill().is_ok() {
-                "sent_to_retained_child"
-            } else {
-                "failed"
-            };
-            reaped = self.reap(Duration::from_secs(1));
-        }
-        // Runtime §11.2 outer cleanup: a read-only anchor snapshot, verified
-        // anchor control and `ESRCH` absence, never a Core reopen.
-        let anchors = if reaped {
-            match outer_cleanup::snapshot(&self.sandbox.state.join("store.sqlite3")) {
-                Ok(rows) => outer_cleanup::verify(&rows, Instant::now() + Duration::from_secs(10)),
-                Err(error) => {
-                    json!({"status":"unverified","absence_proven":false,"reason":error})
-                }
-            }
-        } else {
-            json!({"status":"unverified","absence_proven":false,"reason":"daemon not reaped"})
-        };
-        let report = json!({
-            "direct_child": {"pid":self.child.id(),"was_alive":was_alive,"stop":stop,"kill":kill,"reaped":reaped},
-            "anchors": anchors,
-        });
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.cleanup_path)
+        // Final, live or exited: it begins or joins the scenario's one
+        // deadline (S1-evidence2 fix round 3, Sol r3 finding 1). Only an
+        // explicit `shutdown()` has its own bound.
+        let deadline = self.sandbox.teardown.begin();
+        self.tear_down(deadline);
+    }
+}
+
+/// The scenario's evidence after every daemon generation was torn down:
+/// the Store's backup, `via.log` and the evidence folders, then the whole
+/// teardown's report, `cleanup.json` ([`outer_cleanup::Teardown::summary`]),
+/// which must be complete: at least one generation, every direct child
+/// reaped, every anchor cleanup proved and no recorded failure. The report
+/// is written before any evidence copy can fail, and a copy failure is
+/// returned only after it.
+pub(crate) fn collect_available(
+    evidence: &Evidence,
+    state: &Path,
+    teardown: &outer_cleanup::Teardown,
+) -> Result<(), ScenarioError> {
+    let summary = teardown.summary();
+    let written = outer_cleanup::write_report(&evidence.dir.join("cleanup.json"), &summary);
+    let mut copies = Vec::new();
+    let store = state.join("store.sqlite3");
+    if store.is_file()
+        && let Err(error) = evidence.backup_store(&store)
+    {
+        copies.push(format!("store backup: {error}"));
+    }
+    // The daemon's own trace after startup (Task 4 design §7.6).
+    for name in ["via.log", "via.log.1"] {
+        let log = state.join(name);
+        if log.is_file()
+            && let Err(error) = fs::read(&log)
+                .map_err(Into::into)
+                .and_then(|bytes| evidence.write(name, &bytes))
         {
-            let _ = file.write_all(report.to_string().as_bytes());
-            let _ = file.sync_all();
+            copies.push(format!("{name}: {error}"));
         }
+    }
+    let folders = state.join("evidence");
+    if folders.is_dir()
+        && let Err(error) = evidence.copy_evidence(&folders)
+    {
+        copies.push(format!("evidence folders: {error}"));
+    }
+    written.map_err(infra)?;
+    if summary["complete"] != true {
+        return Err(infra(format!(
+            "outer cleanup is incomplete: {}",
+            summary["failures"]
+        )));
+    }
+    if copies.is_empty() {
+        Ok(())
+    } else {
+        Err(infra(copies.join("; ")))
     }
 }
 
@@ -295,22 +386,25 @@ pub(crate) fn cli(
     args: &[&str],
 ) -> Result<Value, ScenarioError> {
     let capture = sandbox.run(args, Duration::from_secs(20)).map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stdout"), &capture.stdout)
-        .map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stderr"), &capture.stderr)
-        .map_err(infra)?;
+    // The captured outcome first; a lost output write is attached to it,
+    // never in its place (S1-evidence2 fix round 2, finding 5).
+    let written = write_output(evidence, name, &capture);
     if capture.timed_out {
-        return Err(ScenarioError::Timeout(format!("via {args:?} timed out")));
+        return Err(ScenarioError::Timeout(format!(
+            "via {args:?} timed out{}{}",
+            capture.notes(),
+            note(written.as_ref().err())
+        )));
     }
     if !capture.status.success() {
         return Err(failure(format!(
-            "via {args:?} exited {}: {}",
+            "via {args:?} exited {}: {}{}",
             capture.status,
-            String::from_utf8_lossy(&capture.stderr)
+            String::from_utf8_lossy(&capture.stderr),
+            note(written.as_ref().err())
         )));
     }
+    written?;
     serde_json::from_slice(&capture.stdout).map_err(infra)
 }
 
@@ -324,23 +418,49 @@ pub(crate) fn refused(
     kind: &str,
 ) -> Result<Value, ScenarioError> {
     let capture = sandbox.run(args, Duration::from_secs(20)).map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stdout"), &capture.stdout)
-        .map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stderr"), &capture.stderr)
-        .map_err(infra)?;
+    let written = write_output(evidence, name, &capture);
+    // A timeout is classified before the refusal is interpreted
+    // (S1-evidence2 fix round 2, finding 4).
+    if capture.timed_out {
+        return Err(ScenarioError::Timeout(format!(
+            "{name}: via {args:?} timed out{}{}",
+            capture.notes(),
+            note(written.as_ref().err())
+        )));
+    }
     let error: Value = serde_json::from_slice(&capture.stderr).map_err(|_| {
         failure(format!(
-            "{name}: expected a {kind} request error, got exit {} stderr {}",
+            "{name}: expected a {kind} request error, got exit {} stderr {}{}",
             capture.status,
-            String::from_utf8_lossy(&capture.stderr)
+            String::from_utf8_lossy(&capture.stderr),
+            note(written.as_ref().err())
         ))
     })?;
-    if capture.timed_out || capture.status.code() != Some(2) || error["data"]["kind"] != kind {
-        return Err(failure(format!("{name}: expected {kind}, got {error}")));
+    if capture.status.code() != Some(2) || error["data"]["kind"] != kind {
+        return Err(failure(format!(
+            "{name}: expected {kind}, got {error}{}",
+            note(written.as_ref().err())
+        )));
     }
+    written?;
     Ok(error)
+}
+
+/// Writes a call's stdout and stderr as `<name>.stdout` and `<name>.stderr`.
+pub(crate) fn write_output(
+    evidence: &Evidence,
+    name: &str,
+    capture: &Captured,
+) -> Result<(), ScenarioError> {
+    evidence
+        .write(&format!("{name}.stdout"), &capture.stdout)
+        .and_then(|()| evidence.write(&format!("{name}.stderr"), &capture.stderr))
+        .map_err(|error| infra(format!("{name} output not written: {error}")))
+}
+
+/// An attached failure, as a suffix for an error detail.
+pub(crate) fn note(error: Option<&ScenarioError>) -> String {
+    error.map_or_else(String::new, |error| format!(" ({})", error.detail()))
 }
 
 /// Reads a session's durable events through `via events`.
@@ -391,14 +511,14 @@ impl Raw {
 
     /// Writes one request line.
     pub(crate) fn send(&mut self, line: &str) -> Result<(), ScenarioError> {
-        self.writer.write_all(line.as_bytes()).map_err(infra)?;
-        self.writer.write_all(b"\n").map_err(infra)
+        self.writer.write_all(line.as_bytes()).map_err(io)?;
+        self.writer.write_all(b"\n").map_err(io)
     }
 
     pub(crate) fn exchange(&mut self, line: &str) -> Result<Value, ScenarioError> {
         self.send(line)?;
         let mut reply = String::new();
-        if self.reader.read_line(&mut reply).map_err(infra)? == 0 {
+        if self.reader.read_line(&mut reply).map_err(io)? == 0 {
             return Err(failure("daemon closed the connection"));
         }
         serde_json::from_str(&reply).map_err(infra)

@@ -16,6 +16,8 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 mod scenario;
 mod support;
@@ -25,9 +27,11 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, events, failure, infra, request};
+use daemon::{
+    Daemon, Raw, Sandbox, TestResult, cli, collect_available, events, failure, infra, request,
+};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -190,7 +194,7 @@ impl Setup {
         evidence
             .write("events.ndjson", events.as_bytes())
             .map_err(infra)?;
-        collect_available(evidence, &self.sandbox.state)
+        collect_available(evidence, &self.sandbox.state, &self.sandbox.teardown)
     }
 
     /// Spawns a fake session with `prompt`; returns its receipt.
@@ -447,22 +451,20 @@ fn durable_only(types: &[String]) -> Result<(), ScenarioError> {
 }
 
 /// Waits until process `pid` has ended (a zombie counts: it is not reaped
-/// until its `Daemon` drops).
+/// until its `Daemon` drops), observed by the deadline. Unreadable process
+/// state is uncertainty, never an exit (S1-evidence2 fix round 2, findings
+/// 13 and 14).
 fn await_exit(pid: u32) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let ended = fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit(") ")
-                .next()
-                .is_some_and(|rest| rest.starts_with('Z'))
-        });
-        if ended {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
+        let ended = process::exited(pid).map_err(infra)?;
+        if Instant::now() > deadline {
             return Err(ScenarioError::Timeout(format!(
                 "process {pid} is still running"
             )));
+        }
+        if ended {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -1321,7 +1323,7 @@ fn s1_c1_status_every_member_after_eviction_and_restart() -> TestResult {
                 "stop",
                 &["daemon", "stop", "--force", "--json"],
             )?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _restarted = setup.start(evidence)?;
             let restarted = setup.status(evidence, &session, &[])?;
             let busy_after = setup.status(evidence, &busy, &[])?;

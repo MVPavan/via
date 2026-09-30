@@ -20,6 +20,8 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 #[expect(
     dead_code,
@@ -38,7 +40,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use evidenced::evidenced;
+use scenario::ScenarioError;
 use serde_json::{Value, json};
+
+/// Runtime §5.2 cleanup allowance after a deadline with no budget left:
+/// TERM, at most 2 s, then KILL and at most 1 s for exit.
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
+/// Explicit scheduler tolerance for the end-to-end bound over the cleanup
+/// allowance: the harness's boundary is taken before the spawn request, so
+/// it also covers that request's latency and the 5 ms absence polling
+/// under a loaded parallel run (a contract upper bound, design T4-A50).
+const TOLERANCE: Duration = Duration::from_secs(2);
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -47,11 +59,31 @@ struct Captured {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    timed_out: bool,
 }
 
-/// Runs `command` to exit, killing it after `timeout`.
-fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured> {
+/// A typed timeout, which `evidenced` records as `timeout` (runtime §11.2).
+fn timeout(detail: impl Into<String>) -> Box<dyn Error> {
+    Box::new(ScenarioError::Timeout(detail.into()))
+}
+
+/// A thread's error, sendable to its joiner with its type kept: a typed
+/// [`ScenarioError`] stays itself, so a timeout stays a timeout; any other
+/// error is a failure, as `evidenced` records it (S1-evidence2 fix round
+/// 3, `via-t76`).
+fn sendable(error: Box<dyn Error>) -> ScenarioError {
+    match error.downcast::<ScenarioError>() {
+        Ok(typed) => *typed,
+        Err(other) => ScenarioError::Failure(other.to_string()),
+    }
+}
+
+/// Runs `command` to exit within `within`, which covers its run and, if it
+/// is killed, its reap: killed at the bound less a reap reserve (at most
+/// 1 s, at most a quarter of the bound). A timeout is returned as a typed
+/// timeout, never replaced by a reap or output failure: a child left
+/// unreaped is noted beside it.
+fn run_command(command: &mut Command, within: Duration) -> TestResult<Captured> {
+    let deadline = Instant::now() + within;
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -59,16 +91,13 @@ fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured>
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
     let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (status, false);
-        }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            break (child.wait()?, true);
-        }
-        thread::sleep(Duration::from_millis(5));
+    let kill_at = Instant::now()
+        + outer_cleanup::left(deadline).saturating_sub(outer_cleanup::REAP.min(within / 4));
+    let Some(status) = outer_cleanup::wait_by(&mut child, kill_at) else {
+        let reaped = outer_cleanup::kill_and_reap(&mut child, deadline);
+        return Err(timeout(format!(
+            "{command:?} exceeded {within:?} (killed; reaped by the bound: {reaped})"
+        )));
     };
     let read = |file: &mut File| -> TestResult<Vec<u8>> {
         file.rewind()?;
@@ -80,7 +109,6 @@ fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured>
         status,
         stdout: read(&mut stdout)?,
         stderr: read(&mut stderr)?,
-        timed_out,
     })
 }
 
@@ -90,6 +118,8 @@ struct Sandbox {
     root: tempfile::TempDir,
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
+    /// The scenario's final teardown, shared by its guards and its drop.
+    teardown: outer_cleanup::Teardown,
     /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
     /// Cleared by a scenario whose turns launch no vendor by design.
@@ -112,12 +142,13 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-                evidenced::run_within(
-                    self.command().args(["daemon", "stop", "--force", "--json"]),
-                    budget,
-                );
-            });
+            let exited =
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
+                    outer_cleanup::run_within(
+                        self.command().args(["daemon", "stop", "--force", "--json"]),
+                        by,
+                    )
+                });
             let expected = evidenced::Expected {
                 store: self
                     .store_expected
@@ -174,6 +205,7 @@ impl Sandbox {
         Ok(Self {
             root,
             evidence: Some(evidence),
+            teardown: outer_cleanup::Teardown::new(),
             store_expected: std::sync::atomic::AtomicBool::new(true),
             folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
@@ -206,11 +238,7 @@ impl Sandbox {
     fn run(&self, args: &[&str]) -> TestResult<Captured> {
         let mut command = self.command();
         command.args(args);
-        let captured = run_command(&mut command, Duration::from_secs(60))?;
-        if captured.timed_out {
-            return Err(format!("via {args:?} timed out").into());
-        }
-        Ok(captured)
+        run_command(&mut command, Duration::from_secs(60))
     }
 
     /// One successful CLI call's JSON output.
@@ -245,6 +273,9 @@ impl Sandbox {
     }
 
     fn start(&self) -> TestResult<Daemon<'_>> {
+        if self.teardown.begun() {
+            return Err("a daemon started after the final teardown began".into());
+        }
         let mut command = self.command();
         #[cfg(feature = "test-failpoints")]
         self.failpoints.activate(&mut command);
@@ -257,6 +288,7 @@ impl Sandbox {
         let mut daemon = Daemon {
             child: command.spawn()?,
             sandbox: self,
+            torn_down: false,
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -265,11 +297,12 @@ impl Sandbox {
             }
             // A direct probe: never auto-starts a second daemon, which could
             // win `daemon.lock` over the child, even over a stale socket file.
-            if daemon::serving_pid(&self.runtime) == Some(daemon.child.id()) {
-                return Ok(daemon);
+            let ready = daemon::serving_pid(&self.runtime) == Some(daemon.child.id());
+            if Instant::now() > deadline {
+                return Err(timeout("daemon readiness deadline elapsed"));
             }
-            if Instant::now() >= deadline {
-                return Err("daemon readiness deadline elapsed".into());
+            if ready {
+                return Ok(daemon);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -321,13 +354,16 @@ impl Sandbox {
     fn await_file(&self, name: &str) -> TestResult {
         let path = self.sync.join(name);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !path.exists() {
-            if Instant::now() >= deadline {
-                return Err(format!("the fake did not create {name}").into());
+        loop {
+            let exists = path.exists();
+            if Instant::now() > deadline {
+                return Err(timeout(format!("the fake did not create {name}")));
+            }
+            if exists {
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(5));
         }
-        Ok(())
     }
 
     fn release(&self, gate: &str) -> TestResult {
@@ -353,17 +389,25 @@ impl Sandbox {
     fn await_row(&self, sql: &str, expected: &str) -> TestResult {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if self
+            let read = self
                 .query::<String>(sql)
-                .is_ok_and(|value| value == expected)
-            {
-                return Ok(());
+                .is_ok_and(|value| value == expected);
+            if Instant::now() > deadline {
+                return Err(timeout(format!("{sql} never read {expected}")));
             }
-            if Instant::now() >= deadline {
-                return Err(format!("{sql} never read {expected}").into());
+            if read {
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Writes `value` as scenario evidence file `name`.
+    fn record(&self, name: &str, value: &Value) -> TestResult {
+        self.evidence
+            .as_ref()
+            .ok_or("the sandbox has no evidence")?
+            .write(name, value.to_string().as_bytes())
     }
 
     /// A file in the turn's evidence folder (Task 4 design §7.1).
@@ -392,6 +436,8 @@ impl Sandbox {
 struct Daemon<'a> {
     child: Child,
     sandbox: &'a Sandbox,
+    /// Set once [`Daemon::finish`] or [`Daemon::shutdown`] tore it down.
+    torn_down: bool,
 }
 
 impl Daemon<'_> {
@@ -400,54 +446,121 @@ impl Daemon<'_> {
         self.child.id()
     }
 
-    /// Waits for the daemon to exit by itself.
+    /// Waits for the daemon to exit by itself: an exit observed only after
+    /// `within` is a typed timeout.
     fn exit(&mut self, within: Duration) -> TestResult<ExitStatus> {
         let deadline = Instant::now() + within;
         loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(status);
+            let status = self.child.try_wait()?;
+            if Instant::now() > deadline {
+                return Err(timeout("the daemon did not exit in time"));
             }
-            if Instant::now() >= deadline {
-                return Err("the daemon did not exit in time".into());
+            if let Some(status) = status {
+                return Ok(status);
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
 
-    /// Force-stops the daemon, then proves every anchor's group absent, as
-    /// the runtime §11.2 outer harness does.
+    /// The scenario's final teardown of this daemon, within its one
+    /// teardown deadline, which this begins or joins (runtime §11.2): a
+    /// force-stop for at most 2 s, the exit (a kill is incomplete), the
+    /// outer cleanup.
     fn finish(mut self) -> TestResult {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.sandbox.run(&["daemon", "stop", "--force", "--json"]);
-        }
-        self.exit(Duration::from_secs(15))?;
-        self.verify()
+        let deadline = self.sandbox.teardown.begin();
+        self.stop_by(deadline)
     }
 
-    fn verify(&self) -> TestResult {
-        let rows = outer_cleanup::snapshot(&self.sandbox.state.join("store.sqlite3"))?;
-        let anchors = outer_cleanup::verify(&rows, Instant::now() + Duration::from_secs(10));
-        let absent = anchors["status"] == "quiescent" && anchors["absence_proven"] == true;
-        let none = anchors["status"] == "no_anchors";
-        if absent || none {
-            Ok(())
-        } else {
-            Err(format!("outer cleanup is unverified: {anchors}").into())
+    /// A deliberate intermediate shutdown before a restart, with its own
+    /// runtime §11.2 bound: the final teardown has not begun, and the next
+    /// daemon may start.
+    #[cfg(feature = "test-failpoints")]
+    fn shutdown(mut self) -> TestResult {
+        self.stop_by(Instant::now() + outer_cleanup::TEARDOWN)
+    }
+
+    /// Force-stops, reaps and records this daemon, then proves outer
+    /// cleanup, all by `deadline`.
+    fn stop_by(&mut self, deadline: Instant) -> TestResult {
+        let sandbox = self.sandbox;
+        let generation = format!("finish-{}", self.child.id());
+        let record = sandbox.teardown.daemon_generation(
+            &generation,
+            deadline,
+            &mut self.child,
+            None,
+            None,
+            |by| {
+                outer_cleanup::run_within(
+                    sandbox
+                        .command()
+                        .args(["daemon", "stop", "--force", "--json"]),
+                    by,
+                )
+            },
+        );
+        self.torn_down = true;
+        if record["direct_child"]["kill"] != "not_needed" {
+            return Err(timeout(format!(
+                "the daemon did not exit after its force-stop: {record}"
+            )));
         }
+        self.verify_by(deadline)
+    }
+
+    /// The scenario's final outer cleanup after the daemon exited by
+    /// itself, within the one teardown deadline, which this begins or
+    /// joins.
+    fn verify(&self) -> TestResult {
+        self.verify_by(self.sandbox.teardown.begin())
+    }
+
+    /// Proves every committed anchor's group absent by `deadline`, as the
+    /// runtime §11.2 outer harness does.
+    fn verify_by(&self, deadline: Instant) -> TestResult {
+        let anchors =
+            outer_cleanup::anchors_by(&self.sandbox.state.join("store.sqlite3"), None, deadline);
+        check(outer_cleanup::anchors_proven(&anchors), || {
+            format!("outer cleanup is unverified: {anchors}")
+        })
     }
 }
 
 impl Drop for Daemon<'_> {
+    /// Final teardown (runtime §11.2): a live daemon's drop begins, or
+    /// joins, the scenario's one teardown deadline, which bounds the
+    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap
+    /// ([`outer_cleanup::teardown_child`]); an exited child's drop begins
+    /// nothing. Either records its direct child's reap status in the
+    /// teardown, for `cleanup.json`. A deliberate mid-test stop exits the
+    /// daemon first ([`Daemon::exit`], [`Daemon::shutdown`]).
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.sandbox.run(&["daemon", "stop", "--force", "--json"]);
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.torn_down {
+            return;
         }
+        let sandbox = self.sandbox;
+        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let deadline = if live {
+            sandbox.teardown.begin()
+        } else {
+            Instant::now()
+        };
+        let generation = format!("guard-{}", self.child.id());
+        sandbox.teardown.daemon_generation(
+            &generation,
+            deadline,
+            &mut self.child,
+            None,
+            None,
+            |by| {
+                outer_cleanup::run_within(
+                    sandbox
+                        .command()
+                        .args(["daemon", "stop", "--force", "--json"]),
+                    by,
+                )
+            },
+        );
     }
 }
 
@@ -501,15 +614,10 @@ fn check(condition: bool, message: impl FnOnce() -> String) -> TestResult {
     }
 }
 
-/// `pid` is gone, or a zombie awaiting its reaper.
-fn process_live(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|text| {
-            let state = text.get(text.rfind(')')? + 2..)?.chars().next()?;
-            Some(state != 'Z' && state != 'X')
-        })
-        .unwrap_or(false)
+/// `pid` is live: neither gone nor a zombie awaiting its reaper.
+/// Unreadable process state is an error, never absence.
+fn process_live(pid: u32) -> Result<bool, String> {
+    Ok(!process::exited(pid)?)
 }
 
 fn event_types(events: &[Value], turn: u32) -> Vec<String> {
@@ -733,7 +841,7 @@ impl Sandbox {
                 return Ok(event);
             }
             if Instant::now() >= deadline {
-                return Err(format!("no {kind} event").into());
+                return Err(timeout(format!("no {kind} event")));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -779,7 +887,7 @@ fn s1_cancel_running_turn_forced_after_grace() -> TestResult {
                 && reply["cancel"]["cleanup"] == "quiescent",
             || format!("forced cancel reply: {reply}"),
         )?;
-        check(!process_live(agent) && !process_live(grandchild), || {
+        check(!process_live(agent)? && !process_live(grandchild)?, || {
             "the agent or its grandchild survived the forced cancel".to_owned()
         })?;
         daemon.finish()
@@ -820,7 +928,7 @@ fn s1_f20_sigterm_ignored_escalates_to_kill() -> TestResult {
             reply["state"] == "cancelled" && reply["cancel"]["outcome"] == "forced",
             || format!("F20 reply: {reply}"),
         )?;
-        check(!process_live(agent), || {
+        check(!process_live(agent)?, || {
             "the SIGTERM-ignoring agent survived".to_owned()
         })?;
         check(elapsed < Duration::from_millis(200 + 3000 + 1000), || {
@@ -957,7 +1065,7 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
         )?;
         // The setsid limit: a grandchild that leaves the group is out of reach;
         // this one stays in it and is gone with the group.
-        check(!process_live(agent) && !process_live(grandchild), || {
+        check(!process_live(agent)? && !process_live(grandchild)?, || {
             "the idle-stopped group survived".to_owned()
         })?;
         daemon.finish()
@@ -980,8 +1088,23 @@ fn s1_f19_wall_deadline_clears_grandchild() -> TestResult {
             ],
         ))?;
         let daemon = sandbox.start()?;
+        // At or before the wall deadline's origin, so `boundary` is at or
+        // before the deadline itself.
+        let requested = Instant::now();
         let (session, _) = sandbox.spawn("wall", &["--wall-ms", "1000"])?;
         let grandchild = sandbox.pid("gc.pid")?;
+        let boundary = requested + Duration::from_millis(1000);
+        let bound = CLEANUP_ALLOWANCE + TOLERANCE;
+        let absent_after = absent_within(boundary, bound, || Ok(!process_live(grandchild)?))
+            .map_err(|error| format!("the grandchild after the wall deadline: {error}"))?;
+        sandbox.record(
+            "f19_wall_cleanup.json",
+            &json!({
+                "boundary":"spawn request + wall_ms (at or before the wall deadline)",
+                "absent_after_ms":u64::try_from(absent_after.as_millis()).unwrap_or(u64::MAX),
+                "bound_ms":u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            }),
+        )?;
         let envelope = sandbox.wait(&format!("{session}/1"))?;
         check(
             envelope["state"] == "failed"
@@ -989,7 +1112,7 @@ fn s1_f19_wall_deadline_clears_grandchild() -> TestResult {
                 && envelope["cancel"]["cleanup"] == "quiescent",
             || format!("wall envelope: {envelope}"),
         )?;
-        check(!process_live(grandchild), || {
+        check(!process_live(grandchild)?, || {
             "the grandchild survived".to_owned()
         })?;
         daemon.finish()
@@ -1101,7 +1224,7 @@ fn s1_close_cancels_queue_and_running_turn() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -1223,7 +1346,7 @@ fn s1_close_racing_force_stop() -> TestResult {
                         ],
                         "daemon_stopping",
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -1277,7 +1400,9 @@ impl Sandbox {
                 break bytes;
             }
             if Instant::now() >= deadline {
-                return Err(format!("no acknowledgement of {point} #{occurrence}").into());
+                return Err(timeout(format!(
+                    "no acknowledgement of {point} #{occurrence}"
+                )));
             }
             thread::sleep(Duration::from_millis(5));
         };
@@ -1347,7 +1472,7 @@ fn s1_close_reaches_claimed_turn() -> TestResult {
                 let close = scope.spawn(|| {
                     sandbox
                         .ok(&["close", &session, "--handle", &handle, "--json"])
-                        .map_err(|error| error.to_string())
+                        .map_err(sendable)
                 });
                 sandbox.ack(
                     &daemon,
@@ -1499,7 +1624,7 @@ fn s1_cancel_during_settlement_completes() -> TestResult {
             let cancel = scope.spawn(|| {
                 sandbox
                     .ok(&["cancel", &session, "--handle", &handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The cancel found the turn settling and sent no order.
             sandbox.ack(&daemon, "core.cancel.settling", 1, "fail_io")?;
@@ -1724,7 +1849,7 @@ fn s1_close_partial_restarts_keep_one_result() -> TestResult {
             result["state"] == "closed" && result["cancelled_turns"] == json!(expected),
             || format!("close result after restarts: {result}"),
         )?;
-        daemon.finish()?;
+        daemon.shutdown()?;
         let daemon = sandbox.start()?;
         let again = sandbox.ok(&["close", &session, "--handle", &handle, "--json"])?;
         check(again == result, || {
@@ -1779,20 +1904,12 @@ fn s1_close_outcome_retained_for_late_subscriber() -> TestResult {
             "--json",
         ];
         thread::scope(|scope| -> TestResult {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let first = scope.spawn(|| sandbox.refused(&keyed, "store_error").map_err(sendable));
             // The running turn observed the close order.
             sandbox.wait_for_event(&session, "cancel.requested")?;
             // The first caller passed the seam unarmed: this is its second hit.
             sandbox.arm("core.close.before_subscribe", 2, "pause")?;
-            let replay = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let replay = scope.spawn(|| sandbox.refused(&keyed, "store_error").map_err(sendable));
             sandbox.ack(&daemon, "core.close.before_subscribe", 2, "pause")?;
             // No terminal committed yet: the other session's is the first, and
             // its retry the second.
@@ -1919,7 +2036,7 @@ fn s1_close_cleanup_uncertain_with_unproven_group() -> TestResult {
                             &handle,
                             "--json",
                         ])
-                        .map_err(|error| error.to_string())
+                        .map_err(sendable)
                 });
                 // The close order is set before the turn reaches the gate.
                 sandbox.ack(
@@ -1992,7 +2109,7 @@ fn s1_idle_timer_disarms_once_an_order_exists() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The cancel's order is attached before the timer issues its own.
             sandbox.ack(&daemon, "core.cancel.ordered", 1, "fail_io")?;
@@ -2083,7 +2200,7 @@ fn s1_close_at_final_shutdown_entry_refused() -> TestResult {
             let close = scope.spawn(|| {
                 sandbox
                     .ok(&["close", &idle, "--handle", &idle_handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // `Closing` is durable, so its dispatcher start was requested.
             sandbox.await_row(
@@ -2171,7 +2288,7 @@ fn s1_close_stalled_read_bounds_final_shutdown_entry() -> TestResult {
             let close = scope.spawn(|| {
                 sandbox
                     .run(&["close", &session, "--handle", &handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The close holds `admission` in its read; entry now waits for it.
             sandbox.ack(&daemon, stall, next, "pause")?;
@@ -2244,7 +2361,7 @@ fn s1_close_failed_closed_keeps_closing_count() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -2390,20 +2507,14 @@ fn s1_close_waiter_resolves_on_force() -> TestResult {
             "--json",
         ];
         let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let first =
+                scope.spawn(|| sandbox.refused(&close, "daemon_stopping").map_err(sendable));
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
                 "closing",
             )?;
-            let second = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let second =
+                scope.spawn(|| sandbox.refused(&close, "daemon_stopping").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             sandbox.resume_point(subscribe, 2)?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2462,7 +2573,7 @@ fn s1_cancel_wait_across_force_handoff() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.wait_for_event(&session, "cancel.requested")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2531,20 +2642,12 @@ fn s1_close_waiter_resolves_on_latch() -> TestResult {
             "--json",
         ];
         let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let first = scope.spawn(|| sandbox.refused(&close, "store_error").map_err(sendable));
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
                 "closing",
             )?;
-            let second = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let second = scope.spawn(|| sandbox.refused(&close, "store_error").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             sandbox.resume_point(subscribe, 2)?;
             // The Store's one worker serves this read after the `Closing`
@@ -2631,7 +2734,7 @@ fn s1_cancel_wait_across_force_handoff_unacknowledged() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.ack(&daemon, admitted, 1, "pause")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2703,7 +2806,7 @@ fn s1_cancel_wait_across_force_handoff_terminal_not_committed() -> TestResult {
                         ],
                         "store_error",
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.wait_for_event(&session, "cancel.requested")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2782,11 +2885,8 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
         let handoff = "core.run.before_handoff";
         let subscribe = "core.close.before_subscribe";
         thread::scope(|scope| -> TestResult {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let first =
+                scope.spawn(|| sandbox.refused(&keyed, "daemon_stopping").map_err(sendable));
             sandbox.wait_for_event(&session, "cancel.requested")?;
             sandbox.arm(fence, 1, "pause")?;
             sandbox.arm(handoff, 1, "pause")?;
@@ -2796,11 +2896,8 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
             check(stopping["stopping"] == true, || stopping.to_string())?;
             sandbox.ack(&daemon, fence, 1, "pause")?;
             sandbox.ack(&daemon, handoff, 1, "pause")?;
-            let replay = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let replay =
+                scope.spawn(|| sandbox.refused(&keyed, "daemon_stopping").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             check(!first.is_finished(), || {
                 "the close replied before the force exit".to_owned()
@@ -2833,4 +2930,51 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
         }
         Ok(())
     })
+}
+
+/// Polls `gone` until it reports absence, at most `bound` after `boundary`
+/// (S1-evidence2 fix round 1): each probe is timestamped after it returns
+/// and the bound is enforced before its absence is accepted, so a probe
+/// that resumes after expiry and finds the process gone fails. Returns how
+/// long after `boundary` absence was proved.
+fn absent_within(
+    boundary: Instant,
+    bound: Duration,
+    mut gone: impl FnMut() -> Result<bool, String>,
+) -> Result<Duration, String> {
+    loop {
+        let absent = gone()?;
+        let after = Instant::now().saturating_duration_since(boundary);
+        if after > bound {
+            return Err(format!(
+                "absence not proved within {bound:?} of the boundary (probe at {after:?})"
+            ));
+        }
+        if absent {
+            return Ok(after);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`absent_within`] rejects an absence observed only after its bound: the
+/// probe resumes late and finds the process gone (S1-evidence2 fix round 1).
+#[test]
+fn s1_f19_absence_after_the_bound_fails() {
+    let late = absent_within(Instant::now(), Duration::from_millis(50), || {
+        thread::sleep(Duration::from_millis(100));
+        Ok(true)
+    });
+    assert!(late.is_err(), "late absence accepted: {late:?}");
+    let timely = absent_within(Instant::now(), Duration::from_secs(5), || Ok(true));
+    assert!(timely.is_ok(), "{timely:?}");
+    // Unreadable process state is uncertainty, never absence (S1-evidence2
+    // fix round 2, finding 13).
+    let unreadable = absent_within(Instant::now(), Duration::from_secs(5), || {
+        Err("process 1: /proc stat unreadable".to_owned())
+    });
+    assert!(
+        unreadable.is_err(),
+        "unreadable state accepted: {unreadable:?}"
+    );
 }

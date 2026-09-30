@@ -3,6 +3,7 @@
 //! independent sessions (F13, F14, F17, F28), plus C1 `wait.timeout_ms`.
 
 #[path = "support/daemon.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod daemon;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
@@ -13,8 +14,11 @@ mod support;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, events, failure, infra, refused, request};
-use scenario::{ScenarioError, collect_available, run_scenario};
+use daemon::{
+    Daemon, Raw, Sandbox, TestResult, cli, collect_available, events, failure, infra, refused,
+    request,
+};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -250,7 +254,7 @@ fn s1_f13_spawn_retry_after_lost_reply_replays_one_session() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -445,7 +449,7 @@ fn s1_f14_resume_retry_with_op_key_adds_one_turn() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -578,7 +582,7 @@ fn s1_f17_ninth_queued_turn_is_queue_full_and_order_kept() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -774,7 +778,7 @@ fn s1_f28_two_callers_drive_two_sessions_without_crosstalk() -> TestResult {
                 .map_err(infra)?;
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -849,7 +853,7 @@ fn c1_wait_timeout_ms_bounds_the_wait() -> TestResult {
                 .map_err(infra)?;
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -1046,7 +1050,7 @@ fn s1_params_queued_turns_inherit_frozen_per_turn_values() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -1151,7 +1155,7 @@ fn s1_params_frozen_wall_deadline_applies_to_its_turn_only() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -1328,7 +1332,7 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
             check_history(&sandbox, &session, &history, 2)?;
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -1454,7 +1458,7 @@ fn s1_params_keyed_retry_replays_identical_effective() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -1604,7 +1608,7 @@ fn s1_f15_wrong_or_missing_handle_is_invalid_handle_with_no_state_change() -> Te
                 .map_err(infra)?;
             check_history(&sandbox, &session, &history, 1).map(|_| ())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }

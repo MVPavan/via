@@ -18,18 +18,20 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 mod scenario;
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Sandbox, TestResult, cli, failure, infra};
+use daemon::{Daemon, Sandbox, TestResult, cli, collect_available, failure, infra};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -38,6 +40,14 @@ const PAUSE: &str = "core.observations.pause";
 const FALLBACK: &str = "wire.fallback_drop";
 /// The lowered stall (`VIA_TEST_EVENT_STALL_MS`).
 const STALL_MS: &str = "500";
+/// Runtime §5.2 cleanup allowance after a deadline with no budget left:
+/// TERM, at most 2 s, then KILL and at most 1 s for exit.
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
+/// Explicit scheduler tolerance for the end-to-end bound over the cleanup
+/// allowance: the harness's stall boundary is taken before the vendor's
+/// last writes, so it also covers them and the 5 ms absence polling under
+/// a loaded parallel run (a contract upper bound, design T4-A50).
+const TOLERANCE: Duration = Duration::from_secs(2);
 
 fn accepted() -> Value {
     json!({"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}})
@@ -208,23 +218,25 @@ impl Setup {
             .ok_or_else(|| failure(format!("daemon status has no pid: {status}")))
     }
 
-    /// Waits until the fake's reported process is gone: Route stopped it.
-    fn await_vendor_stopped(&self) -> Result<(), ScenarioError> {
+    /// Waits until the fake's reported process is gone, Route stopped it,
+    /// at most `bound` after `boundary`; returns how long after `boundary`
+    /// it was gone.
+    fn await_vendor_stopped(
+        &self,
+        boundary: Instant,
+        bound: Duration,
+    ) -> Result<Duration, ScenarioError> {
         let pid_file = self.sandbox.sync.join("agent.pid");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Ok(pid) = fs::read_to_string(&pid_file)
-                && stopped(pid.trim())
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(ScenarioError::Timeout(
-                    "the silent vendor was not stopped while Core was held".to_owned(),
-                ));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        absent_within(boundary, bound, || match fs::read_to_string(&pid_file) {
+            // Not reported yet: not proved gone.
+            Err(_) => Ok(false),
+            Ok(pid) => stopped(pid.trim()),
+        })
+        .map_err(|error| {
+            failure(format!(
+                "the silent vendor after the stall's start, while Core was held: {error}"
+            ))
+        })
     }
 
     /// `via status <session>` (C1 §3.7).
@@ -267,14 +279,14 @@ impl Setup {
     }
 }
 
-/// Whether process `pid` has exited (absent, or a zombie).
-fn stopped(pid: &str) -> bool {
-    match fs::read_to_string(Path::new("/proc").join(pid).join("stat")) {
-        Err(_) => true,
-        Ok(stat) => stat
-            .rsplit_once(')')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
-    }
+/// Whether process `pid` has exited (absent, or a zombie). A malformed
+/// pid or unreadable process state is uncertainty, never absence
+/// (S1-evidence2 fix round 2, finding 13).
+fn stopped(pid: &str) -> Result<bool, String> {
+    let pid: u32 = pid
+        .parse()
+        .map_err(|error| format!("reported pid {pid:?}: {error}"))?;
+    process::exited(pid)
 }
 
 /// Holds Core at its first model output, lets the stall fail the turn,
@@ -304,8 +316,26 @@ fn held_turn(
     setup.sandbox.release_gate("flood")?;
     setup.sandbox.await_gate("burst")?;
     setup.activity_settled(evidence, &session)?;
+    // The stall starts once a delivery blocks, after this release: from
+    // it, the vendor is gone within the stall, the cleanup allowance and
+    // the tolerance.
+    let stall = Duration::from_millis(STALL_MS.parse().map_err(infra)?);
+    let bound = stall + CLEANUP_ALLOWANCE + TOLERANCE;
+    let started = Instant::now();
     setup.sandbox.release_gate("burst")?;
-    setup.await_vendor_stopped()?;
+    let stopped_after = setup.await_vendor_stopped(started, bound)?;
+    evidence
+        .write(
+            "f24_stall_cleanup.json",
+            json!({
+                "boundary":"burst release (at or before the stall's start)",
+                "absent_after_ms":u64::try_from(stopped_after.as_millis()).unwrap_or(u64::MAX),
+                "bound_ms":u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .map_err(infra)?;
     setup.failpoints.release(PAUSE, 2).map_err(infra)?;
     let envelope = setup.wait(evidence, &session)?;
     setup.record(evidence, &envelope, &session)?;
@@ -341,7 +371,7 @@ fn s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output() -> Tes
             check(rows == 342, || format!("{rows} step rows, not 342"))?;
             setup.no_fallback_drops()
         },
-        |evidence| collect_available(evidence, &setup.sandbox.state),
+        |evidence| collect_available(evidence, &setup.sandbox.state, &setup.sandbox.teardown),
     );
     report.require_pass()
 }
@@ -394,7 +424,7 @@ fn s1_wire_route_services_cancel_while_stdin_is_held() -> TestResult {
             drop(daemon);
             setup.no_fallback_drops()
         },
-        |evidence| collect_available(evidence, &setup.sandbox.state),
+        |evidence| collect_available(evidence, &setup.sandbox.state, &setup.sandbox.teardown),
     );
     report.require_pass()
 }
@@ -486,7 +516,50 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
             drop(daemon);
             setup.no_fallback_drops()
         },
-        |evidence| collect_available(evidence, &setup.sandbox.state),
+        |evidence| collect_available(evidence, &setup.sandbox.state, &setup.sandbox.teardown),
     );
     report.require_pass()
+}
+
+/// Polls `gone` until it reports absence, at most `bound` after `boundary`
+/// (S1-evidence2 fix round 1): each probe is timestamped after it returns
+/// and the bound is enforced before its absence is accepted, so a probe
+/// that resumes after expiry and finds the process gone fails. Returns how
+/// long after `boundary` absence was proved.
+fn absent_within(
+    boundary: Instant,
+    bound: Duration,
+    mut gone: impl FnMut() -> Result<bool, String>,
+) -> Result<Duration, String> {
+    loop {
+        let absent = gone()?;
+        let after = Instant::now().saturating_duration_since(boundary);
+        if after > bound {
+            return Err(format!(
+                "absence not proved within {bound:?} of the boundary (probe at {after:?})"
+            ));
+        }
+        if absent {
+            return Ok(after);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`absent_within`] rejects an absence observed only after its bound: the
+/// probe resumes late and finds the process gone (S1-evidence2 fix round 1).
+#[test]
+fn s1_f24_absence_after_the_bound_fails() {
+    let late = absent_within(Instant::now(), Duration::from_millis(50), || {
+        thread::sleep(Duration::from_millis(100));
+        Ok(true)
+    });
+    assert!(late.is_err(), "late absence accepted: {late:?}");
+    let timely = absent_within(Instant::now(), Duration::from_secs(5), || Ok(true));
+    assert!(timely.is_ok(), "{timely:?}");
+    // A malformed pid is uncertainty, never absence (S1-evidence2 fix
+    // round 2, finding 13): the old probe read `/proc/<garbage>/stat`,
+    // failed, and accepted the vendor as stopped.
+    let malformed = absent_within(Instant::now(), Duration::from_secs(5), || stopped("x1"));
+    assert!(malformed.is_err(), "malformed pid accepted: {malformed:?}");
 }

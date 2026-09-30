@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Sandbox, TestResult, cli, events, failure, infra};
-use scenario::{ScenarioError, collect_available, run_scenario};
+use daemon::{Daemon, Sandbox, TestResult, cli, collect_available, events, failure, infra};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -326,7 +326,7 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
                 format!("the envelope still has raw_spans: {envelope}")
             })
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -418,7 +418,7 @@ fn s1_evidence_undecoded_message_is_saved_and_named() -> TestResult {
             }
             Ok(())
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -489,7 +489,7 @@ fn s1_evidence_folder_failure_fails_store_before_launch() -> TestResult {
                 format!("{} gained {entries} entries", folder.display())
             })
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -569,7 +569,7 @@ fn s1_c1_logs_selects_the_turn_and_never_reads_files() -> TestResult {
                 || format!("turn address: {addressed}"),
             )
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }
@@ -683,7 +683,56 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
                 },
             )
         },
-        |_| Ok(()),
+        // The teardown's report: the refused generation's reap and its
+        // (absent) Store's empty inventory.
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
+}
+
+/// S1-evidence2 fix round 2, finding 1: every daemon generation keeps its
+/// own cleanup report and trace, and collection validates all of them. The
+/// first generation's clean report used to stand for the whole scenario:
+/// a later generation's report was never written (`create_new` on the
+/// existing `cleanup.json`), so its failure was lost. Here the second
+/// generation's report cannot be written, and collection fails.
+#[test]
+fn s1_evidence_every_daemon_generation_is_validated() -> TestResult {
+    let sandbox = Sandbox::new(&json!({}))?;
+    let evidence = Evidence::new("s1_evidence_generations", &sandbox.fake, &sandbox.fixture)?;
+    let first = Daemon::start(&sandbox, &evidence)?;
+    let first_pid = first.pid();
+    first.shutdown()?;
+    let second = Daemon::start(&sandbox, &evidence)?;
+    let second_pid = second.pid();
+    // A directory holds the second generation's report path.
+    fs::DirBuilder::new().create(evidence.dir.join("cleanup-2.json"))?;
+    drop(second);
+    let collected = collect_available(&evidence, &sandbox.state, &sandbox.teardown);
+    let cleanup: Value = serde_json::from_slice(&fs::read(evidence.dir.join("cleanup.json"))?)?;
+    let pids: Vec<Value> = cleanup["generations"]
+        .as_array()
+        .ok_or("cleanup.json has no generations")?
+        .iter()
+        .map(|generation| generation["direct_child"]["pid"].clone())
+        .collect();
+    assert_eq!(pids, [json!(first_pid), json!(second_pid)], "{cleanup}");
+    assert_eq!(cleanup["complete"], false, "{cleanup}");
+    let error = collected.expect_err("a generation's lost cleanup report passed");
+    assert!(
+        error.detail().contains("cleanup report not written"),
+        "{error}"
+    );
+    assert!(evidence.dir.join("cleanup-1.json").is_file());
+    let trace = fs::read_to_string(evidence.dir.join("daemon.trace"))?;
+    for generation in 1..=2 {
+        assert!(
+            trace.contains(&format!("=== daemon generation {generation} ===")),
+            "{trace}"
+        );
+    }
+    // Finalized so the self-test leaves no half-written artifact; its
+    // required Store evidence is absent by design.
+    let _ = evidence.finish("pass", "daemon generation self-test");
+    Ok(())
 }
