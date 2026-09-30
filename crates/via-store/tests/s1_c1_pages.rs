@@ -257,6 +257,31 @@ fn s1_c1_events_page_filters_and_bounds() {
     });
 }
 
+/// Design §4.3: a cursor past every sequence SQLite can store is past the
+/// head too: an empty page that stays at `after`, never `store_error`.
+#[test]
+fn s1_c1_events_page_after_above_i64_is_past_the_head() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client().public();
+    let writer = store.client();
+    let id = session(1);
+    runtime().block_on(async {
+        spawn(&writer, &id, None, 0).await;
+        for after in [
+            i64::MAX.unsigned_abs(),
+            i64::MAX.unsigned_abs() + 1,
+            u64::MAX,
+        ] {
+            for turn_filter in [None, Some(1)] {
+                let (events, beyond) = page(&client, &id, turn_filter, after, 200, &[]).await;
+                assert!(events.is_empty());
+                assert_eq!((beyond.next_after, beyond.more), (after, false));
+            }
+        }
+    });
+}
+
 async fn list(client: &StoreClient, query: ListQuery) -> ListPage {
     client.list_page(query).await.unwrap()
 }

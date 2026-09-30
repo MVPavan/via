@@ -2048,6 +2048,15 @@ fn read_events_page(conn: &Connection, query: &EventsQuery) -> Result<EventsRead
             return Ok(EventsRead::TurnNotFound);
         }
     }
+    // Nothing follows the head: an empty page that stays at `after`, also
+    // for a cursor above `i64::MAX`, past every sequence SQLite stores.
+    if query.after >= head {
+        return Ok(EventsRead::Page(EventsPage {
+            events: "[]".to_owned(),
+            next_after: query.after,
+            more: false,
+        }));
+    }
     let too_large = || StoreError::Constraint("event sequence too large");
     let end = query.after.saturating_add(PAGE_SCAN);
     let after = i64::try_from(query.after).map_err(|_| too_large())?;
@@ -2148,6 +2157,8 @@ fn read_list_page(conn: &Connection, query: &ListQuery) -> Result<ListPage, Stor
         }
         let size = SUMMARY_FIXED + ESCAPED * borrowed;
         if bytes + size > PAGE_MAX - PAGE_WRAPPER {
+            // C1 §3.10 (A49): the first summary always fits a page.
+            debug_assert!(bytes > 0, "the first summary always fits a page");
             break;
         }
         let ord: i64 = row.get(8).map_err(sql_error)?;
