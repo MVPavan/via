@@ -1754,6 +1754,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 `core.progress.publish`, `core.finish_running.pause`, `Store::read_count()`, `store.read.delay_ms`,
 `store.rollback.fail`, `store.statvfs.free_bytes`, `core.data_size.walks`,
 `store.data_size.walk` (holds the walk past its 2 s step; critic round),
+`wire.undecoded.before_note` (holds an oversized prefix's save after its blob step; S1 critique),
 `prompt_file.copy.pause`, `blob.write.fail_after`,
 `Store::blob_writes()`, `VIA_TEST_EVENT_STALL_MS`,
 `VIA_TEST_PARTIAL_LINE_MS`, `VIA_TEST_REPLY_WRITE_MS`,
@@ -1835,6 +1836,7 @@ durable `output_schema` (§0).
 | Step counts and tokens are VIA's and unproven for Claude, Codex and OpenCode until their probes (§2.5), so `tokens` may be `null`; `running_tools` lists at most 64 names | each vendor's probe; the owner's accuracy decision (Q-R5-11) |
 | Transcript paths follow each vendor's internal layout; a deleted transcript loses the conversation (R8) | each vendor task |
 | A `wait` releases its slot on disconnect only while no later request bytes are buffered: a client that pipelines bytes behind a `wait` and then disconnects holds the slot until the wait ends (S1 critique, S1-core Sol r2). An idle connection already holds its slot with no deadline (§10.1), so same-user clients can hold slots either way; the CLI never pipelines | a client that pipelines is supported, or slot exhaustion is observed (`via-d9o.2.3`) |
+| Host keeps a failed acquisition's forced-stop fact (the row-4 path) until final shutdown, so repeated scoped `VendorFacts` write failures without a latch grow that set by one generation each (S1 critique, S1-io Sol r2) | Store-failure recovery work, or the growth is observed (`via-d9o.2.3`) |
 | Reusable connections and their evidence are not designed here | `via-4sw.3.2` and the Codex task |
 | The open-session tally is exact only until an uncertain close; blob verification at start is linear in blob bytes, and the start-up sweep holds every referenced blob id in memory | Store-failure recovery work; retention (`via-jm4.18`) |
 | F24 does not fill the observation budgets together with the other holders (A51) | `via-d9o.2.3` measures real vendors, or the gate is extended |
