@@ -37,8 +37,10 @@ Three limits on these guarantees must remain visible:
 2. A blocked peer cannot be guaranteed a reply. The daemon closes the socket
    after the 10 s reply deadline; the caller retries the read.
 3. Group signalling covers processes that remain in the VIA-owned group.
-   Escaped descendants and uninterruptible kernel waits prevent an absolute
-   all-descendants-gone guarantee. Report uncertainty, never false quiescence.
+   Quiescence is group-scoped (plus, on server routes, the vendor's reported
+   tool items; C2 §2 Interrupt), not an all-descendants guarantee: escaped
+   descendants and uninterruptible kernel waits remain possible. Report
+   uncertainty, never false quiescence.
 
 ## 2. Owners, types and task lifetime
 
@@ -836,7 +838,7 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL (§8); adapter-owned `harnesses` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -1057,9 +1059,9 @@ Daemon-crash recovery produces no leftover report: recovered turns carry
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
-data-size warning, WAL limit and checkpoint triggers; see the end of this
-section) are configurable; C1, C2 and every other limit here are fixed
-(T4-A37). All
+data-size warning, WAL limit and checkpoint triggers, and the adapter-owned
+`harnesses` settings; see the end of this section) are configurable; C1, C2
+and every other limit here are fixed (T4-A37). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
@@ -1076,8 +1078,8 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
 | Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
-| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global/raw failure escalates to connection overflow (C2 §4) |
-| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Strip Basic `Authorization` before transport logging/capture; retain credential-redacted metadata and bounded body and HTTP message-boundary evidence; route by owned server generation and vendor session/message IDs |
+| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
+| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Read, count and discard traffic as for pipes (§4: no copy of vendor traffic); only the bounded decode-failure evidence is written, never a Basic `Authorization` header or credential; route by owned server generation and vendor session/message IDs |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
 | C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
@@ -1129,10 +1131,19 @@ The disk free-space floor, the data-size warning, the WAL limit and its
 checkpoint triggers are keys of `daemon.json` in the state directory, with
 provisional defaults. The daemon reads it once at start; a change takes
 effect at the next start, and an invalid file refuses to start with a named
-error. C1, C2, memory and the other runtime §8 limits are not configurable.
+error. The optional `harnesses` member is passed unparsed to `via-adapters`'
+`AdapterConfig` (adapter design §5.4): `harnesses.<name>.binary` (an absolute
+path; the default is a `PATH` lookup) and
+`harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents,
+instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
+`true`; C2 §6.2, AD13). It is read at daemon start like the other keys; a
+change applies to sessions spawned after the next start, and each session
+freezes its settings at spawn. It holds no credentials and no limits.
+C1, C2, memory and the other runtime §8 limits are not configurable.
 The Codex shared server's lanes and tool metadata are fixed buffers counted
-per server by the Codex task, which measures 32 loaded leases and four
-active turns against the RSS gate.
+per server by the Codex task, which measures 32 loaded leases and the
+maximum concurrent active turns that per-connection admission allows (C2
+§3; up to one per leased session) against the RSS gate.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the frozen server key and vendor
 semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
