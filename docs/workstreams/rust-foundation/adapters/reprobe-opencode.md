@@ -234,3 +234,15 @@ Turn ledger (25):
 - t20 ambient instructions, t21 variant, t22 after crash, t23 task.
 
 † no provider call; ‡ loopback fake provider only.
+
+## Addendum: re-check of the `format` read defect (2026-09-30)
+
+The owner asked for a proper re-check. Result: a genuine OpenCode defect, not caused by the probe's request.
+
+- **Live, 1.18.32, fresh private server, 4 free-model prompts:** a control session reads cleanly. A session sent OpenCode's own documented SDK shape (`format:{type:"json_schema",schema:{…}}`) gets correct structured output, then its full message list and a single GET of that user message return 400 "Expected OutputFormatJsonSchema". A trivially valid `format:{"type":"text"}` fails the same way ("Expected OutputFormatText"), so schema content is irrelevant.
+- **Sharper rule than §2:** a list read fails when the page includes a format-bearing message **and** has no next cursor; cursored pages return 200 because that handler branch skips schema encoding. This explains the "one page decoded while a larger page failed" observation. Single GET of the assistant works.
+- **Cause (source, v1.18.32):** `UserMessage.format` uses `Schema.Class` types; the storage read path returns plain JSON, and encoding a class schema requires a class instance, so the database round trip fails. Reproduced offline with the pinned effect version, no model involved.
+- **Upstream:** open issues sst/opencode#26929 (since 2026-05-11, 1.14.48 onward) and #40169 (fork affected too); fix PR #37541 open, not merged; the relevant files are byte-identical in v1.18.33 and on `dev` (source diff, not run live). No need to file another report.
+- **ACP:** the Agent Client Protocol schema (v1, unstable, v2) has no caller-supplied output schema; `PromptRequest` carries only session, content blocks and `_meta`. OpenCode's ACP mode never sends `format` and never returns `structured`. ACP neither provides nor avoids this.
+
+Evidence stays local in `scratchpad/execution/adapter-reprobe/opencode/recheck-format/`.
