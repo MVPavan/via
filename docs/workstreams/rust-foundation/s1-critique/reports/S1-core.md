@@ -218,3 +218,12 @@ Commands were run in the worktree.
   early draft of the finding 2 tests let a post-drain CLI read auto-start
   an idle daemon. The final tests keep a second session's turn open until
   the harness's reads are done.
+
+## Fix round 1 (Sol high r1)
+
+- **Finding.** Sol found that `s1_c1_wait_timeout_bounds_its_store_reads` did not prove the deadline property. A waiter that sat out its whole first read and then checked the deadline also passed.
+- **Test change.** The wait's first Store read is now held at `store.read.stall` and the pause is acknowledged. The test requires the `wait_timeout` reply while that pause is still unreleased. It then releases the pause and checks that the turn completes.
+- **RED.** The test was run with `read.rs` taken from `7370e0e` (`f10-r1-red.log`). It failed with `no reply and no close within 15 s`.
+- **GREEN.**
+  - `s1_c1_intake`: 17 of 17 passed (`f10-r1-green.log`). As evidence only, the reply came after `took_ms` 150.
+  - Task 4 selector, run 3 times: 87 passed each time (`r1-selector-{1,2,3}.log`).

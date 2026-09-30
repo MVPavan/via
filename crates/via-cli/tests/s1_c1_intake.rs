@@ -961,21 +961,22 @@ fn s1_c1_wait_after_a_slow_read_keeps_its_cadence() -> TestResult {
 }
 
 /// C1 §3.8 (S1 critic finding 10): `timeout_ms` bounds `wait`'s Store
-/// reads too. With every Store read delayed 800 ms (`store.read.delay_ms`),
-/// a 150 ms wait on a running turn returns `wait_timeout` while its first
-/// read is still in the Store worker: that read was admitted (its hit is
-/// acknowledged) and no second read began, since the worker serves reads
-/// one at a time. Before the fix the wait waited out that read and made a
-/// second (the turn-existence read) before its timeout. The measured time
-/// is evidence only.
+/// reads too. A 150 ms wait on a running turn sends its first read, which
+/// the Store worker holds at `store.read.stall` (the pause acknowledged).
+/// The wait must reply `wait_timeout` while that pause is still unreleased:
+/// the deadline cut the pending read, and a waiter that sat out its read
+/// first could not reply at all. Released, the worker serves on and the
+/// turn completes. Before the fix the wait never replied while the read was
+/// held. The measured time is evidence only.
 #[test]
 fn s1_c1_wait_timeout_bounds_its_store_reads() -> TestResult {
+    const STALL: &str = "store.read.stall";
     let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
     let evidence = setup.evidence("s1_c1_wait_timeout_reads")?;
     let report = run_scenario(
         evidence,
         |evidence| {
-            hits::count(&setup.dir, READ_DELAY).map_err(infra)?;
+            hits::count(&setup.dir, STALL).map_err(infra)?;
             let daemon = setup.start(evidence, &[])?;
             let receipt = cli(
                 &setup.sandbox,
@@ -1001,47 +1002,33 @@ fn s1_c1_wait_timeout_bounds_its_store_reads() -> TestResult {
                 .to_owned();
             setup.sandbox.await_gate("hold")?;
             let mut waiter = Conn::open(&setup.sandbox)?;
-            let first = hits::hits(&setup.dir, READ_DELAY).map_err(infra)? + 1;
-            setup
-                .failpoints
-                .arm(READ_DELAY, first, "delay_persist:800")
-                .map_err(infra)?;
+            let next = hits::hits(&setup.dir, STALL).map_err(infra)? + 1;
+            setup.failpoints.arm(STALL, next, "pause").map_err(infra)?;
             let started = Instant::now();
-            let reply = waiter.exchange(&line(
+            waiter.send(&line(
                 &json!(1),
                 "wait",
                 &json!({"address":format!("{session}/1"),"timeout_ms":150}),
             ))?;
+            setup
+                .failpoints
+                .wait_ack(STALL, next, "pause", daemon.pid(), Duration::from_secs(5))
+                .map_err(infra)?;
+            // The pause is not released: the reply must come without it.
+            let reply = waiter.reply()?;
             let took = started.elapsed();
-            let second_read = setup
-                .dir
-                .join(format!("{READ_DELAY}.{}.ack", first + 1))
-                .exists();
             evidence
                 .write(
                     "wait_timeout.json",
-                    json!({"took_ms":took.as_millis(),"second_read":second_read})
-                        .to_string()
-                        .as_bytes(),
+                    json!({"took_ms":took.as_millis()}).to_string().as_bytes(),
                 )
                 .map_err(infra)?;
+            setup.failpoints.release(STALL, next).map_err(infra)?;
+            let reply = reply.ok_or_else(|| failure("the daemon closed the waiter"))?;
             check(is_error(&reply, -32016, "wait_timeout"), || {
                 format!("bounded wait: {reply}")
             })?;
-            check(!second_read, || {
-                format!("the wait outlived its first read ({took:?})")
-            })?;
-            setup
-                .failpoints
-                .wait_ack(
-                    READ_DELAY,
-                    first,
-                    "delay",
-                    daemon.pid(),
-                    Duration::from_secs(5),
-                )
-                .map_err(infra)?;
-            setup.failpoints.disarm(READ_DELAY).map_err(infra)?;
+            setup.failpoints.disarm(STALL).map_err(infra)?;
             setup.sandbox.release_gate("hold")?;
             let envelope = cli(
                 &setup.sandbox,
