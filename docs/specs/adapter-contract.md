@@ -187,12 +187,13 @@ pub struct VendorIdentity {
 
 | Type | Fields |
 |---|---|
-| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5) |
+| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5) |
 | `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `adapter_version`, `vendor_version: Option<String>` (last seen for the binary identity, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, inherited-configuration settings (§6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the input to `check_turn` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
 | `SteerInput` | `text`, `expected_vendor_turn: Option<VendorTurnId>` |
 | `SteerDelivery` | `Injected`, `Partial(&'static str)` |
@@ -383,7 +384,7 @@ For Codex shared stdio, Route partitions its existing 1,024-message/4 MiB
 message staging into per-thread ingress lanes capped at 16 messages/1 MiB,
 before C2 observations. This adds no extra buffer tier. The first full lane
 immediately quarantines that thread generation, with sticky overflow health
-carrying lane generation, the original triggering turn, first unqueued raw
+carrying lane generation, the original triggering turn, first unqueued message
 reference and saturating omitted count. The triggering turn identifies lost
 evidence; continuity loss applies to every **nonterminal** turn submitted in
 that generation, including a successor active after an older turn's late
@@ -465,14 +466,17 @@ order, so the two never meet.
 `exit` and `launched`, plus two facts: `acknowledged` (the vendor
 acknowledged the stop within the cutoff) and `shared` (the connection is a
 persistent server, from the route plan). Core's stop outcome is `forced`,
-else `acknowledged`, else `requested`; a launched, unforced stop on a
-`shared` connection gives outcome `unknown` (C1 §7.6 "Force deadline, shared
-server"), while private routes keep `requested`. Without an earlier order
-the result is always `failed(deadline_wall)` with `cancel` filled (C1 §7.6
-"Core deadline"); an unproven stop shows as `cancel.outcome: requested` and
-`cancel.cleanup: uncertain`. The wall has passed, so P7 settles cleanup at
-once. With an earlier order, the order's row applies (C1 §7.6 force rows,
-including `unknown` on a shared server).
+else `acknowledged`, else `requested`. Only one branch changes: an order's
+launched, unforced, unacknowledged stop with no terminal, which S1 resolves
+`unknown` with outcome `requested`, gives outcome `unknown` when `shared`
+(C1 §7.6 "Force deadline, shared server"); private routes keep `requested`.
+Without an earlier order the result is always `failed(deadline_wall)` with
+`cancel` filled (C1 §7.6 "Core deadline"): a stop acknowledged within the
+cutoff shows `cancel.outcome: acknowledged` with cleanup per §2 Interrupt; an
+unproven stop shows as `cancel.outcome: requested` and `cancel.cleanup:
+uncertain`. The wall has passed, so P7's cap `min(ack + tool_grace, wall)`
+settles cleanup at once. With an earlier order, the order's row applies
+(C1 §7.6 force rows, including `unknown` on a shared server).
 
 **Two deadlines.** The stop order's `force_at` and `close_by` bound the wait
 for acknowledgement. They do not apply after acknowledgement on server
@@ -497,7 +501,7 @@ never signals or manages them. Detection is pending an owner decision
 | Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle policy); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
 | Carried by | Host `CloseReport.leftovers` → Wire `WireCloseReport` → Route result (the shared runtime and each server route's close and loss paths) → Adapter `TurnEnd.leftovers` or driver `CloseReport.leftovers` (§2) → Core envelope, close result and `session.closed` (Store `commit_closed`). Recovery carries none. |
 | Trigger | After Host's close of the connection completes, within its existing bound (unchanged); the report is ready before its destination commits. |
-| Shape | C1 §5 `leftovers`: `{scope: "turn" \| "server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true} \| null`. `processes`: at most 16, oldest first (start time, then pid). `total`: the matches found; exact when not `incomplete`, a lower bound otherwise; `total > processes.len()` is the only truncation signal, distinct from `incomplete`. `started_at`: RFC 3339 UTC with second precision. `comm`: the kernel's name (at most 15 bytes), lossy UTF-8. `null` when no report was produced. |
+| Shape | C1 §5 `leftovers`: `{scope: "turn" \| "server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true} \| null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found; exact when not `incomplete`, a lower bound otherwise; `total > processes.len()` is the only truncation signal, distinct from `incomplete`. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's name (at most 15 bytes), lossy UTF-8. `null` when no report was produced. |
 | Privacy | Nothing from detection is persisted except the report. No environment byte, marker value or command line enters the report, errors (pid and errno only), logs or `Debug` output (coding-style §8). `comm` is process-controlled (a process can name itself anything). |
 | Future (not built) | A kill-or-keep option; Codex `thread/backgroundTerminals/clean` (experimental) is its Codex mechanism. |
 
@@ -632,7 +636,7 @@ for exact validation; canonical never-ask, identity and bound settings win.
 | Observations | `assistant`, `user`, `result` (probe); `result` fields `subtype` (`success`, `error_during_execution`), `is_error`, `terminal_reason` (`completed`, `aborted_tools`), `stop_reason`, `num_turns`, `permission_denials`, `usage`, `total_cost_usd`, `session_id`, `queued_turn_count` (probe, 2.1.283); `structured_output` (docs); a vendor-synthetic API-error message is never acceptance, progress or final text (§2) | `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed` (`agentMessage`, `commandExecution{processId, exitCode, status}`, `fileChange`, `reasoning`), `turn/diff/updated`, `thread/tokenUsage/updated`, `turn/completed` (`turn.status` `completed`/`interrupted`/`failed`, `turn.error`), `error {willRetry}`, `thread/status/changed`, `thread/closed` (schema); final text comes only from `agentMessage` items with `phase:"final_answer"` | pinned legacy `message.*`/`session.*` SSE family; correlate session, caller message, assistant parent and part IDs; unknown notifications bounded, malformed known payloads protocol errors (§§4–5); the terminal follows the packet's three steps, acknowledgement, terminal and cleanup (§4) | `session/update` (`agent_message_chunk`, `tool_call`, `tool_call_update`, `usage_update`) (docs) |
 | `Steer` | `unsupported` (A3, Q6) | `turn/steer {threadId, expectedTurnId, input}` → `turnId`; `activeTurnNotSteerable` → `SteerError::NotSteerable` (schema) | `unsupported`: a v1 busy prompt merges into the running turn, and v2 `delivery:"steer"` runs a separate conversation (A3's reasoning) | `unsupported` (docs) |
 | `Interrupt` (soft stop; also the wall's cleanup step, §4.1) | `control_request {request_id, request:{subtype:"interrupt"}}` → `control_response {subtype:"success", response:{still_queued}}` (probe); then `result` with `error_during_execution`/`aborted_tools` → `Acknowledged`; the interrupt stops what is still in the agent's parent tree; then stdin EOF (EOF alone does not stop an active tool), then S1's close: graceful, then the hard stop at the stop order's bound; private-group `Quiescent` requires runtime §5.2 positive absence proof | `turn/interrupt {threadId, turnId}` → wait `turn/completed` status `interrupted` → `Acknowledged`; `run_turn` returns when every reported `commandExecution` item has completed, or at `min(ack + tool_grace, wall)` with cleanup `Uncertain` (§4.1; P2/P2b: tool ran ≥ 60 s after `interrupted`; `command/exec/terminate` is only for client-started commands, `thread/unsubscribe` does not stop it); background terminals keep running and remain the server's | `POST /session/{id}/abort` (kills only the tool's own group); the 200 is command acknowledgement only. `Acknowledged` once both the session's `MessageAbortedError` and idle have been seen, independent of assistant completion; the adapter keeps that instant. Cleanup reconciliation then runs within `min(ack + tool_grace, wall)` (§4.1), and §2 Interrupt decides cleanup | `session/cancel` notification; `stopReason: cancelled` → `Acknowledged` (docs); cleanup `Uncertain` |
-| `Close` | per turn: stdin EOF after the result, then S1's close (graceful, then Force: request verified anchor own-group cleanup). stdin EOF does not cancel the running turn: with no active tool it completed the turn, and it did not stop an active tool. Interrupt must precede EOF; S1's close bound and hard stop are the fallback | session: detach with `thread/unsubscribe {threadId}`; never delete/archive the thread or close shared stdin for one session. Server (idle retirement, §3): stdin close, which stopped every tool under the sandbox (untested under full access, where grandchildren survived SIGKILL), then S1's hard stop | detach session driver/subscription; preserve private vendor DB; server close is `POST /instance/dispose`, then S1's hard stop (the server has no SIGTERM handler), a separate Host operation with ownership evidence (§§2, 4) | `session/close` if advertised, else detach; Force requests verified anchor cleanup for a private agent |
+| `Close` | per turn: stdin EOF after the result, then S1's close (graceful, then Force: request verified anchor own-group cleanup). stdin EOF does not cancel the running turn: with no active tool it completed the turn, and it did not stop an active tool. Interrupt must precede EOF; S1's close bound and hard stop are the fallback | session: detach with `thread/unsubscribe {threadId}`; never delete/archive the thread or close shared stdin for one session. Server (idle retirement, §3): stdin close, which stopped every tool under the sandbox (untested under full access, where grandchildren survived SIGKILL), then S1's hard stop | C1 `close`: cancel active work, then `POST /instance/dispose` of the session's owned server, then S1's hard stop within the close bound (the server has no SIGTERM handler); preserve the private vendor DB and history; the close result carries `leftovers` (§4.2). Idle retirement is a separate Host operation with ownership evidence and reports nothing (§§2, 4) | `session/close` if advertised, else detach; Force requests verified anchor cleanup for a private agent |
 | Auto-decline (D3) | unknown control requests must be answered or fail closed within 5 s on the control path; no fabricated/dropped refusal is success; `none` recipe: denials from `permission_denials`, deduplicated against a live `permission_denied` by `tool_use_id`; a decline-caused entry is suppressed | pinned 0.157.1 no-grant bodies: command/file approval → {"decision":"decline"}, permissions → {"permissions":{}}, tool user input → {"answers":{}}, MCP elicitation → {"action":"decline"}, tool call → {"success":false,"contentItems":[]}; auth/attestation/legacy/unknown → JSON-RPC -32601 with incoming ID, within A6's 5 s; live receipt remains unproved; no denials are reported | modern permission and question requests reject under §5 within A6's 5 s; a decline-caused denial is suppressed by `callID`; unknown effective policy prevents prompt; live receipt/control proof remains open | session/request_permission → reject-kind option else cancelled (A5, unverified) |
 | Bound | `read_only`, `workspace_write` and `network:false` refused pending CLAUDE-BOUND-1; `full,network:true` separately eligible after exact live recipe continuity proof; tool permissions are not all-tool OS containment | `read_only`/`workspace_write` protocol-mapped but refused pending `via-5lr.3.4`; `full,network:true` uses `dangerFullAccess`; `full,network:false` refused; no fallback to full | only `full,network:true`; nonempty `extra_write_dirs` → `invalid_params` before allocation/I/O; changed bound → `bound_unsupported` before vendor I/O (§§2–3) | `full` only (D7) |
 | Usage, cost | turn aggregate: `result.usage` per turn is authoritative (assistant snapshots are partial) → tokens `turn`; `total_cost_usd` → cost `session_cumulative`, `reported`; `modelUsage.costBasis` and `fallback_credit` kept in `vendor` | per model call: keyless `tokenUsage.last` samples add (their sum equals the change in `.total`) → scope `turn`; `total`, `cacheWriteInputTokens` and `modelContextWindow` → `vendor`; cost `unavailable` | per model call: assistant samples keyed by message ID, summed → scope `turn`; `input` excludes cache-read; child task sessions are excluded (§7) | `usage_update` context tokens; optional cumulative cost (docs) |
@@ -763,14 +767,17 @@ opt-in live check, never in the default gate):
     On a server route `run_turn` returns when every reported tool item has
     ended or at `min(ack + tool_grace, wall)`, with cleanup `Uncertain` for
     unresolved tools; a settled result never carries `Pending`. With no
-    acknowledgement by `force_at`, outcome is `unknown`; one session never
-    kills its shared server.
+    acknowledgement by `force_at`, a shared server gives state and outcome
+    `unknown` and is never killed for one session; a private route follows
+    S1's force path (C1 §7.6 private-process row).
 11. Close(Graceful) positively verifies private group absence on its normal
     path; Close(Force) returns within its deadline with proved or uncertain
     cleanup. A lost/unverified anchor follows runtime §5's degraded case;
     neither close mode touches a shared server's stdin for one session.
-    Cleanup covers only the agent's own group; descendants outside it are
-    leftovers (§4.2), never part of cleanup.
+    Process-group cleanup covers only the agent's own group; on server
+    routes the vendor's reported tool items also count, wherever their
+    processes run (§2 Interrupt). Descendants outside the group that no
+    vendor item tracks are leftovers (§4.2), never part of cleanup.
 12. Backpressure: with Core stalled, the driver blocks on the observation
     channel while the vendor pipe keeps draining; a stall past
     `event_stall_ms` closes the session's route hop: a private route fails
