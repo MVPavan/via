@@ -620,3 +620,74 @@ its folder anywhere in the suite.
 **Leaked processes.** The known `s1_host` `anchor_entry` processes leaked
 again, 6 of them. I SIGKILLed them by explicit pid; no process from this
 worktree remains.
+
+## Fix round 3 (Sol high r3, findings triaged by the coordinator)
+
+Sol r3 confirmed that round 2's findings are fixed. The coordinator
+handled its two new findings as follows:
+- Finding 1: fixed.
+- Finding 2: recorded as a known limitation.
+
+Logs are under `scratchpad/s1/contract/r3-*` in the main checkout.
+
+### Finding 1: an unreadable environment is not absence
+
+`scan_processes`, which `sandbox_processes` calls with `fs::read`, now
+classifies each `/proc/<pid>` as follows:
+- An `environ` read that fails with `NotFound` or `ESRCH` means the
+  process vanished, so it is absent.
+- Any other `environ` error makes the scan read `cmdline`:
+  - If `cmdline` also vanished, the process is absent.
+  - If `argv[0]` is a program other than this build's `via`, the process
+    is unrelated.
+  - Otherwise, including when `cmdline` itself is unreadable, the proof
+    is indeterminate. The sandbox is kept and the scenario records
+    `infrastructure_failure`.
+
+This deviates from the literal rule ("any other read error ... makes the
+proof indeterminate"), out of necessity. On this machine, the user's own
+non-dumpable processes refuse `environ` with `PermissionDenied` even
+though they run under the same uid: `systemd --user`, `(sd-pam)`, `codex`
+and `cat`. Under the literal rule every exit proof would be indeterminate,
+so every scenario would record `infrastructure_failure`. Every sandbox
+process runs `via`, either directly or as a daemon the CLI started with
+`current_exe()`, so a process whose `argv[0]` is another program cannot be
+one of them.
+
+The self-test is
+`collector_exit_proof_is_indeterminate_for_an_unreadable_via_process`. It
+injects errors through the reader into a live `sleep` process that carries
+the sandbox's marker, and checks five cases:
+
+| Injected condition | Expected result |
+| --- | --- |
+| `environ` denied, `cmdline` shows `via` | indeterminate error |
+| `environ` and `cmdline` both denied | indeterminate error |
+| `environ` denied, real `cmdline` (`sleep`) | unrelated, empty |
+| both vanished (`NotFound`) | absent, empty |
+| nothing injected | the process is found |
+
+### Finding 2: `connect` in `c1_protocol` can overrun the budget (not fixed)
+
+This is a known limitation. `Connection::open` calls a blocking
+`UnixStream::connect` before it sets the socket timeouts. A listener with
+a full accept queue can therefore hold the `c1_protocol` stop past its
+budget, and the per-operation timeouts do not add up to an absolute
+deadline.
+
+Two things bound the effect:
+- A proof that completes late is still rejected ("the exit proof exceeded
+  its budget"), so the result is `infrastructure_failure`, never a false
+  pass.
+- nextest bounds the test's runtime.
+
+Revisit this if `c1_protocol` scenarios start stalling in teardown.
+
+### Fix-round-3 checks (tip `4826eba`)
+
+- Collector self-tests: 8 of 8 passed (`r3-selftest.log`).
+- `cargo nextest run --locked -p via-cli --features test-failpoints`: 256
+  passed, 1 skipped (`r3-failpoints.log`).
+- Evidence completeness (`r3-summary-check.log`): 255 new summaries across
+  237 scenarios, all `pass` with complete evidence.
+- No process from this worktree remains.
