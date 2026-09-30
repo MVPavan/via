@@ -38,6 +38,14 @@ const PAUSE: &str = "core.observations.pause";
 const FALLBACK: &str = "wire.fallback_drop";
 /// The lowered stall (`VIA_TEST_EVENT_STALL_MS`).
 const STALL_MS: &str = "500";
+/// Runtime §5.2 cleanup allowance after a deadline with no budget left:
+/// TERM, at most 2 s, then KILL and at most 1 s for exit.
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
+/// Explicit scheduler tolerance for the end-to-end bound over the cleanup
+/// allowance: the harness's stall boundary is taken before the vendor's
+/// last writes, so it also covers them and the 10 ms absence polling under
+/// a loaded parallel run (a contract upper bound, design T4-A50).
+const TOLERANCE: Duration = Duration::from_secs(2);
 
 fn accepted() -> Value {
     json!({"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}})
@@ -208,20 +216,27 @@ impl Setup {
             .ok_or_else(|| failure(format!("daemon status has no pid: {status}")))
     }
 
-    /// Waits until the fake's reported process is gone: Route stopped it.
-    fn await_vendor_stopped(&self) -> Result<(), ScenarioError> {
+    /// Waits until the fake's reported process is gone, Route stopped it,
+    /// at most `bound` after `boundary`; returns how long after `boundary`
+    /// it was gone.
+    fn await_vendor_stopped(
+        &self,
+        boundary: Instant,
+        bound: Duration,
+    ) -> Result<Duration, ScenarioError> {
         let pid_file = self.sandbox.sync.join("agent.pid");
-        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            let after = Instant::now().saturating_duration_since(boundary);
             if let Ok(pid) = fs::read_to_string(&pid_file)
                 && stopped(pid.trim())
             {
-                return Ok(());
+                return Ok(after);
             }
-            if Instant::now() >= deadline {
-                return Err(ScenarioError::Timeout(
-                    "the silent vendor was not stopped while Core was held".to_owned(),
-                ));
+            if after > bound {
+                return Err(failure(format!(
+                    "the silent vendor outlived the stall's start by {after:?} (> {bound:?}) \
+                     while Core was held"
+                )));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -304,8 +319,26 @@ fn held_turn(
     setup.sandbox.release_gate("flood")?;
     setup.sandbox.await_gate("burst")?;
     setup.activity_settled(evidence, &session)?;
+    // The stall starts once a delivery blocks, after this release: from
+    // it, the vendor is gone within the stall, the cleanup allowance and
+    // the tolerance.
+    let stall = Duration::from_millis(STALL_MS.parse().map_err(infra)?);
+    let bound = stall + CLEANUP_ALLOWANCE + TOLERANCE;
+    let started = Instant::now();
     setup.sandbox.release_gate("burst")?;
-    setup.await_vendor_stopped()?;
+    let stopped_after = setup.await_vendor_stopped(started, bound)?;
+    evidence
+        .write(
+            "f24_stall_cleanup.json",
+            json!({
+                "boundary":"burst release (at or before the stall's start)",
+                "absent_after_ms":u64::try_from(stopped_after.as_millis()).unwrap_or(u64::MAX),
+                "bound_ms":u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .map_err(infra)?;
     setup.failpoints.release(PAUSE, 2).map_err(infra)?;
     let envelope = setup.wait(evidence, &session)?;
     setup.record(evidence, &envelope, &session)?;

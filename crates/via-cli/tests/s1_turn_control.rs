@@ -40,6 +40,15 @@ use std::time::{Duration, Instant, SystemTime};
 use evidenced::evidenced;
 use serde_json::{Value, json};
 
+/// Runtime §5.2 cleanup allowance after a deadline with no budget left:
+/// TERM, at most 2 s, then KILL and at most 1 s for exit.
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
+/// Explicit scheduler tolerance for the end-to-end bound over the cleanup
+/// allowance: the harness's boundary is taken before the spawn request, so
+/// it also covers that request's latency and the 5 ms absence polling
+/// under a loaded parallel run (a contract upper bound, design T4-A50).
+const TOLERANCE: Duration = Duration::from_secs(2);
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// A finished CLI call.
@@ -364,6 +373,14 @@ impl Sandbox {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Writes `value` as scenario evidence file `name`.
+    fn record(&self, name: &str, value: &Value) -> TestResult {
+        self.evidence
+            .as_ref()
+            .ok_or("the sandbox has no evidence")?
+            .write(name, value.to_string().as_bytes())
     }
 
     /// A file in the turn's evidence folder (Task 4 design §7.1).
@@ -989,8 +1006,29 @@ fn s1_f19_wall_deadline_clears_grandchild() -> TestResult {
             ],
         ))?;
         let daemon = sandbox.start()?;
+        // At or before the wall deadline's origin, so `boundary` is at or
+        // before the deadline itself.
+        let requested = Instant::now();
         let (session, _) = sandbox.spawn("wall", &["--wall-ms", "1000"])?;
         let grandchild = sandbox.pid("gc.pid")?;
+        let boundary = requested + Duration::from_millis(1000);
+        let bound = CLEANUP_ALLOWANCE + TOLERANCE;
+        while process_live(grandchild) {
+            let after = Instant::now().saturating_duration_since(boundary);
+            check(after <= bound, || {
+                format!("the grandchild outlived the wall deadline by {after:?} (> {bound:?})")
+            })?;
+            thread::sleep(Duration::from_millis(5));
+        }
+        let absent_after = Instant::now().saturating_duration_since(boundary);
+        sandbox.record(
+            "f19_wall_cleanup.json",
+            &json!({
+                "boundary":"spawn request + wall_ms (at or before the wall deadline)",
+                "absent_after_ms":u64::try_from(absent_after.as_millis()).unwrap_or(u64::MAX),
+                "bound_ms":u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            }),
+        )?;
         let envelope = sandbox.wait(&format!("{session}/1"))?;
         check(
             envelope["state"] == "failed"
