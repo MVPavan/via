@@ -98,9 +98,61 @@ pub fn scan(bytes: &[u8]) -> Result<Scanned, LimitError> {
     })
 }
 
+/// The kind of one JSON value, read from its text (design §10.2): a
+/// free-form C1 member is kept as its raw text and refused by its shape,
+/// never built into a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Shape {
+    /// `null`.
+    Null,
+    /// `true` or `false`.
+    Bool,
+    /// A number.
+    Number,
+    /// A string.
+    String,
+    /// An array; `empty` when it has no element.
+    Array {
+        /// No element.
+        empty: bool,
+    },
+    /// An object; `empty` when it has no member.
+    Object {
+        /// No member.
+        empty: bool,
+    },
+}
+
+/// The shape of `text`, one valid JSON value as `serde_json`'s `RawValue`
+/// holds it: its first byte names the kind, and for a container the next
+/// non-whitespace byte tells whether it is empty.
+pub fn shape(text: &str) -> Shape {
+    let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+    let mut bytes = text.as_bytes().iter().filter(|byte| !is_space(byte));
+    match bytes.next() {
+        Some(b'n') => Shape::Null,
+        Some(b't' | b'f') => Shape::Bool,
+        Some(b'"') => Shape::String,
+        Some(b'[') => Shape::Array {
+            empty: bytes.next() == Some(&b']'),
+        },
+        Some(b'{') => Shape::Object {
+            empty: bytes.next() == Some(&b'}'),
+        },
+        // A number (a valid value has no other first byte).
+        _ => Shape::Number,
+    }
+}
+
+/// `text` as a list of strings, or `None` when it is anything else
+/// (design §10.2, §11.1 `require`). Bounded by the request line.
+pub fn string_list(text: &str) -> Option<Vec<String>> {
+    serde_json::from_str(text).ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LimitError, Scanned, scan};
+    use super::{LimitError, Scanned, Shape, scan, shape, string_list};
 
     #[test]
     fn strings_escapes_and_scalars_count_once() {
@@ -110,5 +162,31 @@ mod tests {
         );
         assert_eq!(scan(b"").map(|scanned| scanned.nodes), Ok(0));
         assert_eq!(scan("[".repeat(65).as_bytes()), Err(LimitError::Depth));
+    }
+
+    /// Design §10.2: a free-form member's kind is read from its text
+    /// without building a value.
+    #[test]
+    fn shape_names_the_kind_of_a_value() {
+        assert_eq!(shape("null"), Shape::Null);
+        assert_eq!(shape(" true"), Shape::Bool);
+        assert_eq!(shape("-1.5e3"), Shape::Number);
+        assert_eq!(shape(r#""s""#), Shape::String);
+        assert_eq!(shape("[ ]"), Shape::Array { empty: true });
+        assert_eq!(shape("[0]"), Shape::Array { empty: false });
+        assert_eq!(shape("{ }"), Shape::Object { empty: true });
+        assert_eq!(shape(r#"{"k":1}"#), Shape::Object { empty: false });
+    }
+
+    #[test]
+    fn string_list_expands_a_list_of_strings_only() {
+        assert_eq!(
+            string_list(r#"["spawn", "steer:partial"]"#),
+            Some(vec!["spawn".to_owned(), "steer:partial".to_owned()])
+        );
+        assert_eq!(string_list("[]"), Some(Vec::new()));
+        for other in [r#""spawn""#, "[1]", "null", r#"{"a":"b"}"#, r#"["a",null]"#] {
+            assert_eq!(string_list(other), None, "{other}");
+        }
     }
 }

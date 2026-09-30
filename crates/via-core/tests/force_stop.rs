@@ -113,6 +113,8 @@ fn force_before_dispatch_cancels_the_queued_turn_without_submission() {
         assert_eq!(report.anchors, 0, "nothing was launched: {report:?}");
 
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "cancelled", "{envelope}");
         assert!(envelope["failure"].is_null(), "{envelope}");
         assert_eq!(envelope["stop_reason"], "interrupted", "{envelope}");
@@ -216,6 +218,7 @@ fn force_during_stalled_acquisition_settles_the_turn() {
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "cancelled", "{envelope}");
         assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
         assert_eq!(envelope["cancel"]["cleanup"], "uncertain", "{envelope}");
@@ -288,6 +291,7 @@ fn force_over_stand_in_within(
             .await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         let events = engine.events(session.as_str()).await.unwrap()["events"]
             .as_array()
             .unwrap()

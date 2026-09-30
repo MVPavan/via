@@ -101,6 +101,7 @@ async fn running_turn(client: &StoreClient) {
             handle_hash: [7_u8; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
+            label: None,
             prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             initial_event: event("turn.queued", 1),
@@ -210,6 +211,7 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
+                label: None,
                 prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
@@ -228,7 +230,13 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
             .commit_closing_terminal(cancelled(), event("session.closed", 3))
             .await;
         assert!(matches!(failed, Err(StoreError::Write(_))), "{failed:?}");
-        assert!(client.result(&session(), turn()).await.unwrap().is_none());
+        assert!(
+            client
+                .result_text(&session(), turn())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(client.next_seq(&session()).await.unwrap(), Some(2));
         assert!(
             client
@@ -254,6 +262,7 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
+                label: None,
                 prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
@@ -286,7 +295,13 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
             .await;
         assert!(matches!(closed, Ok(false)), "{closed:?}");
         assert!(!seams.acked("store.commit.rider", 1));
-        assert!(client.result(&session(), turn()).await.unwrap().is_some());
+        assert!(
+            client
+                .result_text(&session(), turn())
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(client.next_seq(&session()).await.unwrap(), Some(4));
     });
 }
@@ -326,12 +341,12 @@ fn request_seams_report_the_split_errors() {
         ));
 
         seams.arm("store.sqlite.corrupt", 1, "fail_io", false);
-        let corrupt = client.result(&session(), turn()).await;
+        let corrupt = client.result_text(&session(), turn()).await;
         assert!(
             matches!(corrupt, Err(StoreError::Corrupt(_))),
             "{corrupt:?}"
         );
-        assert!(client.result(&session(), turn()).await.is_ok());
+        assert!(client.result_text(&session(), turn()).await.is_ok());
     });
 }
 
@@ -349,6 +364,7 @@ fn read_seams_fail_only_their_reads() {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
+                label: None,
                 prompt: "p".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: event("turn.queued", 1),
@@ -372,7 +388,7 @@ fn read_seams_fail_only_their_reads() {
         seams.arm("store.read.dispatch", 6, "fail_io", false);
         assert!(client.predecessors(&session(), turn()).await.is_err());
         assert!(client.predecessors(&session(), turn()).await.is_ok());
-        assert!(client.result(&session(), turn()).await.is_ok());
+        assert!(client.result_text(&session(), turn()).await.is_ok());
     });
 }
 
@@ -387,7 +403,7 @@ fn read_stall_holds_the_worker_until_release() {
         seams.arm("store.read.stall", 1, "pause", false);
         let stalled = tokio::spawn({
             let client = client.clone();
-            async move { client.result(&session(), turn()).await }
+            async move { client.result_text(&session(), turn()).await }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !seams.acked("store.read.stall", 1) {
@@ -452,7 +468,7 @@ fn every_read_reports_corruption_before_its_reply() {
         read!("queued_turn", client.queued_turn(&s, t)),
         read!("predecessors", client.predecessors(&s, t)),
         read!("next_seq", client.next_seq(&s)),
-        read!("result", client.result(&s, t)),
+        read!("result", client.result_text(&s, t)),
         read!("close_result", client.session_close_result(&s)),
         read!("closing_sessions", client.closing_sessions_page(None, 8)),
         read!("terminated", client.terminated(vec![(s.clone(), t)])),

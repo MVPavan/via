@@ -267,6 +267,8 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
         "VIA_TEST_CONNECTION_SLOTS",
         "VIA_TEST_IDLE_EXIT_MS",
         "VIA_TEST_CLIENT_VERSION",
+        "VIA_TEST_PARTIAL_LINE_MS",
+        "VIA_TEST_REPLY_WRITE_MS",
     ] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
@@ -422,6 +424,97 @@ fn transact(
         bail!("daemon response ID mismatch");
     }
     Ok(reply)
+}
+
+/// `via serve --stdio` (C1 §1): forwards bytes unchanged between stdio and
+/// the daemon socket, starting the daemon when none listens. It says no
+/// `hello` itself; its parent does. Stdin's end shuts the socket's write
+/// side; the proxy ends when the daemon's side ends.
+pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
+    let paths = paths()?;
+    let socket = paths.runtime.join("via.sock");
+    let mut starter = Starter::new();
+    let stream = loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                starter.check()?;
+                starter.advance(&paths)?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let stream = verified_peer(stream, rustix::process::geteuid().as_raw())?;
+    // Listening: the pipe is dropped and later daemon writes fail silently.
+    starter.starting = None;
+    let mut to_daemon = stream.try_clone()?;
+    let mut from_daemon = stream;
+    // Blocking copies: a stdin read cannot be cancelled, and the process
+    // exits without joining it (`main` shuts the runtime down in the
+    // background).
+    let mut copies = tokio::task::JoinSet::new();
+    copies.spawn_blocking(move || {
+        let read = copy_stdin(&mut to_daemon);
+        // EOF or a failed read: the daemon sees the end of the requests,
+        // so its side ends too. Safe to ignore: a daemon that already
+        // closed the connection has nothing to shut.
+        let _ = to_daemon.shutdown(std::net::Shutdown::Write);
+        Copied::Stdin(read)
+    });
+    copies.spawn_blocking(move || {
+        let mut stdout = io::stdout().lock();
+        let forwarded = io::copy(&mut from_daemon, &mut stdout).and_then(|_| stdout.flush());
+        Copied::Stdout(forwarded)
+    });
+    // The daemon's side ending ends the proxy, whatever stdin is doing: at
+    // once when writing stdout failed; a failed stdin read is reported
+    // once the replies are forwarded.
+    let mut stdin_failed = None;
+    while let Some(copied) = copies.join_next().await {
+        match copied? {
+            Copied::Stdout(Ok(())) => break,
+            Copied::Stdout(Err(error)) => bail!("writing stdout: {error}"),
+            Copied::Stdin(Ok(())) => {}
+            Copied::Stdin(Err(error)) => stdin_failed = Some(error),
+        }
+    }
+    if let Some(error) = stdin_failed {
+        bail!("reading stdin: {error}");
+    }
+    Ok(0)
+}
+
+/// How one of `serve --stdio`'s two copies ended.
+enum Copied {
+    /// Stdin to the daemon: EOF, or the failed stdin read.
+    Stdin(io::Result<()>),
+    /// The daemon to stdout: the daemon's EOF, or the failed stdout write.
+    Stdout(io::Result<()>),
+}
+
+/// Copies stdin to the daemon until EOF. A failed read is the error; a
+/// failed write means the daemon closed the connection, which the other
+/// copy sees as its end.
+fn copy_stdin(to_daemon: &mut UnixStream) -> io::Result<()> {
+    let mut stdin = io::stdin().lock();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match stdin.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if to_daemon.write_all(&buffer[..read]).is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// Refuses a socket whose listener is not `uid` before any protocol byte (and

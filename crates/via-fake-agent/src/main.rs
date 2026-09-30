@@ -78,6 +78,12 @@ enum Step {
         name: String,
     },
     ReportPids,
+    /// Writes the process's working directory to `cwd-<session>-<turn>` in
+    /// the sync directory (Task 4 design §13.1).
+    ReportCwd,
+    /// Writes the start request's prompt bytes to `prompt-<session>-<turn>`
+    /// in the sync directory, for the test to digest (§13.1).
+    EchoPromptDigest,
     SpawnGrandchild {
         name: String,
     },
@@ -194,6 +200,15 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
             Step::Stderr { bytes } => write_pattern(bytes)?,
             Step::ReportPids => {
                 fs::write(sync_dir.join("agent.pid"), process::id().to_string())?;
+            }
+            Step::ReportCwd => {
+                let cwd = env::current_dir()?;
+                let name = format!("cwd-{}-{}", start.session_id, start.turn);
+                fs::write(sync_dir.join(name), cwd.as_os_str().as_encoded_bytes())?;
+            }
+            Step::EchoPromptDigest => {
+                let name = format!("prompt-{}-{}", start.session_id, start.turn);
+                fs::write(sync_dir.join(name), start.prompt.as_bytes())?;
             }
             Step::SpawnGrandchild { name } => {
                 grandchildren.push(spawn_grandchild(&sync_dir, &name)?);

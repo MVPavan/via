@@ -31,10 +31,16 @@ fn spawn(hash: [u8; 32]) -> SpawnRecord {
         handle_hash: hash,
         receipt: json!({"session_id":"s_7f3k9q2mzr4c","turn":"s_7f3k9q2mzr4c/1","state":"queued"}),
         params: json!({"harness":"fake"}),
+        label: None,
         prompt: "test prompt".into(),
         effective: json!({"deadlines":{"wall_ms":1}}),
         initial_event: json!({"type":"turn.queued","seq":1,"turn":1,"at":"2026-01-01T00:00:00.000Z"}),
     }
+}
+
+/// A stored envelope's text, parsed for inspection.
+fn envelope(text: &serde_json::value::RawValue) -> serde_json::Value {
+    serde_json::from_str(text.get()).unwrap()
 }
 
 fn submission() -> SubmissionRecord {
@@ -125,7 +131,13 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
         let client = store.client();
         rt.block_on(async {
             assert_eq!(
-                client.result(&session(), turn()).await.unwrap().unwrap()["final_text"],
+                envelope(
+                    &client
+                        .result_text(&session(), turn())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )["final_text"],
                 "reply"
             );
             let events = client.events(&session(), 1, 10).await.unwrap();
@@ -168,7 +180,13 @@ fn failure_before_vendor_acceptance_is_still_durable() {
             .await
             .unwrap();
         assert_eq!(
-            client.result(&session(), turn()).await.unwrap().unwrap()["state"],
+            envelope(
+                &client
+                    .result_text(&session(), turn())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )["state"],
             "failed"
         );
     });

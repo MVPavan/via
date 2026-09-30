@@ -107,8 +107,8 @@ impl Engine {
                         .ok()
                         .and_then(|outcome| *outcome);
                     queued_failure(outcome)?;
-                    let envelope = self.await_terminal(&session, turn).await?;
-                    return Ok(reply_envelope(&address, &envelope, false));
+                    let facts = self.await_terminal(&session, turn).await?;
+                    return Ok(reply(&address, &facts.state, &facts.cancel, false));
                 }
                 CancelStep::Absent if !rechecked => {
                     // A receipt registers its turn under `admission` after its
@@ -118,8 +118,8 @@ impl Engine {
                 }
                 CancelStep::Absent => {
                     // Design §3.3 [r3.4]: the drop is not a terminal.
-                    let envelope = self.await_terminal(&session, turn).await?;
-                    return Ok(reply_envelope(&address, &envelope, !acknowledged));
+                    let facts = self.await_terminal(&session, turn).await?;
+                    return Ok(reply(&address, &facts.state, &facts.cancel, !acknowledged));
                 }
             }
         }
@@ -204,17 +204,6 @@ fn requested(address: &str, requested_at: &str) -> Value {
             "settled_at": null,
         },
     })
-}
-
-/// The C1 §3.5 result from a committed envelope `await_terminal` returned
-/// (T4-5 moves it to the terminal's facts).
-fn reply_envelope(address: &str, envelope: &Value, already_terminal: bool) -> Value {
-    reply(
-        address,
-        &envelope["state"],
-        &envelope["cancel"],
-        already_terminal,
-    )
 }
 
 /// The C1 §3.5 result from a committed terminal's `state` and `cancel`.

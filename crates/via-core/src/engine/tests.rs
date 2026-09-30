@@ -309,6 +309,7 @@ async fn submitted(engine: &Engine, session: &SessionId, n: u32) -> bool {
         .result(&format!("{}/{n}", session.as_str()))
         .await
         .unwrap();
+    let result: serde_json::Value = serde_json::from_str(result.get()).unwrap();
     !result["timestamps"]["submitted_at"].is_null()
 }
 
@@ -498,6 +499,7 @@ fn force_on_a_queued_only_session_cancels_its_turns_and_closes_it() {
                 .result(&format!("{}/{n}", session.as_str()))
                 .await
                 .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
             assert_eq!(envelope["state"], "cancelled", "{envelope}");
             assert!(envelope["timestamps"]["submitted_at"].is_null());
         }
@@ -566,6 +568,7 @@ fn a_turn_granted_before_force_submits_then_ends_forced_without_launch() {
             .result(&format!("{}/1", session.as_str()))
             .await
             .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "cancelled", "{envelope}");
         assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
         assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
@@ -1212,6 +1215,7 @@ fn a_claim_rollback_has_one_cancellation_owner() {
             .result(&format!("{}/1", session.as_str()))
             .await
             .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         assert!(
             envelope["timestamps"]["submitted_at"].is_null(),
             "{envelope}"
@@ -1278,6 +1282,7 @@ fn a_dispatcher_cancellation_read_failure_replies_store_error_to_joined_callers(
             .result(&format!("{}/1", session.as_str()))
             .await
             .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "cancelled", "{envelope}");
         assert!(!engine.store_failed(), "a read failure never latches");
     });
@@ -2163,6 +2168,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             first_seq: 1,
             submitted: None,
             folder: None,
+            cwd: None,
         };
         let record = super::TurnRecord {
             session: session.clone(),
@@ -2244,6 +2250,13 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let queueing = engine.queueing(&session, turn(1)).await.unwrap();
+        // T4-5 review round 1: the history fallback keeps the session's
+        // frozen `cwd` for the envelope it builds.
+        assert_eq!(
+            queueing.cwd.as_deref(),
+            engine.adapter.fake_cwd().to_str(),
+            "the rebuilt queueing lost the frozen cwd"
+        );
         let slot = super::queue::Slot::new(super::journal::Head::new(None));
         engine
             .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
@@ -2371,6 +2384,7 @@ fn started_one(session: &SessionId) -> super::Started {
         first_seq: 1,
         submitted: None,
         folder: None,
+        cwd: None,
     }
 }
 

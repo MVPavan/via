@@ -1074,7 +1074,9 @@ deadline, breaks silently on oversize (`:45-46`) and builds a whole-request
   bytes. The connection task is sequential (§4).
 - A line is read into one buffer of at most 1 MiB under one 5 s deadline
   from its first byte to its LF (runtime §8, F5; seam
-  `VIA_TEST_PARTIAL_LINE_MS`); an idle connection has none.
+  `VIA_TEST_PARTIAL_LINE_MS`); an idle connection has none. Bytes a client
+  pipelines behind a request still being handled are timed from when the
+  connection task starts reading that line (A48).
 - A line over 1 MiB, LF included, gets one `request_too_large` error
   (-32020, `id: null`, `data {max_bytes: 1048576, use: "prompt_file"}`)
   under a 2 s write bound, then the connection closes without reading the
@@ -1239,6 +1241,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A37 daemon config | revised: five keys |
 | A30, A39, A42 | revised in round 17 [t4r17.1–3]; A46 is new [t4r17.5] |
 | A47 Wire queue count | new during implementation (T4-3, 2026-09-29) |
+| A48 pipelined partial line | new during implementation (T4-5, 2026-09-30) |
 
 ### 12.2 Amendments
 
@@ -1669,6 +1672,18 @@ the other §16 items in `via-d9o.2.3`.
 | RT §8 row "Route message staging" (`runtime-contracts.md`) | "64 messages and 4 MiB/connection" becomes "1,024 messages and 4 MiB/connection" |
 | C2 Codex shared stdio (`adapter-contract.md`) | "64-message/4 MiB" becomes "1,024-message/4 MiB" |
 | `vendors/codex.md` (three places), `vendors/claude-code.md` (one) | "64-message/4 MiB" and "64 messages/4 MiB" become the 1,024-message forms |
+
+**T4-A48. A pipelined partial line** (implementation, T4-5, 2026-09-30).
+The connection task is sequential (§10.1), so it reads the next line only
+after it has answered the current request. A client that sends part of its
+next line while a long request (such as `wait`) is still being handled
+therefore gets its 5 s from when VIA starts reading that line, not from the
+line's first byte. The deadline exists so a partial request cannot hold a
+connection slot or its 1 MiB buffer; during the earlier request the client
+already holds that slot, so the later start holds it no longer than the
+client's own request allows. Timing the bytes from arrival would need a
+second reader per connection. No spec text changes: runtime §8's "5 s
+partial-request deadline prevents monopolization" still holds.
 
 ## 13. Tests (failure-first)
 

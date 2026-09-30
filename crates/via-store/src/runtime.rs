@@ -10,12 +10,12 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 use tokio::sync::oneshot;
 
 use crate::{
     CommitOutcome, EvidenceRoot, Identity, SessionId, StoreFailureKind, TurnNumber,
-    blob::{BlobReader, BlobRef, BlobTasks, BlobWriter, Blobs},
+    blob::{BlobReader, BlobRef, BlobTasks, BlobWriter, Blobs, PromptFileError},
     evidence::sync_dir,
     lanes::{Lane, Lanes},
 };
@@ -190,8 +190,10 @@ pub struct SpawnRecord {
     pub handle_hash: [u8; 32],
     /// Exact C1 receipt to replay after a committed spawn.
     pub receipt: Value,
-    /// Frozen validated parameters for this turn.
+    /// Frozen session parameters: `{harness, model, cwd, allow_untested}`.
     pub params: Value,
+    /// The caller's session label (C1 §4), at most 120 bytes.
+    pub label: Option<String>,
     /// Frozen first-turn prompt.
     pub prompt: Prompt,
     /// Turn 1's frozen effective per-turn values (C1 §3.2 `effective`).
@@ -265,6 +267,8 @@ pub struct SessionSnapshot {
     /// Frozen effective values of the latest accepted turn, whatever its
     /// state: what an omitted per-turn parameter inherits (C1 P5).
     pub latest_effective: Option<Value>,
+    /// The session's frozen `cwd` (Task 4 design §11.1), if it has one.
+    pub cwd: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -280,6 +284,9 @@ pub struct Predecessors {
 pub struct QueuedTurn {
     /// Frozen prompt.
     pub prompt: Prompt,
+    /// The session's frozen `cwd` (Task 4 design §11.1); `None` for a
+    /// session frozen without one.
+    pub cwd: Option<String>,
     /// Frozen effective per-turn values the turn is driven from.
     pub effective: Value,
     /// Time of `turn.queued`.
@@ -868,10 +875,10 @@ pub(crate) enum Command {
         oneshot::Sender<Result<bool, StoreError>>,
     ),
     SessionClosed(SessionId, Value, oneshot::Sender<Result<bool, StoreError>>),
-    Result(
+    ResultText(
         SessionId,
         TurnNumber,
-        oneshot::Sender<Result<Option<Value>, StoreError>>,
+        oneshot::Sender<Result<Option<Box<RawValue>>, StoreError>>,
     ),
     TerminalFacts(
         SessionId,
@@ -1046,7 +1053,7 @@ impl Command {
             | Self::NextSeq(session, _)
             | Self::Predecessors(session, _, _)
             | Self::CloseResult(session, _)
-            | Self::Result(session, _, _)
+            | Self::ResultText(session, _, _)
             | Self::TerminalFacts(session, _, _)
             | Self::Events(session, _, _, _)
             | Self::EvidenceRefs(session, _, _)
@@ -1489,6 +1496,26 @@ impl StoreClient {
         self.blobs.writer().await
     }
 
+    /// Runs one short blocking filesystem step for a request, such as a
+    /// `cwd` check (Task 4 design §11.1), as a blob step: owned by the
+    /// Store's blob task set until it ends and answered within 2 s.
+    pub async fn blocking_step<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        self.blobs.tasks.run(work).await
+    }
+
+    /// Copies a caller's prompt file into a new finished blob in one pass
+    /// ending by `deadline` (Task 4 design §10.4), with no lock held.
+    pub async fn copy_prompt_file(
+        &self,
+        path: std::path::PathBuf,
+        deadline: tokio::time::Instant,
+    ) -> Result<BlobRef, PromptFileError> {
+        self.blobs.copy_file(path, deadline).await
+    }
+
     /// Unlinks a finished blob after a commit known not to have happened;
     /// a lost discard is swept at the next start.
     pub async fn discard_blob(&self, blob: BlobRef) {
@@ -1805,14 +1832,16 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
-    /// Reads a durable terminal envelope, if one has committed.
-    pub async fn result(
+    /// Reads a durable terminal envelope as its stored text, if one has
+    /// committed (Task 4 design §6.7 `result_text`): checked as JSON, never
+    /// built into a value, and written to a caller as stored.
+    pub async fn result_text(
         &self,
         session_id: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Option<Value>, StoreError> {
+    ) -> Result<Option<Box<RawValue>>, StoreError> {
         let (reply, receive) = oneshot::channel();
-        self.send(Command::Result(session_id.clone(), turn, reply))?;
+        self.send(Command::ResultText(session_id.clone(), turn, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 

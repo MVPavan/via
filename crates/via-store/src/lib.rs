@@ -151,7 +151,9 @@ pub mod json_limits;
 mod lanes;
 mod runtime;
 
-pub use blob::{BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX};
+pub use blob::{
+    BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX, PROMPT_MAX, PromptFileError,
+};
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
 pub use lanes::{Lane, Lanes};
 

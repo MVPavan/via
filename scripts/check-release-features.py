@@ -137,6 +137,8 @@ POINTS = [
     "store.read.corrupt.status",
     "core.progress.publish",
     "core.finish_running.pause",
+    # Task 4 T4-5 (design §10.4): a prompt-file copy held after its first fstat.
+    "prompt_file.copy.pause",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
@@ -145,6 +147,9 @@ OVERRIDES = {
     "VIA_TEST_IDLE_EXIT_MS": "1",
     "VIA_TEST_READ_FAILURE_MS": "1",
     "VIA_TEST_EVENT_STALL_MS": "1",
+    # Task 4 T4-5 (design §10.1): the C1 partial-line and reply-write bounds.
+    "VIA_TEST_PARTIAL_LINE_MS": "1",
+    "VIA_TEST_REPLY_WRITE_MS": "1",
 }
 MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {

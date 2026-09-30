@@ -325,7 +325,7 @@ impl Command {
                 | Self::QueuedTurn(..)
                 | Self::Predecessors(..)
                 | Self::NextSeq(..)
-                | Self::Result(..)
+                | Self::ResultText(..)
                 | Self::TerminalFacts(..)
                 | Self::CloseResult(..)
                 | Self::ClosingSessions(..)
@@ -355,7 +355,7 @@ impl Command {
             Self::QueuedTurn(..) => "store.read.corrupt.queued_turn",
             Self::Predecessors(..) => "store.read.corrupt.predecessors",
             Self::NextSeq(..) => "store.read.corrupt.next_seq",
-            Self::Result(..) => "store.read.corrupt.result",
+            Self::ResultText(..) => "store.read.corrupt.result",
             Self::TerminalFacts(..) => "store.read.corrupt.terminal_facts",
             Self::CloseResult(..) => "store.read.corrupt.close_result",
             Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
@@ -457,7 +457,9 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
             reply!(reply, read_predecessors(conn, &session, turn));
         }
         Command::NextSeq(session, reply) => reply!(reply, read_next_seq(conn, &session)),
-        Command::Result(session, turn, reply) => reply!(reply, read_result(conn, &session, turn)),
+        Command::ResultText(session, turn, reply) => {
+            reply!(reply, read_result_text(conn, &session, turn));
+        }
         Command::TerminalFacts(session, turn, reply) => {
             reply!(reply, read_terminal_facts(conn, &session, turn));
         }
@@ -635,7 +637,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::QueuedTurn(..)
         | Command::NextSeq(..)
         | Command::Predecessors(..)
-        | Command::Result(..)
+        | Command::ResultText(..)
         | Command::TerminalFacts(..)
         | Command::CloseResult(..)
         | Command::ClosingSessions(..)
@@ -819,8 +821,8 @@ fn commit_spawn(
         )
         .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO sessions(id,handle_hash,receipt,params,state,next_seq,created_ms,updated_ms,harness,ord)
-         VALUES (?1,?2,?3,?4,'active',2,?5,?5,?6,?7)",
+        "INSERT INTO sessions(id,handle_hash,receipt,params,state,next_seq,created_ms,updated_ms,harness,ord,label)
+         VALUES (?1,?2,?3,?4,'active',2,?5,?5,?6,?7,?8)",
         params![
             record.session_id.as_str(),
             &record.handle_hash[..],
@@ -828,7 +830,8 @@ fn commit_spawn(
             params_json,
             created,
             harness,
-            ord
+            ord,
+            record.label
         ],
     )
     .map_err(sql_error)?;
@@ -1018,12 +1021,15 @@ fn read_snapshot(
     conn: &Connection,
     session: &SessionId,
 ) -> Result<Option<SessionSnapshot>, StoreError> {
-    let row: Option<(String, String, u32, u32, Option<String>)> = conn
+    /// State, admission, turns, queued turns, latest effective, `cwd`.
+    type Row = (String, String, u32, u32, Option<String>, Option<String>);
+    let row: Option<Row> = conn
         .query_row(
             "SELECT state,admission,
                 (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
                 (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
-                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1)
+                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
+                json_extract(params,'$.cwd')
              FROM sessions WHERE id=?1",
             [session.as_str()],
             |row| {
@@ -1033,17 +1039,19 @@ fn read_snapshot(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(state, admission, turns, queued, latest)| {
+    row.map(|(state, admission, turns, queued, latest, cwd)| {
         Ok(SessionSnapshot {
             closed: state == "closed",
             closing: admission == "closing",
             turns,
             queued,
+            cwd,
             latest_effective: latest
                 .map(|value| serde_json::from_str(&value))
                 .transpose()
@@ -1090,17 +1098,37 @@ fn read_queued_turn(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<QueuedTurn>, StoreError> {
-    /// Prompt, prompt blob, effective values, `queued_at`, `queued_seq`.
-    type Row = (Option<String>, Option<String>, String, Option<String>, i64);
+    /// Prompt, prompt blob, effective values, `queued_at`, `queued_seq`,
+    /// the session's frozen `cwd`.
+    type Row = (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT prompt,prompt_blob,effective,queued_at,queued_seq FROM turns WHERE session_id=?1 AND number=?2 AND state='queued'",
+            "SELECT t.prompt,t.prompt_blob,t.effective,t.queued_at,t.queued_seq,
+                    json_extract(s.params,'$.cwd')
+             FROM turns t JOIN sessions s ON s.id=t.session_id
+             WHERE t.session_id=?1 AND t.number=?2 AND t.state='queued'",
             params![session.as_str(), turn.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(prompt, blob, effective, queued_at, queued_seq)| {
+    row.map(|(prompt, blob, effective, queued_at, queued_seq, cwd)| {
         let prompt = match (prompt, blob) {
             (Some(text), None) => Prompt::Inline(text),
             (None, Some(blob)) => Prompt::Blob(BlobRef::decode(&blob)?),
@@ -1108,6 +1136,7 @@ fn read_queued_turn(
         };
         Ok(QueuedTurn {
             prompt,
+            cwd,
             effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
             queued_at: queued_at.ok_or(StoreError::CorruptEvidence)?,
             queued_seq: u64::try_from(queued_seq).map_err(|_| StoreError::CorruptEvidence)?,
@@ -1803,11 +1832,13 @@ fn unfinished_turns(
     .map_err(sql_error)
 }
 
-fn read_result(
+/// The stored envelope text, checked as one JSON value without building
+/// it (design §6.7 `result_text`); anything else is corrupt evidence.
+fn read_result_text(
     conn: &Connection,
     session: &SessionId,
     turn: TurnNumber,
-) -> Result<Option<Value>, StoreError> {
+) -> Result<Option<Box<serde_json::value::RawValue>>, StoreError> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT envelope FROM turns WHERE session_id=?1 AND number=?2",
@@ -1817,8 +1848,10 @@ fn read_result(
         .optional()
         .map_err(sql_error)?
         .flatten();
-    raw.map(|value| serde_json::from_str(&value).map_err(|_| StoreError::CorruptEvidence))
-        .transpose()
+    raw.map(|text| {
+        serde_json::value::RawValue::from_string(text).map_err(|_| StoreError::CorruptEvidence)
+    })
+    .transpose()
 }
 
 /// A committed terminal's state and `cancel`, extracted by SQLite from the

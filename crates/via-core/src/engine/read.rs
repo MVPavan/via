@@ -3,6 +3,7 @@
 
 use std::{sync::atomic::Ordering, time::Duration};
 
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_store::{StoreClient, TerminalFacts};
 
@@ -13,6 +14,9 @@ use crate::{ApiError, LogsParams, SessionId, StatusParams, TurnNumber, WaitParam
 /// `status` reply bound (Task 4 design §4.2): met by construction, checked
 /// by a debug assertion.
 const STATUS_MAX: usize = 1024 * 1024;
+
+/// How often `wait` checks a turn's terminal facts (design §4.1).
+const WAIT_CHECK: Duration = Duration::from_secs(1);
 
 /// `status` step page size without `limit` (C1 §3.7).
 const STATUS_DEFAULT_LIMIT: u32 = 100;
@@ -44,28 +48,40 @@ impl Engine {
         Ok(snapshot.ok_or(ApiError::SESSION_NOT_FOUND)?.turns)
     }
 
-    /// The turn's durable result as `journal::read_result` reads it, on
-    /// `store`'s lane; Store's read reply latches on SQLite corruption
-    /// (design §7.1). No lock is held.
+    /// The turn's durable envelope as stored (design §6.7 `result_text`),
+    /// on the Public lane; a turn whose terminal could not be made durable
+    /// is `store_error` (`journal::settled_result`). Store's read reply
+    /// latches on SQLite corruption (design §7.1). No lock is held, and no
+    /// value is built from the envelope.
     async fn read_result(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<Box<RawValue>>, ApiError> {
+        let read = self.store.public().result_text(session, turn).await;
+        journal::settled_result(&self.unresolved, session, turn, read)
+    }
+
+    /// The turn's committed terminal facts (design §6.7), on `store`'s
+    /// lane, settled as [`Self::read_result`] settles a result; no envelope
+    /// is parsed.
+    async fn read_facts_on(
         &self,
         store: &StoreClient,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Option<Value>, ApiError> {
-        let read = store.result(session, turn).await;
+    ) -> Result<Option<TerminalFacts>, ApiError> {
+        let read = store.terminal_facts(session, turn).await;
         journal::settled_result(&self.unresolved, session, turn, read)
     }
 
-    /// The turn's committed terminal facts (design §6.7), settled as
-    /// [`Self::read_result`] settles a result; no envelope is parsed.
+    /// [`Self::read_facts_on`] on Core's own lane.
     pub(super) async fn read_facts(
         &self,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<Option<TerminalFacts>, ApiError> {
-        let read = self.store.terminal_facts(session, turn).await;
-        journal::settled_result(&self.unresolved, session, turn, read)
+        self.read_facts_on(&self.store, session, turn).await
     }
 
     /// Refuses a turn the session never had.
@@ -76,13 +92,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Reads a committed terminal result without waiting.
-    pub async fn result(&self, address: &str) -> Result<Value, ApiError> {
+    /// Reads a committed terminal envelope without waiting: one
+    /// `result_text` read, written to the caller as stored (design §4.1).
+    pub async fn result(&self, address: &str) -> Result<Box<RawValue>, ApiError> {
         let (session, turn) = self.address(address).await?;
-        if let Some(result) = self
-            .read_result(&self.store.public(), &session, turn)
-            .await?
-        {
+        if let Some(result) = self.read_result(&session, turn).await? {
             return Ok(result);
         }
         self.exists(&session, turn).await?;
@@ -92,9 +106,14 @@ impl Engine {
     /// Waits for a durable terminal result independently of client lifetime,
     /// at most `timeout_ms` (C1 §3.8), then `wait_timeout`.
     ///
-    /// Once final shutdown committed its last record, a result still missing
-    /// can never commit in this daemon: the wait ends `daemon_stopping`.
-    pub async fn wait(&self, params: WaitParams) -> Result<Value, ApiError> {
+    /// Design §4.1 [t4r16.7.7]: it checks the turn's terminal facts on the
+    /// Public lane at once and then once per second, and reads the envelope
+    /// with `result_text` only once the turn is terminal: 32 waiters make
+    /// 32 reads per second, and a turn's end is seen at most 1 s late.
+    /// Once final shutdown committed its last record, a result still
+    /// missing can never commit in this daemon: the wait ends
+    /// `daemon_stopping`.
+    pub async fn wait(&self, params: WaitParams) -> Result<Box<RawValue>, ApiError> {
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
@@ -103,10 +122,13 @@ impl Engine {
         let public = self.store.public();
         let mut checked = false;
         let mut registered = false;
+        let mut check_at = tokio::time::Instant::now();
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
-            if let Some(result) = self.read_result(&public, &session, turn).await? {
+            if self.read_facts_on(&public, &session, turn).await?.is_some()
+                && let Some(result) = self.read_result(&session, turn).await?
+            {
                 return Ok(result);
             }
             if !checked {
@@ -116,8 +138,7 @@ impl Engine {
             if finalized {
                 return Err(ApiError::DAEMON_STOPPING);
             }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(ApiError::WAIT_TIMEOUT);
             }
             if !registered {
@@ -126,23 +147,24 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.wait.registered").await;
             }
-            tokio::time::sleep_until(deadline.min(now + Duration::from_millis(20))).await;
+            check_at += WAIT_CHECK;
+            tokio::time::sleep_until(deadline.min(check_at)).await;
         }
     }
 
-    /// Waits, unbounded, for the turn's durable terminal as `wait` reads it
-    /// (design §3.3 [r3.4]): a turn's own deadlines bound it. Once final
-    /// shutdown finalized, a turn recorded unpersisted is `store_error` and
-    /// any other is `daemon_stopping`.
+    /// Waits, unbounded, for the turn's durable terminal facts (design
+    /// §3.3 [r3.4], §6.7): a turn's own deadlines bound it; no envelope is
+    /// read. Once final shutdown finalized, a turn recorded unpersisted is
+    /// `store_error` and any other is `daemon_stopping`.
     pub(super) async fn await_terminal(
         &self,
         session: &SessionId,
         turn: TurnNumber,
-    ) -> Result<Value, ApiError> {
+    ) -> Result<TerminalFacts, ApiError> {
         loop {
             let finalized = self.finalized.load(Ordering::Acquire);
-            if let Some(result) = self.read_result(&self.store, session, turn).await? {
-                return Ok(result);
+            if let Some(facts) = self.read_facts(session, turn).await? {
+                return Ok(facts);
             }
             if finalized {
                 return Err(ApiError::DAEMON_STOPPING);

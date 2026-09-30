@@ -843,8 +843,11 @@ fn wait_child(child: &mut Child, within: Duration) -> Result<Option<ExitStatus>,
 }
 
 /// W1-D Sol finding 1: an accepted stop reaches daemon main before its reply
-/// is written. The caller never reads the reply, whose echoed 8 MiB id fills
-/// the socket buffer; the daemon must still run final shutdown and exit.
+/// is written. The caller never reads the reply and keeps the connection
+/// open; the daemon must still run final shutdown and exit. A request id is
+/// now at most 256 bytes (C1 A31), so the reply can no longer fill the
+/// socket buffer; a reply write that never completes is covered by
+/// `s1_c1_reply_not_read_closes_the_socket` (design §10.1, A32).
 #[test]
 fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
     let fixture = json!({
@@ -892,7 +895,8 @@ fn s1_daemon_stop_unread_reply_still_stops() -> TestResult {
                 json_line(reply.as_bytes())?["result"]["api_version"] == 1,
                 || format!("hello reply {reply}"),
             )?;
-            let id = "x".repeat(8 * 1024 * 1024);
+            // The longest id C1 accepts (A31), echoed in the unread reply.
+            let id = "x".repeat(254);
             let stop = json!({"jsonrpc":"2.0","id":id,"method":"daemon/stop","params":{}});
             writeln!(stream, "{stop}").map_err(infra)?;
             // The reply is never read while the daemon stops.

@@ -115,6 +115,7 @@ impl Child {
                 handle_hash: [7_u8; 32],
                 receipt: json!({"state":"queued"}),
                 params: json!({"harness":"fake"}),
+                label: None,
                 prompt: "hello".into(),
                 effective: json!({"deadlines":{"wall_ms":1}}),
                 initial_event: json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
@@ -161,7 +162,7 @@ impl Child {
             let execute = adapter.execute(
                 SessionId::try_from(SESSION).unwrap(),
                 TurnNumber::try_from(1).unwrap(),
-                "hello".to_owned(),
+                ("hello".to_owned(), adapter.fake_cwd().to_path_buf()),
                 sender,
                 via_adapters::TurnActivity::new(tokio::time::Instant::now()),
                 deadline,
@@ -297,7 +298,7 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            "hello".to_owned(),
+            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
             sender,
             via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             deadline,
@@ -368,7 +369,7 @@ fn post_arm_acquisition_deadline_keeps_its_cause() {
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            "hello".to_owned(),
+            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
             sender,
             via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
@@ -416,7 +417,7 @@ fn stalled_acquisition_with_force(
         let execute = child.adapter.execute(
             SessionId::try_from(SESSION).unwrap(),
             TurnNumber::try_from(1).unwrap(),
-            "hello".to_owned(),
+            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
             sender,
             via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             Deadline::at(deadline),

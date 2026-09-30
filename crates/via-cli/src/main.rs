@@ -28,6 +28,11 @@ enum Command {
     Events(ReadArgs),
     Logs(ReadArgs),
     Status(StatusArgs),
+    /// Proxies C1 between stdio and the daemon socket, unchanged.
+    Serve {
+        #[arg(long, required = true)]
+        stdio: bool,
+    },
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
@@ -35,13 +40,29 @@ enum Command {
 }
 
 #[derive(Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent CLI switch of C1 §3.2"
+)]
 struct SpawnArgs {
     #[arg(long)]
     harness: String,
     #[arg(long)]
     model: String,
+    #[command(flatten)]
+    prompt: PromptArgs,
+    /// A file whose path is sent as the session's `instructions`.
     #[arg(long)]
-    prompt: String,
+    instructions: Option<PathBuf>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Verbs the route must support, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    require: Vec<String>,
+    #[arg(long)]
+    allow_untested: bool,
+    #[arg(long)]
+    label: Option<String>,
     #[arg(long)]
     handle: Option<String>,
     #[arg(long)]
@@ -61,8 +82,8 @@ struct SpawnArgs {
 #[derive(Args)]
 struct ResumeArgs {
     session: String,
-    #[arg(long)]
-    prompt: String,
+    #[command(flatten)]
+    prompt: PromptArgs,
     #[arg(long)]
     op_key: Option<String>,
     #[command(flatten)]
@@ -75,6 +96,40 @@ struct ResumeArgs {
     handle_stdin: bool,
     #[arg(long)]
     json: bool,
+}
+
+/// C1 §3.2: exactly one of `--prompt` and `--prompt-file F|-`.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct PromptArgs {
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Sent as `prompt_file`, made absolute; `-` reads stdin into `prompt`.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+}
+
+impl PromptArgs {
+    /// Adds `prompt` or `prompt_file` to `params`.
+    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+        match (self.prompt, self.prompt_file) {
+            (Some(prompt), _) => params["prompt"] = Value::String(prompt),
+            (None, Some(path)) if path.as_os_str() == "-" => {
+                params["prompt"] = Value::String(io::read_to_string(io::stdin())?);
+            }
+            (None, Some(path)) => params["prompt_file"] = json!(absolute(&path)?),
+            (None, None) => anyhow::bail!("--prompt or --prompt-file is required"),
+        }
+        Ok(())
+    }
+}
+
+/// `path` made absolute against the current directory.
+fn absolute(path: &std::path::Path) -> anyhow::Result<String> {
+    let path = std::path::absolute(path)?;
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("path is not UTF-8: {}", path.display()))
 }
 
 /// C1 §3.2/§3.3 per-turn flags; the daemon validates them against the route.
@@ -290,43 +345,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             false,
             true,
         ),
-        Command::Spawn(args) => {
-            let handle = client::read_handle(
-                args.handle_file.as_deref(),
-                args.handle_stdin,
-                args.handle.as_deref(),
-                true,
-            )?;
-            let mut params = json!({"harness":args.harness,"model":args.model,"prompt":args.prompt,"handle":handle});
-            if let Some(key) = args.idempotency_key {
-                params["idempotency_key"] = Value::String(key);
-            }
-            args.turn.apply(&mut params)?;
-            // Foreground: Ctrl-C leaves the turn running (design §6.5).
-            let _interrupt = (!args.background).then(exit_on_interrupt).transpose()?;
-            let mut receipt = client::request("spawn", &params, true)?;
-            if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
-                result.insert("handle".to_owned(), Value::String(handle));
-            }
-            let Some(receipt) = client::emit_response(&receipt, true)? else {
-                return Ok(2);
-            };
-            if args.background {
-                return Ok(0);
-            }
-            let address = receipt["turn"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("spawn receipt has no turn address"))?;
-            let outcome = client::request("wait", &json!({"address":address}), true)?;
-            let Some(envelope) = client::emit_response(&outcome, true)? else {
-                return Ok(2);
-            };
-            Ok(if envelope["state"] == "completed" {
-                0
-            } else {
-                3
-            })
-        }
+        Command::Spawn(args) => spawn(args),
         Command::Resume(args) => {
             let handle = client::read_handle(
                 args.handle_file.as_deref(),
@@ -334,7 +353,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 args.handle.as_deref(),
                 false,
             )?;
-            let mut params = json!({"session":args.session,"prompt":args.prompt,"handle":handle});
+            let mut params = json!({"session":args.session,"handle":handle});
+            args.prompt.apply(&mut params)?;
             if let Some(key) = args.op_key {
                 params["op_key"] = Value::String(key);
             }
@@ -366,7 +386,63 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Logs(args) => logs(&args.address),
         Command::Status(args) => status(&args),
+        Command::Serve { .. } => client::serve_stdio().await,
     }
+}
+
+/// `via spawn` (C1 §3.2): foreground waits for the envelope.
+fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
+    let handle = client::read_handle(
+        args.handle_file.as_deref(),
+        args.handle_stdin,
+        args.handle.as_deref(),
+        true,
+    )?;
+    let mut params = json!({"harness":args.harness,"model":args.model,"handle":handle});
+    args.prompt.apply(&mut params)?;
+    if let Some(path) = args.instructions {
+        params["instructions"] = json!({"path":absolute(&path)?});
+    }
+    if let Some(cwd) = args.cwd {
+        params["cwd"] = json!(absolute(&cwd)?);
+    }
+    if !args.require.is_empty() {
+        params["require"] = json!(args.require);
+    }
+    if args.allow_untested {
+        params["allow_untested"] = Value::Bool(true);
+    }
+    if let Some(label) = args.label {
+        params["label"] = Value::String(label);
+    }
+    if let Some(key) = args.idempotency_key {
+        params["idempotency_key"] = Value::String(key);
+    }
+    args.turn.apply(&mut params)?;
+    // Foreground: Ctrl-C leaves the turn running (design §6.5).
+    let _interrupt = (!args.background).then(exit_on_interrupt).transpose()?;
+    let mut receipt = client::request("spawn", &params, true)?;
+    if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
+        result.insert("handle".to_owned(), Value::String(handle));
+    }
+    let Some(receipt) = client::emit_response(&receipt, true)? else {
+        return Ok(2);
+    };
+    if args.background {
+        return Ok(0);
+    }
+    let address = receipt["turn"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("spawn receipt has no turn address"))?;
+    let outcome = client::request("wait", &json!({"address":address}), true)?;
+    let Some(envelope) = client::emit_response(&outcome, true)? else {
+        return Ok(2);
+    };
+    Ok(if envelope["state"] == "completed" {
+        0
+    } else {
+        3
+    })
 }
 
 /// `via wait` (C1 §3.8).

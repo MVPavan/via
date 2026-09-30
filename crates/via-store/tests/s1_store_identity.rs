@@ -68,6 +68,7 @@ fn s1_store_identity_compares_length_and_sha256() {
                     handle_hash: [7_u8; 32],
                     receipt: json!({"state":"queued"}),
                     params: json!({"harness":"fake"}),
+                    label: None,
                     prompt: "p".into(),
                     effective: json!({"deadlines":{"wall_ms":1}}),
                     initial_event: event("turn.queued", 1, 1),

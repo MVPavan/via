@@ -62,6 +62,7 @@ async fn running(client: &StoreClient, session: &str) {
             handle_hash: [7_u8; 32],
             receipt: json!({"state":"queued","route":"fake"}),
             params: json!({"harness":"fake","model":"fake-model"}),
+            label: None,
             prompt: "p".into(),
             effective: json!({"deadlines":{"wall_ms":1}}),
             initial_event: event("turn.queued", 1, 1),

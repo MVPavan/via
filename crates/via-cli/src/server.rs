@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, bail};
 use tokio::{
     net::UnixListener,
-    sync::{Notify, mpsc, watch},
+    sync::{Notify, Semaphore, mpsc, watch},
     task::JoinSet,
 };
 
@@ -181,6 +181,7 @@ async fn serve_bound(
         socket_path: socket.to_path_buf(),
         store_path: paths.state.join("store.sqlite3"),
         idle_stops,
+        sockets: Arc::new(Semaphore::new(SOCKET_SLOTS)),
     };
     let mut main = Main {
         engine,
@@ -328,4 +329,10 @@ struct Client {
     store_path: std::path::PathBuf,
     /// A version-mismatched client's plain stop, which daemon main decides.
     idle_stops: mpsc::Sender<IdleStop>,
+    /// The accept loop's socket slots (design §10.1), shared with final
+    /// shutdown's diagnostic window.
+    sockets: Arc<Semaphore>,
 }
+
+/// Design §10.1: connected clients served at once.
+const SOCKET_SLOTS: usize = 32;

@@ -1924,6 +1924,28 @@ fn t2c_resume(
     )
 }
 
+/// Polls `result` every 20 ms until `address` is terminal: `wait` checks
+/// only once per second (C1 §3.8), too late for a test that must look
+/// before the re-probe loop's first pass, one second after the turn ends.
+fn result_when_done(
+    paths: &Paths,
+    evidence: &Evidence,
+    address: &str,
+) -> Result<Value, ScenarioError> {
+    let name = format!("result-{}", address.replace('/', "-"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let result = paths.run(evidence, &name, &["result", address, "--json"])?;
+        if result.status.success() {
+            return json_line(&result.stdout);
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!("{address} never ended")));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Waits for a turn's durable envelope through `via wait`.
 fn t2c_wait(paths: &Paths, evidence: &Evidence, address: &str) -> Result<Value, ScenarioError> {
     let name = format!("wait-{}", address.replace('/', "-"));
@@ -1957,6 +1979,20 @@ fn s1_t2c_crash_with_a_queued_successor_cancels_it_on_restart() -> TestResult {
             check(
                 state == "unknown" && first["failure"]["class"] == "daemon_restart",
                 || format!("turn 1: {state} {first}"),
+            )?;
+            // T4-5 review round 1: the recovered envelope reports the
+            // session's frozen `cwd`, as `status` does.
+            let frozen: Option<String> = paths
+                .store()?
+                .query_row(
+                    "SELECT json_extract(params,'$.cwd') FROM sessions WHERE id=?1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(infra)?;
+            check(
+                frozen.is_some() && first["cwd"].as_str() == frozen.as_deref(),
+                || format!("turn 1 cwd {} against the frozen {frozen:?}", first["cwd"]),
             )?;
             let (state, second) = turn_n(paths, &session, 2)?;
             check(
@@ -2436,7 +2472,7 @@ fn s1_t2d_uncertain_cleanup_keeps_its_connection_slot() -> TestResult {
             paths.failpoints.arm(commit, 1, "fail_io").map_err(infra)?;
             let mut daemon = Daemon::start_slots(paths, evidence, "uncertain", 1, None)?;
             let first = spawn_session(paths, evidence, "spawn-a", "s0")?;
-            let envelope = t2c_wait(paths, evidence, &format!("{first}/1"))?;
+            let envelope = result_when_done(paths, evidence, &format!("{first}/1"))?;
             let unproven = "SELECT count(*) FROM anchors WHERE absence_time IS NULL";
             check(store_count(paths, unproven)? == 1, || {
                 format!("turn A's group was proved absent: {envelope}")

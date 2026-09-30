@@ -77,7 +77,7 @@ impl Engine {
         // progress bypass the fence [r3.1, r4.1].
         let operation = match key {
             Some(key) => {
-                let identity = via_store::Identity::of(&retry_identity(raw_params, &hash)?);
+                let identity = retry_identity(raw_params, &hash, None)?;
                 match self.replay(&session, key, identity).await? {
                     Replay::Result(result) => return Ok(result),
                     Replay::InProgress(watch) => return self.await_close(watch, admission).await,

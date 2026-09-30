@@ -178,6 +178,7 @@ async fn running_turn(root: &tempfile::TempDir) -> Store {
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
+            label: None,
             prompt: "hello".into(),
             effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),
@@ -195,6 +196,12 @@ async fn running_turn(root: &tempfile::TempDir) -> Store {
     store
 }
 
+/// The turn's stored envelope, parsed for inspection.
+async fn stored(store: &StoreClient) -> Option<Value> {
+    let text = store.result_text(&session(), turn()).await.unwrap()?;
+    Some(serde_json::from_str(text.get()).unwrap())
+}
+
 fn started() -> Started {
     Started {
         session: session(),
@@ -203,6 +210,7 @@ fn started() -> Started {
         first_seq: 1,
         submitted: Some((AT.to_owned(), Instant::now())),
         folder: Some(FOLDER.to_owned()),
+        cwd: None,
     }
 }
 
@@ -283,7 +291,7 @@ async fn committed_uncertain_observation_is_settled_before_turn_ended() {
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved).await.unwrap();
-    let envelope = store.client().result(&session(), turn()).await.unwrap();
+    let envelope = stored(&store.client()).await;
     let envelope = envelope.expect("the receipted turn reached a durable terminal");
     assert_eq!(envelope["state"], "failed");
     assert_eq!(envelope["failure"]["class"], "store");
@@ -318,7 +326,7 @@ async fn uncommitted_uncertain_observation_keeps_the_sequence() {
     };
     let unresolved = Unresolved::default();
     observe_then_finish(&journal, &unresolved).await.unwrap();
-    let envelope = store.client().result(&session(), turn()).await.unwrap();
+    let envelope = stored(&store.client()).await;
     let envelope = envelope.expect("the receipted turn reached a durable terminal");
     assert_eq!(envelope["events"]["last_seq"], 3);
     let events = store.client().events(&session(), 1, 10).await.unwrap();
@@ -382,12 +390,7 @@ async fn an_unused_uncertain_sequence_taken_by_another_writer_is_not_the_turns()
     )
     .await
     .unwrap();
-    let envelope = store
-        .client()
-        .result(&session(), turn())
-        .await
-        .unwrap()
-        .unwrap();
+    let envelope = stored(&store.client()).await.unwrap();
     assert_eq!(
         envelope["events"],
         json!({"first_seq":1,"last_seq":4,"count":4})
@@ -420,14 +423,7 @@ async fn unsettled_turn_reads_as_store_error_not_running() {
     let finished = observe_then_finish(&journal, &unresolved).await;
     assert_eq!(finished.unwrap_err().kind, "store_error");
     // No terminal was invented, and `result`/`wait` report `store_error`.
-    assert!(
-        store
-            .client()
-            .result(&session(), turn())
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(stored(&store.client()).await.is_none());
     let read = read_result(&store.client(), &unresolved, &session(), turn()).await;
     assert_eq!(
         read.unwrap_err().data(),
@@ -474,6 +470,7 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
             params: json!({"harness":"fake"}),
+            label: None,
             prompt: "hello".into(),
             effective: frozen(),
             initial_event: event(1, EventBody::TurnQueued { queue_position: 0 }),

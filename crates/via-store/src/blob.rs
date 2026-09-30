@@ -27,8 +27,9 @@ pub const INLINE_MAX: usize = 256 * 1024;
 /// [`BlobReader::next_chunk`] returns.
 pub const BLOB_CHUNK: usize = 64 * 1024;
 
-/// Largest blob a prompt load accepts: C1's 16 MiB prompt.
-const PROMPT_MAX: u64 = 16 * 1024 * 1024;
+/// Largest blob a prompt load accepts, and largest prompt file: C1's
+/// 16 MiB prompt (Task 4 design §5.2 `PROMPT_MAX`).
+pub const PROMPT_MAX: u64 = 16 * 1024 * 1024;
 
 /// Bound of each blocking blob step.
 const BLOB_IO: Duration = Duration::from_secs(2);
@@ -157,7 +158,7 @@ impl BlobTasks {
     /// Runs one blob step, owned by this set, and waits for its result at
     /// most [`BLOB_IO`]. A step that overran keeps running to its end,
     /// owning what it was given; the caller's request is not committed.
-    async fn run<T: Send + 'static>(
+    pub(crate) async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
@@ -179,6 +180,30 @@ impl BlobTasks {
                 "blob task ended without a result".to_owned(),
             )),
             Err(_) => Err(StoreError::Write("blob I/O exceeded 2 s".to_owned())),
+        }
+    }
+
+    /// Like [`Self::run`] for a step on a caller's file, bounded by the
+    /// caller's `deadline` instead of 2 s: `Ok(None)` when the deadline
+    /// passed first, the step still owned until it ends. The step's own
+    /// outcome, errors included, is its value.
+    async fn run_until<T: Send + 'static>(
+        &self,
+        deadline: tokio::time::Instant,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Option<T>, StoreError> {
+        let runtime = Handle::try_current()
+            .map_err(|error| StoreError::Write(format!("blob task: {error}")))?;
+        let (reply, result) = oneshot::channel();
+        self.admit(&runtime, move || {
+            let _ = reply.send(work());
+        })?;
+        match tokio::time::timeout_at(deadline, result).await {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(_)) => Err(StoreError::Write(
+                "blob task ended without a result".to_owned(),
+            )),
+            Err(_) => Ok(None),
         }
     }
 
@@ -390,6 +415,204 @@ impl Blobs {
     }
 }
 
+/// Why a prompt file was not copied (Task 4 design §10.4 step 4).
+#[derive(Debug)]
+pub enum PromptFileError {
+    /// Refused by `reason`: `unreadable`, `not_regular`, `too_large`,
+    /// `not_utf8`, `changed` or `timeout`.
+    Refused(&'static str),
+    /// A blob step failed: the request is not committed.
+    Store(StoreError),
+}
+
+/// A prompt file's metadata that must not change during the pass.
+#[derive(Debug, Eq, PartialEq)]
+struct Stamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl Blobs {
+    /// Copies the prompt file at `path` into a new finished blob in one
+    /// pass (design §10.4): opened read-only with `O_NONBLOCK`, so a FIFO
+    /// cannot block the open, and `fstat`ed: a regular file of at most
+    /// [`PROMPT_MAX`]. It streams in 64 KiB chunks through the blob's
+    /// running SHA-256 with a streaming UTF-8 check, then `fstat`s again:
+    /// bytes read other than the first size, or a changed size, `mtime`
+    /// or `ctime`, refuse it as `changed`. The whole pass ends by
+    /// `deadline`. Any refusal discards the blob; the caller holds no lock.
+    pub(crate) async fn copy_file(
+        &self,
+        path: PathBuf,
+        deadline: tokio::time::Instant,
+    ) -> Result<BlobRef, PromptFileError> {
+        let opened = self
+            .tasks
+            .run_until(deadline, move || -> io::Result<(File, fs::Metadata)> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+                    .open(path)?;
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            })
+            .await
+            .map_err(PromptFileError::Store)?;
+        let (file, first) = match opened {
+            None => return Err(PromptFileError::Refused("timeout")),
+            Some(Err(_)) => return Err(PromptFileError::Refused("unreadable")),
+            Some(Ok(opened)) => opened,
+        };
+        if !first.is_file() {
+            return Err(PromptFileError::Refused("not_regular"));
+        }
+        if first.len() > PROMPT_MAX {
+            return Err(PromptFileError::Refused("too_large"));
+        }
+        // Test builds: the pass holds here, with no lock held (§13.2).
+        #[cfg(feature = "test-failpoints")]
+        let _ = crate::failpoint::hit_async("prompt_file.copy.pause").await;
+        let timeout = || PromptFileError::Refused("timeout");
+        // The blob's own steps end by `deadline` too. A creation cut off
+        // leaves at most an unnamed file, which the start-up sweep removes.
+        let mut writer = tokio::time::timeout_at(deadline, self.writer())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if let Err(error) = self
+            .copy_chunks(file, &Stamp::of(&first), &mut writer, deadline)
+            .await
+        {
+            writer.discard().await;
+            return Err(error);
+        }
+        // A `finish` cut off drops its writer, which unlinks the file.
+        let blob = tokio::time::timeout_at(deadline, writer.finish())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if tokio::time::Instant::now() >= deadline {
+            self.discard(&blob).await;
+            return Err(timeout());
+        }
+        Ok(blob)
+    }
+
+    /// The streaming part of [`Self::copy_file`]: every chunk into
+    /// `writer`, then the second `fstat`.
+    async fn copy_chunks(
+        &self,
+        file: File,
+        first: &Stamp,
+        writer: &mut BlobWriter,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PromptFileError> {
+        let timeout = || PromptFileError::Refused("timeout");
+        let mut file = Some(file);
+        let mut total = 0_u64;
+        // An incomplete UTF-8 sequence at a chunk's end (at most 3 bytes).
+        let mut carry = Vec::new();
+        loop {
+            let Some(mut taken) = file.take() else {
+                return Err(PromptFileError::Refused("unreadable"));
+            };
+            let read = self
+                .tasks
+                .run_until(deadline, move || {
+                    let chunk = read_chunk(&mut taken);
+                    (taken, chunk)
+                })
+                .await
+                .map_err(PromptFileError::Store)?;
+            let (taken, chunk) = read.ok_or_else(timeout)?;
+            let chunk = chunk.map_err(|_| PromptFileError::Refused("unreadable"))?;
+            file = Some(taken);
+            if chunk.is_empty() {
+                break;
+            }
+            total += chunk.len() as u64;
+            if total > first.len {
+                return Err(PromptFileError::Refused("changed"));
+            }
+            if !utf8_continues(&mut carry, &chunk) {
+                return Err(PromptFileError::Refused("not_utf8"));
+            }
+            tokio::time::timeout_at(deadline, writer.write(&chunk))
+                .await
+                .map_err(|_| timeout())?
+                .map_err(PromptFileError::Store)?;
+        }
+        if !carry.is_empty() {
+            return Err(PromptFileError::Refused("not_utf8"));
+        }
+        let Some(file) = file else {
+            return Err(PromptFileError::Refused("unreadable"));
+        };
+        let second = self
+            .tasks
+            .run_until(deadline, move || file.metadata())
+            .await
+            .map_err(PromptFileError::Store)?
+            .ok_or_else(timeout)?
+            .map_err(|_| PromptFileError::Refused("unreadable"))?;
+        if total != first.len || Stamp::of(&second) != *first {
+            return Err(PromptFileError::Refused("changed"));
+        }
+        Ok(())
+    }
+}
+
+/// Reads up to [`BLOB_CHUNK`] bytes, fewer only at end of file.
+fn read_chunk(file: &mut File) -> io::Result<Vec<u8>> {
+    let mut chunk = vec![0_u8; BLOB_CHUNK];
+    let mut filled = 0;
+    while filled < BLOB_CHUNK {
+        match file.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    chunk.truncate(filled);
+    Ok(chunk)
+}
+
+/// Checks `chunk` as the continuation of UTF-8 text whose previous chunk
+/// left `carry`, an incomplete sequence, which this updates.
+fn utf8_continues(carry: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let joined;
+    let text = if carry.is_empty() {
+        chunk
+    } else {
+        let mut bytes = std::mem::take(carry);
+        bytes.extend_from_slice(chunk);
+        joined = bytes;
+        &joined[..]
+    };
+    match std::str::from_utf8(text) {
+        Ok(_) => true,
+        // Only an incomplete sequence at the end: the next chunk decides.
+        Err(error) if error.error_len().is_none() => {
+            *carry = text[error.valid_up_to()..].to_vec();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Opens `path` without following a symlink and returns it with its length
 /// when it is a regular file.
 fn open_regular(path: &Path) -> io::Result<(File, u64)> {
@@ -538,7 +761,7 @@ impl BlobReader {
 mod tests {
     use std::{sync::mpsc, time::Duration};
 
-    use super::{BLOB_TASKS, BlobTasks};
+    use super::{BLOB_TASKS, BlobTasks, utf8_continues};
     use crate::StoreError;
 
     /// Review round 1: past [`BLOB_TASKS`] owned steps a new step is
@@ -579,5 +802,23 @@ mod tests {
         );
         drop(release);
         assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+    }
+
+    /// Design §10.4: a character split across chunks carries over; an
+    /// invalid byte fails wherever it is.
+    #[test]
+    fn utf8_check_carries_a_split_character() {
+        let text = "a€b".as_bytes();
+        let mut carry = Vec::new();
+        assert!(utf8_continues(&mut carry, &text[..2]));
+        assert_eq!(carry, text[1..2]);
+        assert!(utf8_continues(&mut carry, &text[2..3]));
+        assert!(utf8_continues(&mut carry, &text[3..]));
+        assert!(carry.is_empty());
+        let mut carry = Vec::new();
+        assert!(!utf8_continues(&mut carry, &[b'a', 0xff]));
+        let mut carry = Vec::new();
+        assert!(utf8_continues(&mut carry, &[0xe2]));
+        assert!(!utf8_continues(&mut carry, b"x"));
     }
 }
