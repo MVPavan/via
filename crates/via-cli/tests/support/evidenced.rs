@@ -225,7 +225,26 @@ pub(crate) fn run_within(command: &mut std::process::Command, budget: Duration) 
 /// The live (not zombie) processes whose environment names the sandbox's
 /// runtime or State directory. An unreadable `/proc` proves nothing.
 fn sandbox_processes(runtime: &Path, state: &Path) -> Result<Vec<u32>, String> {
+    scan_processes(runtime, state, |path| fs::read(path))
+}
+
+/// [`sandbox_processes`], reading `/proc/<pid>/{environ,cmdline}` through
+/// `read`. Only a vanished process (`NotFound`, `ESRCH`) is absent (S1-contract
+/// r3 finding 1). A process whose environment cannot be read otherwise is
+/// unrelated only when its command line shows another program than this
+/// build's `via`: the user's own non-dumpable processes (`systemd --user`,
+/// agents) refuse `environ` too, and every sandbox process runs `via`. An
+/// unreadable `via`, or an unreadable command line, is indeterminate.
+pub(crate) fn scan_processes(
+    runtime: &Path,
+    state: &Path,
+    read: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<u32>, String> {
     use std::os::unix::ffi::OsStrExt as _;
+    let vanished = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+    };
     let marks = [
         [
             b"VIA_RUNTIME_DIR=".as_slice(),
@@ -234,6 +253,7 @@ fn sandbox_processes(runtime: &Path, state: &Path) -> Result<Vec<u32>, String> {
         .concat(),
         [b"VIA_STATE_DIR=".as_slice(), state.as_os_str().as_bytes()].concat(),
     ];
+    let via = Path::new(env!("CARGO_BIN_EXE_via")).as_os_str().as_bytes();
     let own = std::process::id();
     let mut alive = Vec::new();
     for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
@@ -248,9 +268,18 @@ fn sandbox_processes(runtime: &Path, state: &Path) -> Result<Vec<u32>, String> {
         if pid == own {
             continue;
         }
-        // Gone, or another user's: not the sandbox's.
-        let Ok(environ) = fs::read(entry.path().join("environ")) else {
-            continue;
+        let environ = match read(&entry.path().join("environ")) {
+            Ok(environ) => environ,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => match read(&entry.path().join("cmdline")) {
+                Err(cmdline) if vanished(&cmdline) => continue,
+                Ok(cmdline) if cmdline.split(|byte| *byte == 0).next() != Some(via) => continue,
+                _ => {
+                    return Err(format!(
+                        "process {pid}'s environment is unreadable ({error}): exit indeterminate"
+                    ));
+                }
+            },
         };
         if environ
             .split(|byte| *byte == 0)

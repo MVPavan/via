@@ -259,3 +259,61 @@ fn collector_launched_turn_without_its_folder_is_an_infrastructure_failure()
     assert_eq!(summary["outcome"], "infrastructure_failure", "{summary}");
     Ok(())
 }
+
+/// A process whose environment cannot be read is absent only when it
+/// vanished; otherwise it is unrelated only when its command line shows
+/// another program than `via` (S1-contract r3 finding 1).
+#[test]
+fn collector_exit_proof_is_indeterminate_for_an_unreadable_via_process()
+-> Result<(), Box<dyn Error>> {
+    let sandbox = tempfile::tempdir()?;
+    let (runtime, state) = (sandbox.path().join("runtime"), sandbox.path().join("state"));
+    let mut process = sandbox_process(&runtime)?;
+    let proc_dir = Path::new("/proc").join(process.id().to_string());
+    let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let via_cmdline = [env!("CARGO_BIN_EXE_via").as_bytes(), b"\0daemon\0"].concat();
+    let unreadable_via = evidenced::scan_processes(&runtime, &state, |path| {
+        if path == proc_dir.join("environ") {
+            Err(denied())
+        } else if path == proc_dir.join("cmdline") {
+            Ok(via_cmdline.clone())
+        } else {
+            fs::read(path)
+        }
+    });
+    let unreadable_cmdline = evidenced::scan_processes(&runtime, &state, |path| {
+        if path.starts_with(&proc_dir) {
+            Err(denied())
+        } else {
+            fs::read(path)
+        }
+    });
+    let unreadable_other = evidenced::scan_processes(&runtime, &state, |path| {
+        if path == proc_dir.join("environ") {
+            Err(denied())
+        } else {
+            fs::read(path)
+        }
+    });
+    let vanished = evidenced::scan_processes(&runtime, &state, |path| {
+        if path.starts_with(&proc_dir) {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else {
+            fs::read(path)
+        }
+    });
+    let readable = evidenced::scan_processes(&runtime, &state, |path| fs::read(path));
+    process.kill()?;
+    process.wait()?;
+    let error = unreadable_via.expect_err("an unreadable via process was accepted as absent");
+    assert!(error.contains("indeterminate"), "{error}");
+    unreadable_cmdline.expect_err("an unreadable command line was accepted as unrelated");
+    assert_eq!(
+        unreadable_other?,
+        Vec::<u32>::new(),
+        "a `sleep` is not a daemon"
+    );
+    assert_eq!(vanished?, Vec::<u32>::new());
+    assert_eq!(readable?, vec![process.id()]);
+    Ok(())
+}
