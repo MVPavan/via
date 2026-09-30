@@ -223,12 +223,11 @@ impl Setup {
         )
     }
 
-    fn pid(&self, evidence: &Evidence) -> Result<u32, ScenarioError> {
-        let status = self.daemon_status(evidence, "daemon_pid")?;
-        status["pid"]
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or_else(|| failure(format!("daemon status has no pid: {status}")))
+    /// The serving daemon's pid, through the direct socket probe: never
+    /// an auto-start.
+    fn pid(&self) -> Result<u32, ScenarioError> {
+        daemon::serving_pid(&self.sandbox.runtime)
+            .ok_or_else(|| failure("no daemon serves the socket"))
     }
 
     fn count(&self, sql: &str) -> Result<i64, ScenarioError> {
@@ -629,7 +628,7 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
             let point = "core.accept.before_commit";
             setup.failpoints.arm(point, 1, "crash").map_err(infra)?;
             let crashed = setup.start(evidence)?;
-            let pid = setup.pid(evidence)?;
+            let pid = setup.pid()?;
             let session = setup.spawn(evidence, "logged")?;
             setup
                 .failpoints
@@ -1259,7 +1258,7 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
         evidence,
         |evidence| {
             let daemon = setup.start(evidence)?;
-            let pid = setup.pid(evidence)?;
+            let pid = setup.pid()?;
             let first = setup.daemon_status(evidence, "status_first")?;
             let started = first["started_at"].clone();
             check(started.is_string(), || format!("started_at: {first}"))?;
