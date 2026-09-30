@@ -15,9 +15,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use via_core::{ApiError, Engine, FakeConfig, SessionId, StoreLock};
+use via_core::{ApiError, Engine, FakeConfig, Limits, SessionId, StoreLock};
 
+mod config;
 mod dispatch;
+mod log;
 mod serving;
 mod shutdown;
 
@@ -51,6 +53,10 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
 /// Exit status of a daemon that found `daemon.lock` held (runtime §6.1,
 /// amendment A3): the CLI polls the socket and respawns within its budget.
 pub(crate) const LOCK_CONTENDED: i32 = 75;
+
+/// Exit status of a daemon whose `daemon.json` is invalid (Task 4 design
+/// §5.5, Q-R8-2).
+pub(crate) const CONFIG_INVALID: i32 = 78;
 
 /// Why a lock file could not be taken.
 enum LockFailure {
@@ -91,14 +97,24 @@ fn lock(path: &Path) -> Result<File, LockFailure> {
 
 /// The daemon: startup (design §6.1), serving and final shutdown. Returns
 /// the process exit status: 0 for a clean shutdown, 75 when another daemon
-/// holds `daemon.lock`; every other startup failure is an error (exit 4).
+/// holds `daemon.lock`, 78 for an invalid `daemon.json`; every other
+/// startup failure is an error (exit 4).
 pub(crate) async fn serve() -> anyhow::Result<i32> {
+    // Task 4 design §7.6: stderr during startup, then `via.log` only.
     tracing_subscriber::fmt()
-        .with_writer(io::stderr)
+        .with_writer(|| log::Line)
         .with_ansi(false)
         .init();
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     let paths = super::client::paths()?;
+    // Task 4 design §5.5: read once, before any Store or socket change.
+    let limits = match config::read(&paths.state) {
+        Ok(limits) => limits,
+        Err(invalid) => {
+            let _ = writeln!(io::stderr().lock(), "via: {invalid}");
+            return Ok(CONFIG_INVALID);
+        }
+    };
     ensure_dir(&paths.runtime)?;
     ensure_dir(&paths.state)?;
     // Test builds only: the daemon's own seams need the controller before
@@ -128,6 +144,8 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     // Store only under it.
     let store_lock =
         StoreLock::acquire(&paths.state).map_err(|error| anyhow::anyhow!("store lock: {error}"))?;
+    // Task 4 design §7.6: after both locks, before the Store opens.
+    log::open(&paths.state).context("open via.log")?;
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.runtime.join("anchors"))?;
     let socket = paths.runtime.join("via.sock");
@@ -141,7 +159,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
-    let served = serve_bound(listener, &socket, &paths, store_lock).await;
+    let served = serve_bound(listener, &socket, &paths, (store_lock, limits)).await;
     if served.is_err() {
         // A failure after bind unlinks the socket before the locks are
         // released (design §6.1). Best effort: a stale socket refuses
@@ -157,11 +175,11 @@ async fn serve_bound(
     listener: UnixListener,
     socket: &Path,
     paths: &super::client::Paths,
-    store_lock: StoreLock,
+    locked: (StoreLock, Limits),
 ) -> anyhow::Result<i32> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let engine = open_engine(paths, store_lock).await?;
+    let engine = open_engine(paths, locked).await?;
     // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
     let starts = engine
         .take_starts()
@@ -193,6 +211,8 @@ async fn serve_bound(
         idle_requests,
         failed: 0,
     };
+    // Task 4 design §7.6: from here on, only `via.log` is written.
+    log::serving();
     let exit = main.serve(&listener, &client).await;
     // Design §7.4: after a latch that preceded final shutdown, the listener
     // keeps serving through the diagnostic window, which final shutdown
@@ -238,7 +258,7 @@ async fn serve_bound(
 /// the first request is accepted (C1 §7.5).
 async fn open_engine(
     paths: &super::client::Paths,
-    store_lock: StoreLock,
+    locked: (StoreLock, Limits),
 ) -> anyhow::Result<Arc<Engine>> {
     let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
     let state = paths.state.clone();
@@ -246,13 +266,16 @@ async fn open_engine(
     let binary = std::env::current_exe()?;
     let engine = Arc::new(
         tokio::task::spawn_blocking(move || {
-            Engine::open_locked(&state, &runtime, fake, binary, store_lock)
+            Engine::open_locked(&state, &runtime, fake, binary, locked)
         })
         .await?
         .map_err(anyhow::Error::msg)?,
     );
+    // Task 4 design §7.6: one warning per turn, naming it.
     let recovered = engine
-        .recover()
+        .recover_logged(|session, turn| {
+            tracing::warn!(%session, turn = turn.get(), "recovered unfinished turn as unknown");
+        })
         .await
         .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
     if recovered > 0 {
@@ -288,17 +311,22 @@ fn spawn_dispatcher(
     session: SessionId,
 ) {
     let engine = Arc::clone(engine);
-    drives.spawn(async move { engine.dispatcher(session).await });
+    drives.spawn(async move {
+        let result = engine.dispatcher(session.clone()).await;
+        if let Err(error) = &result {
+            // Task 4 design §7.6: a line about a session names it.
+            tracing::error!(%session, kind = error.kind, "turn drive failed");
+        }
+        result
+    });
 }
 
-/// Whether a joined drive ended without error; a failure is logged.
+/// Whether a joined drive ended without error; a drive's own failure was
+/// logged with its session, a task failure is logged here.
 fn drive_joined(result: Result<Result<(), ApiError>, tokio::task::JoinError>) -> bool {
     match result {
         Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::error!(kind = error.kind, "turn drive failed");
-            false
-        }
+        Ok(Err(_)) => false,
         Err(error) => {
             tracing::error!(%error, "turn task failed");
             false

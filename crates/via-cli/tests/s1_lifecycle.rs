@@ -505,10 +505,12 @@ impl Daemon<'_> {
         }
     }
 
-    /// The daemon's final shutdown summary.
+    /// The daemon's final shutdown summary: the last in `via.log` (Task 4
+    /// design §7.6).
     fn summary(&self) -> TestResult<Value> {
-        fs::read_to_string(&self.trace)?
+        fs::read_to_string(self.sandbox.state.join("via.log"))?
             .lines()
+            .rev()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find_map(|line| line.get("daemon_shutdown").cloned())
             .ok_or_else(|| "the daemon wrote no shutdown summary".into())

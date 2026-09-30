@@ -886,7 +886,7 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
                     )
                 },
             )?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             check_whole_queued_session(paths)?;
             let session = paths.only_session()?;
             paths.failpoints.disarm(point).map_err(infra)?;
@@ -1501,16 +1501,12 @@ fn s1_f10_failed_absence_commit_fails_startup() -> TestResult {
 
 /// Waits for a daemon that latched Store failure to end its own final
 /// shutdown with exit 4, and returns its shutdown summary.
-fn latched_exit(
-    daemon: &mut Daemon<'_>,
-    evidence: &Evidence,
-    run: &str,
-) -> Result<Value, ScenarioError> {
+fn latched_exit(daemon: &mut Daemon<'_>) -> Result<Value, ScenarioError> {
     let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
         .ok_or_else(|| ScenarioError::Timeout("the latched daemon never exited".to_owned()))?;
-    let trace =
-        fs::read_to_string(evidence.dir.join(format!("daemon-{run}.trace"))).map_err(infra)?;
-    let summary = trace
+    // Task 4 design §7.6: the summary is in `via.log`.
+    let log = fs::read_to_string(daemon.paths.state.join("via.log")).map_err(infra)?;
+    let summary = log
         .lines()
         .rev()
         .find_map(|line| {
@@ -1554,7 +1550,7 @@ fn s1_f10_uncertain_submission_latches_and_launches_nothing() -> TestResult {
                 .failpoints
                 .wait_ack(point, 2, "fail_io", daemon.child.id(), ACK_WAIT)
                 .map_err(|error| fail(&format!("failpoint {point}: {error}")))?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             let turn = paths.turn(&session)?;
             let types = paths.event_types(&session)?;
             check(
@@ -1654,7 +1650,7 @@ fn s1_f10_latch_at_the_pre_arm_gate_launches_nothing() -> TestResult {
                 || "the lost receipt was not store_error".to_owned(),
             )?;
             paths.failpoints.release(gate, 1).map_err(infra)?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             check_pre_launch_force(paths, &session, false)?;
             paths.failpoints.disarm(gate).map_err(infra)?;
             paths.failpoints.disarm(lost).map_err(infra)?;
@@ -1741,7 +1737,7 @@ fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
             check(exit.success() && envelope["state"] == "completed", || {
                 format!("waiter ended {exit} with {envelope}")
             })?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
             let _daemon = Daemon::start(paths, evidence, "final")?;
@@ -1790,8 +1786,8 @@ fn s1_f12_stalled_force_path_read_expires_within_the_shutdown_bound() -> TestRes
             let status = wait_child(&mut daemon.child, FINAL_SHUTDOWN + Duration::from_secs(2))?
                 .ok_or_else(|| ScenarioError::Timeout("shutdown outlived its bound".to_owned()))?;
             let elapsed = stopped.elapsed();
-            let trace =
-                fs::read_to_string(evidence.dir.join("daemon-stalled.trace")).map_err(infra)?;
+            // Task 4 design §7.6: the summary is in `via.log`.
+            let trace = fs::read_to_string(paths.state.join("via.log")).map_err(infra)?;
             check(
                 status.code() == Some(4)
                     && elapsed < FINAL_SHUTDOWN + Duration::from_secs(1)
@@ -2080,7 +2076,7 @@ fn s1_t2c_keyed_receipt_replay_after_restart_runs_once() -> TestResult {
                         == json!({"kind":"store_error","commit_outcome":"unknown","retry":"same_key_only"}),
                 || format!("lost receipt: {error}"),
             )?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             paths.failpoints.disarm(point).map_err(infra)?;
             drop(daemon);
             let session = paths.only_session()?;
@@ -2135,7 +2131,7 @@ fn s1_t2c_unkeyed_lost_resume_receipt_runs_once_after_restart() -> TestResult {
                 !lost.status.success() && error["data"]["commit_outcome"] == "unknown",
                 || format!("lost resume receipt: {error}"),
             )?;
-            latched_exit(&mut daemon, evidence, "latched")?;
+            latched_exit(&mut daemon)?;
             let (state, _) = turn_n(paths, &session, 2)?;
             check(state == "queued", || {
                 format!("turn 2 before restart: {state}")
@@ -2363,7 +2359,7 @@ fn s1_t2d_latch_while_turns_wait_for_a_slot() -> TestResult {
                 && error_kind(&seventh.stderr).as_deref() == Some("store_error"),
             || "the seventh receipt was not store_error".to_owned(),
         )?;
-        latched_exit(&mut daemon, evidence, "latched")?;
+        latched_exit(&mut daemon)?;
         let mut waiting = 0;
         for session in &sessions {
             let (state, envelope) = turn_n(paths, session, 1)?;

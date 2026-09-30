@@ -309,8 +309,13 @@ impl Sandbox {
         )?)
     }
 
+    /// Everything the daemon wrote: its stderr trace, then `via.log`
+    /// (Task 4 design §7.6).
     fn trace(&self) -> String {
-        fs::read_to_string(self.root.path().join("daemon.trace")).unwrap_or_default()
+        let mut trace =
+            fs::read_to_string(self.root.path().join("daemon.trace")).unwrap_or_default();
+        trace.push_str(&fs::read_to_string(self.state.join("via.log")).unwrap_or_default());
+        trace
     }
 }
 
@@ -1903,7 +1908,7 @@ fn s1_idle_timer_disarms_once_an_order_exists() -> TestResult {
     daemon.finish()
 }
 
-/// The last final-shutdown summary in the daemon trace.
+/// The last final-shutdown summary in the daemon trace or `via.log`.
 #[cfg(feature = "test-failpoints")]
 fn shutdown_summary(sandbox: &Sandbox) -> TestResult<Value> {
     sandbox
@@ -2517,6 +2522,7 @@ fn s1_cancel_wait_across_force_handoff_terminal_not_committed() -> TestResult {
     let summary = sandbox
         .trace()
         .lines()
+        .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find_map(|line| line.get("daemon_shutdown").cloned())
         .ok_or("no shutdown summary")?;

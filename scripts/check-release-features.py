@@ -139,6 +139,10 @@ POINTS = [
     "core.finish_running.pause",
     # Task 4 T4-5 (design §10.4): a prompt-file copy held after its first fstat.
     "prompt_file.copy.pause",
+    # Task 4 T4-7 (design §5.3, §13.1): a reported free space; each
+    # data-size walk, counted.
+    "store.statvfs.free_bytes",
+    "core.data_size.walks",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.
