@@ -56,7 +56,7 @@ does.
 |---|---|---|
 | Session dispatcher | The session's FIFO of receipted, unsubmitted turns and the turn it has granted or is running; every run, wait and cancel decision for them | At most 1 per session with queued or owned work |
 | Stop latch (`Engine.stop`) | The accepted stop mode; the dispatch grant reads it | 1 per daemon |
-| Store-failed latch (`Engine.store_failed`) | Whether a state write failed or was uncertain (§3) | 1 per daemon |
+| Store-failed latch (`Engine.store_failed`) | Whether an uncertain state write, a failed turn resolution write or terminal retry, or SQLite corruption latched Store failure; a write known not committed is scoped to its request or turn (§3) | 1 per daemon |
 | Daemon main | Dispatcher tasks and retries of pending dispatcher starts (§5) | 1 |
 
 Queued turns are owned under claims (T3 §3.1). A cancel request or the
