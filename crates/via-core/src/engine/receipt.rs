@@ -162,7 +162,8 @@ impl Engine {
     ///
     /// Design §10.3: the prompt is staged, the `cwd` checked and the retry
     /// identity streamed with no lock held; under `admission` a keyed retry
-    /// is looked up before any admission check (runtime §6): the same key,
+    /// is looked up before any admission check, the `cwd` check's result
+    /// included (runtime §6): the same key,
     /// handle and byte-identical `raw_params` (a prompt file by its
     /// content) replay the stored receipt, anything else under the key is
     /// `idempotency_conflict`.
@@ -175,7 +176,9 @@ impl Engine {
         params.check_session_members()?;
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.idempotency_key.as_deref())?.map(str::to_owned);
-        let cwd = self.session_cwd(params.cwd.take()).await?;
+        // Checked with no lock held, applied only to new work: a keyed
+        // replay comes before any current-state check (runtime §6).
+        let cwd = self.session_cwd(params.cwd.take()).await;
         let Staged {
             prompt,
             mut pending,
@@ -205,7 +208,7 @@ impl Engine {
     async fn spawn_admitted(
         &self,
         params: SpawnParams,
-        (prompt, cwd): (Prompt, String),
+        (prompt, cwd): (Prompt, Result<String, ApiError>),
         (hash, key, free): ([u8; 32], Option<SpawnKey>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
@@ -230,7 +233,8 @@ impl Engine {
                 Err(ApiError::IDEMPOTENCY_CONFLICT)
             };
         }
-        // No key was found: the floor applies to this new work (§5.3).
+        // No key was found: the `cwd` check and the floor apply (§5.3).
+        let cwd = cwd?;
         self.floor_admits(free.as_ref())?;
         if lock(&self.signal.stop).is_some() {
             return Err(ApiError::DAEMON_STOPPING);

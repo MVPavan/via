@@ -1430,6 +1430,65 @@ fn s1_c1_cwd_is_frozen_applied_and_reported() -> TestResult {
     report.require_pass()
 }
 
+/// Runtime §6, Task 4 design §5.3 (T4-fix; Astra 3): a keyed replay comes
+/// before any check on current state. A keyed spawn in a temporary `cwd`
+/// runs to completion; with the directory removed, the identical request
+/// still returns the original receipt, while an unkeyed spawn with the
+/// removed `cwd` is `invalid_params` naming `cwd`.
+#[test]
+fn s1_c1_keyed_spawn_replays_after_its_cwd_is_removed() -> TestResult {
+    let setup = Setup::new(&json!({"scripts":[any_prompt(&[])]}))?;
+    let evidence = setup.evidence("s1_c1_keyed_cwd_replay")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = setup.start(evidence, &[])?;
+            let work = setup.root.join("gone");
+            daemon::private_dir(&work).map_err(infra)?;
+            let cwd = work.to_str().ok_or_else(|| infra("path"))?.to_owned();
+            let keyed = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,
+                "cwd":cwd,"idempotency_key":"keyed-cwd-replay"});
+            let mut conn = Conn::open(&setup.sandbox)?;
+            let first = conn.exchange(&line(&json!(1), "spawn", &keyed))?;
+            let session = first["result"]["session_id"]
+                .as_str()
+                .ok_or_else(|| failure(format!("keyed spawn: {first}")))?
+                .to_owned();
+            let envelope = setup.wait(evidence, "wait_keyed", &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("keyed turn: {envelope}")
+            })?;
+            fs::remove_dir(&work).map_err(infra)?;
+            let replay = conn.exchange(&line(&json!(2), "spawn", &keyed))?;
+            evidence
+                .write(
+                    "receipts.json",
+                    json!({"first":first,"replay":replay})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(
+                replay.get("result").is_some() && replay["result"] == first["result"],
+                || format!("the replay after the cwd went: {replay}; first {first}"),
+            )?;
+            let mut unkeyed = keyed.clone();
+            unkeyed
+                .as_object_mut()
+                .ok_or_else(|| infra("params"))?
+                .remove("idempotency_key");
+            let refused = conn.exchange(&line(&json!(3), "spawn", &unkeyed))?;
+            check(
+                is_error(&refused, -32602, "invalid_params")
+                    && refused["error"]["data"]["field"] == "cwd",
+                || format!("an unkeyed spawn in the removed cwd: {refused}"),
+            )
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 /// Design §11.1: `label` (at most 120 bytes) is stored and reported;
 /// `allow_untested` is frozen; `require` is expanded and checked against
 /// the fake's capabilities, the first unmet name refused; `instructions`
