@@ -1245,6 +1245,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A49 oversize page item | new during implementation (T4-6, 2026-09-30) |
 | A50 latency by order | new during implementation (T4-6, 2026-09-30); extended by the critic round |
 | A51 F24 coverage | new in the critic round (2026-09-30) |
+| A52 F24 control bound | new in the critic round (2026-09-30) |
 
 ### 12.2 Amendments
 
@@ -1724,6 +1725,15 @@ does not fill the four observation budgets (4 MiB each), whose bound
 proves separately; they add at most 16 MiB to a measured peak of about 195
 MiB against the 415 MiB limit. The row now says so; §15 records it.
 
+**T4-A52. F24's control bound** (critic round, 2026-09-30). A50 kept F24's
+100 ms control checks because F24 runs alone. Running alone, one F24 run
+still answered a `cancel` in 114.58 ms (T4-fix round 2), against 37–61 ms in
+the other recorded runs, so the 100 ms check fails without starvation. The
+row's purpose is that a flood cannot starve the controls. F24 now fails a
+control slower than 1 s, which is ten times the target, and records each
+round's slowest reply (`slowest_control_ms`, `slowest_control_held_ms` in
+`rss.json`) against the 100 ms target.
+
 ## 13. Tests (failure-first)
 
 Each test is written first, fails on the code as found for the stated reason,
@@ -1785,7 +1795,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_prompt_file_copies_hashes_and_refuses_changes` [t4r17.1, t4r18.1] | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and leaves no extra blob, also below a lowered floor; the file rewritten between two requests with the same key gives `idempotency_conflict`, and the stored blob still matches the stored identity; with `prompt_file.copy.pause` holding one copy, a `close` of another session and `daemon/status` answer while the pause still holds it (A50); an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
 | `s1_c1_list_creation_order_and_last_active` [t4r16.4] | 250 sessions page newest first with no repeats while states change; a session created mid-scan never appears; `last_active_at` is the latest event's time and `since` filters on it; `l2.` is `invalid_params`; a filter matching one old session gives empty pages with a cursor, then it |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket` | A31; A32, including a peer that never reads the first byte [t4r16.5.5] |
-| `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once except the observation budgets (A51) (four turns with 16 MiB prompts flooding maximal messages; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
+| `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once except the observation budgets (A51) (four turns with 16 MiB prompts flooding maximal messages; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 1 s, the slowest recorded against a 100 ms target (A52), also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent: `overflow` at the lowered stall |
 | `s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib` | the C2 bounds |
 | `s1_bounds_final_text_spills_to_a_file` [t4r16.7.8] | a text of exactly 256 KiB encoded is inline; one more byte puts the exact text in `final_text.txt`, with `final_text: null` and `final_text_file {path, bytes, truncated: false}`; past a lowered file cap the file ends at a character boundary with `truncated: true` and the turn ends `completed`; `final_text.write.short` fails the turn `store` with a file cut to its last complete character, named with its `bytes` and `truncated: true`; `final_text.sync.fail` fails it `store` with `final_text_file: null`; killed right after the terminal commit, the restarted daemon finds the named file with `bytes` bytes [t4r17.3] |
