@@ -370,6 +370,100 @@ fn a_decoded_terminal_survives_wall_expiry_in_finalization() {
     assert_eq!(evidence.cleanup, Cleanup::Quiescent);
 }
 
+/// S1 critic r2 finding 2 (design §2 rule 3 [r1.23], Task 4 design §2.3):
+/// a terminal Route decoded but had not yet handed over when the wall
+/// deadline passed is delivered before the late result returns, so its
+/// final text reaches Core. See [`held_terminal`].
+#[test]
+fn a_held_terminal_is_delivered_after_wall_expiry() {
+    let name = "a_held_terminal_is_delivered_after_wall_expiry";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script());
+    };
+    let (outcome, text) = held_terminal(&Child::open(&root), true);
+    let evidence = outcome.unwrap();
+    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
+    assert_eq!(text, "done", "a completed turn lost its final text");
+}
+
+/// S1 critic r2 finding 2: a held terminal that cannot reach the hop within
+/// the late path's cleanup allowance fails the turn with the delivery's
+/// own failure (the allowance's `Deadline`), never a completion.
+#[test]
+fn an_undelivered_held_terminal_is_not_a_completion() {
+    let name = "an_undelivered_held_terminal_is_not_a_completion";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script());
+    };
+    let (outcome, text) = held_terminal(&Child::open(&root), false);
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(failure.cause, RouteError::Deadline { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(text, "");
+}
+
+/// The acceptance, 1,025 texts and the terminal, then a live vendor.
+fn held_terminal_script() -> String {
+    format!(
+        "read -r start\nprintf '%s\\n' '{ACCEPTED}'\ni=0\n\
+         while [ \"$i\" -lt 1025 ]; do\n\
+         printf '%s\\n' '{{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"text\":\"x\"}}'\n\
+         i=$((i+1))\ndone\n\
+         printf '%s\\n' '{{\"type\":\"terminal\",\"vendor_turn_id\":\"fake-turn-1\",\"status\":\"completed\",\"final_text\":\"done\",\"stop_reason\":\"end_turn\"}}'\n\
+         exec sleep 60\n"
+    )
+}
+
+/// Runs [`held_terminal_script`] under a 3 s wall deadline and drains
+/// nothing before it: the acceptance and 1,023 texts fill Core's 1,024-item
+/// channel, the Adapter's delivery holds the 1,024th text, the hop of one
+/// the 1,025th, and Route holds the terminal. From the deadline on the
+/// channel is drained if `drain`. Returns the outcome and the final text
+/// Core received.
+fn held_terminal(child: &Child, drain: bool) -> (Outcome, String) {
+    let (sender, mut receiver) = via_adapters::observation_channel();
+    let expiry = tokio::time::Instant::now() + Duration::from_secs(3);
+    let (_force, force) = watch::channel(None);
+    let (_order, orders) = watch::channel(None);
+    child.runtime.block_on(async {
+        let execute = child.adapter.execute(
+            SessionId::try_from(SESSION).unwrap(),
+            TurnNumber::try_from(1).unwrap(),
+            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
+            sender,
+            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
+            Deadline::at(expiry),
+            force,
+            orders,
+            Box::new(()),
+        );
+        tokio::pin!(execute);
+        let mut text = String::new();
+        let mut collect = |observation: FakeObservation| {
+            if let FakeObservation::Data {
+                observation: Observation::FinalText(piece),
+            } = observation
+            {
+                text.push_str(&piece);
+            }
+        };
+        let mut draining = false;
+        let outcome = loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(expiry), if drain && !draining => draining = true,
+                Some(admitted) = receiver.recv(), if draining => collect(admitted.observation),
+                outcome = &mut execute => break outcome,
+            }
+        };
+        while let Ok(admitted) = receiver.try_recv() {
+            collect(admitted.observation);
+        }
+        (outcome, text)
+    })
+}
+
 /// Design §7.2 row 3: an anchor intent that is not committed starts no
 /// process; Route reports `Store` with kind `NotCommitted`, not launched and
 /// with no anchor intent.

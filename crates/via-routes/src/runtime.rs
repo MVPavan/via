@@ -154,28 +154,40 @@ impl FakeRoute {
             Ok(Finished::Late(terminal)) => {
                 // Design §2 rule 3 [r1.23]: a decoded terminal is returned
                 // even though the wall deadline passed during finalization;
-                // cleanup comes from Host's force close.
+                // cleanup comes from Host's force close. A message still
+                // held, such as the terminal with its final text, reaches the
+                // hop first, within the same cleanup allowance; if it cannot,
+                // that failure is the turn's, never a completion.
                 let cleanup = cleanup_deadline();
-                let report = sender
-                    .close(CloseRequest {
-                        mode: CloseMode::Force,
-                        deadline: cleanup,
-                    })
-                    .await;
-                messages.finish(cleanup).await;
-                return Ok(terminal.result(
-                    report.vendor_exit.unwrap_or(ExitReport {
-                        code: None,
-                        signal: None,
-                    }),
-                    report.cleanup,
-                    report.journal_uncertain,
-                ));
+                serving.deadline = cleanup;
+                match serving.flush().await {
+                    Ok(()) => {
+                        let report = sender
+                            .close(CloseRequest {
+                                mode: CloseMode::Force,
+                                deadline: cleanup,
+                            })
+                            .await;
+                        messages.finish(cleanup).await;
+                        return Ok(terminal.result(
+                            report.vendor_exit.unwrap_or(ExitReport {
+                                code: None,
+                                signal: None,
+                            }),
+                            report.cleanup,
+                            report.journal_uncertain,
+                        ));
+                    }
+                    Err(mut failed) => {
+                        failed.close_by.get_or_insert(cleanup);
+                        failed
+                    }
+                }
             }
             Err(failed) => failed,
         };
         // The turn deadline may already have elapsed; cleanup gets its own
-        // bound, or the stop order's `close_by`.
+        // bound, or `close_by`.
         let cleanup = failed.close_by.unwrap_or_else(cleanup_deadline);
         let report = sender
             .close(CloseRequest {
@@ -684,7 +696,8 @@ async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>) {
 struct Failed {
     cause: RouteError,
     exit: Option<ExitReport>,
-    /// A stop order's bound on the force close and drain.
+    /// A stop order's bound on the force close and drain, or a late
+    /// terminal's cleanup allowance.
     close_by: Option<Deadline>,
 }
 
