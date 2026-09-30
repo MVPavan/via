@@ -1243,7 +1243,8 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A47 Wire queue count | new during implementation (T4-3, 2026-09-29) |
 | A48 pipelined partial line | new during implementation (T4-5, 2026-09-30) |
 | A49 oversize page item | new during implementation (T4-6, 2026-09-30) |
-| A50 latency by order | new during implementation (T4-6, 2026-09-30) |
+| A50 latency by order | new during implementation (T4-6, 2026-09-30); extended by the critic round |
+| A51 F24 coverage | new in the critic round (2026-09-30) |
 
 ### 12.2 Amendments
 
@@ -1706,6 +1707,23 @@ both replies while the acknowledged pause still holds the copy, releases it
 only afterwards, and records the latencies as evidence. F24 keeps its 100 ms
 control checks because it runs alone (`.config/nextest.toml`).
 
+A50 also covers two more rows (critic round, 2026-09-30):
+`s1_c1_status_latency_under_bounded_store_delay` proves that each `status`
+call makes exactly one delayed Store read, which is Q-R5-5's accepted
+wording, and records each latency;
+`s1_evidence_stderr_is_written_by_the_os_and_listed` proves "idle was not
+reset" from the daemon's own event timestamps.
+
+**T4-A51. What F24 fills** (critic round, 2026-09-30). The §13 F24 row said
+every §5.1 holder is at its maximum at once. The test holds the 32 C1
+sockets at their larger phase (a maximal line and its 65,536-node decode;
+§5.1 builds the reply only after those are dropped), the four Wire
+connections, and the running turns' 16 MiB prompts and maximal messages. It
+does not fill the four observation budgets (4 MiB each), whose bound
+`s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib`
+proves separately; they add at most 16 MiB to a measured peak of about 195
+MiB against the 415 MiB limit. The row now says so; §15 records it.
+
 ## 13. Tests (failure-first)
 
 Each test is written first, fails on the code as found for the stated reason,
@@ -1742,7 +1760,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | Test | Proves |
 |---|---|
 | `s1_progress_step_rule_counts_output_after_tool_results` | fake: text, tool_started, tool_ended, text, text, tool_started, tool_ended, text → `current_step` 3; rows 1–2 before the terminal, row 3 in it (`store.commit.step` barriers); envelope `steps` `null` |
-| `s1_progress_snapshot_adds_no_store_read`; `s1_c1_status_latency_under_bounded_store_delay` | `status` on a running turn and on an idle session make the same number of Store reads; with `store.read.delay_ms` = 200 it answers within 300 ms while the turn progresses (Q-R5-5) |
+| `s1_progress_snapshot_adds_no_store_read`; `s1_c1_status_latency_under_bounded_store_delay` | `status` on a running turn and on an idle session make the same number of Store reads; with `store.read.delay_ms` = 200 each call makes exactly one delayed read while the turn progresses, its latency recorded (Q-R5-5, A50) |
 | `s1_c1_status_progress_only_for_the_selected_turn` [t4r16.5.2] | with turn 2 running, `status --turn 1` has `progress: null` and turn 1's rows; `status` has turn 2's `progress`, whose `current_step` has no row; a step ended after the Store read (`core.progress.publish` held) appears on the next call; with `store.commit.step` held at a boundary, `status` shows the new `current_step` and no row for it, and once released the row appears while `current_step` is already past it [t4r17.4]; with the drive held between the terminal commit and `finish_running` (`core.finish_running.pause`), `status` shows the terminal turn and its last row with `progress: null` [t4r18.2] |
 | `s1_progress_tokens_sum_per_step_and_label_scope` | two keyless samples in one step supersede, steps add; `tokens.scope` is the fake's declared scope |
 | `s1_progress_tools_overflow_and_untracked_end_count` | 70 concurrent tool starts: 64 names and `tools_overflow`; an untracked end then model output advances `current_step` and writes a row |
@@ -1766,7 +1784,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_c1_prompt_file_copies_hashes_and_refuses_changes` [t4r17.1, t4r18.1] | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and leaves no extra blob, also below a lowered floor; the file rewritten between two requests with the same key gives `idempotency_conflict`, and the stored blob still matches the stored identity; with `prompt_file.copy.pause` holding one copy, a `close` of another session and `daemon/status` answer while the pause still holds it (A50); an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
 | `s1_c1_list_creation_order_and_last_active` [t4r16.4] | 250 sessions page newest first with no repeats while states change; a session created mid-scan never appears; `last_active_at` is the latest event's time and `since` filters on it; `l2.` is `invalid_params`; a filter matching one old session gives empty pages with a cursor, then it |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket` | A31; A32, including a peer that never reads the first byte [t4r16.5.5] |
-| `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once (four turns with 16 MiB prompts flooding maximal messages and filling observations; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
+| `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once except the observation budgets (A51) (four turns with 16 MiB prompts flooding maximal messages; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
 | `s1_f24_stall_closes_the_hop_and_fails_overflow_without_vendor_output` | Core held at `core.observations.pause`, vendor silent: `overflow` at the lowered stall |
 | `s1_f24_observation_budget_admits_more_than_64_and_at_most_1024_or_4_mib` | the C2 bounds |
 | `s1_bounds_final_text_spills_to_a_file` [t4r16.7.8] | a text of exactly 256 KiB encoded is inline; one more byte puts the exact text in `final_text.txt`, with `final_text: null` and `final_text_file {path, bytes, truncated: false}`; past a lowered file cap the file ends at a character boundary with `truncated: true` and the turn ends `completed`; `final_text.write.short` fails the turn `store` with a file cut to its last complete character, named with its `bytes` and `truncated: true`; `final_text.sync.fail` fails it `store` with `final_text_file: null`; killed right after the terminal commit, the restarted daemon finds the named file with `bytes` bytes [t4r17.3] |
@@ -1802,11 +1820,12 @@ durable `output_schema` (§0).
 | `via.log` grows without bound between daemon starts | its measured size (§16) |
 | Below the floor a queued turn fails `store` rather than waits | callers need queued work to survive a full disk |
 | At `wal.max` admitted turns keep writing, so the WAL grows past it while a reader holds a snapshot [t4r17.2] | `via-d9o.2.3` measures the growth (§16) |
-| `data_bytes` costs one directory walk per minute, linear in evidence files | retention (`via-jm4.18`), or the walk is slow |
+| `data_bytes` costs one directory walk per minute, linear in evidence files; a walk over 2 s reports `null` until the next minute | retention (`via-jm4.18`), or the measured walk time (§16) |
 | Step counts and tokens are VIA's and unproven for Claude, Codex and OpenCode until their probes (§2.5), so `tokens` may be `null`; `running_tools` lists at most 64 names | each vendor's probe; the owner's accuracy decision (Q-R5-11) |
 | Transcript paths follow each vendor's internal layout; a deleted transcript loses the conversation (R8) | each vendor task |
 | Reusable connections and their evidence are not designed here | `via-4sw.3.2` and the Codex task |
-| The open-session tally is exact only until an uncertain close; blob verification at start is linear in blob bytes | Store-failure recovery work; retention |
+| The open-session tally is exact only until an uncertain close; blob verification at start is linear in blob bytes, and the start-up sweep holds every referenced blob id in memory | Store-failure recovery work; retention (`via-jm4.18`) |
+| F24 does not fill the observation budgets together with the other holders (A51) | `via-d9o.2.3` measures real vendors, or the gate is extended |
 | `revision` is 0; `process.idle_since` is `null` (A16) | late evidence; vendor idle shutdown |
 | Inferred: the §6.2 lifecycle count, the terminal and failure-batch sizes and the envelope maxima, `bound.effective` included (§6.4), the 128 B step row, the §5.1 sizes, `journal_size_limit` behaviour, and that `json_limits::scan` and serde_json agree on token boundaries | the checking test fails |
 
