@@ -43,14 +43,15 @@ python3 scripts/check-layers.py
 cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings
 cargo nextest run --locked --workspace --features via-cli/test-failpoints
 cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08|09|10|12)_/)'
-cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_(f2[4567]|bounds|store)_/)'
+cargo nextest run --locked --workspace --features via-cli/test-failpoints -E 'test(/^s1_(f05|f2[47]|bounds|store|blob|wire|c1|progress|evidence|config|daemon_log)_/)'
 cargo build --locked --release -p via-cli --no-default-features
 python3 scripts/check-release-features.py target/release/via
 ```
 
-The `s1_(f2[4567]|bounds|store)_` selection is Task 4's scenario set
-(`via-jm4.7.8`). Until those scenarios exist it exits 4 with "no tests to
-run"; that is expected and is not a pass.
+The `s1_(f05|f2[47]|bounds|store|blob|wire|c1|progress|evidence|config|daemon_log)_`
+selection is Task 4's scenario set (`via-jm4.7.8`). It runs across the
+workspace because the Store and Wire tests live in their crates. F25, F26 and
+the raw log are obsolete (Task 4 design §14).
 
 `test-failpoints` is default-off and test-only; its feature wiring, code and
 environment parsing must be absent from the release feature graph.
@@ -60,10 +61,12 @@ configuration) and verifies they are ignored, then scans for unique control
 marker strings as supporting evidence. A string scan alone is insufficient. It
 drives the fake agent, so `target/debug/via-fake-agent` must exist (the
 nextest lines build it). Points added by later tasks join its `POINTS` list.
-Scenario tests `s1_f01_...` through `s1_f30_...`, `s1_bounds_...` and
-`s1_store_...` must use real daemon/SQLite paths and emit a summary, sha256
+Daemon scenario tests (the `via-cli` tests that start a daemon, among them
+`s1_f01_...` through `s1_f30_...`, `s1_bounds_...`, `s1_c1_...` and
+`s1_store_...`) must use real daemon/SQLite paths and emit a summary, sha256
 manifest, consistent SQLite backup, event logs, the turns' evidence folders
-and report under `scratchpad/`. The gate fails for missing evidence; never treat a
+and report under `scratchpad/`. Crate-level Store and Wire tests (`via-store`,
+`via-wire`) exercise one layer and emit no scenario evidence. The gate fails for missing evidence; never treat a
 copy of a live WAL file as a consistent backup.
 F22/P-I2 requires both positive cleanup paths and negative identity refusals
 specified in `docs/specs/runtime-contracts.md` §5.2 and §11. A result that
