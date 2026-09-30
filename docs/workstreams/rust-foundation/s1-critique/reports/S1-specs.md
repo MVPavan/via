@@ -17,7 +17,9 @@ Bead `via-jm4.7.9.3`, S1 critic finding 13. Branch `wt/s1-specs`, cut from
 | `5eba7e0`, `bbec36f` | `.repo-context/coding-style.md` §6 | A6 (the second commit makes it an exception to the "only daemon main and the anchor" sentence) |
 | `f04260d`, `523e5f4` | this report | |
 | `cfac18e` | runtime §8, §10; dispatch §1 | fix round 1: C1, C2 |
-| the commit after `cfac18e` | this report | fix round 1 |
+| `cae88e2` | this report | fix round 1 |
+| `f2ede70` | dispatch design | fix round 2: Sol r1 findings 1, 2 |
+| the commit after `f2ede70` | this report | fix round 2 |
 
 The orchestrator's mapping of rows to targets matches the table: I found
 no row that targets another document.
@@ -154,3 +156,50 @@ Commit `cfac18e`.
 
 Verification: `grep -n "first failure retained\|state write failed or was uncertain"`
 on both files finds nothing; `git status` clean after this commit.
+
+## Fix round 2 (Sol high review r1: UNSOUND, two findings)
+
+Commit `f2ede70`, `docs/workstreams/rust-foundation/t2/dispatch-design.md` only.
+
+- **Finding 1 (Important).** Appending "not committed / uncertain" lines in
+  `e848a6b` left sentences that still said a failed write latches. Each such
+  sentence now states the A14/A16 distinction, with the site's T3 §7.2
+  resolution write or retry:
+  - §2.2 step 5 (`queued → cancelled`, row 9): not committed keeps the entry
+    and retries once; a retry that commits stays `cancelled`; a failed retry
+    or an uncertain commit latches.
+  - §2.2 step 6 (submission, row 2): split into **Not committed** (no vendor
+    I/O, permit dropped, resolution write `commit_submit_failed`; successors
+    dispatch; a failed resolution write latches) and **Uncertain** (latch;
+    stays queued).
+  - §2.2 step 7 (event or terminal, rows 5–7): not committed is scoped with
+    one resolution write, or one retry for a natural terminal; a failed
+    resolution write or retry, or an uncertain write, latches.
+  - §2.3 first bullet and the closing-rider bullet (row 9, including the
+    refused-rider case).
+  - §2.4 (row 14): a close not committed counts in `unclosed_sessions` and
+    does not latch; an uncertain one latches.
+  - §3 receipt paragraph (row 1): not committed returns `store_error`
+    `not_committed`, retires a slot the request created and does not latch;
+    uncertain returns `unknown` with `retry: same_key_only` and latches.
+    Matches `latch.rs` `report`: `NotCommitted` latches only for sites
+    whose `scoped()` is false (`Resolution`, `Batch`); `Receipt` is scoped.
+  - §3 "best-effort writes after the first failure" becomes "on the latched
+    path (the failure-resolution batch and forced terminals)".
+  - §6 drain paragraph, §7 "Writes after a failed write" row and §8 runtime
+    §7 row: rewritten to the scoped/latched rule (the appended lines removed).
+  - §9 test list items 2 and 3 ("Failed submission commit", "Failed
+    cancellation under force") now say "Uncertain" (and "or a failed
+    retry"), since a not-committed one no longer latches. These describe the
+    T2 step-2 tests; I did not check the current test names.
+- **Finding 2 (Minor).** §1's "It scans no slot" now says that for a force
+  stop `request_stop` first collects the force set (§2.4) under
+  `admission`, reading `sessions` and then each slot's state, each released
+  before the next, and scans no slot otherwise (`stop.rs`
+  `unfinished_sessions`).
+- Also reflowed two over-long lines in §2.4 that `e848a6b` left.
+
+Verification: a grep of the dispatch design for "latch" shows no remaining
+unconditional "failed ... latches" clause outside the latched-path text and
+the header's history list (line 7, a record of the T2 correction, left as
+history). `git status` clean after this commit.
