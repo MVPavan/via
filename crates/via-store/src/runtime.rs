@@ -1408,7 +1408,8 @@ impl Store {
             )
             .map_err(|error| StoreError::Open(error.to_string()))?;
         let wal_full = Arc::new(AtomicBool::new(false));
-        let wal = disk::Wal::new(wal, &db, Arc::clone(&wal_full));
+        let mut wal = disk::Wal::new(wal, &db, Arc::clone(&wal_full));
+        wal.opened(&conn);
         let lanes = Arc::new(Lanes::default());
         let read_corruption = ReadCorruption::default();
         let observer = read_corruption.clone();

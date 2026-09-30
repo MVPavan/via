@@ -71,6 +71,17 @@ impl Wal {
         }
     }
 
+    /// At open, before the first mutation: a WAL an earlier writer left at
+    /// or above `wal.max` (a reader held it) gets one `TRUNCATE` attempt,
+    /// and the Store starts with new work refused while it stays at the
+    /// limit, as after a commit (review r1).
+    pub(super) fn opened(&mut self, conn: &Connection) {
+        if self.length().is_some_and(|len| len >= self.limits.max) {
+            self.full.store(true, Ordering::Release);
+            self.truncate(conn);
+        }
+    }
+
     /// Before a mutation: while `wal_full` is set, a write at least 1 s
     /// after the last attempt retries `TRUNCATE`, which clears the flag
     /// below `wal.max`. Then a `spawn` or `resume` receipt still meeting

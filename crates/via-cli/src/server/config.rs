@@ -49,26 +49,46 @@ impl fmt::Display for Invalid {
     }
 }
 
+// Every member keeps its presence: an explicit `null` is `Some`, refused by
+// its key's rule, never read as absent (§5.5, review r1).
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
     wal: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Disk {
+    #[serde(default, deserialize_with = "present")]
     free_floor: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     warn_size: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Wal {
+    #[serde(default, deserialize_with = "present")]
     max: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     checkpoint_bytes: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     checkpoint_commits: Option<Value>,
+}
+
+/// A member that is present, `null` included; an absent one is the
+/// field's `default`, `None`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Reads `<state>/daemon.json`: defaults when it is absent, else the
@@ -235,5 +255,13 @@ mod tests {
         assert!(invalid(r#"{"disk":{"free_floor":1.5}}"#).contains("disk.free_floor"));
         let limits = parse(br#"{"wal":{"checkpoint_bytes":8191}}"#).expect("pages");
         assert_eq!(limits.wal.checkpoint_bytes, 4096);
+        assert_eq!(
+            invalid(r#"{"disk":{"warn_size":null}}"#),
+            "daemon config invalid: disk.warn_size: must be a non-negative integer at most 2^62"
+        );
+        assert_eq!(
+            invalid(r#"{"disk":null}"#),
+            "daemon config invalid: disk: must be an object"
+        );
     }
 }

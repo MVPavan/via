@@ -458,7 +458,19 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
 
             let runtime = &setup.sandbox.runtime;
             let state = &setup.sandbox.state;
-            let cases: [(&str, &str, &str); 11] = [
+            let cases: [(&str, &str, &str); 14] = [
+                // An explicit null is neither absent nor a value (review r1).
+                (
+                    r#"{"disk":{"free_floor":null}}"#,
+                    "disk.free_floor",
+                    "integer",
+                ),
+                (
+                    r#"{"wal":{"checkpoint_commits":null}}"#,
+                    "wal.checkpoint_commits",
+                    "integer",
+                ),
+                (r#"{"wal":null}"#, "wal", "must be an object"),
                 (r#"{"memory":{"max":1}}"#, "memory", "unknown key"),
                 (r#"{"disk":{"floor":1}}"#, "disk.floor", "unknown key"),
                 (
@@ -1149,6 +1161,72 @@ fn s1_store_wal_limit_refuses_only_new_work() -> TestResult {
             check(setup.wal_len() < 4 * MIB, || {
                 format!("WAL after TRUNCATE: {}", setup.wal_len())
             })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Design §5.4 (review r1): a WAL left at `wal.max` by a reader that holds
+/// it across a restart refuses the first new receipt of the next daemon:
+/// the Store checks the WAL it opens, tries one `TRUNCATE` and starts with
+/// new work refused while the WAL stays at the limit.
+#[test]
+fn s1_store_wal_limit_holds_across_a_restart() -> TestResult {
+    const ROUNDS: usize = 40;
+    const PER: u64 = 40;
+    let fixture = json!({"scripts":[rounds_script("grow", ROUNDS, PER), script("after", &[])]});
+    let setup = Setup::new(&fixture)?;
+    let evidence = setup.evidence("s1_store_wal_restart")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            setup.config(r#"{"wal":{"max":4194304,"checkpoint_bytes":65536}}"#)?;
+            let daemon = setup.start(evidence)?;
+            let session = setup.spawn(evidence, "grow")?;
+            setup.sandbox.await_gate("grow-start")?;
+            let store = setup.sandbox.state.join("store.sqlite3");
+            let reader = rusqlite::Connection::open_with_flags(
+                &store,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(infra)?;
+            reader.execute_batch("BEGIN").map_err(infra)?;
+            let _: i64 = reader
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .map_err(infra)?;
+            setup.sandbox.release_gate("grow-start")?;
+            drain(&setup, (&session, "grow", PER), (0, ROUNDS))?;
+            let envelope = setup.wait(evidence, "wait_grow", &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || format!("{envelope}"))?;
+            drop(daemon);
+            let held = setup.wal_len();
+            check(held >= 4 * MIB, || {
+                format!("the WAL held across the restart is {held} bytes")
+            })?;
+            let _daemon = setup.start(evidence)?;
+            let mut conn = Conn::open(&setup.sandbox)?;
+            let refused = conn.call("spawn", &spawn_params("after"))?;
+            evidence
+                .write(
+                    "wal_restart.json",
+                    json!({"wal_bytes_at_restart":held,"first_spawn":refused})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(
+                is_error(&refused, -32018, "store_error")
+                    && refused["error"]["data"]["commit_outcome"] == "not_committed"
+                    && refused["error"]["data"]["kind2"] == "wal_full",
+                || format!("first spawn after a restart at wal.max: {refused}"),
+            )?;
+            drop(reader);
+            wait_until(
+                "a spawn after the reader closed",
+                Duration::from_secs(10),
+                || Ok(conn.call("spawn", &spawn_params("after"))?["result"].is_object()),
+            )
         },
         |evidence| setup.collect(evidence),
     );
