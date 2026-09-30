@@ -341,7 +341,7 @@ impl Engine {
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
         let source = params.take_prompt()?;
-        let hash = hash_handle(&params.handle)?;
+        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
         let key = retry_key(params.op_key.as_deref())?.map(str::to_owned);
         let Staged {
             prompt,
@@ -556,7 +556,7 @@ impl Engine {
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        let hash = hash_handle(&params.handle)?;
+        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
         if !self
             .store
             .authenticate(&params.session, &hash)

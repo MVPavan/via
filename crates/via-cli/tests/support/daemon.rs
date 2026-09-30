@@ -135,6 +135,34 @@ impl Sandbox {
     }
 }
 
+/// A deterministic dump of the live Store's session, turn, event, operation
+/// and anchor rows, for before/after comparisons around a refused request.
+pub(crate) fn store_dump(state: &Path) -> Result<String, ScenarioError> {
+    use std::fmt::Write as _;
+    let store = rusqlite::Connection::open_with_flags(
+        state.join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(infra)?;
+    let mut dump = String::new();
+    for table in ["sessions", "turns", "events", "operations", "anchors"] {
+        let mut statement = store
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .map_err(infra)?;
+        let columns = statement.column_count();
+        let mut rows = statement.query([]).map_err(infra)?;
+        while let Some(row) = rows.next().map_err(infra)? {
+            dump.push_str(table);
+            for index in 0..columns {
+                let value: rusqlite::types::Value = row.get(index).map_err(infra)?;
+                write!(dump, " {value:?}").map_err(infra)?;
+            }
+            dump.push('\n');
+        }
+    }
+    Ok(dump)
+}
+
 /// The daemon child; dropping it force-stops, reaps and records cleanup.
 pub(crate) struct Daemon<'a> {
     child: Child,

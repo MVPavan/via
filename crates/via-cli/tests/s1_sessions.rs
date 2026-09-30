@@ -1458,3 +1458,103 @@ fn s1_params_keyed_retry_replays_identical_effective() -> TestResult {
     );
     report.require_pass()
 }
+
+/// F15: on every existing-session mutation (`resume`, `steer`, `cancel`,
+/// `close`), a wrong handle and a missing one are both `invalid_handle`,
+/// and the Store and the session's `status` are unchanged. On the fake,
+/// `steer` checks the handle before its capability, so neither reaches
+/// `unsupported_verb`.
+#[test]
+fn s1_f15_wrong_or_missing_handle_is_invalid_handle_with_no_state_change() -> TestResult {
+    let sandbox = Sandbox::new(&fixture(&[turn_script(1, "f15", Some("hold_f15"))]))?;
+    let evidence = Evidence::new("s1_f15_invalid_handle", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let receipt = cli(
+                &sandbox,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "f15",
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = session_of(&receipt)?;
+            sandbox.await_gate("hold_f15")?;
+            await_count(
+                &sandbox,
+                "SELECT count(*) FROM events WHERE type='turn.started'",
+                1,
+            )?;
+            let status = || {
+                cli(
+                    &sandbox,
+                    evidence,
+                    "status",
+                    &["status", &session, "--json"],
+                )
+            };
+            let before = (daemon::store_dump(&sandbox.state)?, status()?);
+            let mut raw = Raw::open(&sandbox)?;
+            let mut id = 10;
+            for (verb, params) in [
+                ("resume", json!({"session":session,"prompt":"f15b"})),
+                ("steer", json!({"session":session,"text":"late"})),
+                ("cancel", json!({"session":session})),
+                ("close", json!({"session":session,"mode":"force"})),
+            ] {
+                for handle in [None, Some(OTHER_HANDLE)] {
+                    let mut params = params.clone();
+                    if let Some(handle) = handle {
+                        params["handle"] = json!(handle);
+                    }
+                    id += 1;
+                    let reply = raw.exchange(&request(id, verb, &params))?;
+                    if reply["error"]["data"]["kind"] != "invalid_handle" {
+                        return Err(failure(format!(
+                            "{verb} with handle {handle:?}: expected invalid_handle, got {reply}"
+                        )));
+                    }
+                }
+            }
+            let after = (daemon::store_dump(&sandbox.state)?, status()?);
+            if after != before {
+                return Err(failure(format!(
+                    "a refused mutation changed state: {before:?} then {after:?}"
+                )));
+            }
+            sandbox.release_gate("hold_f15")?;
+            let envelope = wait_completed(
+                &sandbox,
+                evidence,
+                "wait",
+                &format!("{session}/1"),
+                "f15 reply",
+            )?;
+            evidence
+                .write("envelopes.ndjson", format!("{envelope}\n").as_bytes())
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 1).map(|_| ())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}

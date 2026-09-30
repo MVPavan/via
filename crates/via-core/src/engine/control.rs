@@ -20,7 +20,7 @@ impl Engine {
     /// `already_terminal: true`; once force is accepted `daemon_stopping`.
     /// Allowed during a drain and while the session is closing.
     pub async fn cancel(&self, params: CancelParams) -> Result<Value, ApiError> {
-        let hash = hash_handle(&params.handle)?;
+        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
         if params.turn == Some(0) {
             return Err(ApiError::INVALID_PARAMS);
         }

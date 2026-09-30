@@ -44,7 +44,7 @@ impl Engine {
     /// C1 §3.6 `close`: design §4's admission step under `admission`, then
     /// the caller waits, holding no lock, for the close attempt's outcome.
     pub async fn close(&self, params: CloseParams, raw_params: &str) -> Result<Value, ApiError> {
-        let hash = hash_handle(&params.handle)?;
+        let hash = hash_handle(params.handle.as_deref().ok_or(ApiError::INVALID_HANDLE)?)?;
         let key = retry_key(params.op_key.as_deref())?;
         let deadline_ms = params.deadline_ms.unwrap_or(DEFAULT_CLOSE_DEADLINE_MS);
         if deadline_ms == 0 {
