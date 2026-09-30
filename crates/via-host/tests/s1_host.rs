@@ -175,8 +175,46 @@ impl Fixture {
 }
 
 impl Drop for Fixture {
+    /// A paused anchor waits for its release file in `points`: removing the
+    /// folder first would hide the file, and the anchor would stay paused
+    /// after the test (bead via-jm4.19). Every point entered is released,
+    /// and the folder is kept until this fixture's anchors have exited,
+    /// within a bound.
     fn drop(&mut self) {
+        if let Ok(entries) = fs::read_dir(&self.points) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(occurrence) = name.strip_suffix(".ack") {
+                    let _ = fs::write(self.points.join(format!("{occurrence}.release")), b"");
+                }
+            }
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while self.anchors_alive() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    /// Whether a live process was started with a bootstrap of this
+    /// fixture: an anchor's environment names its config under `anchors`.
+    fn anchors_alive(&self) -> bool {
+        let marker = format!(
+            "VIA_HOST_TEST_CONFIG={}/",
+            self.root.join("anchors").to_string_lossy()
+        );
+        let Ok(processes) = fs::read_dir("/proc") else {
+            return false;
+        };
+        processes.flatten().any(|process| {
+            fs::read(process.path().join("environ")).is_ok_and(|environ| {
+                environ
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry.starts_with(marker.as_bytes()))
+            })
+        })
     }
 }
 
@@ -1528,6 +1566,105 @@ fn early_stops_are_concurrent() {
         fixture.release("host.anchor.stop_received");
         let close = closing.await.unwrap();
         assert!(matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)));
+    });
+}
+
+/// S1 critic finding 5: a live Host collects each finished turn's reaper
+/// and exit poll, and prunes its dropped control, as later turns begin; the
+/// registries stay bounded instead of growing per turn. S1-io review r1
+/// finding 1: forced turns too, whose forced-stop fact their close already
+/// handed to the owner, leave no Host-wide fact behind.
+#[test]
+fn live_service_collects_finished_turn_tasks() {
+    const TURNS: usize = 6;
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        for turn in 0..2 * TURNS {
+            let forced = turn >= TURNS;
+            let (program, mode) = if forced {
+                ("/bin/sleep", CloseMode::Force)
+            } else {
+                ("/bin/true", CloseMode::Graceful)
+            };
+            let args: &[&str] = if forced { &["60"] } else { &[] };
+            let acquired = host
+                .acquire(fixture.spec(program, args), within(4))
+                .await
+                .unwrap();
+            let close = acquired
+                .control
+                .close(CloseRequest {
+                    mode,
+                    deadline: within(3),
+                })
+                .await;
+            assert!(
+                matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+                "{close:?}"
+            );
+            assert_eq!(close.forced, forced, "{close:?}");
+            drop(acquired);
+        }
+        // At most this turn's and the previous turn's two tasks and control.
+        let (tasks, controls, facts) = host.tracked();
+        assert!(
+            tasks <= 4 && controls <= 2 && facts == 0,
+            "{tasks} tasks, {controls} controls and {facts} forced facts tracked \
+             after {TURNS} graceful and {TURNS} forced turns"
+        );
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
+    });
+}
+
+/// Continues a stopped anchor when dropped, so a failed assertion never
+/// leaves it stopped.
+struct Stopped(rustix::process::Pid);
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process(self.0, rustix::process::Signal::CONT);
+    }
+}
+
+/// S1-io review r1, decision 3: a retired control is shut down, so the
+/// anchor sees control EOF and cleans up its group (runtime §5.1). A
+/// stopped anchor answers no `Status`, so the exit poll's bound retires the
+/// control; `close` then sends no `Stop` and proves absence through the
+/// journal, with no forced evidence.
+#[test]
+fn a_retired_control_is_shut_down_and_the_anchor_cleans_up_on_eof() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let mut acquired = host
+            .acquire(fixture.spec("/bin/sleep", &["60"]), within(4))
+            .await
+            .unwrap();
+        let identity = acquired.control.identity().clone();
+        let anchor = rustix::process::Pid::from_raw(i32::try_from(identity.pid).unwrap()).unwrap();
+        rustix::process::kill_process(anchor, rustix::process::Signal::STOP).unwrap();
+        let stopped = Stopped(anchor);
+        let ended = tokio::time::timeout(Duration::from_secs(5), acquired.exits.changed()).await;
+        drop(stopped);
+        assert!(matches!(ended, Ok(Err(_))), "exit supervision did not end");
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(
+            matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{close:?}"
+        );
+        assert!(!close.forced, "control EOF made forced evidence: {close:?}");
+        assert!(group_gone(identity.pgid));
+        drop(acquired);
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
     });
 }
 

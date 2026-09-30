@@ -204,6 +204,9 @@ impl Shared {
             Ok(()) => format!("{what}; first {kept} in {}", path.display()),
             Err(error) => format!("{what}; not saved: {error}"),
         };
+        // Test builds: the save's outcome is known and not yet noted.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("wire.undecoded.before_note").await;
         *undecoded
             .note
             .lock()
@@ -726,6 +729,8 @@ where
 /// never awaiting a consumer or the Store. A full queue or a message over
 /// 1 MiB latches the failure and switches to discard mode: read to EOF,
 /// count the bytes, keep nothing, so the vendor never blocks on its pipe.
+/// An oversized message's prefix save runs beside those reads, owned by
+/// this loop, and is awaited before EOF is recorded.
 async fn read_stdout<R: AsyncRead + Unpin>(
     mut stdout: R,
     shared: Arc<Shared>,
@@ -735,10 +740,24 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     let mut buffer = vec![0_u8; READ_BYTES];
     let mut splitter = LineSplitter::new();
     let mut discard = false;
+    // The oversized prefix's save, bounded by its blob step's 2 s. It is
+    // polled with the reads, so discard reads go on while it waits. A stop
+    // drops it, as the abort that follows the stop would; the blob step
+    // itself stays owned by the Store pool.
+    let mut saving: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
     loop {
         let read = tokio::select! {
             biased;
             () = stopped(&mut stop) => return,
+            () = async {
+                match saving.as_mut() {
+                    Some(save) => save.await,
+                    None => std::future::pending().await,
+                }
+            }, if saving.is_some() => {
+                saving = None;
+                continue;
+            }
             read = stdout.read(&mut buffer) => read,
         };
         let count = match read {
@@ -746,6 +765,9 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             Ok(count) => count,
             Err(_) => {
                 shared.fail(FailureCause::Reader(WireFailure::Transport));
+                if let Some(save) = saving {
+                    save.await;
+                }
                 return;
             }
         };
@@ -768,10 +790,17 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                         "vendor message over the {} byte cap",
                         super::MAX_STDOUT_MESSAGE_BYTES
                     );
-                    shared.keep_undecoded(&prefix, &what).await;
+                    let shared = Arc::clone(&shared);
+                    saving = Some(Box::pin(async move {
+                        shared.keep_undecoded(&prefix, &what).await;
+                    }));
                 }
             }
         }
+    }
+    // Finalization names `undecoded.bin` from the note: settle it first.
+    if let Some(save) = saving {
+        save.await;
     }
     if !discard && let Some(tail) = splitter.finish() {
         let length = tail.len();

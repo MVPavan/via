@@ -721,3 +721,88 @@ async fn s1_wire_held_undecoded_write_stays_owned() -> Result<(), Box<dyn std::e
     messages.finish(after(Duration::from_secs(3))).await;
     Ok(())
 }
+
+/// S1 critic finding 6 (runtime-contracts, the stdout reader): while the
+/// oversized prefix's save is held, the reader keeps draining. The save is
+/// held at `wire.undecoded.before_note`, after its blob step and before its
+/// note, so no timer can answer it (S1-io review r2 finding 3). The vendor
+/// writes a suffix larger than the 64 KiB pipe and finishes while the save
+/// is held; the reader counts the discarded bytes, and at EOF it still
+/// awaits the save before its note is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_reader_drains_while_the_prefix_save_is_held()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "s1-wire-draining-save-token";
+    const POINT: &str = "wire.undecoded.before_note";
+    const PIPE: usize = 64 * 1024;
+    const SUFFIX: usize = 4 * PIPE;
+    // Kept on a failed assertion: removing it could hide the release file
+    // from the held save, which would then never end.
+    let points = std::mem::ManuallyDrop::new(Scratch::new("draining-points")?);
+    std::fs::set_permissions(&points.0, std::fs::Permissions::from_mode(0o700))?;
+    via_store::failpoint::activate(&points.0, TOKEN)?;
+    std::fs::write(
+        points.0.join(format!("{POINT}.json")),
+        format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause"}}"#),
+    )?;
+    let release = Release(points.0.join(format!("{POINT}.1.release")));
+    let folder = Scratch::new("draining")?;
+    let (stdout, mut vendor) = tokio::io::duplex(PIPE);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(PIPE);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes(stdout, stdin, folder.0.clone());
+    let writer = tokio::spawn(async move {
+        vendor
+            .write_all(&vec![b'h'; MAX_STDOUT_MESSAGE_BYTES + 1 + SUFFIX])
+            .await?;
+        vendor.shutdown().await
+    });
+    let failure = messages.next_message().await.err();
+    assert!(
+        matches!(
+            failure,
+            Some(WireError::Message(WireFailure::MessageTooLarge))
+        ),
+        "{failure:?}"
+    );
+    assert!(
+        eventually(Duration::from_secs(10), || points
+            .0
+            .join(format!("{POINT}.1.ack"))
+            .exists())
+        .await,
+        "the prefix save never reached its note"
+    );
+    // The whole suffix goes through the 64 KiB pipe while the save is held;
+    // the 10 s only bounds a reader that stopped draining.
+    let written = tokio::time::timeout(Duration::from_secs(10), writer).await;
+    assert!(
+        matches!(written, Ok(Ok(Ok(())))),
+        "the vendor blocked on its pipe while the save was held"
+    );
+    let discarded = input.discarded();
+    assert!(
+        discarded > u64::try_from(PIPE)?,
+        "discarded only {discarded} bytes"
+    );
+    assert!(input.take_undecoded().is_none(), "the held save was noted");
+    drop(release);
+    messages.finish(after(Duration::from_secs(5))).await;
+    // Finalization reads the note only after the reader awaited the save.
+    let note = input.take_undecoded();
+    assert!(
+        note.as_deref()
+            .is_some_and(|note| note.contains("undecoded.bin")),
+        "{note:?}"
+    );
+    assert!(
+        eventually(Duration::from_secs(10), || input.blob_tasks() == 0).await,
+        "the finished step was never reaped"
+    );
+    assert_eq!(fallback_drops(), 0);
+    drop(std::mem::ManuallyDrop::into_inner(points));
+    Ok(())
+}

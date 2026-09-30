@@ -3,19 +3,23 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
+    future::Future,
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
+    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use tokio::{
+    io::AsyncWriteExt,
     net::UnixStream,
     process::{ChildStdin, ChildStdout},
     sync::{Mutex, watch},
@@ -309,6 +313,66 @@ struct HostTasks {
     forced: HashSet<String>,
 }
 
+impl HostTasks {
+    /// Owns `task` until its outcome is collected. Tracking first collects
+    /// the tasks that already finished and prunes dropped controls, so live
+    /// service keeps these registries bounded (coding style §5).
+    fn track(&mut self, task: JoinHandle<TaskResult>) {
+        self.collect_finished();
+        self.prune_controls();
+        self.running.push(TrackedTask::new(task));
+    }
+
+    /// Takes the outcome of each finished task without blocking; a failure
+    /// joins the sticky `failed` count. A task whose handle a shutdown join
+    /// holds is left to that join.
+    fn collect_finished(&mut self) {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut failed = 0;
+        self.running.retain(|task| {
+            if task.joined.load(Ordering::Acquire) {
+                return false;
+            }
+            let Ok(mut handle) = task.handle.try_lock() else {
+                return true;
+            };
+            if !handle.is_finished() {
+                return true;
+            }
+            let Poll::Ready(result) = Pin::new(&mut *handle).poll(&mut context) else {
+                return true;
+            };
+            task.joined.store(true, Ordering::Release);
+            if !matches!(result, Ok(Ok(()))) {
+                failed += 1;
+            }
+            false
+        });
+        self.failed += failed;
+    }
+
+    /// Drops the records of controls whose stream is gone. A dropped
+    /// control's forced-stop fact that no close report handed to its owner
+    /// moves to `forced`, where shutdown's reconciliation still reads it; a
+    /// handed-off one is already the owner's, so live service keeps no fact
+    /// per turn. A live control keeps its fact on its own `StopFacts`: its
+    /// close may still report it.
+    fn prune_controls(&mut self) {
+        let forced = &mut self.forced;
+        self.controls.retain(|control| {
+            if control.stream.strong_count() > 0 {
+                return true;
+            }
+            if control.stop.forced.load(Ordering::Acquire)
+                && !control.stop.reported.load(Ordering::Acquire)
+            {
+                forced.insert(control.generation.clone());
+            }
+            false
+        });
+    }
+}
+
 /// Owned task outcome: an `Err` is a failed task, such as a failed child wait.
 type TaskResult = Result<(), ()>;
 
@@ -341,6 +405,8 @@ struct TrackedControl {
 struct StopFacts {
     /// The verified anchor reported that Host's stop stopped a live vendor.
     forced: AtomicBool,
+    /// A close report carried `forced` to the control's owner.
+    reported: AtomicBool,
 }
 
 /// The Host journal write that failed (design §7.2 rows 3, 4 and 12).
@@ -565,15 +631,59 @@ enum Reprobed {
 struct ControlConnection {
     stream: UnixStream,
     reader: protocol::ControlReader,
+    /// The stream may hold a partial request or an unread reply: an
+    /// exchange was cancelled, timed out or failed. Set when an exchange
+    /// starts and cleared once its reply is read, so a cancelled exchange
+    /// leaves it set. A retired control is never read again: it is shut
+    /// down, so the anchor sees control EOF and cleans up its group
+    /// (runtime §5.1), and every later exchange fails at once and its
+    /// caller takes its fallback.
+    retired: bool,
 }
 
 impl ControlConnection {
+    /// Admits one exchange, or refuses it on a retired control, which a
+    /// cancelled exchange may have left open: it is shut down first.
+    async fn begin(&mut self) -> io::Result<()> {
+        if self.retired {
+            self.retire().await;
+            return Err(io::Error::other("anchor control retired"));
+        }
+        self.retired = true;
+        Ok(())
+    }
+
+    /// Retires the control and shuts its stream down for writing: the
+    /// anchor reads EOF, which is not a `Stop` and yields no forced
+    /// evidence. Idempotent; a failed shutdown leaves the EOF to the drop.
+    async fn retire(&mut self) {
+        self.retired = true;
+        let _ = self.stream.shutdown().await;
+    }
+
     async fn transact(&mut self, request: &Request, max: usize) -> io::Result<Reply> {
-        protocol::write_message(&mut self.stream, request, max).await?;
-        self.reader
-            .read(&self.stream)
-            .await?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
+        self.begin().await?;
+        let exchanged = match protocol::write_message(&mut self.stream, request, max).await {
+            Ok(()) => self.reader.read(&self.stream).await,
+            Err(error) => Err(error),
+        };
+        match exchanged {
+            Ok(Some(reply)) => {
+                self.retired = false;
+                Ok(reply)
+            }
+            Ok(None) => {
+                self.retire().await;
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "anchor closed control",
+                ))
+            }
+            Err(error) => {
+                self.retire().await;
+                Err(error)
+            }
+        }
     }
 
     /// Like [`Self::transact`], but only the wait for the reply ends at
@@ -581,22 +691,43 @@ impl ControlConnection {
     /// deadline has passed, so a caller past its deadline still delivers it.
     /// A reply in hand only at or after `deadline` is late and is refused:
     /// Tokio polls the read before its timer, so a task that runs late would
-    /// otherwise be handed a ready reply as if it were in time.
+    /// otherwise be handed a ready reply as if it were in time. A reply read,
+    /// late or not, completes the exchange; no reply retires the control.
     async fn transact_by(
         &mut self,
         request: &Request,
         max: usize,
         deadline: Instant,
     ) -> io::Result<Reply> {
-        protocol::write_message(&mut self.stream, request, max).await?;
+        self.begin().await?;
+        if let Err(error) = protocol::write_message(&mut self.stream, request, max).await {
+            self.retire().await;
+            return Err(error);
+        }
         let late = || io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline");
-        let reply = timeout_at(deadline, self.reader.read(&self.stream))
-            .await
-            .map_err(|_| late())??;
+        let reply = match timeout_at(deadline, self.reader.read(&self.stream)).await {
+            Ok(Ok(Some(reply))) => reply,
+            Ok(Ok(None)) => {
+                self.retire().await;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "anchor closed control",
+                ));
+            }
+            Ok(Err(error)) => {
+                self.retire().await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.retire().await;
+                return Err(late());
+            }
+        };
+        self.retired = false;
         if Instant::now() >= deadline {
             return Err(late());
         }
-        reply.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
+        Ok(reply)
     }
 }
 
@@ -895,6 +1026,23 @@ impl Host {
         live + ledger.acquiring.len()
     }
 
+    /// Test builds: how many owned tasks, live-control records and
+    /// Host-wide forced-stop facts Host still keeps, as
+    /// `(tasks, controls, forced)`.
+    #[cfg(feature = "test-failpoints")]
+    #[doc(hidden)]
+    pub fn tracked(&self) -> (usize, usize, usize) {
+        let tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            tasks.running.len(),
+            tasks.controls.len(),
+            tasks.forced.len(),
+        )
+    }
+
     /// Positive evidence that a vendor of one of `anchors` is live (Task 4
     /// design §11.3 `process.alive`): its verified control is held, phase
     /// `Armed`, and its exit watch has not reported an exit.
@@ -948,8 +1096,7 @@ impl Host {
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .running
-            .push(TrackedTask::new(task));
+            .track(task);
     }
 
     /// Design §8: one non-signalling pass over held groups with no live
@@ -1146,6 +1293,7 @@ impl Host {
         let control = Arc::new(Mutex::new(ControlConnection {
             stream,
             reader: protocol::ControlReader::new(1024),
+            retired: false,
         }));
         let stop = Arc::new(StopFacts::default());
         let registered = self.capacity.register(
@@ -1228,8 +1376,7 @@ impl Host {
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .running
-            .push(TrackedTask::new(task));
+            .track(task);
         Ok((pipes, anchor_process_id))
     }
 
@@ -1353,52 +1500,16 @@ impl Host {
     }
 
     fn track_control(&self, control: &ProcessControl, sender: watch::Sender<Option<ExitReport>>) {
-        let poll_stream = Arc::downgrade(&control.stream);
-        let poll_generation = control.generation.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let Some(stream) = poll_stream.upgrade() else {
-                    break;
-                };
-                let reply = tokio::time::timeout(Duration::from_millis(100), async {
-                    stream
-                        .lock()
-                        .await
-                        .transact(
-                            &Request::Status {
-                                generation: poll_generation.clone(),
-                            },
-                            1024,
-                        )
-                        .await
-                })
-                .await;
-                drop(stream);
-                match reply {
-                    Ok(Ok(Reply::Status {
-                        exit_code,
-                        exit_signal,
-                        ..
-                    })) if exit_code.is_some() || exit_signal.is_some() => {
-                        let report = ExitReport {
-                            code: exit_code,
-                            signal: exit_signal,
-                        };
-                        sender.send_replace(Some(report));
-                        break;
-                    }
-                    Ok(Ok(Reply::Status { .. })) => {}
-                    _ => break,
-                }
-            }
-            Ok(())
-        });
+        let task = tokio::spawn(supervise_exit(
+            Arc::downgrade(&control.stream),
+            control.generation.clone(),
+            sender,
+        ));
         let mut tasks = self
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tasks.running.push(TrackedTask::new(task));
+        tasks.track(task);
         tasks.controls.push(TrackedControl {
             stream: Arc::downgrade(&control.stream),
             identity: control.identity.clone(),
@@ -1438,6 +1549,9 @@ impl Host {
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.prune_controls();
+            // Shutdown's reconciliation reads the facts of the controls
+            // still live, whether or not their closes finish in time.
             let HostTasks {
                 controls, forced, ..
             } = &mut *tasks;
@@ -1446,7 +1560,6 @@ impl Host {
                     forced.insert(control.generation.clone());
                 }
             }
-            controls.retain(|control| control.stream.strong_count() > 0);
             controls.clone()
         };
         for tracked in controls {
@@ -1706,6 +1819,67 @@ impl Host {
     }
 }
 
+/// How long an admitted `Status` exchange may wait for its reply before the
+/// control is retired. A52 measured anchor control replies of 115 ms or less
+/// under the F24 flood.
+const STATUS_REPLY_BOUND: Duration = Duration::from_secs(1);
+
+/// Unit tests: exit-poll ticks that found the control busy.
+#[cfg(test)]
+static BUSY_SKIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Polls `stream` for the vendor's exit and publishes it on `sender`. A
+/// control busy with another exchange only skips a tick. Supervision ends
+/// once the exit is seen, the stream is gone, or the control is retired: a
+/// `Status` exchange that failed or had no reply within
+/// [`STATUS_REPLY_BOUND`] retires it and shuts it down, as does an exchange
+/// of another holder.
+/// Only that last end, a real loss of control, drops `sender` under a live
+/// turn, which Wire reports as a transport failure.
+async fn supervise_exit(
+    poll_stream: Weak<Mutex<ControlConnection>>,
+    poll_generation: String,
+    sender: watch::Sender<Option<ExitReport>>,
+) -> TaskResult {
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let Some(stream) = poll_stream.upgrade() else {
+            break;
+        };
+        let Ok(mut control) = stream.try_lock() else {
+            #[cfg(test)]
+            BUSY_SKIPS.fetch_add(1, Ordering::AcqRel);
+            continue;
+        };
+        let request = Request::Status {
+            generation: poll_generation.clone(),
+        };
+        // Cancelling the exchange at its bound leaves the control retired.
+        let reply =
+            tokio::time::timeout(STATUS_REPLY_BOUND, control.transact(&request, 1024)).await;
+        let Ok(Ok(Reply::Status {
+            exit_code,
+            exit_signal,
+            ..
+        })) = reply
+        else {
+            control.retire().await;
+            break;
+        };
+        let report = (exit_code.is_some() || exit_signal.is_some()).then_some(ExitReport {
+            code: exit_code,
+            signal: exit_signal,
+        });
+        drop(control);
+        drop(stream);
+        if let Some(report) = report {
+            sender.send_replace(Some(report));
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Collects owned task results until the deadline; returns `(pending, failed)`,
 /// where `failed` counts every failure collected so far, by any call.
 ///
@@ -1790,6 +1964,14 @@ impl ProcessControl {
                 .await
         })
         .await;
+        // A `Stop` cut short by the deadline left the control retired: shut
+        // it down now, unless a holder has it and will on its next exchange.
+        if stopping.is_err()
+            && let Ok(mut control) = self.stream.try_lock()
+            && control.retired
+        {
+            control.retire().await;
+        }
         // Only the anchor knows whether the vendor was still live when its
         // cleanup signalled the group; Host's polled exit watch may be stale.
         let forced = matches!(stopping, Ok(Ok(Reply::Stopping { stopped_live: true })));
@@ -1820,12 +2002,16 @@ impl ProcessControl {
             ),
         };
         self.capacity.settle(&self.anchor_id, &cleanup);
+        // The anchor repeats `stopped_live` on every Stop; an earlier early
+        // stop's reply counts too (design §6.8 [r5.4]).
+        let forced = forced || self.stop.forced.load(Ordering::Acquire);
+        if forced {
+            self.stop.reported.store(true, Ordering::Release);
+        }
         CloseReport {
             cleanup,
             vendor_exit: *self.exit.borrow(),
-            // The anchor repeats `stopped_live` on every Stop; an earlier
-            // early stop's reply counts too (design §6.8 [r5.4]).
-            forced: forced || self.stop.forced.load(Ordering::Acquire),
+            forced,
             journal_uncertain,
         }
     }
@@ -2083,6 +2269,8 @@ async fn force_raised(signal: &mut watch::Receiver<Option<Instant>>) {
 /// deadline, and a `Stop` message is far smaller than the socket buffer.
 /// `Stop` is idempotent and only shortens the anchor's deadline, so a second
 /// request through the same control owner changes nothing (runtime §5.1).
+/// A retired control writes nothing and records no forced evidence; a
+/// `Stop` whose reply missed `deadline` retires it.
 async fn stop_through(
     control: &Mutex<ControlConnection>,
     generation: &str,
@@ -2415,6 +2603,7 @@ mod tests {
         let control = Arc::new(Mutex::new(ControlConnection {
             stream: ours,
             reader: protocol::ControlReader::new(1024),
+            retired: false,
         }));
         (control, peer)
     }
@@ -2521,6 +2710,243 @@ mod tests {
         assert!(stop_through(&control, "g1", &stop, deadline).await);
         assert!(stop.forced.load(Ordering::Acquire));
         drop(anchor.await.expect("anchor side"));
+    }
+
+    /// Reads the next request the anchor's side received, within 2 s.
+    async fn next_request(peer: &mut UnixStream) -> Option<Request> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            protocol::read_message::<Request>(peer, 1024),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+    }
+
+    fn exited() -> Reply {
+        Reply::Status {
+            pid: Some(1),
+            exit_code: Some(0),
+            exit_signal: None,
+        }
+    }
+
+    /// S1 critic finding 4: a control lock held, as a `Stop` exchange holds
+    /// it, only skips poll ticks; the exit is still reported once the lock
+    /// is free. The lock is released only after polls met it on three
+    /// ticks (S1-io r1 finding 2), whenever the poll first runs.
+    #[tokio::test]
+    async fn a_busy_control_lock_does_not_end_exit_supervision() {
+        let (control, mut peer) = control_pair();
+        let (sender, mut exits) = watch::channel(None);
+        let busy = control.clone().lock_owned().await;
+        let supervision = tokio::spawn(supervise_exit(
+            Arc::downgrade(&control),
+            "g1".to_owned(),
+            sender,
+        ));
+        // Three ticks met the held lock: supervision outlived a lock busy
+        // for longer than one poll's wait.
+        let met = tokio::time::timeout(Duration::from_secs(2), async {
+            while BUSY_SKIPS.load(Ordering::Acquire) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(met.is_ok(), "supervision stopped polling the held lock");
+        drop(busy);
+        assert!(
+            matches!(next_request(&mut peer).await, Some(Request::Status { .. })),
+            "no Status poll once the lock was free"
+        );
+        protocol::write_message(&mut peer, &exited(), 1024)
+            .await
+            .expect("reply");
+        let seen = tokio::time::timeout(Duration::from_secs(2), exits.wait_for(Option::is_some))
+            .await
+            .map(|seen| seen.map(|exit| *exit));
+        assert!(
+            matches!(seen, Ok(Ok(Some(ExitReport { code: Some(0), .. })))),
+            "the exit was not reported"
+        );
+        assert!(matches!(supervision.await, Ok(Ok(()))));
+    }
+
+    /// S1 critic finding 4: a `Status` reply later than its bound retires
+    /// the control and ends supervision; a following `Stop` fails at once
+    /// and never reads the stale `Status` reply as its own.
+    #[tokio::test]
+    async fn a_status_reply_past_its_bound_retires_the_control() {
+        let (control, mut peer) = control_pair();
+        let (sender, mut exits) = watch::channel(None);
+        let supervision = tokio::spawn(supervise_exit(
+            Arc::downgrade(&control),
+            "g1".to_owned(),
+            sender,
+        ));
+        assert!(matches!(
+            next_request(&mut peer).await,
+            Some(Request::Status { .. })
+        ));
+        // The anchor answers only after supervision gave up on the reply.
+        let ended = tokio::time::timeout(Duration::from_secs(5), exits.changed()).await;
+        assert!(matches!(ended, Ok(Err(_))), "supervision did not end");
+        assert!(exits.borrow().is_none());
+        drop(supervision.await);
+        // S1-io r1 decision 3: retiring shut the control down, so the anchor
+        // sees control EOF and cleans up its group (runtime §5.1).
+        let eof = tokio::time::timeout(
+            Duration::from_secs(2),
+            protocol::read_message::<Request>(&mut peer, 1024),
+        )
+        .await;
+        assert!(matches!(eof, Ok(Ok(None))), "the anchor saw no control EOF");
+        protocol::write_message(&mut peer, &exited(), 1024)
+            .await
+            .expect("stale reply");
+        let stop = Request::Stop {
+            generation: "g1".to_owned(),
+            deadline_monotonic_ns: u64::MAX,
+        };
+        let reply = control.lock().await.transact(&stop, 1024).await;
+        assert!(
+            !matches!(reply, Ok(Reply::Status { .. })),
+            "the Stop read the stale Status reply as its own"
+        );
+        assert!(reply.is_err(), "a retired control answered");
+    }
+
+    /// S1 critic finding 4: an exchange cancelled after its write, as a
+    /// close's deadline cancels its `Stop`, retires the control.
+    #[tokio::test]
+    async fn a_cancelled_exchange_retires_the_control() {
+        let (control, mut peer) = control_pair();
+        let stop = Request::Stop {
+            generation: "g1".to_owned(),
+            deadline_monotonic_ns: u64::MAX,
+        };
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), async {
+            control.lock().await.transact(&stop, 1024).await
+        })
+        .await;
+        assert!(cancelled.is_err());
+        assert!(matches!(
+            next_request(&mut peer).await,
+            Some(Request::Stop { .. })
+        ));
+        protocol::write_message(&mut peer, &Reply::Stopping { stopped_live: true }, 1024)
+            .await
+            .expect("late reply");
+        let status = Request::Status {
+            generation: "g1".to_owned(),
+        };
+        let reply = control.lock().await.transact(&status, 1024).await;
+        assert!(
+            !matches!(reply, Ok(Reply::Stopping { .. })),
+            "the Status read the late Stop reply as its own"
+        );
+        assert!(reply.is_err(), "a retired control answered");
+    }
+
+    /// S1 critic finding 5: tracking a task first collects finished ones;
+    /// a failed one is counted, and shutdown still reports it.
+    #[tokio::test]
+    async fn tracking_a_task_collects_finished_ones_and_keeps_failures() {
+        let (host, _store, root) = host_fixture(true);
+        let failed: JoinHandle<TaskResult> = tokio::spawn(async { Err(()) });
+        let ended: JoinHandle<TaskResult> = tokio::spawn(async { Ok(()) });
+        host.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .track(failed);
+        host.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .track(ended);
+        while !host
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
+            .iter()
+            .all(|task| {
+                task.handle
+                    .try_lock()
+                    .is_ok_and(|handle| handle.is_finished())
+            })
+        {
+            tokio::task::yield_now().await;
+        }
+        let release = hold(&host);
+        let (release_next, held) = tokio::sync::oneshot::channel::<()>();
+        host.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .track(tokio::spawn(async move {
+                let _ = held.await;
+                Ok(())
+            }));
+        {
+            let tasks = host
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(tasks.running.len(), 2, "finished tasks were kept");
+            assert_eq!(tasks.failed, 1, "the failed task was not counted");
+        }
+        assert!(release.send(()).is_ok() && release_next.send(()).is_ok());
+        let report = host
+            .shutdown(Deadline::at(Instant::now() + Duration::from_secs(1)), &[])
+            .await;
+        assert_eq!(
+            (report.pending_tasks, report.failed_tasks),
+            (0, 1),
+            "{report:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// S1-io review r2 finding 1: an acquisition that tracks its tasks
+    /// while another turn's close is between its `Stop` reply (`forced`
+    /// set) and its report (`reported` set) must not copy that live
+    /// control's fact; once the close reported it and the control is
+    /// dropped, no fact is left Host-wide.
+    #[tokio::test]
+    async fn an_acquisition_during_a_close_keeps_no_handed_off_fact() {
+        let mut tasks = HostTasks::default();
+        let (control, _peer) = control_pair();
+        let stop = Arc::new(StopFacts::default());
+        let (_sender, exit) = watch::channel(None);
+        tasks.controls.push(TrackedControl {
+            stream: Arc::downgrade(&control),
+            identity: ProcessIdentity {
+                pid: 1,
+                pgid: 1,
+                uid: 0,
+                boot_id: "boot".to_owned(),
+                pid_namespace: "pidns".to_owned(),
+                start_ticks: 1,
+                marker: crate::ProcessMarker::try_from_generated("m".to_owned()).expect("marker"),
+            },
+            anchor_id: "a1".to_owned(),
+            generation: "g1".to_owned(),
+            exit,
+            stop: stop.clone(),
+        });
+        // The close has its `stopped_live` reply and waits for absence.
+        stop.forced.store(true, Ordering::Release);
+        tasks.track(tokio::spawn(async { Ok(()) }));
+        // The close reports the fact to its owner, then the owner drops it.
+        stop.reported.store(true, Ordering::Release);
+        drop(control);
+        tasks.track(tokio::spawn(async { Ok(()) }));
+        assert!(tasks.controls.is_empty());
+        assert!(
+            tasks.forced.is_empty(),
+            "a fact the close handed off stayed Host-wide: {:?}",
+            tasks.forced
+        );
     }
 
     /// A live control in `phase` over a socket pair; keep the returned

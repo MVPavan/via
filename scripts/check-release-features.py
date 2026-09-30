@@ -129,6 +129,8 @@ POINTS = [
     # observation; a Wire connection dropped without `finish`.
     "core.observations.pause",
     "wire.fallback_drop",
+    # S1-io fix round 2: an undecoded save's outcome held before its note.
+    "wire.undecoded.before_note",
     # Task 4 T4-4 (design §3.2, §4.2, §13.1): a step-row commit, a delayed
     # Store read, the `status` read's corruption, a boundary's progress
     # publish, the drive between the terminal commit and `finish_running`.
