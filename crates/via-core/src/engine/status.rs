@@ -77,9 +77,10 @@ impl Limits {
     }
 }
 
-/// One data-size walk's result (design §5.3).
+/// One data-size walk's result (design §5.3); `None` for a walk that
+/// failed or overran its 2 s step.
 pub(super) struct DataSize {
-    bytes: u64,
+    bytes: Option<u64>,
     measured_at: String,
     at: tokio::time::Instant,
 }
@@ -193,7 +194,9 @@ impl Engine {
     /// now, and VIA's data size from a walk at most 60 s old. A call that
     /// finds the cached walk absent or older recomputes it on the blocking
     /// pool; concurrent calls wait on the one walk and share its result. A
-    /// value that cannot be read is `null`; a failed walk keeps the last one.
+    /// value that cannot be read is `null`; a walk that fails or overruns
+    /// is cached as `null` too, so at most one walk starts per minute
+    /// whatever its outcome (§15).
     pub async fn storage(&self) -> Value {
         let free = self.store.free_bytes().await.ok();
         let data = {
@@ -206,17 +209,16 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.data_size.walks").await;
                 let measured_at = rfc3339(SystemTime::now());
-                if let Ok(bytes) = self.store.data_bytes().await {
-                    *cached = Some(DataSize {
-                        bytes,
-                        measured_at,
-                        at: tokio::time::Instant::now(),
-                    });
-                }
+                let bytes = self.store.data_bytes().await.ok();
+                *cached = Some(DataSize {
+                    bytes,
+                    measured_at,
+                    at: tokio::time::Instant::now(),
+                });
             }
             cached
                 .as_ref()
-                .map(|size| (size.bytes, size.measured_at.clone()))
+                .and_then(|size| Some((size.bytes?, size.measured_at.clone())))
         };
         let floor = self.limits.free_floor;
         json!({

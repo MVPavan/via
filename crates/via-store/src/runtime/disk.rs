@@ -174,7 +174,10 @@ const DATA_FILES: [&str; 5] = [
 /// (§5.3 [t4r17.7]): [`DATA_FILES`] and every file under `blobs/` and
 /// `evidence/`, in one walk that follows no symbolic link. A file or
 /// directory gone meanwhile counts nothing; any other error fails the walk.
+/// Test builds: the point `store.data_size.walk` may stall or fail it.
 pub(super) fn data_bytes(state: &Path) -> io::Result<u64> {
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("store.data_size.walk")?;
     let mut total = 0_u64;
     for name in DATA_FILES {
         total = total.saturating_add(present(fs::symlink_metadata(state.join(name)))?);

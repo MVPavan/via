@@ -11,7 +11,6 @@
 #[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod daemon;
 #[path = "support/failpoints.rs"]
-#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod failpoints;
 #[path = "support/hits.rs"]
 mod hits;
@@ -914,6 +913,61 @@ fn s1_store_data_size_warning_is_cached() -> TestResult {
                     && second["storage"]["data_bytes"] == storage["data_bytes"],
                 || format!("a second call walked again: {walks}, {}", second["storage"]),
             )
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Design §5.3, §15 (T4-fix; Astra 5, Fable F1): a walk that overruns its
+/// 2 s step is still the minute's one walk. With the walk held
+/// (`store.data_size.walk`), two `daemon/status` calls within 60 s start
+/// one walk and both report `data_bytes: null`; the held walk does not
+/// hold another blob-step slot per call.
+#[test]
+fn s1_store_data_size_overrun_walks_once() -> TestResult {
+    const WALK: &str = "store.data_size.walk";
+    let setup = Setup::new(&json!({ "scripts": [script("sized", &[])] }))?;
+    let evidence = setup.evidence("s1_store_data_size_overrun")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            hits::count(&setup.dir, WALKS).map_err(infra)?;
+            setup.failpoints.arm(WALK, 1, "pause").map_err(infra)?;
+            let _daemon = setup.start(evidence)?;
+            let pid = setup.pid()?;
+            // Every CLI command sends `daemon/status`: the spawn and the
+            // wait take part in the minute's walk count too.
+            let session = setup.spawn(evidence, "sized")?;
+            setup.wait(evidence, "wait_sized", &format!("{session}/1"))?;
+            let first = setup.daemon_status(evidence, "status_first");
+            let second = setup.daemon_status(evidence, "status_second");
+            let walks = hits::hits(&setup.dir, WALKS).map_err(infra)?;
+            let held = setup
+                .failpoints
+                .wait_ack(WALK, 1, "pause", pid, Duration::from_secs(5))
+                .map_err(infra);
+            setup.failpoints.release(WALK, 1).map_err(infra)?;
+            held?;
+            evidence
+                .write(
+                    "walk_ack.json",
+                    &setup.failpoints.ack_bytes(WALK, 1).map_err(infra)?,
+                )
+                .map_err(infra)?;
+            let (first, second) = (first?, second?);
+            check(walks == 1, || format!("{walks} walks within 60 s"))?;
+            for status in [&first, &second] {
+                let storage = &status["storage"];
+                check(
+                    storage["data_bytes"].is_null()
+                        && storage["data_measured_at"].is_null()
+                        && storage["over_warn_size"].is_null()
+                        && storage["free_bytes"].as_u64().is_some_and(|free| free > 0),
+                    || format!("storage after an overrun walk: {storage}"),
+                )?;
+            }
+            Ok(())
         },
         |evidence| setup.collect(evidence),
     );
