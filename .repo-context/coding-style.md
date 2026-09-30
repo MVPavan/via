@@ -185,9 +185,10 @@ the set.
   threads/file creation, retain validated directory identities, and never
   open the same Store under two runtime roots as competing writers.
 - Only the daemon's `main` and the same binary's internal Host-anchor
-  entrypoint install signal handlers. The anchor retains its TERM handler
-  through own-group TERM so it can escalate to own-group KILL. No vendor
-  signal handler is installed by VIA.
+  entrypoint install signal handlers, except that the CLI's foreground wait
+  may install a SIGINT handler that only exits 130. The anchor retains its
+  TERM handler through own-group TERM so it can escalate to own-group KILL.
+  No vendor signal handler is installed by VIA.
 
 ## 7. Store
 
