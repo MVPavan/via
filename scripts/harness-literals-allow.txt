@@ -1,0 +1,4 @@
+# Exceptions for scripts/check-harness-literals.py, one per line:
+#   path: substring: reason
+# `path` is repo-relative; an entry allows findings on lines of that file
+# containing `substring`. This file is expected to stay empty.
