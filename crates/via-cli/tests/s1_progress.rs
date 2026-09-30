@@ -584,9 +584,28 @@ fn s1_progress_snapshot_adds_no_store_read() -> TestResult {
     report.require_pass()
 }
 
-/// Design §4.2, §13.2 (Q-R5-5): with every Store read delayed 200 ms,
-/// `status` answers within 300 ms while the turn makes steps: it waits for
-/// one read and nothing else.
+/// How many hits of `point` have been acknowledged: with a persistent
+/// action, each hit it acted on since it was armed.
+fn acked(dir: &std::path::Path, point: &str) -> Result<u64, ScenarioError> {
+    let prefix = format!("{point}.");
+    let mut count = 0;
+    for entry in fs::read_dir(dir).map_err(infra)? {
+        let name = entry.map_err(infra)?.file_name();
+        let acknowledged = name
+            .to_string_lossy()
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".ack"))
+            .is_some_and(|number| number.parse::<u64>().is_ok());
+        count += u64::from(acknowledged);
+    }
+    Ok(count)
+}
+
+/// Design §4.2, §13.2 (Q-R5-5, A50): with every Store read delayed 200 ms,
+/// each `status` call makes exactly one delayed read while the turn makes
+/// steps: it waits for that read and nothing else. Proven by the delay
+/// point's acknowledged hits, one per call; each call's latency is
+/// recorded as evidence, not asserted.
 #[test]
 fn s1_c1_status_latency_under_bounded_store_delay() -> TestResult {
     let mut steps = vec![accepted(1), emit(&text(1))];
@@ -614,6 +633,7 @@ fn s1_c1_status_latency_under_bounded_store_delay() -> TestResult {
             setup.arm(READ_DELAY, 1, "delay_persist:200")?;
             let mut raw = Raw::open(&setup.sandbox)?;
             let mut seen = Vec::new();
+            let mut latencies = Vec::new();
             for round in 0..3 {
                 if round > 0 {
                     setup.sandbox.await_gate(&format!("round{round}"))?;
@@ -622,11 +642,15 @@ fn s1_c1_status_latency_under_bounded_store_delay() -> TestResult {
                 for call in 0..3_u64 {
                     let line =
                         request(round * 10 + call + 1, "status", &json!({"session":session}));
+                    let before = acked(&setup.dir, READ_DELAY)?;
                     let sent = Instant::now();
                     let reply = raw.exchange(&line)?;
                     let took = sent.elapsed();
-                    check(took < Duration::from_millis(300), || {
-                        format!("status took {took:?}: {reply}")
+                    let reads = acked(&setup.dir, READ_DELAY)? - before;
+                    latencies.push(json!({"call":round * 10 + call + 1,
+                        "took_ms":took.as_secs_f64() * 1000.0,"reads":reads}));
+                    check(reads == 1, || {
+                        format!("status made {reads} delayed reads: {reply}")
                     })?;
                     check(reply["result"]["session_id"] == session.as_str(), || {
                         format!("status reply: {reply}")
@@ -636,6 +660,12 @@ fn s1_c1_status_latency_under_bounded_store_delay() -> TestResult {
             }
             evidence
                 .write("current_steps.json", json!(seen).to_string().as_bytes())
+                .map_err(infra)?;
+            evidence
+                .write(
+                    "status_latency.json",
+                    json!(latencies).to_string().as_bytes(),
+                )
                 .map_err(infra)?;
             check(
                 seen.iter().flatten().max() > seen.iter().flatten().min(),
