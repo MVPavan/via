@@ -1,6 +1,7 @@
 # S1-specs: Task 3 amendments applied to the specs
 
-Status: DONE_WITH_CONCERNS (documentation only; concerns C1–C4 below).
+Status: DONE_WITH_CONCERNS (documentation only; C1 and C2 resolved in fix
+round 1, C3 and C4 left as reported by orchestrator decision).
 
 Bead `via-jm4.7.9.3`, S1 critic finding 13. Branch `wt/s1-specs`, cut from
 `rust-foundation` at `7370e0e`. Source: `docs/workstreams/rust-foundation/t3/design.md`
@@ -14,7 +15,9 @@ Bead `via-jm4.7.9.3`, S1 critic finding 13. Branch `wt/s1-specs`, cut from
 | `56e4309` | `docs/specs/via-api-v1.md` | A4, A5, A7, A8, A9, A15, A17, A21, A22 |
 | `e848a6b` | `docs/workstreams/rust-foundation/t2/dispatch-design.md` | A1, A2, A11, A16, A18 |
 | `5eba7e0`, `bbec36f` | `.repo-context/coding-style.md` §6 | A6 (the second commit makes it an exception to the "only daemon main and the anchor" sentence) |
-| `f04260d` and the next commit | this report | |
+| `f04260d`, `523e5f4` | this report | |
+| `cfac18e` | runtime §8, §10; dispatch §1 | fix round 1: C1, C2 |
+| the commit after `cfac18e` | this report | fix round 1 |
 
 The orchestrator's mapping of rows to targets matches the table: I found
 no row that targets another document.
@@ -63,16 +66,16 @@ no row that targets another document.
   `health`. The applied shape is `... health, store_failure, connections,
   limits, storage` and keeps T4's sentence on `limits` and `storage`.
 
-## Concerns (reported, not resolved)
+## Concerns
 
 - **C1. Runtime §8 "Health channel" row** still says "first failure
   retained", while A14/A15 report the latest recorded failure in
   `store_failure` (code: `latch.rs` keeps a `latest`). No amendment targets
-  this row, so I left it.
+  this row, so I left it. **Resolved in fix round 1 (`cfac18e`).**
 - **C2. Runtime §10 audit rows and dispatch §1's latch row** ("Whether a
   state write failed or was uncertain") still use pre-A14/A16 wording. They
   point to §7 and §3, which now carry the scoping, and no amendment names
-  them.
+  them. **Resolved in fix round 1 (`cfac18e`).**
 - **C3. Specs now cite the Task 3 design** for the scoped-case list (runtime
   §7, C1 §7.6, C1 §3.6, dispatch-design). Runtime §7 already cited "amendment
   A23 in the Task 3 design", so this follows the existing pattern, but the
@@ -123,3 +126,31 @@ No cargo run (documentation only, per the brief).
   failure" and "best-effort cleanup but return" no longer occur in runtime
   §7.
 - `git status`: clean after the report commit.
+
+## Fix round 1 (orchestrator decision: fix C1 and C2; leave C3 and C4)
+
+Commit `cfac18e`.
+
+- **C1.** Runtime §8 "Health channel" row: "first failure retained" becomes
+  "`health: store_failed` is sticky after the latch; `store_failure` reports
+  the latest recorded failure and its scope". Confirmed against the code:
+  `Engine::health` in `crates/via-core/src/engine/latch.rs` returns
+  `store_failed` "from the latch's phase one on, sticky", and
+  `FailureRecord` keeps only `latest` plus a `count`, which
+  `store_failure_status` reports.
+- **C2.** Runtime §10, first audit row (C1 summary, §3.8–3.9, §8.1): a write
+  known not committed after a receipt is scoped to its turn, which ends
+  `failed(store)` through one resolution write; the `store_error` with
+  `terminal_persisted:false` applies once the failure is latched (an
+  uncertain write, a failed turn resolution write or terminal retry, or
+  SQLite corruption); "Add health" becomes "Add `health` and
+  `store_failure`". The other §10 rows do not contradict A14/A16 and are
+  unchanged. Dispatch-design §1 latch row: "Whether a state write failed or
+  was uncertain" becomes the A16 rule.
+- Not changed, since they are outside the named rows or already carry an
+  A16 site line: dispatch-design header history (line 8, a record of the
+  T2 correction), §2.3, §6, §7 and §8 left columns (A16 lines appended in
+  `e848a6b`), and §3's "best-effort writes after the first failure".
+
+Verification: `grep -n "first failure retained\|state write failed or was uncertain"`
+on both files finds nothing; `git status` clean after this commit.
