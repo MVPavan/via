@@ -204,6 +204,9 @@ impl Shared {
             Ok(()) => format!("{what}; first {kept} in {}", path.display()),
             Err(error) => format!("{what}; not saved: {error}"),
         };
+        // Test builds: the save's outcome is known and not yet noted.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("wire.undecoded.before_note").await;
         *undecoded
             .note
             .lock()
