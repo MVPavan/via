@@ -2,6 +2,13 @@
 //! strict request envelopes and parameters (C1 §1, §8) and the client-side
 //! peer uid check (C1 §1 "both ends verify the peer uid").
 
+#[path = "support/evidenced.rs"]
+mod evidenced;
+#[path = "support/outer_cleanup.rs"]
+mod outer_cleanup;
+mod support;
+
+use std::cell::RefCell;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,6 +20,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use evidenced::evidenced;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -21,9 +29,12 @@ const SESSION: &str = "s_0123456789ab";
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 struct Sandbox {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     state: PathBuf,
     runtime: PathBuf,
+    /// The scenario's evidence, opened when its first daemon starts and
+    /// collected when the sandbox is dropped.
+    evidence: RefCell<Option<support::evidence::Evidence>>,
 }
 
 impl Sandbox {
@@ -32,9 +43,10 @@ impl Sandbox {
         let state = root.path().join("state");
         let runtime = root.path().join("runtime");
         Ok(Self {
-            _root: root,
+            root,
             state,
             runtime,
+            evidence: RefCell::new(None),
         })
     }
 
@@ -53,6 +65,19 @@ impl Sandbox {
     }
 }
 
+/// Collects a daemon scenario's evidence once its daemon was reaped, which
+/// the daemon's borrow of the sandbox guarantees. These scenarios run no
+/// turn by design, and their daemon runs no fake agent: the fixture is
+/// empty.
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if let Some(evidence) = self.evidence.take() {
+            self.root.disable_cleanup(true);
+            evidenced::park(evidence, self.root.path().to_owned(), &self.state, false);
+        }
+    }
+}
+
 /// Owns the daemon child: stops it over C1, then kills and reaps it.
 struct Daemon<'a> {
     child: Child,
@@ -61,11 +86,21 @@ struct Daemon<'a> {
 
 impl<'a> Daemon<'a> {
     fn start(sandbox: &'a Sandbox) -> TestResult<Self> {
+        if sandbox.evidence.borrow().is_none() {
+            let via = Path::new(env!("CARGO_BIN_EXE_via"));
+            let fake = via
+                .parent()
+                .ok_or("via binary has no parent directory")?
+                .join("via-fake-agent");
+            let fixture = sandbox.root.path().join("fixture.json");
+            fs::write(&fixture, b"{}")?;
+            *sandbox.evidence.borrow_mut() = Some(evidenced::open(&fake, &fixture)?);
+        }
         let child = sandbox
             .command()
             .arg("daemon")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(sandbox.root.path().join("daemon.trace"))?)
             .spawn()?;
         let mut daemon = Self { child, sandbox };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -211,13 +246,14 @@ fn run_cases(sandbox: &Sandbox, cases: Vec<Case>) -> Vec<String> {
 
 #[test]
 fn c1_request_envelope_is_strict() -> TestResult {
-    let sandbox = Sandbox::new()?;
-    let daemon = Daemon::start(&sandbox)?;
-    let hello =
-        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test"});
-    let (request, params) = (-32600, -32602);
-    // (name, sent before hello, line, code, echoed id is 7 rather than null)
-    let table: Vec<(&str, bool, String, i64, bool)> = vec![
+    evidenced(|| {
+        let sandbox = Sandbox::new()?;
+        let daemon = Daemon::start(&sandbox)?;
+        let hello =
+            json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test"});
+        let (request, params) = (-32600, -32602);
+        // (name, sent before hello, line, code, echoed id is 7 rather than null)
+        let table: Vec<(&str, bool, String, i64, bool)> = vec![
         ("hello without jsonrpc", true, json!({"id":7,"method":"hello","params":hello}).to_string(), request, true),
         ("hello with jsonrpc 1.0", true, json!({"jsonrpc":"1.0","id":7,"method":"hello","params":hello}).to_string(), request, true),
         ("hello with unknown envelope member", true, json!({"jsonrpc":"2.0","id":7,"method":"hello","params":hello,"extra":1}).to_string(), request, true),
@@ -241,39 +277,40 @@ fn c1_request_envelope_is_strict() -> TestResult {
         ("status params by position", false, request_line("daemon/status", &json!([])), params, true),
         ("status null params", false, r#"{"jsonrpc":"2.0","id":7,"method":"daemon/status","params":null}"#.to_owned(), params, true),
     ];
-    let cases = table
-        .into_iter()
-        .map(|(name, before_hello, line, code, echoes_id)| Case {
-            after_hello: !before_hello,
-            id: if echoes_id { json!(7) } else { Value::Null },
-            ..case(name, line, code, kind_of(code))
-        })
-        .collect();
-    let mut failures = run_cases(&sandbox, cases);
-    // F5: a valid request before `hello` is refused with the handshake
-    // error and changes nothing; the connection then completes `hello`.
-    let mut connection = Connection::open(&sandbox)?;
-    let spawn = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE});
-    let refused = connection.exchange(&request_line("spawn", &spawn))?;
-    if refused["id"] != 7
-        || refused["error"]["code"] != -32000
-        || refused["error"]["data"]["kind"] != "handshake_required"
-        || refused.get("result").is_some()
-    {
-        failures.push(format!("spawn before hello: {refused}"));
-    }
-    connection.hello()?;
-    let sessions: i64 = rusqlite::Connection::open_with_flags(
-        sandbox.state.join("store.sqlite3"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?
-    .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
-    if sessions != 0 {
-        failures.push(format!("spawn before hello left {sessions} sessions"));
-    }
-    drop(daemon);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-    Ok(())
+        let cases = table
+            .into_iter()
+            .map(|(name, before_hello, line, code, echoes_id)| Case {
+                after_hello: !before_hello,
+                id: if echoes_id { json!(7) } else { Value::Null },
+                ..case(name, line, code, kind_of(code))
+            })
+            .collect();
+        let mut failures = run_cases(&sandbox, cases);
+        // F5: a valid request before `hello` is refused with the handshake
+        // error and changes nothing; the connection then completes `hello`.
+        let mut connection = Connection::open(&sandbox)?;
+        let spawn = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE});
+        let refused = connection.exchange(&request_line("spawn", &spawn))?;
+        if refused["id"] != 7
+            || refused["error"]["code"] != -32000
+            || refused["error"]["data"]["kind"] != "handshake_required"
+            || refused.get("result").is_some()
+        {
+            failures.push(format!("spawn before hello: {refused}"));
+        }
+        connection.hello()?;
+        let sessions: i64 = rusqlite::Connection::open_with_flags(
+            sandbox.state.join("store.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+        if sessions != 0 {
+            failures.push(format!("spawn before hello left {sessions} sessions"));
+        }
+        drop(daemon);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    })
 }
 
 fn kind_of(code: i64) -> &'static str {
@@ -287,71 +324,73 @@ fn kind_of(code: i64) -> &'static str {
 
 #[test]
 fn c1_request_params_are_typed_and_reject_unknown_fields() -> TestResult {
-    let sandbox = Sandbox::new()?;
-    let daemon = Daemon::start(&sandbox)?;
-    let hello = json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test","extra":1});
-    let spawn = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,"extra":1});
-    let turn = format!("{SESSION}/1");
-    let cases = vec![
-        Case {
-            after_hello: false,
-            ..unknown_field("hello", "hello", &hello)
-        },
-        unknown_field("daemon/status", "daemon/status", &json!({"extra":1})),
-        unknown_field("spawn", "spawn", &spawn),
-        unknown_field(
-            "steer",
-            "steer",
-            &json!({"session":SESSION,"text":"t","handle":HANDLE,"extra":1}),
-        ),
-        unknown_field("result", "result", &json!({"address":turn,"extra":1})),
-        unknown_field("wait", "wait", &json!({"address":turn,"extra":1})),
-        unknown_field("events", "events", &json!({"session":SESSION,"extra":1})),
-        unknown_field("logs", "logs", &json!({"session":SESSION,"extra":1})),
-        case(
-            "result address not a string",
-            request_line("result", &json!({"address":7})),
-            -32602,
-            "invalid_params",
-        ),
-        case(
-            "events session missing",
-            request_line("events", &json!({})),
-            -32602,
-            "invalid_params",
-        ),
-        case(
-            "logs session malformed",
-            request_line("logs", &json!({"session":"not-a-session"})),
-            -32602,
-            "invalid_params",
-        ),
-        // Last: before the fix these stop the daemon.
-        unknown_field(
-            "daemon/stop",
-            "daemon/stop",
-            &json!({"force":false,"extra":1}),
-        ),
-        case(
-            "daemon/stop force not a boolean",
-            request_line("daemon/stop", &json!({"force":"yes"})),
-            -32602,
-            "invalid_params",
-        ),
-    ];
-    let mut failures = run_cases(&sandbox, cases);
-    // Well-formed requests still succeed after the refusals above.
-    let status = Connection::open(&sandbox).and_then(|mut connection| {
-        connection.hello()?;
-        connection.exchange(r#"{"jsonrpc":"2.0","id":"s","method":"daemon/status"}"#)
-    });
-    match status {
-        Ok(status) if status["id"] == "s" && status["result"]["store_path"].is_string() => {}
-        other => failures.push(format!("valid status after refusals: {other:?}")),
-    }
-    drop(daemon);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-    Ok(())
+    evidenced(|| {
+        let sandbox = Sandbox::new()?;
+        let daemon = Daemon::start(&sandbox)?;
+        let hello = json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test","extra":1});
+        let spawn = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,"extra":1});
+        let turn = format!("{SESSION}/1");
+        let cases = vec![
+            Case {
+                after_hello: false,
+                ..unknown_field("hello", "hello", &hello)
+            },
+            unknown_field("daemon/status", "daemon/status", &json!({"extra":1})),
+            unknown_field("spawn", "spawn", &spawn),
+            unknown_field(
+                "steer",
+                "steer",
+                &json!({"session":SESSION,"text":"t","handle":HANDLE,"extra":1}),
+            ),
+            unknown_field("result", "result", &json!({"address":turn,"extra":1})),
+            unknown_field("wait", "wait", &json!({"address":turn,"extra":1})),
+            unknown_field("events", "events", &json!({"session":SESSION,"extra":1})),
+            unknown_field("logs", "logs", &json!({"session":SESSION,"extra":1})),
+            case(
+                "result address not a string",
+                request_line("result", &json!({"address":7})),
+                -32602,
+                "invalid_params",
+            ),
+            case(
+                "events session missing",
+                request_line("events", &json!({})),
+                -32602,
+                "invalid_params",
+            ),
+            case(
+                "logs session malformed",
+                request_line("logs", &json!({"session":"not-a-session"})),
+                -32602,
+                "invalid_params",
+            ),
+            // Last: before the fix these stop the daemon.
+            unknown_field(
+                "daemon/stop",
+                "daemon/stop",
+                &json!({"force":false,"extra":1}),
+            ),
+            case(
+                "daemon/stop force not a boolean",
+                request_line("daemon/stop", &json!({"force":"yes"})),
+                -32602,
+                "invalid_params",
+            ),
+        ];
+        let mut failures = run_cases(&sandbox, cases);
+        // Well-formed requests still succeed after the refusals above.
+        let status = Connection::open(&sandbox).and_then(|mut connection| {
+            connection.hello()?;
+            connection.exchange(r#"{"jsonrpc":"2.0","id":"s","method":"daemon/status"}"#)
+        });
+        match status {
+            Ok(status) if status["id"] == "s" && status["result"]["store_path"].is_string() => {}
+            other => failures.push(format!("valid status after refusals: {other:?}")),
+        }
+        drop(daemon);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    })
 }
 
 /// Listens on `socket` from a thread whose effective uid is `uid`, so the
