@@ -6,7 +6,9 @@ Status: accepted with changes. This version folds in:
 - the orchestrator's decisions after it;
 - the orchestrator's correction after Sol's re-review. Runtime §7 latches
   Store failure on the first failed or uncertain state write, which
-  replaces failed-write retries and the in-daemon orphan machinery;
+  replaces failed-write retries and the in-daemon orphan machinery. That
+  latch rule is superseded by amendment A16 (Task 3 design §12): a write
+  known not committed is scoped, and only the §3 cases latch;
 - Sol's round-3 check (`sol-review-T2-B2-design-r3.md`): a pre-ARM launch
   gate (§3.1), and a rule against `session.closed` in Store-failed mode,
   since replaced by the round-3 closure rule below;

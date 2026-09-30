@@ -203,3 +203,12 @@ Verification: a grep of the dispatch design for "latch" shows no remaining
 unconditional "failed ... latches" clause outside the latched-path text and
 the header's history list (line 7, a record of the T2 correction, left as
 history). `git status` clean after this commit.
+
+## Fix round 3 (Sol high review r2: UNSOUND, two findings)
+
+Runtime §10's first audit row now defers to §7's per-site rules and names
+A14's two exceptions (a natural terminal whose one retry commits keeps its
+result; a dispatcher-owned queued cancellation whose retry commits stays
+`cancelled`); the dispatch design's history bullet marks the old
+first-failed-write latch rule as superseded by A16 (Task 3 design §12).
+Commit: the one that adds this section, together with both document edits.
