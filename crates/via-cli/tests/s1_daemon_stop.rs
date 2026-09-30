@@ -1390,7 +1390,8 @@ fn vendor_launched(paths: &Paths, session: &str) -> Result<Option<bool>, Scenari
 /// T4-2 review round 2 (coding-style §5, design §6.5): a blob step still
 /// running after the Store's bounded drain is pending work, so final
 /// shutdown is `incomplete` (exit 4) and its summary counts the step. A
-/// prompt over 256 KiB stalls its first blob step (`blob.step.stall`);
+/// prompt over 256 KiB stalls its first blob step (`blob.step.stall`, the
+/// second of the run: the small turn's folder creation is the first);
 /// the spawn fails `not_committed` at the 2 s bound; an idle stop then
 /// drops the Store with the step still held. A first small turn completes,
 /// so the run has turn evidence.
@@ -1414,7 +1415,8 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
                 .ok_or_else(|| infra("the state directory has no parent"))?;
             let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
             let point = "blob.step.stall";
-            failpoints.arm(point, 1, "pause").map_err(infra)?;
+            // Step 1 creates the small turn's evidence folder (T4-fix).
+            failpoints.arm(point, 2, "pause").map_err(infra)?;
             let mut daemon =
                 Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
             let receipted = paths.run(
@@ -1438,7 +1440,7 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
             let spawn = json!({"harness":"fake","model":"fake","prompt":"p".repeat(256 * 1024 + 1),"handle":format!("h_{}", "A".repeat(43))});
             let refused = raw.request("spawn", &spawn)?;
             failpoints
-                .wait_ack(point, 1, "pause", daemon.child.id(), FINAL_SHUTDOWN)
+                .wait_ack(point, 2, "pause", daemon.child.id(), FINAL_SHUTDOWN)
                 .map_err(infra)?;
             check(
                 refused["error"]["data"]["kind"] == "store_error"
@@ -1458,12 +1460,12 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
                     break summary;
                 }
                 if Instant::now() >= deadline {
-                    failpoints.release(point, 1).map_err(infra)?;
+                    failpoints.release(point, 2).map_err(infra)?;
                     return Err(fail("daemon wrote no final shutdown summary"));
                 }
                 thread::sleep(Duration::from_millis(5));
             };
-            failpoints.release(point, 1).map_err(infra)?;
+            failpoints.release(point, 2).map_err(infra)?;
             let status = daemon
                 .wait_exit(FINAL_SHUTDOWN)?
                 .ok_or_else(|| fail("the daemon did not exit"))?;
@@ -1482,4 +1484,135 @@ fn s1_daemon_stop_stalled_blob_step_is_not_a_clean_exit() -> TestResult {
             )
         },
     )
+}
+
+/// T4-fix (coding-style §5; Astra 1, Fable F3): a blocking step that
+/// overran its 2 s bound still counts at final shutdown. `stall` holds the
+/// first blob step of what `act` requests after one small turn completed;
+/// `act` checks that request's refusal. An idle stop then writes a summary
+/// that counts the held step (`blob_tasks` 1, `incomplete`, exit 4).
+#[cfg(feature = "test-failpoints")]
+fn stalled_step_is_counted(
+    name: &str,
+    stall: u64,
+    act: impl FnOnce(&Paths, &mut Raw, &str) -> Result<(), ScenarioError>,
+) -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hello"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"reply","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(name, &fixture, |paths, evidence| {
+        let root = paths
+            .state
+            .parent()
+            .ok_or_else(|| infra("the state directory has no parent"))?;
+        let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
+        let point = "blob.step.stall";
+        failpoints.arm(point, stall, "pause").map_err(infra)?;
+        let mut daemon =
+            Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
+        let receipted = paths.run(
+            evidence,
+            "spawn",
+            &[
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "hello",
+                "--json",
+            ],
+        )?;
+        check(receipted.status.success(), || {
+            format!("the small spawn exited {}", receipted.status)
+        })?;
+        let receipt = receipted.stdout.split(|byte| *byte == b'\n').next();
+        let session = json_line(receipt.unwrap_or_default())?["session_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| fail("the small spawn named no session"))?;
+        let mut raw = Raw::connect(&paths.runtime.join("via.sock"))?;
+        let acted = act(paths, &mut raw, &session);
+        let held = failpoints.wait_ack(point, stall, "pause", daemon.child.id(), FINAL_SHUTDOWN);
+        if acted.is_err() || held.is_err() {
+            failpoints.release(point, stall).map_err(infra)?;
+        }
+        acted?;
+        held.map_err(infra)?;
+        let stopping = raw.request("daemon/stop", &json!({}))?;
+        check(stopping["result"]["stopping"] == true, || {
+            stopping.to_string()
+        })?;
+        drop(raw);
+        let deadline = Instant::now() + FINAL_SHUTDOWN;
+        let summary = loop {
+            if let Ok(summary) = daemon.summary() {
+                break summary;
+            }
+            if Instant::now() >= deadline {
+                failpoints.release(point, stall).map_err(infra)?;
+                return Err(fail("daemon wrote no final shutdown summary"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        failpoints.release(point, stall).map_err(infra)?;
+        let status = daemon
+            .wait_exit(FINAL_SHUTDOWN)?
+            .ok_or_else(|| fail("the daemon did not exit"))?;
+        evidence
+            .write("daemon_shutdown.json", summary.to_string().as_bytes())
+            .map_err(infra)?;
+        check(
+            status.code() == Some(4)
+                && summary["disposition"] == "incomplete"
+                && summary["blob_tasks"] == 1
+                && summary["pending_joins"] == 1,
+            || format!("a held step must be counted: exit {status}; summary {summary}"),
+        )
+    })
+}
+
+/// T4-fix (design §7.2): the turn folder's creation is an owned blob step.
+/// Held past 2 s, the second turn fails `store` before launch, and the
+/// held step is counted at shutdown. The first turn's folder is step 1.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_blob_stalled_evidence_folder_is_owned_until_shutdown() -> TestResult {
+    stalled_step_is_counted("s1_blob_stalled_evidence_folder", 2, |_, raw, _| {
+        let spawn = json!({"harness":"fake","model":"fake","prompt":"hello",
+            "handle":format!("h_{}", "A".repeat(43))});
+        let receipt = raw.request("spawn", &spawn)?;
+        let session = receipt["result"]["session_id"]
+            .as_str()
+            .ok_or_else(|| fail(&format!("spawn not receipted: {receipt}")))?
+            .to_owned();
+        let ended = raw.request(
+            "wait",
+            &json!({"address":format!("{session}/1"),"timeout_ms":8000}),
+        )?;
+        let envelope = &ended["result"];
+        check(
+            envelope["state"] == "failed" && envelope["failure"]["class"] == "store",
+            || format!("a held folder creation must fail the turn store: {ended}"),
+        )
+    })
+}
+
+/// T4-fix (design §4.4): `logs`'s `lstat`s are an owned blob step. Held
+/// past 2 s, `logs` answers `store_error`, and the held step is counted at
+/// shutdown. The first turn's folder is step 1.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_blob_stalled_logs_step_is_owned_until_shutdown() -> TestResult {
+    stalled_step_is_counted("s1_blob_stalled_logs", 2, |_, raw, session| {
+        let logs = raw.request("logs", &json!({"session":session}))?;
+        check(logs["error"]["data"]["kind"] == "store_error", || {
+            format!("a held logs step must answer store_error: {logs}")
+        })
+    })
 }

@@ -1540,7 +1540,7 @@ impl Store {
             client: StoreClient {
                 lanes,
                 lane: Lane::Internal,
-                evidence: EvidenceRoot::new(state),
+                evidence: EvidenceRoot::new(state, blobs.tasks.clone()),
                 blobs,
                 state: Arc::from(state),
                 wal_full,
@@ -2460,7 +2460,7 @@ mod tests {
         let client = StoreClient {
             lanes: Arc::clone(&lanes),
             lane: Lane::Internal,
-            evidence: EvidenceRoot::new(root.path()),
+            evidence: EvidenceRoot::new(root.path(), crate::BlobTasks::default()),
             blobs: Blobs::open(root.path()).expect("blobs"),
             state: Arc::from(root.path()),
             wal_full: Arc::default(),

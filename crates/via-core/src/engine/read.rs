@@ -239,8 +239,9 @@ impl Engine {
 
     /// C1 §3.12 `logs` (Task 4 design §4.4): where the addressed turn's
     /// evidence is, or for a session its running turn's, else its latest
-    /// submitted one's. Each fixed file name is `stat`ed once on the
-    /// blocking pool, without following a symlink; no file is opened.
+    /// submitted one's. Each fixed file name is `stat`ed once, in one owned
+    /// blob step answered within 2 s (coding-style §5), without following a
+    /// symlink; no file is opened.
     pub async fn logs(&self, params: LogsParams) -> Result<Value, ApiError> {
         let (session, turn) = params.address()?;
         let refs = self
@@ -257,9 +258,10 @@ impl Engine {
         // A failed `lstat` is a failed evidence read: `store_error`, as for
         // the Store read above.
         let files = match folder.clone() {
-            Some(folder) => tokio::task::spawn_blocking(move || evidence_files(&folder))
+            Some(folder) => self
+                .store
+                .blocking_step(move || evidence_files(&folder))
                 .await
-                .map_err(|_| ApiError::STORE)?
                 .map_err(|_| ApiError::STORE)?,
             None => Vec::new(),
         };

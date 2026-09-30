@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{SessionId, TurnNumber};
+use crate::{SessionId, TurnNumber, blob::BlobTasks};
 
 /// The fixed file names a turn's folder can hold, in the order `logs` lists
 /// them (design §7.1).
@@ -23,13 +23,24 @@ pub const EVIDENCE_FILES: [&str; 3] = ["stderr.log", "undecoded.bin", "final_tex
 pub struct EvidenceRoot {
     /// The State directory.
     state: Arc<PathBuf>,
+    /// The Store's owned blob steps, which run the folders' blocking I/O
+    /// (coding-style §5).
+    tasks: BlobTasks,
 }
 
 impl EvidenceRoot {
-    pub(crate) fn new(state: &Path) -> Self {
+    pub(crate) fn new(state: &Path, tasks: BlobTasks) -> Self {
         Self {
             state: Arc::new(state.to_path_buf()),
+            tasks,
         }
+    }
+
+    /// The Store's owned, capped blob steps (coding-style §5), for the
+    /// blocking I/O on a turn's folder: each step answered within 2 s and
+    /// owned until it ends, so final shutdown counts one still running.
+    pub fn blob_tasks(&self) -> &BlobTasks {
+        &self.tasks
     }
 
     /// The turn's folder relative to the State directory, as
