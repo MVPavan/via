@@ -899,7 +899,7 @@ fn large_text(tag: &str) -> String {
 /// content returns the stored receipt and leaves no blob; the file
 /// rewritten under the same key is `idempotency_conflict` and the stored
 /// blob still matches; a paused copy holds no lock (`close` and
-/// `daemon/status` answer within 100 ms), and an append during it is
+/// `daemon/status` answer while the pause still holds it), and an append during it is
 /// `changed` with no blob left; below a lowered floor the keyed retry is
 /// still answered and leaves no blob, while an unkeyed one is refused
 /// `disk_free_floor` (T4-7); a FIFO, a directory, a relative path, a
@@ -1085,6 +1085,11 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
                     Duration::from_secs(10),
                 )
                 .map_err(infra)?;
+            // A paused copy holds no lock: `close` of another session and
+            // `daemon/status` both answer while the acknowledged pause still
+            // holds the copy, released only after both replies. A held lock
+            // fails the read after 15 s instead of hanging. The latencies are
+            // recorded as evidence, not bounded.
             let started = Instant::now();
             let closed = quick.exchange(&line(
                 &json!(4),
@@ -1105,10 +1110,6 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             check(status["result"]["pid"].is_u64(), || {
                 format!("status: {status}")
             })?;
-            check(
-                close_took < Duration::from_millis(100) && status_took < Duration::from_millis(100),
-                || format!("during a paused copy: close {close_took:?}, status {status_took:?}"),
-            )?;
             fs::OpenOptions::new()
                 .append(true)
                 .open(&paused_file)
@@ -1565,6 +1566,14 @@ fn s1_c1_wall_default_and_nested_null_deadlines() -> TestResult {
                     format!("resume deadlines {deadlines}: {reply}")
                 })?;
             }
+            // Turn 1 ends before the scenario stops the daemon, so its
+            // evidence folder exists: a forced stop before `turn.started`
+            // would cancel it with none.
+            let address = format!("{}/1", session.as_str().unwrap_or_default());
+            let envelope = setup.wait(evidence, "wait_turn_1", &address)?;
+            check(envelope["state"] == "completed", || {
+                format!("turn 1 did not complete: {envelope}")
+            })?;
             Ok(())
         },
         |evidence| setup.collect(evidence),
