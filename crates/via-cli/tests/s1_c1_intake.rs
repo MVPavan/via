@@ -960,6 +960,110 @@ fn s1_c1_wait_after_a_slow_read_keeps_its_cadence() -> TestResult {
     report.require_pass()
 }
 
+/// C1 §3.8 (S1 critic finding 10): `timeout_ms` bounds `wait`'s Store
+/// reads too. With every Store read delayed 800 ms (`store.read.delay_ms`),
+/// a 150 ms wait on a running turn returns `wait_timeout` while its first
+/// read is still in the Store worker: that read was admitted (its hit is
+/// acknowledged) and no second read began, since the worker serves reads
+/// one at a time. Before the fix the wait waited out that read and made a
+/// second (the turn-existence read) before its timeout. The measured time
+/// is evidence only.
+#[test]
+fn s1_c1_wait_timeout_bounds_its_store_reads() -> TestResult {
+    let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
+    let evidence = setup.evidence("s1_c1_wait_timeout_reads")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            hits::count(&setup.dir, READ_DELAY).map_err(infra)?;
+            let daemon = setup.start(evidence, &[])?;
+            let receipt = cli(
+                &setup.sandbox,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "hold",
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = receipt["session_id"]
+                .as_str()
+                .ok_or_else(|| failure(format!("spawn: {receipt}")))?
+                .to_owned();
+            setup.sandbox.await_gate("hold")?;
+            let mut waiter = Conn::open(&setup.sandbox)?;
+            let first = hits::hits(&setup.dir, READ_DELAY).map_err(infra)? + 1;
+            setup
+                .failpoints
+                .arm(READ_DELAY, first, "delay_persist:800")
+                .map_err(infra)?;
+            let started = Instant::now();
+            let reply = waiter.exchange(&line(
+                &json!(1),
+                "wait",
+                &json!({"address":format!("{session}/1"),"timeout_ms":150}),
+            ))?;
+            let took = started.elapsed();
+            let second_read = setup
+                .dir
+                .join(format!("{READ_DELAY}.{}.ack", first + 1))
+                .exists();
+            evidence
+                .write(
+                    "wait_timeout.json",
+                    json!({"took_ms":took.as_millis(),"second_read":second_read})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(is_error(&reply, -32016, "wait_timeout"), || {
+                format!("bounded wait: {reply}")
+            })?;
+            check(!second_read, || {
+                format!("the wait outlived its first read ({took:?})")
+            })?;
+            setup
+                .failpoints
+                .wait_ack(
+                    READ_DELAY,
+                    first,
+                    "delay",
+                    daemon.pid(),
+                    Duration::from_secs(5),
+                )
+                .map_err(infra)?;
+            setup.failpoints.disarm(READ_DELAY).map_err(infra)?;
+            setup.sandbox.release_gate("hold")?;
+            let envelope = cli(
+                &setup.sandbox,
+                evidence,
+                "wait_end",
+                &[
+                    "wait",
+                    &format!("{session}/1"),
+                    "--timeout-ms",
+                    "30000",
+                    "--json",
+                ],
+            )?;
+            check(envelope["state"] == "completed", || {
+                format!("the held turn: {envelope}")
+            })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- prompt file
 
 fn spawn_file(path: &str, key: Option<&str>) -> Value {
