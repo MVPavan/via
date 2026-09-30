@@ -269,8 +269,9 @@ retain their original connection/turn correlation and cannot leak to a later
 process for the same session.
 
 Terminal mapping: `success/is_error:false` → Completed; Core independently
-validates any requested structured output (including missing output), yielding
-`structured_output_invalid` on failure. `error_max_turns` with `max_turns` →
+validates any requested structured output: output present but invalid yields
+`structured_output_invalid`; a requested schema with no output keeps the
+`completed` result and adds warning `structured_output_missing` (C1 §5). `error_max_turns` with `max_turns` →
 Failed, class hint `budget_exceeded`, stop reason `max_steps`; the raw vendor code
 is retained. This is not a normal successful max-steps stop. After VIA interrupt,
 the qualified receipt plus `error_during_execution/aborted_tools` → Interrupted.
@@ -454,7 +455,7 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_lazy_init_acceptance` | Logical open returns with internal expected UUID, public ID null/verified false and no opened event; init emitted only after input cannot deadlock; matching init confirms identity/opened but is not acceptance; sole successful terminal confirms before one acceptance token; pre-init rejection echoes UUID without confirming or opening |
 | `claude_identity_resume` | Same UUID across three children; historical confirmed ID remains visible with verified false during reopening; matching init/non-rejection result commits one reopened event and verified true; late prior-generation message cannot confirm; mismatch/missing-session rejection never reopens or creates fresh; no duplicate input after loss |
 | `claude_fifo_busy_input` | Queue two VIA turns while fake tool runs; first process receives exactly one user message; second starts only after terminal/cleanup; vendor queue count has no authority |
-| `claude_schema_replace_clear` | Disjoint schemas A/B and null across same UUID; actual structured output validated by Core; missing/invalid output fails; launch rejection never recreates session |
+| `claude_schema_replace_clear` | Disjoint schemas A/B and null across same UUID; actual structured output validated by Core; present-but-invalid output fails `structured_output_invalid`; missing output keeps `completed` with warning `structured_output_missing`; launch rejection never recreates session |
 | `claude_agentic_step_limit` | N=1 terminal error_max_turns maps failed/budget_exceeded/max_steps even with num_turns=2; N=2 on resume succeeds; null clears flag; N counts agentic iterations, not tool calls |
 | `claude_instructions_effort` | Frozen instruction bytes reapplied after source file changes; explicit model-supported effort preserved on resume; invalid effort refused; large argv budget error before prompt |
 | `claude_never_ask` | Denied action settles; live permission_denied and terminal denials deduplicated (c4: one denial); a decline-caused denial is suppressed (c11b: one decline, zero denials); unknown request refusal or fail-closed action completes within 5 s while normal observations are full |
@@ -483,7 +484,7 @@ zero tests serve as acceptance. Keep network and credentials out of default CI.
    version rule; there is no exact version set.
 3. **Superseded** (adapter design VC10): `describe` reports the last version
    seen from an init; there is no HostProbe `--version` discovery.
-4. **C2 open_session/SessionDriver; C1 §3.8 status and §6.1 session events:** add
+4. **C2 open_session/SessionDriver; C1 §3.7 status and §6.1 session events:** add
    internal `VendorIdentity { expected_id, confirmed_id: Option<VendorSessionId>,
    verified: bool }`, scoped to the current connection generation, and persist
    through Core. “A CLI whose init follows input may open logically with an
@@ -501,8 +502,9 @@ zero tests serve as acceptance. Keep network and credentials out of default CI.
    UUID. The VIA receipt/session exists independently of vendor confirmation.
    Every init/result ID is checked; mismatch fails `resume_mismatch` without
    replacement or resend. No pre-input identity-verification guarantee is made.”
-   Acceptance still requires prompt-associated evidence, not init. Other routes
-   that confirm during open can return confirmed/verified identity immediately.
+   Acceptance still requires prompt-associated evidence, not init. (Adapter
+   design AD3 since made `open_session` logical on every route: identity is
+   confirmed in the first `run_turn`, never during open; C2 §2.)
 5. **C2 §6.2 Claude process/start rows:** replace per-session reuse/restart-on-change
    with “one private process per VIA turn; persistent same vendor UUID; apply
    effective parameters at every launch; Core retains all queued inputs”.
