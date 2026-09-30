@@ -9,9 +9,22 @@ use serde_json::value::RawValue;
 use tokio::time::Instant;
 
 use crate::plan::{VersionStatus, Warning};
-use crate::{
-    AcceptanceToken, AdapterError, Cleanup, ProgressMarks, VendorTerminalStatus, VendorTurnId,
-};
+use crate::{AcceptanceToken, AdapterError, Cleanup, VendorTerminalStatus, VendorTurnId};
+
+/// A vendor message's progress marks (C2 §4 `progress`); the arrival time
+/// is the item's `at`. Replaces the legacy root `ProgressMarks` once Core
+/// moves to this surface.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProgressMarks {
+    /// Model output: text, reasoning or a tool request.
+    pub model: bool,
+    /// Tools started, as `(id, name)`.
+    pub tools_started: Vec<(String, String)>,
+    /// Ids of tools ended.
+    pub tools_ended: Vec<String>,
+    /// A per-model-call usage sample, never a cumulative total (AD6).
+    pub usage: Option<UsageSample>,
+}
 
 /// One observation, stamped when the driver decoded it (C2 §4).
 #[derive(Debug)]

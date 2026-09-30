@@ -416,6 +416,22 @@ pub struct RoutePlan {
     /// reported in status, not in `describe`.
     #[serde(skip)]
     pub inherit: Inherit,
+    /// The persistent server this plan's connections share, if any; not
+    /// part of `describe`.
+    #[serde(skip)]
+    pub server_key: Option<ServerKey>,
+}
+
+/// An opaque key naming one persistent server a route may share across
+/// sessions (C2 §2); Core only compares it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ServerKey(String);
+
+impl ServerKey {
+    /// The key's opaque text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A model's catalog source (C1 §3.13).

@@ -155,12 +155,12 @@ mod runtime;
 pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
-pub use config::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError};
+pub use config::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture};
 pub use fake_config::FakeConfig;
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,
-    InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan,
+    InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan, ServerKey,
     SessionRef, Switch, TurnParams, VendorOptions, VersionStatus, Warning, resolve_model,
 };
 pub use runtime::{

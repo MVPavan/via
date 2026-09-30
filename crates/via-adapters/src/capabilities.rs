@@ -25,7 +25,7 @@ pub enum Support {
 impl Support {
     /// Whether this support meets a request: `native` always, `partial` only
     /// when the request accepts partial support.
-    pub fn meets(&self, partial_ok: bool) -> bool {
+    pub(crate) fn meets(&self, partial_ok: bool) -> bool {
         match self {
             Self::Native => true,
             Self::Partial { .. } => partial_ok,

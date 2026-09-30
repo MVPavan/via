@@ -6,6 +6,7 @@ mod profile;
 
 pub(crate) use profile::FakeProfile;
 
+use crate::config::FakeFixture;
 use crate::harness::Harness;
 use crate::plan::{
     CatalogModel, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan,
@@ -14,7 +15,7 @@ use crate::plan::{
 
 /// The fake adapter's planning half.
 pub(crate) struct FakeAdapter {
-    profile: FakeProfile,
+    fixture: FakeFixture,
 }
 
 /// The values a turn sets that the route must accept.
@@ -27,28 +28,36 @@ struct PerTurn<'a> {
 }
 
 impl FakeAdapter {
-    pub(crate) fn new(profile: FakeProfile) -> Self {
-        Self { profile }
+    pub(crate) fn new(fixture: FakeFixture) -> Self {
+        Self { fixture }
     }
 
     /// The bundled catalog.
     pub(crate) fn catalog(&self) -> &[CatalogModel] {
-        &self.profile.models
+        &self.fixture.profile.models
     }
 
     /// The catalogued model `requested` names; with none, the first one.
+    /// With a named harness (design §5.2): a catalogued name or alias
+    /// resolves, and any other model passes through unchanged for the
+    /// vendor to judge; with no model, the first catalogued one.
     pub(crate) fn resolve(&self, requested: Option<&str>) -> Option<String> {
         let catalog = self.catalog();
         match requested {
-            None => catalog.first(),
-            Some(name) => catalog.iter().find(|entry| entry.matches(name)),
+            None => catalog.first().map(|entry| entry.model.clone()),
+            Some(name) => Some(
+                catalog
+                    .iter()
+                    .find(|entry| entry.matches(name))
+                    .map_or(name, |entry| &entry.model)
+                    .to_owned(),
+            ),
         }
-        .map(|entry| entry.model.clone())
     }
 
     /// AD12: the stored version is this adapter's, or one it declares compatible.
     pub(crate) fn check_version(&self, route: &'static str, stored: &str) -> Result<(), Refusal> {
-        let profile = &self.profile;
+        let profile = &self.fixture.profile;
         if stored == profile.adapter_version || profile.compatible.iter().any(|v| v == stored) {
             return Ok(());
         }
@@ -69,7 +78,7 @@ impl FakeAdapter {
         requested: Inherit,
     ) -> RoutePlan {
         let route = harness.route();
-        let capabilities = self.profile.capabilities.clone();
+        let capabilities = self.fixture.profile.capabilities.clone();
         let mut refusals = self.refusals(
             route,
             &PerTurn {
@@ -95,7 +104,8 @@ impl FakeAdapter {
                 .iter()
                 .any(|r| r.kind == RefusalKind::BoundUnsupported)
         });
-        let (inherit, switch_warning) = effective_inherit(&self.profile.categories, requested);
+        let (inherit, switch_warning) =
+            effective_inherit(&self.fixture.profile.categories, requested);
         let mut warnings = vec![Warning {
             code: "vendor_version_untested",
             message: "the fake agent reports no version".to_owned(),
@@ -106,7 +116,7 @@ impl FakeAdapter {
             harness: harness.name(),
             model,
             route,
-            adapter_version: self.profile.adapter_version.clone(),
+            adapter_version: self.fixture.profile.adapter_version.clone(),
             vendor_version: None,
             version_status: VersionStatus::Untested,
             capabilities,
@@ -114,6 +124,8 @@ impl FakeAdapter {
             refusals,
             warnings,
             inherit,
+            // Every fake turn is its own private process.
+            server_key: None,
         }
     }
 
@@ -132,20 +144,28 @@ impl FakeAdapter {
     }
 
     fn refusals(&self, route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
-        let capabilities = &self.profile.capabilities;
+        let capabilities = &self.fixture.profile.capabilities;
         let params = &capabilities.params;
         let invalid = |field, message: String| {
             Refusal::new(RefusalKind::InvalidParam { field }, Some(route), message)
         };
         let mut refusals = Vec::new();
         if let Some(effort) = turn.effort {
-            // AD18: a value the compiled table does not map is refused.
+            // AD18: an empty value, or one the compiled table does not
+            // map, is refused.
             if !params.effort.meets(true) {
                 refusals.push(invalid(
                     "effort",
                     format!("effort is unsupported on route {route}"),
                 ));
-            } else if !self.profile.efforts.iter().any(|known| known == effort) {
+            } else if effort.is_empty()
+                || !self
+                    .fixture
+                    .profile
+                    .efforts
+                    .iter()
+                    .any(|known| known == effort)
+            {
                 refusals.push(invalid(
                     "effort",
                     format!("effort is not a value route {route} accepts"),

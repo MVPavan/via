@@ -5,7 +5,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -78,6 +78,9 @@ pub enum ConfigError {
     /// The fake fixture is incomplete, relative or unusable.
     #[error("{0}")]
     Fixture(&'static str),
+    /// The scenario file is not JSON.
+    #[error("fake scenario is not JSON: {0}")]
+    Scenario(serde_json::Error),
     /// The scenario's `profile` does not parse.
     #[error("fake scenario profile is invalid: {0}")]
     Profile(serde_json::Error),
@@ -86,10 +89,38 @@ pub enum ConfigError {
     Harnesses,
 }
 
+/// The fake's validated fixture (runtime §11.1): its launch paths and the
+/// profile its scenario declares.
+#[derive(Debug)]
+pub struct FakeFixture {
+    binary: PathBuf,
+    scenario: PathBuf,
+    sync_dir: PathBuf,
+    pub(crate) profile: FakeProfile,
+}
+
+impl FakeFixture {
+    /// The fake agent executable.
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    /// The scenario file.
+    pub fn scenario(&self) -> &Path {
+        &self.scenario
+    }
+
+    /// The synchronization directory.
+    pub fn sync_dir(&self) -> &Path {
+        &self.sync_dir
+    }
+}
+
 /// Per-harness settings and the fake fixture, validated once.
 #[derive(Debug)]
 pub struct AdapterConfig {
-    fake: Option<FakeProfile>,
+    fake: Option<FakeFixture>,
+    harnesses: Option<Box<RawValue>>,
 }
 
 impl AdapterConfig {
@@ -113,7 +144,12 @@ impl AdapterConfig {
             [None, None, None] => None,
             [Some(binary), Some(scenario), Some(sync_dir)] => {
                 check_fixture(binary, scenario, sync_dir)?;
-                Some(read_profile(scenario)?)
+                Some(FakeFixture {
+                    binary: binary.to_path_buf(),
+                    scenario: scenario.to_path_buf(),
+                    sync_dir: sync_dir.to_path_buf(),
+                    profile: read_profile(scenario)?,
+                })
             }
             _ => {
                 return Err(ConfigError::Fixture(
@@ -121,11 +157,24 @@ impl AdapterConfig {
                 ));
             }
         };
-        Ok(Self { fake })
+        Ok(Self {
+            fake,
+            harnesses: harnesses.map(ToOwned::to_owned),
+        })
     }
 
-    /// The fake's profile, when the fixture is configured.
-    pub(crate) fn into_fake(self) -> Option<FakeProfile> {
+    /// The fake's fixture, when configured.
+    pub fn fake_fixture(&self) -> Option<&FakeFixture> {
+        self.fake.as_ref()
+    }
+
+    /// The `harnesses` object as given, kept opaque (H4).
+    pub fn harnesses(&self) -> Option<&RawValue> {
+        self.harnesses.as_deref()
+    }
+
+    /// The fake's fixture, when configured.
+    pub(crate) fn into_fake(self) -> Option<FakeFixture> {
         self.fake
     }
 }
@@ -148,17 +197,40 @@ fn check_fixture(binary: &Path, scenario: &Path, sync_dir: &Path) -> Result<(), 
     Ok(())
 }
 
-/// The object form `{profile, scripts}` gives the profile. Any other
-/// scenario (the legacy forms, or raw lines a test agent replays) keeps the
-/// default profile; the agent itself judges the scripts.
+/// Decision H2: the scenario is `{profile?, scripts: [..]}`, or the legacy
+/// single script `{expected_request, steps: [..]}`, which keeps the default
+/// profile. Anything else is refused (runtime §11.1). The fake agent itself
+/// judges the scripts' content.
 fn read_profile(scenario: &Path) -> Result<FakeProfile, ConfigError> {
     let bytes =
         fs::read(scenario).map_err(|_| ConfigError::Fixture("fake scenario is unreadable"))?;
-    match serde_json::from_slice::<Value>(&bytes) {
-        Ok(Value::Object(mut scenario)) => match scenario.remove("profile") {
-            Some(profile) => serde_json::from_value(profile).map_err(ConfigError::Profile),
-            None => Ok(FakeProfile::default()),
-        },
-        Ok(_) | Err(_) => Ok(FakeProfile::default()),
+    let Value::Object(mut scenario) =
+        serde_json::from_slice::<Value>(&bytes).map_err(ConfigError::Scenario)?
+    else {
+        return Err(ConfigError::Fixture("fake scenario must be a JSON object"));
+    };
+    if scenario.contains_key("scripts") {
+        let scripts_form = scenario.get("scripts").is_some_and(Value::is_array)
+            && scenario
+                .keys()
+                .all(|key| key == "scripts" || key == "profile");
+        if !scripts_form {
+            return Err(ConfigError::Fixture(
+                "fake scenario must be {profile?, scripts: [...]}",
+            ));
+        }
+        return scenario.remove("profile").map_or_else(
+            || Ok(FakeProfile::default()),
+            |profile| serde_json::from_value(profile).map_err(ConfigError::Profile),
+        );
     }
+    let single_script = scenario.len() == 2
+        && scenario.contains_key("expected_request")
+        && scenario.get("steps").is_some_and(Value::is_array);
+    if !single_script {
+        return Err(ConfigError::Fixture(
+            "fake scenario must be {profile?, scripts} or one script {expected_request, steps}",
+        ));
+    }
+    Ok(FakeProfile::default())
 }

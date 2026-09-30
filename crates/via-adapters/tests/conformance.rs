@@ -11,10 +11,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use via_adapters::observation::{Observation, ProgressMarks, UsageSample};
 use via_adapters::{
-    AdapterConfig, AdapterSet, BOOTSTRAP_ENV, BootstrapEnv, CatalogModel, Category,
-    DescribeRequest, InheritState, ModelSource, RefusalKind, SessionRef, TurnParams, Verb, VerbReq,
-    harness_names, resolve_model,
+    AdapterConfig, AdapterSet, BOOTSTRAP_ENV, BootstrapEnv, Bound, CatalogModel, Category,
+    CategoryDecl, DescribeRequest, InheritState, ModelSource, RefusalKind, SessionRef, Switch,
+    TurnParams, Verb, VerbReq, harness_names, resolve_model,
 };
 
 /// A fake fixture deployment whose scenario file holds `scenario`.
@@ -206,8 +207,9 @@ fn conformance_adapter_version_chain() {
 /// with no effort setting any effort is.
 #[test]
 fn conformance_unknown_effort_refused() {
+    // `""` in the table must not make an empty effort valid.
     let set = fake_set(&json!({"capabilities": partial_capabilities(),
-                                "efforts": ["low", "high"]}));
+                                "efforts": ["low", "high", ""]}));
     let with_effort = |effort: &str| DescribeRequest {
         effort: Some(effort.to_owned()),
         ..describe(Some("fake"), None)
@@ -227,10 +229,13 @@ fn conformance_unknown_effort_refused() {
     };
     let current = session(env!("CARGO_PKG_VERSION"));
     assert_eq!(set.check_turn(&current, &turn("low")), Ok(()));
-    assert_eq!(
-        set.check_turn(&current, &turn("turbo")).unwrap_err().kind,
-        RefusalKind::InvalidParam { field: "effort" }
-    );
+    for effort in ["turbo", ""] {
+        assert_eq!(
+            set.check_turn(&current, &turn(effort)).unwrap_err().kind,
+            RefusalKind::InvalidParam { field: "effort" },
+            "{effort:?}"
+        );
+    }
 
     let default = default_set();
     assert_eq!(
@@ -248,12 +253,14 @@ fn states(plan: &via_adapters::RoutePlan) -> Vec<(Category, InheritState)> {
 
 fn switch_warning(plan: &via_adapters::RoutePlan) -> Option<Value> {
     let warnings = serde_json::to_value(&plan.warnings).unwrap();
-    warnings
+    let mut found = warnings
         .as_array()
         .unwrap()
         .iter()
-        .find(|warning| warning["code"] == "config_switch_unverified")
-        .cloned()
+        .filter(|warning| warning["code"] == "config_switch_unverified");
+    let first = found.next().cloned();
+    assert_eq!(found.next(), None, "one config_switch_unverified warning");
+    first
 }
 
 /// (19) AD13, state half, on the compiled OD2 defaults (hooks and MCP off,
@@ -440,18 +447,168 @@ fn conformance_default_fake_refusals() {
             "{harness}"
         );
     }
+}
+
+/// Design §5.2: with the harness given, a catalogued name or alias
+/// resolves, and an uncatalogued model passes through for the vendor to
+/// judge; `UnknownModel` is only for an unresolved model-only request.
+#[test]
+fn conformance_explicit_model_passes_through() {
+    let set = fake_set(&json!({"models": [{"model":"fake-large","aliases":["large"]}]}));
+    let resolved = |model| {
+        set.plan(&describe(Some("fake"), Some(model)))
+            .unwrap()
+            .model
+            .resolved
+    };
+    assert_eq!(resolved("large"), "fake-large");
+    assert_eq!(resolved("other"), "other");
     assert_eq!(
-        set.plan(&describe(Some("fake"), Some("other")))
-            .unwrap_err()
-            .kind,
+        set.plan(&describe(None, Some("other"))).unwrap_err().kind,
         RefusalKind::UnknownModel
     );
+    let empty = fake_set(&json!({"models": []}));
+    assert_eq!(
+        empty
+            .plan(&describe(Some("fake"), Some("other")))
+            .unwrap()
+            .model
+            .resolved,
+        "other"
+    );
+    let plan = default_set()
+        .plan(&describe(Some("fake"), Some("other")))
+        .unwrap();
+    assert_eq!(plan.model.resolved, "other");
+    assert_eq!(plan.server_key, None);
+}
+
+/// `check_turn` refuses each per-turn value the route cannot take, by
+/// member; a refusal serializes with its field, kind, route and reason.
+#[test]
+fn conformance_check_turn_refusals() {
+    let set = default_set();
+    let current = session(env!("CARGO_PKG_VERSION"));
+    let bound: Bound =
+        serde_json::from_value(json!({"mode":"read_only","extra_write_dirs":[],"network":false}))
+            .unwrap();
+    let cases = [
+        (
+            TurnParams {
+                output_schema: true,
+                ..TurnParams::default()
+            },
+            RefusalKind::InvalidParam {
+                field: "output_schema",
+            },
+        ),
+        (
+            TurnParams {
+                max_steps: Some(3),
+                ..TurnParams::default()
+            },
+            RefusalKind::InvalidParam { field: "max_steps" },
+        ),
+        (
+            TurnParams {
+                bound: Some(bound),
+                ..TurnParams::default()
+            },
+            RefusalKind::BoundUnsupported,
+        ),
+        (
+            TurnParams {
+                vendor: serde_json::from_value(json!({"fake":{"k":"v"}})).unwrap(),
+                ..TurnParams::default()
+            },
+            RefusalKind::InvalidParam { field: "vendor" },
+        ),
+    ];
+    for (turn, kind) in cases {
+        let refusal = set.check_turn(&current, &turn).unwrap_err();
+        assert_eq!(refusal.kind, kind);
+        assert_eq!(refusal.route, Some("fake"));
+    }
+    assert_eq!(set.check_turn(&current, &TurnParams::default()), Ok(()));
+
+    let partial = fake_set(&json!({"capabilities": partial_capabilities()}));
+    let mut request = describe(Some("fake"), None);
+    request.require = vec![VerbReq::parse("cancel").unwrap()];
+    let plan = partial.plan(&request).unwrap();
+    let refusal = serde_json::to_value(&plan.refusals).unwrap();
+    assert_eq!(refusal[0]["field"], "cancel");
+    assert_eq!(refusal[0]["kind"], "missing_capability");
+    assert_eq!(refusal[0]["route"], "fake");
+    assert!(refusal[0]["message"].is_string());
+
+    let version = set.check_turn(&session("0.0.0-old"), &TurnParams::default());
+    let refusal = serde_json::to_value(vec![version.unwrap_err()]).unwrap();
+    assert_eq!(refusal[0]["kind"], "harness_unavailable");
+    assert_eq!(refusal[0]["reason"], "adapter_version");
+    assert_eq!(refusal[0]["route"], "fake");
+    assert_eq!(refusal[0].get("field"), None);
+}
+
+/// AD13, per direction: the request only through a verified switch; an
+/// unverified switch is `unknown`; with no switch, the verified observation,
+/// else `unknown`.
+#[test]
+fn conformance_inherit_directional_table() {
+    use InheritState::{Off, On, Unknown};
+    use Switch::{None as NoSwitch, Unverified, Verified};
+    let cases = [
+        // (on switch, off switch, observed, requested, effective)
+        (Verified, NoSwitch, None, On, On),
+        (Unverified, NoSwitch, None, On, Unknown),
+        (Unverified, NoSwitch, Some(Off), On, Unknown),
+        (NoSwitch, NoSwitch, Some(Off), On, Off),
+        (NoSwitch, NoSwitch, Some(On), On, On),
+        (NoSwitch, NoSwitch, None, On, Unknown),
+        (NoSwitch, Verified, None, Off, Off),
+        (NoSwitch, Unverified, None, Off, Unknown),
+        (NoSwitch, Unverified, Some(On), Off, Unknown),
+        (NoSwitch, NoSwitch, Some(On), Off, On),
+        (NoSwitch, NoSwitch, Some(Off), Off, Off),
+        (NoSwitch, NoSwitch, None, Off, Unknown),
+    ];
+    for (on, off, observed, requested, effective) in cases {
+        let decl = CategoryDecl { on, off, observed };
+        assert_eq!(
+            decl.effective(requested),
+            effective,
+            "{decl:?} {requested:?}"
+        );
+    }
+}
+
+/// C2 §4: a progress observation carries an AD6 usage sample whose
+/// components are independently nullable.
+#[test]
+fn conformance_progress_carries_usage_sample() {
+    let usage = UsageSample {
+        key: Some("call-1".to_owned()),
+        input: Some(10),
+        cached_input: None,
+        output: Some(3),
+        reasoning_output: None,
+        total: None,
+    };
+    let marks = ProgressMarks {
+        model: true,
+        tools_started: vec![],
+        tools_ended: vec![],
+        usage: Some(usage.clone()),
+    };
+    let Observation::Progress(marks) = Observation::Progress(marks) else {
+        unreachable!()
+    };
+    assert_eq!(marks.usage, Some(usage));
 }
 
 /// H2/H4 configuration: only the three fixture names are read; the fixture
-/// is all or nothing; `harnesses` is opaque but must be an object; a
-/// scenario that is not the object form keeps the default profile, while a
-/// malformed `profile` is refused.
+/// is all or nothing and kept with its profile; `harnesses` is opaque but
+/// must be an object, and is kept; the legacy scenario forms keep the
+/// default profile; malformed or non-JSON scenarios are refused.
 #[test]
 fn conformance_config_load() {
     assert_eq!(
@@ -468,7 +625,9 @@ fn conformance_config_load() {
     let object = serde_json::value::RawValue::from_string(r#"{"codex":{}}"#.to_owned()).unwrap();
     let array = serde_json::value::RawValue::from_string("[]".to_owned()).unwrap();
     let none = || BootstrapEnv::from_vars::<_, &str, &str>([]);
-    assert!(AdapterConfig::load(none(), Some(&object)).is_ok());
+    let config = AdapterConfig::load(none(), Some(&object)).unwrap();
+    assert_eq!(config.harnesses().unwrap().get(), r#"{"codex":{}}"#);
+    assert!(config.fake_fixture().is_none());
     assert!(AdapterConfig::load(none(), Some(&array)).is_err());
 
     let (_dir, env) = fixture(&json!({"scripts": []}));
@@ -479,12 +638,39 @@ fn conformance_config_load() {
     );
     assert!(AdapterConfig::load(partial, None).is_err());
 
-    // A raw-lines scenario (route tests) and a legacy array keep the default.
-    for scenario in ["not json\n", "[]"] {
+    let paths: Vec<_> = env.vars().map(|(_, value)| value.to_owned()).collect();
+    let config = AdapterConfig::load(env, None).unwrap();
+    let fake = config.fake_fixture().unwrap();
+    assert_eq!(fake.binary().as_os_str(), paths[0]);
+    assert_eq!(fake.scenario().as_os_str(), paths[1]);
+    assert_eq!(fake.sync_dir().as_os_str(), paths[2]);
+
+    // The legacy forms via-fake-agent reads keep the default profile.
+    for scenario in [
+        r#"{"scripts": []}"#,
+        r#"{"expected_request": {}, "steps": []}"#,
+    ] {
         let (dir, env) = fixture(&json!(null));
         fs::write(dir.path().join("scenario.json"), scenario).unwrap();
         let set = AdapterSet::new(AdapterConfig::load(env, None).unwrap());
-        assert_eq!(set.models(None).len(), 1);
+        assert_eq!(set.models(None).len(), 1, "{scenario}");
+    }
+    // Anything else is refused, never defaulted.
+    for scenario in [
+        "not json\n",
+        "",
+        "[]",
+        "null",
+        r#"{"scripts": ["#,
+        r#"{"profile": {}}"#,
+        r#"{"scripts": {}}"#,
+        r#"{"scripts": [], "other": 1}"#,
+        r#"{"expected_request": {}}"#,
+        r#"{"profile": {}, "expected_request": {}, "steps": []}"#,
+    ] {
+        let (dir, env) = fixture(&json!(null));
+        fs::write(dir.path().join("scenario.json"), scenario).unwrap();
+        assert!(AdapterConfig::load(env, None).is_err(), "{scenario}");
     }
     let (_dir, env) = fixture(&json!({"profile": {"no_such_field": 1}, "scripts": []}));
     assert!(AdapterConfig::load(env, None).is_err());
