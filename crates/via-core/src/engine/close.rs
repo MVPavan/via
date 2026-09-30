@@ -258,8 +258,9 @@ impl Engine {
                         .await;
                     match cancelled {
                         Cancelled::Committed(_) => {}
-                        // The claim stays; the dispatcher timer retries it.
-                        Cancelled::Unread => return Some(Step::Wait),
+                        // The claim stays; the read streak retries it on the
+                        // dispatcher timer and bounds it (design §7.3).
+                        Cancelled::Unread => return Some(Step::Unread(turn)),
                         Cancelled::Failed(_) | Cancelled::Latched | Cancelled::Expired => {
                             slot.cancel_failed(turn, cancelled.published());
                             return Some(Step::Next);

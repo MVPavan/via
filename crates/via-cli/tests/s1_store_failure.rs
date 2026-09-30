@@ -1904,6 +1904,153 @@ fn s1_f12_selective_queued_row_read_failure() -> TestResult {
     dispatcher_reads_fail("store.read.queued_turn", false)
 }
 
+/// Design §3.1 `Cancelling{dispatcher}`, §7.3 (S1 critic finding 2): the
+/// close pass's cancellation of queued turn 2 cannot read its queued row
+/// (persistent `store.read.queued_turn`). The failed reads feed the
+/// dispatcher's read streak; at the lowered deadline turn 2 is cancelled
+/// from its committed `turn.queued`, keeping cause `close`, so the close
+/// completes and a drain issued meanwhile finishes (exit 0) once a second
+/// session's turn, held meanwhile, completes. Before the fix the pass
+/// retried forever.
+#[test]
+fn s1_f12_close_cancellation_read_failure_ends_at_the_streak() -> TestResult {
+    let mut sandbox = Sandbox::new(&scripts(&[held("other", 1), held("first", 1)]))?;
+    sandbox
+        .env
+        .push(("VIA_TEST_READ_FAILURE_MS", READ_STREAK_MS.to_owned()));
+    let point = "store.read.queued_turn";
+    sandbox.count(point)?;
+    let mut daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.await_file("first.entered")?;
+    sandbox.resume(&session, &handle, "second")?;
+    // Turn 1's submission read is done: the next one is turn 2's cancellation.
+    let first_failure = sandbox.next_hit(point)?;
+    sandbox.arm(point, first_failure, "fail_io_persist")?;
+    let close = sandbox.background(&[
+        "close", &session, "--mode", "force", "--handle", &handle, "--json",
+    ]);
+    sandbox.ack(&daemon, point, first_failure, "fail_io")?;
+    // Issued while the close pass retries: the streak bounds the drain.
+    sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    let closed = joined(close)?;
+    check(
+        closed["state"] == "closed"
+            && closed["cancelled_turns"] == json!([format!("{session}/1"), format!("{session}/2")]),
+        || format!("the close did not complete: {closed}"),
+    )?;
+    queued_turn_cancelled(&sandbox, &session, "close")?;
+    other_completes(&sandbox, &other)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    check(status.code() == Some(0), || {
+        format!("the drain exited {status}: {}", daemon.trace())
+    })?;
+    drop(daemon);
+    sandbox.disarm(point)?;
+    sandbox.verify_anchors()
+}
+
+/// Design §3.1 `Cancelling{dispatcher}`, §7.3 (S1 critic finding 2): a
+/// caller `cancel` attaches its order while the dispatcher holds queued
+/// turn 2 claimed (`core.dispatch.before_grant`); the submission's queued
+/// row read then fails persistently, so the claim rolls back to
+/// `Cancelling{dispatcher}`. Its failed reads feed the read streak; at the
+/// lowered deadline turn 2 is cancelled from its committed `turn.queued`
+/// with cause `cancel`, and a drain issued meanwhile finishes (exit 0) once
+/// a second session's turn, held meanwhile, completes.
+#[test]
+fn s1_f12_cancel_read_failure_ends_at_the_streak() -> TestResult {
+    let mut sandbox = Sandbox::new(&scripts(&[held("other", 1), completes("first", 1)]))?;
+    sandbox
+        .env
+        .push(("VIA_TEST_READ_FAILURE_MS", READ_STREAK_MS.to_owned()));
+    let point = "store.read.queued_turn";
+    let grant = "core.dispatch.before_grant";
+    let ordered = "core.cancel.ordered";
+    sandbox.count(point)?;
+    let mut daemon = sandbox.start()?;
+    let other = other_session(&sandbox)?;
+    let (session, handle) = sandbox.spawn("first")?;
+    sandbox.wait(&format!("{session}/1"))?;
+    // The second session's claim and turn 1's were the first two.
+    sandbox.arm(grant, 3, "pause")?;
+    // Acknowledgement only: the order is attached.
+    sandbox.arm(ordered, 1, "fail_io")?;
+    sandbox.resume(&session, &handle, "second")?;
+    sandbox.ack(&daemon, grant, 3, "pause")?;
+    let cancel = sandbox.background(&[
+        "cancel", &session, "--turn", "2", "--handle", &handle, "--json",
+    ]);
+    sandbox.ack(&daemon, ordered, 1, "fail_io")?;
+    // The next read is the submission's queued row.
+    let first_failure = sandbox.next_hit(point)?;
+    sandbox.arm(point, first_failure, "fail_io_persist")?;
+    sandbox.resume_point(grant, 3)?;
+    sandbox.ack(&daemon, point, first_failure, "fail_io")?;
+    // Issued while the dispatcher retries: the streak bounds the drain.
+    sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+    // The caller joined the dispatcher's cancellation: a plain `store_error`
+    // for a failed read, or the committed cancellation.
+    let replied = cancel.join().map_err(|_| "the cancel panicked")??;
+    let reply = String::from_utf8_lossy(&replied.stdout);
+    let error = String::from_utf8_lossy(&replied.stderr);
+    check(
+        (replied.status.success() && reply.contains("\"cancelled\""))
+            || (replied.status.code() == Some(2) && error.contains("store_error")),
+        || format!("cancel exited {}: {reply} {error}", replied.status),
+    )?;
+    let ended = sandbox.wait(&format!("{session}/2"))?;
+    check(ended["state"] == "cancelled", || {
+        format!("turn 2 did not end cancelled: {ended}")
+    })?;
+    queued_turn_cancelled(&sandbox, &session, "cancel")?;
+    other_completes(&sandbox, &other)?;
+    let status = daemon.exit(Duration::from_secs(20))?;
+    check(status.code() == Some(0), || {
+        format!("the drain exited {status}: {}", daemon.trace())
+    })?;
+    drop(daemon);
+    sandbox.disarm(point)?;
+    sandbox.disarm(grant)?;
+    sandbox.disarm(ordered)?;
+    sandbox.verify_anchors()
+}
+
+/// Releases the second session's held turn 1, which completes unaffected;
+/// it kept the drain open for the harness's own reads.
+fn other_completes(sandbox: &Sandbox, other: &str) -> TestResult {
+    sandbox.release("other")?;
+    let envelope = sandbox.wait(&format!("{other}/1"))?;
+    check(envelope["state"] == "completed", || {
+        format!("the second session's turn was affected: {envelope}")
+    })
+}
+
+/// Turn 2 of `session` is durably `cancelled` with `cause`, never submitted
+/// and never launched: `turn.queued`, then `turn.ended`.
+fn queued_turn_cancelled(sandbox: &Sandbox, session: &str, cause: &str) -> TestResult {
+    let row: String = sandbox.query(&format!(
+        "SELECT state || ' ' || cancel_cause || ' '
+                || json_extract(envelope,'$.cancel.outcome') || ' '
+                || json_extract(envelope,'$.cancel.cleanup')
+         FROM turns WHERE session_id='{session}' AND number=2"
+    ))?;
+    check(
+        row == format!("cancelled {cause} acknowledged quiescent"),
+        || format!("turn 2: {row}"),
+    )?;
+    check(sandbox.anchors(session, 2)? == 0, || {
+        "turn 2 launched".to_owned()
+    })?;
+    let events = sandbox.events(session)?;
+    dense(&events)?;
+    check(
+        event_types(&events, 2) == ["turn.queued", "turn.ended"],
+        || format!("turn 2 events: {events:?}"),
+    )
+}
+
 /// Turn 1 of a new session meets persistent `point` failures once its
 /// dispatcher starts (held at `daemon.dispatcher.before_start` while the
 /// failure is armed); a second session's running turn is unaffected.

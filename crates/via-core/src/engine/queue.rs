@@ -785,6 +785,14 @@ impl Slot {
         sweep
     }
 
+    /// Whether the dispatcher owns a cancellation of `turn`
+    /// (`Cancelling{dispatcher}`): its read streak resolves it (design §7.3).
+    pub(super) fn dispatcher_cancelling(&self, turn: TurnNumber) -> bool {
+        lock(&self.state)
+            .entry(turn)
+            .is_some_and(|entry| entry.claim == Claim::Cancelling(Owner::Dispatcher))
+    }
+
     /// Makes a `Waiting` head dispatcher-owned for a P6 cancellation.
     pub(super) fn own(&self, turn: TurnNumber) -> bool {
         let mut state = lock(&self.state);
