@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -151,32 +152,94 @@ pub(crate) struct Expected {
 /// once with the budget left, then each must exit, and then neither
 /// `daemon.lock` nor `store.lock` may still be held. The whole proof,
 /// `stop` included, has one budget, and a proof that completes after it
-/// elapsed is not accepted. That budget is the teardown's one deadline
-/// (runtime §11.2, [`outer_cleanup::TEARDOWN`]), taken on entry and shared
-/// with [`park`]'s anchor cleanup. Children the test started are reaped by
-/// their own guards first.
-pub(crate) fn stop_daemons(runtime: &Path, state: &Path, stop: impl FnOnce(Duration)) -> Exited {
-    stop_within(runtime, state, outer_cleanup::TEARDOWN, stop)
+/// elapsed is not accepted. That budget is what is left of the scenario's
+/// final `teardown` (runtime §11.2): begun by the first guard that tore its
+/// daemon down, or here, and shared with [`park`]'s anchor cleanup. A
+/// guard's recorded cleanup failure, such as an unreaped child, fails the
+/// proof. Children the test started are reaped by their own guards first.
+pub(crate) fn stop_daemons(
+    runtime: &Path,
+    state: &Path,
+    teardown: &Teardown,
+    stop: impl FnOnce(Duration),
+) -> Exited {
+    let deadline = teardown.begin();
+    let mut proof = prove_exit(runtime, state, deadline, teardown.budget, stop);
+    let failures = std::mem::take(
+        &mut *teardown
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    if !failures.is_empty() {
+        let mut detail = failures.join("; ");
+        if let Err(error) = proof {
+            detail = format!("{detail}; {error}");
+        }
+        proof = Err(detail);
+    }
+    Exited { proof, deadline }
+}
+
+/// A scenario's final teardown (runtime §11.2): one deadline, taken by
+/// whichever phase begins it (a guard's drop, then the sandbox's), which
+/// every later phase shares, and the cleanup failures its guards record.
+/// Only a guard dropping a live daemon, or the sandbox's drop, begins it:
+/// a deliberate mid-test stop or restart lets the daemon exit through the
+/// guard's own bounded `exit` first, so its drop never begins this; and no
+/// daemon starts once it began (each sandbox's start refuses), so a live
+/// daemon dropped mid-test fails loudly instead of shortening the teardown.
+pub(crate) struct Teardown {
+    budget: Duration,
+    deadline: Mutex<Option<Instant>>,
+    failures: Mutex<Vec<String>>,
+}
+
+impl Teardown {
+    /// A teardown with runtime §11.2's budget, [`outer_cleanup::TEARDOWN`].
+    pub(crate) fn new() -> Self {
+        Self::with_budget(outer_cleanup::TEARDOWN)
+    }
+
+    pub(crate) fn with_budget(budget: Duration) -> Self {
+        Self {
+            budget,
+            deadline: Mutex::new(None),
+            failures: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Begins the final teardown, or joins it: its one deadline.
+    pub(crate) fn begin(&self) -> Instant {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| Instant::now() + self.budget)
+    }
+
+    /// Whether the final teardown began.
+    pub(crate) fn begun(&self) -> bool {
+        self.deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Records a cleanup failure of a teardown phase, such as a daemon
+    /// child not reaped by the deadline.
+    pub(crate) fn failed(&self, detail: String) {
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(detail);
+    }
 }
 
 /// A sandbox teardown's exit proof and the deadline taken at its entry.
 pub(crate) struct Exited {
     pub(crate) proof: Result<(), String>,
     pub(crate) deadline: Instant,
-}
-
-/// [`stop_daemons`] with budget `budget`.
-pub(crate) fn stop_within(
-    runtime: &Path,
-    state: &Path,
-    budget: Duration,
-    stop: impl FnOnce(Duration),
-) -> Exited {
-    let deadline = Instant::now() + budget;
-    Exited {
-        proof: prove_exit(runtime, state, deadline, budget, stop),
-        deadline,
-    }
 }
 
 fn prove_exit(
@@ -222,8 +285,10 @@ fn prove_exit(
     Ok(())
 }
 
-/// Runs `command`, its output discarded, for at most `budget`: killed and
-/// reaped when the budget elapses. A sandbox's `stop` for [`stop_daemons`].
+/// Runs `command`, its output discarded, for at most `budget`: killed when
+/// the budget elapses, and reaped only if it exited by then (a killed child
+/// left unreaped is a zombie, which no exit proof counts as alive). A
+/// sandbox's `stop` for [`stop_daemons`].
 pub(crate) fn run_within(command: &mut std::process::Command, budget: Duration) {
     use std::process::Stdio;
     let deadline = Instant::now() + budget;
@@ -235,14 +300,24 @@ pub(crate) fn run_within(command: &mut std::process::Command, budget: Duration) 
     else {
         return;
     };
-    while matches!(child.try_wait(), Ok(None)) {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
+    if !reap_by(&mut child, deadline) {
+        let _ = child.kill();
+        reap_by(&mut child, deadline);
     }
-    let _ = child.wait();
+}
+
+/// Whether `child` exited, polled with `try_wait` until `deadline` and
+/// checked at least once; it never blocks past the deadline.
+pub(crate) fn reap_by(child: &mut std::process::Child, deadline: Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
 }
 
 /// The live (not zombie) processes whose environment names the sandbox's
@@ -387,11 +462,14 @@ fn store_evidence(
     store: &Path,
     deadline: Instant,
 ) -> EvidencedResult<serde_json::Value> {
+    // The anchor cleanup first, with what is left of the teardown's
+    // deadline; the evidence copies after it take none of that budget.
+    let rows = outer_cleanup::snapshot(store)?;
+    let anchors = outer_cleanup::verify(&rows, deadline);
     evidence.backup_store(store)?;
     write_rows(evidence, store)?;
     launched_turns_have_folders(evidence, store)?;
-    let rows = outer_cleanup::snapshot(store)?;
-    Ok(outer_cleanup::verify(&rows, deadline))
+    Ok(anchors)
 }
 
 /// Every turn that launched a vendor (it has an anchor) has its evidence

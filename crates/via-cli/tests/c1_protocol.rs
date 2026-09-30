@@ -39,6 +39,8 @@ struct Sandbox {
     /// The scenario's evidence, opened when its first daemon starts and
     /// collected when the sandbox is dropped.
     evidence: RefCell<Option<support::evidence::Evidence>>,
+    /// The scenario's final teardown, shared by its guard and its drop.
+    teardown: evidenced::Teardown,
 }
 
 impl Sandbox {
@@ -51,6 +53,7 @@ impl Sandbox {
             state,
             runtime,
             evidence: RefCell::new(None),
+            teardown: evidenced::Teardown::new(),
         })
     }
 
@@ -78,9 +81,10 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-                stop_by(self, Instant::now() + budget);
-            });
+            let exited =
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |budget| {
+                    stop_by(self, Instant::now() + budget);
+                });
             let expected = evidenced::Expected {
                 store: true,
                 folders: false,
@@ -96,21 +100,30 @@ impl Drop for Sandbox {
     }
 }
 
-/// Asks the sandbox's daemon to stop over C1 by `deadline`: each exchange
-/// waits at most for the time left. The connect is not bounded (recorded
+/// Asks the sandbox's daemon to stop over C1 by `deadline`: `hello`, then
+/// `daemon/stop`, each whole exchange bounded by the time left
+/// ([`outer_cleanup::exchange`]). The connect is not bounded (the recorded
 /// C1-connect limitation).
 fn stop_by(sandbox: &Sandbox, deadline: Instant) {
-    let Ok(mut connection) = Connection::open(sandbox) else {
+    let Ok(stream) = UnixStream::connect(sandbox.socket()) else {
         return;
     };
-    let within = |connection: &Connection| {
-        let left = outer_cleanup::left(deadline);
-        !left.is_zero()
-            && connection.writer.set_read_timeout(Some(left)).is_ok()
-            && connection.writer.set_write_timeout(Some(left)).is_ok()
-    };
-    if within(&connection) && connection.hello().is_ok() && within(&connection) {
-        let _ = connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
+    let params =
+        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test"});
+    let hello = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":0,"method":"hello","params":params})
+    );
+    let accepted = outer_cleanup::exchange(&stream, hello.as_bytes(), deadline, 64 * 1024)
+        .and_then(|reply| serde_json::from_slice::<Value>(&reply).ok())
+        .is_some_and(|reply| reply["result"]["api_version"] == 1);
+    if accepted {
+        let _ = outer_cleanup::exchange(
+            &stream,
+            b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"daemon/stop\"}\n",
+            deadline,
+            64 * 1024,
+        );
     }
 }
 
@@ -122,6 +135,9 @@ struct Daemon<'a> {
 
 impl<'a> Daemon<'a> {
     fn start(sandbox: &'a Sandbox) -> TestResult<Self> {
+        if sandbox.teardown.begun() {
+            return Err("a daemon started after the final teardown began".into());
+        }
         if sandbox.evidence.borrow().is_none() {
             let via = Path::new(env!("CARGO_BIN_EXE_via"));
             let fake = via
@@ -154,27 +170,34 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
-    /// Runtime §11.2 (`via-jm4.19.1`): one teardown deadline, taken on
-    /// entry, bounds the stop exchanges (at most 2 s) and the exit wait,
-    /// leaving the kill 1 s to reap.
+    /// Final teardown (runtime §11.2, `via-jm4.19.1`): a live daemon's drop
+    /// begins, or joins, the scenario's one teardown deadline, which bounds
+    /// the stop exchanges (at most 2 s), the exit wait (at most 5 s) and
+    /// the kill's 1 s reap; a child still unreaped then is recorded as
+    /// incomplete cleanup.
     fn drop(&mut self) {
-        let outer = Instant::now() + outer_cleanup::TEARDOWN;
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let outer = self.sandbox.teardown.begin();
         stop_by(
             self.sandbox,
             outer.min(Instant::now() + Duration::from_secs(2)),
         );
-        let deadline = Instant::now()
+        let exit_by = Instant::now()
             + outer_cleanup::left(outer)
                 .saturating_sub(Duration::from_secs(1))
                 .min(Duration::from_secs(5));
-        while Instant::now() < deadline {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
+        if !evidenced::reap_by(&mut self.child, exit_by) {
+            let _ = self.child.kill();
+            let reap_by = outer.min(Instant::now() + Duration::from_secs(1));
+            if !evidenced::reap_by(&mut self.child, reap_by) {
+                self.sandbox.teardown.failed(format!(
+                    "daemon child {} was not reaped by the teardown deadline",
+                    self.child.id()
+                ));
             }
-            thread::sleep(Duration::from_millis(10));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

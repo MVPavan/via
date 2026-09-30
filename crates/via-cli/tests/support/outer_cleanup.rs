@@ -5,7 +5,7 @@
 //! or the Store owner and never signals a numeric PID or PGID.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
@@ -103,14 +103,19 @@ pub(crate) fn snapshot(store: &Path) -> Result<Vec<AnchorRow>, String> {
 /// `cleanup.json` anchors summary.
 pub(crate) fn verify(rows: &[AnchorRow], deadline: Instant) -> Value {
     let records: Vec<Value> = rows.iter().map(|row| verify_one(row, deadline)).collect();
-    let absent = records
-        .iter()
-        .all(|record| record["cleanup"] == "group_absent");
+    // A teardown that overran its deadline, here or in an earlier phase,
+    // is incomplete cleanup whatever the records show (runtime §11.2).
+    let late = Instant::now() > deadline;
+    let absent = !late
+        && records
+            .iter()
+            .all(|record| record["cleanup"] == "group_absent");
     json!({
         "inventory_committed":true,
         "count":records.len(),
         "absence_proven":absent,
-        "status":if records.is_empty() {"no_anchors"} else if absent {"quiescent"} else {"unverified"},
+        "deadline_exceeded":late,
+        "status":if late {"unverified"} else if records.is_empty() {"no_anchors"} else if absent {"quiescent"} else {"unverified"},
         "records":records,
         "store_snapshot":rows.iter().map(AnchorRow::summary).collect::<Vec<_>>(),
     })
@@ -167,8 +172,8 @@ fn record(
 
 /// Connects and authenticates the live anchor per runtime §5.1 by
 /// `deadline`. Any failure means no destructive command is sent. The
-/// connect itself is not bounded (a private Unix socket's connect does not
-/// wait on its peer), but it starts only with time left.
+/// connect and every exchange are bounded by it ([`connect_by`],
+/// [`exchange`]).
 fn challenge(
     row: &AnchorRow,
     anchor: u32,
@@ -176,10 +181,13 @@ fn challenge(
     start_ticks: u64,
     deadline: Instant,
 ) -> Result<UnixStream, &'static str> {
-    if left(deadline).is_zero() {
-        return Err("deadline");
-    }
-    let stream = UnixStream::connect(&row.socket_path).map_err(|_| "anchor_unreachable")?;
+    let stream = connect_by(Path::new(&row.socket_path), deadline).map_err(|error| {
+        if error.kind() == ErrorKind::TimedOut {
+            "deadline"
+        } else {
+            "anchor_unreachable"
+        }
+    })?;
     let peer = rustix::net::sockopt::socket_peercred(&stream).map_err(|_| "peer_unverified")?;
     if u32::try_from(peer.pid.as_raw_nonzero().get()).ok() != Some(anchor)
         || peer.uid.as_raw() != row.uid
@@ -233,29 +241,101 @@ fn send_stop(stream: &UnixStream, row: &AnchorRow, deadline: Instant) -> bool {
     .is_some_and(|reply| reply["kind"] == "stopping")
 }
 
-/// One request and its reply line, the write and the read each bounded by
-/// the time left before `deadline`; none once it passed.
-fn transact(mut stream: &UnixStream, request: &Value, deadline: Instant) -> Option<Value> {
-    let within = |stream: &UnixStream| {
-        let remaining = left(deadline);
-        !remaining.is_zero()
-            && stream.set_write_timeout(Some(remaining)).is_ok()
-            && stream.set_read_timeout(Some(remaining)).is_ok()
-    };
-    if !within(stream) {
-        return None;
-    }
+/// One request and its reply line, the whole exchange bounded by `deadline`.
+fn transact(stream: &UnixStream, request: &Value, deadline: Instant) -> Option<Value> {
     let mut bytes = serde_json::to_vec(request).ok()?;
     bytes.push(b'\n');
-    stream.write_all(&bytes).ok()?;
-    if !within(stream) {
-        return None;
+    serde_json::from_slice(&exchange(stream, &bytes, deadline, 1024)?).ok()
+}
+
+/// Connects to the Unix socket at `path` by `deadline`: a nonblocking
+/// connect, retried every 10 ms while the listener's backlog is full
+/// (`EAGAIN`; Linux does not report `EINPROGRESS` for a Unix socket), then
+/// switched back to blocking for [`exchange`]. `TimedOut` once the
+/// deadline passed.
+pub(crate) fn connect_by(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let address = SocketAddrUnix::new(path)?;
+    loop {
+        if left(deadline).is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        let socket = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => {
+                rustix::io::ioctl_fionbio(&socket, false)?;
+                return Ok(UnixStream::from(socket));
+            }
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {
+                thread::sleep(Duration::from_millis(10).min(left(deadline)));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
+}
+
+/// Writes `request` and reads one reply line of at most `limit` bytes,
+/// the whole exchange by `deadline`: before every underlying write and
+/// read the socket's timeout is set to the time left, none is attempted
+/// once it passed, and a reply completed after it is none. The reply's
+/// newline is stripped.
+pub(crate) fn exchange(
+    stream: &UnixStream,
+    request: &[u8],
+    deadline: Instant,
+    limit: u64,
+) -> Option<Vec<u8>> {
+    let mut bounded = Bounded { stream, deadline };
+    bounded.write_all(request).ok()?;
     let mut line = Vec::new();
-    BufReader::new(stream.take(1024))
+    BufReader::new(bounded.take(limit))
         .read_until(b'\n', &mut line)
         .ok()?;
-    serde_json::from_slice(line.strip_suffix(b"\n")?).ok()
+    if Instant::now() > deadline {
+        return None;
+    }
+    line.strip_suffix(b"\n").map(<[u8]>::to_vec)
+}
+
+/// A stream whose every read and write waits at most for the time left
+/// before `deadline`, and fails with `TimedOut` once it passed.
+struct Bounded<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Bounded<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let remaining = left(self.deadline);
+        if remaining.is_zero() {
+            Err(ErrorKind::TimedOut.into())
+        } else {
+            Ok(remaining)
+        }
+    }
+}
+
+impl Read for Bounded<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        (&mut &*self.stream).read(buf)
+    }
+}
+
+impl Write for Bounded<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        (&mut &*self.stream).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Non-signalling group query every 20 ms: only `ESRCH` by `deadline`

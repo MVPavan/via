@@ -117,6 +117,8 @@ struct Sandbox {
     root: tempfile::TempDir,
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
+    /// The scenario's final teardown, shared by its guards and its drop.
+    teardown: evidenced::Teardown,
     /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
     /// Cleared by a scenario whose turns launch no vendor by design.
@@ -139,12 +141,13 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-                evidenced::run_within(
-                    self.command().args(["daemon", "stop", "--force", "--json"]),
-                    budget,
-                );
-            });
+            let exited =
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |budget| {
+                    evidenced::run_within(
+                        self.command().args(["daemon", "stop", "--force", "--json"]),
+                        budget,
+                    );
+                });
             let expected = evidenced::Expected {
                 store: self
                     .store_expected
@@ -199,6 +202,7 @@ impl Sandbox {
         Ok(Self {
             root,
             evidence: Some(evidence),
+            teardown: evidenced::Teardown::new(),
             store_expected: std::sync::atomic::AtomicBool::new(true),
             folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
@@ -276,6 +280,9 @@ impl Sandbox {
     /// Starts a daemon directly, with the failpoint controller, without
     /// waiting for it to answer.
     fn launch(&self) -> TestResult<Daemon<'_>> {
+        if self.teardown.begun() {
+            return Err("a daemon started after the final teardown began".into());
+        }
         let run = self.runs.get() + 1;
         self.runs.set(run);
         let trace = self.root.path().join(format!("daemon-{run}.trace"));
@@ -593,23 +600,33 @@ impl Daemon<'_> {
 }
 
 impl Drop for Daemon<'_> {
-    /// Runtime §11.2: one teardown deadline, taken on entry, bounds the
-    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap.
+    /// Final teardown (runtime §11.2): a live daemon's drop begins, or
+    /// joins, the scenario's one teardown deadline, which bounds the
+    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap; a
+    /// child still unreaped then is recorded as incomplete cleanup. A
+    /// deliberate mid-test stop exits the daemon first ([`Daemon::exit`]).
     fn drop(&mut self) {
-        let outer = Instant::now() + outer_cleanup::TEARDOWN;
-        if matches!(self.child.try_wait(), Ok(None)) {
-            evidenced::run_within(
-                self.sandbox
-                    .command()
-                    .args(["daemon", "stop", "--force", "--json"]),
-                outer_cleanup::left(outer).min(Duration::from_secs(2)),
-            );
-            let _ = wait_child(
-                &mut self.child,
-                outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1)),
-            );
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let outer = self.sandbox.teardown.begin();
+        evidenced::run_within(
+            self.sandbox
+                .command()
+                .args(["daemon", "stop", "--force", "--json"]),
+            outer_cleanup::left(outer).min(Duration::from_secs(2)),
+        );
+        let exit_by =
+            Instant::now() + outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1));
+        if !evidenced::reap_by(&mut self.child, exit_by) {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let reap_by = outer.min(Instant::now() + Duration::from_secs(1));
+            if !evidenced::reap_by(&mut self.child, reap_by) {
+                self.sandbox.teardown.failed(format!(
+                    "daemon child {} was not reaped by the teardown deadline",
+                    self.child.id()
+                ));
+            }
         }
     }
 }

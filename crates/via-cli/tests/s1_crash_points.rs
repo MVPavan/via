@@ -332,12 +332,14 @@ impl PendingClient {
     }
 }
 
-/// A scenario that fails before `finish` never leaves its client unreaped.
+/// A scenario that fails before `finish` kills its client and reaps it,
+/// polled for at most the 1 s reap allowance, never a blocking wait. A
+/// client still unreaped then is killed, so no exit proof counts it alive.
 impl Drop for PendingClient {
     fn drop(&mut self) {
         if let Some(Ok(mut child)) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = wait_child(&mut child, Duration::from_secs(1));
         }
     }
 }

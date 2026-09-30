@@ -251,13 +251,24 @@ fn collector_exit_proof_needs_the_process_gone_not_only_the_locks() -> Result<()
     let (runtime, state) = (sandbox.path().join("runtime"), sandbox.path().join("state"));
     let mut process = sandbox_process(&runtime)?;
     let pid = process.id();
-    let unproven =
-        evidenced::stop_within(&runtime, &state, Duration::from_millis(300), |_| {}).proof;
+    let unproven = evidenced::stop_daemons(
+        &runtime,
+        &state,
+        &evidenced::Teardown::with_budget(Duration::from_millis(300)),
+        |_| {},
+    )
+    .proof;
     process.kill()?;
     process.wait()?;
     let error = unproven.expect_err("a live sandbox process was accepted as exited");
     assert!(error.contains(&pid.to_string()), "{error}");
-    evidenced::stop_within(&runtime, &state, Duration::from_secs(5), |_| {}).proof?;
+    evidenced::stop_daemons(
+        &runtime,
+        &state,
+        &evidenced::Teardown::with_budget(Duration::from_secs(5)),
+        |_| {},
+    )
+    .proof?;
     Ok(())
 }
 
@@ -269,12 +280,17 @@ fn collector_exit_proof_budget_includes_the_stop() -> Result<(), Box<dyn Error>>
     let budget = Duration::from_millis(300);
     let mut given = None;
     // The stop proves the exit, but only after the budget elapsed.
-    let late = evidenced::stop_within(&runtime, &state, budget, |left| {
-        given = Some(left);
-        let _ = process.kill();
-        let _ = process.wait();
-        std::thread::sleep(left + Duration::from_millis(100));
-    })
+    let late = evidenced::stop_daemons(
+        &runtime,
+        &state,
+        &evidenced::Teardown::with_budget(budget),
+        |left| {
+            given = Some(left);
+            let _ = process.kill();
+            let _ = process.wait();
+            std::thread::sleep(left + Duration::from_millis(100));
+        },
+    )
     .proof;
     let _ = process.kill();
     let _ = process.wait();
@@ -300,8 +316,15 @@ fn collector_launched_turn_without_its_folder_fails_the_evidence() -> Result<(),
     Connection::open(state.join("store.sqlite3"))?.execute_batch(
         "CREATE TABLE turns(session_id TEXT, number INTEGER, envelope TEXT);
          CREATE TABLE events(session_id TEXT, seq INTEGER, event TEXT);
-         CREATE TABLE anchors(owner_session TEXT, owner_turn INTEGER);
-         INSERT INTO anchors VALUES ('s_a', 1), ('s_a', 2);",
+         CREATE TABLE anchors(anchor_id TEXT, generation TEXT, marker TEXT, socket_path TEXT,
+             phase TEXT, pid INTEGER, pgid INTEGER, uid INTEGER, boot_id TEXT,
+             pid_namespace TEXT, start_ticks INTEGER, absence_time TEXT,
+             owner_session TEXT, owner_turn INTEGER);
+         INSERT INTO anchors VALUES
+             ('a_1', 'g', 'm', 'none.sock', 'created', NULL, NULL, 0, 'b', 'n', NULL, NULL,
+              's_a', 1),
+             ('a_2', 'g', 'm', 'none.sock', 'created', NULL, NULL, 0, 'b', 'n', NULL, NULL,
+              's_a', 2);",
     )?;
     let mut artifact = None;
     let result = evidenced::evidenced(|| {
@@ -415,11 +438,16 @@ fn collector_anchor_cleanup_gets_only_the_teardown_time_left() -> Result<(), Box
         artifact = Some(evidence.dir.clone());
         // The stop phase ends the process but takes all but 300 ms of the
         // budget; the exit proof completes within it.
-        let exited = evidenced::stop_within(&runtime, &state, Duration::from_secs(1), |left| {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
-            std::thread::sleep(left.saturating_sub(Duration::from_millis(300)));
-        });
+        let exited = evidenced::stop_daemons(
+            &runtime,
+            &state,
+            &evidenced::Teardown::with_budget(Duration::from_secs(1)),
+            |left| {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+                std::thread::sleep(left.saturating_sub(Duration::from_millis(300)));
+            },
+        );
         let expected = evidenced::Expected {
             store: true,
             folders: true,
@@ -500,5 +528,168 @@ fn outer_cleanup_absence_after_the_deadline_is_incomplete() -> Result<(), Box<dy
     );
     let timely = outer_cleanup::verify(&rows, std::time::Instant::now() + outer_cleanup::TEARDOWN);
     assert_eq!(timely["status"], "quiescent", "{timely}");
+    Ok(())
+}
+
+/// Runtime §11.2, S1-evidence2 fix round 1: a scenario's final teardown has
+/// one deadline. A guard's phase begins it and uses most of it; the
+/// sandbox's exit proof and anchor cleanup that follow get only what is
+/// left, so a group gone only after the deadline is incomplete cleanup.
+/// A guard's recorded cleanup failure fails the exit proof.
+#[test]
+fn collector_sandbox_teardown_shares_the_guards_deadline() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt as _;
+
+    let sandbox = tempfile::tempdir()?;
+    let root = sandbox.path().join("root");
+    let (runtime, state) = (root.join("runtime"), root.join("state"));
+    fs::create_dir_all(&state)?;
+    let fixture = root.join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    // The anchor's group: gone by itself 1.3 s from now, after the 1 s
+    // deadline but before a fresh 1 s budget begun after the guard's phase.
+    let mut group = Command::new("sleep").arg("1.3").process_group(0).spawn()?;
+    let pid = group.id();
+    let reaper = std::thread::spawn(move || group.wait());
+    anchor_store(&state, &root, pid)?;
+    let teardown = evidenced::Teardown::with_budget(Duration::from_secs(1));
+    // The guard's phase: begins the teardown and uses 700 ms of it.
+    teardown.begin();
+    std::thread::sleep(Duration::from_millis(700));
+    let mut artifact = None;
+    let result = evidenced::evidenced(|| {
+        let evidence = evidenced::open(Path::new(env!("CARGO_BIN_EXE_via")), &fixture)?;
+        artifact = Some(evidence.dir.clone());
+        let exited = evidenced::stop_daemons(&runtime, &state, &teardown, |_| {});
+        let expected = evidenced::Expected {
+            store: true,
+            folders: true,
+        };
+        evidenced::park(evidence, root.clone(), &state, expected, exited);
+        Ok(())
+    });
+    let _ = reaper.join();
+    let error = result
+        .expect_err("the sandbox teardown restarted the budget")
+        .to_string();
+    assert!(error.contains("outer cleanup is unverified"), "{error}");
+    let artifact = artifact.ok_or("no artifact")?;
+    let cleanup: Value = serde_json::from_slice(&fs::read(artifact.join("cleanup.json"))?)?;
+    assert_eq!(cleanup["anchors"]["absence_proven"], false, "{cleanup}");
+
+    let failed = evidenced::Teardown::new();
+    failed.failed("daemon child 1 was not reaped by the teardown deadline".to_owned());
+    let proof = evidenced::stop_daemons(&runtime, &state, &failed, |_| {}).proof;
+    let error = proof.expect_err("an unreaped guard child passed the exit proof");
+    assert!(error.contains("not reaped"), "{error}");
+    Ok(())
+}
+
+/// S1 critic r2 finding 4, S1-evidence2 fix round 1: the anchor connect is
+/// bounded by the deadline. A listener whose backlog is full would hold a
+/// blocking connect indefinitely; `connect_by` gives up at the deadline.
+#[test]
+fn outer_cleanup_connect_is_bounded_by_the_deadline() -> Result<(), Box<dyn Error>> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+
+    let sandbox = tempfile::tempdir()?;
+    let path = sandbox.path().join("anchor.sock");
+    let listener = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let address = SocketAddrUnix::new(&path)?;
+    rustix::net::bind(&listener, &address)?;
+    rustix::net::listen(&listener, 0)?;
+    // Fill the backlog: connections that are never accepted.
+    let mut pending = Vec::new();
+    for _ in 0..64 {
+        let socket = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => pending.push(socket),
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let target = path.clone();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let _ = sender.send(outer_cleanup::connect_by(&target, deadline).map(|_| ()));
+    });
+    let result = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "the anchor connect blocked past its deadline")?;
+    let error = result.expect_err("a full backlog accepted the connect");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    drop(pending);
+    Ok(())
+}
+
+/// S1 critic r2 finding 4, S1-evidence2 fix round 1: a whole exchange is
+/// bounded, not each read. A peer that trickles its reply one byte every
+/// 40 ms keeps every single read under a 300 ms timeout, but the reply
+/// completes after the deadline: the exchange has no reply.
+#[test]
+fn outer_cleanup_exchange_is_bounded_as_a_whole() -> Result<(), Box<dyn Error>> {
+    use std::io::{BufRead as _, Write as _};
+
+    let sandbox = tempfile::tempdir()?;
+    let path = sandbox.path().join("anchor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    let peer = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = String::new();
+        std::io::BufReader::new(stream.try_clone()?).read_line(&mut request)?;
+        for byte in b"{\"kind\":\"stopping\",\"padding\":\"xx\"}\n" {
+            stream.write_all(&[*byte])?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        Ok(())
+    });
+    let stream = std::os::unix::net::UnixStream::connect(&path)?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    let reply = outer_cleanup::exchange(&stream, b"{\"kind\":\"stop\"}\n", deadline, 1024);
+    drop(stream);
+    let _ = peer.join();
+    assert_eq!(
+        reply.map(|reply| String::from_utf8_lossy(&reply).into_owned()),
+        None,
+        "a reply completed after the deadline was accepted"
+    );
+    Ok(())
+}
+
+/// Runtime §11.2, S1-evidence2 fix round 1: finalization that fails partway,
+/// here hashing a missing fake binary, keeps the scenario's outcome in the
+/// fallback artifact and records the evidence failure beside it.
+#[test]
+fn a_finalization_failure_keeps_the_outcome() -> Result<(), Box<dyn Error>> {
+    let sandbox = tempfile::tempdir()?;
+    let fixture = sandbox.path().join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    let evidence = Evidence::new(
+        "collector_finalization_failure",
+        &sandbox.path().join("no-fake-binary"),
+        &fixture,
+    )?;
+    let artifact = evidence.dir.clone();
+    assert!(
+        evidence
+            .finish("timeout", "the turn never finished")
+            .is_err()
+    );
+    let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
+    assert_eq!(summary["outcome"], "timeout", "{summary}");
+    assert_eq!(summary["detail"], "the turn never finished", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(summary["evidence_failure"].is_string(), "{summary}");
     Ok(())
 }

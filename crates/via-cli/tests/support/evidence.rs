@@ -28,6 +28,9 @@ pub(crate) struct Evidence {
     /// Why collecting the State or proving cleanup failed, if it did:
     /// recorded beside the scenario's outcome, never in its place.
     cleanup_failure: Option<String>,
+    /// The scenario's outcome and detail, once `finish` began: a
+    /// finalization that fails partway keeps them in the fallback artifact.
+    finishing: Option<(String, String)>,
 }
 
 impl Evidence {
@@ -59,6 +62,7 @@ impl Evidence {
             store_expected: true,
             folders_expected: true,
             cleanup_failure: None,
+            finishing: None,
         })
     }
 
@@ -108,6 +112,7 @@ impl Evidence {
         ) {
             return Err("invalid scenario outcome".into());
         }
+        self.finishing = Some((outcome.to_owned(), detail.to_owned()));
         let required: &[&str] = if self.store_expected {
             &[
                 "envelopes.ndjson",
@@ -239,14 +244,34 @@ impl Evidence {
 }
 
 impl Drop for Evidence {
+    /// A best-effort artifact when `finish` did not complete: the scenario's
+    /// outcome, if `finish` began with one, with the evidence failure beside
+    /// it (runtime §11.2); otherwise, a crash or panic before any outcome,
+    /// `infrastructure_failure`.
     fn drop(&mut self) {
         if !self.finalized {
-            // Best-effort crash/panic artifact; the gate treats it as infrastructure failure.
-            let summary = json!({"scenario":self.scenario,"outcome":"infrastructure_failure","detail":"scenario did not finalize evidence"});
+            let (outcome, detail) = self.finishing.clone().unwrap_or_else(|| {
+                (
+                    "infrastructure_failure".to_owned(),
+                    "scenario did not finalize evidence".to_owned(),
+                )
+            });
+            let summary = json!({
+                "scenario":self.scenario,
+                "outcome":outcome,
+                "detail":detail,
+                "evidence_complete":false,
+                "evidence_failure":"evidence finalization did not complete",
+                "cleanup_failure":self.cleanup_failure,
+            });
             let _ = fs::write(self.dir.join("summary.json"), summary.to_string());
             let _ = fs::write(
                 self.dir.join("REPORT.md"),
-                "Scenario did not finalize evidence; see summary.json.\n",
+                format!(
+                    "# {}\n\nOutcome: `{outcome}`. {detail}\n\nEvidence complete: no \
+                     (evidence finalization did not complete); see summary.json.\n",
+                    self.scenario
+                ),
             );
             let _ = self.write_manifest();
         }

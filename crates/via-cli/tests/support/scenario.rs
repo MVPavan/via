@@ -70,7 +70,19 @@ pub(crate) fn run_command(
         }
         if Instant::now() >= deadline {
             child.kill()?;
-            break (child.wait()?, true);
+            // A killed child gets at most 1 s to be reaped, polled: never a
+            // blocking wait (S1-evidence2 fix round 1).
+            let reap_by = Instant::now() + Duration::from_secs(1);
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= reap_by {
+                    return Err(format!("killed child {} was not reaped in 1 s", child.id()).into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            break (status, true);
         }
         thread::sleep(Duration::from_millis(5));
     };

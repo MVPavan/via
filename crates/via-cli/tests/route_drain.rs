@@ -7,6 +7,7 @@
 )]
 
 #[path = "support/evidenced.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
@@ -205,12 +206,17 @@ impl Drop for Sandbox {
     /// Stops the auto-started daemon and proves it exited
     /// ([`evidenced::stop_daemons`]) before the evidence is collected.
     fn drop(&mut self) {
-        let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-            evidenced::run_within(
-                self.command().args(["daemon", "stop", "--force", "--json"]),
-                budget,
-            );
-        });
+        let exited = evidenced::stop_daemons(
+            &self.runtime,
+            &self.state,
+            &evidenced::Teardown::new(),
+            |budget| {
+                evidenced::run_within(
+                    self.command().args(["daemon", "stop", "--force", "--json"]),
+                    budget,
+                );
+            },
+        );
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
             evidenced::park(

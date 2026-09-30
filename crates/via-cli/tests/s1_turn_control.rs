@@ -99,6 +99,8 @@ struct Sandbox {
     root: tempfile::TempDir,
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
+    /// The scenario's final teardown, shared by its guards and its drop.
+    teardown: evidenced::Teardown,
     /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
     /// Cleared by a scenario whose turns launch no vendor by design.
@@ -121,12 +123,13 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-                evidenced::run_within(
-                    self.command().args(["daemon", "stop", "--force", "--json"]),
-                    budget,
-                );
-            });
+            let exited =
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |budget| {
+                    evidenced::run_within(
+                        self.command().args(["daemon", "stop", "--force", "--json"]),
+                        budget,
+                    );
+                });
             let expected = evidenced::Expected {
                 store: self
                     .store_expected
@@ -183,6 +186,7 @@ impl Sandbox {
         Ok(Self {
             root,
             evidence: Some(evidence),
+            teardown: evidenced::Teardown::new(),
             store_expected: std::sync::atomic::AtomicBool::new(true),
             folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
@@ -254,6 +258,9 @@ impl Sandbox {
     }
 
     fn start(&self) -> TestResult<Daemon<'_>> {
+        if self.teardown.begun() {
+            return Err("a daemon started after the final teardown began".into());
+        }
         let mut command = self.command();
         #[cfg(feature = "test-failpoints")]
         self.failpoints.activate(&mut command);
@@ -455,24 +462,33 @@ impl Daemon<'_> {
 }
 
 impl Drop for Daemon<'_> {
-    /// Runtime §11.2: one teardown deadline, taken on entry, bounds the
-    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap.
+    /// Final teardown (runtime §11.2): a live daemon's drop begins, or
+    /// joins, the scenario's one teardown deadline, which bounds the
+    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap; a
+    /// child still unreaped then is recorded as incomplete cleanup. A
+    /// deliberate mid-test stop exits the daemon first ([`Daemon::exit`]).
     fn drop(&mut self) {
-        let outer = Instant::now() + outer_cleanup::TEARDOWN;
-        if matches!(self.child.try_wait(), Ok(None)) {
-            evidenced::run_within(
-                self.sandbox
-                    .command()
-                    .args(["daemon", "stop", "--force", "--json"]),
-                outer_cleanup::left(outer).min(Duration::from_secs(2)),
-            );
-            let exit_by =
-                Instant::now() + outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1));
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < exit_by {
-                thread::sleep(Duration::from_millis(10));
-            }
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let outer = self.sandbox.teardown.begin();
+        evidenced::run_within(
+            self.sandbox
+                .command()
+                .args(["daemon", "stop", "--force", "--json"]),
+            outer_cleanup::left(outer).min(Duration::from_secs(2)),
+        );
+        let exit_by =
+            Instant::now() + outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1));
+        if !evidenced::reap_by(&mut self.child, exit_by) {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let reap_by = outer.min(Instant::now() + Duration::from_secs(1));
+            if !evidenced::reap_by(&mut self.child, reap_by) {
+                self.sandbox.teardown.failed(format!(
+                    "daemon child {} was not reaped by the teardown deadline",
+                    self.child.id()
+                ));
+            }
         }
     }
 }
@@ -1013,14 +1029,8 @@ fn s1_f19_wall_deadline_clears_grandchild() -> TestResult {
         let grandchild = sandbox.pid("gc.pid")?;
         let boundary = requested + Duration::from_millis(1000);
         let bound = CLEANUP_ALLOWANCE + TOLERANCE;
-        while process_live(grandchild) {
-            let after = Instant::now().saturating_duration_since(boundary);
-            check(after <= bound, || {
-                format!("the grandchild outlived the wall deadline by {after:?} (> {bound:?})")
-            })?;
-            thread::sleep(Duration::from_millis(5));
-        }
-        let absent_after = Instant::now().saturating_duration_since(boundary);
+        let absent_after = absent_within(boundary, bound, || !process_live(grandchild))
+            .map_err(|error| format!("the grandchild after the wall deadline: {error}"))?;
         sandbox.record(
             "f19_wall_cleanup.json",
             &json!({
@@ -2880,4 +2890,42 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
         }
         Ok(())
     })
+}
+
+/// Polls `gone` until it reports absence, at most `bound` after `boundary`
+/// (S1-evidence2 fix round 1): each probe is timestamped after it returns
+/// and the bound is enforced before its absence is accepted, so a probe
+/// that resumes after expiry and finds the process gone fails. Returns how
+/// long after `boundary` absence was proved.
+fn absent_within(
+    boundary: Instant,
+    bound: Duration,
+    mut gone: impl FnMut() -> bool,
+) -> Result<Duration, String> {
+    loop {
+        let absent = gone();
+        let after = Instant::now().saturating_duration_since(boundary);
+        if after > bound {
+            return Err(format!(
+                "absence not proved within {bound:?} of the boundary (probe at {after:?})"
+            ));
+        }
+        if absent {
+            return Ok(after);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`absent_within`] rejects an absence observed only after its bound: the
+/// probe resumes late and finds the process gone (S1-evidence2 fix round 1).
+#[test]
+fn s1_f19_absence_after_the_bound_fails() {
+    let late = absent_within(Instant::now(), Duration::from_millis(50), || {
+        thread::sleep(Duration::from_millis(100));
+        true
+    });
+    assert!(late.is_err(), "late absence accepted: {late:?}");
+    let timely = absent_within(Instant::now(), Duration::from_secs(5), || true);
+    assert!(timely.is_ok(), "{timely:?}");
 }

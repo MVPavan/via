@@ -43,7 +43,7 @@ const STALL_MS: &str = "500";
 const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
 /// Explicit scheduler tolerance for the end-to-end bound over the cleanup
 /// allowance: the harness's stall boundary is taken before the vendor's
-/// last writes, so it also covers them and the 10 ms absence polling under
+/// last writes, so it also covers them and the 5 ms absence polling under
 /// a loaded parallel run (a contract upper bound, design T4-A50).
 const TOLERANCE: Duration = Duration::from_secs(2);
 
@@ -225,21 +225,14 @@ impl Setup {
         bound: Duration,
     ) -> Result<Duration, ScenarioError> {
         let pid_file = self.sandbox.sync.join("agent.pid");
-        loop {
-            let after = Instant::now().saturating_duration_since(boundary);
-            if let Ok(pid) = fs::read_to_string(&pid_file)
-                && stopped(pid.trim())
-            {
-                return Ok(after);
-            }
-            if after > bound {
-                return Err(failure(format!(
-                    "the silent vendor outlived the stall's start by {after:?} (> {bound:?}) \
-                     while Core was held"
-                )));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        absent_within(boundary, bound, || {
+            fs::read_to_string(&pid_file).is_ok_and(|pid| stopped(pid.trim()))
+        })
+        .map_err(|error| {
+            failure(format!(
+                "the silent vendor after the stall's start, while Core was held: {error}"
+            ))
+        })
     }
 
     /// `via status <session>` (C1 §3.7).
@@ -522,4 +515,42 @@ fn s1_f27_daemon_split_writes_keep_exact_text_and_a_huge_line_saves_its_prefix()
         |evidence| collect_available(evidence, &setup.sandbox.state),
     );
     report.require_pass()
+}
+
+/// Polls `gone` until it reports absence, at most `bound` after `boundary`
+/// (S1-evidence2 fix round 1): each probe is timestamped after it returns
+/// and the bound is enforced before its absence is accepted, so a probe
+/// that resumes after expiry and finds the process gone fails. Returns how
+/// long after `boundary` absence was proved.
+fn absent_within(
+    boundary: Instant,
+    bound: Duration,
+    mut gone: impl FnMut() -> bool,
+) -> Result<Duration, String> {
+    loop {
+        let absent = gone();
+        let after = Instant::now().saturating_duration_since(boundary);
+        if after > bound {
+            return Err(format!(
+                "absence not proved within {bound:?} of the boundary (probe at {after:?})"
+            ));
+        }
+        if absent {
+            return Ok(after);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`absent_within`] rejects an absence observed only after its bound: the
+/// probe resumes late and finds the process gone (S1-evidence2 fix round 1).
+#[test]
+fn s1_f24_absence_after_the_bound_fails() {
+    let late = absent_within(Instant::now(), Duration::from_millis(50), || {
+        thread::sleep(Duration::from_millis(100));
+        true
+    });
+    assert!(late.is_err(), "late absence accepted: {late:?}");
+    let timely = absent_within(Instant::now(), Duration::from_secs(5), || true);
+    assert!(timely.is_ok(), "{timely:?}");
 }
