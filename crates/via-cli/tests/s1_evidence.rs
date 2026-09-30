@@ -206,6 +206,10 @@ fn unix_ms(at: &str) -> Option<i64> {
 /// absolute, `transcript` and `vendor_session_id` `null`, and the envelope's
 /// `evidence` equals it.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario proves the stderr file, the idle order and the logs listing"
+)]
 fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
     const STDERR: usize = 1024 * 1024;
     const IDLE_MS: i64 = 1500;
@@ -222,6 +226,9 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
         evidence,
         |evidence| {
             let _daemon = Daemon::start(&sandbox, evidence)?;
+            // The realtime clock against the monotonic one, across the
+            // window the daemon's and the file's timestamps fall in.
+            let clocks = (std::time::SystemTime::now(), Instant::now());
             let session = spawn(&sandbox, evidence, "stderr", &["--idle-ms", "1500"])?;
             sandbox.await_gate("quiet")?;
             let accepted_at = Instant::now();
@@ -230,6 +237,10 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
             sandbox.release_gate("quiet")?;
             await_event(&sandbox, evidence, &session, "cancel.requested")?;
             let ordered_after = accepted_at.elapsed();
+            let wall = std::time::SystemTime::now()
+                .duration_since(clocks.0)
+                .map_or(i128::MIN, |elapsed| elapsed.as_millis().cast_signed());
+            let stepped = (wall - clocks.1.elapsed().as_millis().cast_signed()).abs() > 100;
             let envelope = wait(&sandbox, evidence, "wait", &format!("{session}/1"))?;
             let listed = logs(&sandbox, evidence, "logs", &session)?;
             record(&sandbox, evidence, &[&envelope], &[&session])?;
@@ -260,23 +271,34 @@ fn s1_evidence_stderr_is_written_by_the_os_and_listed() -> TestResult {
                     json!({"idle_ms":IDLE_MS,"started_to_order_ms":ordered - started,
                         "started_to_stderr_ms":landed - started,
                         "stderr_to_order_ms":ordered - landed,
-                        "test_clock_ordered_after_ms":ordered_after.as_millis()})
+                        "test_clock_ordered_after_ms":ordered_after.as_millis(),
+                        "realtime_clock_stepped":stepped})
                     .to_string()
                     .as_bytes(),
                 )
                 .map_err(infra)?;
-            // The bytes landed inside the idle window, before the order.
-            check(started < landed && landed < ordered, || {
-                format!("stderr landed at {landed}, outside {started}..{ordered}")
-            })?;
-            // Stderr as progress would have put the order a whole budget
-            // after the bytes.
-            check(ordered - landed < IDLE_MS, || {
-                format!(
-                    "the idle order came {} ms after the stderr bytes: they reset idle",
-                    ordered - landed
-                )
-            })?;
+            if stepped {
+                // The realtime clock stepped inside the window (seen on
+                // WSL), so its timestamps cannot be compared: the order is
+                // judged on the monotonic clock instead. Stderr as progress
+                // would have put it past 800 ms + one budget.
+                check(ordered_after < Duration::from_millis(2300), || {
+                    format!("the idle order came {ordered_after:?} after acceptance")
+                })?;
+            } else {
+                // The bytes landed inside the idle window, before the order.
+                check(started < landed && landed < ordered, || {
+                    format!("stderr landed at {landed}, outside {started}..{ordered}")
+                })?;
+                // Stderr as progress would have put the order a whole budget
+                // after the bytes.
+                check(ordered - landed < IDLE_MS, || {
+                    format!(
+                        "the idle order came {} ms after the stderr bytes: they reset idle",
+                        ordered - landed
+                    )
+                })?;
+            }
             let written = fs::read(expected.join("stderr.log")).map_err(infra)?;
             check(written == stderr_bytes(STDERR), || {
                 format!("stderr.log holds {} bytes, not the fake's", written.len())
