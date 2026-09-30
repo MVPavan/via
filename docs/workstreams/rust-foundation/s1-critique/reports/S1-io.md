@@ -1,7 +1,7 @@
 # S1-io report: Host control exchanges, live task collection, draining reader
 
-**Status: DONE** after fix round 1 (see its section; round 0 was
-DONE_WITH_CONCERNS). Fixes S1 critic findings 4, 5 and 6
+**Status: DONE** after fix round 2 (see the fix-round sections; round 0
+was DONE_WITH_CONCERNS). Fixes S1 critic findings 4, 5 and 6
 (`reviews/S1-critic-r1.md`), Bead `via-jm4.7.9.2`, and in fix round 1 the
 Sol r1 review findings and bead `via-jm4.19`. Branch `wt/s1-io`, cut
 from `rust-foundation` at `7370e0e`. Logs: `scratchpad/s1/io/`.
@@ -17,7 +17,10 @@ from `rust-foundation` at `7370e0e`. Logs: `scratchpad/s1/io/`.
 | `d851b3d` | r1 finding 2 | `test(host)`: the busy-lock regression waits for polls that met the lock |
 | `ebba854` | r1 decision 3 | `fix(host)`: a retired control is shut down so the anchor cleans up on EOF |
 | `eefe624` | via-jm4.19 | `test(host)`: the s1_host fixture releases paused anchors before cleanup |
-| (this commit) | — | this report, fix round 1 |
+| `48b6694` | — | this report, fix round 1 |
+| `8f2542b` | r2 finding 1 | `fix(host)`: move a forced fact only when its dropped control is pruned |
+| `2c83931` | r2 finding 3 | `test(wire)`: hold the draining save at a seam, not against its 2 s bound |
+| (this commit) | — | this report, fix round 2 |
 
 ## Finding 4: control exchanges are never abandoned on a reused stream
 
@@ -334,3 +337,83 @@ On `eefe624`, `gate.sh` exit 0 (`r1-gate.log`):
   busy under `supervise_exit`. nextest runs each test in its own process.
 - The fixture's `/proc` scan is Linux-only, as the `s1_host` suite already
   is.
+
+## Fix round 2 (Sol high r2: UNSOUND)
+
+Review: `scratchpad/execution/s1-critic/review-s1-io-sol-r2.md`. Logs are
+under `scratchpad/s1/io/r2-*`.
+
+### Finding 1: a live closing control's fact is not copied
+
+**Defect.** `prune_controls` copied the fact of every control that was
+`forced` and not yet `reported`, including live ones. When an acquisition
+tracked its tasks while another turn's close sat between its `stopped_live`
+reply and its report, that generation was inserted for good. The report that
+followed never removed it.
+
+**Fix.**
+- `prune_controls` now moves a fact only for a control it is actually
+  pruning: a dropped control whose fact no close report handed off.
+- A live control's fact stays on its own `StopFacts`, where its close still
+  reports it.
+- Shutdown copies its live controls' facts before closing them, as it did
+  before this chunk, so reconciliation still reads them if a close misses
+  the deadline.
+
+**Test.** The unit test
+`an_acquisition_during_a_close_keeps_no_handed_off_fact` drives the
+interleaving directly on `HostTasks`:
+1. A live control has `forced` set.
+2. An acquisition's `track` runs.
+3. The close sets `reported`, and the control is dropped.
+4. `track` runs again.
+
+The integration path has no seam that pauses `close` between its `Stop`
+reply and its report, so a real acquisition could not be placed there
+without relying on timing.
+- RED (`r2-f1-red.log`): "a fact the close handed off stayed Host-wide:
+  {"g1"}".
+- GREEN (`r2-f1-green.log`): 71/71 via-host tests pass.
+
+### Finding 2: row-4 insert, deferred
+
+The existing row-4 insert (`VendorFacts` commit failure) stays as it is. The
+set grows by one entry for each repeated scoped `VendorFacts` write failure.
+The orchestrator records this as a limitation in the Task 4 design. There is
+no code change here.
+
+### Finding 3: the draining regression no longer depends on elapsed time
+
+**Defect.** The test held `blob.step.stall`, and `BlobTasks::run` answers a
+held step at its 2 s bound with a "not saved" note. The assertion that no
+note existed yet therefore relied on the vendor finishing within 2 s.
+
+**Fix.**
+- A new test-only seam, `wire.undecoded.before_note`, is compiled only under
+  `test-failpoints`. It sits in `keep_undecoded` after the blob step's outcome
+  and before the note is stored, so no timer can answer a save held there.
+- The test holds the save at this seam. It asserts, before the release, that
+  the vendor finished, that more than 64 KiB was discarded, and that no note
+  exists. After the release and `finish`, the note names `undecoded.bin`.
+- `scripts/check-release-features.py` lists the new point. The release check
+  passes: 106 points armed and ignored, none of 117 markers present.
+- The Task 3 design's seam list does not have the new point. That design is
+  not my file to edit, so I leave the entry to the orchestrator.
+
+**RED on the old reader** (`r2-f3-red-old-reader.log`): with the `7370e0e`
+inline save temporarily restored in `read_stdout`, the test fails with "the
+vendor blocked on its pipe while the save was held". The 10 s there only
+bounds a stalled reader. GREEN: `r2-f3-green.log`.
+
+### Checks, fix round 2 (`r2-tests.log`)
+
+| Check | Result |
+| --- | --- |
+| fmt, clippy (both feature sets) | pass |
+| via-host with failpoints / without | 71 passed / 43 passed |
+| via-wire with failpoints / without | 12 passed / 3 passed |
+| failpoint suite, once | 537 passed, 1 skipped |
+| release build and `check-release-features.py` | pass |
+
+The anchor count under this worktree's target path was 0 afterwards, and no
+process from this worktree was running.
