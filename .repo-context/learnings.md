@@ -101,3 +101,10 @@ in the design record (`docs/`), not here.
   waits for its consumer, so more than 1,024 unconsumed messages overflow by
   design (A47). A test that wrote 1,040 lines in one burst failed 64 of 240
   runs under parallel stress.
+- Review copies committed from `scratchpad/` need their links rewritten, not
+  just stripped of the absolute prefix. Codex reviews link as
+  `(/abs/repo/path:line)`. Removing the prefix leaves repo-root targets with
+  `:line` suffixes, which do not resolve from `docs/.../reviews/` and broke
+  322 links (`6caffb3`). Link repo files relative to the review's folder
+  with `#L<line>`, turn scratchpad targets into plain text, and run the
+  link check from `verification.md` before committing.
