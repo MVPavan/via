@@ -14,6 +14,7 @@ Bead `via-jm4.7.9.3`, S1 critic finding 13. Branch `wt/s1-specs`, cut from
 | `56e4309` | `docs/specs/via-api-v1.md` | A4, A5, A7, A8, A9, A15, A17, A21, A22 |
 | `e848a6b` | `docs/workstreams/rust-foundation/t2/dispatch-design.md` | A1, A2, A11, A16, A18 |
 | `5eba7e0`, `bbec36f` | `.repo-context/coding-style.md` §6 | A6 (the second commit makes it an exception to the "only daemon main and the anchor" sentence) |
+| `f04260d` and the next commit | this report | |
 
 The orchestrator's mapping of rows to targets matches the table: I found
 no row that targets another document.
@@ -93,8 +94,18 @@ with no `interrupt` entrypoint in `crates/via-routes/src/runtime.rs`.
 
 No cargo run (documentation only, per the brief).
 
-- `git diff rust-foundation --stat`: only the four documents and this
-  report (output below).
+- `git diff rust-foundation...HEAD --stat` (from the merge base `7370e0e`;
+  `rust-foundation` has since gained the critic review and a handoff
+  update, which the two-dot diff shows as reverse changes):
+
+  ```text
+   .repo-context/coding-style.md                      |   7 +-
+   docs/specs/runtime-contracts.md                    |  93 ++++++++++++-----
+   docs/specs/via-api-v1.md                           |  74 +++++++++----
+   .../s1-critique/reports/S1-specs.md                | 114 +++++++++++++++++++++
+   .../rust-foundation/t2/dispatch-design.md          |  58 +++++++----
+   5 files changed, 275 insertions(+), 71 deletions(-)
+  ```
 - Key-phrase grep per amendment in its target: each found (A1 "only the
   claim owner writes the turn"; A2 "counted queued turn **or** a close
   order"; A3 "contention exits 75"; A4 "A mismatched `hello` stops nothing";
