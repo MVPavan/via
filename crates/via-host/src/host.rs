@@ -351,20 +351,25 @@ impl HostTasks {
         self.failed += failed;
     }
 
-    /// Drops the records of controls whose stream is gone. A forced-stop
-    /// fact that no close report handed to the control's owner moves to
-    /// `forced`, where shutdown's reconciliation still reads it; a handed-off
-    /// one is already the owner's, so live service keeps no fact per turn.
+    /// Drops the records of controls whose stream is gone. A dropped
+    /// control's forced-stop fact that no close report handed to its owner
+    /// moves to `forced`, where shutdown's reconciliation still reads it; a
+    /// handed-off one is already the owner's, so live service keeps no fact
+    /// per turn. A live control keeps its fact on its own `StopFacts`: its
+    /// close may still report it.
     fn prune_controls(&mut self) {
-        for control in &self.controls {
+        let forced = &mut self.forced;
+        self.controls.retain(|control| {
+            if control.stream.strong_count() > 0 {
+                return true;
+            }
             if control.stop.forced.load(Ordering::Acquire)
                 && !control.stop.reported.load(Ordering::Acquire)
             {
-                self.forced.insert(control.generation.clone());
+                forced.insert(control.generation.clone());
             }
-        }
-        self.controls
-            .retain(|control| control.stream.strong_count() > 0);
+            false
+        });
     }
 }
 
@@ -1545,7 +1550,17 @@ impl Host {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             tasks.prune_controls();
-            tasks.controls.clone()
+            // Shutdown's reconciliation reads the facts of the controls
+            // still live, whether or not their closes finish in time.
+            let HostTasks {
+                controls, forced, ..
+            } = &mut *tasks;
+            for control in controls.iter() {
+                if control.stop.forced.load(Ordering::Acquire) {
+                    forced.insert(control.generation.clone());
+                }
+            }
+            controls.clone()
         };
         for tracked in controls {
             if Instant::now() >= deadline.instant() {
@@ -2890,6 +2905,48 @@ mod tests {
             "{report:?}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// S1-io review r2 finding 1: an acquisition that tracks its tasks
+    /// while another turn's close is between its `Stop` reply (`forced`
+    /// set) and its report (`reported` set) must not copy that live
+    /// control's fact; once the close reported it and the control is
+    /// dropped, no fact is left Host-wide.
+    #[tokio::test]
+    async fn an_acquisition_during_a_close_keeps_no_handed_off_fact() {
+        let mut tasks = HostTasks::default();
+        let (control, _peer) = control_pair();
+        let stop = Arc::new(StopFacts::default());
+        let (_sender, exit) = watch::channel(None);
+        tasks.controls.push(TrackedControl {
+            stream: Arc::downgrade(&control),
+            identity: ProcessIdentity {
+                pid: 1,
+                pgid: 1,
+                uid: 0,
+                boot_id: "boot".to_owned(),
+                pid_namespace: "pidns".to_owned(),
+                start_ticks: 1,
+                marker: crate::ProcessMarker::try_from_generated("m".to_owned()).expect("marker"),
+            },
+            anchor_id: "a1".to_owned(),
+            generation: "g1".to_owned(),
+            exit,
+            stop: stop.clone(),
+        });
+        // The close has its `stopped_live` reply and waits for absence.
+        stop.forced.store(true, Ordering::Release);
+        tasks.track(tokio::spawn(async { Ok(()) }));
+        // The close reports the fact to its owner, then the owner drops it.
+        stop.reported.store(true, Ordering::Release);
+        drop(control);
+        tasks.track(tokio::spawn(async { Ok(()) }));
+        assert!(tasks.controls.is_empty());
+        assert!(
+            tasks.forced.is_empty(),
+            "a fact the close handed off stayed Host-wide: {:?}",
+            tasks.forced
+        );
     }
 
     /// A live control in `phase` over a socket pair; keep the returned
