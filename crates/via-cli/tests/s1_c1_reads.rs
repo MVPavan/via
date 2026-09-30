@@ -13,6 +13,8 @@ mod scenario;
 mod support;
 
 use std::collections::HashSet;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use daemon::{Daemon, Raw, Sandbox, TestResult, cli, failure, infra, refused, request};
 use scenario::{ScenarioError, collect_available, run_scenario};
@@ -222,6 +224,93 @@ fn s1_c1_follow_and_unsubscribe_are_refused() -> TestResult {
                 seqs(&window) == [3, 4] && window["next_after"] == 4 && window["more"] == true,
                 || format!("window page: {window}"),
             )
+        },
+        |evidence| collect(evidence, &sandbox),
+    );
+    report.require_pass()
+}
+
+/// C1 §3.8 (S1 critic finding 3): closing the connection of a pending
+/// `wait` releases only that waiter, and its socket slot. 32 clients, every
+/// socket slot (design §10.1), each complete `hello`, start a long `wait`
+/// on a running turn and disconnect. A new client then completes `hello`
+/// and a request (retried until a slot frees, within a bound far shorter
+/// than the waits). The turn, never affected, reaches its terminal, and
+/// `result` returns it. Before the fix every slot stayed held until the
+/// waits expired.
+#[test]
+fn s1_c1_disconnected_waits_release_their_slots() -> TestResult {
+    const SLOTS: usize = 32;
+    let vendor = "fake-turn-1";
+    let held = json!({"expected_request":{"type":"start","id":1,"turn":1,"prompt":"slow"},"steps":[
+        {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":vendor}},
+        {"action":"gate","name":"slow"},
+        {"action":"emit","message":{"type":"terminal","vendor_turn_id":vendor,
+            "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+    ]});
+    let sandbox = Sandbox::new(&json!({ "scripts": [held] }))?;
+    let evidence = Evidence::new(
+        "s1_c1_wait_disconnect_slots",
+        &sandbox.fake,
+        &sandbox.fixture,
+    )?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let session = spawn(&sandbox, evidence, "slow", None)?;
+            sandbox.await_gate("slow")?;
+            let address = format!("{session}/1");
+            let waiting = request(1, "wait", &json!({"address":address,"timeout_ms":600_000}));
+            // Every slot is taken before any wait starts.
+            let clients = (0..SLOTS)
+                .map(|_| Raw::open(&sandbox))
+                .collect::<Result<Vec<_>, _>>()?;
+            for mut client in clients {
+                client.send(&waiting)?;
+                drop(client);
+            }
+            // Recovery is the handshake succeeding: a refused connection is
+            // closed without bytes, so each attempt either fails or serves.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut attempts = 0_u32;
+            let status = loop {
+                attempts += 1;
+                let served = Raw::open(&sandbox)
+                    .and_then(|mut raw| raw.exchange(&request(2, "daemon/status", &json!({}))));
+                match served {
+                    Ok(reply) => break reply,
+                    Err(error) if Instant::now() >= deadline => {
+                        return Err(failure(format!(
+                            "no slot freed after {SLOTS} disconnected waits \
+                             ({attempts} attempts): {error:?}"
+                        )));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            evidence
+                .write(
+                    "reconnect.json",
+                    json!({"attempts":attempts,"status":status})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(status["result"]["pid"].is_u64(), || {
+                format!("daemon/status: {status}")
+            })?;
+            sandbox.release_gate("slow")?;
+            let waited = wait(&sandbox, evidence, &address)?;
+            let result = cli(
+                &sandbox,
+                evidence,
+                "result",
+                &["result", &address, "--json"],
+            )?;
+            check(result["state"] == "completed" && result == waited, || {
+                format!("result {result}, wait {waited}")
+            })
         },
         |evidence| collect(evidence, &sandbox),
     );

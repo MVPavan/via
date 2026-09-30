@@ -137,11 +137,11 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
         // Design §10.3 step 8: each line's buffer lives for one request.
         let mut line = Vec::new();
         // A request already being served completes; an idle connection closes.
-        let read = tokio::select! {
-            read = read_line(&mut read, &mut line, deadlines.partial_line) => read?,
+        let ended = tokio::select! {
+            ended = read_line(&mut read, &mut line, deadlines.partial_line) => ended?,
             _ = client.closing.wait_for(|closing| *closing) => break,
         };
-        match read {
+        match ended {
             Line::Complete => {}
             Line::Closed => break,
             Line::TooLarge => {
@@ -206,6 +206,14 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
                 Ok(_) => failure(id, &error_data(VERSION_MISMATCH.into())),
                 Err(refusal) => failure(id, &error_data(refusal)),
             }
+        } else if method == "wait" {
+            // C1 §3.8: closing the connection of a pending `wait` releases
+            // only that waiter, and this connection's socket slot.
+            match watched(dispatch(&method, params, &client), &mut read).await {
+                Some(Ok(result)) => success(id, &result),
+                Some(Err(refusal)) => failure(id, &error_data(refusal)),
+                None => break,
+            }
         } else {
             match dispatch(&method, params, &client).await {
                 Ok(result) => success(id, &result),
@@ -217,6 +225,29 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
         }
     }
     Ok(())
+}
+
+/// Serves a `wait` while watching its connection (C1 §3.8). End of stream
+/// or a read error drops the `wait` future and ends the connection
+/// (`None`); `wait` is read-only, so the turn's work, owned elsewhere, is
+/// unaffected, and Store keeps ownership of an admitted read, whose reply
+/// is dropped. Bytes that arrive stay buffered for the next request
+/// (pipelining, A48): `fill_buf` is cancel-safe and consumes nothing, and
+/// from then on the `wait` just finishes.
+async fn watched<T, R: AsyncRead + Unpin>(
+    wait: impl Future<Output = T>,
+    read: &mut BufReader<R>,
+) -> Option<T> {
+    let mut wait = std::pin::pin!(wait);
+    tokio::select! {
+        result = &mut wait => return Some(result),
+        filled = read.fill_buf() => {
+            if !filled.is_ok_and(|bytes| !bytes.is_empty()) {
+                return None;
+            }
+        }
+    }
+    Some(wait.await)
 }
 
 /// Writes one reply within `reply_write` of its being ready (design §4,
