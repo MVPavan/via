@@ -135,3 +135,31 @@ fn evidence_and_evidence_folder_directories_are_private() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+
+/// S1-contract r1 finding 2: missing required evidence records
+/// `infrastructure_failure` in the summary and the report, whatever
+/// outcome the caller passed.
+#[test]
+fn missing_required_evidence_is_an_infrastructure_failure() -> Result<(), Box<dyn Error>> {
+    let sandbox = tempfile::tempdir()?;
+    let fixture = sandbox.path().join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    let evidence = Evidence::new(
+        "collector_missing_evidence",
+        std::path::Path::new(env!("CARGO_BIN_EXE_via")),
+        &fixture,
+    )?;
+    let artifact = evidence.dir.clone();
+    evidence.write("daemon.trace", b"trace\n")?;
+    assert!(
+        evidence
+            .finish("pass", "passing body, missing evidence")
+            .is_err()
+    );
+    let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
+    assert_eq!(summary["outcome"], "infrastructure_failure");
+    assert_eq!(summary["evidence_complete"], false);
+    let report = fs::read_to_string(artifact.join("REPORT.md"))?;
+    assert!(report.contains("`infrastructure_failure`"), "{report}");
+    Ok(())
+}

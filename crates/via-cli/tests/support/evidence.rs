@@ -109,7 +109,13 @@ impl Evidence {
         if self.store_expected && fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
             missing.push("evidence/*");
         }
-        let final_outcome = outcome;
+        // Missing required evidence is an infrastructure failure, whatever
+        // the scenario itself concluded.
+        let final_outcome = if missing.is_empty() {
+            outcome
+        } else {
+            "infrastructure_failure"
+        };
         let summary = self.summary(final_outcome, detail, &missing)?;
         fs::write(
             self.dir.join("summary.json"),
