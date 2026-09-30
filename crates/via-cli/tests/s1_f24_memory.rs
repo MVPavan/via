@@ -43,8 +43,9 @@ const PROMPT: usize = 16 * 1024 * 1024;
 /// Design §5.1's sum over holders, and the gate's 25% margin.
 const SUM_MIB: u64 = 332;
 /// Maximal vendor messages per flooding turn, in chunks: three turns flood
-/// 258 MiB.
-const CHUNKS: u64 = 43;
+/// 282 MiB, so the sampled total clears 256 MiB even when the 10 ms sampler
+/// misses each fake's last chunk and overflow line (4 MiB each).
+const CHUNKS: u64 = 47;
 /// Maximal messages per chunk: 2 MiB, within Wire's 4 MiB queue (§8.2).
 const CHUNK: u64 = 2;
 /// Core's hit before it handles each observation, counted to pace the
