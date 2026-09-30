@@ -67,7 +67,9 @@ Lock order, outermost first: `admission` (async, held across Store reads by
 design) → `sessions` → slot state. `stop` is taken alone. The synchronous
 locks are never held across an `.await`. `request_stop` sets the mode under
 `admission` and `stop`, releases `stop`, and only then sends the force
-watch that wakes the dispatchers. It scans no slot.
+watch that wakes the dispatchers. For a force stop it first collects the
+force set (§2.4) under `admission`, reading `sessions` and then each slot's
+state, each released before the next; it scans no slot otherwise.
 
 ## 2. Session dispatcher
 
@@ -137,27 +139,36 @@ Each decision reads Store at most once for the queue head:
    Turns cancelled while queued are passed over. A failed read means
    `Wait` with the timer.
 5. **`Cancel`:** commit the head `queued → cancelled`. If the commit
-   confirms, pop the turn and release it. If the commit fails or is
-   uncertain, latch Store failure (§3). Not committed: T3 §7.2 row 9;
-   uncertain: latch. A failed *read* before the commit
+   confirms, pop the turn and release it. If it is not committed, the
+   entry, head and accounting are kept and the commit is retried once (T3
+   §7.2 row 9); a retry that commits stays `cancelled`, and a failed retry
+   latches Store failure (§3). If the commit is uncertain, latch. A failed
+   *read* before the commit
    (the queued facts or the head) is only a read failure, retried on the
    timer.
 6. **`Run`:** take the grant (§4). If refused, go to 1. Otherwise commit
    `turn.submitted`:
    - **Committed:** pop the turn, leave `queued`, and run it inline.
-   - **Failed or uncertain:** latch Store failure. The turn stays queued
-     with no vendor I/O, and it is never retried. Not committed: T3 §7.2
-     row 2; uncertain: latch.
+   - **Not committed:** no vendor I/O; the connection permit is dropped,
+     and the resolution write `commit_submit_failed` commits
+     `turn.submitted` with `turn.ended failed(store)` in one transaction
+     (T3 §7.2 row 2). Successors dispatch normally. A failed resolution
+     write latches Store failure.
+   - **Uncertain:** latch Store failure. The turn stays queued with no
+     vendor I/O, and it is never retried.
    - **Read failed first** (the queued facts or the head): nothing was
      written; wait for the timer.
 7. **`run` ends:**
    - **Ended:** the terminal is durable; release the turn.
    - **Forced:** the turn moves to the forced list for final shutdown.
-   - **Failed:** a terminal or event commit failed. The existing per-turn
-     handling applies: later events are dropped, the terminal is `failed`
-     with class `store`, and a terminal that does not commit is recorded
-     failed so reads give `store_error`. The failure also latches. Not
-     committed: T3 §7.2 rows 5–7; uncertain: latch.
+   - **Failed:** a terminal or event commit failed. If it was not
+     committed, the failure is scoped to the turn (T3 §7.2 rows 5–7): an
+     event failure stops the turn and later events are dropped, and its one
+     resolution write is the terminal `failed(store)` with its cleanup
+     evidence; a natural terminal is retried once instead, and a retry that
+     commits keeps the vendor's result. A failed resolution write or retry
+     latches. If it was uncertain, it latches, and a terminal that does not
+     commit is recorded failed so reads give `store_error`.
 8. **`Wait`:** an earlier turn is unresolved in Store and owned elsewhere
    in this daemon, or the read failed. Wait for a wake or the timer. The
    restart handoff (§10) leaves no unresolved turn without an owner, so the
@@ -170,7 +181,8 @@ N waiting turns in one session cost one timer, not N.
 ### 2.3 Under force (Store not failed)
 
 - Every queued turn is committed `queued → cancelled` in FIFO order, with
-  no `turn.submitted` and no vendor I/O. The first failed or uncertain
+  no `turn.submitted` and no vendor I/O. A cancellation not committed is
+  retried once (T3 §7.2 row 9); a failed retry or an uncertain
   cancellation latches, and §3 then applies to the rest. A failed **read**
   before a cancellation (the queued facts or the head) retries with the
   dispatcher backoff until final shutdown's read budget ends. That budget is
@@ -198,8 +210,11 @@ N waiting turns in one session cost one timer, not N.
   turns were all durably cancelled by then.
 - If any cancellation or the close is uncommitted, the session is not
   closed, the turn stays unresolved, and the exit is 4.
-- Force cancellations and the closing rider: not committed: T3 §7.2 row 9;
-  uncertain: latch.
+- Force cancellations and the closing rider follow T3 §7.2 row 9: one
+  retry when not committed; a failed retry or an uncertain commit latches.
+  If Store refuses the retried rider as a close because a turn is
+  unfinished, the cancellation commits alone and the session counts in
+  `unclosed_sessions`.
 - A closing commit (the last queued cancellation, or a forced terminal)
   holds `admission` from its latch and close check through the commit
   (§3.2).
@@ -207,8 +222,9 @@ N waiting turns in one session cost one timer, not N.
 ### 2.4 Force closure pass
 
 At force acceptance, `request_stop` records the sessions whose slot has a
-queue entry or a running or settling turn (T3 §6.3), under `admission`. After the dispatchers join, final shutdown takes each
-recorded session that is still open in Store and, under `admission`:
+queue entry or a running or settling turn (T3 §6.3), under `admission`.
+After the dispatchers join, final shutdown takes each recorded session
+that is still open in Store and, under `admission`:
 
 - if every turn has a durable disposition (no queued or running turn),
   commits `session.closed` (`daemon_stop_force`) alone
@@ -216,9 +232,11 @@ recorded session that is still open in Store and, under `admission`:
 - otherwise counts the session in `unclosed_sessions`, which makes the exit
   4.
 
-The pass starts no close once `failure_pending` is observed (§3.2). It reads before it
-writes, so a session already closed in-path is never closed twice. A failed
-close commit latches. Not committed: T3 §7.2 row 14; uncertain: latch. This covers a session that went idle during force,
+The pass starts no close once `failure_pending` is observed (§3.2). It
+reads before it writes, so a session already closed in-path is never closed
+twice. A close commit not committed counts the session in
+`unclosed_sessions` (exit 4) and does not latch (T3 §7.2 row 14); an
+uncertain one latches. This covers a session that went idle during force,
 for example when force was accepted while its last queued turn's
 cancellation was reading. Closing sessions that were already idle at force
 acceptance, and so hold no slot, stays with `via-jm4.7.7`.
@@ -267,8 +285,8 @@ Once set:
   is written only if no other turn of the session is queued or running
   there (§2.3). That includes a turn that an uncertain receipt committed but
   Core never registered, which was the reason for the earlier rule. Runtime
-  §7 allows best-effort writes after the first failure, and the daemon
-  still exits 4. No other write gate exists.
+  §7 allows best-effort writes on the latched path (the failure-resolution
+  batch and forced terminals), and the daemon still exits 4. No other write gate exists.
 
 A terminal commit whose outcome was uncertain latches even when the
 read-back finds the terminal. Waiters still get the committed envelope,
@@ -278,9 +296,11 @@ result (`journal::Durable`). During startup recovery an uncertain terminal
 commit fails startup instead, because recovery must be certain before
 admission.
 
-An uncertain or failed receipt commit returns C1 §8.1 `store_error` with
-`commit_outcome` (`not_committed` or `unknown`) and `retry: same_key_only`
-where uncertain, and it latches. There is no in-daemon orphan set,
+A receipt commit that is not committed returns C1 §8.1 `store_error` with
+`commit_outcome: not_committed`; a slot the request created is retired,
+and nothing latches (T3 §7.2 row 1). An uncertain receipt commit returns
+`store_error` with `commit_outcome: unknown` and `retry: same_key_only`,
+and it latches. There is no in-daemon orphan set,
 reconciler or adoption. Restart recovery settles such receipts (Task 3). The
 C1 §8.1 paragraph reads: "A receipt whose commit outcome is `unknown`
 latches Store failure (runtime §7). Restart recovery settles it; a keyed
@@ -393,10 +413,11 @@ under `admission`, and stop and the latch refuse receipts under
 
 `active` counts every receipted turn not yet durably terminal and not
 released. Daemon main's drain exit condition (`active() == 0` and no
-dispatcher tasks) covers queued and owned turns. A failed write latches and
-turns the drain into a force-mode shutdown with exit 4, so a failed commit
-never lets a drain finish clean. Not committed: T3 §7.2 (scoped; the drain
-continues); uncertain: latch.
+dispatcher tasks) covers queued and owned turns. A write not committed is
+scoped (T3 §7.2): its turn resolves, and the drain continues. A latching
+failure (an uncertain write, a failed resolution write or retry, or SQLite
+corruption) turns the drain into a force-mode shutdown with exit 4, so a
+latched failure never lets a drain finish clean.
 
 | Work at stop | Idle | Drain | Force | Store failed |
 |---|---|---|---|---|
@@ -429,7 +450,7 @@ turn left by an earlier daemon is unresolved without an owner.
 | Memory | one `TurnNumber` per queued turn (at most 8 per session, 128 daemon-wide in operation; after a restart, all surviving queued turns, §10); pending starts: one per `Starting` session; slots retired when their dispatcher exits unleased |
 | Store reads per dispatcher wake | 1 (`predecessors` of the head). Submission adds 1 read and 1 commit; a cancellation adds 1 read and 1 commit |
 | Periodic reads | only after a failed read or while waiting on an unowned predecessor: at most 1 per 250 ms–5 s per dispatcher in that state; none while waiting on a wake |
-| Writes after a failed write | none from dispatch; final shutdown makes one best-effort terminal commit per forced turn. Not committed: the turn's one resolution write, T3 §7.2; uncertain: latch, then T3 §7.4's batch |
+| Writes after a failed write | not committed: only the turn's one resolution write or retry (T3 §7.2); after the latch: none from dispatch except T3 §7.4's batch, and final shutdown makes one best-effort terminal commit per forced turn |
 
 ## 8. C1 and runtime mapping
 
@@ -439,7 +460,7 @@ turn left by an earlier daemon is unresolved without an owner.
 | C1 §7.2 `queued → cancelled` | §2.2 step 5; §2.3 under force |
 | C1 §3.14 idle, drain and force; `session.closed` with `daemon_stop_force` | §2.3, §4, §6 |
 | C1 §8.1 and runtime §7: an unknown receipt outcome | §3: `store_error` with `commit_outcome`, the latch, exit 4; restart recovery settles it |
-| Runtime §7: the first failed state write stops admission and dispatch | §3. Not committed: T3 §7.2; uncertain: latch |
+| Runtime §7: a write not committed is scoped to its request or turn; a latching failure stops admission and dispatch | §3; the scoped cases per site in T3 §7.2 |
 | Runtime §7: stop and launch fencing on failure; no vendor launch after the latch | §3.1 |
 | C1 §7.5 crash recovery | Out of scope (Task 3) |
 
@@ -451,10 +472,10 @@ has the path:
 1. **Uncertain receipt commit:** `store_error` with `commit_outcome:
    unknown` and `retry: same_key_only`; a new spawn is then refused with
    `store_error`; the shutdown is unclean (exit 4).
-2. **Failed submission commit after the grant:** no vendor launch, the latch
-   is set, and the shutdown is unclean.
-3. **Failed cancellation under force:** the shutdown is unclean, and no
-   `session.closed` for that session.
+2. **Uncertain submission commit after the grant:** no vendor launch, the
+   latch is set, and the shutdown is unclean.
+3. **Uncertain cancellation, or a failed retry, under force:** the shutdown
+   is unclean, and no `session.closed` for that session.
 4. **Force race, both sides:** force before the grant gives `cancelled`
    with no `turn.submitted` and a closed session; grant then force gives a
    submitted turn ending under the force row with no vendor launch.
