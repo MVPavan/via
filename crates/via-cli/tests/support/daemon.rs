@@ -175,7 +175,7 @@ impl<'a> Daemon<'a> {
             // A direct connection: an auto-starting `via daemon status`
             // would start a second daemon, without the child's failpoints,
             // that can win `daemon.lock` over the child.
-            if serving_pid(&sandbox.runtime) == Some(daemon.child.id()) {
+            if serving_pid(&sandbox.runtime) == Some(daemon.pid()) {
                 return Ok(daemon);
             }
             if Instant::now() >= deadline {
@@ -185,6 +185,12 @@ impl<'a> Daemon<'a> {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The pid of the daemon this harness started: readiness confirmed it
+    /// serves the sandbox's socket.
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     fn reap(&mut self, within: Duration) -> bool {

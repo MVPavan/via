@@ -665,7 +665,8 @@ fn recovered_terminal(cancel: Cancel) -> Terminal {
         // C1 §7.6: an unconfirmed outcome, like transport loss, is an error.
         stop_reason: "error",
         vendor_stop_reason: None,
-        final_text: String::new(),
+        final_text: Some(String::new()),
+        final_text_file: None,
         exit: None,
         warnings: Vec::new(),
         cancel: Some(cancel),

@@ -139,6 +139,13 @@ POINTS = [
     "core.finish_running.pause",
     # Task 4 T4-5 (design §10.4): a prompt-file copy held after its first fstat.
     "prompt_file.copy.pause",
+    # Task 4 T4-6 (design §6.4, §6.7): the final-text file's write and sync,
+    # and corruption on the `events` and `list` page reads.
+    "final_text.write.fail",
+    "final_text.write.short",
+    "final_text.sync.fail",
+    "store.read.corrupt.events_page",
+    "store.read.corrupt.list",
     # Task 4 T4-7 (design §5.3, §13.1): a reported free space; each
     # data-size walk, counted.
     "store.statvfs.free_bytes",
@@ -154,6 +161,8 @@ OVERRIDES = {
     # Task 4 T4-5 (design §10.1): the C1 partial-line and reply-write bounds.
     "VIA_TEST_PARTIAL_LINE_MS": "1",
     "VIA_TEST_REPLY_WRITE_MS": "1",
+    # Task 4 T4-6 (design §6.4): the final-text file cap.
+    "VIA_TEST_FINAL_TEXT_FILE_MAX": "1",
 }
 MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
 FIXTURE = {

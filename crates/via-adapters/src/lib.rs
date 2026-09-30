@@ -182,6 +182,54 @@ pub enum Observation {
     /// The marks of one vendor message; Core folds them into the step
     /// tracker (design §2.4). Sent only when the message carries a mark.
     Progress(ProgressMarks),
+    /// One piece of the completed final text (design §2.3): the pieces, in
+    /// order, concatenate to it, each at most [`MAX_OBSERVATION_BYTES`]
+    /// encoded; all come before the vendor terminal, which carries none.
+    FinalText(String),
+}
+
+/// `{"type":"final_text","text":""}`: an observation's bytes besides its
+/// text's escaped characters.
+const FINAL_TEXT_OVERHEAD: usize = 31;
+
+/// A character's bytes in a JSON string, as `serde_json` escapes it.
+fn escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// The bytes `text` encodes to inside a JSON string, quotes excluded, as
+/// `serde_json` escapes it (design §2.3, §6.4).
+pub fn encoded_text_len(text: &str) -> usize {
+    text.chars().map(escaped_len).sum()
+}
+
+/// Cuts a completed final text into `final_text` pieces (design §2.3), each
+/// cut at the last character whose escaped encoding keeps the whole
+/// observation within [`MAX_OBSERVATION_BYTES`]; an empty text has none.
+pub fn final_text_pieces(text: &str) -> impl Iterator<Item = &str> {
+    let room = MAX_OBSERVATION_BYTES - FINAL_TEXT_OVERHEAD;
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut used = 0;
+        let mut end = rest.len();
+        for (at, character) in rest.char_indices() {
+            used += escaped_len(character);
+            if used > room {
+                end = at;
+                break;
+            }
+        }
+        let (piece, tail) = rest.split_at(end);
+        rest = tail;
+        Some(piece)
+    })
 }
 
 /// A vendor message's progress marks (design §2.4, §2.5).
@@ -244,10 +292,9 @@ pub enum FakeObservation {
 
 /// Final fake evidence after the vendor exited; no Core state is chosen here.
 pub struct FakeTerminalEvidence {
-    /// Vendor terminal status.
+    /// Vendor terminal status. The final text came before it, as
+    /// [`Observation::FinalText`] pieces.
     pub status: VendorTerminalStatus,
-    /// Authoritative final text.
-    pub final_text: String,
     /// Raw vendor stop reason.
     pub stop_reason: String,
     /// Optional vendor failure code.

@@ -80,6 +80,10 @@ pub enum C1TurnState {
 mod api;
 mod engine;
 
+/// Test builds only: the envelope with every member at its maximum (Task 4
+/// design §6.4, §13.2).
+#[cfg(feature = "test-failpoints")]
+pub use engine::envelope_at_maximum;
 pub use engine::{
     Connections, DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff, Limits,
     Receipted, StopMode,
@@ -99,8 +103,8 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 
 pub use api::{
     ApiError, CancelParams, CloseMode, CloseParams, DEFAULT_CLOSE_DEADLINE_MS,
-    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, LogsParams,
-    Named, REQUEST_LINE_MAX, ReadParams, ReceiptOutcome, ResumeParams, SessionReadParams,
+    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, EventsParams,
+    ListParams, LogsParams, Named, REQUEST_LINE_MAX, ReadParams, ReceiptOutcome, ResumeParams,
     SpawnParams, StatusParams, SteerParams, Unpersisted, WaitParams, hash_handle, parse_address,
     retry_identity,
 };

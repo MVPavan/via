@@ -21,8 +21,8 @@ use tokio::{
 };
 use via_core::{
     ApiError, CancelParams, CloseParams, DaemonStatusParams, DaemonStopParams, DescribeParams,
-    Engine, HelloParams, LogsParams, ModelsParams, REQUEST_LINE_MAX, ReadParams, Receipted,
-    ResumeParams, SessionReadParams, SpawnParams, StatusParams, SteerParams, WaitParams,
+    Engine, EventsParams, HelloParams, ListParams, LogsParams, ModelsParams, REQUEST_LINE_MAX,
+    ReadParams, Receipted, ResumeParams, SpawnParams, StatusParams, SteerParams, WaitParams,
     json_limits,
 };
 
@@ -359,9 +359,9 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
         // Design §4.1: the stored envelope, written as stored.
         "result" => Ok(engine.result(&typed::<ReadParams>(params)?.address).await?),
         "wait" => Ok(engine.wait(typed::<WaitParams>(params)?).await?),
-        "events" => raw(&engine
-            .events(typed::<SessionReadParams>(params)?.session.as_str())
-            .await?),
+        // Design §4.3: the events array as Store wrote it.
+        "events" => Ok(engine.events(typed::<EventsParams>(params)?).await?),
+        "list" => raw(&engine.list(typed::<ListParams>(params)?).await?),
         "logs" => raw(&engine.logs(typed::<LogsParams>(params)?).await?),
         "status" => raw(&engine.status(typed::<StatusParams>(params)?).await?),
         _ => Err(Refusal::from(METHOD_NOT_FOUND)),

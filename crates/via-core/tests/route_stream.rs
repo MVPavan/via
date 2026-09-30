@@ -220,7 +220,7 @@ fn route_forwards_every_observation_in_order() {
     let expected: Vec<&Value> = lines
         .iter()
         .filter(|line| {
-            ["accepted", "text", "tool_started", "tool_ended"]
+            ["accepted", "text", "tool_started", "tool_ended", "terminal"]
                 .contains(&line["type"].as_str().unwrap())
         })
         .collect();
@@ -230,6 +230,13 @@ fn route_forwards_every_observation_in_order() {
             FakeObservation::Accepted(accepted) => {
                 assert_eq!(line["type"], "accepted");
                 assert_eq!(accepted.vendor_turn_id.as_str(), "fake-turn-1");
+            }
+            // Task 4 design §2.3: the terminal's final text, one piece.
+            FakeObservation::Data {
+                observation: Observation::FinalText(text),
+            } => {
+                assert_eq!(line["type"], "terminal");
+                assert_eq!(line["final_text"], text.as_str());
             }
             FakeObservation::Data {
                 observation: Observation::Progress(marks),
