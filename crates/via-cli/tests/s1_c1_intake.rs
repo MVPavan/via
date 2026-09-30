@@ -43,6 +43,7 @@ const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const MIB: usize = 1024 * 1024;
 const READ_DELAY: &str = "store.read.delay_ms";
 const COPY_PAUSE: &str = "prompt_file.copy.pause";
+const FREE_BYTES: &str = "store.statvfs.free_bytes";
 
 // ---------------------------------------------------------------- fixtures
 
@@ -896,7 +897,9 @@ fn large_text(tag: &str) -> String {
 /// rewritten under the same key is `idempotency_conflict` and the stored
 /// blob still matches; a paused copy holds no lock (`close` and
 /// `daemon/status` answer within 100 ms), and an append during it is
-/// `changed` with no blob left; a FIFO, a directory, a relative path, a
+/// `changed` with no blob left; below a lowered floor the keyed retry is
+/// still answered and leaves no blob, while an unkeyed one is refused
+/// `disk_free_floor` (T4-7); a FIFO, a directory, a relative path, a
 /// missing file, 16 MiB + 1 bytes and invalid UTF-8 are refused by reason.
 #[test]
 #[expect(
@@ -911,6 +914,12 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
         evidence,
         |evidence| {
             hits::count(&setup.dir, COPY_PAUSE).map_err(infra)?;
+            // A lowered floor (design §5.5), crossed below by `FREE_BYTES`.
+            fs::write(
+                setup.sandbox.state.join("daemon.json"),
+                r#"{"disk":{"free_floor":1048576}}"#,
+            )
+            .map_err(infra)?;
             let daemon = setup.start(evidence, &[])?;
             let pid = setup.pid(evidence)?;
             let file = setup.root.join("prompt.txt");
@@ -973,6 +982,31 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             check(setup.blobs()?.len() == blobs, || {
                 "a replayed retry left a blob".to_owned()
             })?;
+            // Below the lowered floor (T4-7, design §5.3 [t4r18.1]): the
+            // keyed retry is answered from its key and leaves no blob.
+            setup
+                .failpoints
+                .arm(FREE_BYTES, 1, "value_persist:4096")
+                .map_err(infra)?;
+            let below = conn.exchange(&line(&json!(6), "spawn", &spawn_file(path, Some("k1"))))?;
+            check(
+                below["result"]["session_id"] == session.as_str()
+                    && below["result"]["turn"] == receipt["turn"],
+                || format!("same content under k1 below the floor: {below}"),
+            )?;
+            check(setup.blobs()?.len() == blobs, || {
+                "a replayed retry below the floor left a blob".to_owned()
+            })?;
+            let refused = conn.exchange(&line(&json!(7), "spawn", &spawn_file(path, None)))?;
+            check(
+                is_error(&refused, -32012, "admission_refused")
+                    && refused["error"]["data"]["kind2"] == "disk_free_floor",
+                || format!("an unkeyed prompt file below the floor: {refused}"),
+            )?;
+            check(setup.blobs()?.len() == blobs, || {
+                "a refused prompt file below the floor left a blob".to_owned()
+            })?;
+            setup.failpoints.disarm(FREE_BYTES).map_err(infra)?;
             fs::write(&file, large_text("second ")).map_err(infra)?;
             let conflict =
                 conn.exchange(&line(&json!(2), "spawn", &spawn_file(path, Some("k1"))))?;

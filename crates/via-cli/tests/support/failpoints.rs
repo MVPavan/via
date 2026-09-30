@@ -70,16 +70,23 @@ impl Failpoints {
         // `delay_persist:<ms>` delays every hit from `occurrence` on by
         // `<ms>` milliseconds, each acknowledged as `delay` (Task 4 design
         // §13.1 `store.read.delay_ms`).
+        // `value_persist:<n>` makes every hit from `occurrence` on report
+        // the value `<n>`, each acknowledged as `value` (Task 4 design §13.1
+        // `store.statvfs.free_bytes`).
+        let number = |prefix: &str| {
+            action
+                .strip_prefix(prefix)
+                .and_then(|number| number.parse::<u64>().ok())
+        };
         let command = match action {
             "fail_io_persist" => json!({"token":self.token,"occurrence":occurrence,
                 "action":"fail_io","persist":true}),
-            action => match action
-                .strip_prefix("delay_persist:")
-                .and_then(|millis| millis.parse::<u64>().ok())
-            {
-                Some(millis) => json!({"token":self.token,"occurrence":occurrence,
+            action => match (number("delay_persist:"), number("value_persist:")) {
+                (Some(millis), _) => json!({"token":self.token,"occurrence":occurrence,
                     "action":"delay","value":millis,"persist":true}),
-                None => json!({"token":self.token,"occurrence":occurrence,"action":action}),
+                (None, Some(value)) => json!({"token":self.token,"occurrence":occurrence,
+                    "action":"value","value":value,"persist":true}),
+                (None, None) => json!({"token":self.token,"occurrence":occurrence,"action":action}),
             },
         };
         let temporary = self.dir.join(format!(".{point}.json.tmp"));
