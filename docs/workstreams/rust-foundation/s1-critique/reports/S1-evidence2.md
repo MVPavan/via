@@ -570,9 +570,13 @@ Gate exit 0. No process from this worktree was left afterwards.
   and SQLite row scanning in `snapshot`. The first two are local syscalls.
   A late scan is recorded by `verify`'s late check.
 - **`anchors_by` now accepts a missing Store file as an empty
-  inventory.** This is sound only because it runs after the direct child's
-  teardown, when no process of that generation remains to create the Store.
-  Revisit if a guard ever runs anchor cleanup before the reap.
+  inventory.** It runs after the direct child's teardown, but not only
+  after a *successful* reap: `Teardown::daemon_generation` runs the anchor
+  cleanup even when the child was not reaped (corrected in fix round 3).
+  In that case the retained reap failure keeps the generation, and so the
+  teardown, incomplete, so the missing-Store result cannot make it pass.
+  After a successful reap, no process of that generation remains to create
+  the Store.
 - **Every daemon generation is now validated (finding 1).** A scenario
   that deliberately leaves an unprovable fabricated anchor must remove it
   before that generation's teardown, as the two `s1_crash_points` t2d
@@ -580,3 +584,59 @@ Gate exit 0. No process from this worktree was left afterwards.
 - **Timing assertions (finding 15).** These use a 500 ms tolerance under
   the parallel gate. None failed in the 3 failpoint runs or the 5 selector
   repeats.
+
+## Fix round 3
+
+**Status: DONE_WITH_CONCERNS.** Review:
+`scratchpad/execution/s1-critic/review-s1-evidence2-sol-r3.md` (Sol r3)
+reported findings 1 and 2, plus bead `via-t76` (the F4 class). The base is
+`0f31b74`, which merges `rust-foundation` (S1-runtime2).
+
+| Item | Change | Regression | RED on `0f31b74` |
+|---|---|---|---|
+| F8 remainder (r3 finding 1) | **`s1_store_failure`:**<br>- `stop_clean` begins the scenario's deadline before any stop work.<br>- `stop_clean_by(deadline)` gives the idle wait, the `daemon stop` (new `ok_within`) and the exit wait only the time left, then runs the outer cleanup by the same deadline.<br>- `stop_clean_between` is the explicit intermediate version with its own bound; `verify_anchors_between` was folded into it.<br>**Exited guards:** the drops in `support/daemon.rs`, `s1_recovery`, `s1_crash_points` and `s1_daemon_stop` now always begin or join the one deadline, live or exited.<br>**Restarts:** a restart after an exited run needs an explicit `shutdown()`. `s1_recovery` gains `shutdown`, with `tear_down` split out. Converted sites: 26 in `s1_crash_points`, 2 `refused` runs in `s1_recovery`, and `crash_with_queued_turns`. `s1_daemon_stop` runs one daemon per scenario and needed none. | `s1_store_failure::s1_store_harness_final_stop_is_within_the_teardown_deadline` (the reviewer's probe): a final stop of a never-exiting child must be a typed timeout within 10 s + 1 s. | Succeeded after 12.0 s. |
+| F5 remainder (r3 finding 2) | **`run()` in `s1_recovery`, `s1_crash_points` and `s1_daemon_stop`:** a lost output write is attached to the capture and recorded in `Paths::lost_outputs`. The capture is returned, so callers classify the exit; `s1_recovery::ok` puts the note in its failure.<br>**Scenario cleanup:** it runs the Store evidence, `collect_available` and `outputs_written` in turn, and reports all their failures together. The Store evidence step no longer short-circuits `collect_available`. | `s1_recovery::s1_recovery_harness_exit_failure_survives_a_lost_output_write` (the reviewer's probe): `false` with its stdout path taken by a directory must give a `Failure` that names both the exit and the lost write. | `Infrastructure("probe output not written: Is a directory")` |
+| F4 class (`via-t76`) | **`sendable`** keeps a typed `ScenarioError` through a thread's result, and turns any other error into `Failure`, as before. It is in `s1_lifecycle`, `s1_turn_control` and `s1_store_failure`.<br>**Sites:** all 22 thread closures that stringified errors (20 in `s1_turn_control`, 1 in `s1_lifecycle`, 1 in `s1_store_failure` `background`), plus `joined`'s handle type.<br>**`c1_protocol::foreign_listener`:** "client never connected" is now a `Timeout`, and other errors are `Infrastructure`.<br>A panicked thread still yields a failure; a timeout seen by the main thread first is not replaced. | `s1_store_failure::s1_store_harness_background_timeout_stays_typed` (a 300 ms `background_within`) | The timeout reached the joiner as an untyped string. |
+| Report wording (r3) | The fix round 2 concern about the missing Store is corrected above: anchor cleanup also runs after an unsuccessful reap, and the retained reap failure keeps the teardown incomplete. The behaviour is unchanged. | — | — |
+
+`background_within` is a behaviour-neutral refactor of `background`, added
+with the regression so that it needs no 60 s wait.
+
+Logs in `scratchpad/s1/evidence2/`:
+- `r3-red-0f31b74.log`: all 3 RED.
+- `r3-green.log`: all 3 GREEN; the final stop returns in 10.0 s.
+- `r3-failpoints-pre.log`: the first failpoint run, whose 5 recovery
+  failures led to the `crash_with_queued_turns` shutdown.
+- `r3-gate.log`, `r3-failpoints-run2.log`, `r3-failpoints-run3.log`.
+
+### Gates (fix round 3)
+
+| Check | Result |
+|---|---|
+| fmt; Clippy default and failpoints | pass |
+| Default nextest | 366 passed, 1 skipped |
+| `cargo deny`; layers | pass |
+| Failpoint nextest, 3 runs | 582 passed, 1 skipped each |
+| F08/F09/F10/F12 selector | 61 passed |
+| Release build and `check-release-features.py` | pass: 649 nodes, 0 of 121 markers |
+| Task 4 selector, 5 repeats | 92 passed each time |
+
+Gate exit 0. No process from this worktree was left afterwards.
+
+### Concerns (fix round 3)
+
+- **The final clean stop now fits inside 10 s.** In `s1_store_failure`,
+  the idle wait, the stop and the exit used to have 20 s + 60 s + 15 s.
+  They now share the teardown's 10 s. A final shutdown slower than that is
+  now a recorded timeout, as §11.2 requires. None occurred in the runs
+  above.
+- **Retained killed runs.** In `s1_recovery` scenarios, a killed run that
+  is retained until the end is dropped at scope end with the final run. It
+  therefore joins the one deadline, which is the reviewer's "retained
+  crashed guards" case.
+- **`latched_exit` is unchanged.** In `s1_store_failure`, it waits up to
+  20 s for the daemon's own latch exit before `verify_anchors` begins the
+  deadline. That exit is the behaviour under test, not teardown work, so it
+  stays outside the budget.
+- **Unchanged limitations** from fix round 2: the D-state reap, the C1
+  blocking connect and the `/proc` environ reads.
