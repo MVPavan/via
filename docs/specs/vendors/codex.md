@@ -158,8 +158,9 @@ are checked against `model/list` inside `run_turn` before `turn/start`, and a
 mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` and no
 `turn/start` written. Live checks use `gpt-6-luna` at low or medium effort. Reject an
 unsupported explicit `max_steps`; this route has no matching control.
-`outputSchema:null` is emitted to clear VIA inheritance. Nonempty final agent
-text is the structured output, which Core validates: present but invalid
+`outputSchema:null` is emitted to clear VIA inheritance. When an output schema
+is requested, nonempty final agent text is the structured output, which Core
+validates: present but invalid
 output, including text that does not parse as JSON, fails
 `structured_output_invalid`; a completed turn with a requested schema and no
 final text keeps the terminal status and adds warning `structured_output_missing`
