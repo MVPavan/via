@@ -1601,6 +1601,39 @@ fn over_proxy(sandbox: &Sandbox, input: &[u8]) -> Result<Vec<u8>, ScenarioError>
     Ok(output.stdout)
 }
 
+/// Runs `serve --stdio` whose stdout reader has gone, sends `request` and
+/// keeps stdin open; returns its output once it exits (at most 20 s).
+fn proxy_with_closed_stdout(
+    sandbox: &Sandbox,
+    request: &str,
+) -> Result<std::process::Output, ScenarioError> {
+    let mut command = sandbox.command();
+    command
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(infra)?;
+    // The reader exits: the proxy's first reply write fails (EPIPE).
+    drop(child.stdout.take());
+    let mut stdin = child.stdin.take().ok_or_else(|| infra("no stdin"))?;
+    writeln!(stdin, "{request}").map_err(infra)?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().map_err(infra)?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ScenarioError::Timeout(
+                "serve --stdio did not exit with stdout closed".to_owned(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Stdin stayed open until the proxy exited.
+    drop(stdin);
+    child.wait_with_output().map_err(infra)
+}
+
 /// Runs `serve --stdio` with a directory as stdin, whose reads fail, and
 /// returns its output once it exits (at most 20 s).
 fn proxy_with_unreadable_stdin(
@@ -1700,6 +1733,17 @@ fn s1_c1_serve_stdio_matches_the_socket() -> TestResult {
                 .map_err(infra)?;
             check(!unreadable.status.success(), || {
                 "a failed stdin read exited 0".to_owned()
+            })?;
+
+            // T4-5 review round 2: stdout closed while stdin stays open;
+            // the first reply fails to write and the proxy exits, non-zero.
+            let closed =
+                proxy_with_closed_stdout(&setup.sandbox, &line(&json!(0), "hello", &hello))?;
+            evidence
+                .write("proxy_closed_stdout.stderr", &closed.stderr)
+                .map_err(infra)?;
+            check(!closed.status.success(), || {
+                "a failed stdout write exited 0".to_owned()
             })
         },
         |evidence| setup.collect(evidence),

@@ -465,28 +465,37 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
         // so its side ends too. Safe to ignore: a daemon that already
         // closed the connection has nothing to shut.
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
-        read.map(|()| false)
+        Copied::Stdin(read)
     });
     copies.spawn_blocking(move || {
         let mut stdout = io::stdout().lock();
-        io::copy(&mut from_daemon, &mut stdout)?;
-        stdout.flush()?;
-        io::Result::Ok(true)
+        let forwarded = io::copy(&mut from_daemon, &mut stdout).and_then(|_| stdout.flush());
+        Copied::Stdout(forwarded)
     });
-    // The daemon's side ending ends the proxy, whatever stdin is doing; a
-    // failed stdin read is reported once the replies are forwarded.
+    // The daemon's side ending ends the proxy, whatever stdin is doing: at
+    // once when writing stdout failed; a failed stdin read is reported
+    // once the replies are forwarded.
     let mut stdin_failed = None;
     while let Some(copied) = copies.join_next().await {
         match copied? {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(error) => stdin_failed = Some(error),
+            Copied::Stdout(Ok(())) => break,
+            Copied::Stdout(Err(error)) => bail!("writing stdout: {error}"),
+            Copied::Stdin(Ok(())) => {}
+            Copied::Stdin(Err(error)) => stdin_failed = Some(error),
         }
     }
     if let Some(error) = stdin_failed {
         bail!("reading stdin: {error}");
     }
     Ok(0)
+}
+
+/// How one of `serve --stdio`'s two copies ended.
+enum Copied {
+    /// Stdin to the daemon: EOF, or the failed stdin read.
+    Stdin(io::Result<()>),
+    /// The daemon to stdout: the daemon's EOF, or the failed stdout write.
+    Stdout(io::Result<()>),
 }
 
 /// Copies stdin to the daemon until EOF. A failed read is the error; a
