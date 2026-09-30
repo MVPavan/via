@@ -17,10 +17,10 @@ use tokio::time::Instant;
 use via_adapters::{RouteError, StoreFailure};
 use via_store::{QueuedTurn, StoreClient, StoreError, SubmitFailedRecord};
 
-use super::drive::{Step, SubmitFailure};
+use super::drive::{Cancelled, Step, SubmitFailure};
 use super::journal::Head;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::Slot;
+use super::queue::{Owner, Slot};
 use super::terminal::terminal_envelope;
 use super::{Engine, FailureNote, Terminal, TurnRecord, failure};
 use crate::api::{Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
@@ -54,8 +54,9 @@ fn read_failure_bound() -> Duration {
 
 /// The dispatcher's read-failure streak for its queue head (design §7.3
 /// [r3.8]). It starts when the head's read sequence (predecessors, then the
-/// queued row, then the head lock) first fails, with an absolute deadline,
-/// and resets only when that sequence completes or the head changes. It
+/// queued row, then the head lock), or a dispatcher-owned cancellation's
+/// reads (§3.1), first fails, with an absolute deadline, and resets only
+/// when that sequence completes or the head changes. It
 /// lives in the dispatcher and needs no lock; its wake is the dispatcher's
 /// read-retry timer.
 pub(super) struct ReadStreak {
@@ -213,7 +214,8 @@ impl Engine {
     /// claims it and fails it with row 2's resolution write, without agent
     /// I/O. The queueing comes from the committed `turn.queued`, since the
     /// row may be what cannot be read; when even that read fails, the
-    /// resolution write cannot be issued, which escalates. A head that
+    /// resolution write cannot be issued, which escalates. A dispatcher-owned
+    /// cancellation's streak is [`Self::cancel_expired`]'s. A head that
     /// changed, a close order, force or the latch leave the turn to their
     /// own path. The caller holds no lock.
     pub(super) async fn read_expired(
@@ -222,6 +224,9 @@ impl Engine {
         session: &SessionId,
         turn: TurnNumber,
     ) -> Step {
+        if slot.dispatcher_cancelling(turn) {
+            return self.cancel_expired(slot, session, turn).await;
+        }
         if !slot.claim(turn) {
             return Step::Next;
         }
@@ -248,6 +253,44 @@ impl Engine {
         };
         self.submit_failed(slot, session, turn, queueing, READ_FAILED)
             .await
+    }
+
+    /// The read streak of a dispatcher-owned cancellation of `turn` expired
+    /// (design §3.1 `Cancelling{dispatcher}`, §7.3): the turn is cancelled
+    /// from its committed `turn.queued`, since the queued row may be what
+    /// cannot be read, keeping the cancellation's cause. It is never
+    /// submitted, so the `unknown` barrier holds [s4.8]. A closing slot is
+    /// accepted: this is the close pass's own cancellation. When even
+    /// `turn.queued` cannot be read the write cannot be issued, which
+    /// escalates as in [`Self::read_expired`]; a commit that fails is
+    /// published to joined callers, as any dispatcher cancellation's. Force
+    /// or the latch leave the turn to their own path. The caller holds no
+    /// lock.
+    async fn cancel_expired(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
+        if !self.grant() {
+            return Step::Next;
+        }
+        let scope = FailureScope::Turn(session, turn);
+        self.store_failure(FailureSite::Read, WriteOutcome::NotCommitted, scope)
+            .finish()
+            .await;
+        let queueing = match self.queueing(session, turn).await {
+            Ok(queueing) => queueing,
+            Err(outcome) => {
+                self.store_failure(FailureSite::Resolution, outcome, scope)
+                    .finish()
+                    .await;
+                return Step::Next;
+            }
+        };
+        let owned = (turn, Owner::Dispatcher);
+        let cancelled = self
+            .commit_queued_cancel(slot, session, owned, false, (slot.cause(turn), queueing))
+            .await;
+        if !matches!(cancelled, Cancelled::Committed(_)) {
+            slot.cancel_failed(turn, cancelled.published());
+        }
+        Step::Next
     }
 
     /// Design §7.2 rows 3, 4 and 6 [O1.D10, D11]: a Store write the turn's

@@ -118,26 +118,30 @@ impl Engine {
     /// 32 reads per second, and a turn's end is seen at most 1 s late.
     /// Once final shutdown committed its last record, a result still
     /// missing can never commit in this daemon: the wait ends
-    /// `daemon_stopping`.
+    /// `daemon_stopping`. The deadline bounds its Store reads too
+    /// ([`by_deadline`]): a turn already terminal when the first check
+    /// completes within it is returned.
     pub async fn wait(&self, params: WaitParams) -> Result<Box<RawValue>, ApiError> {
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or(ApiError::INVALID_PARAMS)?;
-        let (session, turn) = self.address(&params.address).await?;
+        let (session, turn) = by_deadline(deadline, self.address(&params.address)).await?;
         let public = self.store.public();
         let mut checked = false;
         let mut registered = false;
         loop {
             // Read before the Store: a result committed before finalization is seen.
             let finalized = self.finalized.load(Ordering::Acquire);
-            if self.read_facts_on(&public, &session, turn).await?.is_some()
-                && let Some(result) = self.read_result(&session, turn).await?
+            let facts = self.read_facts_on(&public, &session, turn);
+            if by_deadline(deadline, facts).await?.is_some()
+                && let Some(result) =
+                    by_deadline(deadline, self.read_result(&session, turn)).await?
             {
                 return Ok(result);
             }
             if !checked {
-                self.exists(&session, turn).await?;
+                by_deadline(deadline, self.exists(&session, turn)).await?;
                 checked = true;
             }
             if finalized {
@@ -437,6 +441,18 @@ fn evidence_files(folder: &std::path::Path) -> std::io::Result<Vec<Value>> {
         }
     }
     Ok(files)
+}
+
+/// Bounds one of `wait`'s Store reads by the wait's absolute deadline
+/// (C1 §3.8): a read still pending then is `wait_timeout`. Dropping it only
+/// drops its reply receiver; Store keeps ownership of a read it admitted.
+async fn by_deadline<T>(
+    deadline: tokio::time::Instant,
+    read: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    tokio::time::timeout_at(deadline, read)
+        .await
+        .unwrap_or(Err(ApiError::WAIT_TIMEOUT))
 }
 
 #[cfg(test)]

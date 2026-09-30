@@ -264,7 +264,9 @@ impl Engine {
 
     /// Performs the dispatcher-owned cancellation of `turn` with its cause
     /// (design §3.1): a P6 cancellation, a rollback's cancel or the close
-    /// pass's. A failed read keeps the claim and retries on the timer.
+    /// pass's. A failed read keeps the claim and feeds the read streak
+    /// (§7.3), which retries on the timer and, at its deadline, cancels the
+    /// turn from its committed `turn.queued` ([`Engine::read_expired`]).
     pub(super) async fn dispatcher_cancel(
         &self,
         slot: &Slot,
@@ -277,7 +279,7 @@ impl Engine {
             .await;
         match cancelled {
             Cancelled::Committed(_) => Step::Next,
-            Cancelled::Unread => Step::Wait,
+            Cancelled::Unread => Step::Unread(turn),
             cancelled @ (Cancelled::Failed(_) | Cancelled::Latched | Cancelled::Expired) => {
                 slot.cancel_failed(turn, cancelled.published());
                 Step::Next
@@ -862,6 +864,21 @@ impl Engine {
             }
             return Cancelled::Unread;
         };
+        self.commit_queued_cancel(slot, session, (turn, owner), closing, (cause, queued))
+            .await
+    }
+
+    /// [`Self::cancel_queued`] after its reads, from the turn's `queued`
+    /// facts: the queued row's, or the committed `turn.queued`'s when the
+    /// row cannot be read (design §7.3 [s4.8]).
+    pub(super) async fn commit_queued_cancel(
+        &self,
+        slot: &Slot,
+        session: &SessionId,
+        (turn, owner): (TurnNumber, Owner),
+        closing: bool,
+        (cause, queued): (Option<(CancelCause, String)>, Queueing),
+    ) -> Cancelled {
         let (started, record, terminal, extras) =
             queued_cancellation(slot, session, turn, queued, cause);
         let cancel = terminal.cancel.clone();

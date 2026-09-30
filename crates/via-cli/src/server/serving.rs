@@ -21,6 +21,7 @@ use tokio::{
 use via_core::{ApiError, DaemonStopParams, Engine, FinalEntry, SessionId, StopMode};
 
 use super::dispatch::handle_client;
+use super::shutdown::{Bound, Entry};
 use super::{Client, drive_joined, spawn_dispatcher};
 
 /// Runtime §8: a daemon with nothing to do exits after this long.
@@ -44,9 +45,9 @@ pub(super) struct IdleStop {
 /// Why serving ended.
 pub(super) struct Exit {
     pub(super) mode: StopMode,
-    /// Final shutdown was entered while serving; idle expiry enters only
-    /// once the listener is gone.
-    pub(super) entered: bool,
+    /// Final-shutdown entry that began while serving, returned or expired;
+    /// idle expiry enters only once the listener is gone.
+    pub(super) entered: Option<Entry>,
 }
 
 /// Daemon main's owned work while it serves.
@@ -81,12 +82,16 @@ impl Main {
     /// Serves until final shutdown. Drain keeps serving until accepted work
     /// settles; force, the latch's force signal and an accepted plain stop
     /// enter final shutdown at once, still serving until entry returns
-    /// (design §6.8); idle expiry stops serving first (§6.4).
+    /// (design §6.8); idle expiry stops serving first (§6.4). Entry is
+    /// bounded by final shutdown's deadline, taken when it begins (§7.4):
+    /// an entry still waiting for `admission` then is dropped (the lock
+    /// wait is cancel-safe; the fence may stay unset) and final shutdown
+    /// continues, incomplete.
     pub(super) async fn serve(&mut self, listener: &UnixListener, client: &Client) -> Exit {
         let idle_exit = idle_exit_interval();
         let engine = Arc::clone(&self.engine);
         let mut forced = engine.force_signal();
-        let mut entering: Option<Entering<'_>> = None;
+        let mut entering: Option<(Entering<'_>, Bound)> = None;
         let mut idle_since: Option<Instant> = None;
         loop {
             // Core's mode is read first, so a start and a stop both ready
@@ -101,7 +106,8 @@ impl Main {
                     None => false,
                 };
                 if enter {
-                    entering = Some(Box::pin(engine.enter_final_shutdown()));
+                    let bound = Bound::begin(&engine);
+                    entering = Some((Box::pin(engine.enter_final_shutdown()), bound));
                 }
             }
             self.reap_clients();
@@ -112,6 +118,8 @@ impl Main {
             };
             let serving = entering.is_none();
             let idle_at = idle_since.and_then(|since| since.checked_add(idle_exit));
+            let bound = entering.as_ref().map(|(_, bound)| *bound);
+            let entry_by = bound.map(|bound| bound.deadline);
             tokio::select! {
                 accepted = listener.accept() => self.accept(accepted, client),
                 Some(session) = self.starts.recv(), if serving => {
@@ -146,14 +154,20 @@ impl Main {
                 _ = poll_entry(&mut entering), if !serving => {
                     return Exit {
                         mode: engine.stop_mode().unwrap_or(StopMode::Force),
-                        entered: true,
+                        entered: bound.map(|bound| Entry { bound, expired: false }),
+                    };
+                }
+                () = sleep_until(entry_by), if !serving => {
+                    return Exit {
+                        mode: engine.stop_mode().unwrap_or(StopMode::Force),
+                        entered: bound.map(|bound| Entry { bound, expired: true }),
                     };
                 }
                 () = sleep_until(idle_at), if serving && idle_at.is_some() => {
                     if self.idle_expired(listener, client).await {
                         return Exit {
                             mode: StopMode::Idle,
-                            entered: false,
+                            entered: None,
                         };
                     }
                     idle_since = None;
@@ -301,9 +315,9 @@ fn accept_now(
 }
 
 /// Resolves when entry in progress returns; never while none is.
-async fn poll_entry(entering: &mut Option<Entering<'_>>) -> FinalEntry {
+async fn poll_entry(entering: &mut Option<(Entering<'_>, Bound)>) -> FinalEntry {
     match entering.as_mut() {
-        Some(entry) => entry.await,
+        Some((entry, _)) => entry.await,
         None => std::future::pending().await,
     }
 }
