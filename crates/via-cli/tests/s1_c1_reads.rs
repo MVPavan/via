@@ -415,6 +415,8 @@ fn s1_c1_list_creation_order_and_last_active() -> TestResult {
                 ("empty", "l3."),
                 ("sign", "l3.-1"),
                 ("word", "l3.x"),
+                // An `ord` is an SQLite integer: above i64::MAX is malformed.
+                ("above_i64", "l3.9223372036854775808"),
             ] {
                 refused(
                     &sandbox,

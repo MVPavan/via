@@ -790,7 +790,8 @@ pub struct ListParams {
 
 impl ListParams {
     /// The Store query the parameters name; a cursor other than `l3.`
-    /// and decimal digits, or a bad filter, is `invalid_params`.
+    /// and decimal digits at most `i64::MAX`, or a bad filter, is
+    /// `invalid_params`.
     pub(crate) fn query(self) -> Result<via_store::ListQuery, ApiError> {
         let before = match self.cursor.as_deref() {
             None => None,
@@ -799,11 +800,12 @@ impl ListParams {
                 if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err(ApiError::INVALID_PARAMS);
                 }
-                Some(
-                    digits
-                        .parse::<u64>()
-                        .map_err(|_| ApiError::INVALID_PARAMS)?,
-                )
+                // Design §6.8: `ord` is an SQLite integer, a non-negative
+                // i64; a larger value is malformed.
+                let ord = digits
+                    .parse::<i64>()
+                    .map_err(|_| ApiError::INVALID_PARAMS)?;
+                Some(ord.unsigned_abs())
             }
         };
         if self
