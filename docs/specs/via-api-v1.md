@@ -364,11 +364,12 @@ session lacks a proof of absence, else `quiescent` (T4-A23).
 
 `adapter_version` is the session's recorded adapter version, advanced by a
 compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
-from the latest turn's instance handshake (`vendor_version` null before any
-handshake; C2 §5). `inherit` holds the effective state (`on`, `off` or
+from the described turn's instance handshake (`vendor_version` null before
+any handshake; C2 §5). `inherit` holds the effective state (`on`, `off` or
 `unknown`) of each inherited-configuration category, frozen at spawn
-(C2 §6.2). `warnings` repeats the session's standing warnings:
-`vendor_version_untested` while `version_status` is `untested`, and
+(C2 §6.2). `warnings` repeats the standing warnings:
+`vendor_version_untested` while the described turn's `version_status` is
+`untested`, and
 `config_switch_unverified` with `data.categories` while any effective state
 differs from the verified requested state.
 

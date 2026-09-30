@@ -490,7 +490,7 @@ model, variant, system, format, session/message identity, `--auto`,
 | C1/C2 operation | Vendor operation / local behavior |
 |---|---|
 | `hello`, `describe`, `models` | VIA metadata/catalog; model discovery on a previously owned authenticated server can use `GET /provider`, keeping only public model/capability fields |
-| `open_session` / spawn | Logical: no vendor I/O (C2 §2). In the first `run_turn` of a connection generation: subscribe SSE first; `POST /session?directory=<cwd>` with explicit model/agent and full-bound never-ask permission policy; confirm and persist the returned `ses…` ID before the prompt |
+| `open_session` / spawn | Logical: no vendor I/O (C2 §2). In the first `run_turn` of a connection generation: subscribe SSE first. With no stored vendor ID (initial creation), `POST /session?directory=<cwd>` with explicit model/agent and full-bound never-ask permission policy, and confirm and persist the returned `ses…` ID before the prompt. With a stored ID (resume or idle reopen), follow the Resume / idle reopen row instead; never create |
 | `run_turn` submission | One `POST /session/{id}/prompt_async` with frozen request below; HTTP 204 is vendor dispatch acceptance, never completion, and does not validate the model |
 | Resume / idle reopen | Reuse recorded namespace + exact vendor ID; `GET /session/{id}` verifies identity/directory; then one new submission. Missing/mismatching ID fails, never silently create/fork |
 | Steer | Named unsupported-verb refusal, no vendor request (§3) |
