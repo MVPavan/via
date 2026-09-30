@@ -123,9 +123,10 @@ Coordination rules (proposed):
   Codex login. Sol medium reviews it like any Opus work.
 - Reviews (owner, 2026-09-30): Codex **GPT-6.1 Sol** (`gpt-6.1-sol`) at high
   effort runs reviews and critiques from now on, replacing GPT-6 Sol.
-- Review scope (owner, 2026-09-30):
-  - A chunk or fix-round review checks only the defects that the chunk introduced, and the gaps left in the findings it fixes.
-  - Pre-existing issues it notices become beads, which the orchestrator triages; they do not add a round.
+- Review scope (owner, 2026-09-30; revised the same day):
+  - A chunk's first review finds every issue in the code the chunk touches and in the classes of the findings it fixes, including pre-existing ones and every instance, in one pass; the chunk fixes them in one round.
+  - A later fix-round review checks only whether those issues are fixed and the defects the fix itself introduced.
+  - Issues outside the chunk's code become beads, which the orchestrator triages; they do not add a round.
   - The orchestrator checks minor fixes without another review.
   - Each large piece of work (a task, stage or epic) ends with one critique that is fully independent and starts from scratch, unscoped by diffs or earlier findings.
 - Reviews (owner, 2026-09-27): **GPT-6 Sol** reviews the Opus-built work,
