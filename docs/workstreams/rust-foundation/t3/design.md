@@ -14,6 +14,8 @@ in `s4-r1-decisions.md` (`[s4.1]`) and `reports/T3-S4.md` (`[S4]`), and
 S5's in `s5-r1-decisions.md` (`[s5.1]`) and `reports/T3-S5.md` (`[S5]`).
 The whole-task review's decisions are in `t3-review-decisions.md` (`[t3r.1]`),
 and the force-row fix in `reports/T3-force-row.md` (`[T3-FR]`).
+The S1 critique's round-2 fixes are in
+`../s1-critique/reports/S1-runtime2.md` (`[s1c.r2]`).
 Code references follow the merged S0 split (`08fffce`). Normative for Task 3 (`via-jm4.7.7`) once
 accepted.
 
@@ -243,8 +245,18 @@ never extends permissible vendor work.
      finalization, Route still returns the terminal evidence, with cleanup
      from Host (`uncertain` when unproven). It never returns `Deadline`
      for an already decoded terminal (C1 §7.4, [r1.23]).
+     At wall expiry Route starts Host's force close at once and delivers
+     any message it still holds concurrently; delivery, close and drain
+     share one absolute cleanup deadline. Delivery that cannot finish by
+     then is `Overflow`. The connection latch does not change a decoded
+     late terminal's result; the daemon force does (rule 4). On the normal
+     path a latch during finalization still fails the turn [s1c.r2].
 4. **Precedence.** The daemon force watch overrides an order: the result is
-   the existing `ForceStopped`. The order's cause and `requested_at` travel
+   the existing `ForceStopped`. Route reapplies the force after any
+   successful exit's drain, and returns `ForceStopped` with the close's
+   exit, cleanup, forced and journal evidence. The Adapter hands over
+   post-Route data that is deliverable without waiting even under the
+   force; `Overflow` is only a real delivery failure [s1c.r2]. The order's cause and `requested_at` travel
    with the forced turn to final shutdown. That watch is raised by `daemon
    stop --force` and by the Store latch (§7.4). A scoped failure never
    raises it [O1.D3].
@@ -987,6 +999,11 @@ a Store operation, a session head, or `admission`.
   and 3, force, cancel and close) go through the same owner. The two stops
   therefore cannot conflict: `Stop` is idempotent and can only shorten the
   deadline (runtime §5.1), so a second stop is a no-op.
+- **Forced final text kept** [s1c.r2]. A forced turn carries the final
+  text Core received before the force, inline or its synced
+  `final_text.txt`, into its terminal. A failed file step fails it
+  `store`, as on the natural path. Text Core holds is complete, since the
+  Adapter sends only completed text (T4 design §2.3).
 - **Forced evidence kept** [r5.4].
   - The early stop records the anchor's `Stopping{stopped_live}` reply in
     the control's in-memory stop facts (`StopFacts.forced`). This is not a
@@ -1277,8 +1294,11 @@ the resolution write's `turn.ended` and envelope.
 - any escalation (§7.2);
 - SQLite corruption.
 
-The two-phase latch mechanism (dispatch-design §3.2) is unchanged. After
-the latch:
+The two-phase latch mechanism (dispatch-design §3.2) is unchanged. A
+terminal commit that may have written, or hit corruption, raises phase one
+before its read-back; the read-back is bounded at 2 s and keeps a result
+it finds committed. The failure is classified from the commit's typed
+outcome, so corruption stays `corrupt_store` [s1c.r2]. After the latch:
 
 - every mutation and grant is refused daemon-wide, as today;
 - `cancel` and `close` return `store_error`, and the latch's force stop

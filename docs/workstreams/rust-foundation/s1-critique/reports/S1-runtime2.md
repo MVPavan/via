@@ -379,7 +379,10 @@ RED ran against the pre-round code while keeping the new tests and seams:
   `Uncertain` as `outcome_of` did; forced text not applied)
   (`r2-red-core.log`).
 
-GREEN is in `r2-green-new.log`, and every test passes in the gate.
+GREEN is the gate (`r2-gate.log`). `r2-green-new.log` is an intermediate
+run from before `s1_f12_corrupt_terminal_write_latches_as_corruption`'s
+end-state assertion was corrected to `failed` (design §7.4); it shows
+that test failing (coordinator's correction, from Sol r3).
 
 | Test | Finding | RED | GREEN |
 |---|---|---|---|
