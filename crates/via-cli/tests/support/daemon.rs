@@ -221,27 +221,32 @@ impl<'a> Daemon<'a> {
         self.child.id()
     }
 
+    /// Whether the child exited by `within`; checked at least once.
     fn reap(&mut self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
+        loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => return true,
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => return false,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                Ok(None) | Err(_) => return false,
             }
         }
-        false
     }
 }
 
 impl Drop for Daemon<'_> {
+    /// Runtime §11.2 teardown under one deadline taken on entry: force-stop
+    /// for at most 2 s, the exit wait, a kill with at most 1 s to reap, and
+    /// the anchor cleanup each get only the time left.
     fn drop(&mut self) {
+        let deadline = Instant::now() + outer_cleanup::TEARDOWN;
+        let left = || outer_cleanup::left(deadline);
         let was_alive = matches!(self.child.try_wait(), Ok(None));
         let mut stop = "not_attempted";
         if was_alive {
             stop = match self.sandbox.run(
                 &["daemon", "stop", "--force", "--json"],
-                Duration::from_secs(2),
+                left().min(Duration::from_secs(2)),
             ) {
                 Ok(capture) if capture.timed_out => "timed_out",
                 Ok(capture) if capture.status.success() => "accepted",
@@ -250,20 +255,21 @@ impl Drop for Daemon<'_> {
             };
         }
         let mut kill = "not_needed";
-        let mut reaped = self.reap(Duration::from_secs(12));
+        // The last second is the kill's reap allowance.
+        let mut reaped = self.reap(left().saturating_sub(Duration::from_secs(1)));
         if !reaped {
             kill = if self.child.kill().is_ok() {
                 "sent_to_retained_child"
             } else {
                 "failed"
             };
-            reaped = self.reap(Duration::from_secs(1));
+            reaped = self.reap(left().min(Duration::from_secs(1)));
         }
         // Runtime §11.2 outer cleanup: a read-only anchor snapshot, verified
         // anchor control and `ESRCH` absence, never a Core reopen.
         let anchors = if reaped {
             match outer_cleanup::snapshot(&self.sandbox.state.join("store.sqlite3")) {
-                Ok(rows) => outer_cleanup::verify(&rows, Instant::now() + Duration::from_secs(10)),
+                Ok(rows) => outer_cleanup::verify(&rows, deadline),
                 Err(error) => {
                     json!({"status":"unverified","absence_proven":false,"reason":error})
                 }

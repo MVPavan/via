@@ -79,21 +79,7 @@ impl Drop for Sandbox {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
             let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
-                let deadline = Instant::now() + budget;
-                let Ok(mut connection) = Connection::open(self) else {
-                    return;
-                };
-                // Each exchange waits at most for the budget left.
-                let within = |connection: &Connection| {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    !left.is_zero()
-                        && connection.writer.set_read_timeout(Some(left)).is_ok()
-                        && connection.writer.set_write_timeout(Some(left)).is_ok()
-                };
-                if within(&connection) && connection.hello().is_ok() && within(&connection) {
-                    let _ =
-                        connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
-                }
+                stop_by(self, Instant::now() + budget);
             });
             let expected = evidenced::Expected {
                 store: true,
@@ -107,6 +93,24 @@ impl Drop for Sandbox {
                 exited,
             );
         }
+    }
+}
+
+/// Asks the sandbox's daemon to stop over C1 by `deadline`: each exchange
+/// waits at most for the time left. The connect is not bounded (recorded
+/// C1-connect limitation).
+fn stop_by(sandbox: &Sandbox, deadline: Instant) {
+    let Ok(mut connection) = Connection::open(sandbox) else {
+        return;
+    };
+    let within = |connection: &Connection| {
+        let left = outer_cleanup::left(deadline);
+        !left.is_zero()
+            && connection.writer.set_read_timeout(Some(left)).is_ok()
+            && connection.writer.set_write_timeout(Some(left)).is_ok()
+    };
+    if within(&connection) && connection.hello().is_ok() && within(&connection) {
+        let _ = connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
     }
 }
 
@@ -150,12 +154,19 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
+    /// Runtime §11.2 (`via-jm4.19.1`): one teardown deadline, taken on
+    /// entry, bounds the stop exchanges (at most 2 s) and the exit wait,
+    /// leaving the kill 1 s to reap.
     fn drop(&mut self) {
-        if let Ok(mut connection) = Connection::open(self.sandbox) {
-            let _ = connection.hello();
-            let _ = connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let outer = Instant::now() + outer_cleanup::TEARDOWN;
+        stop_by(
+            self.sandbox,
+            outer.min(Instant::now() + Duration::from_secs(2)),
+        );
+        let deadline = Instant::now()
+            + outer_cleanup::left(outer)
+                .saturating_sub(Duration::from_secs(1))
+                .min(Duration::from_secs(5));
         while Instant::now() < deadline {
             if !matches!(self.child.try_wait(), Ok(None)) {
                 return;

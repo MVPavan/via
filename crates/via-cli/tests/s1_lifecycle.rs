@@ -590,10 +590,21 @@ impl Daemon<'_> {
 }
 
 impl Drop for Daemon<'_> {
+    /// Runtime §11.2: one teardown deadline, taken on entry, bounds the
+    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap.
     fn drop(&mut self) {
+        let outer = Instant::now() + outer_cleanup::TEARDOWN;
         if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.sandbox.run(&["daemon", "stop", "--force", "--json"]);
-            let _ = wait_child(&mut self.child, Duration::from_secs(15));
+            evidenced::run_within(
+                self.sandbox
+                    .command()
+                    .args(["daemon", "stop", "--force", "--json"]),
+                outer_cleanup::left(outer).min(Duration::from_secs(2)),
+            );
+            let _ = wait_child(
+                &mut self.child,
+                outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1)),
+            );
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

@@ -270,26 +270,37 @@ impl<'a> Daemon<'a> {
 impl Drop for Daemon<'_> {
     fn drop(&mut self) {
         let was_alive = matches!(self.child.try_wait(), Ok(None));
-        let outer = Instant::now() + FINAL_SHUTDOWN;
+        // Runtime §11.2: one teardown deadline, taken on entry; each
+        // phase gets only the time left.
+        let outer = Instant::now() + outer_cleanup::TEARDOWN;
         let mut stop = "not_needed";
         let mut kill = "not_needed";
         if was_alive {
             let mut command = self.paths.command();
             command.args(["daemon", "stop", "--force", "--json"]);
-            stop = match run_command(&mut command, Duration::from_secs(2)) {
+            stop = match run_command(
+                &mut command,
+                outer_cleanup::left(outer).min(Duration::from_secs(2)),
+            ) {
                 Ok(capture) if capture.status.success() && !capture.timed_out => "accepted",
                 Ok(_) => "refused",
                 Err(_) => "unavailable",
             };
         }
-        let mut reaped = matches!(self.wait_exit(Duration::from_secs(2)), Ok(Some(_)));
+        let mut reaped = matches!(
+            self.wait_exit(outer_cleanup::left(outer).min(Duration::from_secs(2))),
+            Ok(Some(_))
+        );
         if !reaped {
             kill = if self.child.kill().is_ok() {
                 "sent_to_retained_child"
             } else {
                 "failed"
             };
-            reaped = matches!(self.wait_exit(Duration::from_secs(1)), Ok(Some(_)));
+            reaped = matches!(
+                self.wait_exit(outer_cleanup::left(outer).min(Duration::from_secs(1))),
+                Ok(Some(_))
+            );
         }
         let rows = match self.crash_snapshot.take() {
             Some(rows) => Ok(rows),

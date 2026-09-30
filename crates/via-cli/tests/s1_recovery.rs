@@ -44,7 +44,6 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[cfg(feature = "test-failpoints")]
 const ACK_WAIT: Duration = Duration::from_secs(10);
-const FINAL_SHUTDOWN: Duration = Duration::from_secs(10);
 /// A valid caller handle: `h_` and 43 base64url digits whose last is `A`.
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 /// Values placed only in the daemon's environment (F23).
@@ -406,20 +405,28 @@ impl<'a> Daemon<'a> {
 impl Drop for Daemon<'_> {
     fn drop(&mut self) {
         let was_alive = matches!(self.child.try_wait(), Ok(None));
-        let outer = Instant::now() + FINAL_SHUTDOWN;
+        // Runtime §11.2: one teardown deadline, taken on entry; each
+        // phase gets only the time left.
+        let outer = Instant::now() + outer_cleanup::TEARDOWN;
         let mut stop = "not_needed";
         let mut kill = "not_needed";
         if was_alive {
             let mut command = self.paths.command();
             command.args(["daemon", "stop", "--force", "--json"]);
-            stop = match run_command(&mut command, Duration::from_secs(2)) {
+            stop = match run_command(
+                &mut command,
+                outer_cleanup::left(outer).min(Duration::from_secs(2)),
+            ) {
                 Ok(capture) if capture.status.success() && !capture.timed_out => "accepted",
                 Ok(_) => "refused",
                 Err(_) => "unavailable",
             };
         }
         let mut reaped = matches!(
-            wait_child(&mut self.child, Duration::from_secs(10)),
+            wait_child(
+                &mut self.child,
+                outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1))
+            ),
             Ok(Some(_))
         );
         if !reaped {
@@ -429,7 +436,10 @@ impl Drop for Daemon<'_> {
                 "failed"
             };
             reaped = matches!(
-                wait_child(&mut self.child, Duration::from_secs(1)),
+                wait_child(
+                    &mut self.child,
+                    outer_cleanup::left(outer).min(Duration::from_secs(1))
+                ),
                 Ok(Some(_))
             );
         }

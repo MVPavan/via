@@ -203,7 +203,7 @@ fn a_timeout_with_missing_store_evidence_stays_a_timeout() -> Result<(), Box<dyn
             store: true,
             folders: true,
         };
-        evidenced::park(evidence, root.clone(), &state, expected, Ok(()));
+        evidenced::park(evidence, root.clone(), &state, expected, proved());
         Err(ScenarioError::Timeout("the turn never finished".to_owned()).into())
     });
     let error = result.expect_err("a timed-out scenario passed").to_string();
@@ -225,6 +225,14 @@ fn a_timeout_with_missing_store_evidence_stays_a_timeout() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// A teardown whose daemons were proved gone, with its whole budget left.
+fn proved() -> evidenced::Exited {
+    evidenced::Exited {
+        proof: Ok(()),
+        deadline: std::time::Instant::now() + outer_cleanup::TEARDOWN,
+    }
+}
+
 /// A live process of the sandbox, identified by its environment, with no
 /// socket and no lock: the shape of a daemon after its locks' release
 /// (S1-contract r2 finding 1).
@@ -243,12 +251,13 @@ fn collector_exit_proof_needs_the_process_gone_not_only_the_locks() -> Result<()
     let (runtime, state) = (sandbox.path().join("runtime"), sandbox.path().join("state"));
     let mut process = sandbox_process(&runtime)?;
     let pid = process.id();
-    let unproven = evidenced::stop_within(&runtime, &state, Duration::from_millis(300), |_| {});
+    let unproven =
+        evidenced::stop_within(&runtime, &state, Duration::from_millis(300), |_| {}).proof;
     process.kill()?;
     process.wait()?;
     let error = unproven.expect_err("a live sandbox process was accepted as exited");
     assert!(error.contains(&pid.to_string()), "{error}");
-    evidenced::stop_within(&runtime, &state, Duration::from_secs(5), |_| {})?;
+    evidenced::stop_within(&runtime, &state, Duration::from_secs(5), |_| {}).proof?;
     Ok(())
 }
 
@@ -265,7 +274,8 @@ fn collector_exit_proof_budget_includes_the_stop() -> Result<(), Box<dyn Error>>
         let _ = process.kill();
         let _ = process.wait();
         std::thread::sleep(left + Duration::from_millis(100));
-    });
+    })
+    .proof;
     let _ = process.kill();
     let _ = process.wait();
     assert!(given.is_some_and(|left| left <= budget), "{given:?}");
@@ -301,7 +311,7 @@ fn collector_launched_turn_without_its_folder_fails_the_evidence() -> Result<(),
             store: true,
             folders: true,
         };
-        evidenced::park(evidence, root.clone(), &state, expected, Ok(()));
+        evidenced::park(evidence, root.clone(), &state, expected, proved());
         Ok(())
     });
     let error = result
@@ -376,5 +386,119 @@ fn collector_exit_proof_is_indeterminate_for_an_unreadable_via_process()
     );
     assert_eq!(vanished?, Vec::<u32>::new());
     assert_eq!(readable?, vec![process.id()]);
+    Ok(())
+}
+
+/// Runtime §11.2, S1 critic r2 finding 4: a sandbox teardown has one
+/// deadline. The exit proof's stop takes most of it; the anchor cleanup
+/// that follows gets only what is left, so a group that is gone only after
+/// the deadline is incomplete cleanup, not a proved absence.
+#[test]
+fn collector_anchor_cleanup_gets_only_the_teardown_time_left() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt as _;
+
+    let sandbox = tempfile::tempdir()?;
+    let root = sandbox.path().join("root");
+    let (runtime, state) = (root.join("runtime"), root.join("state"));
+    fs::create_dir_all(&state)?;
+    let fixture = root.join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    // The anchor's group: gone by itself 2 s from now, after the deadline.
+    let mut group = Command::new("sleep").arg("2").process_group(0).spawn()?;
+    let pid = group.id();
+    let reaper = std::thread::spawn(move || group.wait());
+    anchor_store(&state, &root, pid)?;
+    let mut daemon = sandbox_process(&runtime)?;
+    let mut artifact = None;
+    let result = evidenced::evidenced(|| {
+        let evidence = evidenced::open(Path::new(env!("CARGO_BIN_EXE_via")), &fixture)?;
+        artifact = Some(evidence.dir.clone());
+        // The stop phase ends the process but takes all but 300 ms of the
+        // budget; the exit proof completes within it.
+        let exited = evidenced::stop_within(&runtime, &state, Duration::from_secs(1), |left| {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            std::thread::sleep(left.saturating_sub(Duration::from_millis(300)));
+        });
+        let expected = evidenced::Expected {
+            store: true,
+            folders: true,
+        };
+        evidenced::park(evidence, root.clone(), &state, expected, exited);
+        Ok(())
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = reaper.join();
+    let error = result
+        .expect_err("absence after the teardown deadline passed")
+        .to_string();
+    assert!(error.contains("outer cleanup is unverified"), "{error}");
+    let artifact = artifact.ok_or("no artifact")?;
+    let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
+    assert_eq!(summary["outcome"], "pass", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    let cleanup: Value = serde_json::from_slice(&fs::read(artifact.join("cleanup.json"))?)?;
+    let record = &cleanup["anchors"]["records"][0];
+    assert_eq!(cleanup["anchors"]["absence_proven"], false, "{cleanup}");
+    assert!(
+        record["absence_probe"] == "present" || record["absence_probe"] == "esrch_after_deadline",
+        "{cleanup}"
+    );
+    Ok(())
+}
+
+/// A State whose Store commits one anchor of turn `s_a/1` for the process
+/// group led by `pid`, with this boot, PID namespace and user, and no
+/// control socket; the turn's evidence folder exists.
+fn anchor_store(state: &Path, root: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(state.join("evidence/s_a/1"))?;
+    fs::write(state.join("evidence/s_a/1/stderr.log"), b"stderr\n")?;
+    let (_, start_ticks) = outer_cleanup::process_stat(pid).ok_or("no stat for the group")?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let namespace = fs::read_link("/proc/self/ns/pid")?;
+    let store = Connection::open(state.join("store.sqlite3"))?;
+    store.execute_batch(
+        "CREATE TABLE turns(session_id TEXT, number INTEGER, envelope TEXT);
+         CREATE TABLE events(session_id TEXT, seq INTEGER, event TEXT);
+         CREATE TABLE anchors(anchor_id TEXT, generation TEXT, marker TEXT, socket_path TEXT,
+             phase TEXT, pid INTEGER, pgid INTEGER, uid INTEGER, boot_id TEXT,
+             pid_namespace TEXT, start_ticks INTEGER, absence_time TEXT,
+             owner_session TEXT, owner_turn INTEGER);",
+    )?;
+    store.execute(
+        "INSERT INTO anchors VALUES ('a_1','g1','marker',?1,'armed',?2,?2,?3,?4,?5,?6,NULL,'s_a',1)",
+        rusqlite::params![
+            root.join("no-anchor.sock").to_string_lossy(),
+            pid,
+            rustix::process::getuid().as_raw(),
+            boot.trim(),
+            namespace.to_string_lossy(),
+            i64::try_from(start_ticks)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Runtime §11.2, S1 critic r2 finding 4: `ESRCH` observed only after the
+/// outer deadline proves nothing; the anchor's cleanup is incomplete.
+#[test]
+fn outer_cleanup_absence_after_the_deadline_is_incomplete() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt as _;
+
+    let sandbox = tempfile::tempdir()?;
+    let (root, state) = (sandbox.path().to_owned(), sandbox.path().join("state"));
+    let mut group = Command::new("sleep").arg("0.2").process_group(0).spawn()?;
+    anchor_store(&state, &root, group.id())?;
+    group.wait()?;
+    let rows = outer_cleanup::snapshot(&state.join("store.sqlite3"))?;
+    let expired = outer_cleanup::verify(&rows, std::time::Instant::now());
+    assert_eq!(expired["status"], "unverified", "{expired}");
+    assert_eq!(
+        expired["records"][0]["absence_probe"], "esrch_after_deadline",
+        "{expired}"
+    );
+    let timely = outer_cleanup::verify(&rows, std::time::Instant::now() + outer_cleanup::TEARDOWN);
+    assert_eq!(timely["status"], "quiescent", "{timely}");
     Ok(())
 }

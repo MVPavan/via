@@ -14,6 +14,16 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+/// Runtime §11.2: the entire outer teardown, normal-stop fallback and
+/// observation included, has one deadline, taken at its entry; every phase
+/// and exchange gets only the time left ([`left`]).
+pub(crate) const TEARDOWN: Duration = Duration::from_secs(10);
+
+/// The time left before `deadline`, zero once it passed.
+pub(crate) fn left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 /// One committed anchor row, read in a single read-only transaction.
 #[derive(Clone)]
 pub(crate) struct AnchorRow {
@@ -155,8 +165,10 @@ fn record(
     })
 }
 
-/// Connects and authenticates the live anchor per runtime §5.1. Any failure
-/// means no destructive command is sent.
+/// Connects and authenticates the live anchor per runtime §5.1 by
+/// `deadline`. Any failure means no destructive command is sent. The
+/// connect itself is not bounded (a private Unix socket's connect does not
+/// wait on its peer), but it starts only with time left.
 fn challenge(
     row: &AnchorRow,
     anchor: u32,
@@ -164,14 +176,10 @@ fn challenge(
     start_ticks: u64,
     deadline: Instant,
 ) -> Result<UnixStream, &'static str> {
+    if left(deadline).is_zero() {
+        return Err("deadline");
+    }
     let stream = UnixStream::connect(&row.socket_path).map_err(|_| "anchor_unreachable")?;
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or("deadline")?;
-    stream
-        .set_read_timeout(Some(remaining))
-        .map_err(|_| "anchor_unreachable")?;
     let peer = rustix::net::sockopt::socket_peercred(&stream).map_err(|_| "peer_unverified")?;
     if u32::try_from(peer.pid.as_raw_nonzero().get()).ok() != Some(anchor)
         || peer.uid.as_raw() != row.uid
@@ -188,6 +196,7 @@ fn challenge(
     let reply = transact(
         &stream,
         &json!({"kind":"challenge","nonce":nonce,"proof":proof}),
+        deadline,
     )
     .ok_or("challenge_refused")?;
     let identity = &reply["identity"];
@@ -219,14 +228,29 @@ fn send_stop(stream: &UnixStream, row: &AnchorRow, deadline: Instant) -> bool {
     transact(
         stream,
         &json!({"kind":"stop","generation":row.generation,"deadline_monotonic_ns":deadline_ns}),
+        deadline,
     )
     .is_some_and(|reply| reply["kind"] == "stopping")
 }
 
-fn transact(mut stream: &UnixStream, request: &Value) -> Option<Value> {
+/// One request and its reply line, the write and the read each bounded by
+/// the time left before `deadline`; none once it passed.
+fn transact(mut stream: &UnixStream, request: &Value, deadline: Instant) -> Option<Value> {
+    let within = |stream: &UnixStream| {
+        let remaining = left(deadline);
+        !remaining.is_zero()
+            && stream.set_write_timeout(Some(remaining)).is_ok()
+            && stream.set_read_timeout(Some(remaining)).is_ok()
+    };
+    if !within(stream) {
+        return None;
+    }
     let mut bytes = serde_json::to_vec(request).ok()?;
     bytes.push(b'\n');
     stream.write_all(&bytes).ok()?;
+    if !within(stream) {
+        return None;
+    }
     let mut line = Vec::new();
     BufReader::new(stream.take(1024))
         .read_until(b'\n', &mut line)
@@ -234,7 +258,9 @@ fn transact(mut stream: &UnixStream, request: &Value) -> Option<Value> {
     serde_json::from_slice(line.strip_suffix(b"\n")?).ok()
 }
 
-/// Non-signalling group query every 20 ms: only `ESRCH` proves absence.
+/// Non-signalling group query every 20 ms: only `ESRCH` by `deadline`
+/// proves absence. One completed after it is `esrch_after_deadline`,
+/// incomplete cleanup, never success (runtime §11.2).
 fn observe_absence(pgid: u32, deadline: Instant) -> &'static str {
     let Some(pgid) = i32::try_from(pgid)
         .ok()
@@ -243,10 +269,13 @@ fn observe_absence(pgid: u32, deadline: Instant) -> &'static str {
         return "invalid_group";
     };
     loop {
-        match rustix::process::test_kill_process_group(pgid) {
+        let query = rustix::process::test_kill_process_group(pgid);
+        let expired = Instant::now() > deadline;
+        match query {
+            Err(rustix::io::Errno::SRCH) if expired => return "esrch_after_deadline",
             Err(rustix::io::Errno::SRCH) => return "esrch",
-            Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Ok(()) => return "present",
+            Ok(()) if expired => return "present",
+            Ok(()) => thread::sleep(Duration::from_millis(20).min(left(deadline))),
             Err(_) => return "denied",
         }
     }

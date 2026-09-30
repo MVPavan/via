@@ -29,14 +29,15 @@ use support::evidence::Evidence;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Runtime §11.2 outer cleanup after the daemon exited: a read-only anchor
-/// snapshot, verified anchor control and `ESRCH` absence, never a Core reopen.
-fn verify_anchors_after_daemon(cx: &Context<'_>) -> Result<Value, ScenarioError> {
+/// Runtime §11.2 outer cleanup after the daemon exited, by the teardown's
+/// `deadline`: a read-only anchor snapshot, verified anchor control and
+/// `ESRCH` absence, never a Core reopen.
+fn verify_anchors_after_daemon(
+    cx: &Context<'_>,
+    deadline: Instant,
+) -> Result<Value, ScenarioError> {
     let rows = outer_cleanup::snapshot(&cx.state.join("store.sqlite3")).map_err(infra)?;
-    Ok(outer_cleanup::verify(
-        &rows,
-        Instant::now() + Duration::from_secs(10),
-    ))
+    Ok(outer_cleanup::verify(&rows, deadline))
 }
 
 struct Daemon<'a> {
@@ -47,7 +48,10 @@ struct Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
+    /// Runtime §11.2: one teardown deadline, taken on entry; each phase
+    /// gets only the time left.
     fn drop(&mut self) {
+        let outer = Instant::now() + outer_cleanup::TEARDOWN;
         let was_alive = matches!(self.child.try_wait(), Ok(None));
         let mut anchors = json!({"status":"unverified","absence_proven":false,"reason":"verified cleanup unavailable"});
         let mut stop = "not_attempted";
@@ -56,7 +60,7 @@ impl Drop for Daemon<'_> {
         if was_alive && self.ready {
             stop = match self.cx.run(
                 &["daemon", "stop", "--force", "--json"],
-                Duration::from_secs(2),
+                outer_cleanup::left(outer).min(Duration::from_secs(2)),
             ) {
                 Ok(capture) if capture.timed_out => "timed_out",
                 Ok(capture) if capture.status.success() => "accepted",
@@ -64,15 +68,15 @@ impl Drop for Daemon<'_> {
                 Err(_) => "unavailable",
             };
         }
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
+        let deadline = outer.min(Instant::now() + Duration::from_secs(1));
+        loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     direct_reaped = true;
                     break;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                Ok(None) | Err(_) => break,
             }
         }
         if !direct_reaped {
@@ -81,20 +85,22 @@ impl Drop for Daemon<'_> {
             } else {
                 "failed"
             };
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < deadline {
+            let deadline = outer.min(Instant::now() + Duration::from_secs(1));
+            loop {
                 match self.child.try_wait() {
                     Ok(Some(_)) => {
                         direct_reaped = true;
                         break;
                     }
-                    Ok(None) => thread::sleep(Duration::from_millis(5)),
-                    Err(_) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(None) | Err(_) => break,
                 }
             }
         }
         if direct_reaped {
-            anchors = verify_anchors_after_daemon(self.cx).unwrap_or_else(|error| {
+            anchors = verify_anchors_after_daemon(self.cx, outer).unwrap_or_else(|error| {
                 json!({
                     "status":"unverified","absence_proven":false,"reason":error.to_string()
                 })
@@ -697,20 +703,22 @@ fn s1_cli_auto_starts_daemon_and_keeps_result() -> TestResult {
             Ok(())
         },
         |evidence| {
+            // Runtime §11.2: one teardown deadline for every phase.
+            let outer = Instant::now() + outer_cleanup::TEARDOWN;
             let stop = cx
                 .run(
                     &["daemon", "stop", "--force", "--json"],
-                    Duration::from_secs(2),
+                    outer_cleanup::left(outer).min(Duration::from_secs(2)),
                 )
                 .map_err(infra)?;
             let stop_accepted = !stop.timed_out && stop.status.success();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = outer.min(Instant::now() + Duration::from_secs(2));
             while runtime.join("via.sock").exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
             let stopped = !runtime.join("via.sock").exists();
             let anchors = if stopped {
-                verify_anchors_after_daemon(&cx).unwrap_or_else(|error| {
+                verify_anchors_after_daemon(&cx, outer).unwrap_or_else(|error| {
                     json!({
                         "status":"unverified","absence_proven":false,"reason":error.to_string()
                     })
