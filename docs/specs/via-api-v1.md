@@ -104,7 +104,10 @@ decided in the slice that needs them, after re-probing.
 ```
 
 - **Version mismatch (decided).** One binary; a differing `client_version`
-  is `version_mismatch`. The CLI restarts an idle daemon, else reports.
+  is `version_mismatch`. A mismatched `hello` stops nothing. It returns
+  `data: {daemon_version, store_path}` and permits one plain `daemon/stop`,
+  which only daemon main's idle predicate accepts. The CLI restarts an idle
+  daemon whose Store matches (runtime §6.1), else reports.
 - **Evolution (decided).** Additive within v1: optional params, result and
   event fields, event types, error kinds, methods. Requests use
   `deny_unknown_fields`. Clients ignore unknown result and event fields.
@@ -266,8 +269,10 @@ completion remains late evidence and does not rewrite that envelope. Codex P2/P2
 survives until it finishes or the server dies. A queued
 turn is dropped: `cancelled`, `acknowledged`, `quiescent`. On an already
 terminal turn: `already_terminal: true` with the recorded `cancel` or
-`null`. Idempotent. Errors: `turn_not_found`, `invalid_handle`,
-`unsupported_verb`.
+`null`. A no-`wait` cancel of a running turn replies `state: running`,
+`cleanup: pending`, `settled_at: null`. A cancel that lands during
+settlement replies `already_terminal: true`. Idempotent. Errors:
+`turn_not_found`, `invalid_handle`, `unsupported_verb`.
 
 ### 3.6 `close` — end the session
 
@@ -277,7 +282,9 @@ Sets the admission gate `closing` (new `resume` → `session_closed`),
 cancels the active turn, drops queued turns as `cancelled`, closes the
 vendor session (`close(mode, deadline)` down to Host, D7), then sets
 `closed`. Result `{session_id, state: "closed", cancelled_turns, cleanup}`.
-Idempotent; a second `close` during closing waits for the first.
+Idempotent; a second `close` during closing waits for the first. A close
+whose `session.closed` commit is refused a second time because turns of the
+session are unfinished replies `admission_refused` ([Task 3 design](../workstreams/rust-foundation/t3/design.md) §4 step 6).
 
 ### 3.7 `status`
 
@@ -411,21 +418,37 @@ not read or decode them; the caller reads the files. There is no paging.
 `via models [--harness H]` → `{models: [{model, harness, aliases, source}]}`.
 `via daemon status` → `{daemon_version, pid, started_at, sessions: {idle,
 active, closing}, servers: [{harness, vendor_version, key, sessions}],
-socket_path, store_path, health, limits, storage}`. `limits` holds the
-effective disk and WAL thresholds; `storage` holds `free_bytes`,
-`data_bytes`, `data_measured_at`, `below_free_floor` and `over_warn_size`.
-`health` reports `healthy` or
-`store_failed` with a bounded failure kind and affected IDs from memory,
-without prompts, payloads or handles. `via daemon stop [--drain|--force]`: refuses
-while sessions are active unless `drain` (gate every session `closing`
-for new work, run accepted queued turns to completion, then stop) or
-`force` (close every session with mode `force`; turns end `cancelled` or
-`unknown`). `drain` with `force` is `invalid_params`; after acceptance new
-work is refused `daemon_stopping`. The result `{"stopping":true}` only
-acknowledges acceptance; it is not evidence that work stopped or the daemon
-exited. A session closed by `force` commits `session.closed` with
-`reason: "daemon_stop_force"`. Drain runs accepted turns under their existing deadlines; force and
-an idle stop then share one final 10 s shutdown deadline. The daemon exits 0
+socket_path, store_path, health, store_failure, connections, limits,
+storage}`. `limits` holds the effective disk and WAL thresholds; `storage`
+holds `free_bytes`, `data_bytes`, `data_measured_at`, `below_free_floor`
+and `over_warn_size`.
+
+`health` reports `healthy`, or `store_failed` once the daemon has latched
+a Store failure (runtime §7); it stays `store_failed` until the daemon
+exits. `store_failure` is `null`, or reports the latest recorded Store
+failure as `{kind, scope, since, count, affected}`. `scope` is `request`,
+`turn`, `session` or `daemon`, and `affected` lists at most 16 addresses
+plus a count. It carries no prompts, payloads or handles. `connections`
+reports `{limit, in_use, held_unproven}`.
+
+`via daemon stop [--drain|--force]` refuses while any session is active
+or durably `closing`, unless one of these is given:
+
+- `drain`: refuse new work, run accepted queued turns to completion, then
+  stop. Drain closes no session; sessions stay open and resumable after
+  restart.
+- `force`: close with mode `force` every session that has unfinished
+  work when force is accepted (a running turn, or a queued turn including
+  one being dispatched or cancelled). Turns end `cancelled` or `unknown`.
+  Sessions without such work stay as they were: open, or `closing` for
+  restart to finish.
+
+`drain` with `force` is `invalid_params`; after acceptance new work is
+refused `daemon_stopping`. The result `{"stopping":true}` only
+acknowledges acceptance; it is not evidence that work stopped or the
+daemon exited. A session closed by `force` commits `session.closed` with
+`reason: "daemon_stop_force"`. Drain runs accepted turns under their
+existing deadlines; force and an idle stop then share one final 10 s shutdown deadline. The daemon exits 0
 only after positive cleanup, joins and durable records, otherwise 4
 (runtime contract §6.2).
 
@@ -443,7 +466,7 @@ only after positive cleanup, joins and durable records, otherwise 4
 | `bound` | `{mode: read_only\|workspace_write\|full, extra_write_dirs: [path], network: bool}` | per turn (D5): inherited unless set on `resume` | always never-ask (D3); combinations per §4.2 |
 | `cwd` | absolute path | session | must exist |
 | `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12, size ≤ 256 KiB) |
-| `deadlines` | `{wall_ms?, idle_ms?}` | per turn | Core-owned absolute deadlines (D7); defaults 3 600 000 / 600 000 |
+| `deadlines` | `{wall_ms?, idle_ms?}` | per turn | Core-owned absolute deadlines (D7); defaults 3 600 000 / 600 000. `idle_ms` is a positive integer; `0` is `invalid_params`. Like `wall_ms`, it is frozen at receipt and inherited (P5) |
 | `max_steps` | integer or `null` | per turn | steps inside one turn (D5) |
 | `require` | `[verb]` / `[verb:partial]` | spawn | preflight |
 | `vendor` | `{"<harness>": {k: v}}` | as the adapter declares | passthrough, non-portable; reserved keys refused (§4.2) |
@@ -621,7 +644,7 @@ is the last non-late event of its turn.
 | `idle` | `active` | a turn is dispatched |
 | `active` | `idle` | turn resolved, queue empty, cleanup not `pending` |
 | `active` | `active` | next queued turn dispatched (§7.3 gate) |
-| any | `closed` | `close`, `daemon/stop --force`, drain completed |
+| any | `closed` | `close`; `daemon/stop --force`, for a session with unfinished work at force acceptance |
 
 Vendor-process idle shutdown (Q4, 15 min, per harness) is **not** a state
 change: the session stays `idle`, `status.process.alive` becomes `false`,
@@ -716,6 +739,13 @@ that does not prove its submitted work had no effect.
 | Daemon restart | any | §7.5 |
 | Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again |
 
+Rows 1–2 cover caller-originated cancels (`cancel`, `close`). A Core-deadline
+stop resolves `failed(deadline_*)` after rows 3–4. A `Deadline` coincident
+with an order's `force_at` takes the order's cause. Only the resolution
+cases in [Task 3 design](../workstreams/rust-foundation/t3/design.md) §7.2 (runtime §7) end `failed(store)`. A natural
+terminal whose one retry commits keeps its result, and a dispatcher-owned
+queued cancellation whose retry commits stays `cancelled`.
+
 ## 8. Errors
 
 ### 8.1 Request errors (JSON-RPC `error`, stable `code` and `data.kind`)
@@ -746,7 +776,7 @@ that does not prove its submitted work had no effect.
 | -32015 | `turn_not_finished` | |
 | -32016 | `wait_timeout` | |
 | -32017 | `daemon_stopping` | |
-| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
+| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
 | -32020 | `request_too_large` | request line over 1 MiB; `data.max_bytes`; the connection closes |
 
