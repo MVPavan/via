@@ -560,12 +560,16 @@ fn s1_c1_logs_selects_the_turn_and_never_reads_files() -> TestResult {
 /// Positive evidence for this case: the child served its own socket, then
 /// left through its idle exit (status 0, a clean `idle` shutdown summary);
 /// readiness reported exactly that exit; the sandbox never got a socket or
-/// a Store, which any daemon started there would create.
+/// a Store, which any daemon started there would create. By design no
+/// Store opens in the sandbox and no turn runs, so the evidence declares
+/// neither (T4-fix, Close finding 1): it holds the probe results, the
+/// readiness message and the child's shutdown summary.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     let sandbox = Sandbox::new(&script(1, "unused", &[]))?;
-    let evidence = Evidence::new("s1_evidence_readiness", &sandbox.fake, &sandbox.fixture)?;
+    let mut evidence = Evidence::new("s1_evidence_readiness", &sandbox.fake, &sandbox.fixture)?;
+    evidence.store_expected = false;
     let elsewhere = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
@@ -576,60 +580,88 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
     for dir in [&state, &runtime] {
         daemon::private_dir(dir)?;
     }
-    // Observes the child serving its own socket, over a direct connection.
-    let served = {
-        let runtime = runtime.clone();
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                if let Some(pid) = daemon::serving_pid(&runtime) {
-                    return Some(pid);
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
-    let started = Daemon::start_with(&sandbox, &evidence, |command| {
-        command.env("VIA_STATE_DIR", &state);
-        command.env("VIA_RUNTIME_DIR", &runtime);
-        command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
-    });
-    let socket = sandbox.runtime.join("via.sock").exists();
-    let store = sandbox.state.join("store.sqlite3").exists();
-    // Stops a daemon the probe may have started; refused when there is none.
-    sandbox.run(
-        &["daemon", "stop", "--force", "--json"],
-        Duration::from_secs(20),
-    )?;
-    let reported = match &started {
-        Err(error) => error.to_string(),
-        Ok(_) => "ready".to_owned(),
-    };
-    drop(started);
-    let served = served.join().map_err(|_| "the serving probe panicked")?;
-    // Task 4 design §7.6: the shutdown summary is the child's `via.log` line.
-    let log = fs::read_to_string(state.join("via.log"))?;
-    let summary = log
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find_map(|line| line.get("daemon_shutdown").cloned())
-        .unwrap_or(Value::Null);
-    let idle_exit = summary["mode"] == "idle" && summary["disposition"] == "clean";
-    if reported != "fail: daemon exited before readiness: exit status: 0"
-        || served.is_none()
-        || !idle_exit
-        || socket
-        || store
-    {
-        return Err(format!(
-            "readiness reported {reported:?}; child served {served:?}; \
-             shutdown {summary}; sandbox socket {socket}, Store {store}"
-        )
-        .into());
-    }
-    Ok(())
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            // Observes the child serving its own socket, over a direct
+            // connection.
+            let served = {
+                let runtime = runtime.clone();
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if let Some(pid) = daemon::serving_pid(&runtime) {
+                            return Some(pid);
+                        }
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            let started = Daemon::start_with(&sandbox, evidence, |command| {
+                command.env("VIA_STATE_DIR", &state);
+                command.env("VIA_RUNTIME_DIR", &runtime);
+                command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
+            });
+            let socket = sandbox.runtime.join("via.sock").exists();
+            let store = sandbox.state.join("store.sqlite3").exists();
+            // Stops a daemon the probe may have started; refused when there
+            // is none.
+            let stop = sandbox
+                .run(
+                    &["daemon", "stop", "--force", "--json"],
+                    Duration::from_secs(20),
+                )
+                .map_err(infra)?;
+            let reported = match &started {
+                Err(error) => error.to_string(),
+                Ok(_) => "ready".to_owned(),
+            };
+            drop(started);
+            let served = served
+                .join()
+                .map_err(|_| infra("the serving probe panicked"))?;
+            // Task 4 design §7.6: the shutdown summary is the child's
+            // `via.log` line.
+            let log = fs::read_to_string(state.join("via.log")).map_err(infra)?;
+            let summary = log
+                .lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|line| line.get("daemon_shutdown").cloned())
+                .unwrap_or(Value::Null);
+            evidence
+                .write(
+                    "readiness.json",
+                    json!({"reported":reported,"child_served_pid":served,
+                        "sandbox_socket":socket,"sandbox_store":store,
+                        "stop_exit":stop.status.code(),
+                        "stop_stdout":String::from_utf8_lossy(&stop.stdout)})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .map_err(infra)?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            let idle_exit = summary["mode"] == "idle" && summary["disposition"] == "clean";
+            check(
+                reported == "fail: daemon exited before readiness: exit status: 0"
+                    && served.is_some()
+                    && idle_exit
+                    && !socket
+                    && !store,
+                || {
+                    format!(
+                        "readiness reported {reported:?}; child served {served:?}; \
+                         shutdown {summary}; sandbox socket {socket}, Store {store}"
+                    )
+                },
+            )
+        },
+        |_| Ok(()),
+    );
+    report.require_pass()
 }
