@@ -361,3 +361,85 @@ Log: `r1-gate.log`, `gate exit 0`.
 | `s1_f(08|09|10|12)_` | 56 passed |
 | release build and `check-release-features.py` | pass; 105 points armed, ignored |
 | Task 4 selector ×3 | 85 passed each time |
+
+## Round 2
+
+Sol high r2 returned UNSOUND with one important finding
+(`scratchpad/execution/t4-impl/review-t4-fix-sol-r2.md`). Logs:
+`scratchpad/t4/t4-fix/r2-*.log`.
+
+### Finding: the status free-space read had no diagnostic permit
+
+- **Defect.** `Engine::storage` read free space through the 16-slot blob
+  pool without a diagnostics permit. Every CLI command sends
+  `daemon/status`, so enough concurrent status calls stalled in `statvfs`
+  could fill the pool.
+- **Change** (`4a68eb7`):
+  - `StoreClient::free_bytes` now takes a `held` value, as `data_bytes`
+    does, and drops it when the read ends.
+  - `storage()` takes a `diagnostics` permit with `try_acquire_owned` and
+    moves it into the read. With no permit, `free_bytes` and
+    `below_free_floor` are `null`, under the existing rule that a value that
+    cannot be read is `null`.
+  - The admission reads stay outside the cap and pass `()`: `free_space`
+    for spawn and resume, and `dispatch_refusal` through `free_space`.
+- **Other diagnostic-only callers checked.** I searched every Core, Wire
+  and Store caller of `free_bytes`, `data_bytes`, `blocking_step`,
+  `BlobTasks::run`, `blob_writer` and `copy_prompt_file`. The only
+  diagnostic-only ones are the status free read (now capped), the status
+  walk and `logs` (both capped in round 1). All the others are turn work:
+  the `cwd` check, prompt staging, folder creation, `undecoded.bin`, final
+  text and admission reads.
+- **Test.** `s1_blob_stalled_logs_are_capped_and_turns_still_start` is
+  extended. `store.statvfs.free_bytes` is counted from the daemon's start.
+  With both `logs` steps held:
+  - a raw `daemon/status` must report `free_bytes: null` and
+    `below_free_floor: null`;
+  - its free-space read count must not advance, so it reached no blob step;
+  - the new turn then still starts.
+  - RED: `status read free space (5 -> 6)`, with a numeric `free_bytes`.
+  - GREEN: 11/11 of `s1_blob_stalled|s1_store_data_size|logs|floor|s1_config_|daemon_status`.
+
+### A clock step in the stderr-idle proof (fix 6), and one F24 latency failure
+
+- **Failure.** The first round 2 gate (`r2-gate.log`) and its selector
+  reruns (`r2-selector-rerun.log`) each had one red selector run.
+- **F24 latency.**
+  - `s1_f24_…` failed once on `cancel answered in 114.58 ms`, against its
+    100 ms wall-clock bound.
+  - That bound is the §13 F24 row's, and the brief left F24 out of scope.
+  - This round changes nothing on the `cancel` path.
+  - It passed in every other run: 8 runs before, and the later reruns.
+- **The stderr-idle proof.**
+  - `s1_evidence_stderr_is_written_by_the_os_and_listed` failed once on its
+    fix-6 timestamp proof.
+    - The daemon put `cancel.requested` 4190 ms after `turn.started`.
+    - The test's monotonic clock saw it 1518 ms after acceptance, in a run
+      of 2.76 s.
+    - So the realtime clock stepped about 2.7 s inside the window, on this
+      WSL host.
+  - Realtime timestamps from the daemon and the file cannot be compared
+    across such a step.
+  - `d1d142e` records the realtime and monotonic clocks around the window.
+    If their elapsed times differ by more than 100 ms, the test judges the
+    order on the monotonic clock instead: under 800 ms plus one idle budget,
+    which is the old bound. It records `realtime_clock_stepped` in
+    `idle_timing.json`. Otherwise it uses the daemon-timestamp proof, as
+    before.
+  - This is a deviation from "prove from the daemon's own timestamps" that
+    applies only when the timestamps are shown to be unreliable.
+- **After `d1d142e`:** the full gate was rerun, in `r2-gate2.log`.
+
+### Round 2 gate counts
+
+Log: `r2-gate2.log`, `gate exit 0`.
+
+| Check | Result |
+|---|---|
+| fmt, both clippy runs, deny, layers | pass |
+| `cargo nextest run --locked --workspace` | 330 passed, 1 skipped |
+| failpoint suite, run 1 (gate) | 529 passed, 1 skipped |
+| failpoint suite, run 2 (`r2-failpoint-2b.log`) | 529 passed, 1 skipped |
+| `s1_f(08|09|10|12)_` | 56 passed |
+| release build and `check-release-features.py` | pass; 105 points armed, ignored |
+| Task 4 selector ×3 | 85 passed each time |
