@@ -1679,10 +1679,15 @@ impl StoreClient {
     }
 
     /// The free space of the State directory's filesystem (§5.3), read by
-    /// one owned step on the blocking pool within 2 s.
-    pub async fn free_bytes(&self) -> Result<u64, StoreError> {
+    /// one owned step on the blocking pool within 2 s. `held`, such as the
+    /// caller's permit, is dropped when the read ends.
+    pub async fn free_bytes(&self, held: impl Send + 'static) -> Result<u64, StoreError> {
         let state = Arc::clone(&self.state);
-        self.disk_step(move || disk::free_bytes(&state)).await
+        self.disk_step(move || {
+            let _held = held;
+            disk::free_bytes(&state)
+        })
+        .await
     }
 
     /// The apparent length of VIA's data under the State directory (§5.3),

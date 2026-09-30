@@ -1617,12 +1617,15 @@ fn s1_blob_stalled_logs_step_is_owned_until_shutdown() -> TestResult {
     })
 }
 
-/// T4-fix round 1 (coding-style §5): diagnostic steps hold at most two of
-/// the Store's blob-step slots. Two `logs` calls are held on their file
-/// checks (`blob.step.stall`, one occurrence each) and answer `store_error`
-/// at 2 s; a third `logs` is refused `store_error` at once, never reaching
-/// a blob step. With both held, a new turn still gets its evidence folder
-/// and completes. The first turn's folder is step 1.
+/// T4-fix rounds 1 and 2 (coding-style §5): diagnostic steps hold at most
+/// two of the Store's blob-step slots. Two `logs` calls are held on their
+/// file checks (`blob.step.stall`, one occurrence each) and answer
+/// `store_error` at 2 s; a third `logs` is refused `store_error` at once,
+/// never reaching a blob step; a `daemon/status` reports `free_bytes` and
+/// `below_free_floor` `null` without a free-space read
+/// (`store.statvfs.free_bytes`, counted). With both held, a new turn still
+/// gets its evidence folder and completes. The first turn's folder is
+/// step 1.
 #[cfg(feature = "test-failpoints")]
 #[test]
 #[expect(
@@ -1647,6 +1650,8 @@ fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
                 .ok_or_else(|| infra("the state directory has no parent"))?;
             let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
             let point = "blob.step.stall";
+            let free = "store.statvfs.free_bytes";
+            hits::count(&root.join("failpoints"), free).map_err(infra)?;
             let mut daemon =
                 Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
             let small = |name: &str| {
@@ -1703,6 +1708,19 @@ fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
                 check(
                     over["error"]["data"]["kind"] == "store_error" && !reached,
                     || format!("a third logs reached a blob step ({reached}): {over}"),
+                )?;
+                // Round 2: the status free-space read is a diagnostic step too.
+                let reads = || hits::hits(&root.join("failpoints"), free).map_err(infra);
+                let before = reads()?;
+                let status = raw.request("daemon/status", &json!({}))?;
+                let after = reads()?;
+                replies.push(status.clone());
+                let storage = &status["result"]["storage"];
+                check(
+                    storage["free_bytes"].is_null()
+                        && storage["below_free_floor"].is_null()
+                        && after == before,
+                    || format!("status read free space ({before} -> {after}): {storage}"),
                 )?;
                 // Turn work keeps its slots: a new turn creates its folder.
                 let second = small("spawn_second")?;

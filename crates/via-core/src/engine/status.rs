@@ -196,9 +196,16 @@ impl Engine {
     /// pool; concurrent calls wait on the one walk and share its result. A
     /// value that cannot be read is `null`; a walk that fails or overruns
     /// is cached as `null` too, so at most one walk starts per minute
-    /// whatever its outcome (§15).
+    /// whatever its outcome (§15). Both reads are diagnostic steps: each
+    /// needs one of the Engine's two diagnostic permits, and without one
+    /// its value is `null` (a walk's for its minute).
     pub async fn storage(&self) -> Value {
-        let free = self.store.free_bytes().await.ok();
+        // A diagnostic step (round 2): with no permit the free space is
+        // not read and reports `null`.
+        let free = match Arc::clone(&self.diagnostics).try_acquire_owned() {
+            Ok(permit) => self.store.free_bytes(permit).await.ok(),
+            Err(_) => None,
+        };
         let data = {
             let mut cached = self.data_size.lock().await;
             let fresh = cached
@@ -240,7 +247,8 @@ impl Engine {
         if self.limits.free_floor == 0 {
             return None;
         }
-        Some(self.store.free_bytes().await)
+        // Turn-critical: outside the diagnostics cap.
+        Some(self.store.free_bytes(()).await)
     }
 
     /// Applies a receipt's free-space read to new work, after the key
