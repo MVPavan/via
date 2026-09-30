@@ -313,3 +313,89 @@ Logs are in `scratchpad/t4/flake/r3/`.
 - Gate G, all exit 0 (`r3/gate.log`): the default suite ran 321 tests with
   321 passed and 1 skipped; the failpoint suite ran 502 with 502 passed and
   1 skipped; the `s1_f(08|09|10|12)_` selector ran 56 with 56 passed.
+
+## Round 3: two via-wire tests assumed the consumer runs first
+
+Base: `wt/t4-flake` merged `rust-foundation` at `d636fc9`. The merged gate
+ran the selector 5 times. One run failed two T4-3 tests
+(`scratchpad/t4/merge-flake/gate.log`):
+
+- `s1_wire_burst_of_1040_lines_reaches_a_live_consumer`: "the burst failed:
+  Some(Message(Overflow))" after 8 ms;
+- `s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_messages`:
+  `left: []` after 180 ms.
+
+### Cause (verified)
+
+Design §8.2 and T4-A47 are clear on both points. The reader never waits
+for the consumer. A message past the 1,024-message or 4 MiB queue fails
+`Reader(Overflow)`, and after that the reader discards. `next_message`
+(`crates/via-wire/src/connection.rs`) returns a latched failure before
+any message still queued, in two places: the check at its entry and the
+check in `received`.
+
+- The burst test wrote 1,040 lines in one write. When the reader queued
+  1,025 before the consumer ran, it overflowed. That outcome is the
+  designed one, and the test assumed it would not happen.
+- The F27 test wrote 40 messages and then, at once, the over-cap line.
+  When the reader reached the huge line before the consumer took the 40,
+  the `MessageTooLarge` latch came first, which is also designed. The
+  consumer then saw no message.
+
+### Fix (test only, `crates/via-wire/tests/s1_wire.rs`)
+
+Each test now syncs on a count the consumer publishes after every message
+it takes (`tokio::sync::watch`), not on time:
+
+- Burst: the first 1,024 lines are still one write. The queue holds them
+  even before the consumer runs. The last 16 are written once the consumer
+  took 16, so unconsumed messages never exceed 1,024. It still proves a
+  flow larger than the queue reaches a live consumer whole and in order.
+  `s1_wire_queue_holds_1024_messages_or_4_mib_then_overflows`, unchanged,
+  still proves that 1,024 are held and the 1,025th overflows.
+- F27: the huge line is written only once the consumer took all 40
+  messages. The byte-exact, randomly chunked split through the reader,
+  `MessageTooLarge`, the saved prefix, the naming and the discard to EOF
+  are all asserted as before.
+
+### Other tests checked for the same pattern
+
+None other needed a change:
+
+- via-wire:
+  - the queue test is deliberately unconsumed;
+  - the `finish` and deadline tests carry no message flow;
+  - `contracts.rs` is splitter-only.
+- `s1_f24_stall` was fixed in round 1 (gate `flood`).
+- `s1_f27_daemon_split_writes_…` already waits for the running tool before
+  it releases the huge line.
+- `s1_f24_observation_budget_…` (via-core) delivers in admitted batches.
+- In `s1_progress.rs`, three tests keep unconsumed messages at or below
+  1,024 behind gates:
+  - `s1_c1_status_latency_under_bounded_store_delay` (302 messages at
+    most, even with none consumed);
+  - `s1_progress_many_steps_all_have_rows` (300 per round, released after
+    the step is seen);
+  - `s1_progress_unknown_messages_send_no_observation` (1,000 per burst,
+    after the pause acknowledgement and settled activity).
+- In `route_drain.rs`, the oversize test expects the failure, and the
+  stderr flood does not use the queue.
+
+### RED and GREEN
+
+Parallel stress: 24 concurrent loops of 10 runs of each test, run directly
+from the `s1_wire` test binary (`scratchpad/t4/flake/r4/{before,after}/`).
+
+| Test | Before | After |
+|---|---|---|
+| burst | 176 of 240 passed; 64 failed `the burst failed: Some(Message(Overflow))` | 240 of 240 passed |
+| F27 | 235 of 240 passed; 5 failed `left: []` | 240 of 240 passed |
+
+### Verification (`scratchpad/t4/flake/r4/`)
+
+- `cargo nextest run --locked -p via-wire --features test-failpoints`, 20
+  runs: every run had 10 tests and all 10 passed.
+- The selector, 10 runs: every run had 60 tests and all 60 passed.
+- Gate G, all exit 0 (`r4/gate.log`): the default suite ran 321 tests with
+  321 passed and 1 skipped; the failpoint suite ran 502 with 502 passed and
+  1 skipped; the `s1_f(08|09|10|12)_` selector ran 56 with 56 passed.
