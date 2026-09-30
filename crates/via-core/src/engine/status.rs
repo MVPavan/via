@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashSet,
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -209,7 +209,11 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.data_size.walks").await;
                 let measured_at = rfc3339(SystemTime::now());
-                let bytes = self.store.data_bytes().await.ok();
+                // A walk with no diagnostic permit counts as failed.
+                let bytes = match Arc::clone(&self.diagnostics).try_acquire_owned() {
+                    Ok(permit) => self.store.data_bytes(permit).await.ok(),
+                    Err(_) => None,
+                };
                 *cached = Some(DataSize {
                     bytes,
                     measured_at,

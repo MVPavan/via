@@ -1616,3 +1616,123 @@ fn s1_blob_stalled_logs_step_is_owned_until_shutdown() -> TestResult {
         })
     })
 }
+
+/// T4-fix round 1 (coding-style §5): diagnostic steps hold at most two of
+/// the Store's blob-step slots. Two `logs` calls are held on their file
+/// checks (`blob.step.stall`, one occurrence each) and answer `store_error`
+/// at 2 s; a third `logs` is refused `store_error` at once, never reaching
+/// a blob step. With both held, a new turn still gets its evidence folder
+/// and completes. The first turn's folder is step 1.
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario holds two logs steps, refuses a third and starts a turn"
+)]
+fn s1_blob_stalled_logs_are_capped_and_turns_still_start() -> TestResult {
+    let fixture = json!({
+        "expected_request":{"type":"start","id":1,"turn":1,"prompt":"hello"},
+        "steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"reply","stop_reason":"end_turn"}}
+        ]
+    });
+    scenario(
+        "s1_blob_stalled_logs_capped",
+        &fixture,
+        |paths, evidence| {
+            let root = paths
+                .state
+                .parent()
+                .ok_or_else(|| infra("the state directory has no parent"))?;
+            let failpoints = failpoints::Failpoints::new(root).map_err(infra)?;
+            let point = "blob.step.stall";
+            let mut daemon =
+                Daemon::start_with(paths, evidence, |command| failpoints.activate(command))?;
+            let small = |name: &str| {
+                paths.run(
+                    evidence,
+                    name,
+                    &[
+                        "spawn",
+                        "--harness",
+                        "fake",
+                        "--model",
+                        "fake",
+                        "--prompt",
+                        "hello",
+                        "--json",
+                    ],
+                )
+            };
+            let first = small("spawn_first")?;
+            check(first.status.success(), || {
+                format!("the first spawn exited {}", first.status)
+            })?;
+            let receipt = first.stdout.split(|byte| *byte == b'\n').next();
+            let session = json_line(receipt.unwrap_or_default())?["session_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| fail("the first spawn named no session"))?;
+            let mut raw = Raw::connect(&paths.runtime.join("via.sock"))?;
+            let mut replies = Vec::new();
+            let outcome = (|| {
+                for occurrence in [2, 3] {
+                    failpoints.arm(point, occurrence, "pause").map_err(infra)?;
+                    let held = raw.request("logs", &json!({"session":session}))?;
+                    failpoints
+                        .wait_ack(
+                            point,
+                            occurrence,
+                            "pause",
+                            daemon.child.id(),
+                            FINAL_SHUTDOWN,
+                        )
+                        .map_err(infra)?;
+                    check(held["error"]["data"]["kind"] == "store_error", || {
+                        format!("a held logs step must answer store_error: {held}")
+                    })?;
+                    replies.push(held);
+                }
+                // Over the cap: refused before any blob step is admitted.
+                failpoints.arm(point, 4, "pause").map_err(infra)?;
+                let over = raw.request("logs", &json!({"session":session}))?;
+                let reached = failpoints.ack_bytes(point, 4).is_ok();
+                failpoints.disarm(point).map_err(infra)?;
+                replies.push(over.clone());
+                check(
+                    over["error"]["data"]["kind"] == "store_error" && !reached,
+                    || format!("a third logs reached a blob step ({reached}): {over}"),
+                )?;
+                // Turn work keeps its slots: a new turn creates its folder.
+                let second = small("spawn_second")?;
+                check(second.status.success(), || {
+                    format!("a turn during held logs exited {}", second.status)
+                })
+            })();
+            for occurrence in [2, 3, 4] {
+                failpoints.release(point, occurrence).map_err(infra)?;
+            }
+            evidence
+                .write("logs_replies.json", json!(replies).to_string().as_bytes())
+                .map_err(infra)?;
+            outcome?;
+            let stopping = raw.request("daemon/stop", &json!({}))?;
+            check(stopping["result"]["stopping"] == true, || {
+                stopping.to_string()
+            })?;
+            drop(raw);
+            let status = daemon
+                .wait_exit(FINAL_SHUTDOWN)?
+                .ok_or_else(|| fail("the daemon did not exit"))?;
+            let summary = daemon.summary()?;
+            evidence
+                .write("daemon_shutdown.json", summary.to_string().as_bytes())
+                .map_err(infra)?;
+            check(
+                status.code() == Some(0) && summary["blob_tasks"] == 0,
+                || format!("released steps must end: exit {status}; summary {summary}"),
+            )
+        },
+    )
+}

@@ -1,7 +1,10 @@
 //! Reads: address resolution, `result`, `wait`, `events`, `logs` and
 //! `status`.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -257,13 +260,21 @@ impl Engine {
             .evidence_dir
             .map(|dir| self.store.evidence().absolute(&dir));
         // A failed `lstat` is a failed evidence read: `store_error`, as for
-        // the Store read above.
+        // the Store read above; so is a diagnostic permit not available.
         let files = match folder.clone() {
-            Some(folder) => self
-                .store
-                .blocking_step(move || evidence_files(&folder))
-                .await
-                .map_err(|_| ApiError::STORE)?,
+            Some(folder) => {
+                let permit = Arc::clone(&self.diagnostics)
+                    .try_acquire_owned()
+                    .map_err(|_| ApiError::STORE)?;
+                self.store
+                    .blocking_step(move || {
+                        // Released when the checks end, even after 2 s.
+                        let _permit = permit;
+                        evidence_files(&folder)
+                    })
+                    .await
+                    .map_err(|_| ApiError::STORE)?
+            }
             None => Vec::new(),
         };
         Ok(json!({

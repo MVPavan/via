@@ -133,6 +133,11 @@ pub struct Engine {
     /// The data-size walk's cached result (design §5.3); the async mutex
     /// shares one walk among concurrent `daemon/status` calls.
     data_size: tokio::sync::Mutex<Option<status::DataSize>>,
+    /// Permits for diagnostic blob steps, the `logs` file checks and the
+    /// data-size walk (coding-style §5): each is held until its blocking
+    /// work ends, so diagnostics hold at most [`DIAGNOSTIC_STEPS`] of the
+    /// Store's blob-step slots and turn work keeps the rest.
+    diagnostics: Arc<tokio::sync::Semaphore>,
     /// Test-only in-process Store fault backend; production builds have none.
     #[cfg(test)]
     faults: Faults,
@@ -235,6 +240,9 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The daemon-wide connection-slot pool (design §11) and its size. Test
 /// builds only: `VIA_TEST_CONNECTION_SLOTS` lowers it.
+/// Most diagnostic blob steps running at once, overrun ones included.
+const DIAGNOSTIC_STEPS: usize = 2;
+
 fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTION_SLOTS));
     #[cfg(feature = "test-failpoints")]
@@ -351,6 +359,7 @@ impl Engine {
             started_at: crate::api::rfc3339(std::time::SystemTime::now()),
             open_sessions: AtomicUsize::new(open_sessions),
             data_size: tokio::sync::Mutex::new(None),
+            diagnostics: Arc::new(tokio::sync::Semaphore::new(DIAGNOSTIC_STEPS)),
             #[cfg(test)]
             faults: Faults::default(),
         })
