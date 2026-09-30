@@ -289,3 +289,75 @@ Log: `scratchpad/t4/t4-fix/gate.log`, `gate exit 0`.
   - the undecoded note on overrun now reads "not saved: blob I/O exceeded
     2 s";
   - `WireError::Evidence` wraps the Store error text.
+
+## Round 1
+
+Sol high r1 returned UNSOUND with one important finding
+(`scratchpad/execution/t4-impl/review-t4-fix-sol-r1.md`). The
+orchestrator's commit `3cf689d`, which lists the `store.data_size.walk`
+seam in design §13.1, is kept. Logs: `scratchpad/t4/t4-fix/r1-*.log`.
+
+### Finding: `logs` shared the 16-slot blob-step pool
+
+- **Defect.** After fix 2, `logs` file checks ran as Store blob steps.
+  Sixteen concurrent stalled `logs` calls could fill the pool, so a prompt
+  write, a final-text step or a turn-folder creation would be refused.
+- **Change** (`05b40a3`), as the orchestrator decided:
+  - The Engine (`crates/via-core/src/engine.rs`) holds
+    `diagnostics: Arc<tokio::sync::Semaphore>` with
+    `DIAGNOSTIC_STEPS = 2` permits, shared by the `logs` file checks and the
+    data-size walk.
+  - Each step takes a permit with `try_acquire_owned` before the step is
+    admitted. The permit moves into the blocking closure, so it is released
+    only when the blocking work ends, even after the 2 s timeout. It is also
+    released if the Store refuses the step at its cap.
+  - `logs` with no permit returns `ApiError::STORE`: `-32018`
+    `store_error`, "durable storage failed". That is the same error `logs`
+    returns when the Store refuses or fails its step.
+  - The walk with no permit counts as a failed walk: it is cached as `null`
+    for its minute.
+    - `StoreClient::data_bytes` now takes a `held: impl Send + 'static`
+      value, which it drops when the walk ends. This is how the permit moves
+      into the Store's closure.
+  - Diagnostics can therefore hold at most 2 of the 16 slots. There is no
+    new dependency, and the layer graph is unchanged.
+- **Test.** New `s1_blob_stalled_logs_are_capped_and_turns_still_start`
+  (`crates/via-cli/tests/s1_daemon_stop.rs`):
+  1. After one small turn, whose folder creation is blob step 1, two `logs`
+     calls are held with `blob.step.stall` at occurrences 2 and 3. Each
+     answers `store_error` at its bound.
+  2. A third `logs` is sent with occurrence 4 armed. It must answer
+     `store_error` without reaching a blob step, so no occurrence-4
+     acknowledgement may exist. This proves the refusal by order, not by
+     time.
+  3. With the two steps still held, a new foreground turn creates its
+     folder and completes.
+  4. After release, `daemon/stop` exits 0 with `blob_tasks` 0.
+  - RED (before the fix): `a third logs reached a blob step (true)`, so
+    there was no cap.
+  - GREEN: 7/7 of `s1_blob_stalled|s1_store_data_size|logs`.
+  - This is the smallest form that fails today, as the orchestrator
+    allowed. It shows that the cap exists and that turn work proceeds. It
+    does not fill all 16 slots.
+- **Not separately tested:** the walk with no permit. It uses the same
+  semaphore, and its outcome is the already-tested failed-walk path
+  (`s1_store_data_size_overrun_walks_once`).
+
+### Minor finding
+
+`d1bfa42` fails clippy on its own. As instructed, the history is not
+rewritten; the orchestrator records it in the merge message.
+
+### Round 1 gate counts
+
+Log: `r1-gate.log`, `gate exit 0`.
+
+| Check | Result |
+|---|---|
+| fmt, both clippy runs, deny, layers | pass |
+| `cargo nextest run --locked --workspace` | 330 passed, 1 skipped |
+| failpoint suite, run 1 (gate) | 529 passed, 1 skipped |
+| failpoint suite, run 2 (`r1-failpoint-2.log`) | 529 passed, 1 skipped |
+| `s1_f(08|09|10|12)_` | 56 passed |
+| release build and `check-release-features.py` | pass; 105 points armed, ignored |
+| Task 4 selector ×3 | 85 passed each time |
