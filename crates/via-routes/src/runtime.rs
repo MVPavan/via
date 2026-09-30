@@ -156,11 +156,11 @@ impl FakeRoute {
                 // even though the wall deadline passed during finalization;
                 // cleanup comes from Host's force close. A message still
                 // held, such as the terminal with its final text, reaches the
-                // hop first, within the same cleanup allowance; if it cannot,
-                // that failure is the turn's, never a completion.
+                // hop first, within the same cleanup allowance and whatever
+                // the force or the latch; if it cannot, that failure is the
+                // turn's, never a completion.
                 let cleanup = cleanup_deadline();
-                serving.deadline = cleanup;
-                match serving.flush().await {
+                match serving.deliver_held(cleanup).await {
                     Ok(()) => {
                         let report = sender
                             .close(CloseRequest {
@@ -178,16 +178,15 @@ impl FakeRoute {
                             report.journal_uncertain,
                         ));
                     }
-                    Err(mut failed) => {
-                        failed.close_by.get_or_insert(cleanup);
-                        failed
-                    }
+                    // Cleanup gets its own bound below: the allowance has
+                    // elapsed, and the force close still needs its time.
+                    Err(failed) => failed,
                 }
             }
             Err(failed) => failed,
         };
         // The turn deadline may already have elapsed; cleanup gets its own
-        // bound, or `close_by`.
+        // bound, or the stop order's `close_by`.
         let cleanup = failed.close_by.unwrap_or_else(cleanup_deadline);
         let report = sender
             .close(CloseRequest {
@@ -518,6 +517,32 @@ impl<'a> Serving<'a> {
         Ok(())
     }
 
+    /// The late path's delivery (design §2 rule 3 [r1.23]): the held
+    /// message, if any, goes on the hop as the reserve arm of
+    /// [`Self::serve_once`] sends it. Only room on the hop, a closed hop or
+    /// `by` ends the wait; no other control acts on an already decoded
+    /// message.
+    async fn deliver_held(&mut self, by: Deadline) -> Result<(), Failed> {
+        let Some(message) = self.held.take() else {
+            return Ok(());
+        };
+        let turn = self.turn;
+        let hop = self.hop;
+        tokio::select! {
+            biased;
+            permit = hop.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(message);
+                    Ok(())
+                }
+                Err(_) => Err(self.hop_closed()),
+            },
+            () = tokio::time::sleep_until(by.instant()) => {
+                Err(RouteError::Deadline { turn }.into())
+            }
+        }
+    }
+
     /// One round of [`Self::serve`]: `Some` once `op` completed.
     async fn serve_once<T>(
         &mut self,
@@ -696,8 +721,7 @@ async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>) {
 struct Failed {
     cause: RouteError,
     exit: Option<ExitReport>,
-    /// A stop order's bound on the force close and drain, or a late
-    /// terminal's cleanup allowance.
+    /// A stop order's bound on the force close and drain.
     close_by: Option<Deadline>,
 }
 

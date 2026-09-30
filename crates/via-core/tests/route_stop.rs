@@ -380,31 +380,93 @@ fn a_held_terminal_is_delivered_after_wall_expiry() {
     let Some(root) = child_root() else {
         return run_child(name, &held_terminal_script());
     };
-    let (outcome, text) = held_terminal(&Child::open(&root), true);
-    let evidence = outcome.unwrap();
+    let run = held_terminal(&Child::open(&root), Some(Duration::ZERO), None);
+    let evidence = run.outcome.unwrap();
     assert_eq!(evidence.status, VendorTerminalStatus::Completed);
-    assert_eq!(text, "done", "a completed turn lost its final text");
+    assert_eq!(run.text, "done", "a completed turn lost its final text");
+}
+
+/// S1-runtime2 fix round 1 (design §2 rule 3 [r1.23]): the late path's
+/// delivery of the held terminal is delivery-only, so a daemon force
+/// raised while it waits for room on the hop does not drop the terminal:
+/// its final text reaches Core. Time gaps, not an order proof, place the
+/// force inside the late delivery: Route enters the late path at the wall
+/// deadline (its own timer, which never fires early), the force comes
+/// 500 ms later, and draining starts 500 ms after that, well within the
+/// late path's 3 s allowance. The Adapter still ends a forced turn
+/// without its post-Route drain (a Route success under force is its
+/// `Overflow`), so the delivered text is asserted, and a completion only
+/// if the Adapter reports one.
+#[test]
+fn a_force_during_late_delivery_keeps_the_held_terminal() {
+    let name = "a_force_during_late_delivery_keeps_the_held_terminal";
+    let Some(root) = child_root() else {
+        return run_child(name, &held_terminal_script());
+    };
+    let run = held_terminal(
+        &Child::open(&root),
+        Some(Duration::from_millis(1000)),
+        Some(Duration::from_millis(500)),
+    );
+    assert_eq!(
+        run.text, "done",
+        "the forced late delivery dropped the terminal"
+    );
+    if let Ok(evidence) = run.outcome {
+        assert_eq!(evidence.status, VendorTerminalStatus::Completed);
+    }
 }
 
 /// S1 critic r2 finding 2: a held terminal that cannot reach the hop within
-/// the late path's cleanup allowance fails the turn with the delivery's
-/// own failure (the allowance's `Deadline`), never a completion.
+/// the late path's allowance fails the turn with the delivery's own
+/// failure (the allowance's `Deadline`), never a completion, and the force
+/// close still gets its own bound: the group ends quiescent.
+///
+/// The late path is proven taken: the vendor wrote the terminal and is
+/// still alive [`LATE_PROBE`] after the wall deadline. On every other exit
+/// after the deadline Route force-closes the group at once (a turn that
+/// never decoded its terminal fails at the deadline itself); only the late
+/// delivery keeps it open, for up to its 3 s allowance.
 #[test]
 fn an_undelivered_held_terminal_is_not_a_completion() {
     let name = "an_undelivered_held_terminal_is_not_a_completion";
     let Some(root) = child_root() else {
         return run_child(name, &held_terminal_script());
     };
-    let (outcome, text) = held_terminal(&Child::open(&root), false);
-    let failure = route_failure(outcome);
+    let run = held_terminal(&Child::open(&root), None, None);
+    assert_eq!(
+        run.alive_late,
+        Some(true),
+        "the vendor was not alive {LATE_PROBE:?} after the wall deadline: no late delivery"
+    );
+    let failure = route_failure(run.outcome);
     assert!(
         matches!(failure.cause, RouteError::Deadline { .. }),
         "{failure:?}"
     );
-    assert_eq!(text, "");
+    assert_eq!(
+        failure.cleanup,
+        Some(via_adapters::WireCleanup::Quiescent),
+        "{failure:?}"
+    );
+    assert_eq!(run.text, "");
 }
 
-/// The acceptance, 1,025 texts and the terminal, then a live vendor.
+/// When [`held_terminal`] checks the vendor after the wall deadline: 500 ms
+/// inside Route's 3 s late-path allowance (`cleanup_deadline` in
+/// `via-routes`' runtime), a margin for the probe's own scheduling.
+const LATE_PROBE: Duration = Duration::from_millis(2500);
+
+/// Whether `pid` is a live process, not a zombie, from `/proc`.
+fn process_live(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| !matches!(rest.trim_start().chars().next(), Some('Z' | 'X')))
+    })
+}
+
+/// The acceptance, 1,025 texts and the terminal, then a live vendor whose
+/// pid is in `vendor.pid`.
 fn held_terminal_script() -> String {
     format!(
         "read -r start\nprintf '%s\\n' '{ACCEPTED}'\ni=0\n\
@@ -412,20 +474,31 @@ fn held_terminal_script() -> String {
          printf '%s\\n' '{{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"text\":\"x\"}}'\n\
          i=$((i+1))\ndone\n\
          printf '%s\\n' '{{\"type\":\"terminal\",\"vendor_turn_id\":\"fake-turn-1\",\"status\":\"completed\",\"final_text\":\"done\",\"stop_reason\":\"end_turn\"}}'\n\
+         echo $$ > \"$VIA_FAKE_SYNC_DIR/vendor.pid\"\n\
          exec sleep 60\n"
     )
+}
+
+/// One [`held_terminal`] run.
+struct HeldRun {
+    outcome: Outcome,
+    /// The final text Core received.
+    text: String,
+    /// Whether the vendor, having written the terminal, was alive
+    /// [`LATE_PROBE`] after the wall deadline; `None` if the run ended first.
+    alive_late: Option<bool>,
 }
 
 /// Runs [`held_terminal_script`] under a 3 s wall deadline and drains
 /// nothing before it: the acceptance and 1,023 texts fill Core's 1,024-item
 /// channel, the Adapter's delivery holds the 1,024th text, the hop of one
-/// the 1,025th, and Route holds the terminal. From the deadline on the
-/// channel is drained if `drain`. Returns the outcome and the final text
-/// Core received.
-fn held_terminal(child: &Child, drain: bool) -> (Outcome, String) {
+/// the 1,025th, and Route holds the terminal. The channel is drained from
+/// `drain` after the deadline, and the daemon force is raised `force`
+/// after it; `None` never does either.
+fn held_terminal(child: &Child, drain: Option<Duration>, force: Option<Duration>) -> HeldRun {
     let (sender, mut receiver) = via_adapters::observation_channel();
     let expiry = tokio::time::Instant::now() + Duration::from_secs(3);
-    let (_force, force) = watch::channel(None);
+    let (forcing, forced) = watch::channel(None);
     let (_order, orders) = watch::channel(None);
     child.runtime.block_on(async {
         let execute = child.adapter.execute(
@@ -435,7 +508,7 @@ fn held_terminal(child: &Child, drain: bool) -> (Outcome, String) {
             sender,
             via_adapters::TurnActivity::new(tokio::time::Instant::now()),
             Deadline::at(expiry),
-            force,
+            forced,
             orders,
             Box::new(()),
         );
@@ -450,9 +523,22 @@ fn held_terminal(child: &Child, drain: bool) -> (Outcome, String) {
             }
         };
         let mut draining = false;
+        let mut force_at = force.map(|after| expiry + after);
+        let drain_at = drain.map(|after| expiry + after);
+        let mut alive_late = None;
         let outcome = loop {
             tokio::select! {
-                () = tokio::time::sleep_until(expiry), if drain && !draining => draining = true,
+                () = tokio::time::sleep_until(expiry + LATE_PROBE), if alive_late.is_none() => {
+                    let pid = fs::read_to_string(child.sync("vendor.pid"))
+                        .ok()
+                        .and_then(|pid| pid.trim().parse().ok());
+                    alive_late = Some(pid.is_some_and(process_live));
+                }
+                () = tokio::time::sleep_until(force_at.unwrap_or(expiry)), if force_at.is_some() => {
+                    forcing.send_replace(force_at.take());
+                }
+                () = tokio::time::sleep_until(drain_at.unwrap_or(expiry)),
+                    if drain_at.is_some() && !draining => draining = true,
                 Some(admitted) = receiver.recv(), if draining => collect(admitted.observation),
                 outcome = &mut execute => break outcome,
             }
@@ -460,7 +546,11 @@ fn held_terminal(child: &Child, drain: bool) -> (Outcome, String) {
         while let Ok(admitted) = receiver.try_recv() {
             collect(admitted.observation);
         }
-        (outcome, text)
+        HeldRun {
+            outcome,
+            text,
+            alive_late,
+        }
     })
 }
 
