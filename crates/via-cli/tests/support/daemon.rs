@@ -172,12 +172,13 @@ impl<'a> Daemon<'a> {
             if let Some(status) = daemon.child.try_wait().map_err(infra)? {
                 return Err(failure(format!("daemon exited before readiness: {status}")));
             }
-            let capture = sandbox
-                .run(&["daemon", "status", "--json"], Duration::from_secs(1))
-                .map_err(infra)?;
-            if capture.status.success()
-                && serde_json::from_slice::<Value>(&capture.stdout)
-                    .is_ok_and(|value| value["pid"].is_u64())
+            // A direct connection: an auto-starting `via daemon status`
+            // would start a second daemon, without the child's failpoints,
+            // that can win `daemon.lock` over the child.
+            let status = Raw::open(sandbox)
+                .and_then(|mut raw| raw.exchange(&request(1, "daemon/status", &json!({}))));
+            if let Ok(status) = status
+                && status["result"]["pid"] == daemon.child.id()
             {
                 return Ok(daemon);
             }

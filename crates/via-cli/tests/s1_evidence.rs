@@ -492,3 +492,45 @@ fn s1_c1_logs_selects_the_turn_and_never_reads_files() -> TestResult {
     );
     report.require_pass()
 }
+
+/// T4-flake: the harness readiness probe never starts a daemon. Here the
+/// harness's daemon serves another deployment, so the sandbox's socket never
+/// appears; an auto-starting probe would start a second daemon in the
+/// sandbox, without the child's failpoints, and report it ready. Under
+/// parallel runs that second daemon won `daemon.lock` from the child.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
+    let sandbox = Sandbox::new(&script(1, "unused", &[]))?;
+    let evidence = Evidence::new("s1_evidence_readiness", &sandbox.fake, &sandbox.fixture)?;
+    let elsewhere = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let (state, runtime) = (
+        elsewhere.path().join("state"),
+        elsewhere.path().join("runtime"),
+    );
+    for dir in [&state, &runtime] {
+        daemon::private_dir(dir)?;
+    }
+    let started = Daemon::start_with(&sandbox, &evidence, |command| {
+        command.env("VIA_STATE_DIR", &state);
+        command.env("VIA_RUNTIME_DIR", &runtime);
+        command.env("VIA_TEST_IDLE_EXIT_MS", "3000");
+    });
+    let socket = sandbox.runtime.join("via.sock").exists();
+    // Stops a daemon the probe may have started; refused when there is none.
+    sandbox.run(
+        &["daemon", "stop", "--force", "--json"],
+        Duration::from_secs(20),
+    )?;
+    let exited =
+        matches!(&started, Err(error) if error.to_string().contains("exited before readiness"));
+    drop(started);
+    if !exited || socket {
+        return Err(
+            format!("readiness: child exit reported {exited}, sandbox socket {socket}").into(),
+        );
+    }
+    Ok(())
+}

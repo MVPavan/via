@@ -196,9 +196,16 @@ impl Sandbox {
             if let Some(status) = daemon.child.try_wait()? {
                 return Err(format!("daemon exited before readiness: {status}").into());
             }
-            let status = self.run(&["daemon", "status", "--json"])?;
-            if status.status.success() {
-                return Ok(daemon);
+            // Never let the readiness probe auto-start a second daemon: one
+            // could win `daemon.lock` over the child.
+            if self.runtime.join("via.sock").exists() {
+                let status = self.run(&["daemon", "status", "--json"])?;
+                if status.status.success()
+                    && serde_json::from_slice::<Value>(&status.stdout)
+                        .is_ok_and(|value| value["pid"] == daemon.child.id())
+                {
+                    return Ok(daemon);
+                }
             }
             if Instant::now() >= deadline {
                 return Err("daemon readiness deadline elapsed".into());

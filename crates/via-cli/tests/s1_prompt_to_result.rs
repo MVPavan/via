@@ -163,19 +163,23 @@ fn start_daemon<'a>(
                 "daemon exited before readiness: {status}"
             )));
         }
-        let capture = cx
-            .run(&["daemon", "status", "--json"], Duration::from_secs(1))
-            .map_err(infra)?;
-        if capture.timed_out {
-            return Err(ScenarioError::Timeout("daemon status timed out".to_owned()));
-        }
-        if capture.status.success()
-            && let Ok(value) = serde_json::from_slice::<Value>(&capture.stdout)
-            && value["daemon_version"].is_string()
-            && value["pid"].as_u64().is_some()
-        {
-            daemon.ready = true;
-            return Ok(daemon);
+        // Never let the readiness probe auto-start a second daemon: one
+        // could win `daemon.lock` over the child.
+        if cx.runtime.join("via.sock").exists() {
+            let capture = cx
+                .run(&["daemon", "status", "--json"], Duration::from_secs(1))
+                .map_err(infra)?;
+            if capture.timed_out {
+                return Err(ScenarioError::Timeout("daemon status timed out".to_owned()));
+            }
+            if capture.status.success()
+                && let Ok(value) = serde_json::from_slice::<Value>(&capture.stdout)
+                && value["daemon_version"].is_string()
+                && value["pid"] == daemon.child.id()
+            {
+                daemon.ready = true;
+                return Ok(daemon);
+            }
         }
         if Instant::now() >= deadline {
             return Err(ScenarioError::Timeout(
