@@ -50,7 +50,16 @@ fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Erro
     assert_eq!(report.outcome, "fail");
     assert!(!report.evidence_complete);
     assert!(report.require_pass().is_err());
-    assert_eq!(outcome(&report.artifact)?["outcome"], "fail");
+    // The run has no daemon, so its required evidence is missing: the
+    // artifact records that, not the failure (S1-contract r1 finding 2).
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "infrastructure_failure");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("scenario assertion panicked")),
+        "{summary}"
+    );
     assert!(report.artifact.join("sha256.manifest").is_file());
     Ok(())
 }
@@ -87,7 +96,15 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
     );
     assert_eq!(report.outcome, "timeout");
     assert!(!report.evidence_complete);
-    assert_eq!(outcome(&report.artifact)?["outcome"], "timeout");
+    // As above: missing required evidence decides the recorded outcome.
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "infrastructure_failure");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("sleep exceeded scenario deadline")),
+        "{summary}"
+    );
     assert!(report.artifact.join("sha256.manifest").is_file());
     Ok(())
 }

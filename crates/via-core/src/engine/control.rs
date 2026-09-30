@@ -5,7 +5,7 @@
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
-use via_store::CancelCause;
+use via_store::{CancelCause, SessionSnapshot};
 
 use super::drive::Cancelled;
 use super::queue::{Ack, CancelStep, Owner, QueuedOutcome, StopSpec};
@@ -15,29 +15,47 @@ use crate::api::{DEFAULT_FORCE_AFTER_MS, rfc3339};
 use crate::{ApiError, CancelParams, SessionId, TurnNumber, hash_handle};
 
 impl Engine {
-    /// C1 §3.5 `cancel`, in design §3's order of checks: authenticate; after
-    /// the latch `store_error`; resolve the turn; a terminal turn replies
-    /// `already_terminal: true`; once force is accepted `daemon_stopping`.
-    /// Allowed during a drain and while the session is closing.
-    pub async fn cancel(&self, params: CancelParams) -> Result<Value, ApiError> {
-        let hash = hash_handle(&params.handle)?;
-        if params.turn == Some(0) {
-            return Err(ApiError::INVALID_PARAMS);
-        }
-        let session = params.session;
+    /// F15's precedence for a mutation of an existing session (`resume`,
+    /// `steer`, `cancel`, `close`), before any other check or I/O: the
+    /// session exists (`session_not_found`), then the handle, wrong or
+    /// missing, authenticates (`invalid_handle`). The handle hash never
+    /// changes, so this needs no `admission`. Returns the hash and the
+    /// session's snapshot as read here.
+    pub(super) async fn authenticate_existing(
+        &self,
+        session: &SessionId,
+        handle: Option<&str>,
+    ) -> Result<([u8; 32], SessionSnapshot), ApiError> {
         let snapshot = self
             .store
-            .session_snapshot(&session)
+            .session_snapshot(session)
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
+        let hash = hash_handle(handle.ok_or(ApiError::INVALID_HANDLE)?)?;
         if !self
             .store
-            .authenticate(&session, &hash)
+            .authenticate(session, &hash)
             .await
             .map_err(|_| ApiError::STORE)?
         {
             return Err(ApiError::INVALID_HANDLE);
+        }
+        Ok((hash, snapshot))
+    }
+
+    /// C1 §3.5 `cancel`, in design §3's order of checks: the session and
+    /// its handle ([`Self::authenticate_existing`]); after the latch
+    /// `store_error`; resolve the turn; a terminal turn replies
+    /// `already_terminal: true`; once force is accepted `daemon_stopping`.
+    /// Allowed during a drain and while the session is closing.
+    pub async fn cancel(&self, params: CancelParams) -> Result<Value, ApiError> {
+        let session = params.session;
+        let (_, snapshot) = self
+            .authenticate_existing(&session, params.handle.as_deref())
+            .await?;
+        if params.turn == Some(0) {
+            return Err(ApiError::INVALID_PARAMS);
         }
         // O1.D13: after the latch its force stop performs the cleanup.
         if self.store_failed() {

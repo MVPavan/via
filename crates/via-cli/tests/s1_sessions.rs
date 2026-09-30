@@ -1458,3 +1458,153 @@ fn s1_params_keyed_retry_replays_identical_effective() -> TestResult {
     );
     report.require_pass()
 }
+
+/// F15: on every existing-session mutation (`resume`, `steer`, `cancel`,
+/// `close`), a wrong handle and a missing one are both `invalid_handle`,
+/// and the Store, the blobs and the session's `status` are unchanged. The
+/// precedence is the session's existence, then the handle, then the rest:
+/// a nonexistent session is `session_not_found` whatever the handle; a
+/// `resume` with a wrong handle is refused before its prompt file is read
+/// (an unreadable one is not `invalid_params`) or stored as a blob; on the
+/// fake, `steer` never reaches `unsupported_verb`.
+/// Every file under the State's `blobs/`, sorted.
+fn blob_files(state: &std::path::Path) -> Result<Vec<String>, ScenarioError> {
+    let mut names = Vec::new();
+    let mut dirs = vec![state.join("blobs")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.map_err(infra)?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                names.push(path.display().to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one F15 scenario keeps every verb, handle and state check together"
+)]
+fn s1_f15_wrong_or_missing_handle_is_invalid_handle_with_no_state_change() -> TestResult {
+    let sandbox = Sandbox::new(&fixture(&[turn_script(1, "f15", Some("hold_f15"))]))?;
+    let evidence = Evidence::new("s1_f15_invalid_handle", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let receipt = cli(
+                &sandbox,
+                evidence,
+                "spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "f15",
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let session = session_of(&receipt)?;
+            sandbox.await_gate("hold_f15")?;
+            await_count(
+                &sandbox,
+                "SELECT count(*) FROM events WHERE type='turn.started'",
+                1,
+            )?;
+            let status = || {
+                cli(
+                    &sandbox,
+                    evidence,
+                    "status",
+                    &["status", &session, "--json"],
+                )
+            };
+            let blobs = || blob_files(&sandbox.state);
+            let root = sandbox.state.parent().ok_or_else(|| infra("no root"))?;
+            let readable = root.join("f15-prompt.txt");
+            std::fs::write(&readable, b"a prompt that must not be stored").map_err(infra)?;
+            let unreadable = root.join("f15-missing.txt");
+            let before = (daemon::store_dump(&sandbox.state)?, status()?, blobs()?);
+            let mut raw = Raw::open(&sandbox)?;
+            let mut id = 10;
+            let absent = "s_0000000000zz";
+            let cases = |session: &str| {
+                [
+                    ("resume", json!({"session":session,"prompt":"f15b"})),
+                    (
+                        "resume",
+                        json!({"session":session,"prompt_file":readable.display().to_string()}),
+                    ),
+                    (
+                        "resume",
+                        json!({"session":session,"prompt_file":unreadable.display().to_string()}),
+                    ),
+                    ("steer", json!({"session":session,"text":"late"})),
+                    ("cancel", json!({"session":session})),
+                    ("close", json!({"session":session,"mode":"force"})),
+                ]
+            };
+            for (target, kind) in [
+                (session.as_str(), "invalid_handle"),
+                (absent, "session_not_found"),
+            ] {
+                for (verb, params) in cases(target) {
+                    for handle in [None, Some(OTHER_HANDLE)] {
+                        let mut params = params.clone();
+                        if let Some(handle) = handle {
+                            params["handle"] = json!(handle);
+                        }
+                        id += 1;
+                        let reply = raw.exchange(&request(id, verb, &params))?;
+                        if reply["error"]["data"]["kind"] != kind {
+                            return Err(failure(format!(
+                                "{verb} {params} with handle {handle:?}: expected {kind}, got {reply}"
+                            )));
+                        }
+                    }
+                }
+            }
+            let after = (daemon::store_dump(&sandbox.state)?, status()?, blobs()?);
+            if after != before {
+                return Err(failure(format!(
+                    "a refused mutation changed state: {before:?} then {after:?}"
+                )));
+            }
+            sandbox.release_gate("hold_f15")?;
+            let envelope = wait_completed(
+                &sandbox,
+                evidence,
+                "wait",
+                &format!("{session}/1"),
+                "f15 reply",
+            )?;
+            evidence
+                .write("envelopes.ndjson", format!("{envelope}\n").as_bytes())
+                .map_err(infra)?;
+            let history = events(&sandbox, evidence, "events", &session)?;
+            evidence
+                .write(
+                    "events.ndjson",
+                    serde_json::to_vec(&history).map_err(infra)?.as_slice(),
+                )
+                .map_err(infra)?;
+            check_history(&sandbox, &session, &history, 1).map(|_| ())
+        },
+        |evidence| collect_available(evidence, &sandbox.state),
+    );
+    report.require_pass()
+}

@@ -330,8 +330,7 @@ impl Engine {
     /// The turn's evidence folder, as its envelope names it (C1 §5).
     pub(super) fn evidence_folder(&self, session: &SessionId, turn: TurnNumber) -> String {
         self.store
-            .evidence()
-            .path(session, turn)
+            .evidence_path(&via_store::EvidenceRoot::relative(session, turn))
             .display()
             .to_string()
     }

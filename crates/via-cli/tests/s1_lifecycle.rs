@@ -7,6 +7,8 @@
 //! acknowledgements, durable rows, sockets or process exit; a sleep only
 //! lets time pass, never orders two events.
 
+#[path = "support/evidenced.rs"]
+mod evidenced;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
@@ -15,6 +17,7 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+mod support;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -29,6 +32,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use evidenced::evidenced;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -120,6 +124,12 @@ fn wait_gone(pid: u32, within: Duration) -> TestResult {
 /// fake fixture, extra environment and the failpoint controller.
 struct Sandbox {
     root: tempfile::TempDir,
+    /// The scenario's evidence, collected when the sandbox is dropped.
+    evidence: Option<support::evidence::Evidence>,
+    /// Cleared by a scenario with no Store by design.
+    store_expected: std::sync::atomic::AtomicBool,
+    /// Cleared by a scenario whose turns launch no vendor by design.
+    folders_expected: std::sync::atomic::AtomicBool,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -132,7 +142,54 @@ struct Sandbox {
     failpoints: failpoints::Failpoints,
 }
 
+/// Collects the scenario's evidence once every daemon has exited: the
+/// children it started are reaped by their guards, which borrow the
+/// sandbox, and [`evidenced::stop_daemons`] proves the rest gone.
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if let Some(evidence) = self.evidence.take() {
+            self.root.disable_cleanup(true);
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
+                evidenced::run_within(
+                    self.command().args(["daemon", "stop", "--force", "--json"]),
+                    budget,
+                );
+            });
+            let expected = evidenced::Expected {
+                store: self
+                    .store_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                folders: self
+                    .folders_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            };
+            evidenced::park(
+                evidence,
+                self.root.path().to_owned(),
+                &self.state,
+                expected,
+                exited,
+            );
+        }
+    }
+}
+
 impl Sandbox {
+    /// Declares a scenario with no Store by design: its evidence then
+    /// requires none of the Store's artifacts.
+    fn no_store(&self) {
+        self.store_expected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Declares a scenario whose turns launch no vendor by design: only
+    /// their evidence folders are waived; the Store, envelopes, events and
+    /// cleanup stay required, and a launched turn must have its folder.
+    fn no_launch(&self) {
+        self.folders_expected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn new(fixture: &Value) -> TestResult<Self> {
         let via = PathBuf::from(env!("CARGO_BIN_EXE_via"));
         let fake = via
@@ -156,8 +213,12 @@ impl Sandbox {
         fs::write(&fixture_path, serde_json::to_vec(fixture)?)?;
         #[cfg(feature = "test-failpoints")]
         let failpoints = failpoints::Failpoints::new(root.path())?;
+        let evidence = evidenced::open(&fake, &fixture_path)?;
         Ok(Self {
             root,
+            evidence: Some(evidence),
+            store_expected: std::sync::atomic::AtomicBool::new(true),
+            folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
             fake,
             state,
@@ -591,21 +652,23 @@ fn snapshot(dir: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
 /// the next daemon takes both locks, then replaces the stale socket.
 #[test]
 fn s1_f02_stale_socket_replaced_after_lock() -> TestResult {
-    let sandbox = Sandbox::new(&completes("after", 1))?;
-    let mut first = sandbox.start()?;
-    first.child.kill()?;
-    first.child.wait()?;
-    check(sandbox.runtime.join("via.sock").exists(), || {
-        "the killed daemon left no socket".to_owned()
-    })?;
-    let second = sandbox.start()?;
-    check(sandbox.status()?["pid"] == second.pid(), || {
-        "another daemon answered".to_owned()
-    })?;
-    let (session, _) = sandbox.spawn("after")?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    second.finish()
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("after", 1))?;
+        let mut first = sandbox.start()?;
+        first.child.kill()?;
+        first.child.wait()?;
+        check(sandbox.runtime.join("via.sock").exists(), || {
+            "the killed daemon left no socket".to_owned()
+        })?;
+        let second = sandbox.start()?;
+        check(sandbox.status()?["pid"] == second.pid(), || {
+            "another daemon answered".to_owned()
+        })?;
+        let (session, _) = sandbox.spawn("after")?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        second.finish()
+    })
 }
 
 /// The socket's identity: inode and device.
@@ -620,55 +683,61 @@ fn socket_identity(runtime: &Path) -> TestResult<(u64, u64)> {
 /// A stale socket is replaced only under both locks (the test above).
 #[test]
 fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
-    // `daemon.lock` held by a live daemon.
-    let sandbox = Sandbox::new(&json!({}))?;
-    let owner = sandbox.start()?;
-    let before = socket_identity(&sandbox.runtime)?;
-    let mut direct = sandbox.command();
-    direct.arg("daemon");
-    let loser = run_command(&mut direct, Duration::from_secs(10))?;
-    check(loser.status.code() == Some(75), || {
-        format!("the losing daemon: {}", loser.status)
-    })?;
-    check(
-        socket_identity(&sandbox.runtime).ok() == Some(before),
-        || "the losing daemon removed or replaced the socket".to_owned(),
-    )?;
-    check(sandbox.status()?["pid"] == owner.pid(), || {
-        "the owner no longer answers on its socket".to_owned()
-    })?;
-    owner.finish()?;
-    // `store.lock` held by another process, no `daemon.lock` holder: the
-    // socket is one the harness listens on.
-    let sandbox = Sandbox::new(&json!({}))?;
-    let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
-    listener.set_nonblocking(true)?;
-    let before = socket_identity(&sandbox.runtime)?;
-    let store_lock = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(sandbox.state.join("store.lock"))?;
-    store_lock.try_lock()?;
-    let mut direct = sandbox.command();
-    direct.arg("daemon");
-    let loser = run_command(&mut direct, Duration::from_secs(10))?;
-    let stderr = String::from_utf8_lossy(&loser.stderr);
-    check(
-        loser.status.code() == Some(4) && stderr.contains("store.lock is held"),
-        || format!("the store-lock loser: {} {stderr}", loser.status),
-    )?;
-    check(
-        socket_identity(&sandbox.runtime).ok() == Some(before),
-        || "the store-lock loser removed or replaced the socket".to_owned(),
-    )?;
-    let _client = UnixStream::connect(sandbox.runtime.join("via.sock"))?;
-    listener
-        .accept()
-        .map_err(|error| format!("the harness's socket has no connection: {error}"))?;
-    Ok(())
+    evidenced(|| {
+        // `daemon.lock` held by a live daemon.
+        let sandbox = Sandbox::new(&json!({}))?;
+        // An idle owner: no turn by design.
+        sandbox.no_launch();
+        let owner = sandbox.start()?;
+        let before = socket_identity(&sandbox.runtime)?;
+        let mut direct = sandbox.command();
+        direct.arg("daemon");
+        let loser = run_command(&mut direct, Duration::from_secs(10))?;
+        check(loser.status.code() == Some(75), || {
+            format!("the losing daemon: {}", loser.status)
+        })?;
+        check(
+            socket_identity(&sandbox.runtime).ok() == Some(before),
+            || "the losing daemon removed or replaced the socket".to_owned(),
+        )?;
+        check(sandbox.status()?["pid"] == owner.pid(), || {
+            "the owner no longer answers on its socket".to_owned()
+        })?;
+        owner.finish()?;
+        // `store.lock` held by another process, no `daemon.lock` holder: the
+        // socket is one the harness listens on.
+        let sandbox = Sandbox::new(&json!({}))?;
+        // No daemon ever opens this Store.
+        sandbox.no_store();
+        let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+        listener.set_nonblocking(true)?;
+        let before = socket_identity(&sandbox.runtime)?;
+        let store_lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(sandbox.state.join("store.lock"))?;
+        store_lock.try_lock()?;
+        let mut direct = sandbox.command();
+        direct.arg("daemon");
+        let loser = run_command(&mut direct, Duration::from_secs(10))?;
+        let stderr = String::from_utf8_lossy(&loser.stderr);
+        check(
+            loser.status.code() == Some(4) && stderr.contains("store.lock is held"),
+            || format!("the store-lock loser: {} {stderr}", loser.status),
+        )?;
+        check(
+            socket_identity(&sandbox.runtime).ok() == Some(before),
+            || "the store-lock loser removed or replaced the socket".to_owned(),
+        )?;
+        let _client = UnixStream::connect(sandbox.runtime.join("via.sock"))?;
+        listener
+            .accept()
+            .map_err(|error| format!("the harness's socket has no connection: {error}"))?;
+        Ok(())
+    })
 }
 
 /// F3 (design §6.1): an unsafe runtime root (a symlink, mode 0755, another
@@ -676,56 +745,60 @@ fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
 /// the daemon's message, exit 4, and nothing created.
 #[test]
 fn s1_f03_unsafe_runtime_dir_refused() -> TestResult {
-    let sandbox = Sandbox::new(&json!({}))?;
-    let target = sandbox.root.path().join("target");
-    fs::DirBuilder::new().mode(0o700).create(&target)?;
-    let link = sandbox.root.path().join("link");
-    std::os::unix::fs::symlink(&target, &link)?;
-    let open = sandbox.root.path().join("open");
-    fs::DirBuilder::new().create(&open)?;
-    fs::set_permissions(&open, fs::Permissions::from_mode(0o755))?;
-    let mut variants = vec![
-        ("symlink", link, Some(target)),
-        ("mode", open.clone(), Some(open)),
-    ];
-    // Another owner: a root-owned directory, when this user is not root.
-    let foreign = Path::new("/root");
-    let uid = rustix::process::geteuid();
-    if !uid.is_root() {
-        let owner = fs::symlink_metadata(foreign)?.uid();
-        check(owner != uid.as_raw(), || "/root is ours".to_owned())?;
-        variants.push(("owner", foreign.to_path_buf(), None));
-    }
-    for (name, runtime, inspect) in variants {
-        let mut command = sandbox.command();
-        command
-            .env("VIA_RUNTIME_DIR", &runtime)
-            .args(["daemon", "status", "--json"]);
-        let captured = run_command(&mut command, Duration::from_secs(30))?;
-        let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-        check(
-            captured.status.code() == Some(4)
-                && error["message"]
-                    .as_str()
-                    .is_some_and(|message| message.starts_with("unsafe VIA managed directory")),
-            || {
-                format!(
-                    "{name}: exit {} stderr {}",
-                    captured.status,
-                    String::from_utf8_lossy(&captured.stderr)
-                )
-            },
-        )?;
-        if let Some(dir) = inspect {
-            check(fs::read_dir(&dir)?.next().is_none(), || {
-                format!("{name}: something was created in {}", dir.display())
+    evidenced(|| {
+        let sandbox = Sandbox::new(&json!({}))?;
+        // The CLI refuses before any daemon or Store.
+        sandbox.no_store();
+        let target = sandbox.root.path().join("target");
+        fs::DirBuilder::new().mode(0o700).create(&target)?;
+        let link = sandbox.root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let open = sandbox.root.path().join("open");
+        fs::DirBuilder::new().create(&open)?;
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755))?;
+        let mut variants = vec![
+            ("symlink", link, Some(target)),
+            ("mode", open.clone(), Some(open)),
+        ];
+        // Another owner: a root-owned directory, when this user is not root.
+        let foreign = Path::new("/root");
+        let uid = rustix::process::geteuid();
+        if !uid.is_root() {
+            let owner = fs::symlink_metadata(foreign)?.uid();
+            check(owner != uid.as_raw(), || "/root is ours".to_owned())?;
+            variants.push(("owner", foreign.to_path_buf(), None));
+        }
+        for (name, runtime, inspect) in variants {
+            let mut command = sandbox.command();
+            command
+                .env("VIA_RUNTIME_DIR", &runtime)
+                .args(["daemon", "status", "--json"]);
+            let captured = run_command(&mut command, Duration::from_secs(30))?;
+            let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+            check(
+                captured.status.code() == Some(4)
+                    && error["message"]
+                        .as_str()
+                        .is_some_and(|message| message.starts_with("unsafe VIA managed directory")),
+                || {
+                    format!(
+                        "{name}: exit {} stderr {}",
+                        captured.status,
+                        String::from_utf8_lossy(&captured.stderr)
+                    )
+                },
+            )?;
+            if let Some(dir) = inspect {
+                check(fs::read_dir(&dir)?.next().is_none(), || {
+                    format!("{name}: something was created in {}", dir.display())
+                })?;
+            }
+            check(fs::read_dir(&sandbox.state)?.next().is_none(), || {
+                format!("{name}: the State directory was touched")
             })?;
         }
-        check(fs::read_dir(&sandbox.state)?.next().is_none(), || {
-            format!("{name}: the State directory was touched")
-        })?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// F11 (design §6.1): a newer Store schema, and a Store that fails
@@ -733,51 +806,53 @@ fn s1_f03_unsafe_runtime_dir_refused() -> TestResult {
 /// the Store's bytes and sidecars unchanged, and no socket left behind.
 #[test]
 fn s1_f11_newer_or_corrupt_store_refused_untouched() -> TestResult {
-    for variant in ["newer", "corrupt"] {
-        let sandbox = Sandbox::new(&completes("seed", 1))?;
-        let daemon = sandbox.start()?;
-        let (session, _) = sandbox.spawn("seed")?;
-        sandbox.wait(&format!("{session}/1"))?;
-        daemon.finish()?;
-        let store = sandbox.state.join("store.sqlite3");
-        let reasons: &[&str] = if variant == "newer" {
-            rusqlite::Connection::open(&store)?.pragma_update(None, "user_version", 99)?;
-            &["newer Store schema"]
-        } else {
-            // Page 2 overwritten: the file still opens, and `quick_check` fails.
-            let mut bytes = fs::read(&store)?;
-            let page = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
-            check(bytes.len() >= 3 * page, || {
-                "the Store is too small".to_owned()
+    evidenced(|| {
+        for variant in ["newer", "corrupt"] {
+            let sandbox = Sandbox::new(&completes("seed", 1))?;
+            let daemon = sandbox.start()?;
+            let (session, _) = sandbox.spawn("seed")?;
+            sandbox.wait(&format!("{session}/1"))?;
+            daemon.finish()?;
+            let store = sandbox.state.join("store.sqlite3");
+            let reasons: &[&str] = if variant == "newer" {
+                rusqlite::Connection::open(&store)?.pragma_update(None, "user_version", 99)?;
+                &["newer Store schema"]
+            } else {
+                // Page 2 overwritten: the file still opens, and `quick_check` fails.
+                let mut bytes = fs::read(&store)?;
+                let page = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+                check(bytes.len() >= 3 * page, || {
+                    "the Store is too small".to_owned()
+                })?;
+                bytes[page..2 * page].fill(0xA5);
+                fs::write(&store, &bytes)?;
+                &["corrupt Store", "malformed"]
+            };
+            let before = snapshot(&sandbox.state)?;
+            let mut command = sandbox.command();
+            command.arg("daemon");
+            let captured = run_command(&mut command, Duration::from_secs(30))?;
+            let stderr = String::from_utf8_lossy(&captured.stderr);
+            check(
+                captured.status.code() == Some(4)
+                    && reasons.iter().any(|reason| stderr.contains(reason)),
+                || format!("{variant}: exit {} stderr {stderr}", captured.status),
+            )?;
+            let after = snapshot(&sandbox.state)?;
+            check(after == before, || {
+                let changed: Vec<_> = before
+                    .keys()
+                    .chain(after.keys())
+                    .filter(|path| before.get(*path) != after.get(*path))
+                    .collect();
+                format!("{variant}: the State directory changed: {changed:?}")
             })?;
-            bytes[page..2 * page].fill(0xA5);
-            fs::write(&store, &bytes)?;
-            &["corrupt Store", "malformed"]
-        };
-        let before = snapshot(&sandbox.state)?;
-        let mut command = sandbox.command();
-        command.arg("daemon");
-        let captured = run_command(&mut command, Duration::from_secs(30))?;
-        let stderr = String::from_utf8_lossy(&captured.stderr);
-        check(
-            captured.status.code() == Some(4)
-                && reasons.iter().any(|reason| stderr.contains(reason)),
-            || format!("{variant}: exit {} stderr {stderr}", captured.status),
-        )?;
-        let after = snapshot(&sandbox.state)?;
-        check(after == before, || {
-            let changed: Vec<_> = before
-                .keys()
-                .chain(after.keys())
-                .filter(|path| before.get(*path) != after.get(*path))
-                .collect();
-            format!("{variant}: the State directory changed: {changed:?}")
-        })?;
-        check(!sandbox.runtime.join("via.sock").exists(), || {
-            format!("{variant}: the socket was left behind")
-        })?;
-    }
-    Ok(())
+            check(!sandbox.runtime.join("via.sock").exists(), || {
+                format!("{variant}: the socket was left behind")
+            })?;
+        }
+        Ok(())
+    })
 }
 
 /// F11 with a WAL left beside the Store and no `-shm` (T3-S3 round 1,
@@ -788,59 +863,61 @@ fn s1_f11_newer_or_corrupt_store_refused_untouched() -> TestResult {
 /// limit is the `-shm` it creates, the one file allowed to appear.
 #[test]
 fn s1_f11_newer_store_in_a_wal_without_shm_refused() -> TestResult {
-    let sandbox = Sandbox::new(&completes("seed", 1))?;
-    let daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("seed")?;
-    sandbox.wait(&format!("{session}/1"))?;
-    daemon.finish()?;
-    let store = sandbox.state.join("store.sqlite3");
-    let wal = sandbox.state.join("store.sqlite3-wal");
-    let shm = sandbox.state.join("store.sqlite3-shm");
-    // Everything in the main file, and no sidecar: the last connection's
-    // close removes both.
-    rusqlite::Connection::open(&store)?.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-    check(!wal.exists() && !shm.exists(), || {
-        "sidecars left after a checkpoint".to_owned()
-    })?;
-    // The newer version is written to a copy, whose WAL is taken while its
-    // connection is still open, so nothing is checkpointed into the file.
-    let scratch = sandbox.root.path().join("wal-copy");
-    fs::DirBuilder::new().mode(0o700).create(&scratch)?;
-    let copy = scratch.join("store.sqlite3");
-    fs::copy(&store, &copy)?;
-    let writer = rusqlite::Connection::open(&copy)?;
-    writer.pragma_update(None, "wal_autocheckpoint", 0)?;
-    writer.pragma_update(None, "user_version", 99)?;
-    fs::copy(scratch.join("store.sqlite3-wal"), &wal)?;
-    fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))?;
-    drop(writer);
-    let main: i64 = rusqlite::Connection::open_with_flags(
-        format!("file:{}?immutable=1", store.display()),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )?
-    .pragma_query_value(None, "user_version", |row| row.get(0))?;
-    check(main == 6, || format!("the main file says v{main}"))?;
-    let before = snapshot(&sandbox.state)?;
-    let mut command = sandbox.command();
-    command.arg("daemon");
-    let captured = run_command(&mut command, Duration::from_secs(30))?;
-    let stderr = String::from_utf8_lossy(&captured.stderr);
-    check(
-        captured.status.code() == Some(4) && stderr.contains("newer Store schema"),
-        || format!("exit {} stderr {stderr}", captured.status),
-    )?;
-    let mut after = snapshot(&sandbox.state)?;
-    after.remove(&shm);
-    check(after == before, || {
-        let changed: Vec<_> = before
-            .keys()
-            .chain(after.keys())
-            .filter(|path| before.get(*path) != after.get(*path))
-            .collect();
-        format!("the State directory changed: {changed:?}")
-    })?;
-    check(!sandbox.runtime.join("via.sock").exists(), || {
-        "the socket was left behind".to_owned()
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("seed", 1))?;
+        let daemon = sandbox.start()?;
+        let (session, _) = sandbox.spawn("seed")?;
+        sandbox.wait(&format!("{session}/1"))?;
+        daemon.finish()?;
+        let store = sandbox.state.join("store.sqlite3");
+        let wal = sandbox.state.join("store.sqlite3-wal");
+        let shm = sandbox.state.join("store.sqlite3-shm");
+        // Everything in the main file, and no sidecar: the last connection's
+        // close removes both.
+        rusqlite::Connection::open(&store)?.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        check(!wal.exists() && !shm.exists(), || {
+            "sidecars left after a checkpoint".to_owned()
+        })?;
+        // The newer version is written to a copy, whose WAL is taken while its
+        // connection is still open, so nothing is checkpointed into the file.
+        let scratch = sandbox.root.path().join("wal-copy");
+        fs::DirBuilder::new().mode(0o700).create(&scratch)?;
+        let copy = scratch.join("store.sqlite3");
+        fs::copy(&store, &copy)?;
+        let writer = rusqlite::Connection::open(&copy)?;
+        writer.pragma_update(None, "wal_autocheckpoint", 0)?;
+        writer.pragma_update(None, "user_version", 99)?;
+        fs::copy(scratch.join("store.sqlite3-wal"), &wal)?;
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))?;
+        drop(writer);
+        let main: i64 = rusqlite::Connection::open_with_flags(
+            format!("file:{}?immutable=1", store.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?
+        .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        check(main == 6, || format!("the main file says v{main}"))?;
+        let before = snapshot(&sandbox.state)?;
+        let mut command = sandbox.command();
+        command.arg("daemon");
+        let captured = run_command(&mut command, Duration::from_secs(30))?;
+        let stderr = String::from_utf8_lossy(&captured.stderr);
+        check(
+            captured.status.code() == Some(4) && stderr.contains("newer Store schema"),
+            || format!("exit {} stderr {stderr}", captured.status),
+        )?;
+        let mut after = snapshot(&sandbox.state)?;
+        after.remove(&shm);
+        check(after == before, || {
+            let changed: Vec<_> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .collect();
+            format!("the State directory changed: {changed:?}")
+        })?;
+        check(!sandbox.runtime.join("via.sock").exists(), || {
+            "the socket was left behind".to_owned()
+        })
     })
 }
 
@@ -850,54 +927,57 @@ fn s1_f11_newer_store_in_a_wal_without_shm_refused() -> TestResult {
 /// group, and the turn continue, and the result is read later.
 #[test]
 fn s1_f29_ctrl_c_foreground_spawn_exits_130() -> TestResult {
-    let sandbox = Sandbox::new(&held("hold", 1))?;
-    let out = sandbox.root.path().join("spawn.stdout");
-    let mut command = sandbox.command();
-    command
-        .args([
-            "spawn",
-            "--harness",
-            "fake",
-            "--model",
-            "fake",
-            "--prompt",
-            "hold",
-            "--json",
-        ])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(File::create(&out)?)
-        .stderr(File::create(sandbox.root.path().join("spawn.stderr"))?);
-    let mut cli = command.spawn()?;
-    sandbox.await_file("hold.entered")?;
-    wait_until("the receipt line", Duration::from_secs(20), || {
-        fs::read(&out).is_ok_and(|bytes| bytes.ends_with(b"\n"))
-    })?;
-    let receipt: Value = serde_json::from_slice(&fs::read(&out)?)?;
-    let group = rustix::process::Pid::from_raw(i32::try_from(cli.id())?).ok_or("no pid")?;
-    rustix::process::kill_process_group(group, rustix::process::Signal::INT)?;
-    let status = wait_child(&mut cli, Duration::from_secs(10))?.ok_or("the CLI kept waiting")?;
-    let lines = fs::read(&out)?
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .count();
-    check(status.code() == Some(130) && lines == 1, || {
-        format!("interrupted CLI: {status}, {lines} lines")
-    })?;
-    let daemon = sandbox.status()?;
-    let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
-    check(daemon["sessions"]["active"] == 1, || {
-        format!("the turn did not continue: {daemon}")
-    })?;
-    sandbox.release("hold")?;
-    let session = receipt["session_id"]
-        .as_str()
-        .ok_or("receipt has no session")?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    let result = sandbox.ok(&["result", &format!("{session}/1"), "--json"])?;
-    check(result["state"] == "completed", || result.to_string())?;
-    sandbox.stop_auto(sandbox.command(), pid)
+    evidenced(|| {
+        let sandbox = Sandbox::new(&held("hold", 1))?;
+        let out = sandbox.root.path().join("spawn.stdout");
+        let mut command = sandbox.command();
+        command
+            .args([
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "hold",
+                "--json",
+            ])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(File::create(&out)?)
+            .stderr(File::create(sandbox.root.path().join("spawn.stderr"))?);
+        let mut cli = command.spawn()?;
+        sandbox.await_file("hold.entered")?;
+        wait_until("the receipt line", Duration::from_secs(20), || {
+            fs::read(&out).is_ok_and(|bytes| bytes.ends_with(b"\n"))
+        })?;
+        let receipt: Value = serde_json::from_slice(&fs::read(&out)?)?;
+        let group = rustix::process::Pid::from_raw(i32::try_from(cli.id())?).ok_or("no pid")?;
+        rustix::process::kill_process_group(group, rustix::process::Signal::INT)?;
+        let status =
+            wait_child(&mut cli, Duration::from_secs(10))?.ok_or("the CLI kept waiting")?;
+        let lines = fs::read(&out)?
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count();
+        check(status.code() == Some(130) && lines == 1, || {
+            format!("interrupted CLI: {status}, {lines} lines")
+        })?;
+        let daemon = sandbox.status()?;
+        let pid = u32::try_from(daemon["pid"].as_u64().ok_or("status has no pid")?)?;
+        check(daemon["sessions"]["active"] == 1, || {
+            format!("the turn did not continue: {daemon}")
+        })?;
+        sandbox.release("hold")?;
+        let session = receipt["session_id"]
+            .as_str()
+            .ok_or("receipt has no session")?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        let result = sandbox.ok(&["result", &format!("{session}/1"), "--json"])?;
+        check(result["state"] == "completed", || result.to_string())?;
+        sandbox.stop_auto(sandbox.command(), pid)
+    })
 }
 
 /// F1 (design §6.1): two auto-starts at once make one daemon. The first
@@ -908,49 +988,53 @@ fn s1_f29_ctrl_c_foreground_spawn_exits_130() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f01_concurrent_auto_start_one_daemon() -> TestResult {
-    let sandbox = Sandbox::new(&json!({}))?;
-    sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
-    let status_cli = |name: &str| -> TestResult<Child> {
-        let mut command = sandbox.command_fp();
-        command
-            .args(["daemon", "status", "--json"])
-            .stdin(Stdio::null())
-            .stdout(File::create(
-                sandbox.root.path().join(format!("{name}.stdout")),
-            )?)
-            .stderr(File::create(
-                sandbox.root.path().join(format!("{name}.stderr")),
-            )?);
-        Ok(command.spawn()?)
-    };
-    let mut first = status_cli("first")?;
-    let owner = sandbox.process_ack("daemon.startup.after_lock", 1, "pause")?;
-    let mut direct = sandbox.command();
-    direct.arg("daemon");
-    let loser = run_command(&mut direct, Duration::from_secs(10))?;
-    let stderr = String::from_utf8_lossy(&loser.stderr);
-    check(
-        loser.status.code() == Some(75)
-            && stderr.lines().count() == 1
-            && stderr.contains("daemon.lock"),
-        || format!("the losing daemon: {} {stderr}", loser.status),
-    )?;
-    let mut second = status_cli("second")?;
-    sandbox.resume_point("daemon.startup.after_lock", 1)?;
-    for (name, cli) in [("first", &mut first), ("second", &mut second)] {
-        let status = wait_child(cli, Duration::from_secs(30))?.ok_or("a CLI never returned")?;
-        let stdout = fs::read(sandbox.root.path().join(format!("{name}.stdout")))?;
-        let reply: Value = serde_json::from_slice(&stdout).unwrap_or_default();
-        check(status.success() && reply["pid"] == owner, || {
-            format!(
-                "{name}: {status} {reply} {}",
-                fs::read_to_string(sandbox.root.path().join(format!("{name}.stderr")))
-                    .unwrap_or_default()
-            )
-        })?;
-    }
-    sandbox.disarm("daemon.startup.after_lock")?;
-    sandbox.stop_auto(sandbox.command(), owner)
+    evidenced(|| {
+        let sandbox = Sandbox::new(&json!({}))?;
+        // Daemon startup only: no turn by design.
+        sandbox.no_launch();
+        sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
+        let status_cli = |name: &str| -> TestResult<Child> {
+            let mut command = sandbox.command_fp();
+            command
+                .args(["daemon", "status", "--json"])
+                .stdin(Stdio::null())
+                .stdout(File::create(
+                    sandbox.root.path().join(format!("{name}.stdout")),
+                )?)
+                .stderr(File::create(
+                    sandbox.root.path().join(format!("{name}.stderr")),
+                )?);
+            Ok(command.spawn()?)
+        };
+        let mut first = status_cli("first")?;
+        let owner = sandbox.process_ack("daemon.startup.after_lock", 1, "pause")?;
+        let mut direct = sandbox.command();
+        direct.arg("daemon");
+        let loser = run_command(&mut direct, Duration::from_secs(10))?;
+        let stderr = String::from_utf8_lossy(&loser.stderr);
+        check(
+            loser.status.code() == Some(75)
+                && stderr.lines().count() == 1
+                && stderr.contains("daemon.lock"),
+            || format!("the losing daemon: {} {stderr}", loser.status),
+        )?;
+        let mut second = status_cli("second")?;
+        sandbox.resume_point("daemon.startup.after_lock", 1)?;
+        for (name, cli) in [("first", &mut first), ("second", &mut second)] {
+            let status = wait_child(cli, Duration::from_secs(30))?.ok_or("a CLI never returned")?;
+            let stdout = fs::read(sandbox.root.path().join(format!("{name}.stdout")))?;
+            let reply: Value = serde_json::from_slice(&stdout).unwrap_or_default();
+            check(status.success() && reply["pid"] == owner, || {
+                format!(
+                    "{name}: {status} {reply} {}",
+                    fs::read_to_string(sandbox.root.path().join(format!("{name}.stderr")))
+                        .unwrap_or_default()
+                )
+            })?;
+        }
+        sandbox.disarm("daemon.startup.after_lock")?;
+        sandbox.stop_auto(sandbox.command(), owner)
+    })
 }
 
 /// F4 (design §6.2) [r1.14]: `VIA_TEST_CLIENT_VERSION` makes the CLI (and
@@ -961,80 +1045,84 @@ fn s1_f01_concurrent_auto_start_one_daemon() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
-    const OTHER: &str = "0.0.0-f04";
-    let sandbox = Sandbox::new(&json!({}))?;
-    let mut daemon = sandbox.start()?;
-    let other_version = |state: &Path| -> TestResult<Captured> {
-        let mut command = sandbox.command();
-        command
-            .env("VIA_TEST_CLIENT_VERSION", OTHER)
-            .env("VIA_STATE_DIR", state)
-            .args(["daemon", "status", "--json"]);
-        run_command(&mut command, Duration::from_secs(40))
-    };
-    // A Store mismatch: exit 4, and nothing is stopped.
-    let elsewhere = sandbox.root.path().join("elsewhere");
-    fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
-    let captured = other_version(&elsewhere)?;
-    check(
-        captured.status.code() == Some(4)
-            && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
-        || {
-            format!(
-                "store mismatch: {}",
-                String::from_utf8_lossy(&captured.stderr)
-            )
-        },
-    )?;
-    check(sandbox.status()?["pid"] == daemon.pid(), || {
-        "the daemon was replaced".to_owned()
-    })?;
-    // Another client connected: the idle-only stop is refused.
-    let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    let captured = other_version(&sandbox.state)?;
-    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-    check(
-        captured.status.code() == Some(2)
-            && error["data"]["kind"] == "admission_refused"
-            && error["message"] == "daemon not idle",
-        || format!("busy daemon: {} {error}", captured.status),
-    )?;
-    check(sandbox.status()?["pid"] == daemon.pid(), || {
-        "a busy daemon was stopped".to_owned()
-    })?;
-    drop(connected);
-    // Idle and Store-matched. A closed connection's task ends shortly after
-    // the close; a refusal while one is still counted is retried in bound.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let captured = loop {
+    evidenced(|| {
+        const OTHER: &str = "0.0.0-f04";
+        let sandbox = Sandbox::new(&json!({}))?;
+        // Idle daemons only: no turn by design.
+        sandbox.no_launch();
+        let mut daemon = sandbox.start()?;
+        let other_version = |state: &Path| -> TestResult<Captured> {
+            let mut command = sandbox.command();
+            command
+                .env("VIA_TEST_CLIENT_VERSION", OTHER)
+                .env("VIA_STATE_DIR", state)
+                .args(["daemon", "status", "--json"]);
+            run_command(&mut command, Duration::from_secs(40))
+        };
+        // A Store mismatch: exit 4, and nothing is stopped.
+        let elsewhere = sandbox.root.path().join("elsewhere");
+        fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
+        let captured = other_version(&elsewhere)?;
+        check(
+            captured.status.code() == Some(4)
+                && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
+            || {
+                format!(
+                    "store mismatch: {}",
+                    String::from_utf8_lossy(&captured.stderr)
+                )
+            },
+        )?;
+        check(sandbox.status()?["pid"] == daemon.pid(), || {
+            "the daemon was replaced".to_owned()
+        })?;
+        // Another client connected: the idle-only stop is refused.
+        let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
         let captured = other_version(&sandbox.state)?;
         let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-        if error["message"] != "daemon not idle" || Instant::now() >= deadline {
-            break captured;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let status: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
-    check(
-        captured.status.success() && status["daemon_version"] == OTHER,
-        || {
-            format!(
-                "idle daemon: {} {status} {}",
-                captured.status,
-                String::from_utf8_lossy(&captured.stderr)
-            )
-        },
-    )?;
-    let exit = daemon.exit(Duration::from_secs(15))?;
-    let summary = daemon.summary()?;
-    check(
-        exit.code() == Some(0) && summary["mode"] == "idle" && status["pid"] != daemon.pid(),
-        || format!("stopped daemon: {exit} {summary}"),
-    )?;
-    let pid = u32::try_from(status["pid"].as_u64().ok_or("status has no pid")?)?;
-    let mut stop = sandbox.command();
-    stop.env("VIA_TEST_CLIENT_VERSION", OTHER);
-    sandbox.stop_auto(stop, pid)
+        check(
+            captured.status.code() == Some(2)
+                && error["data"]["kind"] == "admission_refused"
+                && error["message"] == "daemon not idle",
+            || format!("busy daemon: {} {error}", captured.status),
+        )?;
+        check(sandbox.status()?["pid"] == daemon.pid(), || {
+            "a busy daemon was stopped".to_owned()
+        })?;
+        drop(connected);
+        // Idle and Store-matched. A closed connection's task ends shortly after
+        // the close; a refusal while one is still counted is retried in bound.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let captured = loop {
+            let captured = other_version(&sandbox.state)?;
+            let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+            if error["message"] != "daemon not idle" || Instant::now() >= deadline {
+                break captured;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let status: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
+        check(
+            captured.status.success() && status["daemon_version"] == OTHER,
+            || {
+                format!(
+                    "idle daemon: {} {status} {}",
+                    captured.status,
+                    String::from_utf8_lossy(&captured.stderr)
+                )
+            },
+        )?;
+        let exit = daemon.exit(Duration::from_secs(15))?;
+        let summary = daemon.summary()?;
+        check(
+            exit.code() == Some(0) && summary["mode"] == "idle" && status["pid"] != daemon.pid(),
+            || format!("stopped daemon: {exit} {summary}"),
+        )?;
+        let pid = u32::try_from(status["pid"].as_u64().ok_or("status has no pid")?)?;
+        let mut stop = sandbox.command();
+        stop.env("VIA_TEST_CLIENT_VERSION", OTHER);
+        sandbox.stop_auto(stop, pid)
+    })
 }
 
 /// F4, explicit stop (design §6.2 items 3 and 5, review Y item 6): `via
@@ -1047,97 +1135,101 @@ fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> TestResult {
-    const OTHER: &str = "0.0.0-f04-stop";
-    let sandbox = Sandbox::new(&json!({}))?;
-    let mut daemon = sandbox.start()?;
-    sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
-    let stop = |state: &Path, extra: &[&str]| -> TestResult<Captured> {
-        let mut command = sandbox.command_fp();
-        command
-            .env("VIA_TEST_CLIENT_VERSION", OTHER)
-            .env("VIA_STATE_DIR", state)
-            .args(["daemon", "stop"])
-            .args(extra)
-            .arg("--json");
-        run_command(&mut command, Duration::from_secs(40))
-    };
-    let untouched = |what: &str| -> TestResult {
-        check(sandbox.status()?["pid"] == daemon.pid(), || {
-            format!("{what}: the daemon was stopped or replaced")
-        })
-    };
-    // A Store mismatch: exit 4, and nothing is sent.
-    let elsewhere = sandbox.root.path().join("elsewhere");
-    fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
-    let captured = stop(&elsewhere, &[])?;
-    check(
-        captured.status.code() == Some(4)
-            && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
-        || {
-            format!(
-                "store mismatch: {}",
-                String::from_utf8_lossy(&captured.stderr)
-            )
-        },
-    )?;
-    untouched("store mismatch")?;
-    // `--force` is not the permitted plain stop: reported, daemon untouched.
-    let captured = stop(&sandbox.state, &["--force"])?;
-    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-    check(
-        captured.status.code() == Some(2) && error["data"]["kind"] == "version_mismatch",
-        || format!("forced stop: {} {error}", captured.status),
-    )?;
-    untouched("forced stop")?;
-    // Another client connected: the idle-only stop is refused.
-    let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    let captured = stop(&sandbox.state, &[])?;
-    let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-    check(
-        captured.status.code() == Some(2)
-            && error["data"]["kind"] == "admission_refused"
-            && error["message"] == "daemon not idle",
-        || format!("busy daemon: {} {error}", captured.status),
-    )?;
-    untouched("busy daemon")?;
-    drop(connected);
-    // Idle and Store-matched. A closed connection's task ends shortly after
-    // the close; a refusal while one is still counted is retried in bound.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let captured = loop {
+    evidenced(|| {
+        const OTHER: &str = "0.0.0-f04-stop";
+        let sandbox = Sandbox::new(&json!({}))?;
+        // Idle daemons only: no turn by design.
+        sandbox.no_launch();
+        let mut daemon = sandbox.start()?;
+        sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
+        let stop = |state: &Path, extra: &[&str]| -> TestResult<Captured> {
+            let mut command = sandbox.command_fp();
+            command
+                .env("VIA_TEST_CLIENT_VERSION", OTHER)
+                .env("VIA_STATE_DIR", state)
+                .args(["daemon", "stop"])
+                .args(extra)
+                .arg("--json");
+            run_command(&mut command, Duration::from_secs(40))
+        };
+        let untouched = |what: &str| -> TestResult {
+            check(sandbox.status()?["pid"] == daemon.pid(), || {
+                format!("{what}: the daemon was stopped or replaced")
+            })
+        };
+        // A Store mismatch: exit 4, and nothing is sent.
+        let elsewhere = sandbox.root.path().join("elsewhere");
+        fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
+        let captured = stop(&elsewhere, &[])?;
+        check(
+            captured.status.code() == Some(4)
+                && String::from_utf8_lossy(&captured.stderr).contains("different Store path"),
+            || {
+                format!(
+                    "store mismatch: {}",
+                    String::from_utf8_lossy(&captured.stderr)
+                )
+            },
+        )?;
+        untouched("store mismatch")?;
+        // `--force` is not the permitted plain stop: reported, daemon untouched.
+        let captured = stop(&sandbox.state, &["--force"])?;
+        let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+        check(
+            captured.status.code() == Some(2) && error["data"]["kind"] == "version_mismatch",
+            || format!("forced stop: {} {error}", captured.status),
+        )?;
+        untouched("forced stop")?;
+        // Another client connected: the idle-only stop is refused.
+        let (connected, _) = Raw::hello(&sandbox.runtime, VERSION)?;
         let captured = stop(&sandbox.state, &[])?;
         let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
-        if error["message"] != "daemon not idle" || Instant::now() >= deadline {
-            break captured;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let reply: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
-    check(
-        captured.status.success() && reply["stopping"] == true,
-        || {
-            format!(
-                "idle daemon: {} {reply} {}",
-                captured.status,
-                String::from_utf8_lossy(&captured.stderr)
-            )
-        },
-    )?;
-    let exit = daemon.exit(Duration::from_secs(15))?;
-    let summary = daemon.summary()?;
-    check(exit.code() == Some(0) && summary["mode"] == "idle", || {
-        format!("stopped daemon: {exit} {summary}")
-    })?;
-    // The CLI has returned and the daemon is gone: no replacement was
-    // started (it would have paused and acknowledged at its lock).
-    check(
-        !sandbox.runtime.join("via.sock").exists()
-            && sandbox
-                .failpoints
-                .ack_bytes("daemon.startup.after_lock", 1)
-                .is_err(),
-        || "a replacement daemon was started".to_owned(),
-    )
+        check(
+            captured.status.code() == Some(2)
+                && error["data"]["kind"] == "admission_refused"
+                && error["message"] == "daemon not idle",
+            || format!("busy daemon: {} {error}", captured.status),
+        )?;
+        untouched("busy daemon")?;
+        drop(connected);
+        // Idle and Store-matched. A closed connection's task ends shortly after
+        // the close; a refusal while one is still counted is retried in bound.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let captured = loop {
+            let captured = stop(&sandbox.state, &[])?;
+            let error: Value = serde_json::from_slice(&captured.stderr).unwrap_or_default();
+            if error["message"] != "daemon not idle" || Instant::now() >= deadline {
+                break captured;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let reply: Value = serde_json::from_slice(&captured.stdout).unwrap_or_default();
+        check(
+            captured.status.success() && reply["stopping"] == true,
+            || {
+                format!(
+                    "idle daemon: {} {reply} {}",
+                    captured.status,
+                    String::from_utf8_lossy(&captured.stderr)
+                )
+            },
+        )?;
+        let exit = daemon.exit(Duration::from_secs(15))?;
+        let summary = daemon.summary()?;
+        check(exit.code() == Some(0) && summary["mode"] == "idle", || {
+            format!("stopped daemon: {exit} {summary}")
+        })?;
+        // The CLI has returned and the daemon is gone: no replacement was
+        // started (it would have paused and acknowledged at its lock).
+        check(
+            !sandbox.runtime.join("via.sock").exists()
+                && sandbox
+                    .failpoints
+                    .ack_bytes("daemon.startup.after_lock", 1)
+                    .is_err(),
+            || "a replacement daemon was started".to_owned(),
+        )
+    })
 }
 
 /// F6 (design §6.4): with a lowered idle interval the daemon never exits
@@ -1148,63 +1240,65 @@ fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> Test
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f06_idle_exit_and_late_client() -> TestResult {
-    const IDLE: Duration = Duration::from_millis(300);
-    let mut sandbox = Sandbox::new(&held("hold", 1))?;
-    sandbox
-        .env
-        .push(("VIA_TEST_IDLE_EXIT_MS", "300".to_owned()));
-    let idle_exit = |daemon: &mut Daemon<'_>| -> TestResult {
-        let status = daemon.exit(Duration::from_secs(15))?;
-        let summary = daemon.summary()?;
-        check(
-            status.code() == Some(0) && summary["mode"] == "idle",
-            || format!("idle exit: {status} {summary}"),
-        )
-    };
-    // A connected client keeps the daemon.
-    let mut daemon = sandbox.start()?;
-    let (client, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    daemon.alive_for(IDLE * 3)?;
-    drop(client);
-    idle_exit(&mut daemon)?;
-    // A running turn keeps it; its waiter's connection too.
-    let mut daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("hold")?;
-    sandbox.await_file("hold.entered")?;
-    daemon.alive_for(IDLE * 3)?;
-    let (mut waiter, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    sandbox.release("hold")?;
-    let reply = waiter.call("wait", &json!({"address":format!("{session}/1")}))?;
-    check(reply["result"]["state"] == "completed", || {
-        reply.to_string()
-    })?;
-    drop(waiter);
-    idle_exit(&mut daemon)?;
-    // The late client.
-    sandbox.arm("daemon.shutdown.idle_final", 1, "pause")?;
-    let mut daemon = sandbox.start()?;
-    sandbox.ack(&daemon, "daemon.shutdown.idle_final", 1, "pause")?;
-    check(!sandbox.runtime.join("via.sock").exists(), || {
-        "the socket outlived the listener".to_owned()
-    })?;
-    sandbox.disarm("daemon.shutdown.idle_final")?;
-    let late_out = sandbox.root.path().join("late.stdout");
-    let mut late = sandbox.command_fp();
-    late.args(["daemon", "status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(File::create(&late_out)?)
-        .stderr(File::create(sandbox.root.path().join("late.stderr"))?);
-    let mut late = late.spawn()?;
-    sandbox.resume_point("daemon.shutdown.idle_final", 1)?;
-    idle_exit(&mut daemon)?;
-    let status = wait_child(&mut late, Duration::from_secs(30))?.ok_or("the late CLI hung")?;
-    let reply: Value = serde_json::from_slice(&fs::read(&late_out)?).unwrap_or_default();
-    check(status.success() && reply["pid"] != daemon.pid(), || {
-        format!("late client: {status} {reply}")
-    })?;
-    let fresh = u32::try_from(reply["pid"].as_u64().ok_or("status has no pid")?)?;
-    wait_gone(fresh, Duration::from_secs(15))?;
-    sandbox.verify_anchors()
+    evidenced(|| {
+        const IDLE: Duration = Duration::from_millis(300);
+        let mut sandbox = Sandbox::new(&held("hold", 1))?;
+        sandbox
+            .env
+            .push(("VIA_TEST_IDLE_EXIT_MS", "300".to_owned()));
+        let idle_exit = |daemon: &mut Daemon<'_>| -> TestResult {
+            let status = daemon.exit(Duration::from_secs(15))?;
+            let summary = daemon.summary()?;
+            check(
+                status.code() == Some(0) && summary["mode"] == "idle",
+                || format!("idle exit: {status} {summary}"),
+            )
+        };
+        // A connected client keeps the daemon.
+        let mut daemon = sandbox.start()?;
+        let (client, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+        daemon.alive_for(IDLE * 3)?;
+        drop(client);
+        idle_exit(&mut daemon)?;
+        // A running turn keeps it; its waiter's connection too.
+        let mut daemon = sandbox.start()?;
+        let (session, _) = sandbox.spawn("hold")?;
+        sandbox.await_file("hold.entered")?;
+        daemon.alive_for(IDLE * 3)?;
+        let (mut waiter, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+        sandbox.release("hold")?;
+        let reply = waiter.call("wait", &json!({"address":format!("{session}/1")}))?;
+        check(reply["result"]["state"] == "completed", || {
+            reply.to_string()
+        })?;
+        drop(waiter);
+        idle_exit(&mut daemon)?;
+        // The late client.
+        sandbox.arm("daemon.shutdown.idle_final", 1, "pause")?;
+        let mut daemon = sandbox.start()?;
+        sandbox.ack(&daemon, "daemon.shutdown.idle_final", 1, "pause")?;
+        check(!sandbox.runtime.join("via.sock").exists(), || {
+            "the socket outlived the listener".to_owned()
+        })?;
+        sandbox.disarm("daemon.shutdown.idle_final")?;
+        let late_out = sandbox.root.path().join("late.stdout");
+        let mut late = sandbox.command_fp();
+        late.args(["daemon", "status", "--json"])
+            .stdin(Stdio::null())
+            .stdout(File::create(&late_out)?)
+            .stderr(File::create(sandbox.root.path().join("late.stderr"))?);
+        let mut late = late.spawn()?;
+        sandbox.resume_point("daemon.shutdown.idle_final", 1)?;
+        idle_exit(&mut daemon)?;
+        let status = wait_child(&mut late, Duration::from_secs(30))?.ok_or("the late CLI hung")?;
+        let reply: Value = serde_json::from_slice(&fs::read(&late_out)?).unwrap_or_default();
+        check(status.success() && reply["pid"] != daemon.pid(), || {
+            format!("late client: {status} {reply}")
+        })?;
+        let fresh = u32::try_from(reply["pid"].as_u64().ok_or("status has no pid")?)?;
+        wait_gone(fresh, Duration::from_secs(15))?;
+        sandbox.verify_anchors()
+    })
 }
 
 /// F7's force: a running turn, a turn claimed at `core.dispatch.before_grant`
@@ -1252,98 +1346,100 @@ fn force_with_barriers(sandbox: &Sandbox, mut daemon: Daemon<'_>) -> TestResult<
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f07_stop_refused_drain_keeps_sessions_force_closes_unfinished() -> TestResult {
-    let sandbox = Sandbox::new(&scripts(&[
-        completes("idle", 1),
-        held("hold", 1),
-        completes("again", 2),
-        held("run", 1),
-        completes("claim", 1),
-        completes("queued", 1),
-        completes("later", 2),
-    ]))?;
-    // Plain refused, then drain.
-    let mut daemon = sandbox.start()?;
-    let (idle, idle_handle) = sandbox.spawn("idle")?;
-    sandbox.wait(&format!("{idle}/1"))?;
-    let (drained, drained_handle) = sandbox.spawn("hold")?;
-    sandbox.await_file("hold.entered")?;
-    let refused = sandbox.refused(&["daemon", "stop", "--json"], "admission_refused")?;
-    check(refused["message"] == "sessions are active", || {
-        refused.to_string()
-    })?;
-    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
-    check(stopping["stopping"] == true, || stopping.to_string())?;
-    sandbox.refused(
-        &[
-            "spawn",
-            "--harness",
-            "fake",
-            "--model",
-            "fake",
+    evidenced(|| {
+        let sandbox = Sandbox::new(&scripts(&[
+            completes("idle", 1),
+            held("hold", 1),
+            completes("again", 2),
+            held("run", 1),
+            completes("claim", 1),
+            completes("queued", 1),
+            completes("later", 2),
+        ]))?;
+        // Plain refused, then drain.
+        let mut daemon = sandbox.start()?;
+        let (idle, idle_handle) = sandbox.spawn("idle")?;
+        sandbox.wait(&format!("{idle}/1"))?;
+        let (drained, drained_handle) = sandbox.spawn("hold")?;
+        sandbox.await_file("hold.entered")?;
+        let refused = sandbox.refused(&["daemon", "stop", "--json"], "admission_refused")?;
+        check(refused["message"] == "sessions are active", || {
+            refused.to_string()
+        })?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.refused(
+            &[
+                "spawn",
+                "--harness",
+                "fake",
+                "--model",
+                "fake",
+                "--prompt",
+                "idle",
+                "--background",
+                "--json",
+            ],
+            "daemon_stopping",
+        )?;
+        sandbox.release("hold")?;
+        let status = daemon.exit(Duration::from_secs(15))?;
+        let summary = daemon.summary()?;
+        check(
+            status.code() == Some(0) && summary["mode"] == "drain",
+            || format!("drain exit: {status} {summary}"),
+        )?;
+        drop(daemon);
+        for session in [&idle, &drained] {
+            check(sandbox.closed_reason(session)?.is_none(), || {
+                format!("the drain closed {session}")
+            })?;
+        }
+        // Restart: the drained session resumes. Then a force, with a running,
+        // a claimed and a queued turn, each in its own session.
+        let grant = "core.dispatch.before_grant";
+        let start = "daemon.dispatcher.before_start";
+        sandbox.count(grant)?;
+        sandbox.count(start)?;
+        let daemon = sandbox.start()?;
+        sandbox.ok(&[
+            "resume",
+            &drained,
             "--prompt",
-            "idle",
-            "--background",
+            "again",
+            "--handle",
+            &drained_handle,
             "--json",
-        ],
-        "daemon_stopping",
-    )?;
-    sandbox.release("hold")?;
-    let status = daemon.exit(Duration::from_secs(15))?;
-    let summary = daemon.summary()?;
-    check(
-        status.code() == Some(0) && summary["mode"] == "drain",
-        || format!("drain exit: {status} {summary}"),
-    )?;
-    drop(daemon);
-    for session in [&idle, &drained] {
-        check(sandbox.closed_reason(session)?.is_none(), || {
-            format!("the drain closed {session}")
-        })?;
-    }
-    // Restart: the drained session resumes. Then a force, with a running,
-    // a claimed and a queued turn, each in its own session.
-    let grant = "core.dispatch.before_grant";
-    let start = "daemon.dispatcher.before_start";
-    sandbox.count(grant)?;
-    sandbox.count(start)?;
-    let daemon = sandbox.start()?;
-    sandbox.ok(&[
-        "resume",
-        &drained,
-        "--prompt",
-        "again",
-        "--handle",
-        &drained_handle,
-        "--json",
-    ])?;
-    let again = sandbox.wait(&format!("{drained}/2"))?;
-    check(again["state"] == "completed", || again.to_string())?;
-    let [running, claimed, queued] = force_with_barriers(&sandbox, daemon)?;
-    for session in [&running, &claimed, &queued] {
-        let reason = sandbox.closed_reason(session)?;
-        check(reason.as_deref() == Some("daemon_stop_force"), || {
-            format!("{session} closed as {reason:?}")
-        })?;
-    }
-    for session in [&idle, &drained] {
-        check(sandbox.closed_reason(session)?.is_none(), || {
-            format!("the force closed idle {session}")
-        })?;
-    }
-    // The idle session is still resumable.
-    let daemon = sandbox.start()?;
-    sandbox.ok(&[
-        "resume",
-        &idle,
-        "--prompt",
-        "later",
-        "--handle",
-        &idle_handle,
-        "--json",
-    ])?;
-    let later = sandbox.wait(&format!("{idle}/2"))?;
-    check(later["state"] == "completed", || later.to_string())?;
-    daemon.finish()
+        ])?;
+        let again = sandbox.wait(&format!("{drained}/2"))?;
+        check(again["state"] == "completed", || again.to_string())?;
+        let [running, claimed, queued] = force_with_barriers(&sandbox, daemon)?;
+        for session in [&running, &claimed, &queued] {
+            let reason = sandbox.closed_reason(session)?;
+            check(reason.as_deref() == Some("daemon_stop_force"), || {
+                format!("{session} closed as {reason:?}")
+            })?;
+        }
+        for session in [&idle, &drained] {
+            check(sandbox.closed_reason(session)?.is_none(), || {
+                format!("the force closed idle {session}")
+            })?;
+        }
+        // The idle session is still resumable.
+        let daemon = sandbox.start()?;
+        sandbox.ok(&[
+            "resume",
+            &idle,
+            "--prompt",
+            "later",
+            "--handle",
+            &idle_handle,
+            "--json",
+        ])?;
+        let later = sandbox.wait(&format!("{idle}/2"))?;
+        check(later["state"] == "completed", || later.to_string())?;
+        daemon.finish()
+    })
 }
 
 /// F7's `Cancelling` state (design §6.3, review Y item 8): a session whose
@@ -1357,60 +1453,64 @@ fn s1_f07_stop_refused_drain_keeps_sessions_force_closes_unfinished() -> TestRes
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f07_force_set_includes_session_in_cancelling_state() -> TestResult {
-    let start = "daemon.dispatcher.before_start";
-    let commit = "store.commit.cancel";
-    let sandbox = Sandbox::new(&completes("queued", 1))?;
-    let mut daemon = sandbox.start()?;
-    // Both connections are accepted before daemon main pauses: it accepts
-    // no other, and one carries the force, the other the cancel.
-    let (mut forcer, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    let (mut canceller, _) = Raw::hello(&sandbox.runtime, VERSION)?;
-    sandbox.arm(start, 1, "pause")?;
-    let (session, handle) = sandbox.spawn("queued")?;
-    sandbox.ack(&daemon, start, 1, "pause")?;
-    // The turn is `Waiting` with no dispatcher: the cancel takes it
-    // (`Cancelling{request}`) and parks at its commit.
-    sandbox.arm(commit, 1, "pause")?;
-    let params = json!({"session":session,"handle":handle});
-    let cancel = thread::spawn(move || {
-        canceller
-            .call("cancel", &params)
-            .map_err(|error| error.to_string())
-    });
-    sandbox.ack(&daemon, commit, 1, "pause")?;
-    let stop = forcer.call("daemon/stop", &json!({"force":true}))?;
-    check(stop["result"]["stopping"] == true, || stop.to_string())?;
-    // The cancellation commits; only then does daemon main run final shutdown.
-    sandbox.resume_point(commit, 1)?;
-    let reply = cancel.join().map_err(|_| "the cancel thread panicked")??;
-    check(
-        reply["result"]["state"] == "cancelled" && reply["result"]["already_terminal"] == false,
-        || format!("cancel: {reply}"),
-    )?;
-    sandbox.resume_point(start, 1)?;
-    let status = daemon.exit(Duration::from_secs(15))?;
-    let summary = daemon.summary()?;
-    check(status.code() == Some(0), || {
-        format!("force exit: {status} {summary}")
-    })?;
-    drop(forcer);
-    drop(daemon);
-    let closed: i64 = sandbox.query(&format!(
-        "SELECT count(*) FROM events WHERE session_id='{session}'
+    evidenced(|| {
+        let start = "daemon.dispatcher.before_start";
+        let commit = "store.commit.cancel";
+        let sandbox = Sandbox::new(&completes("queued", 1))?;
+        // The queued turn is cancelled before its launch.
+        sandbox.no_launch();
+        let mut daemon = sandbox.start()?;
+        // Both connections are accepted before daemon main pauses: it accepts
+        // no other, and one carries the force, the other the cancel.
+        let (mut forcer, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+        let (mut canceller, _) = Raw::hello(&sandbox.runtime, VERSION)?;
+        sandbox.arm(start, 1, "pause")?;
+        let (session, handle) = sandbox.spawn("queued")?;
+        sandbox.ack(&daemon, start, 1, "pause")?;
+        // The turn is `Waiting` with no dispatcher: the cancel takes it
+        // (`Cancelling{request}`) and parks at its commit.
+        sandbox.arm(commit, 1, "pause")?;
+        let params = json!({"session":session,"handle":handle});
+        let cancel = thread::spawn(move || {
+            canceller
+                .call("cancel", &params)
+                .map_err(|error| error.to_string())
+        });
+        sandbox.ack(&daemon, commit, 1, "pause")?;
+        let stop = forcer.call("daemon/stop", &json!({"force":true}))?;
+        check(stop["result"]["stopping"] == true, || stop.to_string())?;
+        // The cancellation commits; only then does daemon main run final shutdown.
+        sandbox.resume_point(commit, 1)?;
+        let reply = cancel.join().map_err(|_| "the cancel thread panicked")??;
+        check(
+            reply["result"]["state"] == "cancelled" && reply["result"]["already_terminal"] == false,
+            || format!("cancel: {reply}"),
+        )?;
+        sandbox.resume_point(start, 1)?;
+        let status = daemon.exit(Duration::from_secs(15))?;
+        let summary = daemon.summary()?;
+        check(status.code() == Some(0), || {
+            format!("force exit: {status} {summary}")
+        })?;
+        drop(forcer);
+        drop(daemon);
+        let closed: i64 = sandbox.query(&format!(
+            "SELECT count(*) FROM events WHERE session_id='{session}'
          AND json_extract(event,'$.type')='session.closed'"
-    ))?;
-    let reason = sandbox.closed_reason(&session)?;
-    check(
-        closed == 1 && reason.as_deref() == Some("daemon_stop_force"),
-        || format!("{closed} closures, reason {reason:?}"),
-    )?;
-    let turn: String = sandbox.query(&format!(
-        "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
-    ))?;
-    check(turn == "cancelled", || format!("turn state {turn}"))?;
-    sandbox.disarm(start)?;
-    sandbox.disarm(commit)?;
-    sandbox.verify_anchors()
+        ))?;
+        let reason = sandbox.closed_reason(&session)?;
+        check(
+            closed == 1 && reason.as_deref() == Some("daemon_stop_force"),
+            || format!("{closed} closures, reason {reason:?}"),
+        )?;
+        let turn: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        check(turn == "cancelled", || format!("turn state {turn}"))?;
+        sandbox.disarm(start)?;
+        sandbox.disarm(commit)?;
+        sandbox.verify_anchors()
+    })
 }
 
 /// The pid of the fake vendor, once it reported it.
@@ -1562,14 +1662,14 @@ fn evidence_before_terminal(deferred: bool) -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f12_evidence_before_terminal() -> TestResult {
-    evidence_before_terminal(true)
+    evidenced(|| evidence_before_terminal(true))
 }
 
 /// Design §11 `s1_f12_evidence_before_terminal`, lost-evidence variant.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_f12_evidence_before_terminal_lost_stop_evidence_is_unknown() -> TestResult {
-    evidence_before_terminal(false)
+    evidenced(|| evidence_before_terminal(false))
 }
 
 /// Design §8, §6.6: a group whose close was uncertain holds its connection
@@ -1579,54 +1679,56 @@ fn s1_f12_evidence_before_terminal_lost_stop_evidence_is_unknown() -> TestResult
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_reprobe_returns_capacity() -> TestResult {
-    let mut sandbox = Sandbox::new(&scripts(&[
-        script(
-            "slow",
-            1,
-            vec![json!({"action":"report_pids"}), accepted(1)],
-        ),
-        completes("next", 1),
-    ]))?;
-    sandbox
-        .env
-        .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
-    let daemon = sandbox.start()?;
-    let arm_intent = "host.anchor.after_arm_intent_commit";
-    let eof_cleanup = "host.anchor.before_eof_cleanup";
-    sandbox.arm(arm_intent, 1, "pause")?;
-    sandbox.arm(eof_cleanup, 1, "pause")?;
-    let (session, handle) = sandbox.spawn("slow")?;
-    sandbox.ack(&daemon, arm_intent, 1, "pause")?;
-    let reply = sandbox.ok(&["cancel", &session, "--handle", &handle, "--json"])?;
-    check(reply["cancel"]["outcome"] == "requested", || {
-        reply.to_string()
-    })?;
-    sandbox.resume_point(arm_intent, 1)?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
-    check(envelope["cancel"]["cleanup"] == "uncertain", || {
-        envelope.to_string()
-    })?;
-    let held = sandbox.status()?;
-    check(
-        held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
-        || format!("held slot: {held}"),
-    )?;
-    sandbox.process_ack(eof_cleanup, 1, "pause")?;
-    sandbox.resume_point(eof_cleanup, 1)?;
-    sandbox.disarm(eof_cleanup)?;
-    wait_until(
-        "the re-probe frees the slot",
-        Duration::from_secs(30),
-        || {
-            sandbox.status().is_ok_and(|status| {
-                status["connections"] == json!({"limit":1,"in_use":0,"held_unproven":0})
-            })
-        },
-    )?;
-    let (next, _) = sandbox.spawn("next")?;
-    let envelope = sandbox.wait(&format!("{next}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    daemon.finish()
+    evidenced(|| {
+        let mut sandbox = Sandbox::new(&scripts(&[
+            script(
+                "slow",
+                1,
+                vec![json!({"action":"report_pids"}), accepted(1)],
+            ),
+            completes("next", 1),
+        ]))?;
+        sandbox
+            .env
+            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+        let daemon = sandbox.start()?;
+        let arm_intent = "host.anchor.after_arm_intent_commit";
+        let eof_cleanup = "host.anchor.before_eof_cleanup";
+        sandbox.arm(arm_intent, 1, "pause")?;
+        sandbox.arm(eof_cleanup, 1, "pause")?;
+        let (session, handle) = sandbox.spawn("slow")?;
+        sandbox.ack(&daemon, arm_intent, 1, "pause")?;
+        let reply = sandbox.ok(&["cancel", &session, "--handle", &handle, "--json"])?;
+        check(reply["cancel"]["outcome"] == "requested", || {
+            reply.to_string()
+        })?;
+        sandbox.resume_point(arm_intent, 1)?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["cancel"]["cleanup"] == "uncertain", || {
+            envelope.to_string()
+        })?;
+        let held = sandbox.status()?;
+        check(
+            held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
+            || format!("held slot: {held}"),
+        )?;
+        sandbox.process_ack(eof_cleanup, 1, "pause")?;
+        sandbox.resume_point(eof_cleanup, 1)?;
+        sandbox.disarm(eof_cleanup)?;
+        wait_until(
+            "the re-probe frees the slot",
+            Duration::from_secs(30),
+            || {
+                sandbox.status().is_ok_and(|status| {
+                    status["connections"] == json!({"limit":1,"in_use":0,"held_unproven":0})
+                })
+            },
+        )?;
+        let (next, _) = sandbox.spawn("next")?;
+        let envelope = sandbox.wait(&format!("{next}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        daemon.finish()
+    })
 }
 
 /// Inserts `count` proven-absent anchors named `<prefix><n>` copying a real
@@ -1714,45 +1816,47 @@ fn remove_synthetic_anchors(sandbox: &Sandbox) -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
-    let mut sandbox = Sandbox::new(&scripts(&[completes("seed", 1), completes("later", 1)]))?;
-    sandbox
-        .env
-        .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
-    let daemon = sandbox.start()?;
-    let (seed, _) = sandbox.spawn("seed")?;
-    sandbox.wait(&format!("{seed}/1"))?;
-    daemon.finish()?;
-    let mut daemon = restart_with_unread(&sandbox, &seed)?;
-    let held = sandbox.status()?;
-    check(
-        held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
-        || format!("unread holding: {held}"),
-    )?;
-    let waiting = "core.dispatch.awaiting_slot";
-    sandbox.arm(waiting, 1, "pause")?;
-    let (later, _) = sandbox.spawn("later")?;
-    sandbox.ack(&daemon, waiting, 1, "pause")?;
-    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
-    check(stopping["stopping"] == true, || stopping.to_string())?;
-    sandbox.resume_point(waiting, 1)?;
-    let status = daemon.exit(Duration::from_secs(60))?;
-    let summary = daemon.summary()?;
-    check(
-        status.code() == Some(0) && summary["mode"] == "drain",
-        || format!("drain exit: {status} {summary}"),
-    )?;
-    let state: String = sandbox.query(&format!(
-        "SELECT state FROM turns WHERE session_id='{later}' AND number=1"
-    ))?;
-    let proved: i64 = sandbox.query(
-        "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
-    )?;
-    check(state == "completed" && proved == 1, || {
-        format!("waiting turn {state}, unread anchor proved {proved}")
-    })?;
-    drop(daemon);
-    sandbox.disarm(waiting)?;
-    remove_synthetic_anchors(&sandbox)
+    evidenced(|| {
+        let mut sandbox = Sandbox::new(&scripts(&[completes("seed", 1), completes("later", 1)]))?;
+        sandbox
+            .env
+            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+        let daemon = sandbox.start()?;
+        let (seed, _) = sandbox.spawn("seed")?;
+        sandbox.wait(&format!("{seed}/1"))?;
+        daemon.finish()?;
+        let mut daemon = restart_with_unread(&sandbox, &seed)?;
+        let held = sandbox.status()?;
+        check(
+            held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
+            || format!("unread holding: {held}"),
+        )?;
+        let waiting = "core.dispatch.awaiting_slot";
+        sandbox.arm(waiting, 1, "pause")?;
+        let (later, _) = sandbox.spawn("later")?;
+        sandbox.ack(&daemon, waiting, 1, "pause")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.resume_point(waiting, 1)?;
+        let status = daemon.exit(Duration::from_secs(60))?;
+        let summary = daemon.summary()?;
+        check(
+            status.code() == Some(0) && summary["mode"] == "drain",
+            || format!("drain exit: {status} {summary}"),
+        )?;
+        let state: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{later}' AND number=1"
+        ))?;
+        let proved: i64 = sandbox.query(
+            "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
+        )?;
+        check(state == "completed" && proved == 1, || {
+            format!("waiting turn {state}, unread anchor proved {proved}")
+        })?;
+        drop(daemon);
+        sandbox.disarm(waiting)?;
+        remove_synthetic_anchors(&sandbox)
+    })
 }
 
 /// Design §8, round 1 decision 3: resumed paging progresses while this
@@ -1764,53 +1868,55 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_resumed_paging_progresses_with_a_live_current_group() -> TestResult {
-    let mut sandbox = Sandbox::new(&scripts(&[
-        completes("seed", 1),
-        held("live", 1),
-        completes("later", 1),
-    ]))?;
-    sandbox
-        .env
-        .push(("VIA_TEST_CONNECTION_SLOTS", "2".to_owned()));
-    let daemon = sandbox.start()?;
-    let (seed, _) = sandbox.spawn("seed")?;
-    sandbox.wait(&format!("{seed}/1"))?;
-    daemon.finish()?;
-    let mut daemon = restart_with_unread(&sandbox, &seed)?;
-    let held = sandbox.status()?;
-    check(
-        held["connections"] == json!({"limit":2,"in_use":1,"held_unproven":1}),
-        || format!("unread holding: {held}"),
-    )?;
-    let (live, _) = sandbox.spawn("live")?;
-    sandbox.await_file("live.entered")?;
-    let (later, _) = sandbox.spawn("later")?;
-    let state = |session: &str| {
-        sandbox.query::<String>(&format!(
-            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
-        ))
-    };
-    wait_until(
-        "the waiting turn completes while the live group runs",
-        Duration::from_secs(20),
-        || state(&later).is_ok_and(|state| state == "completed"),
-    )?;
-    let running = state(&live)?;
-    let proved: i64 = sandbox.query(
-        "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
-    )?;
-    check(running == "running" && proved == 1, || {
-        format!("live turn {running}, unread anchor proved {proved}")
-    })?;
-    sandbox.release("live")?;
-    let envelope = sandbox.wait(&format!("{live}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
-    check(stopping["stopping"] == true, || stopping.to_string())?;
-    let status = daemon.exit(Duration::from_secs(30))?;
-    check(status.code() == Some(0), || format!("stop exit: {status}"))?;
-    drop(daemon);
-    remove_synthetic_anchors(&sandbox)
+    evidenced(|| {
+        let mut sandbox = Sandbox::new(&scripts(&[
+            completes("seed", 1),
+            held("live", 1),
+            completes("later", 1),
+        ]))?;
+        sandbox
+            .env
+            .push(("VIA_TEST_CONNECTION_SLOTS", "2".to_owned()));
+        let daemon = sandbox.start()?;
+        let (seed, _) = sandbox.spawn("seed")?;
+        sandbox.wait(&format!("{seed}/1"))?;
+        daemon.finish()?;
+        let mut daemon = restart_with_unread(&sandbox, &seed)?;
+        let held = sandbox.status()?;
+        check(
+            held["connections"] == json!({"limit":2,"in_use":1,"held_unproven":1}),
+            || format!("unread holding: {held}"),
+        )?;
+        let (live, _) = sandbox.spawn("live")?;
+        sandbox.await_file("live.entered")?;
+        let (later, _) = sandbox.spawn("later")?;
+        let state = |session: &str| {
+            sandbox.query::<String>(&format!(
+                "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+            ))
+        };
+        wait_until(
+            "the waiting turn completes while the live group runs",
+            Duration::from_secs(20),
+            || state(&later).is_ok_and(|state| state == "completed"),
+        )?;
+        let running = state(&live)?;
+        let proved: i64 = sandbox.query(
+            "SELECT count(*) FROM anchors WHERE anchor_id='1-unread' AND absence_time IS NOT NULL",
+        )?;
+        check(running == "running" && proved == 1, || {
+            format!("live turn {running}, unread anchor proved {proved}")
+        })?;
+        sandbox.release("live")?;
+        let envelope = sandbox.wait(&format!("{live}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        let status = daemon.exit(Duration::from_secs(30))?;
+        check(status.code() == Some(0), || format!("stop exit: {status}"))?;
+        drop(daemon);
+        remove_synthetic_anchors(&sandbox)
+    })
 }
 
 /// Design §6.8 [r5.1]: Host's early-stop task, wired at serve start, ends
@@ -1819,38 +1925,40 @@ fn s1_resumed_paging_progresses_with_a_live_current_group() -> TestResult {
 /// shutdown summary reports no pending or failed task.
 #[test]
 fn s1_host_early_stop_exits_on_plain_stop_and_drain() -> TestResult {
-    let sandbox = Sandbox::new(&scripts(&[completes("plain", 1), held("drained", 1)]))?;
-    let clean = |daemon: &mut Daemon<'_>, what: &str| -> TestResult {
-        let status = daemon.exit(Duration::from_secs(15))?;
-        let summary = daemon.summary()?;
-        check(
-            status.code() == Some(0)
-                && summary["disposition"] == "clean"
-                && summary["pending_joins"] == 0
-                && summary["failed_joins"] == 0,
-            || format!("{what}: exit {status}, summary {summary}"),
-        )
-    };
-    let mut daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("plain")?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
-    check(stopping["stopping"] == true, || stopping.to_string())?;
-    clean(&mut daemon, "plain stop")?;
-    drop(daemon);
-    let mut daemon = sandbox.start()?;
-    let (session, _) = sandbox.spawn("drained")?;
-    sandbox.await_file("drained.entered")?;
-    let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
-    check(stopping["stopping"] == true, || stopping.to_string())?;
-    sandbox.release("drained")?;
-    clean(&mut daemon, "drain")?;
-    drop(daemon);
-    let daemon = sandbox.start()?;
-    let envelope = sandbox.wait(&format!("{session}/1"))?;
-    check(envelope["state"] == "completed", || envelope.to_string())?;
-    daemon.finish()
+    evidenced(|| {
+        let sandbox = Sandbox::new(&scripts(&[completes("plain", 1), held("drained", 1)]))?;
+        let clean = |daemon: &mut Daemon<'_>, what: &str| -> TestResult {
+            let status = daemon.exit(Duration::from_secs(15))?;
+            let summary = daemon.summary()?;
+            check(
+                status.code() == Some(0)
+                    && summary["disposition"] == "clean"
+                    && summary["pending_joins"] == 0
+                    && summary["failed_joins"] == 0,
+                || format!("{what}: exit {status}, summary {summary}"),
+            )
+        };
+        let mut daemon = sandbox.start()?;
+        let (session, _) = sandbox.spawn("plain")?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        clean(&mut daemon, "plain stop")?;
+        drop(daemon);
+        let mut daemon = sandbox.start()?;
+        let (session, _) = sandbox.spawn("drained")?;
+        sandbox.await_file("drained.entered")?;
+        let stopping = sandbox.ok(&["daemon", "stop", "--drain", "--json"])?;
+        check(stopping["stopping"] == true, || stopping.to_string())?;
+        sandbox.release("drained")?;
+        clean(&mut daemon, "drain")?;
+        drop(daemon);
+        let daemon = sandbox.start()?;
+        let envelope = sandbox.wait(&format!("{session}/1"))?;
+        check(envelope["state"] == "completed", || envelope.to_string())?;
+        daemon.finish()
+    })
 }
 
 /// A force stop whose force-path read stalls in the Store worker.
@@ -1882,9 +1990,13 @@ fn force_with_stalled_read(sandbox: &Sandbox, release: bool) -> TestResult<Stall
     sandbox.arm(reconcile, 1, "pause")?;
     let mut daemon = sandbox.start()?;
     let (session, handle) = sandbox.spawn("hang")?;
-    let running =
-        format!("SELECT count(*) FROM turns WHERE session_id='{session}' AND state='running'");
-    wait_until("turn 1 runs", Duration::from_secs(20), || {
+    // Accepted, not only running: a force before the fake's acceptance is
+    // settled `requested`, not `forced`, and the checks below assume it.
+    let running = format!(
+        "SELECT count(*) FROM turns WHERE session_id='{session}' AND state='running' \
+         AND accepted_at IS NOT NULL"
+    );
+    wait_until("turn 1 is accepted", Duration::from_secs(20), || {
         sandbox.query::<i64>(&running).is_ok_and(|count| count == 1)
     })?;
     sandbox.ok(&[
@@ -1931,40 +2043,42 @@ fn force_with_stalled_read(sandbox: &Sandbox, release: bool) -> TestResult<Stall
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_shutdown_budget_read_cutoff_before_reconciliation() -> TestResult {
-    let sandbox = Sandbox::new(&script(
-        "hang",
-        1,
-        vec![accepted(1), json!({"action":"hang"})],
-    ))?;
-    let run = force_with_stalled_read(&sandbox, true)?;
-    check(run.reconciled_after < Duration::from_secs(5), || {
-        format!(
-            "reconciliation began {:?} after the force",
-            run.reconciled_after
-        )
-    })?;
-    let summary = &run.summary;
-    check(
-        run.status.code() == Some(4)
-            && summary["unresolved_turns"] == 1
-            && summary["uncommitted_turns"] == 0
-            && summary["store"] == "joined",
-        || format!("exit {}, summary {summary}", run.status),
-    )?;
-    let session = &run.session;
-    let forced: String = sandbox.query(&format!(
-        "SELECT state || ' ' || json_extract(envelope,'$.cancel.outcome') || ' '
+    evidenced(|| {
+        let sandbox = Sandbox::new(&script(
+            "hang",
+            1,
+            vec![accepted(1), json!({"action":"hang"})],
+        ))?;
+        let run = force_with_stalled_read(&sandbox, true)?;
+        check(run.reconciled_after < Duration::from_secs(5), || {
+            format!(
+                "reconciliation began {:?} after the force",
+                run.reconciled_after
+            )
+        })?;
+        let summary = &run.summary;
+        check(
+            run.status.code() == Some(4)
+                && summary["unresolved_turns"] == 1
+                && summary["uncommitted_turns"] == 0
+                && summary["store"] == "joined",
+            || format!("exit {}, summary {summary}", run.status),
+        )?;
+        let session = &run.session;
+        let forced: String = sandbox.query(&format!(
+            "SELECT state || ' ' || json_extract(envelope,'$.cancel.outcome') || ' '
                 || json_extract(envelope,'$.cancel.cleanup')
          FROM turns WHERE session_id='{session}' AND number=1"
-    ))?;
-    check(forced == "cancelled forced quiescent", || {
-        format!("turn 1: {forced}")
-    })?;
-    let queued: String = sandbox.query(&format!(
-        "SELECT state FROM turns WHERE session_id='{session}' AND number=2"
-    ))?;
-    check(queued == "queued", || format!("turn 2: {queued}"))?;
-    sandbox.start()?.finish()
+        ))?;
+        check(forced == "cancelled forced quiescent", || {
+            format!("turn 1: {forced}")
+        })?;
+        let queued: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=2"
+        ))?;
+        check(queued == "queued", || format!("turn 2: {queued}"))?;
+        sandbox.start()?.finish()
+    })
 }
 
 /// Design §6.7: a force-path read abandoned at the cutoff leaves its turn
@@ -1975,33 +2089,35 @@ fn s1_shutdown_budget_read_cutoff_before_reconciliation() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn s1_force_cutoff_worker_stalled_read_is_never_clean() -> TestResult {
-    let sandbox = Sandbox::new(&script(
-        "hang",
-        1,
-        vec![accepted(1), json!({"action":"hang"})],
-    ))?;
-    for (release, store) in [(true, "joined"), (false, "join_timed_out")] {
-        let run = force_with_stalled_read(&sandbox, release)?;
-        let summary = &run.summary;
-        check(
-            run.status.code() == Some(4)
-                && summary["disposition"] == "incomplete"
-                && summary["unresolved_turns"].as_u64() >= Some(1)
-                && summary["store"] == store
-                && run.exited_after < Duration::from_secs(13),
-            || {
-                format!(
-                    "released {release}: exit {} after {:?}, summary {summary}",
-                    run.status, run.exited_after
-                )
-            },
-        )?;
-        // The next daemon recovers the unresolved turns, and its fake
-        // re-runs no turn: every session here is forced or queued.
-        let daemon = sandbox.start()?;
-        daemon.finish()?;
-    }
-    Ok(())
+    evidenced(|| {
+        let sandbox = Sandbox::new(&script(
+            "hang",
+            1,
+            vec![accepted(1), json!({"action":"hang"})],
+        ))?;
+        for (release, store) in [(true, "joined"), (false, "join_timed_out")] {
+            let run = force_with_stalled_read(&sandbox, release)?;
+            let summary = &run.summary;
+            check(
+                run.status.code() == Some(4)
+                    && summary["disposition"] == "incomplete"
+                    && summary["unresolved_turns"].as_u64() >= Some(1)
+                    && summary["store"] == store
+                    && run.exited_after < Duration::from_secs(13),
+                || {
+                    format!(
+                        "released {release}: exit {} after {:?}, summary {summary}",
+                        run.status, run.exited_after
+                    )
+                },
+            )?;
+            // The next daemon recovers the unresolved turns, and its fake
+            // re-runs no turn: every session here is forced or queued.
+            let daemon = sandbox.start()?;
+            daemon.finish()?;
+        }
+        Ok(())
+    })
 }
 
 /// Design §6.1 step 5 (T3-S3 round 1, decision 4): the one 15 s startup
@@ -2010,33 +2126,37 @@ fn s1_force_cutoff_worker_stalled_read_is_never_clean() -> TestResult {
 /// request's 30 s read timeout, and no daemon is started over it.
 #[test]
 fn s1_silent_peer_before_hello_is_bounded_by_the_startup_budget() -> TestResult {
-    let sandbox = Sandbox::new(&completes("unused", 1))?;
-    let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
-    let (accepted, held) = std::sync::mpsc::channel();
-    let peer = thread::spawn(move || {
-        // Accepts every connection and keeps it open, reading nothing.
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { break };
-            if accepted.send(stream).is_err() {
-                break;
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("unused", 1))?;
+        // No daemon starts over the silent peer: no Store.
+        sandbox.no_store();
+        let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+        let (accepted, held) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            // Accepts every connection and keeps it open, reading nothing.
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                if accepted.send(stream).is_err() {
+                    break;
+                }
             }
-        }
-    });
-    let started = Instant::now();
-    let mut command = sandbox.command();
-    command.args(["daemon", "status", "--json"]);
-    let captured = run_command(&mut command, Duration::from_secs(25))?;
-    let elapsed = started.elapsed();
-    let stderr = String::from_utf8_lossy(&captured.stderr);
-    check(
-        !captured.status.success() && elapsed < Duration::from_secs(17),
-        || format!("exit {} after {elapsed:?}: {stderr}", captured.status),
-    )?;
-    check(stderr.contains("startup"), || stderr.to_string())?;
-    check(held.try_recv().is_ok(), || {
-        "the CLI never connected".to_owned()
-    })?;
-    drop(held);
-    drop(peer);
-    Ok(())
+        });
+        let started = Instant::now();
+        let mut command = sandbox.command();
+        command.args(["daemon", "status", "--json"]);
+        let captured = run_command(&mut command, Duration::from_secs(25))?;
+        let elapsed = started.elapsed();
+        let stderr = String::from_utf8_lossy(&captured.stderr);
+        check(
+            !captured.status.success() && elapsed < Duration::from_secs(17),
+            || format!("exit {} after {elapsed:?}: {stderr}", captured.status),
+        )?;
+        check(stderr.contains("startup"), || stderr.to_string())?;
+        check(held.try_recv().is_ok(), || {
+            "the CLI never connected".to_owned()
+        })?;
+        drop(held);
+        drop(peer);
+        Ok(())
+    })
 }

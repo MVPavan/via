@@ -21,6 +21,10 @@ pub(crate) struct Evidence {
     /// turn: `finish` then requires neither the Store's backup, envelopes
     /// and events nor a turn's evidence folder, and the summary says so.
     pub(crate) store_expected: bool,
+    /// Cleared by a scenario whose turns launch no vendor, so they have no
+    /// evidence folder: `finish` then waives only `evidence/*`; the
+    /// collector checks that every launched turn still has its folder.
+    pub(crate) folders_expected: bool,
 }
 
 impl Evidence {
@@ -50,6 +54,7 @@ impl Evidence {
             fixture: fixture.to_owned(),
             finalized: false,
             store_expected: true,
+            folders_expected: true,
         })
     }
 
@@ -106,10 +111,19 @@ impl Evidence {
             .copied()
             .collect();
         let mut missing = missing;
-        if self.store_expected && fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
+        if self.store_expected
+            && self.folders_expected
+            && fs::read_dir(self.dir.join("evidence"))?.next().is_none()
+        {
             missing.push("evidence/*");
         }
-        let final_outcome = outcome;
+        // Missing required evidence is an infrastructure failure, whatever
+        // the scenario itself concluded.
+        let final_outcome = if missing.is_empty() {
+            outcome
+        } else {
+            "infrastructure_failure"
+        };
         let summary = self.summary(final_outcome, detail, &missing)?;
         fs::write(
             self.dir.join("summary.json"),
@@ -140,9 +154,13 @@ impl Evidence {
     fn summary(&self, outcome: &str, detail: &str, missing: &[&str]) -> EvidenceResult<Value> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let status = command_output("git", &["status", "--porcelain"], &workspace)?;
-        // The default harness has no feature switches. The runtime failpoint
-        // owner adds feature reporting with the controller in its increment.
-        let features: Vec<&str> = Vec::new();
+        // The `via-cli` features this test binary, and so its `via`, was
+        // built with; `test-failpoints` is the one there is.
+        let features: &[&str] = if cfg!(feature = "test-failpoints") {
+            &["test-failpoints"]
+        } else {
+            &[]
+        };
         let mut summary = json!({
             "scenario":self.scenario,
             "outcome":outcome,
@@ -162,6 +180,9 @@ impl Evidence {
             "fixture_sha256":sha256(&self.fixture)?,
             "normalization_version":1,
         });
+        if !self.folders_expected {
+            summary["folders_expected"] = json!(false);
+        }
         if !self.store_expected {
             summary["store_expected"] = json!(false);
         }

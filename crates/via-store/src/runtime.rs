@@ -2239,9 +2239,10 @@ impl StoreClient {
         crate::FinalTextFile::create(&self.evidence, self.blobs.tasks.clone(), session, turn).await
     }
 
-    /// The evidence root, for making a stored folder absolute; no I/O.
-    pub fn evidence(&self) -> &EvidenceRoot {
-        &self.evidence
+    /// A stored relative evidence folder made absolute; no I/O. Core gets
+    /// the path only, not the evidence capability.
+    pub fn evidence_path(&self, relative: &str) -> PathBuf {
+        self.evidence.absolute(relative)
     }
 
     /// Compares a Core-computed SHA-256 hash without receiving the plaintext handle.

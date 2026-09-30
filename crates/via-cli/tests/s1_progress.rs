@@ -1091,7 +1091,14 @@ fn s1_progress_step_rows_survive_crash_to_last_commit() -> TestResult {
                     && page_steps(&status) == [1, 2]
                     && status["turns"][0] == json!({"n":1,"state":"unknown","revision":0}),
                 || format!("restarted: {status}"),
-            )
+            )?;
+            // F26: the session's events stay dense across the crash, 1..n.
+            let history = events(&setup.sandbox, evidence, "events", &session)?;
+            let seqs: Vec<_> = history.iter().map(|event| event["seq"].clone()).collect();
+            let dense: Vec<_> = (1..=history.len()).map(|seq| json!(seq)).collect();
+            check(!history.is_empty() && seqs == dense, || {
+                format!("events are not dense after the crash: {seqs:?}")
+            })
         },
         |evidence| setup.collect(evidence),
     );

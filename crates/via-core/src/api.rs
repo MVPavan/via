@@ -69,8 +69,10 @@ pub struct SpawnParams {
 pub struct ResumeParams {
     /// Session to add a turn to.
     pub session: SessionId,
-    /// Caller-owned bearer handle.
-    pub handle: String,
+    /// Caller-owned bearer handle; absent, the mutation is `invalid_handle`
+    /// like a wrong one (F15).
+    #[serde(default)]
+    pub handle: Option<String>,
     /// The new turn's inline prompt; exactly one of `prompt` and `prompt_file`.
     #[serde(default, deserialize_with = "given")]
     pub prompt: Option<String>,
@@ -508,8 +510,10 @@ pub const DEFAULT_WAIT_MS: u64 = 30_000;
 pub struct CancelParams {
     /// Session whose turn is cancelled.
     pub session: SessionId,
-    /// Caller-owned bearer handle.
-    pub handle: String,
+    /// Caller-owned bearer handle; absent, the mutation is `invalid_handle`
+    /// like a wrong one (F15).
+    #[serde(default)]
+    pub handle: Option<String>,
     /// One-based turn; omitted, the running turn, else the latest one.
     #[serde(default)]
     pub turn: Option<u32>,
@@ -542,8 +546,10 @@ pub enum CloseMode {
 pub struct CloseParams {
     /// Session to close.
     pub session: SessionId,
-    /// Caller-owned bearer handle.
-    pub handle: String,
+    /// Caller-owned bearer handle; absent, the mutation is `invalid_handle`
+    /// like a wrong one (F15).
+    #[serde(default)]
+    pub handle: Option<String>,
     /// Graceful by default.
     #[serde(default)]
     pub mode: CloseMode,
@@ -566,8 +572,10 @@ pub struct SteerParams {
     pub session: SessionId,
     /// Text that will not be sent on unsupported routes.
     pub text: String,
-    /// Caller-owned bearer handle.
-    pub handle: String,
+    /// Caller-owned bearer handle; absent, the mutation is `invalid_handle`
+    /// like a wrong one (F15).
+    #[serde(default)]
+    pub handle: Option<String>,
 }
 
 /// Strict C1 read-address parameter set.

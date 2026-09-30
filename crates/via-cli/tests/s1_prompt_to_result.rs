@@ -332,7 +332,58 @@ fn expect_request_error(
     Ok(())
 }
 
+/// F16: the plaintext handle appears in no terminal envelope, the daemon's
+/// log, the Store or any file of the turns' evidence folders.
+fn scan_for_handle(evidence: &Evidence, handle: &str) -> Result<(), ScenarioError> {
+    let mut scanned: Vec<PathBuf> = [
+        "events.ndjson",
+        "logs.ndjson",
+        "daemon.trace",
+        "store.sqlite3",
+        "wait.stdout",
+        "result.stdout",
+        "via.log",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    let mut folders = vec![PathBuf::from("evidence")];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(evidence.dir.join(&folder)).map_err(infra)? {
+            let entry = entry.map_err(infra)?;
+            let path = folder.join(entry.file_name());
+            if entry.file_type().map_err(infra)?.is_dir() {
+                folders.push(path);
+            } else {
+                scanned.push(path);
+            }
+        }
+    }
+    if !scanned.iter().any(|path| path.starts_with("evidence")) {
+        return Err(ScenarioError::Failure(
+            "no turn evidence file to scan".to_owned(),
+        ));
+    }
+    for name in scanned {
+        let bytes = fs::read(evidence.dir.join(&name)).map_err(infra)?;
+        if bytes
+            .windows(handle.len())
+            .any(|window| window == handle.as_bytes())
+        {
+            return Err(ScenarioError::Failure(format!(
+                "handle leaked into {}",
+                name.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end scenario keeps its refusals and state checks together"
+)]
 fn s1_prompt_to_result_real_cli() -> TestResult {
     let via = Path::new(env!("CARGO_BIN_EXE_via"));
     let fake = fake_binary(via)?;
@@ -365,6 +416,31 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
             )?;
             let (session, handle) = spawn_and_validate(&cx, evidence)?;
             *generated_handle.borrow_mut() = Some(handle.clone());
+            // The terminal envelope as `wait` and `result` return it, for
+            // the handle scan below.
+            for verb in ["wait", "result"] {
+                cli(
+                    &cx,
+                    evidence,
+                    verb,
+                    &[verb, &session, "--json"],
+                    Duration::from_secs(5),
+                )?;
+            }
+            // F18: the refused `steer`s change neither the Store nor status.
+            let snapshot = || -> Result<(String, Vec<u8>), ScenarioError> {
+                Ok((
+                    daemon::store_dump(&state)?,
+                    cli(
+                        &cx,
+                        evidence,
+                        "status",
+                        &["status", &session, "--json"],
+                        Duration::from_secs(5),
+                    )?,
+                ))
+            };
+            let before = snapshot()?;
             let wrong_handle = format!("h_{}", "A".repeat(43));
             expect_request_error(
                 &cx,
@@ -390,6 +466,11 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
                 ],
                 "unsupported_verb",
             )?;
+            if snapshot()? != before {
+                return Err(ScenarioError::Failure(
+                    "a refused steer changed the Store or status".to_owned(),
+                ));
+            }
             let events = cli(
                 &cx,
                 evidence,
@@ -411,20 +492,7 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
         |evidence| {
             collect_available(evidence, &state)?;
             if let Some(handle) = generated_handle.borrow().as_ref() {
-                for name in [
-                    "events.ndjson",
-                    "logs.ndjson",
-                    "daemon.trace",
-                    "store.sqlite3",
-                ] {
-                    let bytes = fs::read(evidence.dir.join(name)).map_err(infra)?;
-                    if bytes
-                        .windows(handle.len())
-                        .any(|window| window == handle.as_bytes())
-                    {
-                        return Err(ScenarioError::Failure(format!("handle leaked into {name}")));
-                    }
-                }
+                scan_for_handle(evidence, handle)?;
             }
             Ok(())
         },
@@ -527,13 +595,27 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
                 ));
             }
             fs::write(sync.join("wait_disconnected.release"), b"").map_err(infra)?;
-            let result = cli(
-                &cx,
-                evidence,
-                "result_after_disconnect",
-                &["wait", session, "--json"],
-                Duration::from_secs(5),
-            )?;
+            // The envelope through `result`, not another `wait`: polled
+            // until the turn is terminal.
+            let result_deadline = Instant::now() + Duration::from_secs(10);
+            let result = loop {
+                let capture = cx
+                    .run(&["result", session, "--json"], Duration::from_secs(5))
+                    .map_err(infra)?;
+                if capture.status.success() {
+                    evidence
+                        .write("result_after_disconnect.stdout", &capture.stdout)
+                        .map_err(infra)?;
+                    break capture.stdout;
+                }
+                if Instant::now() >= result_deadline {
+                    return Err(ScenarioError::Timeout(format!(
+                        "result never returned the envelope: {}",
+                        String::from_utf8_lossy(&capture.stderr)
+                    )));
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
             let envelope: Value = serde_json::from_slice(&result).map_err(infra)?;
             if envelope["state"] != "completed"
                 || envelope["final_text"] != "after disconnect"
