@@ -342,3 +342,165 @@ The log is `gate2.log`.
    a compile-level API change. Forcing the keyed F8, F16, F26 and F30
    regressions would need production mutations of commit, redaction,
    sequencing or read paths, which is not cheap.
+
+## Fix round 1 (Sol high r1: UNSOUND)
+
+Review: `scratchpad/execution/s1-critic/review-s1-contract-sol-r1.md` (main
+checkout). The coordinator decided to fix findings 1 to 4 and to reject
+finding 5 with no change: those assertions are contract upper bounds with
+margins, not order claims covered by T4-A50.
+
+### Commits
+
+| Commit | Finding | Summary |
+|---|---|---|
+| `868b2f2` | 1 | Session existence, then the handle, before any other check, on the four mutations (F15) |
+| `23cf555` | 2 | Missing required evidence is recorded as `infrastructure_failure` |
+| `6b99272` | 3, 4 | Evidence is collected only after a proved daemon exit; only unlaunched turns' folders are waived |
+
+### Finding 1: F15 precedence
+
+**Defect, confirmed.**
+- `resume` staged its prompt (file I/O, blob) before authenticating.
+- `resume`, `cancel` and `close` read the session before the handle, while
+  `steer` checked the handle first. So a nonexistent session gave
+  `session_not_found` on three verbs and `invalid_handle` on `steer`.
+- A wrong handle together with an unreadable `prompt_file` gave
+  `invalid_params`.
+
+**Change.**
+- A new `Engine::authenticate_existing(session, handle)` (`engine/control.rs`)
+  reads the session snapshot (`session_not_found`), then hashes and
+  authenticates the handle, wrong or missing (`invalid_handle`).
+- All four verbs call it first, after params parse. `resume` calls it
+  before `take_prompt` and `stage_prompt`.
+- It runs outside `admission`, because the handle hash never changes.
+- The in-admission snapshot and state checks of `resume` and `close` stay
+  where they were. Their second `authenticate` was removed as redundant.
+- `steer` now checks the latch after the handle, and a nonexistent session
+  gives `session_not_found` there too.
+
+**Regression (extended F15).** For the live session, then for the absent
+`s_0000000000zz`, the test sends each case twice, once with no handle and
+once with a wrong one. It expects `invalid_handle` for the live session
+and `session_not_found` for the absent one. The cases are:
+- `resume` with an inline prompt;
+- `resume` with a readable `prompt_file`;
+- `resume` with an unreadable (missing) `prompt_file`;
+- `steer`, `cancel` and `close`.
+
+The before/after snapshot now also lists `state/blobs/`.
+
+- RED (`r1-f15-red.log`): the new test against the pre-fix production code
+  (a `git archive` of `33b5989` with the new test copied in) failed with
+  `resume {..."prompt_file":".../f15-missing.txt"...} with handle Some(..): expected invalid_handle, got {... "invalid_params","kind2":"prompt_file","reason":"unreadable"}`.
+- GREEN (`r1-f15-green.log`): pass.
+
+**Updated test.** `s1_close_stalled_read_bounds_final_shutdown_entry` now
+stalls the close's third Store read, `next_hit + 2`. The first two reads
+(the session and the handle) now come before `admission`; the third, the
+in-admission snapshot, is the one that holds `admission`. Without this
+change the test failed: the stalled read no longer held `admission`, so
+entry was not bounded by it.
+
+### Finding 2: missing evidence cannot record a pass
+
+**Defect, confirmed.** `Evidence::finish` wrote the caller's outcome even
+when required evidence was missing.
+
+**Change.** With anything missing, `summary.json` and `REPORT.md` record
+`infrastructure_failure`. The scenario's own detail is kept.
+
+**Evidence.**
+- RED (`r1-f2-red.log`): the new
+  `evidence_collector::missing_required_evidence_is_an_infrastructure_failure`
+  failed with `left: String("pass") right: "infrastructure_failure"`.
+- GREEN (`r1-f2-green.log`): pass.
+
+**Updated tests.** `scenario_runner`'s `actual_wrong_result_panic_is_recorded_as_failure`
+and `actual_hanging_command_is_recorded_as_timeout` run with no daemon, so
+their required evidence is missing. Their artifacts now record
+`infrastructure_failure`, and the tests check that the detail keeps the
+panic or timeout. The `fail`/`timeout` distinction stays asserted:
+- on the in-memory `ScenarioReport`;
+- in `failure_and_timeout_remain_distinct_evidence_outcomes`, which has
+  complete evidence.
+
+### Finding 3: collection only after a proved exit
+
+**Defect, confirmed.** `route_drain`'s cleanup trusted the socket's
+disappearance. A daemon removes its socket before final shutdown ends.
+
+**Change.** A new `evidenced::stop_daemons(runtime, state, stop)` runs
+from every item-5 sandbox's `Drop` before `park`:
+1. The daemon serving the socket, if it answers `hello`, is identified by
+   its `daemon_pid`, stopped and waited out (`/proc` gone, or a zombie).
+2. Then neither `daemon.lock` nor `store.lock` may be held. This also
+   covers a daemon that removed its socket already or refused this
+   binary's version.
+
+The bound is 20 s. Without that proof, `park` collects nothing, and the
+scenario is an `infrastructure_failure`. The sandbox directory is kept,
+never removed from under a live daemon. Children the tests start directly
+are reaped by their own guards first.
+
+This applies to `route_drain`, `c1_protocol`, `s1_lifecycle`,
+`s1_store_failure` and `s1_turn_control`. They are the only cleanups here
+that relied on the socket (or on nothing) for auto-started daemons. The
+harness files' `Daemon` guards reap their child.
+
+### Finding 4: only unlaunched turns' folders are waived
+
+**Change.**
+- `Evidence` gains `folders_expected`. When it is cleared, `finish` waives
+  only `evidence/*`.
+- The collector still requires the Store backup, envelopes, events and
+  cleanup, and checks that every launched turn (any `anchors` row) has its
+  folder.
+- `Sandbox::no_launch()` declares a scenario whose turns launch no vendor.
+  `no_store()` remains only where no Store exists.
+
+**Every former `no_store()` use, re-checked:**
+
+| Scenario | Now |
+|---|---|
+| `s1_f12_writer_lost_latches` | `no_launch` (Store, no turn) |
+| `s1_f12_startup_recovery_corrupt_read_fails_startup` | `no_launch` (Store after the restart, no turn) |
+| `s1_f12_sqlite_corruption_latches`, second sandbox | `no_launch` (turn never launched) |
+| `s1_close_reaches_claimed_turn` | `no_launch` (turns closed before launch) |
+| `s1_f02_losing_daemon_leaves_live_socket_untouched`, first sandbox | `no_launch` (idle owner) |
+| `s1_f02_losing_daemon_leaves_live_socket_untouched`, second sandbox | `no_store` (no daemon opens the Store) |
+| `s1_f07_force_set_includes_session_in_cancelling_state` | `no_launch` (queued turn cancelled before launch) |
+| `s1_f01_concurrent_auto_start_one_daemon` | `no_launch` |
+| both `s1_f04_*` | `no_launch` |
+| `s1_f03_unsafe_runtime_dir_refused` | `no_store` (the CLI refuses before any daemon) |
+| `s1_silent_peer_before_hello_is_bounded_by_the_startup_budget` | `no_store` (no daemon starts) |
+| `c1_protocol` scenarios | folders waived, Store required |
+
+The three `no_store` artifacts hold no `store.sqlite3`, which confirms the
+classification.
+
+**RED for findings 3 and 4.** These are harness behaviours. I did not add
+a failing case for them: forcing one would need a daemon kept alive past
+the socket's removal, or a launched turn with its folder deleted. Both
+checks are exercised on every scenario of the five files, and a failure
+of either fails the test.
+
+### Fix-round-1 gate (tip `6b99272`)
+
+The log is `gate3.log`.
+- `gate exit 0`.
+- `nextest --workspace`: 334 passed, 1 skipped.
+- Failpoint suite: 537 passed, 1 skipped, 3 times: the gate's run,
+  `gate3-failpoints-run2.log` and `gate3-failpoints-run3.log`.
+- F08/F09/F10/F12 selector: 58 passed.
+- Gate selector, 5 repeats: 87 of 87 each time.
+
+**Evidence completeness** (`r1-summary-check.log`). There are 1221 new
+summaries across 237 scenarios, excluding the `runner_*` and `collector_*`
+self-tests. All are `pass` with `evidence_complete: true`; none is
+`infrastructure_failure`.
+
+**Leaked processes.** The known `via-host` `s1_host` `anchor_entry`
+processes leaked again, 5 of them. I SIGKILLed them; no process from this
+worktree remains.
