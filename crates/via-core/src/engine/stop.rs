@@ -411,6 +411,12 @@ impl Engine {
             // cancellation must not present it as a complete record.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
         }
+        // The text Core received before the force is kept (Task 4 design
+        // §2.3), and a failed file step fails the turn as on the natural
+        // path (§6.4).
+        if turn.text.apply(&mut terminal) {
+            terminal.fail(FailureClass::Store, "the final text could not be written");
+        }
         (turn.started, record, terminal)
     }
 

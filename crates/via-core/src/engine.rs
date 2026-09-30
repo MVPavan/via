@@ -202,6 +202,8 @@ struct ForcedTurn {
     /// turn `failed(deadline_idle)` (design §2), a `protocol` one
     /// `failed(protocol)`.
     cause: Option<via_adapters::StopCause>,
+    /// The final text Core received before the force took the turn.
+    text: drive::TurnText,
 }
 
 /// Evidence from Route's verified Host close of a forced turn.

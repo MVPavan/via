@@ -40,6 +40,16 @@ fn event_stall() -> Duration {
     EVENT_STALL
 }
 
+/// How the Adapter's delivery after Route ended went.
+enum Rest {
+    /// Everything Route handed over reached Core.
+    Delivered,
+    /// A delivery failed: Core stalled or went away.
+    Undelivered,
+    /// The daemon force ended a delivery that had to wait.
+    Forced,
+}
+
 /// One observation in Core's channel with its share of the drive's byte
 /// budget (Task 4 design §2.3): Core holds `permit` until it has handled
 /// the observation.
@@ -224,13 +234,13 @@ impl AdapterRuntime {
                 result = &mut route => break result,
             }
         };
-        // Route ended: what it already handed over is still delivered, unless
-        // the daemon force ends the wait.
+        // Route ended: what it already handed over is still delivered. The
+        // daemon force ends only a wait: data deliverable at once still goes.
         let rest = async {
             if let Some(delivery) = delivery
                 && delivery.await.is_err()
             {
-                return false;
+                return Rest::Undelivered;
             }
             if let Some(receiver) = hop_rx.as_mut() {
                 while let Ok(message) = receiver.try_recv() {
@@ -240,33 +250,44 @@ impl AdapterRuntime {
                         .await
                         .is_err()
                     {
-                        return false;
+                        return Rest::Undelivered;
                     }
                 }
             }
-            true
+            Rest::Delivered
         };
-        if delivered {
-            delivered = tokio::select! {
+        let rest = if delivered {
+            tokio::select! {
                 biased;
-                () = forced(&mut forced_stop) => false,
                 rest = rest => rest,
-            };
-        }
-        // A route failure is the first cause; undelivered data fails a success.
-        match result {
-            Ok(result) if delivered => Ok(normalize_terminal(result)),
-            Ok(result) => Err(AdapterError::Route(RouteFailure {
-                cause: RouteError::Overflow { turn },
-                undecoded: None,
-                exit: Some(result.exit),
-                launched: true,
-                cleanup: None,
-                forced: false,
-                journal_uncertain: result.journal_uncertain,
-            })),
-            Err(failure) => Err(AdapterError::Route(failure)),
-        }
+                () = forced(&mut forced_stop) => Rest::Forced,
+            }
+        } else {
+            Rest::Undelivered
+        };
+        // A route failure is the first cause. Undelivered data fails a
+        // success as `Overflow`, and the daemon force that ended the
+        // delivery as `ForceStopped` (design §2 rule 4); either keeps
+        // Route's exit and close evidence.
+        let result = match result {
+            Ok(result) => result,
+            Err(failure) => return Err(AdapterError::Route(failure)),
+        };
+        let cause = match rest {
+            Rest::Delivered => return Ok(normalize_terminal(result)),
+            Rest::Undelivered => RouteError::Overflow { turn },
+            Rest::Forced => RouteError::ForceStopped { turn },
+        };
+        let exit = result.exit;
+        Err(AdapterError::Route(RouteFailure {
+            cause,
+            undecoded: None,
+            exit: (exit.code.is_some() || exit.signal.is_some()).then_some(exit),
+            launched: true,
+            cleanup: Some(result.cleanup),
+            forced: result.forced,
+            journal_uncertain: result.journal_uncertain,
+        }))
     }
 
     /// Drains lower process owners before Store shutdown and returns passive facts.

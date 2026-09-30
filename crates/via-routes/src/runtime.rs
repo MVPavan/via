@@ -10,7 +10,7 @@ use super::{
 };
 use via_wire::{
     CloseMode, CloseRequest, ExitReport, FailureCause, HostError, LatchState, PendingWrite,
-    WireCleanup, WireError, WireFailure, WireMessages, WireParts, WireRuntime, WireSender,
+    WireCloseReport, WireError, WireFailure, WireMessages, WireParts, WireRuntime, WireSender,
     WireSignals,
 };
 
@@ -31,6 +31,9 @@ pub struct FakeRouteResult {
     /// A Host journal write in the turn's cleanup had an uncertain outcome:
     /// the daemon must latch (design §7.2 row 12).
     pub journal_uncertain: bool,
+    /// Host stopped the group while its vendor was live (Host force
+    /// evidence), as on a late terminal's force close.
+    pub forced: bool,
 }
 
 /// One-start state machine and opaque Wire runtime for the private fake route.
@@ -149,39 +152,12 @@ impl FakeRoute {
         let failed = match Box::pin(drive).await {
             Ok(Finished::Result(result, close_by)) => {
                 messages.finish(close_by).await;
-                return Ok(result);
+                // Design §2 rule 4: the daemon force ends the turn even
+                // after its terminal, once the terminal's data was handed on.
+                return serving.unless_forced(result, sender.take_undecoded());
             }
             Ok(Finished::Late(terminal)) => {
-                // Design §2 rule 3 [r1.23]: a decoded terminal is returned
-                // even though the wall deadline passed during finalization;
-                // cleanup comes from Host's force close. A message still
-                // held, such as the terminal with its final text, reaches the
-                // hop first, within the same cleanup allowance and whatever
-                // the force or the latch; if it cannot, that failure is the
-                // turn's, never a completion.
-                let cleanup = cleanup_deadline();
-                match serving.deliver_held(cleanup).await {
-                    Ok(()) => {
-                        let report = sender
-                            .close(CloseRequest {
-                                mode: CloseMode::Force,
-                                deadline: cleanup,
-                            })
-                            .await;
-                        messages.finish(cleanup).await;
-                        return Ok(terminal.result(
-                            report.vendor_exit.unwrap_or(ExitReport {
-                                code: None,
-                                signal: None,
-                            }),
-                            report.cleanup,
-                            report.journal_uncertain,
-                        ));
-                    }
-                    // Cleanup gets its own bound below: the allowance has
-                    // elapsed, and the force close still needs its time.
-                    Err(failed) => failed,
-                }
+                return Self::late(&mut serving, &sender, messages, terminal).await;
             }
             Err(failed) => failed,
         };
@@ -208,6 +184,46 @@ impl FakeRoute {
             forced: report.forced,
             journal_uncertain: report.journal_uncertain,
         })
+    }
+
+    /// Design §2 rule 3 [r1.23]: a decoded terminal whose finalization
+    /// outlived the wall deadline. Host's force close starts at once and a
+    /// message still held, such as the terminal with its final text, is
+    /// delivered to the hop meanwhile, delivery-only; delivery, close and
+    /// drain share one absolute deadline (runtime §5.2). A decoded terminal
+    /// is never `Deadline`: delivery that cannot finish by then is
+    /// `Overflow`, and the daemon force, set at any point, is
+    /// `ForceStopped` (rule 4); either keeps the close's evidence.
+    /// Otherwise the terminal is returned with that evidence.
+    async fn late(
+        serving: &mut Serving<'_>,
+        sender: &WireSender,
+        messages: WireMessages,
+        terminal: TerminalEvidence,
+    ) -> Result<FakeRouteResult, RouteFailure> {
+        // Test builds: the terminal is decoded and held, the late path
+        // entered; nothing is closed or delivered yet.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_wire::failpoint::hit_async("routes.late.entered").await;
+        let by = cleanup_deadline();
+        let close = sender.close(CloseRequest {
+            mode: CloseMode::Force,
+            deadline: by,
+        });
+        let (report, delivered) = tokio::join!(close, serving.deliver_held(by));
+        messages.finish(by).await;
+        let result = terminal.result(
+            report.vendor_exit.unwrap_or(ExitReport {
+                code: None,
+                signal: None,
+            }),
+            &report,
+        );
+        let undecoded = sender.take_undecoded();
+        match delivered {
+            Ok(()) => serving.unless_forced(result, undecoded),
+            Err(cause) => Err(serving.failure_with(cause, &result, undecoded)),
+        }
     }
 
     /// Drains Host controls and reapers before Core releases the Store owner.
@@ -363,10 +379,7 @@ impl FakeRoute {
                         deadline: close_by,
                     })
                     .await;
-                Ok(Finished::Result(
-                    terminal.result(exit, close.cleanup, close.journal_uncertain),
-                    close_by,
-                ))
+                Ok(Finished::Result(terminal.result(exit, &close), close_by))
             }
             Err(failed) if matches!(failed.cause, RouteError::Deadline { .. }) => {
                 Ok(Finished::Late(terminal))
@@ -521,8 +534,8 @@ impl<'a> Serving<'a> {
     /// message, if any, goes on the hop as the reserve arm of
     /// [`Self::serve_once`] sends it. Only room on the hop, a closed hop or
     /// `by` ends the wait; no other control acts on an already decoded
-    /// message.
-    async fn deliver_held(&mut self, by: Deadline) -> Result<(), Failed> {
+    /// message. Delivery that cannot finish by `by` is `Overflow`.
+    async fn deliver_held(&mut self, by: Deadline) -> Result<(), RouteError> {
         let Some(message) = self.held.take() else {
             return Ok(());
         };
@@ -535,11 +548,48 @@ impl<'a> Serving<'a> {
                     permit.send(message);
                     Ok(())
                 }
-                Err(_) => Err(self.hop_closed()),
+                Err(_) => Err(self.hop_closed().cause),
             },
-            () = tokio::time::sleep_until(by.instant()) => {
-                Err(RouteError::Deadline { turn }.into())
-            }
+            () = tokio::time::sleep_until(by.instant()) => Err(RouteError::Overflow { turn }),
+        }
+    }
+
+    /// `result`, unless the daemon force is set: then `ForceStopped` with
+    /// the result's exit and close evidence (design §2 rule 4).
+    fn unless_forced(
+        &self,
+        result: FakeRouteResult,
+        undecoded: Option<String>,
+    ) -> Result<FakeRouteResult, RouteFailure> {
+        if self.signals.force.borrow().is_some() {
+            let cause = RouteError::ForceStopped { turn: self.turn };
+            return Err(self.failure_with(cause, &result, undecoded));
+        }
+        Ok(result)
+    }
+
+    /// A failure after a decoded terminal, with that terminal's exit and
+    /// close evidence; the daemon force outranks any other `cause`.
+    fn failure_with(
+        &self,
+        cause: RouteError,
+        result: &FakeRouteResult,
+        undecoded: Option<String>,
+    ) -> RouteFailure {
+        let cause = if self.signals.force.borrow().is_some() {
+            RouteError::ForceStopped { turn: self.turn }
+        } else {
+            cause
+        };
+        let exit = result.exit;
+        RouteFailure {
+            cause,
+            undecoded,
+            exit: (exit.code.is_some() || exit.signal.is_some()).then_some(exit),
+            launched: true,
+            cleanup: Some(result.cleanup),
+            forced: result.forced,
+            journal_uncertain: result.journal_uncertain,
         }
     }
 
@@ -819,19 +869,15 @@ struct TerminalEvidence {
 }
 
 impl TerminalEvidence {
-    fn result(
-        self,
-        exit: ExitReport,
-        cleanup: WireCleanup,
-        journal_uncertain: bool,
-    ) -> FakeRouteResult {
+    fn result(self, exit: ExitReport, close: &WireCloseReport) -> FakeRouteResult {
         FakeRouteResult {
             status: self.status,
             stop_reason: self.stop_reason,
             vendor_code: self.vendor_code,
             exit,
-            cleanup,
-            journal_uncertain,
+            cleanup: close.cleanup,
+            journal_uncertain: close.journal_uncertain,
+            forced: close.forced,
         }
     }
 }

@@ -75,10 +75,12 @@ enum Decision {
 }
 
 /// How a terminal commits (design §7.2): retried once at the same sequence
-/// (rows 7 and 9).
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Commit {
+/// (rows 7 and 9), and with the latch whose phase one a failure that may
+/// have written raises before its read-back (runtime §7).
+#[derive(Clone, Copy, Default)]
+pub(super) struct Commit<'a> {
     pub(super) retry: bool,
+    pub(super) latch: Option<&'a super::latch::Signal>,
 }
 
 /// How a queued turn's cancellation ended.
@@ -143,6 +145,26 @@ pub(super) enum Step {
     /// The head's read sequence failed: the read streak decides the wake
     /// (design §7.3).
     Unread(TurnNumber),
+}
+
+/// A turn's settled final text, for its terminal (Task 4 design §2.3,
+/// §6.4).
+pub(super) struct TurnText {
+    /// The inline text; `None` once it spilled.
+    inline: Option<String>,
+    /// The durable file, when the text spilled.
+    file: Option<FinalTextFile>,
+    /// A file step failed: the turn fails `store`.
+    failed: bool,
+}
+
+impl TurnText {
+    /// Puts the text in `terminal`; whether a file step failed.
+    pub(super) fn apply(self, terminal: &mut Terminal) -> bool {
+        terminal.final_text = self.inline;
+        terminal.final_text_file = self.file;
+        self.failed
+    }
 }
 
 /// How a drive's execution ended.
@@ -676,7 +698,11 @@ impl Engine {
         let outcome = match driven {
             Driven::Finished(outcome) => outcome,
             Driven::Forced(forced) => {
-                self.hand_off(slot, started, record, forced, order).await;
+                // Task 4 design §2.3: the text Core holds is completed text;
+                // the forced terminal keeps it.
+                let text = self.settle_text(&mut control, &mut record).await;
+                self.hand_off(slot, started, (record, text), forced, order)
+                    .await;
                 return;
             }
         };
@@ -736,7 +762,7 @@ impl Engine {
         &self,
         slot: &Slot,
         started: Started,
-        mut record: TurnRecord,
+        (mut record, text): (TurnRecord, TurnText),
         forced: Forced,
         order: Option<StopOrder>,
     ) {
@@ -758,6 +784,7 @@ impl Engine {
             launched: forced.launched,
             close: forced.close,
             cause: order.map(|order| order.cause),
+            text,
         });
         slot.finish_running(turn);
     }
@@ -935,12 +962,13 @@ impl Engine {
             // Task 4 design §11.2: a closed-now answer.
             self.session_closed();
         }
-        if durable.uncertain {
-            // The terminal is durable, but the commit itself was uncertain:
-            // a Store failure, so the restart handoff fails startup (§10).
+        if let Some(outcome) = durable.uncertain {
+            // The terminal is durable, but the commit itself was uncertain
+            // or corrupt: a Store failure, so the restart handoff fails
+            // startup (§10).
             self.store_failure(
                 FailureSite::QueuedCancel,
-                WriteOutcome::Uncertain,
+                outcome,
                 FailureScope::Turn(session, turn),
             )
             .finish_with(admission.as_ref())
@@ -977,6 +1005,7 @@ impl Engine {
         }
         let mode = Commit {
             retry: retry && !faulted,
+            latch: Some(&self.signal),
         };
         Self::commit_turn_ended_with(&self.store, started, record, terminal, close, extras, mode)
             .await
@@ -1026,7 +1055,10 @@ impl Engine {
             (record, terminal),
             close_session,
             TerminalExtras::default(),
-            Commit::default(),
+            Commit {
+                retry: false,
+                latch: Some(&self.signal),
+            },
         )
         .await;
         // Design §7.2 row 15: a forced terminal is final shutdown's single
@@ -1055,6 +1087,7 @@ impl Engine {
         let extras = TerminalExtras { cancel_cause };
         let mode = Commit {
             retry: record.first_failure.is_none(),
+            latch: Some(&self.signal),
         };
         let kept = (record.clone(), terminal.clone());
         let finished = Self::finish_turn_with(
@@ -1096,7 +1129,10 @@ impl Engine {
             self.session_closed();
         }
         let failed = match finished {
-            Ok(durable) if durable.uncertain => Some((first, WriteOutcome::Uncertain)),
+            Ok(Durable {
+                uncertain: Some(outcome),
+                ..
+            }) => Some((first, *outcome)),
             Ok(durable) if durable.retried => Some((first, WriteOutcome::NotCommitted)),
             Ok(_) => None,
             Err(unended) => Some((last, unended.outcome)),
@@ -1140,7 +1176,7 @@ impl Engine {
         (record, terminal): (TurnRecord, Terminal),
         close_session: bool,
         extras: TerminalExtras,
-        mode: Commit,
+        mode: Commit<'_>,
     ) -> Result<Durable, Unended> {
         let committed = Self::commit_turn_ended_with(
             journal,
@@ -1196,7 +1232,7 @@ impl Engine {
         terminal: Terminal,
         close_session: bool,
         extras: TerminalExtras,
-        mode: Commit,
+        mode: Commit<'_>,
     ) -> Result<Durable, Unended> {
         // A failed read writes nothing; a corrupt one latches (design §7.1),
         // and the hook sees it as this write's outcome.
@@ -1234,19 +1270,20 @@ impl Engine {
             None
         };
         let committed =
-            journal::commit_terminal_with(journal, ended, closed, extras, mode.retry).await;
+            journal::commit_terminal_with(journal, ended, closed, extras, (mode.retry, mode.latch))
+                .await;
         match &committed {
             Ok(Durable {
-                uncertain: false,
+                uncertain: None,
                 closed,
                 ..
             }) => head.committed(seq + 1 - first + u64::from(*closed)),
             // Nothing was written: the sequence stays the session's next.
-            Err(error) if journal::outcome_of(error) == WriteOutcome::NotCommitted => drop(head),
+            Err(unended) if unended.outcome == WriteOutcome::NotCommitted => drop(head),
             // Uncertain: re-read the head before the session's next event.
             Ok(_) | Err(_) => head.lost(),
         }
-        committed.map_err(Unended::from)
+        committed
     }
 
     /// Drives the adapter under the turn deadline, handling each observation it
@@ -1523,19 +1560,27 @@ impl Engine {
         record: &mut TurnRecord,
         terminal: &mut Terminal,
     ) -> bool {
+        self.settle_text(control, record).await.apply(terminal)
+    }
+
+    /// Makes the final text Core holds durable (design §6.4): inline, or
+    /// its file synced. A failed file step is the turn's first failure.
+    async fn settle_text(&self, control: &mut Control<'_>, record: &mut TurnRecord) -> TurnText {
         let text = std::mem::replace(&mut control.final_text, FinalText::new())
             .settle()
             .await;
-        terminal.final_text = text.inline;
-        terminal.final_text_file = text.file.map(|file| FinalTextFile {
-            path: file.path.display().to_string(),
-            bytes: file.bytes,
-            truncated: file.truncated,
-        });
         if text.failed {
             self.final_text_failed(record).await;
         }
-        text.failed
+        TurnText {
+            inline: text.inline,
+            file: text.file.map(|file| FinalTextFile {
+                path: file.path.display().to_string(),
+                bytes: file.bytes,
+                truncated: file.truncated,
+            }),
+            failed: text.failed,
+        }
     }
 
     /// Records a failed final-text file step as the turn's first failure, a

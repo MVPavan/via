@@ -1472,6 +1472,11 @@ fn commit_terminal(
     #[cfg(feature = "test-failpoints")]
     let queued = turn_state(&tx, &record.session_id, record.turn)?.as_deref() == Some("queued");
     let closed = insert_terminal(&tx, record, extras, closed)?;
+    // Test builds: SQLite reports corruption on the terminal write itself
+    // (design §7.1); the transaction rolls back.
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("store.commit.corrupt.terminal")
+        .map_err(|error| StoreError::Corrupt(error.to_string()))?;
     before_commit!(if queued {
         "store.commit.cancel"
     } else {

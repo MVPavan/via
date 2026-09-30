@@ -341,14 +341,8 @@ pub(super) fn classify(
     let failed = |class, message: &str| Some(failure(class, message.to_owned(), None));
     let failure = if accepted {
         match evidence.status {
-            VendorTerminalStatus::Completed if evidence.exit.code != Some(0) => failed(
-                FailureClass::ProcessExited,
-                "the vendor exited unsuccessfully",
-            ),
-            VendorTerminalStatus::Completed if evidence.cleanup != Cleanup::Quiescent => failed(
-                FailureClass::ProcessExited,
-                "vendor process group cleanup is unconfirmed",
-            ),
+            // C1 §7.6 row 3: a decoded `completed` is `completed`; the exit
+            // and cleanup stay independent evidence (C1 §7.5).
             VendorTerminalStatus::Completed => None,
             VendorTerminalStatus::Interrupted | VendorTerminalStatus::Failed => Some(failure(
                 FailureClass::VendorError,
