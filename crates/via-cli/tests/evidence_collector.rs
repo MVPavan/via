@@ -5,6 +5,9 @@
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/scenario.rs"]
+#[expect(dead_code, reason = "shared support; this file uses its typed errors")]
+mod scenario;
 mod support;
 
 use std::error::Error;
@@ -16,6 +19,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde_json::Value;
 
+use scenario::ScenarioError;
 use support::evidence::Evidence;
 
 #[test]
@@ -143,11 +147,11 @@ fn evidence_and_evidence_folder_directories_are_private() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// S1-contract r1 finding 2: missing required evidence records
-/// `infrastructure_failure` in the summary and the report, whatever
-/// outcome the caller passed.
+/// Runtime §11.2 (S1 critic r2 finding 3): missing required evidence keeps
+/// the scenario's own outcome, a passing body's `pass` here, and is recorded
+/// beside it in the summary and the report; finalization still fails.
 #[test]
-fn missing_required_evidence_is_an_infrastructure_failure() -> Result<(), Box<dyn Error>> {
+fn missing_required_evidence_keeps_the_outcome_and_fails() -> Result<(), Box<dyn Error>> {
     let sandbox = tempfile::tempdir()?;
     let fixture = sandbox.path().join("fixture.json");
     fs::write(&fixture, b"{}")?;
@@ -164,10 +168,60 @@ fn missing_required_evidence_is_an_infrastructure_failure() -> Result<(), Box<dy
             .is_err()
     );
     let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
-    assert_eq!(summary["outcome"], "infrastructure_failure");
-    assert_eq!(summary["evidence_complete"], false);
+    assert_eq!(summary["outcome"], "pass", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(
+        summary["evidence_failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("store.sqlite3")),
+        "{summary}"
+    );
     let report = fs::read_to_string(artifact.join("REPORT.md"))?;
-    assert!(report.contains("`infrastructure_failure`"), "{report}");
+    assert!(report.contains("Outcome: `pass`"), "{report}");
+    assert!(report.contains("Evidence complete: no"), "{report}");
+    assert!(report.contains("store.sqlite3"), "{report}");
+    Ok(())
+}
+
+/// Runtime §11.2 (S1 critic r2 finding 3): a body's typed timeout that
+/// ends before its Store exists stays `timeout` through `evidenced`; the
+/// missing Store evidence and the unproven cleanup are recorded beside it,
+/// and the test still fails.
+#[test]
+fn a_timeout_with_missing_store_evidence_stays_a_timeout() -> Result<(), Box<dyn Error>> {
+    let sandbox = tempfile::tempdir()?;
+    let root = sandbox.path().join("root");
+    let state = root.join("state");
+    fs::create_dir_all(&state)?;
+    let fixture = root.join("fixture.json");
+    fs::write(&fixture, b"{}")?;
+    let mut artifact = None;
+    let result = evidenced::evidenced(|| -> Result<(), Box<dyn Error>> {
+        let evidence = evidenced::open(Path::new(env!("CARGO_BIN_EXE_via")), &fixture)?;
+        artifact = Some(evidence.dir.clone());
+        let expected = evidenced::Expected {
+            store: true,
+            folders: true,
+        };
+        evidenced::park(evidence, root.clone(), &state, expected, Ok(()));
+        Err(ScenarioError::Timeout("the turn never finished".to_owned()).into())
+    });
+    let error = result.expect_err("a timed-out scenario passed").to_string();
+    assert!(error.contains("the turn never finished"), "{error}");
+    let artifact = artifact.ok_or("no artifact")?;
+    let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
+    assert_eq!(summary["outcome"], "timeout", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(
+        summary["missing_evidence"]
+            .as_array()
+            .is_some_and(|missing| missing.contains(&Value::from("store.sqlite3"))),
+        "{summary}"
+    );
+    assert!(
+        summary["evidence_failure"].is_string() && summary["cleanup_failure"].is_string(),
+        "{summary}"
+    );
     Ok(())
 }
 
@@ -221,11 +275,11 @@ fn collector_exit_proof_budget_includes_the_stop() -> Result<(), Box<dyn Error>>
 }
 
 /// A scenario whose folders are required still has every launched turn's
-/// folder checked: one of two anchored turns without its folder is an
-/// infrastructure failure (S1-contract r2 finding 3).
+/// folder checked: one of two anchored turns without its folder fails the
+/// test (S1-contract r2 finding 3), and the passing body's outcome stays
+/// `pass` beside the recorded failure (S1 critic r2 finding 3).
 #[test]
-fn collector_launched_turn_without_its_folder_is_an_infrastructure_failure()
--> Result<(), Box<dyn Error>> {
+fn collector_launched_turn_without_its_folder_fails_the_evidence() -> Result<(), Box<dyn Error>> {
     let sandbox = tempfile::tempdir()?;
     let root = sandbox.path().join("root");
     let state = root.join("state");
@@ -256,7 +310,14 @@ fn collector_launched_turn_without_its_folder_is_an_infrastructure_failure()
     assert!(error.contains("s_a/2 has no evidence folder"), "{error}");
     let artifact = artifact.ok_or("no artifact")?;
     let summary: Value = serde_json::from_slice(&fs::read(artifact.join("summary.json"))?)?;
-    assert_eq!(summary["outcome"], "infrastructure_failure", "{summary}");
+    assert_eq!(summary["outcome"], "pass", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
+    assert!(
+        summary["cleanup_failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("s_a/2 has no evidence folder")),
+        "{summary}"
+    );
     Ok(())
 }
 

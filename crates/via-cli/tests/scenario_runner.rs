@@ -51,9 +51,11 @@ fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Erro
     assert!(!report.evidence_complete);
     assert!(report.require_pass().is_err());
     // The run has no daemon, so its required evidence is missing: the
-    // artifact records that, not the failure (S1-contract r1 finding 2).
+    // artifact records that beside the failure, which it keeps (runtime
+    // §11.2, S1 critic r2 finding 3).
     let summary = outcome(&report.artifact)?;
-    assert_eq!(summary["outcome"], "infrastructure_failure");
+    assert_eq!(summary["outcome"], "fail", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
     assert!(
         summary["detail"]
             .as_str()
@@ -96,9 +98,10 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
     );
     assert_eq!(report.outcome, "timeout");
     assert!(!report.evidence_complete);
-    // As above: missing required evidence decides the recorded outcome.
+    // As above: missing required evidence is recorded beside the timeout.
     let summary = outcome(&report.artifact)?;
-    assert_eq!(summary["outcome"], "infrastructure_failure");
+    assert_eq!(summary["outcome"], "timeout", "{summary}");
+    assert_eq!(summary["evidence_complete"], false, "{summary}");
     assert!(
         summary["detail"]
             .as_str()
@@ -109,9 +112,11 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-/// `via-jm4.7.6`: an infrastructure failure, from the action or from a cleanup
-/// that panics after a passing action, is recorded as `infrastructure_failure`,
-/// never as a pass or an ordinary failure.
+/// `via-jm4.7.6`: an infrastructure failure of the action is recorded as
+/// `infrastructure_failure`, never as a pass or an ordinary failure. A
+/// cleanup that panics after a passing action keeps the `pass` and records
+/// the cleanup failure beside it; the scenario still fails (runtime §11.2,
+/// S1 critic r2 finding 3).
 #[test]
 fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<dyn Error>> {
     let (sandbox, fixture) = fixture()?;
@@ -138,12 +143,21 @@ fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<
         |_| Ok(()),
         |_| -> Result<(), ScenarioError> { panic!("cleanup lost its supervisor") },
     );
-    assert_eq!(report.outcome, "infrastructure_failure");
-    assert!(report.detail.contains("cleanup panicked"));
+    assert_eq!(report.outcome, "pass");
+    assert!(!report.evidence_complete);
+    assert!(
+        report.detail.contains("cleanup panicked"),
+        "{}",
+        report.detail
+    );
     assert!(report.require_pass().is_err());
-    assert_eq!(
-        outcome(&report.artifact)?["outcome"],
-        "infrastructure_failure"
+    let summary = outcome(&report.artifact)?;
+    assert_eq!(summary["outcome"], "pass", "{summary}");
+    assert!(
+        summary["cleanup_failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("cleanup panicked")),
+        "{summary}"
     );
     Ok(())
 }

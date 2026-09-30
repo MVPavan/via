@@ -17,6 +17,9 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/scenario.rs"]
+#[expect(dead_code, reason = "shared support; evidenced uses its typed errors")]
+mod scenario;
 mod support;
 
 use std::cell::Cell;

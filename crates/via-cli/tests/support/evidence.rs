@@ -25,6 +25,9 @@ pub(crate) struct Evidence {
     /// evidence folder: `finish` then waives only `evidence/*`; the
     /// collector checks that every launched turn still has its folder.
     pub(crate) folders_expected: bool,
+    /// Why collecting the State or proving cleanup failed, if it did:
+    /// recorded beside the scenario's outcome, never in its place.
+    cleanup_failure: Option<String>,
 }
 
 impl Evidence {
@@ -55,6 +58,7 @@ impl Evidence {
             finalized: false,
             store_expected: true,
             folders_expected: true,
+            cleanup_failure: None,
         })
     }
 
@@ -87,6 +91,16 @@ impl Evidence {
         copy_tree(root, &self.dir.join("evidence"))
     }
 
+    /// Records that collecting the State or proving cleanup failed: `finish`
+    /// then keeps the scenario's outcome, marks the evidence incomplete and
+    /// fails.
+    pub(crate) fn cleanup_failed(&mut self, detail: String) {
+        self.cleanup_failure = Some(detail);
+    }
+
+    /// Finalizes the artifact with the scenario's own `outcome` (runtime
+    /// §11.2): missing required evidence and a recorded cleanup failure are
+    /// added beside it, never in its place, and make finalization fail.
     pub(crate) fn finish(mut self, outcome: &str, detail: &str) -> EvidenceResult<PathBuf> {
         if !matches!(
             outcome,
@@ -117,14 +131,17 @@ impl Evidence {
         {
             missing.push("evidence/*");
         }
-        // Missing required evidence is an infrastructure failure, whatever
-        // the scenario itself concluded.
-        let final_outcome = if missing.is_empty() {
-            outcome
-        } else {
-            "infrastructure_failure"
-        };
-        let summary = self.summary(final_outcome, detail, &missing)?;
+        let evidence_failure = (!missing.is_empty())
+            .then(|| format!("missing required evidence: {}", missing.join(", ")));
+        let failures: Vec<&str> = [&evidence_failure, &self.cleanup_failure]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut summary = self.summary(outcome, detail, &missing)?;
+        summary["evidence_complete"] = json!(failures.is_empty());
+        summary["evidence_failure"] = json!(evidence_failure);
+        summary["cleanup_failure"] = json!(self.cleanup_failure);
         fs::write(
             self.dir.join("summary.json"),
             serde_json::to_vec_pretty(&summary)?,
@@ -132,22 +149,25 @@ impl Evidence {
         fs::write(
             self.dir.join("REPORT.md"),
             format!(
-                "# {}\n\nOutcome: `{final_outcome}`. {detail}\n\nMissing evidence: {}.\n",
+                "# {}\n\nOutcome: `{outcome}`. {detail}\n\nEvidence complete: {}.\n\n\
+                 Missing evidence: {}.\n\nCleanup failure: {}.\n",
                 self.scenario,
+                if failures.is_empty() { "yes" } else { "no" },
                 if missing.is_empty() {
                     "none".to_owned()
                 } else {
                     missing.join(", ")
-                }
+                },
+                self.cleanup_failure.as_deref().unwrap_or("none"),
             ),
         )?;
         self.write_manifest()?;
         self.verify_manifest()?;
         self.finalized = true;
-        if missing.is_empty() {
+        if failures.is_empty() {
             Ok(self.dir.clone())
         } else {
-            Err(format!("missing required evidence: {}", missing.join(", ")).into())
+            Err(failures.join("; ").into())
         }
     }
 
@@ -166,7 +186,6 @@ impl Evidence {
             "outcome":outcome,
             "detail":detail,
             "missing_evidence":missing,
-            "evidence_complete":missing.is_empty(),
             "seed":0,
             "via_version":env!("CARGO_PKG_VERSION"),
             "git_commit":command_output("git", &["rev-parse", "HEAD"], &workspace)?.trim(),

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::outer_cleanup;
+use crate::scenario::ScenarioError;
 use crate::support::evidence::Evidence;
 
 type EvidencedResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -37,31 +38,31 @@ thread_local! {
 }
 
 /// Runs a scenario test's body, then finalizes the evidence of every
-/// sandbox it created with the body's outcome: `pass`, `fail` for an error
-/// or a panic, or `infrastructure_failure` when a passing body's State could
-/// not be collected or its cleanup proved. A panic is resumed afterwards.
+/// sandbox it created with the body's own outcome (runtime §11.2): `pass`,
+/// the category of a typed [`ScenarioError`] (`fail`, `timeout` or
+/// `infrastructure_failure`), or `fail` for any other error or a panic.
+/// A State that could not be collected or a cleanup not proved is recorded
+/// beside that outcome and fails the test. A panic is resumed afterwards.
 pub(crate) fn evidenced<T>(body: impl FnOnce() -> EvidencedResult<T>) -> EvidencedResult<T> {
     INSIDE.set(true);
     let result = catch_unwind(AssertUnwindSafe(body));
     INSIDE.set(false);
     let (outcome, detail) = match &result {
         Ok(Ok(_)) => ("pass", "scenario completed".to_owned()),
-        Ok(Err(error)) => ("fail", error.to_string()),
+        Ok(Err(error)) => match error.downcast_ref::<ScenarioError>() {
+            Some(typed) => (typed.outcome(), typed.detail().to_owned()),
+            None => ("fail", error.to_string()),
+        },
         Err(payload) => (
             "fail",
             format!("scenario panicked: {}", panic_message(payload.as_ref())),
         ),
     };
     let mut incomplete = Vec::new();
-    for parked in PARKED.take() {
+    for mut parked in PARKED.take() {
         let artifact = parked.evidence.dir.clone();
-        let (outcome, detail) = match &parked.collected {
-            Ok(()) => (outcome, detail.clone()),
-            Err(error) if outcome == "pass" => ("infrastructure_failure", error.clone()),
-            Err(error) => (outcome, format!("{detail}; collection: {error}")),
-        };
         if let Err(error) = parked.collected {
-            incomplete.push(format!("{}: {error}", artifact.display()));
+            parked.evidence.cleanup_failed(error);
         }
         if let Err(error) = parked.evidence.finish(outcome, &detail) {
             incomplete.push(format!("{}: {error}", artifact.display()));
@@ -97,8 +98,8 @@ pub(crate) fn open(fake: &Path, fixture: &Path) -> EvidencedResult<Evidence> {
 /// Collects the sandbox at `root`, State `state`, into `evidence` and
 /// parks it for [`evidenced`]; called by the sandbox's drop with
 /// [`stop_daemons`]'s proof that every daemon exited. Without that proof
-/// nothing is collected, the scenario is an infrastructure failure and the
-/// sandbox is kept. `expected` says what the scenario must hold: a
+/// nothing is collected, the cleanup failure is recorded beside the
+/// scenario's outcome, the test fails and the sandbox is kept. `expected` says what the scenario must hold: a
 /// scenario with no Store by design clears `store`; one whose turns launch
 /// no vendor clears only `folders`, so the Store, envelopes, events and
 /// cleanup stay required and a launched turn must still have its folder.

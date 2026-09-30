@@ -20,7 +20,7 @@ pub(crate) enum ScenarioError {
 }
 
 impl ScenarioError {
-    fn outcome(&self) -> &'static str {
+    pub(crate) fn outcome(&self) -> &'static str {
         match self {
             Self::Failure(_) => "fail",
             Self::Timeout(_) => "timeout",
@@ -28,7 +28,7 @@ impl ScenarioError {
         }
     }
 
-    fn detail(&self) -> &str {
+    pub(crate) fn detail(&self) -> &str {
         match self {
             Self::Failure(detail) | Self::Timeout(detail) | Self::Infrastructure(detail) => detail,
         }
@@ -40,6 +40,10 @@ impl std::fmt::Display for ScenarioError {
         write!(f, "{}: {}", self.outcome(), self.detail())
     }
 }
+
+/// Typed, so `evidenced` keeps a body's timeout or infrastructure failure
+/// (runtime §11.2).
+impl Error for ScenarioError {}
 
 pub(crate) struct Captured {
     pub(crate) status: ExitStatus,
@@ -108,7 +112,10 @@ impl ScenarioReport {
     }
 }
 
-pub(crate) fn run_scenario<A, C>(evidence: Evidence, action: A, cleanup: C) -> ScenarioReport
+/// Runs `action`, then `cleanup`, and finalizes `evidence` with the
+/// action's own outcome (runtime §11.2): a cleanup failure is recorded
+/// beside it, never in its place, and leaves the evidence incomplete.
+pub(crate) fn run_scenario<A, C>(mut evidence: Evidence, action: A, cleanup: C) -> ScenarioReport
 where
     A: FnOnce(&Evidence) -> Result<(), ScenarioError>,
     C: FnOnce(&Evidence) -> Result<(), ScenarioError>,
@@ -116,30 +123,29 @@ where
     let artifact = evidence.dir.clone();
     let action_result = catch_unwind(AssertUnwindSafe(|| action(&evidence)));
     let cleanup_result = catch_unwind(AssertUnwindSafe(|| cleanup(&evidence)));
-    let error = match action_result {
-        Ok(Err(error)) => Some(error),
-        Err(payload) => Some(ScenarioError::Failure(format!(
-            "scenario assertion panicked: {}",
-            panic_message(payload.as_ref())
-        ))),
-        Ok(Ok(())) => match &cleanup_result {
-            Ok(Err(error)) => Some(error.clone()),
-            Err(payload) => Some(ScenarioError::Infrastructure(format!(
-                "cleanup panicked: {}",
+    let (outcome, mut detail) = match action_result {
+        Ok(Err(error)) => (error.outcome(), error.detail().to_owned()),
+        Err(payload) => (
+            "fail",
+            format!(
+                "scenario assertion panicked: {}",
                 panic_message(payload.as_ref())
-            ))),
-            Ok(Ok(())) => None,
-        },
+            ),
+        ),
+        Ok(Ok(())) => ("pass", "scenario completed".to_owned()),
     };
-    let (outcome, mut detail) = match error {
-        Some(error) => (error.outcome(), error.detail().to_owned()),
-        None => ("pass", "scenario completed".to_owned()),
+    let cleanup_failure = match cleanup_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(payload) => Some(format!(
+            "cleanup panicked: {}",
+            panic_message(payload.as_ref())
+        )),
     };
-    if let Ok(Err(cleanup_error)) = &cleanup_result
-        && outcome != "pass"
-    {
+    if let Some(failure) = cleanup_failure {
         detail.push_str("; cleanup: ");
-        detail.push_str(cleanup_error.detail());
+        detail.push_str(&failure);
+        evidence.cleanup_failed(failure);
     }
     let finalization = evidence.finish(outcome, &detail);
     let evidence_complete = finalization.is_ok();
