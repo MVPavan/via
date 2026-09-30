@@ -1,28 +1,28 @@
 **UNSOUND.** The two wall fixes are specified correctly. The redirect removes most obsolete mechanisms, but the leftover report still has gaps in scan identity, recovery, completeness, delivery, and acceptance tests.
 
-References below are to [revision 6](docs/workstreams/rust-foundation/adapters/design.md) unless another file is named. This reviews the specification of the owner’s policy, not the policy choice.
+References below are to [revision 6](../../../../../docs/workstreams/rust-foundation/adapters/design.md) unless another file is named. This reviews the specification of the owner’s policy, not the policy choice.
 
 **Part 1 — fix check**
 
 | Round-5 item | Status | Reason | Design line |
 |---|---|---|---|
-| Part 1 #1: capped wall, `by_order`/`stopped` | fixed | Specifies the additional generic `stopped` change and asserts both `unknown` state and `cancel.outcome: unknown`; matches the branch that currently overrides `stop_outcome`. | [466](docs/workstreams/rust-foundation/adapters/design.md:466), [518](docs/workstreams/rust-foundation/adapters/design.md:518) |
-| Part 1 #2: wall commit wording | fixed | Correctly distinguishes the post-return event commit from the wall instant used as `requested_at`; matches `drive.rs:711–730`. | [440](docs/workstreams/rust-foundation/adapters/design.md:440) |
-| Part 2 #1–#3, #5–#6: removed mechanisms | fixed | No active rule still requires the kill loop, subreaper, `DescendantsAbsent`, consuming wait, or former positive descendant predicates. References in the rejected alternative are explicitly conditional. | [672](docs/workstreams/rust-foundation/adapters/design.md:672), [718](docs/workstreams/rust-foundation/adapters/design.md:718) |
-| Part 2 #4: Codex clean barrier | partly | Default clean and its proof claim are removed, but VX14 still requires adding per-thread clean tests. | [976](docs/workstreams/rust-foundation/adapters/design.md:976), [978](docs/workstreams/rust-foundation/adapters/design.md:978) |
-| Part 2 #7: cleanup/audit contradictions | partly | The original P7 contradiction is removed; the new blanket exclusion of out-of-group processes conflicts with the retained server-item rule. | [679](docs/workstreams/rust-foundation/adapters/design.md:679), [685](docs/workstreams/rust-foundation/adapters/design.md:685), [918](docs/workstreams/rust-foundation/adapters/design.md:918) |
-| Part 2 #8: Codex session close | fixed | Session close is unsubscribe only; no descendant cleanup is promised while another lease lives. New report-delivery defects are listed below. | [699](docs/workstreams/rust-foundation/adapters/design.md:699) |
-| Part 2 #9: daemon-crash test | partly | The impossible reply requirement is gone, but the replacement recovery report lacks specified durable inputs and a complete return path. | [711](docs/workstreams/rust-foundation/adapters/design.md:711), [933](docs/workstreams/rust-foundation/adapters/design.md:933) |
-| Part 2 #10: failure-first tests | partly | Positive reporting assertions would fail today; several standalone negative assertions already pass, and some survivor expectations contradict LH. | [723](docs/workstreams/rust-foundation/adapters/design.md:723), [1345](docs/workstreams/rust-foundation/adapters/design.md:1345) |
-| Part 2 #11: public type/test ownership | fixed | Host `lib.rs` and Host tests are now included. New propagation-path overlaps remain. | [1352](docs/workstreams/rust-foundation/adapters/design.md:1352) |
-| Part 2 #12: categorical wording | partly | Anchor-killed row removed and Codex close qualified; §2/AD15 corrected, but VC7 still says unconditionally that early EOF completes the turn. | [840](docs/workstreams/rust-foundation/adapters/design.md:840), [951](docs/workstreams/rust-foundation/adapters/design.md:951) |
+| Part 1 #1: capped wall, `by_order`/`stopped` | fixed | Specifies the additional generic `stopped` change and asserts both `unknown` state and `cancel.outcome: unknown`; matches the branch that currently overrides `stop_outcome`. | [466](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L466), [518](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L518) |
+| Part 1 #2: wall commit wording | fixed | Correctly distinguishes the post-return event commit from the wall instant used as `requested_at`; matches `drive.rs:711–730`. | [440](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L440) |
+| Part 2 #1–#3, #5–#6: removed mechanisms | fixed | No active rule still requires the kill loop, subreaper, `DescendantsAbsent`, consuming wait, or former positive descendant predicates. References in the rejected alternative are explicitly conditional. | [672](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L672), [718](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L718) |
+| Part 2 #4: Codex clean barrier | partly | Default clean and its proof claim are removed, but VX14 still requires adding per-thread clean tests. | [976](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L976), [978](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L978) |
+| Part 2 #7: cleanup/audit contradictions | partly | The original P7 contradiction is removed; the new blanket exclusion of out-of-group processes conflicts with the retained server-item rule. | [679](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L679), [685](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L685), [918](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L918) |
+| Part 2 #8: Codex session close | fixed | Session close is unsubscribe only; no descendant cleanup is promised while another lease lives. New report-delivery defects are listed below. | [699](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L699) |
+| Part 2 #9: daemon-crash test | partly | The impossible reply requirement is gone, but the replacement recovery report lacks specified durable inputs and a complete return path. | [711](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L711), [933](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L933) |
+| Part 2 #10: failure-first tests | partly | Positive reporting assertions would fail today; several standalone negative assertions already pass, and some survivor expectations contradict LH. | [723](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L723), [1345](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L1345) |
+| Part 2 #11: public type/test ownership | fixed | Host `lib.rs` and Host tests are now included. New propagation-path overlaps remain. | [1352](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L1352) |
+| Part 2 #12: categorical wording | partly | Anchor-killed row removed and Codex close qualified; §2/AD15 corrected, but VC7 still says unconditionally that early EOF completes the turn. | [840](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L840), [951](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L951) |
 
 **Part 2 — new redirect findings**
 
 1. **Important — recovery cannot reconstruct the specified start-time prefilter.**  
    **Locations:** AD20 “How” L712; AR2 L933; S-LEFTOVER L1352.
 
-   Only `vendor_marker` is added to persistence. The design does not specify persisting the vendor’s launch/start bound, its clock domain, or its commit order. Today Host generates the vendor marker at [host.rs:2032](crates/via-host/src/host.rs:2032), sends ARM at [1437](crates/via-host/src/host.rs:1437), and records only `vendor_pid` afterward at [1462](crates/via-host/src/host.rs:1462). Recovery can therefore encounter launched work without post-spawn facts.
+   Only `vendor_marker` is added to persistence. The design does not specify persisting the vendor’s launch/start bound, its clock domain, or its commit order. Today Host generates the vendor marker at [host.rs:2032](../../../../../crates/via-host/src/host.rs#L2032), sends ARM at [1437](../../../../../crates/via-host/src/host.rs#L1437), and records only `vendor_pid` afterward at [1462](../../../../../crates/via-host/src/host.rs#L1462). Recovery can therefore encounter launched work without post-spawn facts.
 
    **Smallest fix:** Persist the exact marker and a defined boot-relative launch lower bound before ARM can launch the vendor. Specify boot/namespace validation and handling of missing legacy facts. Test daemon death after ARM but before vendor-facts commit. Define tick precision: an older process born in the same kernel tick cannot be excluded by the proposed comparison.
 
@@ -43,7 +43,7 @@ References below are to [revision 6](docs/workstreams/rust-foundation/adapters/d
 4. **Important — the scan bound is incomplete and may have no usable budget.**  
    **Locations:** AD20 L712; AD19 L698–700; S-LEFTOVER L1352.
 
-   `min(close deadline, 1 s)` mixes an absolute deadline with a duration. It also runs after the Stop result without defining whether that means the initial `Stopping` reply or completed Host close. Current [Host close](crates/via-host/src/host.rs:1944) can spend the remaining deadline proving absence. Neither environment-buffer size nor scanner concurrency/task cancellation is bounded. Sixteen returned entries does not bound scan memory.
+   `min(close deadline, 1 s)` mixes an absolute deadline with a duration. It also runs after the Stop result without defining whether that means the initial `Stopping` reply or completed Host close. Current [Host close](../../../../../crates/via-host/src/host.rs#L1944) can spend the remaining deadline proving absence. Neither environment-buffer size nor scanner concurrency/task cancellation is bounded. Sixteen returned entries does not bound scan memory.
 
    **Smallest fix:** Name the trigger and use an absolute scan deadline such as `min(close_by, scan_started + 1 s)`. Specify the zero-budget result, preserve the existing close bound, and use bounded streaming reads with explicit truncation/cancellation behavior. Test exhausted close budget and oversized environments.
 
@@ -61,7 +61,7 @@ References below are to [revision 6](docs/workstreams/rust-foundation/adapters/d
 
    “No environment value is ever serialized” cannot hold literally while the environment’s marker value is persisted as `anchors.vendor_marker`. The report also returns `comm`, which is process-controlled metadata rather than a guaranteed secret-free label. Dropping the environment buffer does not by itself verify that errors, debug formatting, or tracing never expose it.
 
-   **Smallest fix:** Explicitly permit only the marker’s internal persistence, keep it distinct from the private anchor marker, and forbid it and raw environment bytes in diagnostics and public output. Scope the guarantee to the fields VIA reads/emits. Use synthetic sentinels to test success, error, and debug paths; disclose or omit potentially sensitive process labels. Preserve [coding-style §8](.repo-context/coding-style.md:214).
+   **Smallest fix:** Explicitly permit only the marker’s internal persistence, keep it distinct from the private anchor marker, and forbid it and raw environment bytes in diagnostics and public output. Scope the guarantee to the fields VIA reads/emits. Use synthetic sentinels to test success, error, and debug paths; disclose or omit potentially sensitive process labels. Preserve [coding-style §8](../../../../../.repo-context/coding-style.md#L214).
 
 7. **Important — “environment-clearing leftover is missed” is not a sound test definition.**  
    **Locations:** AD20 “Limits” L715 and test L724.
@@ -73,21 +73,21 @@ References below are to [revision 6](docs/workstreams/rust-foundation/adapters/d
 8. **Important — the return surfaces do not carry all promised reports.**  
    **Locations:** §3.2 L277–280, L288, L303; AD20 L714; AR2 L933; S-LEFTOVER L1352.
 
-   `TurnEnd.leftovers` is expressly limited to per-turn routes, although server-crash turns also need it. The driver’s `CloseReport` and recovery results gain no specified report field. Adding Host `CloseReport.leftovers` and “carry the report” in Wire does not complete Route/Adapter/recovery propagation. Current [Wire close conversion](crates/via-wire/src/connection.rs:341) and [adapter recovery normalization](crates/via-adapters/src/runtime.rs:605) illustrate those separate seams.
+   `TurnEnd.leftovers` is expressly limited to per-turn routes, although server-crash turns also need it. The driver’s `CloseReport` and recovery results gain no specified report field. Adding Host `CloseReport.leftovers` and “carry the report” in Wire does not complete Route/Adapter/recovery propagation. Current [Wire close conversion](../../../../../crates/via-wire/src/connection.rs#L341) and [adapter recovery normalization](../../../../../crates/via-adapters/src/runtime.rs#L605) illustrate those separate seams.
 
    **Smallest fix:** Specify the report on server-loss `TurnEnd`, driver close, Host/Wire/Route recovery, and adapter recovery facts. Define one report per connection generation and its aggregation where a turn has multiple generations.
 
 9. **Important — report ordering, crash fan-out, and close replay are unspecified.**  
    **Locations:** AD20 L714; AC10 L925; S-LEFTOVER L1352.
 
-   “Every `server_lost` turn” needs one completed scan retained before those turns commit, or an explicit unavailable/incomplete result. No barrier prevents one affected turn committing first. For close, the same report must enter `session.closed`, the close result, and keyed/idempotent replay atomically. Today [Store `commit_closed`](crates/via-store/src/runtime/sql.rs:1625) derives its result from durable rows; it does not accept the proposed report.
+   “Every `server_lost` turn” needs one completed scan retained before those turns commit, or an explicit unavailable/incomplete result. No barrier prevents one affected turn committing first. For close, the same report must enter `session.closed`, the close result, and keyed/idempotent replay atomically. Today [Store `commit_closed`](../../../../../crates/via-store/src/runtime/sql.rs#L1625) derives its result from durable rows; it does not accept the proposed report.
 
    **Smallest fix:** Specify scan-before-terminal/close commit ordering, one retained snapshot for shared-server fan-out, and atomic persistence with close/event/operation results. Recovery must collect reporting facts before publishing recovered envelopes. Test stalled delivery, simultaneous affected turns, and crashes on both sides of these commits.
 
 10. **Important — several server exits have no report destination, and “last lease” needs a defined owner.**  
     **Locations:** AD20 L711, L714; AD16 L863–864; AC10 L925; Codex/OpenCode slice rows L1357–1358.
 
-    Idle retirement can release the last lease without a C1 `close`; Codex explicitly permits idle detachment in [its packet](docs/specs/vendors/codex.md:82). An idle-server crash, daemon shutdown between turns, or recovery of an idle server can likewise have no `server_lost` or recovered turn to receive the report. Concurrent final lease release/new acquisition also needs a rule identifying which close owns the retiring generation.
+    Idle retirement can release the last lease without a C1 `close`; Codex explicitly permits idle detachment in [its packet](../../../../../docs/specs/vendors/codex.md#L82). An idle-server crash, daemon shutdown between turns, or recovery of an idle server can likewise have no `server_lost` or recovered turn to receive the report. Concurrent final lease release/new acquisition also needs a rule identifying which close owns the retiring generation.
 
     **Smallest fix:** Define a durable, retrievable session-level destination for exits without an eligible turn/close. Serialize final release and retirement against new leases, and identify the report’s owning close generation. Preserve terminal-envelope immutability.
 
@@ -96,14 +96,14 @@ References below are to [revision 6](docs/workstreams/rust-foundation/adapters/d
 
     The table correctly restores C1 P7, §7.3 and §7.6: reported server tool items remain relevant until completion or the bound. But the following prose excludes *all* processes outside the agent’s group from cleanup. LH establishes that those reported tools can themselves run outside the server group. The table and prose therefore give different answers for an open reported tool.
 
-    The table also lacks the preserved no-launch case, where no group exists and a complete journal permits quiescence; see [C1 §7.4](docs/specs/via-api-v1.md:683).
+    The table also lacks the preserved no-launch case, where no group exists and a complete journal permits quiescence; see [C1 §7.4](../../../../../docs/specs/via-api-v1.md#L683).
 
     **Smallest fix:** Scope the group exclusion to OS group-absence evidence and untracked descendants. Explicitly retain reported-item waiting on server routes and the no-launch rule. With those qualifications, the restored rules match C1.
 
 12. **Important — acceptance tests contain incorrect survivor expectations and unsupported failure-first claims.**  
     **Locations:** AD20 L723–728; §7 L1345; S-LEFTOVER L1352; Claude L1355; Codex L1357.
 
-    The Claude row requires c7’s setsid `sleep` in leftovers, although [LH E1](docs/workstreams/rust-foundation/adapters/lifecycle-harnesses.md:36) shows interrupt killing the setsid descendant and leaving only the double fork. Codex requires background terminals at server close, while [LH E2c](docs/workstreams/rust-foundation/adapters/lifecycle-harnesses.md:66) observed none surviving sandboxed stdin close. These are conditional outcomes, not universal expectations.
+    The Claude row requires c7’s setsid `sleep` in leftovers, although [LH E1](../../../../../docs/workstreams/rust-foundation/adapters/lifecycle-harnesses.md#L36) shows interrupt killing the setsid descendant and leaving only the double fork. Codex requires background terminals at server close, while [LH E2c](../../../../../docs/workstreams/rust-foundation/adapters/lifecycle-harnesses.md#L66) observed none surviving sandboxed stdin close. These are conditional outcomes, not universal expectations.
 
     Positive “listed” assertions would fail today because no report exists. Standalone no-signal/no-serialization/missed-process assertions already pass. `systemd-run --user` also needs declared prerequisites.
 
@@ -142,21 +142,21 @@ References below are to [revision 6](docs/workstreams/rust-foundation/adapters/d
 
 | Omitted occurrence | Required disposition |
 |---|---|
-| [runtime §5.1 L485–486](docs/specs/runtime-contracts.md:485): never open `/proc/*/environ` or inspect credentials | Scope the approved exception while preserving anchor verification rules. |
-| [coding-style L164–165](.repo-context/coding-style.md:164): never perform a vendor-environment scan | Currently absent from the audit’s L173–174 amendment. |
-| [coding-style L175–176](.repo-context/coding-style.md:175): never read/copy/log credentials | Must be reconciled with transient buffer reads, not just invariant 1. |
-| [C1 §9 L814–823](docs/specs/via-api-v1.md:814): credential prohibition and bounded OpenCode exception | The existing generated-password exception does not authorize reading user/provider credentials. |
-| [platform P-I3 L371](docs/specs/platform-packaging.md:371): vendor environment is never read | This test requirement remains contradictory. |
-| [Codex packet L205](docs/specs/vendors/codex.md:205): never read/copy credential contents | Applies to the new scan too. |
-| [OpenCode packet L223–224](docs/specs/vendors/opencode.md:223), [OC12 L685](docs/specs/vendors/opencode.md:685), [mirrored C1 amendment L740–749](docs/specs/vendors/opencode.md:740) | Reconcile the dump/credential prohibitions and their mirrored wording. |
+| [runtime §5.1 L485–486](../../../../../docs/specs/runtime-contracts.md#L485): never open `/proc/*/environ` or inspect credentials | Scope the approved exception while preserving anchor verification rules. |
+| [coding-style L164–165](../../../../../.repo-context/coding-style.md#L164): never perform a vendor-environment scan | Currently absent from the audit’s L173–174 amendment. |
+| [coding-style L175–176](../../../../../.repo-context/coding-style.md#L175): never read/copy/log credentials | Must be reconciled with transient buffer reads, not just invariant 1. |
+| [C1 §9 L814–823](../../../../../docs/specs/via-api-v1.md#L814): credential prohibition and bounded OpenCode exception | The existing generated-password exception does not authorize reading user/provider credentials. |
+| [platform P-I3 L371](../../../../../docs/specs/platform-packaging.md#L371): vendor environment is never read | This test requirement remains contradictory. |
+| [Codex packet L205](../../../../../docs/specs/vendors/codex.md#L205): never read/copy credential contents | Applies to the new scan too. |
+| [OpenCode packet L223–224](../../../../../docs/specs/vendors/opencode.md#L223), [OC12 L685](../../../../../docs/specs/vendors/opencode.md#L685), [mirrored C1 amendment L740–749](../../../../../docs/specs/vendors/opencode.md#L740) | Reconcile the dump/credential prohibitions and their mirrored wording. |
 
-Also explicitly disposition [platform L269](docs/specs/platform-packaging.md:269) and [L328](docs/specs/platform-packaging.md:328): anchor marker proof must remain control-based, and a persisted marker must never become liveness evidence. Persisting a random vendor marker is not itself credential recovery; using it for attribution requires independent process observation.
+Also explicitly disposition [platform L269](../../../../../docs/specs/platform-packaging.md#L269) and [L328](../../../../../docs/specs/platform-packaging.md#L328): anchor marker proof must remain control-based, and a persisted marker must never become liveness evidence. Persisting a random vendor marker is not itself credential recovery; using it for attribution requires independent process observation.
 
 I found no additional executable blanket prohibition on environment reads. Test-support collectors already read synthetic process environments; they do not authorize production scanning.
 
 **Out of scope, noticed**
 
-VO11’s generic post-crash `unknown` wording predates this revision and still needs the distinction already made in [OpenCode L613–619](docs/specs/vendors/opencode.md:613): supervised server death versus recovery after daemon death. I did not reopen it as a redirect finding.
+VO11’s generic post-crash `unknown` wording predates this revision and still needs the distinction already made in [OpenCode L613–619](../../../../../docs/specs/vendors/opencode.md#L613): supervised server death versus recovery after daemon death. I did not reopen it as a redirect finding.
 
 **Could not verify**
 
