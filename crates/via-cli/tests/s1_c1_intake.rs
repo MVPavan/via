@@ -697,10 +697,13 @@ fn s1_f05_33rd_socket_is_closed_without_bytes() -> TestResult {
         |evidence| {
             let _daemon = setup.start(evidence, &[("VIA_TEST_PARTIAL_LINE_MS", "300")])?;
             setup.one_turn(evidence)?;
+            // Each of the 32 retries while a just-closed socket (the CLI's,
+            // or the ones dropped before the second fill) still holds its
+            // permit: the daemon returns it when it sees the close.
             let full = |label: &str| -> Result<Vec<Conn>, ScenarioError> {
                 let mut open = Vec::new();
                 for _ in 0..32 {
-                    open.push(Conn::open(&setup.sandbox)?);
+                    open.push(retry_open(&setup.sandbox)?);
                 }
                 let mut extra = Conn::connect(&setup.sandbox)?;
                 check(extra.closed()?, || {

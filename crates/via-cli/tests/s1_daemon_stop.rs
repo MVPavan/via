@@ -5,6 +5,12 @@
 //! exit, and cleanup after daemon-first death is proved by the outer harness
 //! seam.
 
+#[path = "support/daemon.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; this file uses the direct status probe"
+)]
+mod daemon;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 mod failpoints;
@@ -225,18 +231,9 @@ impl<'a> Daemon<'a> {
             if let Some(status) = daemon.child.try_wait().map_err(infra)? {
                 return Err(fail(&format!("daemon exited before readiness: {status}")));
             }
-            // Never let the readiness probe auto-start a second daemon.
-            if !paths.runtime.join("via.sock").exists() {
-                if Instant::now() >= deadline {
-                    return Err(ScenarioError::Timeout("daemon socket".to_owned()));
-                }
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            let mut status = paths.command();
-            status.args(["daemon", "status", "--json"]);
-            let capture = run_command(&mut status, Duration::from_secs(1)).map_err(infra)?;
-            if capture.status.success() {
+            // A direct probe: never auto-starts a second daemon, even over
+            // the stale socket file a killed daemon left.
+            if daemon::serving_pid(&paths.runtime) == Some(daemon.child.id()) {
                 return Ok(daemon);
             }
             if Instant::now() >= deadline {
@@ -970,21 +967,14 @@ fn s1_daemon_stop_store_failure_is_not_a_clean_exit() -> TestResult {
 /// Waits until the daemon reports the latch (`health: store_failed`,
 /// design §7.5), which it serves through the diagnostic window (§7.4); the
 /// socket stays until the window ends. Never auto-starts a second daemon:
-/// each probe needs the socket.
+/// each probe is a direct connection.
 fn wait_latched(paths: &Paths) -> Result<(), ScenarioError> {
-    let socket = paths.runtime.join("via.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if socket.exists() {
-            let mut status = paths.command();
-            status.args(["daemon", "status", "--json"]);
-            let capture = run_command(&mut status, Duration::from_secs(1)).map_err(infra)?;
-            let latched = capture.status.success()
-                && json_line(&capture.stdout)
-                    .is_ok_and(|status| status["health"] == "store_failed");
-            if latched {
-                return Ok(());
-            }
+        if daemon::direct_status(&paths.runtime)
+            .is_ok_and(|status| status["health"] == "store_failed")
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(ScenarioError::Timeout(

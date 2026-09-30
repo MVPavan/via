@@ -208,10 +208,19 @@ async fn s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_messages()
         .collect();
     let stream = sent.concat();
     let pieces = chunks(&mut random, &stream);
+    // A latched failure is returned before messages still queued (design
+    // §8.2, §8.5), so the huge line follows only once the consumer took
+    // every message before it: a synchronization point, not a sleep.
+    let (consumed, mut taken) = tokio::sync::watch::channel(0_usize);
+    let before_huge = sent.len();
     let writer = tokio::spawn(async move {
         for piece in pieces {
             vendor.write_all(&piece).await?;
         }
+        taken
+            .wait_for(|count| *count >= before_huge)
+            .await
+            .map_err(io::Error::other)?;
         vendor.write_all(&huge).await?;
         // After the failure the reader discards: 4 MiB more never blocks.
         vendor.write_all(&vec![b'x'; 4 * 1024 * 1024]).await?;
@@ -220,7 +229,10 @@ async fn s1_f27_invalid_utf8_split_and_huge_lines_keep_exact_messages()
     let mut received = Vec::new();
     let failure = loop {
         match messages.next_message().await {
-            Ok(Some(message)) => received.push(message.bytes().to_vec()),
+            Ok(Some(message)) => {
+                received.push(message.bytes().to_vec());
+                consumed.send_replace(received.len());
+            }
             Ok(None) => break None,
             Err(error) => break Some(error),
         }
@@ -478,9 +490,13 @@ async fn s1_wire_queue_holds_1024_messages_or_4_mib_then_overflows()
     Ok(())
 }
 
-/// Design §8.2 (A47): a burst of 1,040 small lines written at once reaches a
-/// live consumer whole; at 64 messages the same burst failed a healthy turn
-/// `overflow` in 241 ms (T4-3 report).
+/// Design §8.2 (A47): 1,040 small lines, more than the queue holds, reach a
+/// live consumer whole. The first 1,024 are one write, which the queue
+/// holds even before the consumer runs (at 64 messages such a burst failed
+/// a healthy turn `overflow` in 241 ms, T4-3 report); the last 16 follow
+/// once the consumer took 16, so unconsumed messages never pass 1,024. The
+/// reader never waits for the consumer, so an unpaced 1,040 may overflow by
+/// design: pacing is on observed consumption, not on time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s1_wire_burst_of_1040_lines_reaches_a_live_consumer()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -499,15 +515,25 @@ async fn s1_wire_burst_of_1040_lines_reaches_a_live_consumer()
             .into_bytes()
         })
         .collect();
-    let burst = sent.concat();
+    let (burst, rest) = sent.split_at(1024);
+    let (burst, rest) = (burst.concat(), rest.concat());
+    let (consumed, mut taken) = tokio::sync::watch::channel(0_usize);
     let writer = tokio::spawn(async move {
         vendor.write_all(&burst).await?;
+        taken
+            .wait_for(|count| *count >= 16)
+            .await
+            .map_err(io::Error::other)?;
+        vendor.write_all(&rest).await?;
         vendor.shutdown().await
     });
     let mut received = Vec::new();
     let end = loop {
         match messages.next_message().await {
-            Ok(Some(message)) => received.push(message.bytes().to_vec()),
+            Ok(Some(message)) => {
+                received.push(message.bytes().to_vec());
+                consumed.send_replace(received.len());
+            }
             Ok(None) => break None,
             Err(error) => break Some(error),
         }
