@@ -154,6 +154,8 @@ POINTS = [
     "core.data_size.walks",
     # T4-fix (design §5.3): a data-size walk held past its 2 s step.
     "store.data_size.walk",
+    # S1 critic r2 finding 1 (design §7.1): corruption on the acceptance write.
+    "store.commit.corrupt.acceptance",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

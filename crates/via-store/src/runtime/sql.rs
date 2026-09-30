@@ -1279,6 +1279,11 @@ fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result
     )
     .map_err(sql_error)?;
     insert_event(&tx, session, &record.event)?;
+    // Test builds: SQLite reports corruption on the acceptance write itself,
+    // after its prerequisite read (design §7.1); the transaction rolls back.
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoint::hit("store.commit.corrupt.acceptance")
+        .map_err(|error| StoreError::Corrupt(error.to_string()))?;
     before_commit!("store.commit.event");
     commit(tx)
 }

@@ -1457,20 +1457,21 @@ impl Engine {
                         head.committed(1);
                         record.accepted = Some(accepted);
                     }
-                    Err(uncertain) => {
-                        let outcome = if let Some((accepted, event)) = uncertain {
+                    Err((outcome, sent)) => {
+                        if outcome.head_unknown() {
                             head.lost();
-                            record.uncertain = Some(UncertainEvent {
-                                seq,
-                                event,
-                                accepted: Some(accepted),
-                            });
-                            WriteOutcome::Uncertain
+                            if let Some((accepted, event)) = sent {
+                                record.uncertain = Some(UncertainEvent {
+                                    seq,
+                                    event,
+                                    accepted: Some(accepted),
+                                });
+                            }
                         } else {
                             drop(head);
-                            WriteOutcome::NotCommitted
-                        };
-                        // The head lock is released before the latch takes admission.
+                        }
+                        // The head lock is released before the latch takes
+                        // admission; corruption latches (design §7.1).
                         self.event_failed(record, outcome).await;
                     }
                 }
@@ -1742,8 +1743,8 @@ impl Engine {
     }
 
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
-    /// A failure carries the acceptance and the event sent when Store may
-    /// have committed it.
+    /// A failure carries its classified outcome ([`WriteOutcome::of`]) and,
+    /// when the head is unknown, the acceptance and the event sent.
     async fn accept(
         &self,
         session: &SessionId,
@@ -1751,7 +1752,7 @@ impl Engine {
         seq: u64,
         effective: &Effective,
         observation: FakeAcceptanceObservation,
-    ) -> Result<Accepted, Option<(Accepted, serde_json::Value)>> {
+    ) -> Result<Accepted, AcceptFailure> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
             seq,
@@ -1764,7 +1765,7 @@ impl Engine {
             },
         }
         .to_value()
-        .map_err(|_| None)?;
+        .map_err(|_| (WriteOutcome::NotCommitted, None))?;
         let vendor_turn_id = observation.vendor_turn_id.as_str().to_owned();
         // The vendor accepted; its acceptance is not yet recorded.
         #[cfg(feature = "test-failpoints")]
@@ -1772,7 +1773,7 @@ impl Engine {
             .await
             .is_err()
         {
-            return Err(None);
+            return Err((WriteOutcome::NotCommitted, None));
         }
         let committed = self
             .store
@@ -1786,10 +1787,17 @@ impl Engine {
         let accepted = Accepted { at, vendor_turn_id };
         match committed {
             Ok(()) => Ok(accepted),
-            Err(error) => Err(journal::may_have_committed(&error).then_some((accepted, event))),
+            Err(error) => {
+                let outcome = WriteOutcome::of(&error);
+                Err((outcome, outcome.head_unknown().then_some((accepted, event))))
+            }
         }
     }
 }
+
+/// A failed acceptance commit: its classified outcome and, when the head is
+/// unknown, the acceptance and the event sent.
+type AcceptFailure = (WriteOutcome, Option<(Accepted, serde_json::Value)>);
 
 /// `turn.ended` at `seq` with the terminal envelope; `record` is already
 /// reconciled (design §7.4's batch builds it the same way).

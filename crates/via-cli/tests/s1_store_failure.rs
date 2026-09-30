@@ -2334,6 +2334,50 @@ fn corrupt_head_read(verb: &str) -> TestResult {
     Ok(())
 }
 
+/// S1 critic r2 finding 1 (runtime §7, design §7.1): SQLite corruption on
+/// the acceptance write itself (`store.commit.corrupt.acceptance`), after
+/// its prerequisite head read succeeded, latches at once: `daemon/status`
+/// reports `store_failed` with a `corrupt_store` failure of scope `daemon`,
+/// a new spawn is refused `store_error`, and a second session's turn held
+/// before its dispatch grant (`core.dispatch.before_grant`) never launches.
+#[test]
+fn s1_f12_corrupt_acceptance_write_latches() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&scripts(&[completes("first", 1), completes("second", 1)]))?;
+        sandbox.no_launch();
+        let daemon = sandbox.start()?;
+        let accept = "core.accept.before_commit";
+        let corrupt = "store.commit.corrupt.acceptance";
+        let grant = "core.dispatch.before_grant";
+        sandbox.arm(accept, 1, "pause")?;
+        sandbox.arm(corrupt, 1, "fail_io")?;
+        let (_first, _) = sandbox.spawn("first")?;
+        sandbox.ack(&daemon, accept, 1, "pause")?;
+        // The first session's dispatch took grant hit 1; the second's is 2.
+        sandbox.arm(grant, 2, "pause")?;
+        let (second, _) = sandbox.spawn("second")?;
+        sandbox.ack(&daemon, grant, 2, "pause")?;
+        sandbox.resume_point(accept, 1)?;
+        sandbox.ack(&daemon, corrupt, 1, "fail_io")?;
+        wait_until("the latch", Duration::from_secs(5), || {
+            sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+        })?;
+        let failure = store_failure(&sandbox)?;
+        check(
+            failure["kind"] == "corrupt_store" && failure["scope"] == "daemon",
+            || format!("unexpected store_failure: {failure}"),
+        )?;
+        sandbox.refused(&spawn_args("late", &[]), "store_error")?;
+        sandbox.resume_point(grant, 2)?;
+        daemon.latched_exit()?;
+        check(sandbox.anchors(&second, 1)? == 0, || {
+            "the second session's turn launched after the latch".to_owned()
+        })
+    })
+}
+
 /// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
 /// session-head read of final shutdown's failure-resolution batch is
 /// reported as corruption. A lost event reply (`store.commit.reply_lost`,
