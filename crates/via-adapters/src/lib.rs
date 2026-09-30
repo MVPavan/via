@@ -143,10 +143,16 @@ pub enum DriverHealth {
     Closed,
 }
 
+mod capabilities;
 mod fake_config;
+mod harness;
 mod runtime;
 
+pub use capabilities::{
+    BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
+};
 pub use fake_config::FakeConfig;
+pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use runtime::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdmittedObservation, FakeRecovery,
     FakeShutdown, FakeTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink,
