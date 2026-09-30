@@ -1963,9 +1963,13 @@ fn force_with_stalled_read(sandbox: &Sandbox, release: bool) -> TestResult<Stall
     sandbox.arm(reconcile, 1, "pause")?;
     let mut daemon = sandbox.start()?;
     let (session, handle) = sandbox.spawn("hang")?;
-    let running =
-        format!("SELECT count(*) FROM turns WHERE session_id='{session}' AND state='running'");
-    wait_until("turn 1 runs", Duration::from_secs(20), || {
+    // Accepted, not only running: a force before the fake's acceptance is
+    // settled `requested`, not `forced`, and the checks below assume it.
+    let running = format!(
+        "SELECT count(*) FROM turns WHERE session_id='{session}' AND state='running' \
+         AND accepted_at IS NOT NULL"
+    );
+    wait_until("turn 1 is accepted", Duration::from_secs(20), || {
         sandbox.query::<i64>(&running).is_ok_and(|count| count == 1)
     })?;
     sandbox.ok(&[
