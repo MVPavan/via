@@ -2052,9 +2052,10 @@ pub(crate) fn cut_encoded(text: &str, max: usize) -> &str {
     text
 }
 
-/// A `failure.message` cut to 2 KiB encoded at a character boundary.
+/// A `failure.message` cut to 2 KiB encoded, its two quotes included, at
+/// a character boundary.
 pub(crate) fn failure_message(mut message: String) -> String {
-    let kept = cut_encoded(&message, FAILURE_MESSAGE_MAX).len();
+    let kept = cut_encoded(&message, FAILURE_MESSAGE_MAX - 2).len();
     message.truncate(kept);
     message
 }
@@ -2522,5 +2523,17 @@ mod tests {
         assert_eq!(rfc3339(leap_day), "2000-02-29T23:59:59.042Z");
         let new_year = UNIX_EPOCH + Duration::from_hours(499_656);
         assert_eq!(rfc3339(new_year), "2027-01-01T00:00:00.000Z");
+    }
+
+    /// Design §6.4: `failure.message` is at most 2 KiB encoded, its quotes
+    /// included; an ASCII message or one with escapes stops at the bound.
+    #[test]
+    fn failure_message_encodes_within_two_kib_with_its_quotes() {
+        for message in ["a".repeat(4096), "\"".repeat(2048), "é".repeat(2048)] {
+            let kept = super::failure_message(message);
+            let encoded = serde_json::to_string(&kept).map_or(usize::MAX, |text| text.len());
+            assert!(encoded <= 2048, "{encoded} bytes encoded");
+            assert!(encoded + 6 > 2048, "{encoded} bytes encoded: cut too far");
+        }
     }
 }
