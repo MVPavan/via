@@ -1980,6 +1980,20 @@ fn s1_t2c_crash_with_a_queued_successor_cancels_it_on_restart() -> TestResult {
                 state == "unknown" && first["failure"]["class"] == "daemon_restart",
                 || format!("turn 1: {state} {first}"),
             )?;
+            // T4-5 review round 1: the recovered envelope reports the
+            // session's frozen `cwd`, as `status` does.
+            let frozen: Option<String> = paths
+                .store()?
+                .query_row(
+                    "SELECT json_extract(params,'$.cwd') FROM sessions WHERE id=?1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(infra)?;
+            check(
+                frozen.is_some() && first["cwd"].as_str() == frozen.as_deref(),
+                || format!("turn 1 cwd {} against the frozen {frozen:?}", first["cwd"]),
+            )?;
             let (state, second) = turn_n(paths, &session, 2)?;
             check(
                 state == "cancelled"

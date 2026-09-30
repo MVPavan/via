@@ -81,8 +81,8 @@ enum Step {
     /// Writes the process's working directory to `cwd-<session>-<turn>` in
     /// the sync directory (Task 4 design §13.1).
     ReportCwd,
-    /// Writes the start request's prompt as `sha256:<64 hex>:<len>` to
-    /// `prompt-<session>-<turn>.digest` in the sync directory (§13.1).
+    /// Writes the start request's prompt bytes to `prompt-<session>-<turn>`
+    /// in the sync directory, for the test to digest (§13.1).
     EchoPromptDigest,
     SpawnGrandchild {
         name: String,
@@ -207,8 +207,8 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
                 fs::write(sync_dir.join(name), cwd.as_os_str().as_encoded_bytes())?;
             }
             Step::EchoPromptDigest => {
-                let name = format!("prompt-{}-{}.digest", start.session_id, start.turn);
-                fs::write(sync_dir.join(name), prompt_digest(&start.prompt))?;
+                let name = format!("prompt-{}-{}", start.session_id, start.turn);
+                fs::write(sync_dir.join(name), start.prompt.as_bytes())?;
             }
             Step::SpawnGrandchild { name } => {
                 grandchildren.push(spawn_grandchild(&sync_dir, &name)?);
@@ -430,18 +430,6 @@ fn grandchild_main() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing grandchild name"))?;
     let sync_dir = PathBuf::from(env::var(SYNC_ENV).map_err(io::Error::other)?);
     gate(&sync_dir, &name)
-}
-
-/// `sha256:<64 hex>:<len>` of `prompt`'s bytes.
-fn prompt_digest(prompt: &str) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
-    let mut digest = String::from("sha256:");
-    for byte in Sha256::digest(prompt.as_bytes()) {
-        let _ = write!(digest, "{byte:02x}");
-    }
-    let _ = write!(digest, ":{}", prompt.len());
-    digest
 }
 
 fn dump_environment(sync_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

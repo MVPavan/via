@@ -158,7 +158,7 @@ impl BlobTasks {
     /// Runs one blob step, owned by this set, and waits for its result at
     /// most [`BLOB_IO`]. A step that overran keeps running to its end,
     /// owning what it was given; the caller's request is not committed.
-    async fn run<T: Send + 'static>(
+    pub(crate) async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
@@ -484,17 +484,30 @@ impl Blobs {
         // Test builds: the pass holds here, with no lock held (§13.2).
         #[cfg(feature = "test-failpoints")]
         let _ = crate::failpoint::hit_async("prompt_file.copy.pause").await;
-        let mut writer = self.writer().await.map_err(PromptFileError::Store)?;
-        match self
+        let timeout = || PromptFileError::Refused("timeout");
+        // The blob's own steps end by `deadline` too. A creation cut off
+        // leaves at most an unnamed file, which the start-up sweep removes.
+        let mut writer = tokio::time::timeout_at(deadline, self.writer())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if let Err(error) = self
             .copy_chunks(file, &Stamp::of(&first), &mut writer, deadline)
             .await
         {
-            Ok(()) => writer.finish().await.map_err(PromptFileError::Store),
-            Err(error) => {
-                writer.discard().await;
-                Err(error)
-            }
+            writer.discard().await;
+            return Err(error);
         }
+        // A `finish` cut off drops its writer, which unlinks the file.
+        let blob = tokio::time::timeout_at(deadline, writer.finish())
+            .await
+            .map_err(|_| timeout())?
+            .map_err(PromptFileError::Store)?;
+        if tokio::time::Instant::now() >= deadline {
+            self.discard(&blob).await;
+            return Err(timeout());
+        }
+        Ok(blob)
     }
 
     /// The streaming part of [`Self::copy_file`]: every chunk into
@@ -536,10 +549,10 @@ impl Blobs {
             if !utf8_continues(&mut carry, &chunk) {
                 return Err(PromptFileError::Refused("not_utf8"));
             }
-            writer.write(&chunk).await.map_err(PromptFileError::Store)?;
-            if tokio::time::Instant::now() >= deadline {
-                return Err(timeout());
-            }
+            tokio::time::timeout_at(deadline, writer.write(&chunk))
+                .await
+                .map_err(|_| timeout())?
+                .map_err(PromptFileError::Store)?;
         }
         if !carry.is_empty() {
             return Err(PromptFileError::Refused("not_utf8"));

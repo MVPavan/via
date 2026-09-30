@@ -108,8 +108,8 @@ impl ReadStreak {
 pub(super) struct Queueing {
     pub(super) queued_at: String,
     pub(super) queued_seq: u64,
-    /// The session's frozen `cwd` when the queued row was read (design
-    /// §11.1); `None` when the queueing comes from the event history.
+    /// The session's frozen `cwd` (design §11.1), from the queued row or,
+    /// for a queueing rebuilt from the event history, the session row.
     pub(super) cwd: Option<String>,
 }
 

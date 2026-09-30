@@ -945,13 +945,9 @@ fn s1_c1_prompt_file_copies_hashes_and_refuses_changes() -> TestResult {
             check(envelope["state"] == "completed", || {
                 format!("prompt-file turn: {envelope}")
             })?;
-            let echoed = fs::read_to_string(
-                setup
-                    .sandbox
-                    .sync
-                    .join(format!("prompt-{session}-1.digest")),
-            )
-            .map_err(infra)?;
+            let echoed = digest(
+                &fs::read(setup.sandbox.sync.join(format!("prompt-{session}-1"))).map_err(infra)?,
+            );
             check(echoed == digest(text.as_bytes()), || {
                 format!("the fake got {echoed}, not the file")
             })?;
@@ -1215,13 +1211,9 @@ fn s1_c1_prompt_file_cli_flag_reads_stdin_or_a_relative_path() -> TestResult {
             let session = receipt["session_id"]
                 .as_str()
                 .ok_or_else(|| failure("no session"))?;
-            let echoed = fs::read_to_string(
-                setup
-                    .sandbox
-                    .sync
-                    .join(format!("prompt-{session}-1.digest")),
-            )
-            .map_err(infra)?;
+            let echoed = digest(
+                &fs::read(setup.sandbox.sync.join(format!("prompt-{session}-1"))).map_err(infra)?,
+            );
             check(echoed == digest(b"from stdin"), || {
                 format!("stdin prompt: {echoed}")
             })?;
@@ -1269,13 +1261,9 @@ fn s1_c1_prompt_file_cli_flag_reads_stdin_or_a_relative_path() -> TestResult {
             let session = receipt["session_id"]
                 .as_str()
                 .ok_or_else(|| failure("no session"))?;
-            let echoed = fs::read_to_string(
-                setup
-                    .sandbox
-                    .sync
-                    .join(format!("prompt-{session}-1.digest")),
-            )
-            .map_err(infra)?;
+            let echoed = digest(
+                &fs::read(setup.sandbox.sync.join(format!("prompt-{session}-1"))).map_err(infra)?,
+            );
             check(echoed == digest(b"relative file"), || {
                 format!("relative prompt: {echoed}")
             })
@@ -1613,6 +1601,29 @@ fn over_proxy(sandbox: &Sandbox, input: &[u8]) -> Result<Vec<u8>, ScenarioError>
     Ok(output.stdout)
 }
 
+/// Runs `serve --stdio` with a directory as stdin, whose reads fail, and
+/// returns its output once it exits (at most 20 s).
+fn proxy_with_unreadable_stdin(
+    sandbox: &Sandbox,
+    dir: &Path,
+) -> Result<std::process::Output, ScenarioError> {
+    let mut command = sandbox.command();
+    command
+        .args(["serve", "--stdio"])
+        .stdin(fs::File::open(dir).map_err(infra)?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().map_err(infra)?;
+    let (done, finished) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(20))
+        .map_err(|_| ScenarioError::Timeout("serve --stdio did not exit".to_owned()))?
+        .map_err(infra)
+}
+
 /// Design §4.6: `serve --stdio` is a byte proxy to one daemon socket: one
 /// scripted sequence (errors of each kind, then an oversized line) gives
 /// byte-identical replies over the socket and over the proxy, and stdin
@@ -1679,6 +1690,16 @@ fn s1_c1_serve_stdio_matches_the_socket() -> TestResult {
             let count = proxy.split(|byte| *byte == b'\n').count() - 1;
             check(count == 7, || {
                 format!("{count} replies after stdin EOF, expected 7")
+            })?;
+
+            // T4-5 review round 1: a failed stdin read (a directory) also
+            // shuts the socket's write side, so the proxy exits, non-zero.
+            let unreadable = proxy_with_unreadable_stdin(&setup.sandbox, &setup.root)?;
+            evidence
+                .write("proxy_unreadable.stderr", &unreadable.stderr)
+                .map_err(infra)?;
+            check(!unreadable.status.success(), || {
+                "a failed stdin read exited 0".to_owned()
             })
         },
         |evidence| setup.collect(evidence),

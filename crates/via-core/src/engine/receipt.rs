@@ -117,8 +117,8 @@ impl Engine {
         }
     }
 
-    /// Design §11.1: the session's `cwd`, checked on the blocking pool with
-    /// no lock held: at most 4096 bytes, absolute and an existing
+    /// Design §11.1: the session's `cwd`, checked by an owned blocking step
+    /// with no lock held: at most 4096 bytes, absolute and an existing
     /// directory. An omitted `cwd` is the fake's configured default.
     async fn session_cwd(&self, cwd: Option<String>) -> Result<String, ApiError> {
         let invalid = |message| {
@@ -142,11 +142,15 @@ impl Engine {
             ));
         }
         let path = PathBuf::from(&cwd);
-        let directory = tokio::task::spawn_blocking(move || {
-            std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
-        })
-        .await
-        .unwrap_or(false);
+        // An owned, bounded blocking step: a stalled filesystem holds a
+        // Store blob-step slot, never an unowned thread.
+        let directory = self
+            .store
+            .blocking_step(move || {
+                Ok(std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+            })
+            .await
+            .map_err(|_| WriteOutcome::NotCommitted.api_error())?;
         if directory {
             Ok(cwd)
         } else {

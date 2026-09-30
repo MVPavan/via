@@ -305,11 +305,34 @@ impl Engine {
             queued_seq,
             ..
         } = self.history(session, turn).await?;
+        let cwd = self
+            .frozen_cwd(session)
+            .await
+            .map_err(|error| WriteOutcome::of_read(&error))?;
         Ok(Queueing {
             queued_at,
             queued_seq,
-            cwd: None,
+            cwd,
         })
+    }
+
+    /// The turn's evidence folder, as its envelope names it (C1 §5).
+    pub(super) fn evidence_folder(&self, session: &SessionId, turn: TurnNumber) -> String {
+        self.store
+            .evidence()
+            .path(session, turn)
+            .display()
+            .to_string()
+    }
+
+    /// The session's frozen `cwd` (design §11.1), which a rebuilt envelope
+    /// reports as the live drive would.
+    async fn frozen_cwd(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .store
+            .session_snapshot(session)
+            .await?
+            .and_then(|snapshot| snapshot.cwd))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -423,6 +446,10 @@ impl Engine {
             .history(&session, turn)
             .await
             .map_err(|_| ApiError::STORE)?;
+        let cwd = self
+            .frozen_cwd(&session)
+            .await
+            .map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -472,17 +499,7 @@ impl Engine {
             terminal,
             record.accepted,
             // A recovered turn was submitted: its folder was named then.
-            // Its session's `cwd` is not read here (design §11.1).
-            (
-                None,
-                Some(
-                    self.store
-                        .evidence()
-                        .path(&session, turn)
-                        .display()
-                        .to_string(),
-                ),
-            ),
+            (cwd, Some(self.evidence_folder(&session, turn))),
             timestamps,
             None,
             (queued_seq, seq),

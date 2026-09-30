@@ -255,3 +255,58 @@ fn s1_blob_stalled_step_times_out_owned_until_reaped() {
     });
     assert!(blob_files(state).is_empty());
 }
+
+/// T4-5 review round 1 (design §10.4): the prompt-file pass's deadline
+/// covers the blob's creation, writes and `finish`. The final sync is held
+/// past the deadline and then released within its own 2 s step bound: the
+/// copy is refused `timeout` and leaves no blob, where it used to be
+/// admitted late.
+#[test]
+fn s1_blob_prompt_file_finished_after_its_deadline_is_refused() {
+    let points = private_dir();
+    failpoint::activate(points.path(), TOKEN).unwrap();
+    let root = private_dir();
+    let state = root.path().join("state");
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let prompt = root.path().join("prompt.txt");
+    fs::write(&prompt, "a short prompt").unwrap();
+    let store = Store::open(&state).unwrap();
+    let client = store.client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // One-chunk file: step 1 creates the blob, 2 writes it, 3 syncs it.
+    fs::write(
+        points.path().join("blob.step.stall.json"),
+        json!({"token":TOKEN,"occurrence":3,"action":"pause"}).to_string(),
+    )
+    .unwrap();
+    let ack = points.path().join("blob.step.stall.3.ack");
+    let release = Release(points.path().join("blob.step.stall.3.release"));
+    let copied = runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let copy = tokio::spawn(async move { client.copy_prompt_file(prompt, deadline).await });
+        while !ack.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Past the pass's deadline, still inside the sync's 2 s bound.
+        tokio::time::sleep_until(deadline + std::time::Duration::from_millis(200)).await;
+        drop(release);
+        copy.await.unwrap()
+    });
+    assert!(
+        matches!(copied, Err(via_store::PromptFileError::Refused("timeout"))),
+        "{copied:?}"
+    );
+    // Every owned step ends; the late blob is gone.
+    for _ in 0..2000 {
+        if store.blob_tasks() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(store.blob_tasks(), 0);
+    assert!(blob_files(&state).is_empty(), "{:?}", blob_files(&state));
+}

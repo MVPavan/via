@@ -267,6 +267,8 @@ pub struct SessionSnapshot {
     /// Frozen effective values of the latest accepted turn, whatever its
     /// state: what an omitted per-turn parameter inherits (C1 P5).
     pub latest_effective: Option<Value>,
+    /// The session's frozen `cwd` (Task 4 design §11.1), if it has one.
+    pub cwd: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -1492,6 +1494,16 @@ impl StoreClient {
     /// before `admission` is taken.
     pub async fn blob_writer(&self) -> Result<BlobWriter, StoreError> {
         self.blobs.writer().await
+    }
+
+    /// Runs one short blocking filesystem step for a request, such as a
+    /// `cwd` check (Task 4 design §11.1), as a blob step: owned by the
+    /// Store's blob task set until it ends and answered within 2 s.
+    pub async fn blocking_step<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        self.blobs.tasks.run(work).await
     }
 
     /// Copies a caller's prompt file into a new finished blob in one pass

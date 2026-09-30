@@ -601,13 +601,7 @@ impl Engine {
             first_seq: queued.queued_seq,
             cwd: cwd.to_str().map(str::to_owned),
             submitted: Some((rfc3339(submitted), clock)),
-            folder: Some(
-                self.store
-                    .evidence()
-                    .path(session, turn)
-                    .display()
-                    .to_string(),
-            ),
+            folder: Some(self.evidence_folder(session, turn)),
         };
         (started, cwd)
     }

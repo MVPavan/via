@@ -2250,6 +2250,13 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let queueing = engine.queueing(&session, turn(1)).await.unwrap();
+        // T4-5 review round 1: the history fallback keeps the session's
+        // frozen `cwd` for the envelope it builds.
+        assert_eq!(
+            queueing.cwd.as_deref(),
+            engine.adapter.fake_cwd().to_str(),
+            "the rebuilt queueing lost the frozen cwd"
+        );
         let slot = super::queue::Slot::new(super::journal::Head::new(None));
         engine
             .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")

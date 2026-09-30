@@ -1021,12 +1021,15 @@ fn read_snapshot(
     conn: &Connection,
     session: &SessionId,
 ) -> Result<Option<SessionSnapshot>, StoreError> {
-    let row: Option<(String, String, u32, u32, Option<String>)> = conn
+    /// State, admission, turns, queued turns, latest effective, `cwd`.
+    type Row = (String, String, u32, u32, Option<String>, Option<String>);
+    let row: Option<Row> = conn
         .query_row(
             "SELECT state,admission,
                 (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
                 (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
-                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1)
+                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
+                json_extract(params,'$.cwd')
              FROM sessions WHERE id=?1",
             [session.as_str()],
             |row| {
@@ -1036,17 +1039,19 @@ fn read_snapshot(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(state, admission, turns, queued, latest)| {
+    row.map(|(state, admission, turns, queued, latest, cwd)| {
         Ok(SessionSnapshot {
             closed: state == "closed",
             closing: admission == "closing",
             turns,
             queued,
+            cwd,
             latest_effective: latest
                 .map(|value| serde_json::from_str(&value))
                 .transpose()

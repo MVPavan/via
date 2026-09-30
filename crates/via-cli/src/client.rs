@@ -460,12 +460,12 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
     // background).
     let mut copies = tokio::task::JoinSet::new();
     copies.spawn_blocking(move || {
-        // Safe to ignore: a failed write means the daemon closed the
-        // connection, which the other copy sees as its end.
-        if io::copy(&mut io::stdin().lock(), &mut to_daemon).is_ok() {
-            let _ = to_daemon.shutdown(std::net::Shutdown::Write);
-        }
-        io::Result::Ok(false)
+        let read = copy_stdin(&mut to_daemon);
+        // EOF or a failed read: the daemon sees the end of the requests,
+        // so its side ends too. Safe to ignore: a daemon that already
+        // closed the connection has nothing to shut.
+        let _ = to_daemon.shutdown(std::net::Shutdown::Write);
+        read.map(|()| false)
     });
     copies.spawn_blocking(move || {
         let mut stdout = io::stdout().lock();
@@ -473,13 +473,39 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<i32> {
         stdout.flush()?;
         io::Result::Ok(true)
     });
-    // The daemon's side ending ends the proxy, whatever stdin is doing.
+    // The daemon's side ending ends the proxy, whatever stdin is doing; a
+    // failed stdin read is reported once the replies are forwarded.
+    let mut stdin_failed = None;
     while let Some(copied) = copies.join_next().await {
-        if copied?? {
-            break;
+        match copied? {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => stdin_failed = Some(error),
         }
     }
+    if let Some(error) = stdin_failed {
+        bail!("reading stdin: {error}");
+    }
     Ok(0)
+}
+
+/// Copies stdin to the daemon until EOF. A failed read is the error; a
+/// failed write means the daemon closed the connection, which the other
+/// copy sees as its end.
+fn copy_stdin(to_daemon: &mut UnixStream) -> io::Result<()> {
+    let mut stdin = io::stdin().lock();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match stdin.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if to_daemon.write_all(&buffer[..read]).is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// Refuses a socket whose listener is not `uid` before any protocol byte (and
