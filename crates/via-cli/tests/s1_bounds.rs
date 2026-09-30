@@ -186,7 +186,9 @@ fn named_file(
 /// character boundary with `truncated: true` and the turn completes; a
 /// write cut inside a character (`final_text.write.short`) fails the turn
 /// `store` with the file cut to its last complete character, named with its
-/// `bytes` and `truncated: true`; a failed sync (`final_text.sync.fail`)
+/// `bytes` and `truncated: true`; a write failing before any byte
+/// (`final_text.write.fail`) fails it `store` with the empty file named,
+/// `bytes: 0` and `truncated: true`; a failed sync (`final_text.sync.fail`)
 /// fails it `store` with `final_text_file: null`; killed right after the
 /// terminal commit, the restarted daemon finds the named file.
 #[test]
@@ -201,6 +203,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
     // 400,000 bytes of two-byte characters: past the lowered cap.
     let capped = "é".repeat(200_000);
     let short = "é".repeat(140_000);
+    let unwritten = format!("{inline}fail");
     let synced = format!("{inline}sync");
     let crashed = format!("{inline}crash");
     let setup = Setup::new(&json!({"scripts":[
@@ -208,6 +211,7 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
         script("spilled", &spilled, "end_turn"),
         script("capped", &capped, "end_turn"),
         script("short", &short, "end_turn"),
+        script("unwritten", &unwritten, "end_turn"),
         script("synced", &synced, "end_turn"),
         script("crashed", &crashed, "end_turn"),
     ]}))?;
@@ -288,6 +292,32 @@ fn s1_bounds_final_text_spills_to_a_file() -> TestResult {
             setup
                 .failpoints
                 .disarm("final_text.write.short")
+                .map_err(infra)?;
+
+            // The first write fails before any byte: the empty file is named.
+            setup
+                .failpoints
+                .arm("final_text.write.fail", 1, "fail_io")
+                .map_err(infra)?;
+            {
+                let _daemon = setup.start(evidence)?;
+                let session = setup.spawn(evidence, "unwritten")?;
+                let envelope = setup.wait(evidence, &session)?;
+                check(
+                    envelope["state"] == "failed"
+                        && envelope["failure"]["class"] == "store"
+                        && envelope["final_text"].is_null()
+                        && envelope["final_text_file"]["truncated"] == true,
+                    || format!("failed-write envelope: {envelope}"),
+                )?;
+                let bytes = named_file(&setup, &session, &envelope, &unwritten)?;
+                check(bytes == 0, || {
+                    format!("the unwritten file holds {bytes} bytes")
+                })?;
+            }
+            setup
+                .failpoints
+                .disarm("final_text.write.fail")
                 .map_err(infra)?;
 
             // The file's sync fails: the envelope names no file.
