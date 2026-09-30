@@ -72,15 +72,22 @@ impl Sandbox {
         }
     }
 
-    fn run(&self, args: &[&str], timeout: Duration) -> Output {
-        let mut child = Command::new(&self.via)
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.via);
+        command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("VIA_STATE_DIR", &self.state)
             .env("VIA_RUNTIME_DIR", &self.runtime)
             .env("VIA_FAKE_AGENT_BINARY", &self.fake)
             .env("VIA_FAKE_SCENARIO", &self.fixture)
-            .env("VIA_FAKE_SYNC_DIR", &self.sync)
+            .env("VIA_FAKE_SYNC_DIR", &self.sync);
+        command
+    }
+
+    fn run(&self, args: &[&str], timeout: Duration) -> Output {
+        let mut child = self
+            .command()
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -195,10 +202,10 @@ impl Drop for Sandbox {
     /// Stops the auto-started daemon and proves it exited
     /// ([`evidenced::stop_daemons`]) before the evidence is collected.
     fn drop(&mut self) {
-        let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
-            let _ = self.run(
-                &["daemon", "stop", "--force", "--json"],
-                Duration::from_secs(5),
+        let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
+            evidenced::run_within(
+                self.command().args(["daemon", "stop", "--force", "--json"]),
+                budget,
             );
         });
         if let Some(evidence) = self.evidence.take() {

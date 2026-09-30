@@ -136,8 +136,11 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
-                let _ = self.run(&["daemon", "stop", "--force", "--json"]);
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
+                evidenced::run_within(
+                    self.command().args(["daemon", "stop", "--force", "--json"]),
+                    budget,
+                );
             });
             let expected = evidenced::Expected {
                 store: self

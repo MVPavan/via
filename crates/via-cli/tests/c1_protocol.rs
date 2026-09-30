@@ -3,6 +3,7 @@
 //! peer uid check (C1 §1 "both ends verify the peer uid").
 
 #[path = "support/evidenced.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
@@ -74,9 +75,19 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
-                if let Ok(mut connection) = Connection::open(self) {
-                    let _ = connection.hello();
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, |budget| {
+                let deadline = Instant::now() + budget;
+                let Ok(mut connection) = Connection::open(self) else {
+                    return;
+                };
+                // Each exchange waits at most for the budget left.
+                let within = |connection: &Connection| {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    !left.is_zero()
+                        && connection.writer.set_read_timeout(Some(left)).is_ok()
+                        && connection.writer.set_write_timeout(Some(left)).is_ok()
+                };
+                if within(&connection) && connection.hello().is_ok() && within(&connection) {
                     let _ =
                         connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
                 }

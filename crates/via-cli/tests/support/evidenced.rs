@@ -135,25 +135,47 @@ pub(crate) struct Expected {
 }
 
 /// Proves every daemon of a sandbox exited, before its State is collected
-/// or the sandbox removed (S1-contract r1 finding 3). A missing socket
-/// proves nothing: a daemon removes it before its final shutdown ends. The
-/// daemon serving `runtime`, if one answers `hello`, is identified by its
-/// pid, stopped by `stop` and waited out. Then neither `daemon.lock` nor
-/// `store.lock` may still be held, which also covers a daemon that removed
-/// its socket already or refuses this binary's version. Children the test
-/// started are reaped by their own guards first.
+/// or the sandbox removed (S1-contract r1 finding 3, r2 findings 1 and 2).
+/// A daemon is identified by its process, not by its socket or locks: a
+/// daemon removes its socket and releases both locks before it exits. Every
+/// `via` process of the sandbox carries `VIA_RUNTIME_DIR=<runtime>` or
+/// `VIA_STATE_DIR=<state>` in its environment, the one the harness gave its
+/// child or the one the CLI gives the daemon it starts; anchors and vendors
+/// are started with a cleared environment. While one is alive, `stop` runs
+/// once with the budget left, then each must exit, and then neither
+/// `daemon.lock` nor `store.lock` may still be held. The whole proof,
+/// `stop` included, has one budget, and a proof that completes after it
+/// elapsed is not accepted. Children the test started are reaped by their
+/// own guards first.
 pub(crate) fn stop_daemons(
     runtime: &Path,
     state: &Path,
-    stop: impl FnOnce(),
+    stop: impl FnOnce(Duration),
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    if let Some(pid) = serving_pid(runtime) {
-        stop();
-        while !exited(pid) {
-            if Instant::now() >= deadline {
-                return Err(format!("daemon {pid} did not exit"));
-            }
+    stop_within(runtime, state, Duration::from_secs(20), stop)
+}
+
+/// [`stop_daemons`] with budget `budget`.
+pub(crate) fn stop_within(
+    runtime: &Path,
+    state: &Path,
+    budget: Duration,
+    stop: impl FnOnce(Duration),
+) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    let mut stop = Some(stop);
+    loop {
+        let alive = sandbox_processes(runtime, state)?;
+        if alive.is_empty() {
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("sandbox processes {alive:?} did not exit"));
+        }
+        if let Some(stop) = stop.take() {
+            stop(left);
+        } else {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -171,27 +193,74 @@ pub(crate) fn stop_daemons(
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    if Instant::now() > deadline {
+        return Err(format!("the exit proof exceeded its {budget:?} budget"));
+    }
     Ok(())
 }
 
-/// The pid of the daemon serving `runtime`'s socket, from its `hello`.
-fn serving_pid(runtime: &Path) -> Option<u32> {
-    use std::io::{BufRead, BufReader, Write};
-    let stream = std::os::unix::net::UnixStream::connect(runtime.join("via.sock")).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .ok()?;
-    let params =
-        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"evidenced"});
-    let hello = json!({"jsonrpc":"2.0","id":0,"method":"hello","params":params});
-    (&stream).write_all(format!("{hello}\n").as_bytes()).ok()?;
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply).ok()?;
-    let reply: serde_json::Value = serde_json::from_str(&reply).ok()?;
-    reply["result"]["daemon_pid"]
-        .as_u64()
-        .and_then(|pid| u32::try_from(pid).ok())
+/// Runs `command`, its output discarded, for at most `budget`: killed and
+/// reaped when the budget elapses. A sandbox's `stop` for [`stop_daemons`].
+pub(crate) fn run_within(command: &mut std::process::Command, budget: Duration) {
+    use std::process::Stdio;
+    let deadline = Instant::now() + budget;
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = child.wait();
+}
+
+/// The live (not zombie) processes whose environment names the sandbox's
+/// runtime or State directory. An unreadable `/proc` proves nothing.
+fn sandbox_processes(runtime: &Path, state: &Path) -> Result<Vec<u32>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let marks = [
+        [
+            b"VIA_RUNTIME_DIR=".as_slice(),
+            runtime.as_os_str().as_bytes(),
+        ]
+        .concat(),
+        [b"VIA_STATE_DIR=".as_slice(), state.as_os_str().as_bytes()].concat(),
+    ];
+    let own = std::process::id();
+    let mut alive = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
+        let entry = entry.map_err(|error| format!("/proc: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        // Gone, or another user's: not the sandbox's.
+        let Ok(environ) = fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        if environ
+            .split(|byte| *byte == 0)
+            .any(|variable| marks.iter().any(|mark| variable == mark.as_slice()))
+            && !exited(pid)
+        {
+            alive.push(pid);
+        }
+    }
+    Ok(alive)
 }
 
 /// Whether `pid` has exited: gone, or a zombie awaiting its reaper.
@@ -263,9 +332,7 @@ fn collect(evidence: &Evidence, root: &Path, state: &Path) -> EvidencedResult {
 fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult<serde_json::Value> {
     evidence.backup_store(store)?;
     write_rows(evidence, store)?;
-    if !evidence.folders_expected {
-        launched_turns_have_folders(evidence, store)?;
-    }
+    launched_turns_have_folders(evidence, store)?;
     let rows = outer_cleanup::snapshot(store)?;
     Ok(outer_cleanup::verify(
         &rows,
@@ -273,9 +340,9 @@ fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult<serde_js
     ))
 }
 
-/// With the folders waived, a turn that launched a vendor (it has an
-/// anchor) must still have its evidence folder: only unlaunched turns lack
-/// one.
+/// Every turn that launched a vendor (it has an anchor) has its evidence
+/// folder, whether or not the scenario waived folders: only unlaunched
+/// turns lack one (S1-contract r2 finding 3).
 fn launched_turns_have_folders(evidence: &Evidence, store: &Path) -> EvidencedResult {
     let store =
         rusqlite::Connection::open_with_flags(store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
