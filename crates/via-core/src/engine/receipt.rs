@@ -203,6 +203,31 @@ impl Engine {
         receipted
     }
 
+    /// A keyed spawn's stored receipt, under `admission` before any
+    /// admission check (runtime §6); another identity under the key is
+    /// `idempotency_conflict`. `None` when there is no key or none stored.
+    async fn spawn_replay(&self, key: Option<&SpawnKey>) -> Result<Option<Receipted>, ApiError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .store
+            .spawn_key(&key.key)
+            .await
+            .map_err(|_| ApiError::STORE)?
+        else {
+            return Ok(None);
+        };
+        if stored.identity == key.identity {
+            Ok(Some(Receipted {
+                receipt: stored.receipt,
+                enqueued: None,
+            }))
+        } else {
+            Err(ApiError::IDEMPOTENCY_CONFLICT)
+        }
+    }
+
     /// `spawn` under `admission`: `pending` is taken by a commit that may
     /// have happened, and left for discard otherwise.
     async fn spawn_admitted(
@@ -217,23 +242,11 @@ impl Engine {
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        if let Some(key) = &key
-            && let Some(stored) = self
-                .store
-                .spawn_key(&key.key)
-                .await
-                .map_err(|_| ApiError::STORE)?
-        {
-            return if stored.identity == key.identity {
-                Ok(Receipted {
-                    receipt: stored.receipt,
-                    enqueued: None,
-                })
-            } else {
-                Err(ApiError::IDEMPOTENCY_CONFLICT)
-            };
+        if let Some(replayed) = self.spawn_replay(key.as_ref()).await? {
+            return Ok(replayed);
         }
-        // No key was found: the `cwd` check and the floor apply (§5.3).
+        // No key was found: the `cwd` check and the floor apply to this new
+        // work (§5.3).
         let cwd = cwd?;
         self.floor_admits(free.as_ref())?;
         if lock(&self.signal.stop).is_some() {
