@@ -1743,6 +1743,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 `Lanes::peak(lane)`, `store.commit.step`, `core.observations.pause`,
 `core.progress.publish`, `core.finish_running.pause`, `Store::read_count()`, `store.read.delay_ms`,
 `store.rollback.fail`, `store.statvfs.free_bytes`, `core.data_size.walks`,
+`store.data_size.walk` (holds the walk past its 2 s step; critic round),
 `prompt_file.copy.pause`, `blob.write.fail_after`,
 `Store::blob_writes()`, `VIA_TEST_EVENT_STALL_MS`,
 `VIA_TEST_PARTIAL_LINE_MS`, `VIA_TEST_REPLY_WRITE_MS`,
