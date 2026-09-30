@@ -1580,6 +1580,56 @@ fn live_service_collects_finished_turn_tasks() {
     });
 }
 
+/// Continues a stopped anchor when dropped, so a failed assertion never
+/// leaves it stopped.
+struct Stopped(rustix::process::Pid);
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process(self.0, rustix::process::Signal::CONT);
+    }
+}
+
+/// S1-io review r1, decision 3: a retired control is shut down, so the
+/// anchor sees control EOF and cleans up its group (runtime §5.1). A
+/// stopped anchor answers no `Status`, so the exit poll's bound retires the
+/// control; `close` then sends no `Stop` and proves absence through the
+/// journal, with no forced evidence.
+#[test]
+fn a_retired_control_is_shut_down_and_the_anchor_cleans_up_on_eof() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let mut acquired = host
+            .acquire(fixture.spec("/bin/sleep", &["60"]), within(4))
+            .await
+            .unwrap();
+        let identity = acquired.control.identity().clone();
+        let anchor = rustix::process::Pid::from_raw(i32::try_from(identity.pid).unwrap()).unwrap();
+        rustix::process::kill_process(anchor, rustix::process::Signal::STOP).unwrap();
+        let stopped = Stopped(anchor);
+        let ended = tokio::time::timeout(Duration::from_secs(5), acquired.exits.changed()).await;
+        drop(stopped);
+        assert!(matches!(ended, Ok(Err(_))), "exit supervision did not end");
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(
+            matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{close:?}"
+        );
+        assert!(!close.forced, "control EOF made forced evidence: {close:?}");
+        assert!(group_gone(identity.pgid));
+        drop(acquired);
+        let report = host.shutdown(within(3), &[]).await;
+        assert_eq!((report.pending_tasks, report.failed_tasks), (0, 0));
+    });
+}
+
 /// A fresh `stderr.log` name per spec: Host creates it exclusively.
 fn next_stderr() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

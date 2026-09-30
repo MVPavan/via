@@ -19,6 +19,7 @@ use std::{
 
 use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use tokio::{
+    io::AsyncWriteExt,
     net::UnixStream,
     process::{ChildStdin, ChildStdout},
     sync::{Mutex, watch},
@@ -628,30 +629,56 @@ struct ControlConnection {
     /// The stream may hold a partial request or an unread reply: an
     /// exchange was cancelled, timed out or failed. Set when an exchange
     /// starts and cleared once its reply is read, so a cancelled exchange
-    /// leaves it set. A retired control is never read again; every later
-    /// exchange fails at once and its caller takes its fallback.
+    /// leaves it set. A retired control is never read again: it is shut
+    /// down, so the anchor sees control EOF and cleans up its group
+    /// (runtime §5.1), and every later exchange fails at once and its
+    /// caller takes its fallback.
     retired: bool,
 }
 
 impl ControlConnection {
-    /// Admits one exchange, or refuses it on a retired control.
-    fn begin(&mut self) -> io::Result<()> {
+    /// Admits one exchange, or refuses it on a retired control, which a
+    /// cancelled exchange may have left open: it is shut down first.
+    async fn begin(&mut self) -> io::Result<()> {
         if self.retired {
+            self.retire().await;
             return Err(io::Error::other("anchor control retired"));
         }
         self.retired = true;
         Ok(())
     }
 
+    /// Retires the control and shuts its stream down for writing: the
+    /// anchor reads EOF, which is not a `Stop` and yields no forced
+    /// evidence. Idempotent; a failed shutdown leaves the EOF to the drop.
+    async fn retire(&mut self) {
+        self.retired = true;
+        let _ = self.stream.shutdown().await;
+    }
+
     async fn transact(&mut self, request: &Request, max: usize) -> io::Result<Reply> {
-        self.begin()?;
-        protocol::write_message(&mut self.stream, request, max).await?;
-        let reply =
-            self.reader.read(&self.stream).await?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control")
-            })?;
-        self.retired = false;
-        Ok(reply)
+        self.begin().await?;
+        let exchanged = match protocol::write_message(&mut self.stream, request, max).await {
+            Ok(()) => self.reader.read(&self.stream).await,
+            Err(error) => Err(error),
+        };
+        match exchanged {
+            Ok(Some(reply)) => {
+                self.retired = false;
+                Ok(reply)
+            }
+            Ok(None) => {
+                self.retire().await;
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "anchor closed control",
+                ))
+            }
+            Err(error) => {
+                self.retire().await;
+                Err(error)
+            }
+        }
     }
 
     /// Like [`Self::transact`], but only the wait for the reply ends at
@@ -659,27 +686,43 @@ impl ControlConnection {
     /// deadline has passed, so a caller past its deadline still delivers it.
     /// A reply in hand only at or after `deadline` is late and is refused:
     /// Tokio polls the read before its timer, so a task that runs late would
-    /// otherwise be handed a ready reply as if it were in time.
+    /// otherwise be handed a ready reply as if it were in time. A reply read,
+    /// late or not, completes the exchange; no reply retires the control.
     async fn transact_by(
         &mut self,
         request: &Request,
         max: usize,
         deadline: Instant,
     ) -> io::Result<Reply> {
-        self.begin()?;
-        protocol::write_message(&mut self.stream, request, max).await?;
-        let late = || io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline");
-        let reply = timeout_at(deadline, self.reader.read(&self.stream))
-            .await
-            .map_err(|_| late())??;
-        // A reply read, late or not, completes the exchange.
-        if reply.is_some() {
-            self.retired = false;
+        self.begin().await?;
+        if let Err(error) = protocol::write_message(&mut self.stream, request, max).await {
+            self.retire().await;
+            return Err(error);
         }
+        let late = || io::Error::new(io::ErrorKind::TimedOut, "no reply by the deadline");
+        let reply = match timeout_at(deadline, self.reader.read(&self.stream)).await {
+            Ok(Ok(Some(reply))) => reply,
+            Ok(Ok(None)) => {
+                self.retire().await;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "anchor closed control",
+                ));
+            }
+            Ok(Err(error)) => {
+                self.retire().await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.retire().await;
+                return Err(late());
+            }
+        };
+        self.retired = false;
         if Instant::now() >= deadline {
             return Err(late());
         }
-        reply.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "anchor closed control"))
+        Ok(reply)
     }
 }
 
@@ -1774,7 +1817,8 @@ static BUSY_SKIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// control busy with another exchange only skips a tick. Supervision ends
 /// once the exit is seen, the stream is gone, or the control is retired: a
 /// `Status` exchange that failed or had no reply within
-/// [`STATUS_REPLY_BOUND`] retires it, as does an exchange of another holder.
+/// [`STATUS_REPLY_BOUND`] retires it and shuts it down, as does an exchange
+/// of another holder.
 /// Only that last end, a real loss of control, drops `sender` under a live
 /// turn, which Wire reports as a transport failure.
 async fn supervise_exit(
@@ -1804,7 +1848,7 @@ async fn supervise_exit(
             ..
         })) = reply
         else {
-            control.retired = true;
+            control.retire().await;
             break;
         };
         let report = (exit_code.is_some() || exit_signal.is_some()).then_some(ExitReport {
@@ -1905,6 +1949,14 @@ impl ProcessControl {
                 .await
         })
         .await;
+        // A `Stop` cut short by the deadline left the control retired: shut
+        // it down now, unless a holder has it and will on its next exchange.
+        if stopping.is_err()
+            && let Ok(mut control) = self.stream.try_lock()
+            && control.retired
+        {
+            control.retire().await;
+        }
         // Only the anchor knows whether the vendor was still live when its
         // cleanup signalled the group; Host's polled exit watch may be stale.
         let forced = matches!(stopping, Ok(Ok(Reply::Stopping { stopped_live: true })));
@@ -2727,6 +2779,14 @@ mod tests {
         assert!(matches!(ended, Ok(Err(_))), "supervision did not end");
         assert!(exits.borrow().is_none());
         drop(supervision.await);
+        // S1-io r1 decision 3: retiring shut the control down, so the anchor
+        // sees control EOF and cleans up its group (runtime §5.1).
+        let eof = tokio::time::timeout(
+            Duration::from_secs(2),
+            protocol::read_message::<Request>(&mut peer, 1024),
+        )
+        .await;
+        assert!(matches!(eof, Ok(Ok(None))), "the anchor saw no control EOF");
         protocol::write_message(&mut peer, &exited(), 1024)
             .await
             .expect("stale reply");
