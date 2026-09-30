@@ -77,3 +77,15 @@ the implementation slices.
 - **Tests:** the main source of rounds. First drafts proved less than claimed: vacuous, sleep-based, or relying on a hidden timer. The failure-first rule caught them only after review.
 - **New harness code:** the evidence wrapper for 106 tests took three rounds of truthfulness probing.
 - **Scope growth:** each review's whole-chunk pass surfaced pre-existing issues. The owner then set the review-scope rule in `cloud-and-local.md`: diff-only chunk reviews, and one independent critique at the end of large work.
+
+## Opus 5.5 medium, S1 critique round-2 fixes (2026-09-30; reviews GPT-6.1 Sol high)
+
+| Chunk | Rounds | Findings by round | Rule breaches |
+|---|---|---|---|
+| S1-runtime2 (Core, Route, Adapter) | 3 Sol: scoped, exhaustive, fix check (SOUND) | r1: 1 important (the late delivery honoured force and latch), 1 minor; r2 exhaustive: 2 blockers, 6 important, 1 minor, mostly pre-existing (Core classifier, latch ordering, forced final text; one Host item became a bead); r3: none | the report cited an intermediate, failing log as GREEN |
+| S1-evidence2 (test harness) | 3 Sol plus an orchestrator check | r1: 5 important (deadline leaks); r2 exhaustive: 4 blockers, 12 important, 2 minor; r3: 2 important remainders; round 3 checked by the orchestrator | none by the worker; the Sol r3 reviewer created a bead despite a read-only brief |
+
+- **Exhaustive first review:** after the owner revised the rule, one review listed 9 and 18 findings at once. The fix checks after it found 0 and 2 remainders, so the chunks converged instead of surfacing one more instance per round.
+- **Worker class sweeps:** asked to fix the whole class, workers still missed same-shaped sites (teardown blocking calls, thread aggregators) that the exhaustive review found. A worker sweep does not replace the reviewer's exhaustive pass.
+- **Production fixes:** right at the owning layer once the brief named the contract rule; the one gap in r1 came from the late path reusing a general helper with different precedence.
+- **Orchestrator errors:** an ambiguous brief line about the recorded connect limitation caused one evidence2 r1 finding; the runtime2 merge title misstates r1's verdict (corrected in `5148bb4`'s body).

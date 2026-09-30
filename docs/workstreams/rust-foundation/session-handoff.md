@@ -205,26 +205,48 @@ the historical checkpoint; its findings table is updated by this section.
   Task 3: Task 4 (`.7.8`), then the final critique (`.7.9`). After a reboot, restore tmux session
   `via` (window `main`; Sol reviews open their own windows). The cloud
   sessions are archived, so no branch watcher runs.
-- **Final S1 critique (`via-jm4.7.9`, claimed).** From 2026-09-30 reviews
-  and critiques run on Codex `gpt-6.1-sol` at high effort (owner). Round 1
-  at `7370e0e`: **S1 NOT ACCEPTABLE** although every gate passed
-  ([s1-critique/reviews/S1-critic-r1.md](s1-critique/reviews/S1-critic-r1.md)).
-  All 13 findings were confirmed and fixed in four chunks (Opus 5.5 medium,
-  Sol high reviews; reports in `s1-critique/reports/`), all merged:
-  S1-specs `4d210df` (Task 3 amendments A1–A23 reached the specs), S1-core
-  `af036af`, S1-io `4eb02c2` (also the via-host anchor leak), S1-contract
-  `78d1f9b` (F15 precedence, missing assertions, truthful evidence for all
-  237 daemon scenarios; also closed `via-jm4.15`). Two findings became Task 4
-  design §15 limitations (a pipelined-then-disconnected `wait`; Host's row-4
-  forced cache). Merged gate at `60d81fe`: default 343 / 1, failpoints 549 / 1
-  (3 runs), F08–F12 58, Task 4 selector 88 (10 of 10), every daemon scenario
-  pass and complete, no leftover processes. **Owner review rule (2026-09-30):**
-  chunk reviews stay on the diff, pre-existing issues become beads, minor
-  fixes are checked by the orchestrator, and each large piece of work ends
-  with one independent critique from scratch
-  ([cloud-and-local.md](cloud-and-local.md)). Next: critic round 2 from
-  scratch at the integrated tip, then record the stable shared interfaces
-  and close `.7.9`. Ledger: `scratchpad/execution/s1-critic/progress.md`.
+- **Final S1 critique (`via-jm4.7.9`, closed 2026-09-30).** Reviews and
+  critiques run on Codex `gpt-6.1-sol` at high effort (owner); fixes by
+  Opus 5.5 medium. Round 1 at `7370e0e`: **S1 NOT ACCEPTABLE** although
+  every gate passed ([s1-critique/reviews/S1-critic-r1.md](s1-critique/reviews/S1-critic-r1.md));
+  13 findings fixed in S1-specs `4d210df`, S1-core `af036af`, S1-io
+  `4eb02c2` and S1-contract `78d1f9b`. Round 2, from scratch at `c226b1f`:
+  NOT ACCEPTABLE, 5 findings ([S1-critic-r2.md](s1-critique/reviews/S1-critic-r2.md)),
+  fixed in S1-runtime2 `edaca6b` (corruption latches on acceptance and
+  terminal writes; decoded terminals and final text survive late and
+  forced paths; T3 design rules tagged `[s1c.r2]`) and S1-evidence2
+  `f304c93` (outcome kept beside evidence failures; one 10 s teardown
+  deadline; F19/F24 bounds). Reports in `s1-critique/reports/`, reviews in
+  `s1-critique/reviews/`. **Merged gate at `3b3e980`:** default 366 / 1,
+  failpoints 582 / 1 (3 runs), F08–F12 61, Task 4 selector 92 (10 of 10),
+  every daemon scenario pass and complete (the non-pass summaries are
+  harness self-tests that must fail), no leftover processes. **Owner review
+  rule (2026-09-30, revised):** a chunk's first review finds every issue in
+  its code and finding classes at once; later rounds check only fixes and
+  fix-introduced defects; issues outside the chunk become beads; each large
+  piece of work ends with one independent critique from scratch
+  ([cloud-and-local.md](cloud-and-local.md)). Follow-ups: `via-jm4.20`
+  (pre-existing load flakes), `via-jm4.21` (Host journal corruption reported
+  as `commit_uncertain`), `via-jm4.19` (via-cli anchor/daemon orphan class).
+  Recorded harness limitations: the C1 guard's blocking connect,
+  `/proc/<pid>/environ` reads, spawn and SQLite row scan outside the
+  teardown bound, untested D-state reaps. Ledger:
+  `scratchpad/execution/s1-critic/progress.md`.
+- **Stable shared interfaces at S1 close (`3b3e980`).** S2, S3, S5 and P1
+  build on these:
+  - Contracts: C1 [via-api-v1.md](../../specs/via-api-v1.md), C2
+    [adapter-contract.md](../../specs/adapter-contract.md) and
+    [runtime-contracts.md](../../specs/runtime-contracts.md), with Task 3
+    amendments A1–A23 applied, plus the T3 design rules tagged `[s1c.r2]`.
+  - Crate boundaries: the six layers checked by `scripts/check-layers.py`.
+    The critique changed public signatures only in
+    `CancelParams.handle: Option<String>` (C1 F15 precedence),
+    `StoreClient::evidence_path(relative)` (replaces `evidence()`),
+    `HostTasks::tracked()`, and `via_wire::failpoint` (test builds only).
+  - Result rules an adapter keeps: a decoded `completed` stays `completed`,
+    with exit and cleanup as evidence (C1 §7.6 row 3); the daemon force
+    gives `ForceStopped` with Host's evidence; only a real delivery failure
+    is `Overflow`; SQLite corruption latches as `corrupt_store`.
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
