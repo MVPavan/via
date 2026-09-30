@@ -187,7 +187,7 @@ impl BlobTasks {
     /// caller's `deadline` instead of 2 s: `Ok(None)` when the deadline
     /// passed first, the step still owned until it ends. The step's own
     /// outcome, errors included, is its value.
-    async fn run_until<T: Send + 'static>(
+    pub(crate) async fn run_until<T: Send + 'static>(
         &self,
         deadline: tokio::time::Instant,
         work: impl FnOnce() -> T + Send + 'static,

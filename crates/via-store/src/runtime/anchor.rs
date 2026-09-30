@@ -365,7 +365,8 @@ mod tests {
     fn store_with_anchors(total: u32) -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().expect("temporary directory");
         let mut conn = Connection::open(dir.path().join("store.sqlite3")).expect("open");
-        super::super::configure(&mut conn, true).expect("schema");
+        super::super::configure(&mut conn, true, &super::super::WalLimits::default())
+            .expect("schema");
         // Only the anchor rows matter here; their owning turns do not.
         conn.execute_batch("PRAGMA foreign_keys=OFF")
             .expect("pragma");
@@ -475,7 +476,8 @@ mod tests {
         );
         let empty = tempfile::tempdir().expect("temporary directory");
         let mut fresh = Connection::open(empty.path().join("store.sqlite3")).expect("open");
-        super::super::configure(&mut fresh, true).expect("schema");
+        super::super::configure(&mut fresh, true, &super::super::WalLimits::default())
+            .expect("schema");
         assert_eq!(read_anchor_cohort(&fresh).expect("cohort"), AnchorCohort(0));
     }
 }
