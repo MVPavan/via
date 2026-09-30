@@ -7,6 +7,12 @@
 //! Waits are bounded waits on durable rows, fake gates, failpoint
 //! acknowledgements or process exit; no sleep orders two events.
 
+#[path = "support/daemon.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; this file uses the direct status probe"
+)]
+mod daemon;
 #[cfg(feature = "test-failpoints")]
 #[path = "support/failpoints.rs"]
 #[expect(dead_code, reason = "shared support; this file uses part of it")]
@@ -373,14 +379,10 @@ impl<'a> Daemon<'a> {
             if let Some(status) = self.child.try_wait().map_err(infra)? {
                 return Err(fail(&format!("daemon exited before readiness: {status}")));
             }
-            // Never let the readiness probe auto-start a second daemon.
-            if paths.runtime.join("via.sock").exists() {
-                let mut status = paths.command();
-                status.args(["daemon", "status", "--json"]);
-                let capture = run_command(&mut status, Duration::from_secs(1)).map_err(infra)?;
-                if capture.status.success() {
-                    return Ok(());
-                }
+            // A direct probe: never auto-starts a second daemon, even over
+            // the stale socket file a killed daemon left.
+            if daemon::serving_pid(&paths.runtime) == Some(self.child.id()) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(ScenarioError::Timeout("daemon readiness".to_owned()));

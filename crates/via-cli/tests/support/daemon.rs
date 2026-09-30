@@ -175,11 +175,7 @@ impl<'a> Daemon<'a> {
             // A direct connection: an auto-starting `via daemon status`
             // would start a second daemon, without the child's failpoints,
             // that can win `daemon.lock` over the child.
-            let status = Raw::open(sandbox)
-                .and_then(|mut raw| raw.exchange(&request(1, "daemon/status", &json!({}))));
-            if let Ok(status) = status
-                && status["result"]["pid"] == daemon.child.id()
-            {
+            if serving_pid(&sandbox.runtime) == Some(daemon.child.id()) {
                 return Ok(daemon);
             }
             if Instant::now() >= deadline {
@@ -335,7 +331,12 @@ pub(crate) struct Raw {
 
 impl Raw {
     pub(crate) fn open(sandbox: &Sandbox) -> Result<Self, ScenarioError> {
-        let stream = UnixStream::connect(sandbox.runtime.join("via.sock")).map_err(infra)?;
+        Self::open_at(&sandbox.runtime)
+    }
+
+    /// [`Self::open`] on the socket in `runtime`.
+    pub(crate) fn open_at(runtime: &Path) -> Result<Self, ScenarioError> {
+        let stream = UnixStream::connect(runtime.join("via.sock")).map_err(infra)?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(infra)?;
@@ -376,6 +377,26 @@ impl Raw {
         thread::sleep(Duration::from_millis(200));
         Ok(())
     }
+}
+
+/// `daemon/status` over a direct connection to the socket in `runtime`:
+/// unlike `via daemon status`, it never auto-starts a daemon, and a stale
+/// socket file refuses it.
+pub(crate) fn direct_status(runtime: &Path) -> Result<Value, ScenarioError> {
+    let reply = Raw::open_at(runtime)?.exchange(&request(1, "daemon/status", &json!({})))?;
+    reply
+        .get("result")
+        .cloned()
+        .ok_or_else(|| failure(format!("daemon/status refused: {reply}")))
+}
+
+/// The pid of the daemon serving `runtime`'s socket, if one answers:
+/// readiness compares it with the child the harness started.
+pub(crate) fn serving_pid(runtime: &Path) -> Option<u32> {
+    direct_status(runtime)
+        .ok()
+        .and_then(|status| status["pid"].as_u64())
+        .and_then(|pid| u32::try_from(pid).ok())
 }
 
 /// One JSON-RPC request line with `params` serialized exactly as the CLI does.

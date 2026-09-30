@@ -191,12 +191,31 @@ reports `forced` only with Host's evidence that its stop found the vendor
 live. A plausible cause is an ordering between Route's own force stop and
 Host's stop [I, not verified]. It is left for `via-jm4.15`, unchanged.
 
-## 2. Other exposure left as is
+## 2. Round 2: the socket-guarded probes (same cause as 1.1)
 
-`s1_crash_points.rs`, `s1_recovery.rs` and `s1_daemon_stop.rs` guard their
-readiness probe on the socket's existence. After a SIGKILL restart, a stale
-socket could still let one auto-start probe through (a refused connect
-auto-starts). No failure of this kind was seen. They were not changed.
+`s1_crash_points.rs`, `s1_recovery.rs` and `s1_daemon_stop.rs` polled
+readiness with `via daemon status` once `via.sock` existed. After a SIGKILL
+restart the killed daemon's socket file remains. The guard then passes, the
+connect is refused, and the CLI auto-starts a daemon without the failpoint
+environment: cause 1.1 again (coordinator's finding; no failure was
+observed here).
+
+Fix. The shared harness now has `direct_status(runtime)` and
+`serving_pid(runtime)` (`support/daemon.rs`), built on the existing `Raw`
+direct connection (`Raw::open_at`). `Daemon::start_with` uses them, and the
+three files include `support/daemon.rs` and use them:
+
+- `wait_ready` (crash points, recovery) and `Daemon::start_with` (daemon
+  stop) require `serving_pid == child pid`;
+- `s1_daemon_stop.rs` `wait_latched` polls `direct_status` for
+  `health: store_failed`. Its old exists-then-CLI probe could also
+  auto-start if the socket was unlinked between the check and the connect.
+
+No replaced probe relied on CLI auto-start. The other CLI calls in these
+files (`spawn`, `wait`, `status`, and the `daemon status` evidence call in
+`s1_f12_corrupt_frozen_row_fails_turn_on_restart`) are unchanged. They run
+against a daemon already proven to be the child and do not rely on
+auto-start.
 
 ## 3. Verification
 
@@ -226,3 +245,15 @@ Gate G, all exit 0 (`scratchpad/t4/flake/gate.log`):
 | `-E 'test(/^s1_f(08\|09\|10\|12)_/)'` | 56 passed |
 | `cargo build --locked --release -p via-cli --no-default-features` | exit 0 |
 | `python3 scripts/check-release-features.py target/release/via` | exit 0 |
+
+### 3.1 Round 2 verification
+
+Logs are in `scratchpad/t4/flake/r2/`.
+
+- The three changed files, `-E 'binary(s1_crash_points) | binary(s1_recovery)
+  | binary(s1_daemon_stop)'`, 5 runs: every run had 57 tests and all 57
+  passed.
+- The selector, 10 runs: all 10 exited 0, each with 60 passed.
+- Gate G, all exit 0 (`r2/gate.log`): the default suite ran 321 tests with
+  321 passed and 1 skipped; the failpoint suite ran 502 with 502 passed and
+  1 skipped; the `s1_f(08|09|10|12)_` selector ran 56 with 56 passed.
