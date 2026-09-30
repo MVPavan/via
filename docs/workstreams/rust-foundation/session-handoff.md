@@ -166,13 +166,22 @@ the historical checkpoint; its findings table is updated by this section.
   `t4/reviews/T4-A-sol-r*.md`). The plan is [t4/plan.md](t4/plan.md)
   (`76001d0`; the old `t4/s1.md`–`s7.md` are superseded): T4-1 → (T4-2 ∥ T4-3)
   → T4-4 → T4-5 → (T4-6 ∥ T4-7) → Close → critic, Beads `via-jm4.7.8.3`–`.10`
-  with T4-7 = `.7.8.1`. Merged and closed, each after Sol high SOUND in
-  three rounds (`t4/reviews/`, reports in `t4/reports/`): T4-1 (`795ddcb`),
-  T4-2 (`9574169`), T4-3 (`77415b9`). Gate at `c837490`: 304 passed / 1
-  skipped, failpoints 454 / 1, F08–F12 56. Amendment T4-A47 (orchestrator,
-  on T4-3 evidence): the Wire message queue holds 1,024 messages, not 64.
-  **Now:** T4-4 in worktree `via-wt/t4-4` (branch `wt/t4-4`). Ledger:
-  `scratchpad/execution/t4-impl/progress.md`; worker logs under
+  with T4-7 = `.7.8.1`. All chunks are merged and closed after Sol high
+  SOUND (`t4/reviews/`, reports in `t4/reports/`): T4-1 (`795ddcb`), T4-2
+  (`9574169`), T4-3 (`77415b9`), T4-4 (`7f5c6ed`), T4-5 (`1011484`),
+  T4-flake bug `.7.8.11` (`00b9464`, `b201e59`: harness readiness never
+  auto-starts a daemon; floods pace on observed consumption), T4-7
+  (`8deb767`), T4-6 (`4508181`). Amendments made during implementation:
+  A47 (Wire queue 1,024 messages), A48 (pipelined partial-line deadline),
+  A49 (first page item always fits), A50 ("does not block" proven by
+  order). Close (`.7.8.9`, `7790912`) widened the Task 4 selector in
+  `.repo-context/verification.md` and wrote
+  [t4/reports/T4-close.md](t4/reports/T4-close.md): gate 330 / 1,
+  failpoints 521 / 1, F08–F12 56, Task 4 selector 77 (10 of 10 runs).
+  **Now:** the critic reviews (`.7.8.10`), Astra high (tmux window
+  `critic-astra`) and Fable 5.1 high, on `76001d0..7790912`; then fix the
+  confirmed findings and Close finding 1, re-verify, and close epic
+  `.7.8`. Ledger: `scratchpad/execution/t4-impl/progress.md`; worker logs under
   `scratchpad/t4/<chunk>/`. Retention is deferred to `via-jm4.18`. On 2026-09-29 the owner renamed
   "frame" to vendor message/event/event trace (`.repo-context/CONTEXT.md`;
   specs and crates in `8e2bb3e`..`370903d`, `via-jm4.17` closed). The T4
