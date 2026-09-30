@@ -10,20 +10,32 @@ Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md), reviewed
 [approved goal](../../workstreams/rust-foundation/goal.md). Section 9 contains
 proposed shared-spec amendments for coordinator integration; this packet
 does not itself change C1/C2. Decisions below require independent review
-before dependent implementation.
+before dependent implementation. Amended 2026-09-30 by the adapter design's
+VX1–VX17 ([adapter design](../../workstreams/rust-foundation/adapters/design.md)
+§3.6, revision 9, from the live re-probe of Codex 0.159.2).
 
 ## 1. Pin and evidence boundary
 
-Pin **`codex-cli 0.157.1`**, app-server v2 method schemas with the v1
-`initialize` handshake, over newline-delimited JSON on owned stdin/stdout.
-The generated v2 schema bundle SHA-256 is
-`2719fccd25a97a7ce355497ca5e9123a63f6dce7f9f83724a5b73fd927811f59`.
+This packet was designed against **`codex-cli 0.157.1`**; the re-probe of
+2026-09-30 observed **0.159.2** (four releases in four days). It uses
+app-server v2 method schemas with the v1 `initialize` handshake, over
+newline-delimited JSON on owned stdin/stdout. The generated v2 schema bundle
+SHA-256 for 0.157.1 was
+`2719fccd25a97a7ce355497ca5e9123a63f6dce7f9f83724a5b73fd927811f59`; a
+schema sha is a record of the maintainers' check, not a runtime refusal
+(0.159.2's differs: additions and removed plugin definitions and fields).
 Do not interpret “v2” as a negotiated wire-version number. Initialize once
 per connection, then send `initialized`; use
-`clientInfo:{name:"via",version:<VIA version>}`, no experimental capabilities
-and no notification opt-outs. Record observed binary and adapter versions.
-A failed handshake refuses acquisition. A different binary version follows
-C2's untested-version gate, never silently extends the tested range.
+`clientInfo:{name:"via",version:<VIA version>}` and no notification opt-outs.
+Experimental features follow the owner's policy (K17): used where they help,
+each confirmed by the per-version live check, with `Uncertain` as the
+fallback; no experimental capability is sent by default. Record observed
+binary and adapter versions. The version rule is C2 §5 (owner OD1): the
+instance version is parsed from `initialize.userAgent` (the parse rule is
+qualified in `via-5lr.3.1`); a version outside the adapter's `checked` set is
+`untested` and warns; only a failed handshake check (policy and sandbox echo)
+refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
+cached per C2 §5.
 
 Local primary sources live under
 `scratchpad/execution/rust-foundation-release/codex-evidence/`:
@@ -37,7 +49,8 @@ Local primary sources live under
 
 C3 observed the same tool alive **65 seconds** after interrupted terminal
 status, with no matching tool completion. C4/C4b **did not prove read-only
-enforcement**: the model never attempted the denied write. C5 used a
+enforcement**: the re-probe found that the model attempted the write through
+code-mode `exec`, and no item appeared. C5 used a
 persistent thread; an ephemeral resume failed with `no rollout found`.
 C6 proved only one tool-free turn with seven environment variables. These
 are bounded observations, not guarantees for arbitrary tools/platforms.
@@ -73,10 +86,12 @@ contents. The bound, model, instructions and session cwd are thread/turn
 settings, not key components. Never attach to a pre-existing vendor server.
 Reserve ownership before launch and publish the connection only after a
 successful handshake; concurrent equal-key acquisition shares that result.
+The first `initialize` took 38 s on a fresh SQLite home (single re-probe
+observation), so the handshake deadline is the turn's remaining wall time.
 
 Each session has one lease and a registered thread ID. One shared server
-uses one of the runtime's four connection/process slots; active turns across
-all adapters still consume the existing four dispatch slots. Initially cap
+holds one of the runtime's four connection slots for its life; a turn on a
+live server pins it and takes no further slot (C2 §3 connection admission). Initially cap
 loaded Codex leases at 32 daemon-wide and outstanding client RPCs at 64 per
 connection, with eight slots reserved for control. Refuse excess admission
 before submitting input. Idle leases can detach and later reopen; no
@@ -101,15 +116,15 @@ session's cancel/close deadline.
 
 | Operation | Wire mapping and acceptance rule |
 |---|---|
-| Open new session | `thread/start` with explicit `model`, `cwd`, `developerInstructions` when supplied, `sandbox`, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`. Register returned `thread.id` before admitting a turn. Verify returned policy/model/cwd against effective settings; mismatch fails closed. |
-| Reopen idle session | `thread/resume` with exact stored `threadId`, canonical thread settings with the current effective bound's sandbox mode, and `excludeTurns:true`. Verify returned `thread.id` and effective policy; identity mismatch is `resume_mismatch`, never create a replacement. Do not restore the spawn-time bound after a bound change. The following turn/start supplies the full current structured policy. `excludeTurns` bounds history hydration and needs live acceptance coverage. |
-| `StartTurn` | `turn/start` with `threadId`, `input:[{type:"text",text:<prompt>}]`, explicit frozen `cwd`, `model`, `effort`, `outputSchema`, `approvalPolicy:"never"`, `approvalsReviewer:"user"` and `sandboxPolicy`. No active turn may exist on that thread. |
+| Open new session | `thread/start` with explicit `model`, `cwd`, `developerInstructions` when supplied, `sandbox`, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`. Register returned `thread.id` before admitting a turn. Verify returned policy/model/cwd against effective settings; mismatch fails closed. The `approvalsReviewer` echo is live-covered (re-probe c6). |
+| Reopen idle session | `thread/resume` with exact stored `threadId`, canonical thread settings with the current effective bound's sandbox mode, and `excludeTurns:true`. Verify returned `thread.id` and effective policy; identity mismatch is `resume_mismatch`, never create a replacement. Do not restore the spawn-time bound after a bound change. The following turn/start supplies the full current structured policy. `excludeTurns` bounds history hydration and is live-covered (re-probe c5). |
+| `run_turn` submission | `turn/start` with `threadId`, `input:[{type:"text",text:<prompt>}]`, explicit frozen `cwd`, `model`, `effort`, `outputSchema`, `approvalPolicy:"never"`, `approvalsReviewer:"user"` and `sandboxPolicy`. Turn overrides persist as thread defaults, so send the frozen values on every turn. No active turn may exist on that thread. Thread start or resume happens in the first `run_turn` of a connection generation (C2 §2). |
 | `Steer` | `turn/steer {threadId,expectedTurnId,input:[{type:"text",text:<text>}]}`. Return `Injected` only when response `turnId` equals the expected active ID. Never call `turn/start` as steer. |
 | `Interrupt` | `turn/interrupt {threadId,turnId}`; `{}` confirms request handling only. A matching `turn/completed` with `status:"interrupted"` is cancellation acknowledgement. See §6. |
 | `Close` | Core cancels queued/active work under C1, then driver detaches with `thread/unsubscribe`. Retain cleanup uncertainty. No thread deletion/archive and no shared stdin close. |
 | `recover` (A7) | Unsupported. Never submit or call `thread/resume` to rejoin an in-flight turn. Return `Dead` only with verified process-death evidence, otherwise `Unknown`; both leave an uncertain submitted turn `unknown` with no resend. |
 
-Core persists submission intent before `StartTurn`. Acceptance requires the
+Core persists submission intent before `run_turn`. Acceptance requires the
 paired `turn/start` response containing `turn.id`; an early `turn/started`
 notification does not bypass this rule. Route retains bounded early messages
 for that thread, then releases acceptance and observations in order. C2's
@@ -120,17 +135,27 @@ turn evidence exists. Unknown/duplicate response IDs or conflicting returned
 turn IDs are protocol failure, never reassigned to the next waiter.
 
 While submitting, steer waits for acceptance within its absolute deadline.
-Idle/stale turns receive C1 `no_active_turn` / `turn_mismatch`. The pinned
-probe's stale-ID `-32600` must not be mapped universally to mismatch: use
-the operation, pending expected ID and known error shape; unrecognized
-errors remain vendor/protocol errors. A start response reporting an already
+Idle/stale turns receive C1 `no_active_turn` / `turn_mismatch`. Every
+refusal the re-probe observed is JSON-RPC `-32600` with free text, including
+an unknown method, so `-32600` must not be mapped universally to mismatch:
+the `SteerError` mapping comes from fixture text only, using the operation,
+pending expected ID and known error shape; unrecognized errors remain
+vendor/protocol errors. A start response reporting an already
 known active turn violates VIA's start invariant; fail with uncertainty,
 never report a new turn or resend. Controls and health remain serviceable
 while start awaits a response.
 
 Instructions map to `developerInstructions`; this adds instructions at that
 level and does not promise replacement of vendor/system/repository policy.
-Effort values come from the pinned schema and model catalog. Reject an
+The model catalog comes only from `model/list`, sent by the driver on an owned
+live server right after `initialize` and cached per server instance with its
+version; model-only resolution fails `unknown_model` before discovery, and an
+explicit model passes to the vendor. A bad model or failed auth fails after
+acceptance as a Failed terminal (C2 §2). Effort (C2 §5): canonical efforts
+are checked in `plan` against the compiled mapping; model-advertised efforts
+are checked against `model/list` inside `run_turn` before `turn/start`, and a
+mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` and no
+`turn/start` written. Live checks use `gpt-6-luna` at low or medium effort. Reject an
 unsupported explicit `max_steps`; this route has no matching control.
 `outputSchema:null` is emitted to clear VIA inheritance; final agent text
 must parse and validate before becoming `structured_output`, otherwise use
@@ -190,8 +215,8 @@ and thread/turn association when known. Vendor-reported denials separately
 emit `action.denied`; a model's prose refusal or absent file is not proof
 of a sandbox denial.
 
-Default decline deadline is 1 second from decode, capped by the remaining
-connection deadline; pending server requests are limited to eight and
+The decline deadline is C2 A6's 5 seconds from decode, capped by the
+remaining connection deadline; pending server requests are limited to eight and
 64 KiB total. Unknown thread requests are still declined, but only retained
 as connection diagnostics, never broadcast into other sessions. A saturated
 or blocked control writer cannot hang forever: latch overflow/transport
@@ -208,6 +233,23 @@ or arbitrary `CODEX_*` forwarding. Changes require named evidence and enter
 the server key. This is a candidate integration policy, not a claim that
 C6 tested tools, authentication refresh, macOS or installed plugins. Never
 silently broaden the allow-list after failure.
+
+Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
+With hooks off, launch with `--disable hooks` (verified). MCP suppression
+through a `-c` override is unverified. Both switches enter `config_hash`.
+
+| Category (default) | Switch and evidence | Effective state with the default |
+|---|---|---|
+| hooks (off) | `--disable hooks`: **verified** (the owner's hooks ran without it) | `off` |
+| MCP servers (off) | `~/.codex` config; a `-c` override is **unverified**; inventory via `mcpServerStatus/list` (schema, **unverified**) | `unknown`, warns |
+| plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
+| skills (on) | **unverified** | `unknown`, no switch applied, warns |
+| agents (on) | **unverified** | `unknown`, no switch applied, warns |
+| instruction files (on) | AGENTS.md; switch and inventory **unverified** | `unknown`, no switch applied, warns |
+
+The only inventory source is `configWarning`; otherwise inventory is
+unavailable. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
+switchable.
 
 ## 5. Correlation, events and bounds
 
@@ -230,8 +272,8 @@ is a tombstone, retaining unresolved-tool metadata and a bounded session
 observation sender independent of the vendor lease. Unsubscribe, close,
 uncertain settlement and a successor turn do not evict it. Thus an already
 received or later delivered completion after lease release is still
-attributed to its original turn: it still counts for P7 cleanup
-(`tool.quiescent`), and any durable observation it yields (`action.denied`,
+attributed to its original turn: it still counts for P7 cleanup within
+the driver's window (C2 §4.1), and any durable observation it yields (`action.denied`,
 `vendor.request_declined`, `warning`) is committed with `late:true`. A tool
 completion alone is no event (C1 §6.1). `thread/unsubscribe` does not
 promise more vendor notifications. A detached session's Core observation
@@ -257,13 +299,27 @@ starts and deltas are `model`; a tool item's `item/started` is
 `tools_started (itemId, item type)` and its `item/completed` is
 `tools_ended`; `thread/tokenUsage/updated` `tokenUsage.last` is a `usage`
 sample. Terminal statuses map as below. For the envelope's final text, send
-each completed `agentMessage` text as C2 `final_text` pieces in order (C2
-§4); deltas are never final text. Preserve vendor item order. Retain
+the text of each completed `agentMessage` item with `phase:"final_answer"`
+as C2 `final_text` pieces in order (C2 §4); commentary-phase messages and
+deltas are never final text. Preserve vendor item order. Retain
 only bounded metadata for open tools, keyed by `(threadId,turnId,itemId)`;
 1024 entries and 256 KiB/session, charged to the observation budget. A
 turn-terminal payload may carry partial items (`itemsView`); absence from
 its `items` is not completion evidence. `error {willRetry:true}` is progress
 diagnostic, not a terminal failure. Core applies disposition precedence.
+`warning` and `configWarning` are activity only.
+
+Class hints (C2 §6.2): an HTTP 401 or 403 → `auth`, including
+`httpConnectionFailed{401|403}`, which arrives after about 15 s of vendor
+retries; `tooManyDenials` and `flexUnavailable` → `vendor_error`. Denials are
+best-effort (C2 §7 item 9): a slow denial is a failed item, but a fast denial
+emits no item, and code-mode `exec` can act with no item at all, so no item
+history proves complete denial reporting or complete tool tracking.
+`instant_interrupt` is a watch item for P7. `write_stdin_approval` (now
+stable and on) produces approval requests only under an approval policy
+other than `never`; under `never` any such request is declined like the
+others (qualify in `via-5lr.3.3`). The `guardianv2.thread_context` removal
+is unused.
 
 Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
 64 KiB pipe buffers, 1,024 messages/4 MiB per connection, C2 1024 observations/4 MiB per
@@ -333,11 +389,16 @@ unsubscribe reply, server leader exit, or empty item list alone does not
 establish tool quiescence. `processId` is an opaque vendor identifier, not
 an OS PID or authority to call `command/exec/terminate` for agent tools.
 
+Cancel, and the wall's cleanup step (C2 §4.1), send only `turn/interrupt`.
 After the matching interrupted terminal, cancellation is acknowledged.
-With complete observation history and no open tool items, cleanup is
-`quiescent` on vendor evidence. Otherwise cleanup is `pending`, the same
-session's dispatch gate remains closed, and Core uses the single absolute
-cleanup deadline `min(acknowledged_at + 60 seconds, turn.wall_deadline)`.
+With complete observation history and no open reported tool items, cleanup
+is `quiescent` on vendor evidence; this covers reported items only (C2 §2
+Interrupt), since fast denials and code-mode `exec` emit no item. Otherwise
+cleanup is `pending`, the same session's dispatch gate remains closed, and
+the driver applies the single absolute cleanup deadline
+`min(acknowledged_at + 60 seconds, turn.wall_deadline)` from Core's
+`tool_grace` (C2 §4.1); the stop order's `force_at` and `close_by` bound only
+the wait for acknowledgement.
 If no wall budget remains at acknowledgement, settle `uncertain`
 immediately; do not begin another wait. Matching completions
 for all open tools settle it `quiescent`. Deadline expiration, loss of
@@ -355,6 +416,19 @@ control deadline, report outcome `unknown`; never kill the shared server
 to manufacture `forced`. An ordinary completed terminal that wins the
 race stays completed under C1 precedence.
 
+`turn/interrupt` alone and `thread/unsubscribe` leave background terminals
+running; they stay the server's until it closes. They are not part of
+cleanup. `thread/backgroundTerminals/clean` (experimental) is recorded as the
+Codex mechanism of a future kill-or-keep option; it is not sent.
+
+Server close (idle retirement, C2 §3) is stdin close, which stopped every
+tool under the sandbox; under full access graceful close is untested, and
+grandchildren survived a SIGKILL. Then S1's hard stop. Idle retirement
+produces no leftover report, and a C1 `close` of one session only
+unsubscribes, so its `leftovers` is `null` (C2 §4.2). A supervised server
+loss with turns in flight gives one shared report on every `server_lost`
+turn.
+
 To preserve terminal-envelope immutability, keep the acknowledged
 cancellation's turn nonterminal while cleanup is pending. Status and
 non-waiting cancel expose `acknowledged/pending`; `wait` resolves only
@@ -366,23 +440,22 @@ necessary shared-contract clarification explicitly.
 
 ## 7. Usage and declared capability
 
-Use `thread/tokenUsage/updated` for its exact thread/turn. `tokenUsage.last`
-maps reported input, cached input, output, reasoning output and total counts
-to canonical usage with `scope:"vendor_interval"`, never `turn` until its
-accounting interval is proved. Preserve `total` as separate reported
-`session_cumulative` vendor metadata, including cache-write counts when
-available. Replace snapshots; never sum repeated notifications or subtract
-totals to invent per-turn usage. Missing data is unavailable, not zero.
+Use `thread/tokenUsage/updated` for its exact thread/turn. One
+notification arrives per model request, and its `tokenUsage.last` maps
+reported input, cached input, output and reasoning output counts to a keyless
+per-call usage sample (C2 §5 usage). Keyless samples add: the re-probe's sum
+of `last` values equalled the change in `total` (c1: 20522 + 20613), so the
+turn's usage has `scope:"turn"`. `total`, `cacheWriteInputTokens` and
+`modelContextWindow` go to `vendor`. Missing data is unavailable, not zero.
 Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
-Add `usage_interval_unverified` while using `last`.
 
 Target capability after the corresponding fixture/live gates: spawn,
 stored-conversation resume, steer, cancel and detach-close native;
 recover unsupported; instructions, effort and output-schema native;
-max_steps unsupported; tokens vendor_interval, cost unavailable. Native
+max_steps unsupported; tokens turn, cost unavailable. Native
 cancel means protocol cancellation with the cleanup semantics above, not
 all tools stopped. Bounds are separately gated in §3. No declaration may
-claim all 0.157.1 behavior tested merely because the handshake passed.
+claim a version's behavior tested merely because the handshake passed.
 
 ## 8. Exact acceptance fixtures and remaining live proof
 
@@ -392,17 +465,18 @@ time; retain raw-span evidence for every scenario.
 
 | Fixture name | Observable acceptance |
 |---|---|
-| `codex_pin_handshake` | One initialize/initialized per shared connection; unknown version gated; malformed handshake refuses lease; no experimental flag or opt-out. |
+| `codex_pin_handshake` | One initialize/initialized per shared connection; version parsed from `userAgent`; a version outside `checked` warns and proceeds; malformed handshake or a policy/sandbox echo mismatch refuses the lease; no experimental capability sent by default (K17) and no opt-out. |
 | `codex_start_order` | Notification before response buffers; paired response accepts once; unknown/duplicate/mismatched response IDs fail; lost/partial start yields unknown and exactly one outbound start. |
 | `codex_resume_identity` | Persistent thread reopened with exact ID and excludeTurns; fresh/different ID fails resume_mismatch; no fallback start; schema/history-clear fields encode exactly. After a bound change and server retirement, resume the exact stored thread with the current sandbox mode, verify identity/policy and assert the next start carries the current full sandboxPolicy rather than spawn-time defaults. |
 | `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
-| `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 1 s deadline holds while data lane full; failed write never recorded as successful decline. |
+| `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 5 s deadline holds while data lane full; failed write never recorded as successful decline. |
 | `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. |
 | `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation/raw extraction stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
-| `codex_cleanup_60s` | With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; final completion settles early. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
+| `codex_cleanup_60s` | The driver applies the window from Core's `tool_grace`, not the stop order's `close_by`. With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; a tool ending 20 s after acknowledgement settles `quiescent`; final completion settles early. c3 (interrupt only) settles `uncertain` at the window. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
 | `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood stays raw-only/bounded; distinguish normalized loss from actual raw gaps. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
-| `codex_usage_snapshot` | Repeated last/total and decreasing/reset counters never sum or become turn-scoped; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
+| `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
+| `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 
 Required live work: `via-5lr.3.4` must observe a real attempted prohibited
@@ -453,6 +527,9 @@ fallback route is implemented or enabled by this packet.
 > for a session's cancel deadline. Late tool completion is retained as late
 > evidence; it does not rewrite a settled cancelled result.
 
+Applied; the adapter design (AD4) makes the window driver-applied from Core's
+`tool_grace` (C2 §4.1), bounded by `force_at` only before acknowledgement.
+
 **C1 P11; C2 A8 and §6.2 Process shape:**
 
 > Codex uses an owned stdio app-server shared by compatible leases with key
@@ -482,9 +559,6 @@ fallback route is implemented or enabled by this packet.
 > item/completed; no late-completion guarantee or thread-to-OS-PID mapping
 > is assumed. B6 remains a limitation handled by settled uncertainty.
 
-**C2 §7 item 6, replace the terminal ordering requirement:**
-
-> Emit one vendor-terminal observation per turn, after previously decoded
-> observations of that turn. Tool completion and other evidence can arrive
-> after vendor terminal; retain their original turn IDs and mark them late
-> after Core's terminal commit. Vendor terminal alone does not seal cleanup.
+**C2 §7 item 6:** superseded by the adapter design (AD4): the vendor
+terminal is retained in the turn's `TurnEnd`, not emitted as an observation
+(C2 §4.1, §7 item 6). Late evidence keeps its original turn ID.
