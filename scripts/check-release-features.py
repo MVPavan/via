@@ -154,6 +154,14 @@ POINTS = [
     "core.data_size.walks",
     # T4-fix (design §5.3): a data-size walk held past its 2 s step.
     "store.data_size.walk",
+    # S1 critic r2 finding 1 (design §7.1): corruption on the acceptance write.
+    "store.commit.corrupt.acceptance",
+    # S1-runtime2 fix round 2: corruption on the terminal write; the
+    # terminal read-back held after the latch's phase one; Route's late
+    # path entered with the terminal held.
+    "store.commit.corrupt.terminal",
+    "core.terminal.read_back",
+    "routes.late.entered",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

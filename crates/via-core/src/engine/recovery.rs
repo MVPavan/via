@@ -262,7 +262,7 @@ impl Engine {
         )
         .await
         {
-            Ok(durable) if !durable.uncertain => Ok(()),
+            Ok(durable) if durable.uncertain.is_none() => Ok(()),
             Ok(_) | Err(_) => Err(format!(
                 "store_error: queued turn {session}/{} could not be cancelled",
                 turn.get()
@@ -531,7 +531,7 @@ impl Engine {
         .await;
         // Recovery must be certain before admission: an uncertain commit, even
         // one read back as durable, fails startup instead (runtime §7).
-        if committed.is_ok_and(|durable| !durable.uncertain) {
+        if committed.is_ok_and(|durable| durable.uncertain.is_none()) {
             head.committed(1);
             Ok(())
         } else {

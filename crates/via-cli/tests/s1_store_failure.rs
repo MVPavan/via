@@ -2334,6 +2334,194 @@ fn corrupt_head_read(verb: &str) -> TestResult {
     Ok(())
 }
 
+/// S1 critic r2 finding 1 (runtime §7, design §7.1): SQLite corruption on
+/// the acceptance write itself (`store.commit.corrupt.acceptance`), after
+/// its prerequisite head read succeeded, latches at once: `daemon/status`
+/// reports `store_failed` with a `corrupt_store` failure of scope `daemon`,
+/// a new spawn is refused `store_error`, and a second session's turn held
+/// before its dispatch grant (`core.dispatch.before_grant`) never launches.
+#[test]
+fn s1_f12_corrupt_acceptance_write_latches() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&scripts(&[completes("first", 1), completes("second", 1)]))?;
+        sandbox.no_launch();
+        let daemon = sandbox.start()?;
+        let accept = "core.accept.before_commit";
+        let corrupt = "store.commit.corrupt.acceptance";
+        let grant = "core.dispatch.before_grant";
+        sandbox.arm(accept, 1, "pause")?;
+        sandbox.arm(corrupt, 1, "fail_io")?;
+        let (_first, _) = sandbox.spawn("first")?;
+        sandbox.ack(&daemon, accept, 1, "pause")?;
+        // The first session's dispatch took grant hit 1; the second's is 2.
+        sandbox.arm(grant, 2, "pause")?;
+        let (second, _) = sandbox.spawn("second")?;
+        sandbox.ack(&daemon, grant, 2, "pause")?;
+        sandbox.resume_point(accept, 1)?;
+        sandbox.ack(&daemon, corrupt, 1, "fail_io")?;
+        wait_until("the latch", Duration::from_secs(5), || {
+            sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+        })?;
+        let failure = store_failure(&sandbox)?;
+        check(
+            failure["kind"] == "corrupt_store" && failure["scope"] == "daemon",
+            || format!("unexpected store_failure: {failure}"),
+        )?;
+        sandbox.refused(&spawn_args("late", &[]), "store_error")?;
+        sandbox.resume_point(grant, 2)?;
+        daemon.latched_exit()?;
+        check(sandbox.anchors(&second, 1)? == 0, || {
+            "the second session's turn launched after the latch".to_owned()
+        })
+    })
+}
+
+/// S1-runtime2 fix round 2 (runtime §7): a natural terminal commit whose
+/// reply is lost (`store.commit.reply_lost`) latches before its read-back:
+/// while the read-back is held (`core.terminal.read_back`), `daemon/status`
+/// already reports `health: store_failed` and a new spawn is refused
+/// `store_error`. Released, the read-back finds the committed terminal,
+/// which stays `completed`; the failure is `commit_uncertain`.
+#[test]
+fn s1_f12_uncertain_terminal_latches_before_its_read_back() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&held("first", 1))?;
+        sandbox.count("store.commit.reply_lost")?;
+        let daemon = sandbox.start()?;
+        let settling = "core.run.settling";
+        let read_back = "core.terminal.read_back";
+        sandbox.arm(settling, 1, "pause")?;
+        let (session, _) = sandbox.spawn("first")?;
+        sandbox.await_file("first.entered")?;
+        sandbox.release("first")?;
+        sandbox.ack(&daemon, settling, 1, "pause")?;
+        // The terminal's commit is the next lifecycle reply.
+        let lost = sandbox.next_hit("store.commit.reply_lost")?;
+        sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+        sandbox.arm(read_back, 1, "pause")?;
+        sandbox.resume_point(settling, 1)?;
+        sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+        sandbox.ack(&daemon, read_back, 1, "pause")?;
+        let status = sandbox.status()?;
+        check(status["health"] == "store_failed", || {
+            format!("not latched before the read-back: {status}")
+        })?;
+        sandbox.refused(&spawn_args("late", &[]), "store_error")?;
+        sandbox.resume_point(read_back, 1)?;
+        wait_until("the failure record", Duration::from_secs(5), || {
+            store_failure(&sandbox).is_ok_and(|failure| failure["kind"] == "commit_uncertain")
+        })?;
+        let failure = store_failure(&sandbox)?;
+        check(failure["scope"] == "daemon", || {
+            format!("unexpected store_failure: {failure}")
+        })?;
+        daemon.latched_exit()?;
+        let state: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        check(state == "completed", || format!("turn 1 is {state}"))
+    })
+}
+
+/// S1-runtime2 fix round 2 (design §7.1): SQLite corruption on the
+/// terminal write itself (`store.commit.corrupt.terminal`) latches as
+/// `corrupt_store`, not `commit_uncertain`, although its read-back finds no
+/// terminal; final shutdown's batch then resolves the turn.
+#[test]
+fn s1_f12_corrupt_terminal_write_latches_as_corruption() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new(&completes("first", 1))?;
+        let daemon = sandbox.start()?;
+        let point = "store.commit.corrupt.terminal";
+        sandbox.arm(point, 1, "fail_io")?;
+        let (session, _) = sandbox.spawn("first")?;
+        sandbox.ack(&daemon, point, 1, "fail_io")?;
+        wait_until("the latch", Duration::from_secs(5), || {
+            sandbox
+                .status()
+                .is_ok_and(|status| status["health"] == "store_failed")
+        })?;
+        wait_until("the failure record", Duration::from_secs(5), || {
+            store_failure(&sandbox).is_ok_and(|failure| !failure.is_null())
+        })?;
+        let failure = store_failure(&sandbox)?;
+        check(
+            failure["kind"] == "corrupt_store" && failure["scope"] == "daemon",
+            || format!("unexpected store_failure: {failure}"),
+        )?;
+        daemon.latched_exit()?;
+        let state: String = sandbox.query(&format!(
+            "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
+        ))?;
+        // Nothing was written; final shutdown's failure-resolution batch
+        // ends the affected turn `failed(store)` (design §7.4).
+        check(state == "failed", || {
+            format!("the corrupt terminal write left turn 1 {state}")
+        })
+    })
+}
+
+/// S1-runtime2 fix round 2 (design §2 rule 4, Task 4 design §2.3): the
+/// final text Core received before the daemon force took the turn is kept
+/// in the forced terminal. Core has handled the terminal's `"done"` once it
+/// holds at the next observation (`core.observations.pause`, hit 3); the
+/// force comes then, from `daemon stop --force` or from a latch (a
+/// receipt's lost reply). Either way the durable forced terminal carries
+/// `final_text: "done"`.
+#[test]
+fn s1_force_keeps_the_final_text_core_received() -> TestResult {
+    evidenced(|| {
+        for latch in [false, true] {
+            let sandbox = Sandbox::new(&scripts(&[script(
+                "first",
+                1,
+                vec![
+                    accepted(1),
+                    terminal(1),
+                    text("after"),
+                    json!({"action":"hang"}),
+                ],
+            )]))?;
+            sandbox.count("store.commit.reply_lost")?;
+            let mut daemon = sandbox.start()?;
+            let observed = "core.observations.pause";
+            // Acceptance, the final text, then the late `text`.
+            sandbox.arm(observed, 3, "pause")?;
+            let (session, _) = sandbox.spawn("first")?;
+            sandbox.ack(&daemon, observed, 3, "pause")?;
+            if latch {
+                let lost = sandbox.next_hit("store.commit.reply_lost")?;
+                sandbox.arm("store.commit.reply_lost", lost, "fail_io")?;
+                sandbox.refused(&spawn_args("lost", &[]), "store_error")?;
+                sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
+            } else {
+                sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+            }
+            sandbox.resume_point(observed, 3)?;
+            let status = daemon.exit(Duration::from_secs(20))?;
+            check(status.code() == Some(if latch { 4 } else { 0 }), || {
+                format!(
+                    "latch {latch}: the daemon exited {status}: {}",
+                    daemon.trace()
+                )
+            })?;
+            let envelope: String = sandbox.query(&format!(
+                "SELECT envelope FROM turns WHERE session_id='{session}' AND number=1"
+            ))?;
+            let envelope: Value = serde_json::from_str(&envelope)?;
+            check(
+                envelope["state"] == "cancelled"
+                    && envelope["final_text"] == "done"
+                    && envelope["cancel"]["outcome"] == "forced",
+                || format!("latch {latch}: unexpected forced terminal: {envelope}"),
+            )?;
+        }
+        Ok(())
+    })
+}
+
 /// T3-S5 round 1, decision 10 (design §7.1): SQLite corruption on the
 /// session-head read of final shutdown's failure-resolution batch is
 /// reported as corruption. A lost event reply (`store.commit.reply_lost`,
