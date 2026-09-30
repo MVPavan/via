@@ -66,6 +66,17 @@ fn timeout(detail: impl Into<String>) -> Box<dyn Error> {
     Box::new(ScenarioError::Timeout(detail.into()))
 }
 
+/// A thread's error, sendable to its joiner with its type kept: a typed
+/// [`ScenarioError`] stays itself, so a timeout stays a timeout; any other
+/// error is a failure, as `evidenced` records it (S1-evidence2 fix round
+/// 3, `via-t76`).
+fn sendable(error: Box<dyn Error>) -> ScenarioError {
+    match error.downcast::<ScenarioError>() {
+        Ok(typed) => *typed,
+        Err(other) => ScenarioError::Failure(other.to_string()),
+    }
+}
+
 /// Runs `command` to exit within `within`, which covers its run and, if it
 /// is killed, its reap: killed at the bound less a reap reserve (at most
 /// 1 s, at most a quarter of the bound). A timeout is returned as a typed
@@ -1213,7 +1224,7 @@ fn s1_close_cancels_queue_and_running_turn() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -1335,7 +1346,7 @@ fn s1_close_racing_force_stop() -> TestResult {
                         ],
                         "daemon_stopping",
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -1461,7 +1472,7 @@ fn s1_close_reaches_claimed_turn() -> TestResult {
                 let close = scope.spawn(|| {
                     sandbox
                         .ok(&["close", &session, "--handle", &handle, "--json"])
-                        .map_err(|error| error.to_string())
+                        .map_err(sendable)
                 });
                 sandbox.ack(
                     &daemon,
@@ -1613,7 +1624,7 @@ fn s1_cancel_during_settlement_completes() -> TestResult {
             let cancel = scope.spawn(|| {
                 sandbox
                     .ok(&["cancel", &session, "--handle", &handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The cancel found the turn settling and sent no order.
             sandbox.ack(&daemon, "core.cancel.settling", 1, "fail_io")?;
@@ -1893,20 +1904,12 @@ fn s1_close_outcome_retained_for_late_subscriber() -> TestResult {
             "--json",
         ];
         thread::scope(|scope| -> TestResult {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let first = scope.spawn(|| sandbox.refused(&keyed, "store_error").map_err(sendable));
             // The running turn observed the close order.
             sandbox.wait_for_event(&session, "cancel.requested")?;
             // The first caller passed the seam unarmed: this is its second hit.
             sandbox.arm("core.close.before_subscribe", 2, "pause")?;
-            let replay = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let replay = scope.spawn(|| sandbox.refused(&keyed, "store_error").map_err(sendable));
             sandbox.ack(&daemon, "core.close.before_subscribe", 2, "pause")?;
             // No terminal committed yet: the other session's is the first, and
             // its retry the second.
@@ -2033,7 +2036,7 @@ fn s1_close_cleanup_uncertain_with_unproven_group() -> TestResult {
                             &handle,
                             "--json",
                         ])
-                        .map_err(|error| error.to_string())
+                        .map_err(sendable)
                 });
                 // The close order is set before the turn reaches the gate.
                 sandbox.ack(
@@ -2106,7 +2109,7 @@ fn s1_idle_timer_disarms_once_an_order_exists() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The cancel's order is attached before the timer issues its own.
             sandbox.ack(&daemon, "core.cancel.ordered", 1, "fail_io")?;
@@ -2197,7 +2200,7 @@ fn s1_close_at_final_shutdown_entry_refused() -> TestResult {
             let close = scope.spawn(|| {
                 sandbox
                     .ok(&["close", &idle, "--handle", &idle_handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // `Closing` is durable, so its dispatcher start was requested.
             sandbox.await_row(
@@ -2285,7 +2288,7 @@ fn s1_close_stalled_read_bounds_final_shutdown_entry() -> TestResult {
             let close = scope.spawn(|| {
                 sandbox
                     .run(&["close", &session, "--handle", &handle, "--json"])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             // The close holds `admission` in its read; entry now waits for it.
             sandbox.ack(&daemon, stall, next, "pause")?;
@@ -2358,7 +2361,7 @@ fn s1_close_failed_closed_keeps_closing_count() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
@@ -2504,20 +2507,14 @@ fn s1_close_waiter_resolves_on_force() -> TestResult {
             "--json",
         ];
         let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let first =
+                scope.spawn(|| sandbox.refused(&close, "daemon_stopping").map_err(sendable));
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
                 "closing",
             )?;
-            let second = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let second =
+                scope.spawn(|| sandbox.refused(&close, "daemon_stopping").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             sandbox.resume_point(subscribe, 2)?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2576,7 +2573,7 @@ fn s1_cancel_wait_across_force_handoff() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.wait_for_event(&session, "cancel.requested")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2645,20 +2642,12 @@ fn s1_close_waiter_resolves_on_latch() -> TestResult {
             "--json",
         ];
         let (first, second) = thread::scope(|scope| -> TestResult<(Value, Value)> {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let first = scope.spawn(|| sandbox.refused(&close, "store_error").map_err(sendable));
             sandbox.await_row(
                 &format!("SELECT admission FROM sessions WHERE id='{session}'"),
                 "closing",
             )?;
-            let second = scope.spawn(|| {
-                sandbox
-                    .refused(&close, "store_error")
-                    .map_err(|error| error.to_string())
-            });
+            let second = scope.spawn(|| sandbox.refused(&close, "store_error").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             sandbox.resume_point(subscribe, 2)?;
             // The Store's one worker serves this read after the `Closing`
@@ -2745,7 +2734,7 @@ fn s1_cancel_wait_across_force_handoff_unacknowledged() -> TestResult {
                         &handle,
                         "--json",
                     ])
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.ack(&daemon, admitted, 1, "pause")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2817,7 +2806,7 @@ fn s1_cancel_wait_across_force_handoff_terminal_not_committed() -> TestResult {
                         ],
                         "store_error",
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(sendable)
             });
             sandbox.wait_for_event(&session, "cancel.requested")?;
             let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
@@ -2896,11 +2885,8 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
         let handoff = "core.run.before_handoff";
         let subscribe = "core.close.before_subscribe";
         thread::scope(|scope| -> TestResult {
-            let first = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let first =
+                scope.spawn(|| sandbox.refused(&keyed, "daemon_stopping").map_err(sendable));
             sandbox.wait_for_event(&session, "cancel.requested")?;
             sandbox.arm(fence, 1, "pause")?;
             sandbox.arm(handoff, 1, "pause")?;
@@ -2910,11 +2896,8 @@ fn s1_close_outcome_retained_for_late_subscriber_under_force() -> TestResult {
             check(stopping["stopping"] == true, || stopping.to_string())?;
             sandbox.ack(&daemon, fence, 1, "pause")?;
             sandbox.ack(&daemon, handoff, 1, "pause")?;
-            let replay = scope.spawn(|| {
-                sandbox
-                    .refused(&keyed, "daemon_stopping")
-                    .map_err(|error| error.to_string())
-            });
+            let replay =
+                scope.spawn(|| sandbox.refused(&keyed, "daemon_stopping").map_err(sendable));
             sandbox.ack(&daemon, subscribe, 2, "pause")?;
             check(!first.is_finished(), || {
                 "the close replied before the force exit".to_owned()

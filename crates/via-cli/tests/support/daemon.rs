@@ -309,22 +309,19 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
-    /// The scenario's final teardown of this generation (runtime §11.2): a
-    /// live daemon's drop begins, or joins, the one teardown deadline,
-    /// which bounds the force-stop (at most 2 s), the exit wait, the kill's
-    /// 1 s reap and the anchor cleanup. An exited daemon's drop joins a
-    /// teardown already begun, or else processes its anchors with its own
-    /// bound, beginning nothing.
+    /// The scenario's final teardown of this generation (runtime §11.2):
+    /// the drop, of a live or an exited daemon, begins or joins the one
+    /// teardown deadline, which bounds the force-stop (at most 2 s), the
+    /// exit wait, the kill's 1 s reap and the anchor cleanup. A deliberate
+    /// stop before a restart is [`Daemon::shutdown`].
     fn drop(&mut self) {
         if self.torn_down {
             return;
         }
-        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
-        let deadline = if live || self.sandbox.teardown.begun() {
-            self.sandbox.teardown.begin()
-        } else {
-            Instant::now() + outer_cleanup::TEARDOWN
-        };
+        // Final, live or exited: it begins or joins the scenario's one
+        // deadline (S1-evidence2 fix round 3, Sol r3 finding 1). Only an
+        // explicit `shutdown()` has its own bound.
+        let deadline = self.sandbox.teardown.begin();
         self.tear_down(deadline);
     }
 }

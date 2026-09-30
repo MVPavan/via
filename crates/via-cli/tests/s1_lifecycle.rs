@@ -58,6 +58,18 @@ fn timeout(detail: impl Into<String>) -> Box<dyn Error> {
     Box::new(ScenarioError::Timeout(detail.into()))
 }
 
+/// A thread's error, sendable to its joiner with its type kept: a typed
+/// [`ScenarioError`] stays itself, so a timeout stays a timeout; any other
+/// error is a failure, as `evidenced` records it (S1-evidence2 fix round
+/// 3, `via-t76`).
+#[cfg(feature = "test-failpoints")]
+fn sendable(error: Box<dyn Error>) -> ScenarioError {
+    match error.downcast::<ScenarioError>() {
+        Ok(typed) => *typed,
+        Err(other) => ScenarioError::Failure(other.to_string()),
+    }
+}
+
 /// Runs `command` to exit, killing it after `timeout`: a typed timeout,
 /// with the kill's bounded reap beside it.
 fn run_command(command: &mut Command, within: Duration) -> TestResult<Captured> {
@@ -1600,11 +1612,7 @@ fn s1_f07_force_set_includes_session_in_cancelling_state() -> TestResult {
         // (`Cancelling{request}`) and parks at its commit.
         sandbox.arm(commit, 1, "pause")?;
         let params = json!({"session":session,"handle":handle});
-        let cancel = thread::spawn(move || {
-            canceller
-                .call("cancel", &params)
-                .map_err(|error| error.to_string())
-        });
+        let cancel = thread::spawn(move || canceller.call("cancel", &params).map_err(sendable));
         sandbox.ack(&daemon, commit, 1, "pause")?;
         let stop = forcer.call("daemon/stop", &json!({"force":true}))?;
         check(stop["result"]["stopping"] == true, || stop.to_string())?;

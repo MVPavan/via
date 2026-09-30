@@ -515,32 +515,40 @@ fn foreign_listener(
     socket: &Path,
     uid: u32,
     ready: mpsc::Sender<()>,
-) -> thread::JoinHandle<Result<usize, String>> {
+) -> thread::JoinHandle<Result<usize, ScenarioError>> {
     let socket = socket.to_owned();
     thread::spawn(move || {
         // Linux credentials are per thread; this changes only this thread.
         let uid = rustix::process::Uid::from_raw(uid);
-        rustix::thread::set_thread_res_uid(uid, uid, uid).map_err(|e| e.to_string())?;
-        let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        ready.send(()).map_err(|e| e.to_string())?;
+        rustix::thread::set_thread_res_uid(uid, uid, uid)
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
+        let listener = UnixListener::bind(&socket)
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
+        ready
+            .send(())
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        return Err("client never connected".to_owned());
+                        return Err(ScenarioError::Timeout("client never connected".to_owned()));
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(ScenarioError::Infrastructure(error.to_string())),
             }
         };
-        stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ScenarioError::Infrastructure(e.to_string()))?;
         let mut received = Vec::new();
         let mut buffer = [0; 4096];
         loop {
@@ -555,7 +563,7 @@ fn foreign_listener(
                 {
                     break;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(ScenarioError::Infrastructure(error.to_string())),
             }
         }
         Ok(received.len())

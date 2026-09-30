@@ -58,6 +58,17 @@ fn timeout(detail: impl Into<String>) -> Box<dyn Error> {
     Box::new(ScenarioError::Timeout(detail.into()))
 }
 
+/// A thread's error, sendable to its joiner with its type kept: a typed
+/// [`ScenarioError`] stays itself, so a timeout stays a timeout; any other
+/// error is a failure, as `evidenced` records it (S1-evidence2 fix round
+/// 3, `via-t76`).
+fn sendable(error: Box<dyn Error>) -> ScenarioError {
+    match error.downcast::<ScenarioError>() {
+        Ok(typed) => *typed,
+        Err(other) => ScenarioError::Failure(other.to_string()),
+    }
+}
+
 /// Runs `command` to exit, killing it after `timeout`: a typed timeout,
 /// with the kill's bounded reap beside it.
 fn run_command(command: &mut Command, within: Duration) -> TestResult<Captured> {
@@ -257,7 +268,14 @@ impl Sandbox {
 
     /// One successful CLI call's JSON output.
     fn ok(&self, args: &[&str]) -> TestResult<Value> {
-        let captured = self.run(args)?;
+        self.ok_within(args, Duration::from_secs(60))
+    }
+
+    /// [`Self::ok`], the call killed after `within`.
+    fn ok_within(&self, args: &[&str], within: Duration) -> TestResult<Value> {
+        let mut command = self.command();
+        command.args(args);
+        let captured = run_command(&mut command, within)?;
         if !captured.status.success() {
             return Err(format!(
                 "via {args:?} exited {}: {}",
@@ -396,12 +414,19 @@ impl Sandbox {
     }
 
     /// Runs one CLI call on its own thread, for a call that blocks.
-    fn background(&self, args: &[&str]) -> thread::JoinHandle<Result<Captured, String>> {
+    fn background(&self, args: &[&str]) -> thread::JoinHandle<Result<Captured, ScenarioError>> {
+        self.background_within(args, Duration::from_secs(60))
+    }
+
+    /// [`Self::background`], killed after `within`.
+    fn background_within(
+        &self,
+        args: &[&str],
+        within: Duration,
+    ) -> thread::JoinHandle<Result<Captured, ScenarioError>> {
         let mut command = self.command();
         command.args(args);
-        thread::spawn(move || {
-            run_command(&mut command, Duration::from_secs(60)).map_err(|error| error.to_string())
-        })
+        thread::spawn(move || run_command(&mut command, within).map_err(sendable))
     }
 
     /// The scenario's final outer cleanup: proves every committed anchor's
@@ -409,12 +434,6 @@ impl Sandbox {
     /// scenario's one teardown deadline, which this begins or joins.
     fn verify_anchors(&self) -> TestResult {
         self.verify_anchors_by(self.teardown.begin())
-    }
-
-    /// An intermediate outer cleanup before a restart, with its own
-    /// runtime §11.2 bound: the final teardown has not begun.
-    fn verify_anchors_between(&self) -> TestResult {
-        self.verify_anchors_by(Instant::now() + outer_cleanup::TEARDOWN)
     }
 
     /// Proves every committed anchor's group absent by `deadline`.
@@ -599,35 +618,39 @@ impl Daemon<'_> {
         trace
     }
 
-    /// The scenario's final stop: a plain `daemon stop` once no work is
-    /// active, the exit 0, then the final outer cleanup
-    /// ([`Sandbox::verify_anchors`]).
+    /// The scenario's final stop, within its one teardown deadline, which
+    /// this begins or joins before any stop work (runtime §11.2): a plain
+    /// `daemon stop` once no work is active, the exit 0, then the final
+    /// outer cleanup.
     fn stop_clean(self) -> TestResult {
-        let sandbox = self.sandbox;
-        self.stop_clean_only()?;
-        sandbox.verify_anchors()
+        let deadline = self.sandbox.teardown.begin();
+        self.stop_clean_by(deadline)
     }
 
-    /// [`Self::stop_clean`] before a restart: its outer cleanup is
-    /// intermediate ([`Sandbox::verify_anchors_between`]).
+    /// [`Self::stop_clean`] before a restart: a deliberate intermediate
+    /// stop with its own runtime §11.2 bound; the final teardown has not
+    /// begun.
     fn stop_clean_between(self) -> TestResult {
-        let sandbox = self.sandbox;
-        self.stop_clean_only()?;
-        sandbox.verify_anchors_between()
+        self.stop_clean_by(Instant::now() + outer_cleanup::TEARDOWN)
     }
 
-    /// A plain `daemon stop` once no work is active; the exit must be 0.
-    fn stop_clean_only(mut self) -> TestResult {
-        wait_until("the daemon is idle", Duration::from_secs(20), || {
-            self.sandbox
+    /// A plain `daemon stop` once no work is active, the exit 0 and the
+    /// outer cleanup, all by `deadline`: every wait gets only the time left
+    /// (S1-evidence2 fix round 3, Sol r3 finding 1).
+    fn stop_clean_by(mut self, deadline: Instant) -> TestResult {
+        let sandbox = self.sandbox;
+        wait_until("the daemon is idle", outer_cleanup::left(deadline), || {
+            sandbox
                 .status()
                 .is_ok_and(|status| status["sessions"]["active"] == 0)
         })?;
-        self.sandbox.ok(&["daemon", "stop", "--json"])?;
-        let status = self.exit(Duration::from_secs(15))?;
+        sandbox.ok_within(&["daemon", "stop", "--json"], outer_cleanup::left(deadline))?;
+        let status = self.exit(outer_cleanup::left(deadline))?;
         check(status.code() == Some(0), || {
             format!("a plain stop exited {status}: {}", self.trace())
-        })
+        })?;
+        drop(self);
+        sandbox.verify_anchors_by(deadline)
     }
 
     /// Waits for a latched daemon's own exit: 4 with `store_failed`.
@@ -741,7 +764,7 @@ fn held(prompt: &str, turn: u32) -> Value {
 }
 
 /// A background call's JSON result.
-fn joined(call: thread::JoinHandle<Result<Captured, String>>) -> TestResult<Value> {
+fn joined(call: thread::JoinHandle<Result<Captured, ScenarioError>>) -> TestResult<Value> {
     let captured = call.join().map_err(|_| "the background call panicked")??;
     if !captured.status.success() {
         return Err(format!(
@@ -3255,5 +3278,98 @@ fn s1_f12_exit_observed_under_force_is_the_force_row() -> TestResult {
                 && envelope["cancel"]["settled_at"].is_string(),
             || format!("B did not end by the force row (daemon {status}): {envelope}"),
         )
+    })
+}
+
+/// S1-evidence2 fix round 3 (Sol r3 finding 1): the scenario's final clean
+/// stop runs inside its one teardown deadline, begun before the stop
+/// command and the exit wait. The reviewer's probe: a "daemon" that never
+/// exits by itself (`sleep 12`) behind a mock CLI that accepts the stop;
+/// the final stop succeeded after 12 s. It must fail as a timeout by the
+/// deadline instead.
+#[test]
+fn s1_store_harness_final_stop_is_within_the_teardown_deadline() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new(&json!({}))?;
+        // No collection: this checks the stop helper alone.
+        drop(sandbox.evidence.take());
+        let mock = sandbox.root.path().join("mock-via");
+        fs::write(
+            &mock,
+            b"#!/bin/sh\nprintf '%s\\n' '{\"sessions\":{\"active\":0},\"stopping\":true}'\n",
+        )?;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o700))?;
+        sandbox.via = mock;
+        rusqlite::Connection::open(sandbox.state.join("store.sqlite3"))?.execute_batch(
+            "CREATE TABLE anchors(anchor_id TEXT, generation TEXT, marker TEXT, socket_path TEXT,
+                 phase TEXT, pid INTEGER, pgid INTEGER, uid INTEGER, boot_id TEXT,
+                 pid_namespace TEXT, start_ticks INTEGER, absence_time TEXT)",
+        )?;
+        // The idle check's `hello` and `daemon/status`, answered once.
+        let listener = std::os::unix::net::UnixListener::bind(sandbox.runtime.join("via.sock"))?;
+        let peer = thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = BufReader::new(stream.try_clone()?);
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                let request: Value = serde_json::from_str(&line)?;
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"sessions":{"active":0}}})
+                )?;
+            }
+            Ok(())
+        });
+        let daemon = Daemon {
+            child: Command::new("sleep").arg("12").spawn()?,
+            sandbox: &sandbox,
+            trace: sandbox.root.path().join("daemon.trace"),
+        };
+        let started = Instant::now();
+        let result = daemon.stop_clean();
+        let elapsed = started.elapsed();
+        let _ = peer.join();
+        let error = result.expect_err("a final stop past the teardown deadline succeeded");
+        assert!(
+            matches!(
+                error.downcast_ref::<ScenarioError>(),
+                Some(ScenarioError::Timeout(_))
+            ),
+            "{error}"
+        );
+        // The one deadline, plus a scheduling tolerance (a contract upper
+        // bound, design T4-A50).
+        assert!(
+            elapsed <= outer_cleanup::TEARDOWN + Duration::from_secs(1),
+            "the final stop returned after {elapsed:?}"
+        );
+        Ok(())
+    })
+}
+
+/// S1-evidence2 fix round 3 (Sol r3, `via-t76`): a background call's typed
+/// timeout keeps its type through the thread's result and its join, so the
+/// scenario records `timeout`, not `fail`.
+#[test]
+fn s1_store_harness_background_timeout_stays_typed() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new(&json!({}))?;
+        drop(sandbox.evidence.take());
+        let mock = sandbox.root.path().join("hanging-via");
+        fs::write(&mock, b"#!/bin/sh\nexec sleep 30\n")?;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o700))?;
+        sandbox.via = mock;
+        let error = joined(sandbox.background_within(&["ignored"], Duration::from_millis(300)))
+            .expect_err("a hanging background call returned");
+        assert!(
+            matches!(
+                error.downcast_ref::<ScenarioError>(),
+                Some(ScenarioError::Timeout(_))
+            ),
+            "the background timeout lost its type: {error}"
+        );
+        Ok(())
     })
 }

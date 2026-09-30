@@ -63,6 +63,9 @@ struct Paths {
     teardown: outer_cleanup::Teardown,
     /// Daemon runs started so far, numbering their traces and reports.
     runs: std::sync::atomic::AtomicUsize,
+    /// Command outputs that could not be written as evidence: reported at
+    /// collection, beside the scenario's outcome, never in its place.
+    lost_outputs: std::sync::Mutex<Vec<String>>,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -99,6 +102,7 @@ impl Paths {
             _root: root,
             teardown: outer_cleanup::Teardown::new(),
             runs: std::sync::atomic::AtomicUsize::new(0),
+            lost_outputs: std::sync::Mutex::new(Vec::new()),
             via,
             fake,
             state,
@@ -132,19 +136,41 @@ impl Paths {
     ) -> Result<Captured, ScenarioError> {
         let mut command = self.command();
         command.args(args);
-        let capture = run_command(&mut command, Duration::from_secs(20)).map_err(infra)?;
-        // The captured outcome first; a lost output write is attached to
-        // it, never in its place (S1-evidence2 fix round 2, finding 5).
-        let written = daemon::write_output(evidence, name, &capture);
+        let mut capture = run_command(&mut command, Duration::from_secs(20)).map_err(infra)?;
+        // The captured outcome first: a lost output write is attached to
+        // the capture and reported at collection, never in its place; the
+        // caller classifies the exit (S1-evidence2 fix round 2 finding 5,
+        // fix round 3).
+        if let Err(error) = daemon::write_output(evidence, name, &capture) {
+            capture.attached.push(error.detail().to_owned());
+            self.lost_outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(error.detail().to_owned());
+        }
         if capture.timed_out {
             return Err(ScenarioError::Timeout(format!(
-                "via {args:?} timed out{}{}",
-                capture.notes(),
-                daemon::note(written.as_ref().err())
+                "via {args:?} timed out{}",
+                capture.notes()
             )));
         }
-        written?;
         Ok(capture)
+    }
+
+    /// Fails if any command output could not be written as evidence.
+    fn outputs_written(&self) -> Result<(), ScenarioError> {
+        let lost = self
+            .lost_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lost.is_empty() {
+            Ok(())
+        } else {
+            Err(infra(format!(
+                "command output not written: {}",
+                lost.join("; ")
+            )))
+        }
     }
 
     /// One successful CLI call's JSON output.
@@ -152,9 +178,10 @@ impl Paths {
         let capture = self.run(evidence, name, args)?;
         check(capture.status.success(), || {
             format!(
-                "via {args:?} exited {}: {}",
+                "via {args:?} exited {}: {}{}",
                 capture.status,
-                String::from_utf8_lossy(&capture.stderr)
+                String::from_utf8_lossy(&capture.stderr),
+                capture.notes()
             )
         })?;
         serde_json::from_slice(&capture.stdout).map_err(infra)
@@ -328,6 +355,8 @@ struct Daemon<'a> {
     /// The run's own cleanup report, `cleanup-<n>-<run>.json`.
     report: PathBuf,
     crash_snapshot: Option<Vec<outer_cleanup::AnchorRow>>,
+    /// Set once the run was torn down: its drop then does nothing.
+    torn_down: bool,
 }
 
 impl<'a> Daemon<'a> {
@@ -393,6 +422,7 @@ impl<'a> Daemon<'a> {
             report: evidence.dir.join(format!("cleanup-{run}.json")),
             run,
             crash_snapshot: None,
+            torn_down: false,
         })
     }
 
@@ -439,22 +469,55 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
-    /// The scenario's final teardown of this run (runtime §11.2): a live
+    /// The scenario's final teardown of this run (runtime §11.2): a
     /// daemon's drop begins, or joins, the scenario's one teardown deadline
     /// (`Paths::teardown`), which bounds the force-stop (at most 2 s), the
-    /// exit wait, the kill's 1 s reap and the anchor cleanup; an exited
-    /// daemon's drop joins a teardown already begun, or else processes its
-    /// anchors with its own bound, beginning nothing. The run is recorded in
+    /// exit wait, the kill's 1 s reap and the anchor cleanup. An exited
+    /// daemon's drop begins or joins it too; a deliberate stop before a
+    /// restart is `Daemon::shutdown`, with its own bound. The run is recorded in
     /// `cleanup-<n>-<run>.json` and the teardown, which
     /// [`daemon::collect_available`] validates as a whole.
     fn drop(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        // Final, live or exited: it begins or joins the scenario's one
+        // deadline (S1-evidence2 fix round 3, Sol r3 finding 1). Only an
+        // explicit `shutdown()` has its own bound.
+        let deadline = self.paths.teardown.begin();
+        self.tear_down(deadline);
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Daemon<'_> {
+    /// A deliberate intermediate shutdown before a restart, with its own
+    /// runtime §11.2 bound: the final teardown has not begun, so the next
+    /// run may start. Recorded like the final one; a run that needed a
+    /// kill is a timeout, any other cleanup failure an infrastructure
+    /// failure.
+    fn shutdown(mut self) -> Result<(), ScenarioError> {
+        let record = self.tear_down(Instant::now() + outer_cleanup::TEARDOWN);
+        if record["direct_child"]["kill"] != "not_needed" {
+            return Err(ScenarioError::Timeout(format!(
+                "the daemon did not exit after its force-stop: {record}"
+            )));
+        }
+        if record["failures"]
+            .as_array()
+            .is_some_and(|failures| !failures.is_empty())
+        {
+            return Err(infra(format!("intermediate shutdown incomplete: {record}")));
+        }
+        Ok(())
+    }
+}
+
+impl Daemon<'_> {
+    /// Tears this run down by `deadline` and records it.
+    fn tear_down(&mut self, deadline: Instant) -> Value {
+        self.torn_down = true;
         let paths = self.paths;
-        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
-        let deadline = if live || paths.teardown.begun() {
-            paths.teardown.begin()
-        } else {
-            Instant::now() + outer_cleanup::TEARDOWN
-        };
         let rows = self.crash_snapshot.take();
         paths.teardown.daemon_generation(
             &self.run,
@@ -470,7 +533,7 @@ impl Drop for Daemon<'_> {
                     by,
                 )
             },
-        );
+        )
     }
 }
 
@@ -521,9 +584,22 @@ fn scenario(
     run_scenario(
         evidence,
         |evidence| action(&paths, evidence),
+        // Every collection step runs; their failures are reported together.
         |evidence| {
-            paths.write_store_evidence(evidence)?;
-            collect_available(evidence, &paths.state, &paths.teardown)
+            let failures: Vec<String> = [
+                paths.write_store_evidence(evidence),
+                collect_available(evidence, &paths.state, &paths.teardown),
+                paths.outputs_written(),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.detail().to_owned())
+            .collect();
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(infra(failures.join("; ")))
+            }
         },
     )
     .require_pass()
@@ -990,7 +1066,7 @@ fn s1_recovery_keeps_the_durable_cancel_settled() -> TestResult {
             check(!status.success() && trace.contains("store_error"), || {
                 format!("startup did not fail on the terminal write ({status}): {trace}")
             })?;
-            drop(refused);
+            refused.shutdown()?;
             let (state, _) = paths.turn(&session, 1)?;
             let types = paths.turn_types(&session, 1)?;
             check(
@@ -1136,7 +1212,9 @@ fn crash_with_queued_turns(
     }
     daemon.kill()?;
     paths.failpoints.disarm(point).map_err(infra)?;
-    drop(daemon);
+    // The caller restarts: an explicit intermediate shutdown of the killed
+    // run (S1-evidence2 fix round 3).
+    daemon.shutdown()?;
     Ok((session, receipts))
 }
 
@@ -1246,7 +1324,7 @@ fn s1_recovery_corrupt_row_write_failure_fails_startup() -> TestResult {
             check(!status.success() && trace.contains("store_error"), || {
                 format!("startup did not fail on the Store failure ({status}): {trace}")
             })?;
-            drop(refused);
+            refused.shutdown()?;
             let (state, _) = paths.turn(&session, 2)?;
             check(state == "queued", || {
                 format!("turn 2 after the failed write: {state}")
@@ -1690,4 +1768,26 @@ fn s1_restart_keeps_nondefault_frozen_values() -> TestResult {
             || format!("spawn replay after restart: {spawned}"),
         )
     })
+}
+
+/// S1-evidence2 fix round 3 (Sol r3 finding 2): a command's known exit
+/// failure survives a lost output write. The reviewer's probe: `false`
+/// (exit 1) with its stdout evidence path taken by a directory became
+/// `Infrastructure("... Is a directory ...")`; the exit failure is
+/// classified first, and the lost write is attached beside it.
+#[test]
+fn s1_recovery_harness_exit_failure_survives_a_lost_output_write() -> TestResult {
+    let mut paths = Paths::new(&json!({}))?;
+    paths.via = PathBuf::from("/bin/false");
+    let evidence = Evidence::new("s1_recovery_lost_output", &paths.fake, &paths.fixture)?;
+    fs::create_dir(evidence.dir.join("probe.stdout"))?;
+    let error = paths
+        .ok(&evidence, "probe", &["irrelevant"])
+        .expect_err("a failed command passed");
+    assert!(
+        matches!(&error, ScenarioError::Failure(detail) if detail.contains("exited")
+            && detail.contains("not written")),
+        "the exit failure was replaced: {error:?}"
+    );
+    Ok(())
 }

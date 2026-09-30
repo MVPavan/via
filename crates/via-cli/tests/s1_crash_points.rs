@@ -60,6 +60,9 @@ struct Paths {
     teardown: outer_cleanup::Teardown,
     /// Daemon runs started so far, numbering their traces and reports.
     runs: std::sync::atomic::AtomicUsize,
+    /// Command outputs that could not be written as evidence: reported at
+    /// collection, beside the scenario's outcome, never in its place.
+    lost_outputs: std::sync::Mutex<Vec<String>>,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -94,6 +97,7 @@ impl Paths {
             root,
             teardown: outer_cleanup::Teardown::new(),
             runs: std::sync::atomic::AtomicUsize::new(0),
+            lost_outputs: std::sync::Mutex::new(Vec::new()),
             via,
             fake,
             state,
@@ -130,19 +134,41 @@ impl Paths {
     ) -> Result<Captured, ScenarioError> {
         let mut command = self.command();
         command.args(args);
-        let capture = run_command(&mut command, Duration::from_secs(15)).map_err(infra)?;
-        // The captured outcome first; a lost output write is attached to
-        // it, never in its place (S1-evidence2 fix round 2, finding 5).
-        let written = daemon::write_output(evidence, name, &capture);
+        let mut capture = run_command(&mut command, Duration::from_secs(15)).map_err(infra)?;
+        // The captured outcome first: a lost output write is attached to
+        // the capture and reported at collection, never in its place; the
+        // caller classifies the exit (S1-evidence2 fix round 2 finding 5,
+        // fix round 3).
+        if let Err(error) = daemon::write_output(evidence, name, &capture) {
+            capture.attached.push(error.detail().to_owned());
+            self.lost_outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(error.detail().to_owned());
+        }
         if capture.timed_out {
             return Err(ScenarioError::Timeout(format!(
-                "via {args:?} timed out{}{}",
-                capture.notes(),
-                daemon::note(written.as_ref().err())
+                "via {args:?} timed out{}",
+                capture.notes()
             )));
         }
-        written?;
         Ok(capture)
+    }
+
+    /// Fails if any command output could not be written as evidence.
+    fn outputs_written(&self) -> Result<(), ScenarioError> {
+        let lost = self
+            .lost_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lost.is_empty() {
+            Ok(())
+        } else {
+            Err(infra(format!(
+                "command output not written: {}",
+                lost.join("; ")
+            )))
+        }
     }
 
     /// Starts `via spawn --background` without waiting: its reply may never
@@ -513,24 +539,22 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
-    /// The scenario's final teardown of this run (runtime §11.2): a live
+    /// The scenario's final teardown of this run (runtime §11.2): a
     /// daemon's drop begins, or joins, the scenario's one teardown deadline
     /// (`Paths::teardown`), which bounds the force-stop (at most 2 s), the
-    /// exit wait, the kill's 1 s reap and the anchor cleanup; an exited
-    /// daemon's drop joins a teardown already begun, or else processes its
-    /// anchors with its own bound, beginning nothing. The run is recorded in
+    /// exit wait, the kill's 1 s reap and the anchor cleanup. An exited
+    /// daemon's drop begins or joins it too; a deliberate stop before a
+    /// restart is `Daemon::shutdown`, with its own bound. The run is recorded in
     /// `cleanup-<n>-<run>.json` and the teardown, which
     /// [`daemon::collect_available`] validates as a whole.
     fn drop(&mut self) {
         if self.torn_down {
             return;
         }
-        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
-        let deadline = if live || self.paths.teardown.begun() {
-            self.paths.teardown.begin()
-        } else {
-            Instant::now() + outer_cleanup::TEARDOWN
-        };
+        // Final, live or exited: it begins or joins the scenario's one
+        // deadline (S1-evidence2 fix round 3, Sol r3 finding 1). Only an
+        // explicit `shutdown()` has its own bound.
+        let deadline = self.paths.teardown.begin();
         self.tear_down(deadline);
     }
 }
@@ -738,9 +762,22 @@ fn scenario(
     run_scenario(
         evidence,
         |evidence| action(&paths, evidence),
+        // Every collection step runs; their failures are reported together.
         |evidence| {
-            paths.write_store_evidence(evidence)?;
-            collect_available(evidence, &paths.state, &paths.teardown)
+            let failures: Vec<String> = [
+                paths.write_store_evidence(evidence),
+                collect_available(evidence, &paths.state, &paths.teardown),
+                paths.outputs_written(),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.detail().to_owned())
+            .collect();
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(infra(failures.join("; ")))
+            }
         },
     )
     .require_pass()
@@ -805,7 +842,7 @@ fn s1_f08_crash_inside_spawn_write_leaves_nothing() -> TestResult {
                 format!("crashed spawn client exited {status} with a receipt")
             })?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let recovered = paths.counts()?;
             check(recovered == [0; 5], || {
@@ -862,7 +899,7 @@ fn s1_f08_crash_after_spawn_commit_keeps_the_whole_session() -> TestResult {
                 format!("crashed spawn client exited {status} with a receipt")
             })?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             // Durable state as the crash left it, before any restart.
             check_whole_queued_session(paths)?;
             let session = paths.only_session()?;
@@ -980,7 +1017,7 @@ fn s1_f08_lost_spawn_reply_leaves_one_whole_undispatched_session() -> TestResult
             check_whole_queued_session(paths)?;
             let session = paths.only_session()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             runs_once_after_restart(paths, evidence, &session)?;
             completes_normally(paths, evidence).map(drop)
@@ -1171,7 +1208,7 @@ fn s1_f10_submission_precedes_agent_io_and_restarts_unknown() -> TestResult {
             )?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
             check(
@@ -1214,7 +1251,7 @@ fn s1_f10_crash_after_prompt_write_restarts_unknown_without_resend() -> TestResu
             )?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let envelope = restarted_unknown(paths, evidence, &session)?;
             check(envelope["vendor"]["turn_id"].is_null(), || {
@@ -1260,7 +1297,7 @@ fn s1_f10_crash_before_acceptance_commit_restarts_unknown() -> TestResult {
                 || format!("acceptance recorded despite the crash: {}", turn.state),
             )?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let envelope = restarted_unknown(paths, evidence, &session)?;
             check(envelope["timestamps"]["accepted_at"].is_null(), || {
@@ -1373,7 +1410,7 @@ fn s1_f10_failed_host_reconciliation_refuses_admission() -> TestResult {
             wait_file(&paths.sync.join("prompted.entered"))?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let tamper = |phase: &str| {
                 let store =
                     rusqlite::Connection::open(paths.state.join("store.sqlite3")).map_err(infra)?;
@@ -1463,7 +1500,7 @@ fn s1_f10_recovery_pages_past_ten_thousand_anchors_and_admits() -> TestResult {
             wait_file(&paths.sync.join("prompted.entered"))?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             insert_proven_absent(paths, &session, "synthetic", 10_001)?;
             let mut daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
@@ -1512,7 +1549,7 @@ fn s1_f10_reconciliation_deadline_settles_uncertain_and_admits() -> TestResult {
                 .map_err(|error| fail(&format!("failpoint {intent}: {error}")))?;
             daemon.kill()?;
             paths.failpoints.disarm(intent).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             check(paths.anchors_for(&session)? == 0, || {
                 "the crashed turn launched".to_owned()
             })?;
@@ -1566,7 +1603,7 @@ fn s1_f10_failed_absence_commit_fails_startup() -> TestResult {
             wait_file(&paths.sync.join("prompted.entered"))?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let commit = "host.recovery.absence_commit";
             arm(paths, commit, "fail_io")?;
             let (status, trace) = refused_start(paths, evidence, "refused")?;
@@ -1653,7 +1690,7 @@ fn s1_f10_uncertain_submission_latches_and_launches_nothing() -> TestResult {
                 || "a vendor launched after the uncertain submission".to_owned(),
             )?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             restarted_unknown(paths, evidence, &session)?;
             completes_normally(paths, evidence).map(drop)
@@ -1703,7 +1740,7 @@ fn s1_f10_force_at_the_pre_arm_gate_launches_nothing() -> TestResult {
             check(status.code() == Some(0), || format!("daemon exit {status}"))?;
             // A later daemon runs a normal turn, which also leaves turn evidence.
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence).map(drop)
         },
@@ -1743,7 +1780,7 @@ fn s1_f10_latch_at_the_pre_arm_gate_launches_nothing() -> TestResult {
             check_pre_launch_force(paths, &session, false)?;
             paths.failpoints.disarm(gate).map_err(infra)?;
             paths.failpoints.disarm(lost).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence).map(drop)
         },
@@ -1828,7 +1865,7 @@ fn s1_f12_lost_terminal_reply_returns_the_envelope_and_latches() -> TestResult {
             })?;
             latched_exit(&mut daemon)?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence).map(drop)
         },
@@ -1888,7 +1925,7 @@ fn s1_f12_stalled_force_path_read_expires_within_the_shutdown_bound() -> TestRes
                 format!("events {types:?}")
             })?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence).map(drop)
         },
@@ -1916,7 +1953,7 @@ fn s1_f10_lost_recovery_terminal_reply_fails_startup_then_admits() -> TestResult
             acknowledged(paths, evidence, intent, "pause", &daemon)?;
             daemon.kill()?;
             paths.failpoints.disarm(intent).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             // Recovery commits `cancel.requested` and `cancel.settled`, then the
             // terminal: the third Core lifecycle commit of the new daemon.
             let lost = "store.commit.reply_lost";
@@ -2058,7 +2095,7 @@ fn s1_t2c_crash_with_a_queued_successor_cancels_it_on_restart() -> TestResult {
             let resume = t2c_resume(paths, evidence, "resume", &session, "c2")?;
             check(resume.status.success(), || "resume refused".to_owned())?;
             daemon.kill()?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let (state, first) = turn_n(paths, &session, 1)?;
             check(
@@ -2130,7 +2167,7 @@ fn s1_t2c_queued_successor_after_a_committed_terminal_runs_on_restart() -> TestR
             })?;
             daemon.kill()?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let envelope = t2c_wait(paths, evidence, &format!("{session}/2"))?;
             check(envelope["state"] == "completed", || {
@@ -2167,7 +2204,7 @@ fn s1_t2c_keyed_receipt_replay_after_restart_runs_once() -> TestResult {
             )?;
             latched_exit(&mut daemon)?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let session = paths.only_session()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let replay = t2c_spawn(paths, evidence, "spawn-replay", "k1", Some("key-1"))?;
@@ -2226,7 +2263,7 @@ fn s1_t2c_unkeyed_lost_resume_receipt_runs_once_after_restart() -> TestResult {
                 format!("turn 2 before restart: {state}")
             })?;
             paths.failpoints.disarm(point).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let second = t2c_wait(paths, evidence, &format!("{session}/2"))?;
             check(second["state"] == "completed", || {
@@ -2259,7 +2296,7 @@ fn s1_t2c_lost_handoff_cancellation_reply_fails_startup_then_admits() -> TestRes
             let resume = t2c_resume(paths, evidence, "resume", &session, "c2")?;
             check(resume.status.success(), || "resume refused".to_owned())?;
             daemon.kill()?;
-            drop(daemon);
+            daemon.shutdown()?;
             // Recovery commits turn 1's `cancel.requested`,
             // `cancel.settled` and terminal; the handoff's cancellation of
             // turn 2 is fourth.
@@ -2424,7 +2461,7 @@ fn s1_t2d_force_while_turns_wait_for_a_slot() -> TestResult {
         check((forced, never_submitted) == (4, 2), || {
             format!("forced {forced}, cancelled while waiting {never_submitted}")
         })?;
-        drop(daemon);
+        daemon.shutdown()?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
     })
@@ -2469,7 +2506,7 @@ fn s1_t2d_latch_while_turns_wait_for_a_slot() -> TestResult {
             format!("waiting {waiting}, anchors {anchors}, submitted {submitted}")
         })?;
         paths.failpoints.disarm(lost).map_err(infra)?;
-        drop(daemon);
+        daemon.shutdown()?;
         release_six(paths)?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
@@ -2570,7 +2607,7 @@ fn s1_t2d_uncertain_cleanup_keeps_its_connection_slot() -> TestResult {
                 "shutdown never proved turn A's group absent".to_owned()
             })?;
             paths.failpoints.disarm(commit).map_err(infra)?;
-            drop(daemon);
+            daemon.shutdown()?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             completes_normally(paths, evidence).map(drop)
         },
@@ -2611,7 +2648,7 @@ fn s1_t2d_unproven_recovered_group_reduces_capacity() -> TestResult {
         // anchors (S1-evidence2 fix round 2, finding 1: every run is
         // validated).
         delete_synthetic(paths, "unverified-")?;
-        drop(daemon);
+        daemon.shutdown()?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
     })
@@ -2701,7 +2738,7 @@ fn s1_t2d_recovery_deadline_counts_unread_unproven_anchors() -> TestResult {
         // As above: the fabricated rows go before the run's teardown.
         delete_synthetic(paths, "0-synthetic")?;
         delete_synthetic(paths, "1-unproven")?;
-        drop(daemon);
+        daemon.shutdown()?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
     })

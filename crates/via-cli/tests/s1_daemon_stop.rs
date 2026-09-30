@@ -52,6 +52,9 @@ struct Paths {
     teardown: outer_cleanup::Teardown,
     /// Daemon runs started so far, numbering their traces and reports.
     runs: std::sync::atomic::AtomicUsize,
+    /// Command outputs that could not be written as evidence: reported at
+    /// collection, beside the scenario's outcome, never in its place.
+    lost_outputs: std::sync::Mutex<Vec<String>>,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -84,6 +87,7 @@ impl Paths {
             _root: root,
             teardown: outer_cleanup::Teardown::new(),
             runs: std::sync::atomic::AtomicUsize::new(0),
+            lost_outputs: std::sync::Mutex::new(Vec::new()),
             via,
             fake,
             state,
@@ -113,19 +117,41 @@ impl Paths {
     ) -> Result<Captured, ScenarioError> {
         let mut command = self.command();
         command.args(args);
-        let capture = run_command(&mut command, Duration::from_secs(15)).map_err(infra)?;
-        // The captured outcome first; a lost output write is attached to
-        // it, never in its place (S1-evidence2 fix round 2, finding 5).
-        let written = daemon::write_output(evidence, name, &capture);
+        let mut capture = run_command(&mut command, Duration::from_secs(15)).map_err(infra)?;
+        // The captured outcome first: a lost output write is attached to
+        // the capture and reported at collection, never in its place; the
+        // caller classifies the exit (S1-evidence2 fix round 2 finding 5,
+        // fix round 3).
+        if let Err(error) = daemon::write_output(evidence, name, &capture) {
+            capture.attached.push(error.detail().to_owned());
+            self.lost_outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(error.detail().to_owned());
+        }
         if capture.timed_out {
             return Err(ScenarioError::Timeout(format!(
-                "via {args:?} timed out{}{}",
-                capture.notes(),
-                daemon::note(written.as_ref().err())
+                "via {args:?} timed out{}",
+                capture.notes()
             )));
         }
-        written?;
         Ok(capture)
+    }
+
+    /// Fails if any command output could not be written as evidence.
+    fn outputs_written(&self) -> Result<(), ScenarioError> {
+        let lost = self
+            .lost_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lost.is_empty() {
+            Ok(())
+        } else {
+            Err(infra(format!(
+                "command output not written: {}",
+                lost.join("; ")
+            )))
+        }
     }
 
     /// Writes every committed envelope and event, read-only, as scenario evidence.
@@ -305,22 +331,18 @@ impl<'a> Daemon<'a> {
 }
 
 impl Drop for Daemon<'_> {
-    /// The scenario's final teardown of this run (runtime §11.2): a live
+    /// The scenario's final teardown of this run (runtime §11.2): a
     /// daemon's drop begins, or joins, the scenario's one teardown deadline
     /// (`Paths::teardown`), which bounds the force-stop (at most 2 s), the
-    /// exit wait, the kill's 1 s reap and the anchor cleanup; an exited
-    /// daemon's drop joins a teardown already begun, or else processes its
-    /// anchors with its own bound, beginning nothing. The run is recorded in
+    /// exit wait, the kill's 1 s reap and the anchor cleanup. An exited
+    /// daemon's drop begins or joins it too. The run is recorded in
     /// `cleanup-<n>-<run>.json` and the teardown, which
     /// [`daemon::collect_available`] validates as a whole.
     fn drop(&mut self) {
         let paths = self.paths;
-        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
-        let deadline = if live || paths.teardown.begun() {
-            paths.teardown.begin()
-        } else {
-            Instant::now() + outer_cleanup::TEARDOWN
-        };
+        // Final, live or exited: it begins or joins the scenario's one
+        // deadline (S1-evidence2 fix round 3, Sol r3 finding 1).
+        let deadline = paths.teardown.begin();
         let rows = self.crash_snapshot.take();
         paths.teardown.daemon_generation(
             &self.run,
@@ -572,9 +594,22 @@ fn scenario(
     run_scenario(
         evidence,
         |evidence| action(&paths, evidence),
+        // Every collection step runs; their failures are reported together.
         |evidence| {
-            paths.write_store_evidence(evidence)?;
-            collect_available(evidence, &paths.state, &paths.teardown)
+            let failures: Vec<String> = [
+                paths.write_store_evidence(evidence),
+                collect_available(evidence, &paths.state, &paths.teardown),
+                paths.outputs_written(),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.detail().to_owned())
+            .collect();
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(infra(failures.join("; ")))
+            }
         },
     )
     .require_pass()
