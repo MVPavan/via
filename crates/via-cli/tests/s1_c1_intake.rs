@@ -32,9 +32,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Sandbox, TestResult, cli, failure, infra};
+use daemon::{Daemon, Sandbox, TestResult, cli, collect_available, failure, infra};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::evidence::Evidence;
@@ -185,7 +185,7 @@ impl Setup {
         evidence
             .write("events.ndjson", events.as_bytes())
             .map_err(infra)?;
-        collect_available(evidence, &self.sandbox.state)
+        collect_available(evidence, &self.sandbox.state, &self.sandbox.teardown)
     }
 
     /// One completed turn, so the scenario leaves an evidence folder.
@@ -1908,11 +1908,13 @@ fn proxy_with_closed_stdout(
     let deadline = Instant::now() + Duration::from_secs(20);
     while child.try_wait().map_err(infra)?.is_none() {
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ScenarioError::Timeout(
-                "serve --stdio did not exit with stdout closed".to_owned(),
-            ));
+            // A bounded reap, never a blocking wait (S1-evidence2 fix round
+            // 2, finding 10); an unreaped child is named in the timeout.
+            let reaped =
+                outer_cleanup::kill_and_reap(&mut child, Instant::now() + outer_cleanup::REAP);
+            return Err(ScenarioError::Timeout(format!(
+                "serve --stdio did not exit with stdout closed (killed, reaped in 1 s: {reaped})"
+            )));
         }
         thread::sleep(Duration::from_millis(20));
     }

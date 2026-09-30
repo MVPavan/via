@@ -16,8 +16,10 @@ use std::collections::HashSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, failure, infra, refused, request};
-use scenario::{ScenarioError, collect_available, run_scenario};
+use daemon::{
+    Daemon, Raw, Sandbox, TestResult, cli, collect_available, failure, infra, refused, request,
+};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -559,5 +561,5 @@ fn collect(evidence: &Evidence, sandbox: &Sandbox) -> Result<(), ScenarioError> 
     evidence
         .write("events.ndjson", events.as_bytes())
         .map_err(infra)?;
-    collect_available(evidence, &sandbox.state)
+    collect_available(evidence, &sandbox.state, &sandbox.teardown)
 }

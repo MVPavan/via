@@ -18,8 +18,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, events, failure, infra, request};
-use scenario::{ScenarioError, collect_available, run_scenario};
+use daemon::{
+    Daemon, Raw, Sandbox, TestResult, cli, collect_available, events, failure, infra, request,
+};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::evidence::Evidence;
@@ -205,7 +207,7 @@ fn s1_blob_prompt_over_inline_max_is_a_verified_blob() -> TestResult {
                 .map_err(infra)?;
             stored_as_expected(&sandbox, (&session, &large), (&small_session, &inline))
         },
-        |evidence| collect_available(evidence, &sandbox.state),
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );
     report.require_pass()
 }

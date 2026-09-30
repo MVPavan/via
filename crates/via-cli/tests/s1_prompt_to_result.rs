@@ -15,110 +15,65 @@ mod support;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use scenario::{Captured, ScenarioError, collect_available, run_command, run_scenario};
+use daemon::collect_available;
+use scenario::{Captured, ScenarioError, run_command, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Runtime §11.2 outer cleanup after the daemon exited, by the teardown's
-/// `deadline`: a read-only anchor snapshot, verified anchor control and
-/// `ESRCH` absence, never a Core reopen.
-fn verify_anchors_after_daemon(
-    cx: &Context<'_>,
-    deadline: Instant,
-) -> Result<Value, ScenarioError> {
-    let rows = outer_cleanup::snapshot(&cx.state.join("store.sqlite3")).map_err(infra)?;
-    Ok(outer_cleanup::verify(&rows, deadline))
-}
-
 struct Daemon<'a> {
     child: Child,
     cx: &'a Context<'a>,
-    cleanup_path: PathBuf,
+    /// This daemon's own cleanup report, `cleanup-<n>.json`.
+    report: PathBuf,
     ready: bool,
 }
 
 impl Drop for Daemon<'_> {
-    /// Runtime §11.2: one teardown deadline, taken on entry; each phase
-    /// gets only the time left.
+    /// The scenario's final teardown of this daemon (runtime §11.2): a live
+    /// daemon's drop begins, or joins, the scenario's one teardown deadline
+    /// (`Context::teardown`), which bounds the force-stop (at most 2 s, only
+    /// for a daemon that became ready), the exit wait, the kill's 1 s reap
+    /// and the anchor cleanup; an exited daemon's drop joins a teardown
+    /// already begun, or else processes its anchors with its own bound.
+    /// Recorded in its report and the teardown, which
+    /// [`daemon::collect_available`] validates as a whole.
     fn drop(&mut self) {
-        let outer = Instant::now() + outer_cleanup::TEARDOWN;
-        let was_alive = matches!(self.child.try_wait(), Ok(None));
-        let mut anchors = json!({"status":"unverified","absence_proven":false,"reason":"verified cleanup unavailable"});
-        let mut stop = "not_attempted";
-        let mut direct_kill = "not_needed";
-        let mut direct_reaped = false;
-        if was_alive && self.ready {
-            stop = match self.cx.run(
-                &["daemon", "stop", "--force", "--json"],
-                outer_cleanup::left(outer).min(Duration::from_secs(2)),
-            ) {
-                Ok(capture) if capture.timed_out => "timed_out",
-                Ok(capture) if capture.status.success() => "accepted",
-                Ok(_) => "refused",
-                Err(_) => "unavailable",
-            };
-        }
-        let deadline = outer.min(Instant::now() + Duration::from_secs(1));
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    direct_reaped = true;
-                    break;
+        let cx = self.cx;
+        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let deadline = if live || cx.teardown.begun() {
+            cx.teardown.begin()
+        } else {
+            Instant::now() + outer_cleanup::TEARDOWN
+        };
+        let ready = self.ready;
+        cx.teardown.daemon_generation(
+            &self.child.id().to_string(),
+            deadline,
+            &mut self.child,
+            Some((&cx.state.join("store.sqlite3"), None)),
+            Some(&self.report),
+            |by| {
+                if ready {
+                    outer_cleanup::run_within(
+                        cx.command().args(["daemon", "stop", "--force", "--json"]),
+                        by,
+                    )
+                } else {
+                    (
+                        json!({"status":"not_attempted","reason":"never ready"}),
+                        None,
+                    )
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-                Ok(None) | Err(_) => break,
-            }
-        }
-        if !direct_reaped {
-            direct_kill = if self.child.kill().is_ok() {
-                "sent_to_retained_child"
-            } else {
-                "failed"
-            };
-            let deadline = outer.min(Instant::now() + Duration::from_secs(1));
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        direct_reaped = true;
-                        break;
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-        if direct_reaped {
-            anchors = verify_anchors_after_daemon(self.cx, outer).unwrap_or_else(|error| {
-                json!({
-                    "status":"unverified","absence_proven":false,"reason":error.to_string()
-                })
-            });
-        }
-        let report = json!({
-            "direct_child": {"pid":self.child.id(),"was_alive":was_alive,"stop":stop,"kill":direct_kill,"reaped":direct_reaped},
-            "anchors": anchors,
-        });
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.cleanup_path)
-        {
-            let _ = file.write_all(report.to_string().as_bytes());
-            let _ = file.sync_all();
-        }
+            },
+        );
     }
 }
 
@@ -129,6 +84,8 @@ struct Context<'a> {
     fake: &'a Path,
     fixture: &'a Path,
     sync: &'a Path,
+    /// The scenario's one final teardown (runtime §11.2).
+    teardown: outer_cleanup::Teardown,
 }
 
 impl Context<'_> {
@@ -154,8 +111,11 @@ impl Context<'_> {
 fn start_daemon<'a>(
     cx: &'a Context<'a>,
     trace: &Path,
-    cleanup_path: PathBuf,
+    report: PathBuf,
 ) -> Result<Daemon<'a>, ScenarioError> {
+    if cx.teardown.begun() {
+        return Err(infra("a daemon started after the final teardown began"));
+    }
     let mut command = cx.command();
     command
         .arg("daemon")
@@ -165,7 +125,7 @@ fn start_daemon<'a>(
     let mut daemon = Daemon {
         child: command.spawn().map_err(infra)?,
         cx,
-        cleanup_path,
+        report,
         ready: false,
     };
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -177,14 +137,15 @@ fn start_daemon<'a>(
         }
         // A direct probe: never auto-starts a second daemon, which could
         // win `daemon.lock` over the child, even over a stale socket file.
-        if daemon::serving_pid(cx.runtime) == Some(daemon.child.id()) {
-            daemon.ready = true;
-            return Ok(daemon);
-        }
-        if Instant::now() >= deadline {
+        let ready = daemon::serving_pid(cx.runtime) == Some(daemon.child.id());
+        if Instant::now() > deadline {
             return Err(ScenarioError::Timeout(
                 "daemon readiness deadline elapsed".to_owned(),
             ));
+        }
+        if ready {
+            daemon.ready = true;
+            return Ok(daemon);
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -202,21 +163,24 @@ fn cli(
     timeout: Duration,
 ) -> Result<Vec<u8>, ScenarioError> {
     let capture = cx.run(args, timeout).map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stdout"), &capture.stdout)
-        .map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stderr"), &capture.stderr)
-        .map_err(infra)?;
+    // The captured outcome first; a lost output write is attached to it,
+    // never in its place (S1-evidence2 fix round 2, finding 5).
+    let written = daemon::write_output(evidence, name, &capture);
     if capture.timed_out {
-        return Err(ScenarioError::Timeout(format!("via {args:?} timed out")));
+        return Err(ScenarioError::Timeout(format!(
+            "via {args:?} timed out{}{}",
+            capture.notes(),
+            daemon::note(written.as_ref().err())
+        )));
     }
     if !capture.status.success() {
         return Err(ScenarioError::Failure(format!(
-            "via {args:?} exited {}",
-            capture.status
+            "via {args:?} exited {}{}",
+            capture.status,
+            daemon::note(written.as_ref().err())
         )));
     }
+    written?;
     Ok(capture.stdout)
 }
 
@@ -318,17 +282,24 @@ fn expect_request_error(
     kind: &str,
 ) -> Result<(), ScenarioError> {
     let capture = cx.run(args, Duration::from_secs(5)).map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stdout"), &capture.stdout)
-        .map_err(infra)?;
-    evidence
-        .write(&format!("{name}.stderr"), &capture.stderr)
-        .map_err(infra)?;
-    if capture.timed_out || capture.status.code() != Some(2) {
-        return Err(ScenarioError::Failure(format!(
-            "{name}: expected request exit 2"
+    let written = daemon::write_output(evidence, name, &capture);
+    // A timeout is classified before the refusal is interpreted
+    // (S1-evidence2 fix round 2, finding 4).
+    if capture.timed_out {
+        return Err(ScenarioError::Timeout(format!(
+            "{name}: via {args:?} timed out{}{}",
+            capture.notes(),
+            daemon::note(written.as_ref().err())
         )));
     }
+    if capture.status.code() != Some(2) {
+        return Err(ScenarioError::Failure(format!(
+            "{name}: expected request exit 2, got {}{}",
+            capture.status,
+            daemon::note(written.as_ref().err())
+        )));
+    }
+    written?;
     let error: Value = serde_json::from_slice(&capture.stderr).map_err(infra)?;
     if error["data"]["kind"] != kind {
         return Err(ScenarioError::Failure(format!(
@@ -410,6 +381,7 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
         fake: &fake,
         fixture: &fixture,
         sync: &sync,
+        teardown: outer_cleanup::Teardown::new(),
     };
     let generated_handle = RefCell::new(None::<String>);
     let report = run_scenario(
@@ -418,7 +390,7 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
             let _daemon = start_daemon(
                 &cx,
                 &evidence.dir.join("daemon.trace"),
-                evidence.dir.join("cleanup.json"),
+                evidence.dir.join("cleanup-1.json"),
             )?;
             let (session, handle) = spawn_and_validate(&cx, evidence)?;
             *generated_handle.borrow_mut() = Some(handle.clone());
@@ -496,7 +468,7 @@ fn s1_prompt_to_result_real_cli() -> TestResult {
             Ok(())
         },
         |evidence| {
-            collect_available(evidence, &state)?;
+            collect_available(evidence, &state, &cx.teardown)?;
             if let Some(handle) = generated_handle.borrow().as_ref() {
                 scan_for_handle(evidence, handle)?;
             }
@@ -531,6 +503,7 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
         fake: &fake,
         fixture: &fixture,
         sync: &sync,
+        teardown: outer_cleanup::Teardown::new(),
     };
     let report = run_scenario(
         evidence,
@@ -538,7 +511,7 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
             let _daemon = start_daemon(
                 &cx,
                 &evidence.dir.join("daemon.trace"),
-                evidence.dir.join("cleanup.json"),
+                evidence.dir.join("cleanup-1.json"),
             )?;
             let receipt_bytes = cli(
                 &cx,
@@ -654,7 +627,7 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
             evidence.write("logs.ndjson", &logs).map_err(infra)?;
             Ok(())
         },
-        |evidence| collect_available(evidence, &state),
+        |evidence| collect_available(evidence, &state, &cx.teardown),
     );
     report.require_pass()
 }
@@ -678,6 +651,7 @@ fn s1_cli_auto_starts_daemon_and_keeps_result() -> TestResult {
         fake: &fake,
         fixture: &fixture,
         sync: &sync,
+        teardown: outer_cleanup::Teardown::new(),
     };
     let report = run_scenario(
         evidence,
@@ -703,43 +677,44 @@ fn s1_cli_auto_starts_daemon_and_keeps_result() -> TestResult {
             Ok(())
         },
         |evidence| {
-            // Runtime §11.2: one teardown deadline for every phase.
-            let outer = Instant::now() + outer_cleanup::TEARDOWN;
-            let stop = cx
-                .run(
-                    &["daemon", "stop", "--force", "--json"],
-                    outer_cleanup::left(outer).min(Duration::from_secs(2)),
-                )
-                .map_err(infra)?;
-            let stop_accepted = !stop.timed_out && stop.status.success();
-            let deadline = outer.min(Instant::now() + Duration::from_secs(2));
-            while runtime.join("via.sock").exists() && Instant::now() < deadline {
+            // Runtime §11.2: the scenario's final teardown of the daemon
+            // the CLI started, under its one deadline: a force-stop for at
+            // most 2 s, the socket's removal observed by the deadline, the
+            // anchor cleanup; recorded as this scenario's only generation.
+            let outer = cx.teardown.begin();
+            let (stop, stop_failure) = outer_cleanup::run_within(
+                cx.command().args(["daemon", "stop", "--force", "--json"]),
+                outer.min(Instant::now() + outer_cleanup::ORDINARY_STOP),
+            );
+            let stop_accepted = stop["status"] == "accepted";
+            let stopped = loop {
+                let present = runtime.join("via.sock").exists();
+                if Instant::now() > outer {
+                    break false;
+                }
+                if !present {
+                    break true;
+                }
                 thread::sleep(Duration::from_millis(5));
-            }
-            let stopped = !runtime.join("via.sock").exists();
-            let anchors = if stopped {
-                verify_anchors_after_daemon(&cx, outer).unwrap_or_else(|error| {
-                    json!({
-                        "status":"unverified","absence_proven":false,"reason":error.to_string()
-                    })
-                })
-            } else {
-                json!({"status":"unverified","absence_proven":false,"reason":"daemon socket remained open"})
             };
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(evidence.dir.join("cleanup.json"))
-                .map_err(infra)?;
-            file.write_all(
-                json!({"anchors":anchors,"daemon":{"stop_accepted":stop_accepted,"socket_removed":stopped},"cli_child":"reaped_by_runner"})
-                    .to_string()
-                    .as_bytes(),
-            )
-            .map_err(infra)?;
-            file.sync_all().map_err(infra)?;
-            collect_available(evidence, &state)?;
+            let anchors = outer_cleanup::anchors_by(&state.join("store.sqlite3"), None, outer);
+            let mut failures: Vec<String> = stop_failure.into_iter().collect();
+            if !stopped {
+                failures.push("the daemon socket remained by the teardown deadline".to_owned());
+            }
+            if !outer_cleanup::anchors_proven(&anchors) {
+                failures.push(format!(
+                    "outer anchor cleanup is unverified: {}",
+                    anchors["status"]
+                ));
+            }
+            let failure = (!failures.is_empty()).then(|| failures.join("; "));
+            cx.teardown.record(
+                json!({"generation":"auto","daemon":{"stop":stop,"socket_removed":stopped},
+                    "cli_child":"reaped_by_runner","anchors":anchors,"failures":failures}),
+                failure,
+            );
+            collect_available(evidence, &state, &cx.teardown)?;
             if !stop_accepted || !stopped {
                 return Err(ScenarioError::Infrastructure(
                     "auto-started daemon did not stop cleanly".to_owned(),
@@ -1004,6 +979,7 @@ fn s1_c1_events_receipt_and_envelope_shapes() -> TestResult {
         fake: &fake,
         fixture: &fixture,
         sync: &sync,
+        teardown: outer_cleanup::Teardown::new(),
     };
     let report = run_scenario(
         evidence,
@@ -1011,7 +987,7 @@ fn s1_c1_events_receipt_and_envelope_shapes() -> TestResult {
             let _daemon = start_daemon(
                 &cx,
                 &evidence.dir.join("daemon.trace"),
-                evidence.dir.join("cleanup.json"),
+                evidence.dir.join("cleanup-1.json"),
             )?;
             let output = cli(
                 &cx,
@@ -1074,7 +1050,7 @@ fn s1_c1_events_receipt_and_envelope_shapes() -> TestResult {
                 Err(ScenarioError::Failure(problems.join("\n")))
             }
         },
-        |evidence| collect_available(evidence, &state),
+        |evidence| collect_available(evidence, &state, &cx.teardown),
     );
     report.require_pass()
 }

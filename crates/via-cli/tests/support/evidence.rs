@@ -25,9 +25,13 @@ pub(crate) struct Evidence {
     /// evidence folder: `finish` then waives only `evidence/*`; the
     /// collector checks that every launched turn still has its folder.
     pub(crate) folders_expected: bool,
-    /// Why collecting the State or proving cleanup failed, if it did:
-    /// recorded beside the scenario's outcome, never in its place.
+    /// Why proving cleanup failed, if it did: recorded beside the
+    /// scenario's outcome, never in its place; failures accumulate.
     cleanup_failure: Option<String>,
+    /// Why collecting the State's evidence failed, if it did: recorded
+    /// beside the outcome and any cleanup failure (S1-evidence2 fix round
+    /// 2, finding 6).
+    pub(crate) collection_failure: Option<String>,
     /// The scenario's outcome and detail, once `finish` began: a
     /// finalization that fails partway keeps them in the fallback artifact.
     finishing: Option<(String, String)>,
@@ -62,6 +66,7 @@ impl Evidence {
             store_expected: true,
             folders_expected: true,
             cleanup_failure: None,
+            collection_failure: None,
             finishing: None,
         })
     }
@@ -95,11 +100,11 @@ impl Evidence {
         copy_tree(root, &self.dir.join("evidence"))
     }
 
-    /// Records that collecting the State or proving cleanup failed: `finish`
-    /// then keeps the scenario's outcome, marks the evidence incomplete and
-    /// fails.
+    /// Records that proving cleanup failed: `finish` then keeps the
+    /// scenario's outcome, marks the evidence incomplete and fails. Each
+    /// failure is kept beside the earlier ones.
     pub(crate) fn cleanup_failed(&mut self, detail: String) {
-        self.cleanup_failure = Some(detail);
+        accumulate(&mut self.cleanup_failure, detail);
     }
 
     /// Finalizes the artifact with the scenario's own `outcome` (runtime
@@ -136,8 +141,11 @@ impl Evidence {
         {
             missing.push("evidence/*");
         }
-        let evidence_failure = (!missing.is_empty())
+        let mut evidence_failure = (!missing.is_empty())
             .then(|| format!("missing required evidence: {}", missing.join(", ")));
+        if let Some(collection) = self.collection_failure.clone() {
+            accumulate(&mut evidence_failure, collection);
+        }
         let failures: Vec<&str> = [&evidence_failure, &self.cleanup_failure]
             .into_iter()
             .flatten()
@@ -262,6 +270,7 @@ impl Drop for Evidence {
                 "detail":detail,
                 "evidence_complete":false,
                 "evidence_failure":"evidence finalization did not complete",
+                "collection_failure":self.collection_failure,
                 "cleanup_failure":self.cleanup_failure,
             });
             let _ = fs::write(self.dir.join("summary.json"), summary.to_string());
@@ -276,6 +285,14 @@ impl Drop for Evidence {
             let _ = self.write_manifest();
         }
     }
+}
+
+/// Adds `detail` beside the failure already in `slot`, if any.
+fn accumulate(slot: &mut Option<String>, detail: String) {
+    *slot = Some(match slot.take() {
+        Some(earlier) => format!("{earlier}; {detail}"),
+        None => detail,
+    });
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> EvidenceResult {

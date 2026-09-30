@@ -3,10 +3,15 @@
 //! peer uid check (C1 §1 "both ends verify the peer uid").
 
 #[path = "support/evidenced.rs"]
-#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; C1 stops its daemon over C1, not the CLI"
+)]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 #[expect(dead_code, reason = "shared support; evidenced uses its typed errors")]
 mod scenario;
@@ -25,6 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use evidenced::evidenced;
+use scenario::ScenarioError;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -40,7 +46,7 @@ struct Sandbox {
     /// collected when the sandbox is dropped.
     evidence: RefCell<Option<support::evidence::Evidence>>,
     /// The scenario's final teardown, shared by its guard and its drop.
-    teardown: evidenced::Teardown,
+    teardown: outer_cleanup::Teardown,
 }
 
 impl Sandbox {
@@ -53,7 +59,7 @@ impl Sandbox {
             state,
             runtime,
             evidence: RefCell::new(None),
-            teardown: evidenced::Teardown::new(),
+            teardown: outer_cleanup::Teardown::new(),
         })
     }
 
@@ -82,8 +88,8 @@ impl Drop for Sandbox {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
             let exited =
-                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |budget| {
-                    stop_by(self, Instant::now() + budget);
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
+                    (stop_by(self, by), None)
                 });
             let expected = evidenced::Expected {
                 store: true,
@@ -100,13 +106,14 @@ impl Drop for Sandbox {
     }
 }
 
-/// Asks the sandbox's daemon to stop over C1 by `deadline`: `hello`, then
-/// `daemon/stop`, each whole exchange bounded by the time left
+/// Asks the sandbox's daemon to force-stop over C1 by `deadline`: `hello`,
+/// then `daemon/stop` with `force` (runtime §11.2's ordinary force-stop),
+/// each whole exchange bounded by the time left
 /// ([`outer_cleanup::exchange`]). The connect is not bounded (the recorded
-/// C1-connect limitation).
-fn stop_by(sandbox: &Sandbox, deadline: Instant) {
+/// C1-connect limitation). Returns the attempt's record.
+fn stop_by(sandbox: &Sandbox, deadline: Instant) -> Value {
     let Ok(stream) = UnixStream::connect(sandbox.socket()) else {
-        return;
+        return json!({"method":"daemon/stop","status":"unreachable"});
     };
     let params =
         json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"c1-test"});
@@ -117,14 +124,20 @@ fn stop_by(sandbox: &Sandbox, deadline: Instant) {
     let accepted = outer_cleanup::exchange(&stream, hello.as_bytes(), deadline, 64 * 1024)
         .and_then(|reply| serde_json::from_slice::<Value>(&reply).ok())
         .is_some_and(|reply| reply["result"]["api_version"] == 1);
-    if accepted {
-        let _ = outer_cleanup::exchange(
-            &stream,
-            b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"daemon/stop\"}\n",
-            deadline,
-            64 * 1024,
-        );
+    if !accepted {
+        return json!({"method":"daemon/stop","status":"hello_refused"});
     }
+    let stop = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":9,"method":"daemon/stop","params":{"force":true}})
+    );
+    let reply = outer_cleanup::exchange(&stream, stop.as_bytes(), deadline, 64 * 1024)
+        .and_then(|reply| serde_json::from_slice::<Value>(&reply).ok());
+    json!({"method":"daemon/stop","force":true,"status":match reply {
+        Some(reply) if reply.get("result").is_some() => "accepted",
+        Some(_) => "refused",
+        None => "no_reply",
+    }})
 }
 
 /// Owns the daemon child: stops it over C1, then kills and reaps it.
@@ -161,7 +174,7 @@ impl<'a> Daemon<'a> {
                 return Err(format!("daemon exited before readiness: {status}").into());
             }
             if Instant::now() >= deadline {
-                return Err("daemon readiness deadline elapsed".into());
+                return Err(timeout("daemon readiness deadline elapsed"));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -172,32 +185,22 @@ impl<'a> Daemon<'a> {
 impl Drop for Daemon<'_> {
     /// Final teardown (runtime §11.2, `via-jm4.19.1`): a live daemon's drop
     /// begins, or joins, the scenario's one teardown deadline, which bounds
-    /// the stop exchanges (at most 2 s), the exit wait (at most 5 s) and
-    /// the kill's 1 s reap; a child still unreaped then is recorded as
-    /// incomplete cleanup.
+    /// the force-stop (at most 2 s), the exit wait and the kill's 1 s reap
+    /// ([`outer_cleanup::teardown_child`]). Every drop records its direct
+    /// child's reap status in the teardown, for `cleanup.json`; an exited
+    /// child's drop begins nothing.
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(None)) {
-            return;
-        }
-        let outer = self.sandbox.teardown.begin();
-        stop_by(
-            self.sandbox,
-            outer.min(Instant::now() + Duration::from_secs(2)),
-        );
-        let exit_by = Instant::now()
-            + outer_cleanup::left(outer)
-                .saturating_sub(Duration::from_secs(1))
-                .min(Duration::from_secs(5));
-        if !evidenced::reap_by(&mut self.child, exit_by) {
-            let _ = self.child.kill();
-            let reap_by = outer.min(Instant::now() + Duration::from_secs(1));
-            if !evidenced::reap_by(&mut self.child, reap_by) {
-                self.sandbox.teardown.failed(format!(
-                    "daemon child {} was not reaped by the teardown deadline",
-                    self.child.id()
-                ));
-            }
-        }
+        let teardown = &self.sandbox.teardown;
+        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let deadline = if live {
+            teardown.begin()
+        } else {
+            Instant::now()
+        };
+        let generation = format!("guard-{}", self.child.id());
+        teardown.daemon_generation(&generation, deadline, &mut self.child, None, None, |by| {
+            (stop_by(self.sandbox, by), None)
+        });
     }
 }
 
@@ -217,11 +220,13 @@ impl Connection {
         })
     }
 
+    /// One request and its reply; a socket timeout is a typed
+    /// [`ScenarioError::Timeout`], so the scenario records `timeout`.
     fn exchange(&mut self, line: &str) -> TestResult<Value> {
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(b"\n")?;
+        self.writer.write_all(line.as_bytes()).map_err(io_error)?;
+        self.writer.write_all(b"\n").map_err(io_error)?;
         let mut reply = String::new();
-        if self.reader.read_line(&mut reply)? == 0 {
+        if self.reader.read_line(&mut reply).map_err(io_error)? == 0 {
             return Err("daemon closed the connection".into());
         }
         Ok(serde_json::from_str(&reply)?)
@@ -274,10 +279,49 @@ fn unknown_field(name: &'static str, method: &str, params: &Value) -> Case {
     }
 }
 
+/// A typed timeout, which `evidenced` records as `timeout`.
+fn timeout(detail: &str) -> Box<dyn Error> {
+    Box::new(ScenarioError::Timeout(detail.to_owned()))
+}
+
+/// An I/O error, typed as a timeout when a socket timeout elapsed.
+fn io_error(error: std::io::Error) -> Box<dyn Error> {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        timeout(&format!("C1 exchange timed out: {error}"))
+    } else {
+        error.into()
+    }
+}
+
+/// Whether `error` is a typed timeout.
+fn is_timeout(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<ScenarioError>()
+        .is_some_and(|error| matches!(error, ScenarioError::Timeout(_)))
+}
+
+/// The scenario's result from its mismatches and timeouts: a timeout is
+/// classified first, so an aggregated timeout records `timeout`, not
+/// `fail`.
+fn verdict(failures: &[String], timeouts: &[String]) -> TestResult {
+    if !timeouts.is_empty() {
+        return Err(timeout(&timeouts.join("; ")));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ScenarioError::Failure(failures.join("\n")).into())
+    }
+}
+
 /// Runs each case on its own connection so one stalled reply cannot hide the
-/// others; returns every mismatch.
-fn run_cases(sandbox: &Sandbox, cases: Vec<Case>) -> Vec<String> {
+/// others; returns every mismatch, and every case that timed out.
+fn run_cases(sandbox: &Sandbox, cases: Vec<Case>) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
+    let mut timeouts = Vec::new();
     for case in cases {
         let outcome = Connection::open(sandbox).and_then(|mut connection| {
             if case.after_hello {
@@ -287,6 +331,10 @@ fn run_cases(sandbox: &Sandbox, cases: Vec<Case>) -> Vec<String> {
         });
         let reply = match outcome {
             Ok(reply) => reply,
+            Err(error) if is_timeout(error.as_ref()) => {
+                timeouts.push(format!("{}: no reply ({error})", case.name));
+                continue;
+            }
             Err(error) => {
                 failures.push(format!("{}: no reply ({error})", case.name));
                 continue;
@@ -307,7 +355,7 @@ fn run_cases(sandbox: &Sandbox, cases: Vec<Case>) -> Vec<String> {
             ));
         }
     }
-    failures
+    (failures, timeouts)
 }
 
 #[test]
@@ -351,7 +399,7 @@ fn c1_request_envelope_is_strict() -> TestResult {
                 ..case(name, line, code, kind_of(code))
             })
             .collect();
-        let mut failures = run_cases(&sandbox, cases);
+        let (mut failures, timeouts) = run_cases(&sandbox, cases);
         // F5: a valid request before `hello` is refused with the handshake
         // error and changes nothing; the connection then completes `hello`.
         let mut connection = Connection::open(&sandbox)?;
@@ -374,8 +422,7 @@ fn c1_request_envelope_is_strict() -> TestResult {
             failures.push(format!("spawn before hello left {sessions} sessions"));
         }
         drop(daemon);
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-        Ok(())
+        verdict(&failures, &timeouts)
     })
 }
 
@@ -443,7 +490,7 @@ fn c1_request_params_are_typed_and_reject_unknown_fields() -> TestResult {
                 "invalid_params",
             ),
         ];
-        let mut failures = run_cases(&sandbox, cases);
+        let (mut failures, mut timeouts) = run_cases(&sandbox, cases);
         // Well-formed requests still succeed after the refusals above.
         let status = Connection::open(&sandbox).and_then(|mut connection| {
             connection.hello()?;
@@ -451,11 +498,13 @@ fn c1_request_params_are_typed_and_reject_unknown_fields() -> TestResult {
         });
         match status {
             Ok(status) if status["id"] == "s" && status["result"]["store_path"].is_string() => {}
+            Err(error) if is_timeout(error.as_ref()) => {
+                timeouts.push(format!("valid status after refusals: {error}"));
+            }
             other => failures.push(format!("valid status after refusals: {other:?}")),
         }
         drop(daemon);
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-        Ok(())
+        verdict(&failures, &timeouts)
     })
 }
 
@@ -538,9 +587,10 @@ fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(20);
     while child.try_wait()?.is_none() {
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("client did not exit".into());
+            if !outer_cleanup::kill_and_reap(&mut child, Instant::now() + outer_cleanup::REAP) {
+                return Err(timeout("client did not exit, and was not reaped in 1 s"));
+            }
+            return Err(timeout("client did not exit"));
         }
         thread::sleep(Duration::from_millis(10));
     }

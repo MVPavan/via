@@ -17,6 +17,8 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 #[expect(dead_code, reason = "shared support; evidenced uses its typed errors")]
 mod scenario;
@@ -33,6 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use evidenced::evidenced;
+use scenario::ScenarioError;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -50,8 +53,14 @@ struct Captured {
     stderr: Vec<u8>,
 }
 
-/// Runs `command` to exit, killing it after `timeout`.
-fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured> {
+/// A typed timeout, which `evidenced` records as `timeout` (runtime §11.2).
+fn timeout(detail: impl Into<String>) -> Box<dyn Error> {
+    Box::new(ScenarioError::Timeout(detail.into()))
+}
+
+/// Runs `command` to exit, killing it after `timeout`: a typed timeout,
+/// with the kill's bounded reap beside it.
+fn run_command(command: &mut Command, within: Duration) -> TestResult<Captured> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -59,10 +68,11 @@ fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured>
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
     let mut child = command.spawn()?;
-    let Some(status) = wait_child(&mut child, timeout)? else {
-        child.kill()?;
-        child.wait()?;
-        return Err(format!("{command:?} timed out").into());
+    let Some(status) = wait_child(&mut child, within)? else {
+        let reaped = outer_cleanup::kill_and_reap(&mut child, Instant::now() + outer_cleanup::REAP);
+        return Err(timeout(format!(
+            "{command:?} timed out (killed, reaped in 1 s: {reaped})"
+        )));
     };
     let read = |file: &mut File| -> TestResult<Vec<u8>> {
         file.rewind()?;
@@ -77,30 +87,37 @@ fn run_command(command: &mut Command, timeout: Duration) -> TestResult<Captured>
     })
 }
 
-/// Waits up to `within` for `child` to exit.
+/// Waits up to `within` for `child` to exit. Each observation is
+/// timestamped after it returns: an exit observed only after the deadline
+/// is `None`.
 fn wait_child(child: &mut Child, within: Duration) -> TestResult<Option<ExitStatus>> {
     let deadline = Instant::now() + within;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
+        let status = child.try_wait()?;
+        if Instant::now() > deadline {
             return Ok(None);
+        }
+        if status.is_some() {
+            return Ok(status);
         }
         thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// Waits up to `within` until `ready` holds.
+/// Waits up to `within` until `ready` holds, observed by the deadline; a
+/// typed timeout otherwise.
 fn wait_until(what: &str, within: Duration, mut ready: impl FnMut() -> bool) -> TestResult {
     let deadline = Instant::now() + within;
-    while !ready() {
-        if Instant::now() >= deadline {
-            return Err(format!("timed out waiting until {what}").into());
+    loop {
+        let reached = ready();
+        if Instant::now() > deadline {
+            return Err(timeout(format!("timed out waiting until {what}")));
+        }
+        if reached {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(5));
     }
-    Ok(())
 }
 
 fn check(condition: bool, message: impl FnOnce() -> String) -> TestResult {
@@ -118,7 +135,7 @@ struct Sandbox {
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
     /// The scenario's final teardown, shared by its guards and its drop.
-    teardown: evidenced::Teardown,
+    teardown: outer_cleanup::Teardown,
     /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
     /// Cleared by a scenario whose turns launch no vendor by design.
@@ -142,11 +159,11 @@ impl Drop for Sandbox {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
             let exited =
-                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |budget| {
-                    evidenced::run_within(
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
+                    outer_cleanup::run_within(
                         self.command().args(["daemon", "stop", "--force", "--json"]),
-                        budget,
-                    );
+                        by,
+                    )
                 });
             let expected = evidenced::Expected {
                 store: self
@@ -202,7 +219,7 @@ impl Sandbox {
         Ok(Self {
             root,
             evidence: Some(evidence),
-            teardown: evidenced::Teardown::new(),
+            teardown: outer_cleanup::Teardown::new(),
             store_expected: std::sync::atomic::AtomicBool::new(true),
             folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
@@ -387,14 +404,23 @@ impl Sandbox {
         })
     }
 
-    /// Proves every committed anchor's group absent, as the runtime §11.2
-    /// outer harness does.
+    /// The scenario's final outer cleanup: proves every committed anchor's
+    /// group absent, as the runtime §11.2 outer harness does, within the
+    /// scenario's one teardown deadline, which this begins or joins.
     fn verify_anchors(&self) -> TestResult {
-        let rows = outer_cleanup::snapshot(&self.state.join("store.sqlite3"))?;
-        let anchors = outer_cleanup::verify(&rows, Instant::now() + Duration::from_secs(10));
-        let absent = anchors["status"] == "quiescent" && anchors["absence_proven"] == true;
-        let none = anchors["status"] == "no_anchors";
-        check(absent || none, || {
+        self.verify_anchors_by(self.teardown.begin())
+    }
+
+    /// An intermediate outer cleanup before a restart, with its own
+    /// runtime §11.2 bound: the final teardown has not begun.
+    fn verify_anchors_between(&self) -> TestResult {
+        self.verify_anchors_by(Instant::now() + outer_cleanup::TEARDOWN)
+    }
+
+    /// Proves every committed anchor's group absent by `deadline`.
+    fn verify_anchors_by(&self, deadline: Instant) -> TestResult {
+        let anchors = outer_cleanup::anchors_by(&self.state.join("store.sqlite3"), None, deadline);
+        check(outer_cleanup::anchors_proven(&anchors), || {
             format!("outer cleanup is unverified: {anchors}")
         })
     }
@@ -420,7 +446,9 @@ impl Sandbox {
                 break bytes;
             }
             if Instant::now() >= deadline {
-                return Err(format!("no acknowledgement of {point} #{occurrence}").into());
+                return Err(timeout(format!(
+                    "no acknowledgement of {point} #{occurrence}"
+                )));
             }
             thread::sleep(Duration::from_millis(5));
         };
@@ -532,11 +560,12 @@ impl Daemon<'_> {
                 )
                 .into());
             }
-            if self.sandbox.status().is_ok() {
-                return Ok(());
+            let ready = self.sandbox.status().is_ok();
+            if Instant::now() > deadline {
+                return Err(timeout("daemon readiness deadline elapsed"));
             }
-            if Instant::now() >= deadline {
-                return Err("daemon readiness deadline elapsed".into());
+            if ready {
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -545,11 +574,10 @@ impl Daemon<'_> {
     /// Waits for the daemon to exit by itself.
     fn exit(&mut self, within: Duration) -> TestResult<ExitStatus> {
         wait_child(&mut self.child, within)?.ok_or_else(|| {
-            format!(
+            timeout(format!(
                 "the daemon did not exit in time: {}",
                 fs::read_to_string(&self.trace).unwrap_or_default()
-            )
-            .into()
+            ))
         })
     }
 
@@ -571,8 +599,25 @@ impl Daemon<'_> {
         trace
     }
 
+    /// The scenario's final stop: a plain `daemon stop` once no work is
+    /// active, the exit 0, then the final outer cleanup
+    /// ([`Sandbox::verify_anchors`]).
+    fn stop_clean(self) -> TestResult {
+        let sandbox = self.sandbox;
+        self.stop_clean_only()?;
+        sandbox.verify_anchors()
+    }
+
+    /// [`Self::stop_clean`] before a restart: its outer cleanup is
+    /// intermediate ([`Sandbox::verify_anchors_between`]).
+    fn stop_clean_between(self) -> TestResult {
+        let sandbox = self.sandbox;
+        self.stop_clean_only()?;
+        sandbox.verify_anchors_between()
+    }
+
     /// A plain `daemon stop` once no work is active; the exit must be 0.
-    fn stop_clean(mut self) -> TestResult {
+    fn stop_clean_only(mut self) -> TestResult {
         wait_until("the daemon is idle", Duration::from_secs(20), || {
             self.sandbox
                 .status()
@@ -582,8 +627,7 @@ impl Daemon<'_> {
         let status = self.exit(Duration::from_secs(15))?;
         check(status.code() == Some(0), || {
             format!("a plain stop exited {status}: {}", self.trace())
-        })?;
-        self.sandbox.verify_anchors()
+        })
     }
 
     /// Waits for a latched daemon's own exit: 4 with `store_failed`.
@@ -602,32 +646,35 @@ impl Daemon<'_> {
 impl Drop for Daemon<'_> {
     /// Final teardown (runtime §11.2): a live daemon's drop begins, or
     /// joins, the scenario's one teardown deadline, which bounds the
-    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap; a
-    /// child still unreaped then is recorded as incomplete cleanup. A
-    /// deliberate mid-test stop exits the daemon first ([`Daemon::exit`]).
+    /// force-stop (at most 2 s), the exit wait and the kill's 1 s reap
+    /// ([`outer_cleanup::teardown_child`]); an exited child's drop begins
+    /// nothing. Either records its direct child's reap status in the
+    /// teardown, for `cleanup.json`. A deliberate mid-test stop exits the
+    /// daemon first ([`Daemon::exit`]).
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(None)) {
-            return;
-        }
-        let outer = self.sandbox.teardown.begin();
-        evidenced::run_within(
-            self.sandbox
-                .command()
-                .args(["daemon", "stop", "--force", "--json"]),
-            outer_cleanup::left(outer).min(Duration::from_secs(2)),
+        let sandbox = self.sandbox;
+        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let deadline = if live {
+            sandbox.teardown.begin()
+        } else {
+            Instant::now()
+        };
+        let generation = format!("guard-{}", self.child.id());
+        sandbox.teardown.daemon_generation(
+            &generation,
+            deadline,
+            &mut self.child,
+            None,
+            None,
+            |by| {
+                outer_cleanup::run_within(
+                    sandbox
+                        .command()
+                        .args(["daemon", "stop", "--force", "--json"]),
+                    by,
+                )
+            },
         );
-        let exit_by =
-            Instant::now() + outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1));
-        if !evidenced::reap_by(&mut self.child, exit_by) {
-            let _ = self.child.kill();
-            let reap_by = outer.min(Instant::now() + Duration::from_secs(1));
-            if !evidenced::reap_by(&mut self.child, reap_by) {
-                self.sandbox.teardown.failed(format!(
-                    "daemon child {} was not reaped by the teardown deadline",
-                    self.child.id()
-                ));
-            }
-        }
     }
 }
 
@@ -1660,14 +1707,25 @@ fn s1_f12_force_rider_rollback_retries() -> TestResult {
 // ------------------------------------------------ Host journal (3, 4)
 
 /// `pid` is live: neither gone nor a zombie awaiting its reaper.
-fn process_live(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|text| {
-            let state = text.get(text.rfind(')')? + 2..)?.chars().next()?;
-            Some(state != 'Z' && state != 'X')
-        })
-        .unwrap_or(false)
+/// Unreadable process state is an error, never absence.
+fn process_live(pid: u32) -> TestResult<bool> {
+    Ok(!process::exited(pid)?)
+}
+
+/// Waits up to `within` until `pid` exited ([`process_live`]), observed by
+/// the deadline; a typed timeout otherwise.
+fn wait_exited(what: &str, within: Duration, pid: u32) -> TestResult {
+    let deadline = Instant::now() + within;
+    loop {
+        let live = process_live(pid)?;
+        if Instant::now() > deadline {
+            return Err(timeout(format!("timed out waiting until {what}")));
+        }
+        if !live {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Design §7.2 row 3 [O1.D10]: an anchor intent that is not committed
@@ -1768,7 +1826,7 @@ fn host_journal_failure_stops_group(point: &str) -> TestResult {
     let agent = sandbox.sync.join("agent.pid");
     if agent.exists() {
         let pid: u32 = fs::read_to_string(&agent)?.trim().parse()?;
-        check(!process_live(pid), || "the vendor survived".to_owned())?;
+        check(!process_live(pid)?, || "the vendor survived".to_owned())?;
     }
     sandbox.resume(&session, &handle, "second")?;
     let second = sandbox.wait(&format!("{session}/2"))?;
@@ -1933,7 +1991,7 @@ fn resumed_paging_daemon(
     let daemon = sandbox.start()?;
     let (seed, _) = sandbox.spawn("seed")?;
     sandbox.wait(&format!("{seed}/1"))?;
-    daemon.stop_clean()?;
+    daemon.stop_clean_between()?;
     arm(sandbox)?;
     restart_with_unread(sandbox, &seed)
 }
@@ -2343,7 +2401,7 @@ fn corrupt_head_read(verb: &str) -> TestResult {
     let (session, handle) = sandbox.spawn("first")?;
     let first = sandbox.wait(&format!("{session}/1"))?;
     check(first["state"] == "completed", || format!("turn 1: {first}"))?;
-    daemon.stop_clean()?;
+    daemon.stop_clean_between()?;
     let daemon = sandbox.start()?;
     let point = "store.read.corrupt.next_seq";
     sandbox.arm(point, 1, "fail_io")?;
@@ -2565,10 +2623,10 @@ fn s1_f12_latch_window_bound_and_host_stop() -> TestResult {
         check(stop["stopping"] == true, || format!("daemon/stop: {stop}"))?;
         // Host's early stop: the running group is gone within 3 s.
         let stopped_by = after + Duration::from_secs(3) + SLACK;
-        wait_until(
+        wait_exited(
             "the running group is gone",
             stopped_by.saturating_duration_since(Instant::now()),
-            || !process_live(vendor),
+            vendor,
         )?;
         // The window ends at failed_at + 5 s: new connections are refused.
         let socket = sandbox.runtime.join("via.sock");
@@ -2865,9 +2923,7 @@ fn s1_f12_latch_pipeline_orders_handoffs() -> TestResult {
         check(status["health"] == "store_failed", || {
             format!("the window's status: {status}")
         })?;
-        wait_until("B's group is gone", Duration::from_secs(3), || {
-            !process_live(vendor)
-        })?;
+        wait_exited("B's group is gone", Duration::from_secs(3), vendor)?;
         check(sandbox.next_hit(early)? > 1, || {
             "no early stop was sent".to_owned()
         })?;
@@ -2947,9 +3003,7 @@ fn s1_f12_host_early_stop_independent_of_store() -> TestResult {
         sandbox.refused(&spawn_args("a", &[]), "store_error")?;
         sandbox.ack(&daemon, "store.commit.reply_lost", lost, "fail_io")?;
         sandbox.ack(&daemon, "host.early_stop.sent", 1, "fail_io")?;
-        wait_until("B's group is gone", Duration::from_secs(3), || {
-            !process_live(vendor)
-        })?;
+        wait_exited("B's group is gone", Duration::from_secs(3), vendor)?;
         sandbox.resume_point("store.commit.step", send)?;
         daemon.latched_exit()?;
         let envelope: String = sandbox.query(&format!(

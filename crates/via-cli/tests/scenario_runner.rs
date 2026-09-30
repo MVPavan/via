@@ -2,6 +2,7 @@
 
 #[path = "support/scenario.rs"]
 mod scenario;
+#[expect(dead_code, reason = "shared support; this file collects no State")]
 mod support;
 
 use std::error::Error;
@@ -10,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use scenario::{ScenarioError, collect_available, run_command, run_scenario};
+use scenario::{ScenarioError, run_command, run_scenario};
 use serde_json::Value;
 use support::evidence::Evidence;
 
@@ -29,7 +30,7 @@ fn outcome(artifact: &Path) -> Result<Value, Box<dyn Error>> {
 
 #[test]
 fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Error>> {
-    let (sandbox, fixture) = fixture()?;
+    let (_sandbox, fixture) = fixture()?;
     let via = Path::new(env!("CARGO_BIN_EXE_via"));
     let evidence = Evidence::new("runner_wrong_result", via, &fixture)?;
     let report = run_scenario(
@@ -45,7 +46,7 @@ fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Erro
             assert_eq!(capture.stdout, b"deliberately wrong result\n");
             Ok(())
         },
-        |evidence| collect_available(evidence, sandbox.path()),
+        |_| Ok(()),
     );
     assert_eq!(report.outcome, "fail");
     assert!(!report.evidence_complete);
@@ -68,7 +69,7 @@ fn actual_wrong_result_panic_is_recorded_as_failure() -> Result<(), Box<dyn Erro
 
 #[test]
 fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>> {
-    let (sandbox, fixture) = fixture()?;
+    let (_sandbox, fixture) = fixture()?;
     let via = Path::new(env!("CARGO_BIN_EXE_via"));
     let evidence = Evidence::new("runner_timeout", via, &fixture)?;
     let report = run_scenario(
@@ -76,25 +77,29 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
         |evidence| {
             let mut command = Command::new("sleep");
             command.arg("5");
-            let capture = run_command(&mut command, Duration::from_millis(20))
+            let capture = run_command(&mut command, Duration::from_millis(400))
                 .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-            evidence
+            // The captured outcome first; a lost output write is attached
+            // to it, never in its place (S1-evidence2 fix round 2, finding 5).
+            let written = evidence
                 .write("sleep.stdout", &capture.stdout)
-                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
-            evidence
-                .write("sleep.stderr", &capture.stderr)
-                .map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
+                .and_then(|()| evidence.write("sleep.stderr", &capture.stderr));
             if capture.timed_out {
                 assert!(!capture.status.success());
-                return Err(ScenarioError::Timeout(
-                    "sleep exceeded scenario deadline".to_owned(),
-                ));
+                return Err(ScenarioError::Timeout(format!(
+                    "sleep exceeded scenario deadline{}{}",
+                    capture.notes(),
+                    written
+                        .err()
+                        .map_or_else(String::new, |error| format!(" ({error})"))
+                )));
             }
+            written.map_err(|error| ScenarioError::Infrastructure(error.to_string()))?;
             Err(ScenarioError::Failure(
                 "sleep unexpectedly finished".to_owned(),
             ))
         },
-        |evidence| collect_available(evidence, sandbox.path()),
+        |_| Ok(()),
     );
     assert_eq!(report.outcome, "timeout");
     assert!(!report.evidence_complete);
@@ -119,7 +124,7 @@ fn actual_hanging_command_is_recorded_as_timeout() -> Result<(), Box<dyn Error>>
 /// S1 critic r2 finding 3).
 #[test]
 fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<dyn Error>> {
-    let (sandbox, fixture) = fixture()?;
+    let (_sandbox, fixture) = fixture()?;
     let via = Path::new(env!("CARGO_BIN_EXE_via"));
     let evidence = Evidence::new("runner_infrastructure_action", via, &fixture)?;
     let report = run_scenario(
@@ -129,7 +134,7 @@ fn infrastructure_failures_are_classified_as_infrastructure() -> Result<(), Box<
                 "fixture host is unavailable".to_owned(),
             ))
         },
-        |evidence| collect_available(evidence, sandbox.path()),
+        |_| Ok(()),
     );
     assert_eq!(report.outcome, "infrastructure_failure");
     assert!(report.require_pass().is_err());

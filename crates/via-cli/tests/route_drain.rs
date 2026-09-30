@@ -7,10 +7,12 @@
 )]
 
 #[path = "support/evidenced.rs"]
-#[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
+#[expect(dead_code, reason = "shared support; this file has no daemon guard")]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 #[expect(dead_code, reason = "shared support; evidenced uses its typed errors")]
 mod scenario;
@@ -26,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use evidenced::evidenced;
+use scenario::ScenarioError;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -109,9 +112,13 @@ impl Sandbox {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("via {args:?} exceeded {timeout:?}");
+                // A typed timeout (runtime §11.2): `evidenced` records it
+                // as `timeout`, with the kill's bounded reap beside it.
+                let reaped =
+                    outer_cleanup::kill_and_reap(&mut child, Instant::now() + outer_cleanup::REAP);
+                std::panic::panic_any(ScenarioError::Timeout(format!(
+                    "via {args:?} exceeded {timeout:?} (killed, reaped in 1 s: {reaped})"
+                )));
             }
             thread::sleep(Duration::from_millis(5));
         };
@@ -188,7 +195,11 @@ impl Sandbox {
             if output.status.success() {
                 return serde_json::from_slice(&output.stdout).unwrap();
             }
-            assert!(Instant::now() < deadline, "no result within {timeout:?}");
+            if Instant::now() >= deadline {
+                std::panic::panic_any(ScenarioError::Timeout(format!(
+                    "no result within {timeout:?}"
+                )));
+            }
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -209,12 +220,12 @@ impl Drop for Sandbox {
         let exited = evidenced::stop_daemons(
             &self.runtime,
             &self.state,
-            &evidenced::Teardown::new(),
-            |budget| {
-                evidenced::run_within(
+            &outer_cleanup::Teardown::new(),
+            |by| {
+                outer_cleanup::run_within(
                     self.command().args(["daemon", "stop", "--force", "--json"]),
-                    budget,
-                );
+                    by,
+                )
             },
         );
         if let Some(evidence) = self.evidence.take() {

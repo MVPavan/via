@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, failure, infra, request};
+use daemon::{Daemon, Raw, Sandbox, TestResult, cli, collect_available, failure, infra, request};
 use failpoints::Failpoints;
-use scenario::{ScenarioError, collect_available, run_scenario};
+use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -637,5 +637,5 @@ fn collect(evidence: &Evidence, sandbox: &Sandbox) -> Result<(), ScenarioError> 
     evidence
         .write("events.ndjson", events.as_bytes())
         .map_err(infra)?;
-    collect_available(evidence, &sandbox.state)
+    collect_available(evidence, &sandbox.state, &sandbox.teardown)
 }

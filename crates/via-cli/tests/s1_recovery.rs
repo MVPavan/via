@@ -22,6 +22,8 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/scenario.rs"]
 mod scenario;
 mod support;
@@ -30,13 +32,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use scenario::{Captured, ScenarioError, collect_available, run_command, run_scenario};
+use daemon::collect_available;
+use scenario::{Captured, ScenarioError, run_command, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
 
@@ -55,6 +58,11 @@ const SECRETS: [(&str, &str); 2] = [
 /// One scenario's private deployment.
 struct Paths {
     _root: tempfile::TempDir,
+    /// The scenario's one final teardown (runtime §11.2), which every
+    /// daemon guard records into.
+    teardown: outer_cleanup::Teardown,
+    /// Daemon runs started so far, numbering their traces and reports.
+    runs: std::sync::atomic::AtomicUsize,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -89,6 +97,8 @@ impl Paths {
         let failpoints = failpoints::Failpoints::new(root.path())?;
         Ok(Self {
             _root: root,
+            teardown: outer_cleanup::Teardown::new(),
+            runs: std::sync::atomic::AtomicUsize::new(0),
             via,
             fake,
             state,
@@ -123,15 +133,17 @@ impl Paths {
         let mut command = self.command();
         command.args(args);
         let capture = run_command(&mut command, Duration::from_secs(20)).map_err(infra)?;
-        evidence
-            .write(&format!("{name}.stdout"), &capture.stdout)
-            .map_err(infra)?;
-        evidence
-            .write(&format!("{name}.stderr"), &capture.stderr)
-            .map_err(infra)?;
+        // The captured outcome first; a lost output write is attached to
+        // it, never in its place (S1-evidence2 fix round 2, finding 5).
+        let written = daemon::write_output(evidence, name, &capture);
         if capture.timed_out {
-            return Err(ScenarioError::Timeout(format!("via {args:?} timed out")));
+            return Err(ScenarioError::Timeout(format!(
+                "via {args:?} timed out{}{}",
+                capture.notes(),
+                daemon::note(written.as_ref().err())
+            )));
         }
+        written?;
         Ok(capture)
     }
 
@@ -305,13 +317,16 @@ impl Paths {
     }
 }
 
-/// Directly owned daemon child. The last one of a scenario writes
-/// `cleanup.json` over every anchor the Store committed, crashed runs included.
+/// Directly owned daemon child of one run. Its drop records the run's
+/// teardown; the scenario's `cleanup.json` covers every run, crashed ones
+/// included ([`daemon::collect_available`]).
 struct Daemon<'a> {
     child: Child,
     paths: &'a Paths,
-    cleanup: PathBuf,
-    evidence_dir: PathBuf,
+    /// `<n>-<run>`: the run's name in the teardown.
+    run: String,
+    /// The run's own cleanup report, `cleanup-<n>-<run>.json`.
+    report: PathBuf,
     crash_snapshot: Option<Vec<outer_cleanup::AnchorRow>>,
 }
 
@@ -340,11 +355,27 @@ impl<'a> Daemon<'a> {
         run: &str,
         env: &[(&str, &str)],
     ) -> Result<Self, ScenarioError> {
+        if paths.teardown.begun() {
+            return Err(infra("a daemon started after the final teardown began"));
+        }
+        // Every run appends to its trace under its own header, never
+        // truncating an earlier run's (S1-evidence2 fix round 2, finding 1).
         let trace = if run == "final" {
             evidence.dir.join("daemon.trace")
         } else {
             evidence.dir.join(format!("daemon-{run}.trace"))
         };
+        let number = paths
+            .runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let run = format!("{number}-{run}");
+        let mut trace = File::options()
+            .create(true)
+            .append(true)
+            .open(&trace)
+            .map_err(infra)?;
+        writeln!(trace, "=== daemon run {run} ===").map_err(infra)?;
         let mut command = paths.command();
         #[cfg(feature = "test-failpoints")]
         paths.failpoints.activate(&mut command);
@@ -355,17 +386,12 @@ impl<'a> Daemon<'a> {
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(&trace).map_err(infra)?);
-        let cleanup = if run == "final" {
-            evidence.dir.join("cleanup.json")
-        } else {
-            evidence.dir.join(format!("cleanup-{run}.json"))
-        };
+            .stderr(trace);
         Ok(Self {
             child: command.spawn().map_err(infra)?,
             paths,
-            cleanup,
-            evidence_dir: evidence.dir.clone(),
+            report: evidence.dir.join(format!("cleanup-{run}.json")),
+            run,
             crash_snapshot: None,
         })
     }
@@ -380,11 +406,12 @@ impl<'a> Daemon<'a> {
             }
             // A direct probe: never auto-starts a second daemon, even over
             // the stale socket file a killed daemon left.
-            if daemon::serving_pid(&paths.runtime) == Some(self.child.id()) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
+            let ready = daemon::serving_pid(&paths.runtime) == Some(self.child.id());
+            if Instant::now() > deadline {
                 return Err(ScenarioError::Timeout("daemon readiness".to_owned()));
+            }
+            if ready {
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -394,97 +421,75 @@ impl<'a> Daemon<'a> {
     /// value alive until the scenario ends: its drop runs the outer cleanup,
     /// which would otherwise stop a surviving anchor before the restart.
     fn kill(&mut self) -> Result<(), ScenarioError> {
-        self.crash_snapshot =
-            Some(outer_cleanup::snapshot(&self.paths.state.join("store.sqlite3")).map_err(infra)?);
+        self.crash_snapshot = Some(
+            outer_cleanup::snapshot(
+                &self.paths.state.join("store.sqlite3"),
+                Instant::now() + outer_cleanup::TEARDOWN,
+            )
+            .map_err(infra)?,
+        );
         self.child.kill().map_err(infra)?;
-        self.child.wait().map_err(infra)?;
+        if !outer_cleanup::reap_by(&mut self.child, Instant::now() + outer_cleanup::REAP) {
+            return Err(ScenarioError::Timeout(
+                "the killed daemon was not reaped in 1 s".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
 
 impl Drop for Daemon<'_> {
+    /// The scenario's final teardown of this run (runtime §11.2): a live
+    /// daemon's drop begins, or joins, the scenario's one teardown deadline
+    /// (`Paths::teardown`), which bounds the force-stop (at most 2 s), the
+    /// exit wait, the kill's 1 s reap and the anchor cleanup; an exited
+    /// daemon's drop joins a teardown already begun, or else processes its
+    /// anchors with its own bound, beginning nothing. The run is recorded in
+    /// `cleanup-<n>-<run>.json` and the teardown, which
+    /// [`daemon::collect_available`] validates as a whole.
     fn drop(&mut self) {
-        let was_alive = matches!(self.child.try_wait(), Ok(None));
-        // Runtime §11.2: one teardown deadline, taken on entry; each
-        // phase gets only the time left.
-        let outer = Instant::now() + outer_cleanup::TEARDOWN;
-        let mut stop = "not_needed";
-        let mut kill = "not_needed";
-        if was_alive {
-            let mut command = self.paths.command();
-            command.args(["daemon", "stop", "--force", "--json"]);
-            stop = match run_command(
-                &mut command,
-                outer_cleanup::left(outer).min(Duration::from_secs(2)),
-            ) {
-                Ok(capture) if capture.status.success() && !capture.timed_out => "accepted",
-                Ok(_) => "refused",
-                Err(_) => "unavailable",
-            };
-        }
-        let mut reaped = matches!(
-            wait_child(
-                &mut self.child,
-                outer_cleanup::left(outer).saturating_sub(Duration::from_secs(1))
-            ),
-            Ok(Some(_))
+        let paths = self.paths;
+        let live = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let deadline = if live || paths.teardown.begun() {
+            paths.teardown.begin()
+        } else {
+            Instant::now() + outer_cleanup::TEARDOWN
+        };
+        let rows = self.crash_snapshot.take();
+        paths.teardown.daemon_generation(
+            &self.run,
+            deadline,
+            &mut self.child,
+            Some((&paths.state.join("store.sqlite3"), rows)),
+            Some(&self.report),
+            |by| {
+                outer_cleanup::run_within(
+                    paths
+                        .command()
+                        .args(["daemon", "stop", "--force", "--json"]),
+                    by,
+                )
+            },
         );
-        if !reaped {
-            kill = if self.child.kill().is_ok() {
-                "sent_to_retained_child"
-            } else {
-                "failed"
-            };
-            reaped = matches!(
-                wait_child(
-                    &mut self.child,
-                    outer_cleanup::left(outer).min(Duration::from_secs(1))
-                ),
-                Ok(Some(_))
-            );
-        }
-        let rows = match self.crash_snapshot.take() {
-            Some(rows) => Ok(rows),
-            None => outer_cleanup::snapshot(&self.paths.state.join("store.sqlite3")),
-        };
-        let anchors = match rows {
-            Ok(rows) => outer_cleanup::verify(&rows, outer),
-            Err(error) => json!({"status":"unverified","absence_proven":false,"reason":error}),
-        };
-        let report = json!({
-            "direct_child":{"pid":self.child.id(),"was_alive":was_alive,"stop":stop,"kill":kill,"reaped":reaped},
-            "anchors":anchors,
-        });
-        let final_report = self.evidence_dir.join("cleanup.json");
-        for path in [&self.cleanup, &final_report] {
-            // A crashed run's report stands in until the final daemon's
-            // teardown, which covers every committed anchor, replaces it.
-            if path == &final_report && path != &self.cleanup && path.exists() {
-                continue;
-            }
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-            {
-                // Evidence only: a lost write shows as missing evidence.
-                let _ = file.write_all(report.to_string().as_bytes());
-                let _ = file.sync_all();
-            }
-        }
     }
 }
 
-fn wait_child(child: &mut Child, within: Duration) -> Result<Option<ExitStatus>, ScenarioError> {
+#[cfg(feature = "test-failpoints")]
+/// Waits for `child` to exit; `None` when it is still running at `within`.
+/// Each observation is timestamped after it returns: an exit observed only
+/// after the deadline is `None`.
+fn wait_child(
+    child: &mut Child,
+    within: Duration,
+) -> Result<Option<std::process::ExitStatus>, ScenarioError> {
     let deadline = Instant::now() + within;
     loop {
-        if let Some(status) = child.try_wait().map_err(infra)? {
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
+        let status = child.try_wait().map_err(infra)?;
+        if Instant::now() > deadline {
             return Ok(None);
+        }
+        if status.is_some() {
+            return Ok(status);
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -518,7 +523,7 @@ fn scenario(
         |evidence| action(&paths, evidence),
         |evidence| {
             paths.write_store_evidence(evidence)?;
-            collect_available(evidence, &paths.state)
+            collect_available(evidence, &paths.state, &paths.teardown)
         },
     )
     .require_pass()
@@ -634,14 +639,10 @@ fn wait(paths: &Paths, evidence: &Evidence, address: &str) -> Result<Value, Scen
 }
 
 /// `pid` names a live, non-zombie process.
-fn process_live(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|text| {
-            let state = text.get(text.rfind(')')? + 2..)?.chars().next()?;
-            Some(state != 'Z' && state != 'X')
-        })
-        .unwrap_or(false)
+/// Unreadable process state is uncertainty, never absence (S1-evidence2
+/// fix round 2, finding 13).
+fn process_live(pid: u32) -> Result<bool, ScenarioError> {
+    Ok(!process::exited(pid).map_err(infra)?)
 }
 
 /// The harness's own non-signalling query: only `ESRCH` proves the group gone.
@@ -654,18 +655,26 @@ fn group_absent(pgid: u32) -> bool {
         })
 }
 
-/// Waits until every pid is gone and `pgid` answers `ESRCH`.
+/// Waits until every pid is gone and `pgid` answers `ESRCH`, observed by
+/// the deadline: an absence observed only after it is not accepted.
 fn await_gone(pids: &[u32], pgid: u32) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while pids.iter().any(|pid| process_live(*pid)) || !group_absent(pgid) {
-        if Instant::now() >= deadline {
+    loop {
+        let mut live = false;
+        for pid in pids {
+            live |= process_live(*pid)?;
+        }
+        let gone = !live && group_absent(pgid);
+        if Instant::now() > deadline {
             return Err(fail(&format!(
                 "processes {pids:?} or group {pgid} survived the cleanup"
             )));
         }
+        if gone {
+            return Ok(());
+        }
         thread::sleep(Duration::from_millis(10));
     }
-    Ok(())
 }
 
 /// Warning codes of an envelope.
@@ -817,21 +826,17 @@ fn s1_f22_surviving_anchor_verified_and_stopped_on_restart() -> TestResult {
             evidence
                 .write(&format!("{point}.ack.json"), &ack)
                 .map_err(infra)?;
-            check(
-                process_live(anchor)
-                    && process_live(agent)
-                    && process_live(grandchild)
-                    && !group_absent(pgid),
-                || {
-                    format!(
-                        "the held group did not survive the crash: anchor {} agent {} grandchild {} group {}",
-                        process_live(anchor),
-                        process_live(agent),
-                        process_live(grandchild),
-                        !group_absent(pgid)
-                    )
-                },
-            )?;
+            let live = [
+                process_live(anchor)?,
+                process_live(agent)?,
+                process_live(grandchild)?,
+            ];
+            check(live == [true; 3] && !group_absent(pgid), || {
+                format!(
+                    "the held group did not survive the crash: anchor, agent, grandchild {live:?} group {}",
+                    !group_absent(pgid)
+                )
+            })?;
             paths.failpoints.disarm(point).map_err(infra)?;
             let _daemon = Daemon::start(paths, evidence, "final")?;
             let envelope = recovered_unknown(paths, &session)?;
