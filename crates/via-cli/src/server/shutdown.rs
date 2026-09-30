@@ -33,6 +33,38 @@ pub(super) struct Window {
     pub(super) socket: PathBuf,
 }
 
+/// Final shutdown's one absolute bound (design §7.4 [O1.D5, r3.17]),
+/// taken when daemon main begins final-shutdown entry: "the window starts
+/// at `enter_final_shutdown`". The deadline is `start + 10 s`, or
+/// `failed_at + 10 s` when a latch came earlier; a failure after entry began
+/// never extends it (a later `failed_at` only gives a later bound).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bound {
+    pub(super) started: Instant,
+    pub(super) deadline: Instant,
+}
+
+impl Bound {
+    /// The bound of a final-shutdown entry that begins now.
+    pub(super) fn begin(engine: &Engine) -> Self {
+        let started = Instant::now();
+        let deadline = engine
+            .failed_at()
+            .map_or(started + FINAL_SHUTDOWN, |failed_at| {
+                (started + FINAL_SHUTDOWN).min(failed_at + FINAL_SHUTDOWN)
+            });
+        Self { started, deadline }
+    }
+}
+
+/// How final-shutdown entry ended: its bound, and whether it had not
+/// returned by the deadline.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Entry {
+    pub(super) bound: Bound,
+    pub(super) expired: bool,
+}
+
 /// How long the window serves after the latch (design §7.4).
 const WINDOW: Duration = Duration::from_secs(5);
 
@@ -47,9 +79,9 @@ struct Pipeline {
 /// Joins the daemon's owned work under one absolute deadline and decides the
 /// process exit: 0 only for a clean shutdown, otherwise 4 (incomplete).
 ///
-/// The deadline is `start + 10 s`, or `failed_at + 10 s` when a latch
-/// preceded final shutdown (design §7.4 [r3.17]); a failure during final
-/// shutdown never extends it. Idle clients close at once, or when the
+/// The deadline is the one [`Bound`] taken when entry began (design §7.4).
+/// An entry that had not returned by it (`entry.expired`) is never clean:
+/// the fence may be unset, so the pipeline's start drain proves nothing. Idle clients close at once, or when the
 /// latch's diagnostic window ends; a client already serving a request (such
 /// as a `wait`) delivers it after the final records commit. Only daemon main
 /// takes the incomplete exit. Unjoined tasks are aborted and reported, a
@@ -60,12 +92,13 @@ pub(super) async fn final_shutdown(
     joins: Joins,
     mode: StopMode,
     window: Option<Window>,
+    entry: Entry,
 ) -> i32 {
-    let started = Instant::now();
+    let Entry {
+        bound: Bound { started, deadline },
+        expired,
+    } = entry;
     let failed_at = engine.failed_at();
-    let deadline = failed_at.map_or(started + FINAL_SHUTDOWN, |failed_at| {
-        (started + FINAL_SHUTDOWN).min(failed_at + FINAL_SHUTDOWN)
-    });
     // Force-path reads stop retrying in time for Host cleanup and terminals.
     engine.begin_final_shutdown(deadline);
     let Joins {
@@ -116,12 +149,14 @@ pub(super) async fn final_shutdown(
     let blob_tasks = blob_tasks.outstanding();
     pending_joins += blob_tasks;
     let host = report.as_ref().ok();
-    let clean = pending_joins == 0
+    let clean = !expired
+        && pending_joins == 0
         && failed_joins == 0
         && store == "joined"
         && host.is_some_and(via_core::EngineShutdown::is_clean);
     let summary = json!({"daemon_shutdown":{
         "mode":mode.as_str(),
+        "entry":if expired {"expired"} else {"entered"},
         "queued_drives":queued_drives,
         "elapsed_ms":u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "pending_joins":pending_joins + host.map_or(0, |host| host.pending_tasks),

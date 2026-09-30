@@ -2028,6 +2028,70 @@ fn s1_close_at_final_shutdown_entry_refused() -> TestResult {
     Ok(())
 }
 
+/// Design §7.4 (S1 critic finding 1): the final-shutdown bound starts when
+/// entry begins. A force is accepted and daemon main, entering, is paused
+/// at `daemon.shutdown.before_fence`; a close then takes `admission` and
+/// its first Store read is held at `store.read.stall`, never released.
+/// Entry waits for `admission`, so it cannot finish: at the deadline daemon
+/// main takes the incomplete exit (4), and its summary says the entry
+/// expired. Before the fix the daemon stayed alive for as long as the read
+/// was held.
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the measured time is evidence, never asserted (T4-A50)"
+)]
+fn s1_close_stalled_read_bounds_final_shutdown_entry() -> TestResult {
+    let sandbox = Sandbox::new(&completes("idle", 1))?;
+    let before = "daemon.shutdown.before_fence";
+    let stall = "store.read.stall";
+    sandbox.arm(before, 1, "pause")?;
+    sandbox.count(stall)?;
+    let mut daemon = sandbox.start()?;
+    let (session, handle) = sandbox.spawn("idle", &[])?;
+    sandbox.wait(&format!("{session}/1"))?;
+    let forced_at = Instant::now();
+    let stopping = sandbox.ok(&["daemon", "stop", "--force", "--json"])?;
+    check(stopping["stopping"] == true, || stopping.to_string())?;
+    sandbox.ack(&daemon, before, 1, "pause")?;
+    let next = sandbox.next_hit(stall)?;
+    sandbox.arm(stall, next, "pause")?;
+    let status = thread::scope(|scope| -> TestResult<ExitStatus> {
+        let close = scope.spawn(|| {
+            sandbox
+                .run(&["close", &session, "--handle", &handle, "--json"])
+                .map_err(|error| error.to_string())
+        });
+        // The close holds `admission` in its read; entry now waits for it.
+        sandbox.ack(&daemon, stall, next, "pause")?;
+        sandbox.resume_point(before, 1)?;
+        let status = daemon.exit(Duration::from_secs(30))?;
+        // The close never got a result: its daemon exited under it.
+        let closed = close.join().map_err(|_| "close panicked")??;
+        check(!closed.status.success(), || {
+            format!(
+                "the close succeeded: {}",
+                String::from_utf8_lossy(&closed.stdout)
+            )
+        })?;
+        Ok(status)
+    })?;
+    // Evidence only (T4-A50): the time from the force to the exit.
+    eprintln!("force to exit: {:?}", forced_at.elapsed());
+    let summary = shutdown_summary(&sandbox)?;
+    check(
+        status.code() == Some(4)
+            && summary["disposition"] == "incomplete"
+            && summary["entry"] == "expired",
+        || format!("exit {status}: {summary}"),
+    )?;
+    drop(daemon);
+    sandbox.disarm(before)?;
+    sandbox.disarm(stall)?;
+    sandbox.start()?.finish()
+}
+
 /// Design §6.3, §6.6 [r3.5], the status half (S5 adds the failed
 /// `Closed`): a close whose session's group is unproven (its anchor held at
 /// `host.anchor.before_eof_cleanup`) waits in its bounded absence check,
