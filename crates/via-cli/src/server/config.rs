@@ -92,12 +92,17 @@ where
 }
 
 /// Reads `<state>/daemon.json`: defaults when it is absent, else the
-/// validated limits. It follows no symbolic link.
+/// validated limits. It follows no symbolic link, and opens without
+/// blocking so a FIFO is refused by its type, never waited on.
 pub(super) fn read(state: &Path) -> Result<Limits, Invalid> {
     let path = state.join(FILE);
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                .bits()
+                .cast_signed(),
+        )
         .open(&path);
     let mut file = match file {
         Ok(file) => file,

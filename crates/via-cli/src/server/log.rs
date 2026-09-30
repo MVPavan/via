@@ -57,11 +57,15 @@ pub(super) fn line(bytes: &[u8]) {
 
 /// Opens `<state>/via.log` after both locks are held, before the Store
 /// opens (§7.6): one longer than 10 MiB is renamed `via.log.1` first,
-/// replacing it; then it is opened for append, 0600, following no link.
+/// replacing it; then it is opened for append, 0600, following no link and
+/// without blocking. An entry that is not a regular file, such as a FIFO,
+/// is refused before and after the open, never waited on.
 pub(super) fn open(state: &Path) -> io::Result<()> {
     let path = state.join("via.log");
+    let irregular = || io::Error::other("must be a regular file");
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > ROTATE_BYTES => {
+        Ok(metadata) if !metadata.is_file() => return Err(irregular()),
+        Ok(metadata) if metadata.len() > ROTATE_BYTES => {
             fs::rename(&path, state.join("via.log.1"))?;
         }
         Ok(_) => {}
@@ -72,8 +76,15 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                .bits()
+                .cast_signed(),
+        )
         .open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(irregular());
+    }
     *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(file);
     Ok(())
 }

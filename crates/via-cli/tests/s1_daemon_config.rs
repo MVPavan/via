@@ -583,6 +583,76 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
     report.require_pass()
 }
 
+/// Design §5.5, §7.6 (T4-fix; Astra 4): a FIFO at `daemon.json` or at
+/// `via.log` is refused at once, never waited on for a writer or a reader.
+/// `daemon.json` exits 78 "must be a regular file" before any Store or
+/// socket change; `via.log` fails startup with a message naming it before
+/// the Store opens. Each start is bounded by 10 s: before the fix both hung.
+#[test]
+fn s1_config_and_daemon_log_fifo_are_refused_at_once() -> TestResult {
+    let setup = Setup::new(&script("fifo", &[]))?;
+    let evidence = setup.evidence("s1_config_fifo")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let mut outcomes = Vec::new();
+            for name in ["daemon.json", "via.log"] {
+                let fresh = Sandbox::new(&script("fifo", &[])).map_err(infra)?;
+                let made = std::process::Command::new("mkfifo")
+                    .arg(fresh.state.join(name))
+                    .status()
+                    .map_err(infra)?;
+                check(made.success(), || "mkfifo failed".to_owned())?;
+                let run = fresh
+                    .run(&["daemon"], Duration::from_secs(10))
+                    .map_err(infra)?;
+                let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+                let names: Vec<String> = fs::read_dir(&fresh.state)
+                    .map_err(infra)?
+                    .map(|entry| {
+                        entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect::<Result<_, _>>()
+                    .map_err(infra)?;
+                outcomes.push(json!({"fifo":name,"exit":run.status.code(),
+                    "timed_out":run.timed_out,"stderr":stderr,"state":names}));
+                check(!run.timed_out, || format!("a {name} FIFO hung the start"))?;
+                let expected = if name == "daemon.json" {
+                    run.status.code() == Some(78) && stderr.lines().any(|line| {
+                        line == "via: daemon config invalid: daemon.json: must be a regular file"
+                    })
+                } else {
+                    run.status.code().is_some_and(|code| code != 0)
+                        && stderr.contains("via.log")
+                        && stderr.contains("must be a regular file")
+                };
+                check(expected, || {
+                    format!("a {name} FIFO: exit {:?}, {stderr}", run.status)
+                })?;
+                // `store.lock` precedes `via.log` (§7.6); the Store does not.
+                check(
+                    !names.iter().any(|entry| entry.starts_with("store.sqlite3")),
+                    || format!("a {name} FIFO opened the Store: {names:?}"),
+                )?;
+                check(!fresh.runtime.join("via.sock").exists(), || {
+                    format!("a {name} FIFO left a socket")
+                })?;
+            }
+            evidence
+                .write(
+                    "fifo_starts.json",
+                    Value::Array(outcomes).to_string().as_bytes(),
+                )
+                .map_err(infra)?;
+            // The scenario's own deployment runs one turn for its evidence.
+            let _daemon = setup.start(evidence)?;
+            setup.one_turn(evidence, "fifo")
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- daemon log
 
 /// Design §7.6, §13.2 [t4r16.7.1]: an invalid `daemon.json` is reported by
