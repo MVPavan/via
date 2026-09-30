@@ -21,6 +21,10 @@ pub(crate) struct Evidence {
     /// turn: `finish` then requires neither the Store's backup, envelopes
     /// and events nor a turn's evidence folder, and the summary says so.
     pub(crate) store_expected: bool,
+    /// Cleared by a scenario whose turns launch no vendor, so they have no
+    /// evidence folder: `finish` then waives only `evidence/*`; the
+    /// collector checks that every launched turn still has its folder.
+    pub(crate) folders_expected: bool,
 }
 
 impl Evidence {
@@ -50,6 +54,7 @@ impl Evidence {
             fixture: fixture.to_owned(),
             finalized: false,
             store_expected: true,
+            folders_expected: true,
         })
     }
 
@@ -106,7 +111,10 @@ impl Evidence {
             .copied()
             .collect();
         let mut missing = missing;
-        if self.store_expected && fs::read_dir(self.dir.join("evidence"))?.next().is_none() {
+        if self.store_expected
+            && self.folders_expected
+            && fs::read_dir(self.dir.join("evidence"))?.next().is_none()
+        {
             missing.push("evidence/*");
         }
         // Missing required evidence is an infrastructure failure, whatever
@@ -172,6 +180,9 @@ impl Evidence {
             "fixture_sha256":sha256(&self.fixture)?,
             "normalization_version":1,
         });
+        if !self.folders_expected {
+            summary["folders_expected"] = json!(false);
+        }
         if !self.store_expected {
             summary["store_expected"] = json!(false);
         }

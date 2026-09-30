@@ -65,15 +65,33 @@ impl Sandbox {
     }
 }
 
-/// Collects a daemon scenario's evidence once its daemon was reaped, which
-/// the daemon's borrow of the sandbox guarantees. These scenarios run no
-/// turn by design, and their daemon runs no fake agent: the fixture is
-/// empty.
+/// Collects a daemon scenario's evidence once its daemon has exited: the
+/// child is reaped by its guard, which borrows the sandbox, and
+/// [`evidenced::stop_daemons`] proves no other daemon remains. These
+/// scenarios launch no vendor by design, so only turn folders are waived,
+/// and their daemon runs no fake agent: the fixture is empty.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            evidenced::park(evidence, self.root.path().to_owned(), &self.state, false);
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
+                if let Ok(mut connection) = Connection::open(self) {
+                    let _ = connection.hello();
+                    let _ =
+                        connection.exchange(r#"{"jsonrpc":"2.0","id":9,"method":"daemon/stop"}"#);
+                }
+            });
+            let expected = evidenced::Expected {
+                store: true,
+                folders: false,
+            };
+            evidenced::park(
+                evidence,
+                self.root.path().to_owned(),
+                &self.state,
+                expected,
+                exited,
+            );
         }
     }
 }

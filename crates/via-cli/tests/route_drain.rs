@@ -192,18 +192,27 @@ impl Sandbox {
 }
 
 impl Drop for Sandbox {
+    /// Stops the auto-started daemon and proves it exited
+    /// ([`evidenced::stop_daemons`]) before the evidence is collected.
     fn drop(&mut self) {
-        let _ = self.run(
-            &["daemon", "stop", "--force", "--json"],
-            Duration::from_secs(5),
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.runtime.join("via.sock").exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
+        let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
+            let _ = self.run(
+                &["daemon", "stop", "--force", "--json"],
+                Duration::from_secs(5),
+            );
+        });
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            evidenced::park(evidence, self.root.path().to_owned(), &self.state, true);
+            evidenced::park(
+                evidence,
+                self.root.path().to_owned(),
+                &self.state,
+                evidenced::Expected {
+                    store: true,
+                    folders: true,
+                },
+                exited,
+            );
         }
     }
 }

@@ -114,8 +114,10 @@ struct Sandbox {
     root: tempfile::TempDir,
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
-    /// Cleared by a scenario with no Store or no turn by design.
+    /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
+    /// Cleared by a scenario whose turns launch no vendor by design.
+    folders_expected: std::sync::atomic::AtomicBool,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -127,28 +129,41 @@ struct Sandbox {
     failpoints: failpoints::Failpoints,
 }
 
-/// Collects the scenario's evidence once every daemon it started was
-/// reaped, which their borrow of the sandbox guarantees.
+/// Collects the scenario's evidence once every daemon has exited: the
+/// children it started are reaped by their guards, which borrow the
+/// sandbox, and [`evidenced::stop_daemons`] proves the rest gone.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
+                let _ = self.run(&["daemon", "stop", "--force", "--json"]);
+            });
+            let expected = evidenced::Expected {
+                store: self
+                    .store_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                folders: self
+                    .folders_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            };
             evidenced::park(
                 evidence,
                 self.root.path().to_owned(),
                 &self.state,
-                self.store_expected
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                expected,
+                exited,
             );
         }
     }
 }
 
 impl Sandbox {
-    /// Declares a scenario with no Store or no turn by design: its
-    /// evidence then requires neither.
-    fn no_store(&self) {
-        self.store_expected
+    /// Declares a scenario whose turns launch no vendor by design: only
+    /// their evidence folders are waived; the Store, envelopes, events and
+    /// cleanup stay required, and a launched turn must have its folder.
+    fn no_launch(&self) {
+        self.folders_expected
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -179,6 +194,7 @@ impl Sandbox {
             root,
             evidence: Some(evidence),
             store_expected: std::sync::atomic::AtomicBool::new(true),
+            folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
             fake,
             state,
@@ -809,7 +825,7 @@ fn s1_f12_writer_lost_latches() -> TestResult {
     evidenced(|| {
         let sandbox = Sandbox::new(&completes("lost", 1))?;
         // The spawn is never committed: no turn.
-        sandbox.no_store();
+        sandbox.no_launch();
         sandbox.count("store.writer.lost")?;
         let daemon = sandbox.start()?;
         let next = sandbox.next_hit("store.writer.lost")?;
@@ -2253,7 +2269,7 @@ fn s1_f12_sqlite_corruption_latches() -> TestResult {
         daemon.latched_exit()?;
         // The dispatcher's read; the turn never launches.
         let sandbox = Sandbox::new(&scripts(&[completes("first", 1)]))?;
-        sandbox.no_store();
+        sandbox.no_launch();
         sandbox.count(point)?;
         let daemon = sandbox.start()?;
         let start = "daemon.dispatcher.before_start";
@@ -2381,7 +2397,7 @@ fn s1_f12_startup_recovery_corrupt_read_fails_startup() -> TestResult {
         let point = "store.read.corrupt.unfinished";
         let sandbox = Sandbox::new(&completes("first", 1))?;
         // Startup fails before any turn.
-        sandbox.no_store();
+        sandbox.no_launch();
         sandbox.arm(point, 1, "fail_io")?;
         let mut daemon = sandbox.launch()?;
         sandbox.ack(&daemon, point, 1, "fail_io")?;

@@ -126,8 +126,10 @@ struct Sandbox {
     root: tempfile::TempDir,
     /// The scenario's evidence, collected when the sandbox is dropped.
     evidence: Option<support::evidence::Evidence>,
-    /// Cleared by a scenario with no Store or no turn by design.
+    /// Cleared by a scenario with no Store by design.
     store_expected: std::sync::atomic::AtomicBool,
+    /// Cleared by a scenario whose turns launch no vendor by design.
+    folders_expected: std::sync::atomic::AtomicBool,
     via: PathBuf,
     fake: PathBuf,
     state: PathBuf,
@@ -140,28 +142,48 @@ struct Sandbox {
     failpoints: failpoints::Failpoints,
 }
 
-/// Collects the scenario's evidence once every daemon it started was
-/// reaped, which their borrow of the sandbox guarantees.
+/// Collects the scenario's evidence once every daemon has exited: the
+/// children it started are reaped by their guards, which borrow the
+/// sandbox, and [`evidenced::stop_daemons`] proves the rest gone.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
+            let exited = evidenced::stop_daemons(&self.runtime, &self.state, || {
+                let _ = self.run(&["daemon", "stop", "--force", "--json"]);
+            });
+            let expected = evidenced::Expected {
+                store: self
+                    .store_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                folders: self
+                    .folders_expected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            };
             evidenced::park(
                 evidence,
                 self.root.path().to_owned(),
                 &self.state,
-                self.store_expected
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                expected,
+                exited,
             );
         }
     }
 }
 
 impl Sandbox {
-    /// Declares a scenario with no Store or no turn by design: its
-    /// evidence then requires neither.
+    /// Declares a scenario with no Store by design: its evidence then
+    /// requires none of the Store's artifacts.
     fn no_store(&self) {
         self.store_expected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Declares a scenario whose turns launch no vendor by design: only
+    /// their evidence folders are waived; the Store, envelopes, events and
+    /// cleanup stay required, and a launched turn must have its folder.
+    fn no_launch(&self) {
+        self.folders_expected
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -193,6 +215,7 @@ impl Sandbox {
             root,
             evidence: Some(evidence),
             store_expected: std::sync::atomic::AtomicBool::new(true),
+            folders_expected: std::sync::atomic::AtomicBool::new(true),
             via,
             fake,
             state,
@@ -660,8 +683,8 @@ fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
     evidenced(|| {
         // `daemon.lock` held by a live daemon.
         let sandbox = Sandbox::new(&json!({}))?;
-        // No turn by design; the losing daemon opens no Store.
-        sandbox.no_store();
+        // An idle owner: no turn by design.
+        sandbox.no_launch();
         let owner = sandbox.start()?;
         let before = socket_identity(&sandbox.runtime)?;
         let mut direct = sandbox.command();
@@ -681,6 +704,7 @@ fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
         // `store.lock` held by another process, no `daemon.lock` holder: the
         // socket is one the harness listens on.
         let sandbox = Sandbox::new(&json!({}))?;
+        // No daemon ever opens this Store.
         sandbox.no_store();
         let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
         listener.set_nonblocking(true)?;
@@ -964,7 +988,7 @@ fn s1_f01_concurrent_auto_start_one_daemon() -> TestResult {
     evidenced(|| {
         let sandbox = Sandbox::new(&json!({}))?;
         // Daemon startup only: no turn by design.
-        sandbox.no_store();
+        sandbox.no_launch();
         sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
         let status_cli = |name: &str| -> TestResult<Child> {
             let mut command = sandbox.command_fp();
@@ -1022,7 +1046,7 @@ fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
         const OTHER: &str = "0.0.0-f04";
         let sandbox = Sandbox::new(&json!({}))?;
         // Idle daemons only: no turn by design.
-        sandbox.no_store();
+        sandbox.no_launch();
         let mut daemon = sandbox.start()?;
         let other_version = |state: &Path| -> TestResult<Captured> {
             let mut command = sandbox.command();
@@ -1112,7 +1136,7 @@ fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> Test
         const OTHER: &str = "0.0.0-f04-stop";
         let sandbox = Sandbox::new(&json!({}))?;
         // Idle daemons only: no turn by design.
-        sandbox.no_store();
+        sandbox.no_launch();
         let mut daemon = sandbox.start()?;
         sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
         let stop = |state: &Path, extra: &[&str]| -> TestResult<Captured> {
@@ -1431,7 +1455,7 @@ fn s1_f07_force_set_includes_session_in_cancelling_state() -> TestResult {
         let commit = "store.commit.cancel";
         let sandbox = Sandbox::new(&completes("queued", 1))?;
         // The queued turn is cancelled before its launch.
-        sandbox.no_store();
+        sandbox.no_launch();
         let mut daemon = sandbox.start()?;
         // Both connections are accepted before daemon main pauses: it accepts
         // no other, and one carries the force, the other the cancel.

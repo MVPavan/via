@@ -24,8 +24,11 @@ struct Parked {
     evidence: Evidence,
     /// The sandbox directory, kept until the summary hashed its fixture.
     root: PathBuf,
-    /// Why collecting the State or proving cleanup failed, if it did.
+    /// Why proving the daemons' exit, collecting the State or proving
+    /// cleanup failed, if it did.
     collected: Result<(), String>,
+    /// Whether every daemon was proved gone, so the sandbox may be removed.
+    exited: bool,
 }
 
 thread_local! {
@@ -63,7 +66,10 @@ pub(crate) fn evidenced<T>(body: impl FnOnce() -> EvidencedResult<T>) -> Evidenc
         if let Err(error) = parked.evidence.finish(outcome, &detail) {
             incomplete.push(format!("{}: {error}", artifact.display()));
         }
-        let _ = fs::remove_dir_all(&parked.root);
+        // Never remove a sandbox from under a daemon not proved gone.
+        if parked.exited {
+            let _ = fs::remove_dir_all(&parked.root);
+        }
     }
     match result {
         Err(payload) => resume_unwind(payload),
@@ -89,20 +95,111 @@ pub(crate) fn open(fake: &Path, fixture: &Path) -> EvidencedResult<Evidence> {
 }
 
 /// Collects the sandbox at `root`, State `state`, into `evidence` and
-/// parks it for [`evidenced`]; called by the sandbox's drop. A scenario
-/// with no Store or no turn by design passes `store_expected: false`: its
-/// Store, envelopes, events and turn folders are then collected if they
-/// can be, but not required.
-pub(crate) fn park(mut evidence: Evidence, root: PathBuf, state: &Path, store_expected: bool) {
-    evidence.store_expected = store_expected;
-    let collected = collect(&evidence, &root, state).map_err(|error| error.to_string());
+/// parks it for [`evidenced`]; called by the sandbox's drop with
+/// [`stop_daemons`]'s proof that every daemon exited. Without that proof
+/// nothing is collected, the scenario is an infrastructure failure and the
+/// sandbox is kept. `expected` says what the scenario must hold: a
+/// scenario with no Store by design clears `store`; one whose turns launch
+/// no vendor clears only `folders`, so the Store, envelopes, events and
+/// cleanup stay required and a launched turn must still have its folder.
+pub(crate) fn park(
+    mut evidence: Evidence,
+    root: PathBuf,
+    state: &Path,
+    expected: Expected,
+    exited: Result<(), String>,
+) {
+    evidence.store_expected = expected.store;
+    evidence.folders_expected = expected.folders;
+    let proved = exited.is_ok();
+    let collected = exited
+        .map_err(|error| format!("daemon exit unproven, nothing collected: {error}"))
+        .and_then(|()| collect(&evidence, &root, state).map_err(|error| error.to_string()));
     PARKED.with_borrow_mut(|parked| {
         parked.push(Parked {
             evidence,
             root,
             collected,
+            exited: proved,
         });
     });
+}
+
+/// What a scenario's evidence must hold (see [`park`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Expected {
+    /// The Store, envelopes, events, cleanup and the turns' folders.
+    pub(crate) store: bool,
+    /// The turns' evidence folders, which only a launched vendor creates.
+    pub(crate) folders: bool,
+}
+
+/// Proves every daemon of a sandbox exited, before its State is collected
+/// or the sandbox removed (S1-contract r1 finding 3). A missing socket
+/// proves nothing: a daemon removes it before its final shutdown ends. The
+/// daemon serving `runtime`, if one answers `hello`, is identified by its
+/// pid, stopped by `stop` and waited out. Then neither `daemon.lock` nor
+/// `store.lock` may still be held, which also covers a daemon that removed
+/// its socket already or refuses this binary's version. Children the test
+/// started are reaped by their own guards first.
+pub(crate) fn stop_daemons(
+    runtime: &Path,
+    state: &Path,
+    stop: impl FnOnce(),
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    if let Some(pid) = serving_pid(runtime) {
+        stop();
+        while !exited(pid) {
+            if Instant::now() >= deadline {
+                return Err(format!("daemon {pid} did not exit"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    for lock in [runtime.join("daemon.lock"), state.join("store.lock")] {
+        loop {
+            match fs::File::open(&lock) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(format!("{}: {error}", lock.display())),
+                Ok(file) if file.try_lock().is_ok() => break,
+                Ok(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{} is still held", lock.display()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
+/// The pid of the daemon serving `runtime`'s socket, from its `hello`.
+fn serving_pid(runtime: &Path) -> Option<u32> {
+    use std::io::{BufRead, BufReader, Write};
+    let stream = std::os::unix::net::UnixStream::connect(runtime.join("via.sock")).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    let params =
+        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"evidenced"});
+    let hello = json!({"jsonrpc":"2.0","id":0,"method":"hello","params":params});
+    (&stream).write_all(format!("{hello}\n").as_bytes()).ok()?;
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply).ok()?;
+    let reply: serde_json::Value = serde_json::from_str(&reply).ok()?;
+    reply["result"]["daemon_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+/// Whether `pid` has exited: gone, or a zombie awaiting its reaper.
+fn exited(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X'))
+    })
 }
 
 /// The daemons' stderr traces (`<root>/daemon*.trace`), `via.log`, the
@@ -166,11 +263,38 @@ fn collect(evidence: &Evidence, root: &Path, state: &Path) -> EvidencedResult {
 fn store_evidence(evidence: &Evidence, store: &Path) -> EvidencedResult<serde_json::Value> {
     evidence.backup_store(store)?;
     write_rows(evidence, store)?;
+    if !evidence.folders_expected {
+        launched_turns_have_folders(evidence, store)?;
+    }
     let rows = outer_cleanup::snapshot(store)?;
     Ok(outer_cleanup::verify(
         &rows,
         Instant::now() + Duration::from_secs(10),
     ))
+}
+
+/// With the folders waived, a turn that launched a vendor (it has an
+/// anchor) must still have its evidence folder: only unlaunched turns lack
+/// one.
+fn launched_turns_have_folders(evidence: &Evidence, store: &Path) -> EvidencedResult {
+    let store =
+        rusqlite::Connection::open_with_flags(store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement = store.prepare("SELECT DISTINCT owner_session, owner_turn FROM anchors")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (session, turn) = row?;
+        if !evidence
+            .dir
+            .join("evidence")
+            .join(&session)
+            .join(turn.to_string())
+            .is_dir()
+        {
+            return Err(format!("launched turn {session}/{turn} has no evidence folder").into());
+        }
+    }
+    Ok(())
 }
 
 /// Every stored envelope and event, read-only, as `envelopes.ndjson` and
