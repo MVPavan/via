@@ -1243,6 +1243,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A47 Wire queue count | new during implementation (T4-3, 2026-09-29) |
 | A48 pipelined partial line | new during implementation (T4-5, 2026-09-30) |
 | A49 oversize page item | new during implementation (T4-6, 2026-09-30) |
+| A50 latency by order | new during implementation (T4-6, 2026-09-30) |
 
 ### 12.2 Amendments
 
@@ -1695,6 +1696,16 @@ refusal path that cannot run is untestable code, so it is a debug assertion
 instead. C1 §3.10 and §3.11 now say so; `admission_refused` keeps its other
 meanings (read lane full, disk floor).
 
+**T4-A50. "Does not block" is proven by order** (implementation, T4-6,
+2026-09-30). The §13 prompt-file row said `close` and `daemon/status` answer
+"within 100 ms" while a copy is paused. Its purpose is to show that a paused
+copy holds no lock. A wall-clock bound fails under a loaded parallel test
+run (181 ms was measured) without any lock being held, and a held lock would
+block those replies until the pause is released. The test therefore requires
+both replies while the acknowledged pause still holds the copy, releases it
+only afterwards, and records the latencies as evidence. F24 keeps its 100 ms
+control checks because it runs alone (`.config/nextest.toml`).
+
 ## 13. Tests (failure-first)
 
 Each test is written first, fails on the code as found for the stated reason,
@@ -1752,7 +1763,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_store_full_disk_rolls_back_known` | `SQLITE_FULL` on an ordinary commit and on a terminal: rolled back, `NotCommitted`, no latch; `store.rollback.fail` latches |
 | `s1_store_wal_limit_refuses_only_new_work` [t4r16.3, t4r17.2] | lowered `wal.max` and an external reader holding a snapshot: a spawn is `store_error` `not_committed` `wal_full` and a queued turn fails `store` at dispatch; a running turn's step rows, `warning` event, cancel and terminal all commit and it ends normally; a keyed retry of a stored spawn returns its receipt; a close commits; health stays healthy; the reader closes, a write after 1 s retries `TRUNCATE` and writes resume; WAL growth while the reader holds is recorded for `via-d9o.2.3` (§16) |
 | `s1_c1_request_too_large_is_named_then_closes` [t4r16.2] | 1 MiB + 1 bytes: `request_too_large`, then close; exactly 1 MiB is served; a partial line times out alone |
-| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` [t4r17.1, t4r18.1] | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and leaves no extra blob, also below a lowered floor; the file rewritten between two requests with the same key gives `idempotency_conflict`, and the stored blob still matches the stored identity; with `prompt_file.copy.pause` holding one copy, a `close` of another session and `daemon/status` answer within 100 ms; an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
+| `s1_c1_prompt_file_copies_hashes_and_refuses_changes` [t4r17.1, t4r18.1] | a 3 MiB file: the prompt is a blob with a matching SHA-256 (`EchoPromptDigest`); a keyed retry with the same content returns the stored receipt and leaves no extra blob, also below a lowered floor; the file rewritten between two requests with the same key gives `idempotency_conflict`, and the stored blob still matches the stored identity; with `prompt_file.copy.pause` holding one copy, a `close` of another session and `daemon/status` answer while the pause still holds it (A50); an append during `prompt_file.copy.pause` is `changed`, no blob left; a FIFO, a directory, a relative path, 16 MiB + 1 bytes and invalid UTF-8 are each refused by reason |
 | `s1_c1_list_creation_order_and_last_active` [t4r16.4] | 250 sessions page newest first with no repeats while states change; a session created mid-scan never appears; `last_active_at` is the latest event's time and `since` filters on it; `l2.` is `invalid_params`; a filter matching one old session gives empty pages with a cursor, then it |
 | `s1_c1_request_id_over_256_bytes_is_invalid_request`; `s1_c1_reply_not_read_closes_the_socket` | A31; A32, including a peer that never reads the first byte [t4r16.5.5] |
 | `s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control` [t4r16.2, t4r16.5.6] | every §5.1 holder at its maximum at once (four turns with 16 MiB prompts flooding maximal messages and filling observations; 32 sockets sending maximal lines with 65,536-node lists and reading pages): peak RSS less the idle baseline ≤ 1.25 × the §5.1 sum; growth < 32 MiB after the first 64 MiB of a 256 MiB flood; each anchor ≤ 32 MiB; `daemon/status`, `status` and `cancel` of another turn answer within 100 ms, also with its interrupt blocked at `HoldStdin`; the flood turn ends `failed(overflow)` |
