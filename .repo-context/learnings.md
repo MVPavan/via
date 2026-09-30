@@ -106,5 +106,6 @@ in the design record (`docs/`), not here.
   `(/abs/repo/path:line)`. Removing the prefix leaves repo-root targets with
   `:line` suffixes, which do not resolve from `docs/.../reviews/` and broke
   322 links (`6caffb3`). Link repo files relative to the review's folder
-  with `#L<line>`, turn scratchpad targets into plain text, and run the
-  link check from `verification.md` before committing.
+  with `#L<line>`, turn scratchpad targets into plain text (they resolve only on the machine
+  that has `scratchpad/`, so the link check misses them), and run the link
+  check from `verification.md` before committing.

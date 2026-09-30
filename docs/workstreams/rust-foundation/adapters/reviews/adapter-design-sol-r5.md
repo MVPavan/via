@@ -59,7 +59,7 @@ The underlying S1 chain is verified: Route’s deadline failure → bounded forc
 6. **Important — “non-shell parts ended” does not prove OpenCode quiescence.**  
    **Locations:** [AD9 L692](../../../../../docs/workstreams/rust-foundation/adapters/design.md#L692); tests L526–527, L719–720 and L1374; propagated through AC2 L933 and conflict 4 L174.
 
-   **Defect/evidence:** A parent `task` part is non-shell, but launches a child session whose tools are outside the parent’s message ledger. This delegation is already verified in [the re-probe L127](../../../../../docs/workstreams/rust-foundation/adapters/reprobe-opencode.md#L127), and the saved [task implementation L200](../../../../../scratchpad/execution/adapter-reprobe/opencode/recheck-format/src/oc-1.18.32/packages/opencode/src/tool/task.ts#L200) runs that child session. Custom tools and enabled integrations likewise cannot be classified safe merely by lacking the shell name. LH tested Bash, not this negative classification.
+   **Defect/evidence:** A parent `task` part is non-shell, but launches a child session whose tools are outside the parent’s message ledger. This delegation is already verified in [the re-probe L127](../../../../../docs/workstreams/rust-foundation/adapters/reprobe-opencode.md#L127), and the saved task implementation L200 (`scratchpad/execution/adapter-reprobe/opencode/recheck-format/src/oc-1.18.32/packages/opencode/src/tool/task.ts:200`) runs that child session. Custom tools and enabled integrations likewise cannot be classified safe merely by lacking the shell name. LH tested Bash, not this negative classification.
 
    **Smallest fix:** Use an explicitly qualified allow-list of tools that cannot leave processes, with complete observation continuity. Treat delegation and unknown/custom tools as `Uncertain` unless their descendants are separately proved absent.
 
@@ -108,7 +108,7 @@ The underlying S1 chain is verified: Route’s deadline failure → bounded forc
 
 **Out of scope, noticed:** AD9 L709’s future adopted-child query cannot, by itself, prove absence of descendants still parented beneath a live server. It needs a narrower proof claim before adoption. Anchor-crash coverage remains deferred; I did not challenge that decision or argue for either run-end policy.
 
-**Could not verify:** No implementation, fixture or live qualification was executed. The mechanism probe uses a `/proc` census and blocking waits ([anchor.py L24](../../../../../scratchpad/execution/tool-lifecycle/mechanisms/anchor.py#L24)); it does not exercise the specified ECHILD/Tokio protocol. Its vendor-crash case sends Stop after observing survivors, so it does not demonstrate automatic cleanup at vendor exit.
+**Could not verify:** No implementation, fixture or live qualification was executed. The mechanism probe uses a `/proc` census and blocking waits (anchor.py L24 (`scratchpad/execution/tool-lifecycle/mechanisms/anchor.py:24`)); it does not exercise the specified ECHILD/Tokio protocol. Its vendor-crash case sends Stop after observing survivors, so it does not demonstrate automatic cleanup at vendor exit.
 
 No files were edited, Git state changed, `bd` run, or vendor CLI/model invoked. Final branch, HEAD and Git status matched the initial observations.
 
