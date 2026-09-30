@@ -1766,6 +1766,10 @@ impl Host {
 /// under the F24 flood.
 const STATUS_REPLY_BOUND: Duration = Duration::from_secs(1);
 
+/// Unit tests: exit-poll ticks that found the control busy.
+#[cfg(test)]
+static BUSY_SKIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Polls `stream` for the vendor's exit and publishes it on `sender`. A
 /// control busy with another exchange only skips a tick. Supervision ends
 /// once the exit is seen, the stream is gone, or the control is retired: a
@@ -1784,6 +1788,8 @@ async fn supervise_exit(
             break;
         };
         let Ok(mut control) = stream.try_lock() else {
+            #[cfg(test)]
+            BUSY_SKIPS.fetch_add(1, Ordering::AcqRel);
             continue;
         };
         let request = Request::Status {
@@ -2659,9 +2665,10 @@ mod tests {
         }
     }
 
-    /// S1 critic finding 4: a control lock held past the old 100 ms poll
-    /// bound, as a `Stop` exchange holds it, only skips poll ticks; the exit
-    /// is still reported once the lock is free.
+    /// S1 critic finding 4: a control lock held, as a `Stop` exchange holds
+    /// it, only skips poll ticks; the exit is still reported once the lock
+    /// is free. The lock is released only after polls met it on three
+    /// ticks (S1-io r1 finding 2), whenever the poll first runs.
     #[tokio::test]
     async fn a_busy_control_lock_does_not_end_exit_supervision() {
         let (control, mut peer) = control_pair();
@@ -2672,7 +2679,15 @@ mod tests {
             "g1".to_owned(),
             sender,
         ));
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Three ticks met the held lock: supervision outlived a lock busy
+        // for longer than one poll's wait.
+        let met = tokio::time::timeout(Duration::from_secs(2), async {
+            while BUSY_SKIPS.load(Ordering::Acquire) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(met.is_ok(), "supervision stopped polling the held lock");
         drop(busy);
         assert!(
             matches!(next_request(&mut peer).await, Some(Request::Status { .. })),
