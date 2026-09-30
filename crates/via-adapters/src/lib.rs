@@ -144,15 +144,25 @@ pub enum DriverHealth {
 }
 
 mod capabilities;
+mod config;
+mod fake;
 mod fake_config;
 mod harness;
+pub mod observation;
+mod plan;
 mod runtime;
 
 pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
+pub use config::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError};
 pub use fake_config::FakeConfig;
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
+pub use plan::{
+    AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,
+    InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan,
+    SessionRef, Switch, TurnParams, VendorOptions, VersionStatus, Warning, resolve_model,
+};
 pub use runtime::{
     AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdmittedObservation, FakeRecovery,
     FakeShutdown, FakeTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink,
