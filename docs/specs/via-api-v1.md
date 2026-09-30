@@ -17,8 +17,8 @@ decision; **Proposed** = drafted here, listed in §10.
 
 **Shape.** JSON-RPC 2.0, newline-delimited, over the daemon's user-only Unix
 socket; `via serve --stdio` proxies the same messages. Entities: **session**
-(one conversation, one vendor session, one route and adapter version for
-life) and **turn** (one prompt → one envelope), addressed `s_7f3/2`. The
+(one conversation, one vendor session, one route for life; a compatible
+resume advances its recorded adapter version, C2 §1 rule 2) and **turn** (one prompt → one envelope), addressed `s_7f3/2`. The
 caller generates the session's handle; the daemon stores only its hash.
 
 **First-release scope (owner, 2026-09-26):** Claude Code, Codex and OpenCode;
@@ -231,7 +231,11 @@ warnings}`. Effective values are frozen at acceptance (§7.3). A given
 `bound` is re-validated against the route (D7), recorded on this turn, and
 inherited by later turns; nothing changes it silently (D5). Errors:
 `session_not_found`, `session_closed` (also while closing), `invalid_handle`,
-`queue_full`, `bound_unsupported`, `unsupported_verb`, `admission_refused`.
+`queue_full`, `bound_unsupported`, `unsupported_verb`, `admission_refused`,
+`harness_unavailable` (including `data.reason: adapter_version` when the
+stored adapter version is not compatible with the running adapter).
+A compatible resume advances the session's recorded `adapter_version` to the
+running adapter's version at that turn's `turn.started` commit.
 
 ### 3.4 `steer` — input into the active turn
 
@@ -259,7 +263,8 @@ Params: `session`, `handle`, `turn?`, `force_after_ms?` (Proposed default
 side effects are known to have stopped: `quiescent` (private process group
 absence positively proved under §7.5, or the vendor reported every tool
 item of the turn completed),
-`uncertain` (acknowledged but not provable), `pending` (still waiting for
+`uncertain` (stopping not provable, whether the stop was acknowledged or
+only requested), `pending` (still waiting for
 tool completion or the cleanup deadline). `pending` exists only before the
 cleanup deadline; a settled result is `quiescent` or `uncertain`. OS
 group-absence evidence covers the agent's own group; descendants outside it
@@ -272,7 +277,9 @@ the wall budget has expired, settle `uncertain` immediately. On tool
 quiescence or that deadline, commit one `cancelled` envelope with cleanup
 `quiescent` or `uncertain`. At uncertainty, warn `cancel_cleanup_uncertain`;
 a successor may dispatch with `predecessor_cleanup_uncertain`. No
-acknowledgement by the control deadline gives outcome `unknown`. Late tool
+acknowledgement by the order's `force_at` on a shared server gives state and
+outcome `unknown`, with no kill; a private process follows §7.6's
+private-process force row. Late tool
 completion remains late evidence and does not rewrite that envelope. Codex P2/P2b: after
 `interrupted` the tool's `sleep 120` ran to the 60 s poll limit;
 `command/exec/terminate` does not apply to agent-started tools and
@@ -293,9 +300,9 @@ Sets the admission gate `closing` (new `resume` → `session_closed`),
 cancels the active turn, drops queued turns as `cancelled`, closes the
 vendor session (`close(mode, deadline)` down to Host, D7), then sets
 `closed`. Result `{session_id, state: "closed", cancelled_turns, cleanup,
-leftovers}`; `leftovers` (§5) is present only when this close stopped the
-session's server, and a keyed replay returns the stored report; otherwise
-`null`.
+leftovers}`; `leftovers` (§5) is always present and non-null only when this
+close stopped the session's server, where a keyed replay returns the stored
+report; otherwise `null`.
 Idempotent; a second `close` during closing waits for the first. A close
 whose `session.closed` commit is refused a second time because turns of the
 session are unfinished replies `admission_refused` ([Task 3 design](../workstreams/rust-foundation/t3/design.md) §4 step 6).
@@ -309,7 +316,10 @@ Params: `session`, `turn?` (default the running turn, else the latest),
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"untested",
+ "inherit":{"hooks":"off","mcp_servers":"unknown","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"unknown"},
+ "warnings":[{"code":"vendor_version_untested","message":"…"},{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
+ "vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
              "tokens":{"total":18200,"scope":"vendor_interval"}},
@@ -351,6 +361,16 @@ after a Store write of uncertain outcome (runtime §7).
 `process.alive` is true only on positive evidence that the vendor process
 is live; `process.cleanup` is `uncertain` when any process group of the
 session lacks a proof of absence, else `quiescent` (T4-A23).
+
+`adapter_version` is the session's recorded adapter version, advanced by a
+compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
+from the latest turn's instance handshake (`vendor_version` null before any
+handshake; C2 §5). `inherit` holds the effective state (`on`, `off` or
+`unknown`) of each inherited-configuration category, frozen at spawn
+(C2 §6.2). `warnings` repeats the session's standing warnings:
+`vendor_version_untested` while `version_status` is `untested`, and
+`config_switch_unverified` with `data.categories` while any effective state
+differs from the verified requested state.
 
 `vendor_session_id` is nullable and contains only the last confirmed vendor
 ID. `vendor_identity_verified` is false until the current connection
@@ -568,7 +588,7 @@ cut at a character boundary.
  "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1","version_status":"tested",
  "vendor_session_id":"0192f…","cwd":"/work/repo",
  "bound":{"requested":{…},"effective":{…},"inherited":true},
- "final_text":"","final_text_file":null,"structured_output":null,
+ "final_text":"","final_text_file":null,"structured_output":null,"leftovers":null,
  "denied_actions":[{"kind":"command","target":"curl …","reason":"network disabled","at":"…","event_seq":41}],
  "auto_declined_requests":[{"vendor_method":"item/tool/requestUserInput","summary":"2 questions","blocking":true,"at":"…","event_seq":52}],
  "denied_actions_total":1,"auto_declined_requests_total":1,
@@ -599,7 +619,7 @@ cut at a character boundary.
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
 | `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
-| `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first. `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Present on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Detection is pending an owner decision (adapter design, conflict 4); until it is decided, `leftovers` is `null` |
+| `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Detection is pending an owner decision (adapter design, conflict 4); until it is decided, `leftovers` is `null` |
 
 ## 6. Durable events
 
@@ -624,7 +644,7 @@ envelope except through §7.6.
 | `action.denied`, `vendor.request_declined` | as envelope lists; `blocking` on declines | Adapter |
 | `steer.delivered` | `delivery` | Adapter |
 | `cancel.requested` / `cancel.settled` | — / `outcome`, `cleanup` | Core |
-| `warning` | `code`, `message` | either |
+| `warning` | `code`, `message`, `data?` (structured, bounded; `config_switch_unverified` carries `data.categories: [{category, requested, effective}]`, §5) | either |
 | `process.exited`, `server.lost` | `code`, `signal` / `key` | Core (from Host) |
 
 Events are durable records only: an event exists when crash recovery or the
