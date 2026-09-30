@@ -1242,6 +1242,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | A30, A39, A42 | revised in round 17 [t4r17.1–3]; A46 is new [t4r17.5] |
 | A47 Wire queue count | new during implementation (T4-3, 2026-09-29) |
 | A48 pipelined partial line | new during implementation (T4-5, 2026-09-30) |
+| A49 oversize page item | new during implementation (T4-6, 2026-09-30) |
 
 ### 12.2 Amendments
 
@@ -1684,6 +1685,15 @@ already holds that slot, so the later start holds it no longer than the
 client's own request allows. Timing the bytes from arrival would need a
 second reader per connection. No spec text changes: runtime §8's "5 s
 partial-request deadline prevents monopolization" still holds.
+
+**T4-A49. No oversize page item** (implementation, T4-6, 2026-09-30). C1
+§3.10 and §3.11 said a single `list` summary or event too large for the 1
+MiB response is refused with `admission_refused`. Round 17 made that case
+impossible by construction [t4r17.8]: an event's payload is at most 256 KiB
+and a summary's members are bounded, so the first item always fits (§4.3). A
+refusal path that cannot run is untestable code, so it is a debug assertion
+instead. C1 §3.10 and §3.11 now say so; `admission_refused` keeps its other
+meanings (read lane full, disk floor).
 
 ## 13. Tests (failure-first)
 

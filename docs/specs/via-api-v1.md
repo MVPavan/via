@@ -366,8 +366,9 @@ admission, harness, model, label, created_at, last_active_at}`;
 `last_active_at` is the time of the session's latest durable event, and
 `since` matches `last_active_at ≥ since`. Result
 `{sessions: [summary], next_cursor}`. The page stops at both requested item
-count and 1 MiB encoded bytes; an individual result that cannot fit the
-bounded response is refused with `admission_refused`, never truncated.
+count and 1 MiB encoded bytes. A summary is far smaller than a page, so the
+first one always fits; there is no refusal path and never a truncated
+success.
 
 ### 3.11 `events` — page
 
@@ -381,8 +382,9 @@ earliest_seq}`. Semantics:
   `types` (gaps in `seq` are expected under a filter). It stops at both the
   requested count and 1 MiB encoded bytes. `next_after` is the last scanned
   seq, including filtered-out events; `more` uses the committed head captured
-  with the page. An individual result exceeding the response bound is
-  `admission_refused`, never a truncated success.
+  with the page. An event (its payload at most 256 KiB) is far smaller than
+  a page, so the first match always fits; there is no refusal path and never
+  a truncated success.
 - History pruned by retention: `history_pruned` error carrying
   `earliest_seq` when `after < earliest_seq - 1`. Until retention prunes,
   `earliest_seq` is 1.
