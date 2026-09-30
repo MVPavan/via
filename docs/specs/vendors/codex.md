@@ -63,11 +63,12 @@ Core owns receipts, submission intent, queues, deadlines, results and Store
 transactions. Adapter owns canonical mapping, capabilities, normalization
 and cleanup evidence. A concrete `CodexConnection` in Routes owns typed
 methods, request pairing and thread demultiplexing. Wire owns bounded JSONL,
-raw references and transport. Host owns the process, verified identity,
+and transport. Host owns the process, verified identity,
 shared-server leases and whole-server shutdown. Follow runtime §2's opaque
 resource wiring; no Adapter access to SQLite or credentials.
 
-Extend the typed route with only `initialize`, `thread_start`,
+Extend the typed route with only `initialize`, `model_list` (catalog
+discovery right after `initialize`, §3), `thread_start`,
 `thread_resume`, `turn_start`, `turn_steer`, `turn_interrupt`,
 `thread_unsubscribe`, and typed server-request replies. A single connection
 task receives all vendor messages; session drivers receive already correlated
@@ -157,9 +158,11 @@ are checked against `model/list` inside `run_turn` before `turn/start`, and a
 mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` and no
 `turn/start` written. Live checks use `gpt-6-luna` at low or medium effort. Reject an
 unsupported explicit `max_steps`; this route has no matching control.
-`outputSchema:null` is emitted to clear VIA inheritance; final agent text
-must parse and validate before becoming `structured_output`, otherwise use
-`structured_output_missing`. A live clear/change fixture remains required.
+`outputSchema:null` is emitted to clear VIA inheritance. Final agent text
+that parses as JSON is `structured_output`, which Core validates: present but
+invalid output fails `structured_output_invalid`; a requested schema with no
+output keeps the terminal status and adds warning `structured_output_missing`
+(C1 §5). A live clear/change fixture remains required.
 Do not expose arbitrary Codex `config` or raw CLI argument forwarding.
 Reserve C2's existing keys plus `config`, `modelProvider`,
 `excludeTurns`, permission-profile selectors, `serviceTierForTurn`,
@@ -184,7 +187,8 @@ effect, workspace roots, protected paths and network enforcement need live
 coverage before claiming the limited bounds. **Until that coverage passes,
 `describe` must omit `read_only`/`workspace_write` and refuse those requests
 as `bound_unsupported` with the unverified-enforcement reason.** An
-`allow_untested` version override does not waive this known proof gap.
+`allow_untested` compatibility parameter has no effect and does not waive
+this known proof gap.
 `full` grants full access; it is never a fallback for a refused limited
 bound. A8 chooses a bound-free key because policy is per turn; enabling
 mixed-bound sharing remains gated on `via-5lr.3.4`, not on C4's marker
@@ -291,7 +295,7 @@ to admit another or relabel its evidence session-level. Existing uncertain
 results remain immutable; pending cleanup settles uncertain and active
 turns follow Core's failure precedence. Retirement is a documented loss of
 continuity, not proof that unresolved tools stopped. Release tombstones
-only after raw/control draining ends and the continuity-loss reports have
+only after message/control draining ends and the continuity-loss reports have
 been handed to Core (or sticky Store/transport failure records their loss).
 
 Normalize with C2 `progress` items: `agentMessage` and `reasoning` item
@@ -338,7 +342,7 @@ receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting
 for the 10-second C2 observation-stall timer. Latch a per-thread `overflow`
 health report containing the thread/lane generation, triggering original
-turn correlation, first unqueued raw reference and a saturating count of
+turn correlation, first unqueued message's sequence and a saturating count of
 omitted observations. The triggering turn identifies lost evidence, not
 the entire failure target.
 
@@ -355,18 +359,18 @@ escape continuity-loss handling. Existing queued observation prefixes retain
 their ordering. Do not enqueue lost observations into B's lane or start an
 unbounded spill queue.
 
-While quarantined, continue reading and raw-logging A's traffic, pairing
-responses and declining requests on reserved paths; do not produce further
-ordinary A observations. Its bounded correlation/tool metadata remains
-owned by A, with continuity marked incomplete; do not infer quiescence
-from the surviving subset. Core records explicit normalized-event loss
-with the overflow, and `raw_log_incomplete` only if raw bytes were actually
-lost. Raw evidence is otherwise retained exactly. B's ordinary lane and
+While quarantined, continue reading and counting A's traffic, then
+discard it (C2 §4), pairing responses and declining requests on reserved
+paths; do not produce further ordinary A observations. Its bounded
+correlation/tool metadata remains owned by A, with continuity marked
+incomplete; do not infer quiescence from the surviving subset. Core records
+explicit normalized-event loss with the overflow. VIA keeps no copy of
+vendor traffic beyond the bounded decode-failure evidence (runtime §4). B's ordinary lane and
 control replies remain independently serviceable. Quarantine remains until
 that thread detaches; a later reopen uses a new lane generation and never
 replays or resends the affected input. Retained old-turn tombstones still
 prevent reassignment. If the reserved correlation/health/control path or
-global/raw budget cannot be maintained, escalate explicitly to connection
+global budget cannot be maintained, escalate explicitly to connection
 overflow, report every affected session and retire the connection.
 
 The normalizer may still wait on its full **C2 observation channel**, as
@@ -377,7 +381,9 @@ one full queue. A full C2 channel with no further ingress waits for that
 timer; continued ingress may exhaust its staging earlier.
 Independent sticky health delivery bypasses data lanes. Codex observation/staging
 lanes and retained tool metadata are fixed per-server buffers. Measure the expanded
-aggregate budget for 32 loaded leases and four active turns; do not
+aggregate budget for 32 loaded leases and the maximum concurrent active
+turns that per-connection admission allows (one per leased session, so up to
+32 on one server; C2 §3); do not
 preallocate 4 MiB for every idle lease or assume S1's RSS result covers this
 extension. Retain the runtime's 256 MiB RSS acceptance target; a failure
 requires design review, not silent ceiling growth.
@@ -412,13 +418,15 @@ At `uncertain`, finalize cancellation with `cancel_cleanup_uncertain`; the
 next queued turn may dispatch with `predecessor_cleanup_uncertain`. This
 explicitly allows possible overlap with a surviving tool. Other threads
 remain usable throughout. If no interrupted terminal arrives before the
-control deadline, report outcome `unknown`; never kill the shared server
+order's `force_at`, report state and outcome `unknown`; never kill the shared server
 to manufacture `forced`. An ordinary completed terminal that wins the
 race stays completed under C1 precedence.
 
 `turn/interrupt` alone and `thread/unsubscribe` leave background terminals
-running; they stay the server's until it closes. They are not part of
-cleanup. `thread/backgroundTerminals/clean` (experimental) is recorded as the
+running; they stay the server's until it closes. A background process
+outside the turn's reported tool items is not part of cleanup; any reported
+item still counts until it ends or P7's bound passes, wherever it runs
+(C2 §2 Interrupt). `thread/backgroundTerminals/clean` (experimental) is recorded as the
 Codex mechanism of a future kill-or-keep option; it is not sent.
 
 Server close (idle retirement, C2 §3) is stdin close, which stopped every
@@ -471,10 +479,10 @@ time; retain raw-span evidence for every scenario.
 | `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
 | `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 5 s deadline holds while data lane full; failed write never recorded as successful decline. |
 | `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. |
-| `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation/raw extraction stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
+| `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
 | `codex_cleanup_60s` | The driver applies the window from Core's `tool_grace`, not the stop order's `close_by`. With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; a tool ending 20 s after acknowledgement settles `quiescent`; final completion settles early. c3 (interrupt only) settles `uncertain` at the window. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
-| `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood stays raw-only/bounded; distinguish normalized loss from actual raw gaps. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
+| `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood is read, counted and discarded within bounds, with the normalized loss explicit and no copy of the discarded traffic. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
 | `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
 | `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
@@ -550,7 +558,9 @@ Applied; the adapter design (AD4) makes the window driver-applied from Core's
 
 **C2 §6.2 Open/StartTurn/Auto-decline and §8 B2/B6:**
 
-> Pin 0.157.1. Use persistent threads, never approval policy and explicit
+> *(The pin is superseded: every version is supported by default under
+> C2 §5, adapter design AD7; 0.157.1 remains the inspected schema version.)*
+> Use persistent threads, never approval policy and explicit
 > user reviewer; send the frozen structured sandbox policy on every turn.
 > Use thread/resume with excludeTurns and verify returned identity.
 > The six no-grant response bodies in vendors/codex.md §4 validate against
