@@ -336,3 +336,146 @@ After the runs, no process from this worktree remained.
   latch during the late delivery.
 - **Timing in the tests:** both late-path tests rely on 500 ms margins,
   which are documented in the tests.
+
+## Fix round 2
+
+**Status: DONE_WITH_CONCERNS.**
+- Review source: the Sol r2 exhaustive review
+  (`scratchpad/execution/s1-critic/review-s1-runtime2-sol-r2.md`),
+  findings 1–3 and 5–9. Finding 4 (Host-journal corruption kind) is bead
+  `via-jm4.21`; via-host is untouched.
+- Commit: `fc14ec7`, which carries every fix and test.
+- Logs: `scratchpad/s1/runtime2/r2-*.log`.
+
+### Dispositions
+
+| Finding | Disposition | Change |
+|---|---|---|
+| 1 (important) | fixed | `engine/terminal.rs` `classify`: the exit-code and cleanup guards are removed, so a decoded `completed` is `completed` (C1 §7.6 row 3). Exit and cleanup stay evidence (C1 §7.5). |
+| 2 (blocker) | fixed | `journal::commit_terminal_with` takes `(retry, latch)`. A failure that may have written, or corruption, runs `Signal::fail_pending` (the latch's phase one) before the read-back, which is bounded by `READ_BACK` (2 s, runtime §7) and keeps a committed result. Every caller passes the engine's latch through `Commit { retry, latch }`: natural and resolution terminals (`finish_with`), queued cancellations for both owners (`commit_cancellation`), and forced terminals (`finish`). Startup recovery passes none: it fails startup instead. |
+| 3 (important) | fixed | `Durable.uncertain` is now `Option<WriteOutcome>`, and `commit_terminal_with` returns `Unended { error, outcome }` with `WriteOutcome::of(&error)`. `Corrupt` therefore stays `corrupt_store` whether or not the read-back finds the terminal. `finished()` and the queued-cancel path classify from that outcome. |
+| 5 (important) | fixed | Route: `Finished::Result` and the late path reapply the daemon force after draining (`Serving::unless_forced`): `ForceStopped`, with the close's exit, cleanup, `forced` and journal evidence. `FakeRouteResult` gains `forced`. Adapter: the post-Route delivery is polled before the force (`biased`), so data deliverable at once still goes. A rest ended by the force is `ForceStopped`, and a real delivery failure is `Overflow`; both keep Route's exit, cleanup, `forced` and `journal_uncertain` (no longer `cleanup: None`). |
+| 6 (important; the review says blocker) | fixed | On `Driven::Forced`, Core settles its final text (`settle_text`: inline, or file synced) and carries it in `ForcedTurn.text` (`drive::TurnText`). `forced_terminal` applies it in both ordinary and Store-failure shutdown. A failed file step still fails the turn `store` ("the final text could not be written"). |
+| 7 (important) | fixed | `FakeRoute::late`: at wall expiry the force close starts at once, and the held message is delivered concurrently (`tokio::join!`). Delivery, close and `finish` share one absolute deadline `by`, with no second allowance. |
+| 8 (important) | fixed | `deliver_held` returns `Overflow` when the deadline expires, never `Deadline`, and a closed hop gives the existing hop-closed cause. The daemon force outranks either (`failure_with`). |
+| 9 (minor) | fixed | New test-only seam `routes.late.entered`, hit with the terminal decoded and held before anything is closed or delivered, reached through the new `via_wire::failpoint` re-export. The late tests act only on its acknowledgement; the 500 ms gaps are gone. A latch case is added. |
+
+Test-only seams added in this round are listed in
+`scripts/check-release-features.py`:
+- `routes.late.entered`;
+- `core.terminal.read_back`, after the latch's phase one and before the
+  read-back;
+- `store.commit.corrupt.terminal`, which makes the terminal write report
+  `Corrupt` and roll back.
+
+### Tests, RED then GREEN
+
+RED ran against the pre-round code while keeping the new tests and seams:
+- Route and Adapter tests: `b2eade0`'s `via-routes` and `via-adapters`
+  runtimes with the late seam inserted (`r2-red-route.log`); for the latch
+  case, round 0's `6191814` (`r2-red-latch.log`).
+- Core tests: `b2eade0`'s `terminal.rs`, plus the three Core fixes
+  toggled back (no phase one before the read-back; the outcome reduced to
+  `Uncertain` as `outcome_of` did; forced text not applied)
+  (`r2-red-core.log`).
+
+GREEN is in `r2-green-new.log`, and every test passes in the gate.
+
+| Test | Finding | RED | GREEN |
+|---|---|---|---|
+| `route_drain::a_completed_terminal_then_a_failed_exit_is_completed` (replaces `failure_class_process_exited_after_completed_terminal`) | 1 | `left: "failed" right: "completed"` | `completed`, `final_text` `"done"`, `exit.code` 5 |
+| `route_drain::a_completed_terminal_whose_vendor_outlives_the_wall_is_completed` (the reviewer's daemon probe) | 1 | `failed` | `completed`, `"done"`, `exit.signal` set |
+| `s1_store_failure::s1_f12_uncertain_terminal_latches_before_its_read_back` (the probe: lost terminal reply, read-back held) | 2 | `health: healthy`, `store_failure: null` during the hold | `store_failed` during the hold; spawn refused `store_error`; then `commit_uncertain` scope `daemon`, exit 4, turn `completed` |
+| `s1_store_failure::s1_f12_corrupt_terminal_write_latches_as_corruption` | 3 | `kind: commit_uncertain` | `corrupt_store` scope `daemon`; exit 4; the batch ends the turn `failed` |
+| `s1_store_failure::s1_force_keeps_the_final_text_core_received`, ordinary (`daemon stop --force`) and latch (lost receipt reply) variants (the probe: FinalText handled, then force) | 6 | durable `final_text: ""` | `cancelled`, `forced`, `final_text: "done"`, in both variants |
+| `route_stop::a_force_during_late_delivery_keeps_the_held_terminal` | 5, 9 | `Overflow`, `cleanup: None`, `forced: false` | `ForceStopped`, cleanup `Quiescent`, `forced`, text `"done"` |
+| `route_stop::a_latch_during_late_delivery_keeps_the_held_terminal` | 9 | against round-0 `flush`: `Overflow` from the latch (`vendor message over the 1048576 byte cap`), which proves the latch was set | `completed`, cleanup `Quiescent`, text `"done"` |
+| `route_stop::an_undelivered_held_terminal_is_not_a_completion` | 7, 8, 9 | `Deadline` | `Overflow`, cleanup `Quiescent`, `forced`, text `""`, late-path acknowledgement seen |
+| `route_stop::a_held_terminal_is_delivered_after_wall_expiry` | round-0 regression | (round 0) | `completed`, cleanup `Quiescent`, `"done"` |
+
+**Order proofs, with no timing gaps:**
+- Late tests: the `routes.late.entered` acknowledgement proves that the
+  terminal is decoded and held and that the late path was entered, with
+  nothing closed or delivered yet.
+- Force: the test raises the force after that acknowledgement and before
+  release.
+- Latch: the vendor writes a 2 MiB line after the acknowledgement. Its
+  `wrote` marker appears only once the pipe has taken the line, so the
+  reader has passed the 1 MiB bound and latched. Only then is Route
+  released. Draining starts after release.
+- Daemon tests: `core.run.settling`, `core.terminal.read_back`, and
+  `core.observations.pause` hit 3, which comes after the FinalText
+  observation.
+
+**Updated tests:**
+- `failure_class_process_exited_after_completed_terminal` is replaced.
+  The guard it relied on contradicts C1 §7.6; the new test asserts the
+  exit evidence instead.
+- The three late-path tests are rewritten for the new seam and are now
+  test-failpoints only. The default build therefore runs one test fewer
+  (345).
+- The round-1 time probe (`LATE_PROBE`) is removed.
+
+### Gate counts (tip `fc14ec7`; `r2-gate.log`, `gate exit 0`)
+
+| Check | Result |
+|---|---|
+| fmt, both clippy runs, deny, check-layers, release build and release-feature check | ok |
+| default nextest | 345 passed, 1 skipped |
+| failpoint suite (run 1) | 558 passed, 1 skipped |
+| `s1_f(08\|09\|10\|12)_` | 61 passed |
+| selector, 5 repeats | 88 passed each time |
+| failpoint suite, runs 2 and 3 (`r2-failpoints-2.log`, `r2-failpoints-3.log`) | 558 passed, 1 skipped each time |
+
+After the runs, no process from this worktree remained.
+
+### Design sentences I believe change (for the coordinator to write)
+
+1. **T3 design §2 rule 3 [r1.23].** At wall expiry with a decoded
+   terminal, Route starts Host's force close at once and delivers any
+   held message concurrently. Delivery, close and drain share one
+   absolute cleanup deadline. Delivery that cannot finish by then is
+   `Overflow`. The result is the terminal with the force close's evidence
+   unless the daemon force is set (rule 4), which makes it `ForceStopped`
+   with that evidence. The connection latch does not change a decoded
+   late terminal's result. The normal path is unchanged: a latch during
+   finalization still fails the turn.
+2. **T3 design §2 rule 4.** Route reapplies the daemon force after any
+   successful exit's drain. The Adapter hands over post-Route data that
+   is deliverable without waiting even under the force. A rest the force
+   ended is `ForceStopped` with Route's evidence, and `Overflow` is only
+   a real delivery failure.
+3. **T3 §7.2 / runtime §7 (terminal commits).** A terminal commit that
+   may have written, or hit corruption, raises the latch's phase one
+   before its read-back. The read-back is bounded at 2 s and keeps a
+   committed result. The failure is classified from the commit's typed
+   outcome, so corruption is `corrupt_store`.
+4. **T3 §6.8 / design §2 rule 4 (forced terminals).** A forced terminal
+   carries the final text Core received before the force: inline, or its
+   synced file. A failed file step fails it `store`, as on the natural
+   path.
+5. **C1 §7.6 row 3.** Core's classifier no longer turns a decoded
+   `completed` into `failed(process_exited)` for a non-zero exit or
+   uncertain cleanup. Earlier design text or tests that implied it are
+   superseded.
+
+### Concerns
+
+- **One commit for the whole round.** Findings 2, 3 and 6 share
+  `drive.rs` hunks, findings 5, 7 and 8 share `run_turn`, and the three
+  seams share one hunk of the release list. Splitting per finding would
+  need hunk staging. This is a deviation from "one or two commits per
+  finding".
+- **Latch-case result is my choice.** Under a latch, the late path
+  returns the delivered terminal (`completed`); only the force changes
+  the result. The coordinator's disposition fixed force but not latch.
+  I chose this because pre-chunk behaviour and rule 3 [r1.23] return a
+  decoded late terminal, and because a latch raised by Route's own force
+  close must not fail it. Design sentence 1 records it.
+- **Unbounded forced-path file sync.** The forced path now awaits the
+  final-text settle, a file sync, before the handoff. It is a bounded
+  Store blob step, but it runs after the force. A stalled filesystem
+  delays that dispatcher's handoff until final shutdown aborts it
+  (`dispatchers_by`), and then the text is lost as before.
+- **Finding 4 is not addressed.** Host-journal corruption still reports
+  `commit_uncertain`; it is bead `via-jm4.21`.
