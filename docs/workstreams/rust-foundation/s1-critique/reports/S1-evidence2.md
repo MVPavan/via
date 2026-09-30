@@ -423,3 +423,160 @@ Gate exit 0. No process from this worktree was left afterwards.
 - Two failure paths have no regression, because they cannot be forced
   cheaply: the D-state reap and an overrunning `/proc` read. Both are
   recorded, not proven.
+
+## Fix round 2
+
+**Status: DONE_WITH_CONCERNS.** All 18 findings are fixed; gate G passed. Review:
+`scratchpad/execution/s1-critic/review-s1-evidence2-sol-r2.md` (Sol r2),
+findings 1–18. The coordinator asked for every listed site and every
+same-shaped site to be fixed. Scope: test support and tests in
+`crates/via-cli/tests` only.
+
+### Shape of the change
+
+- **One teardown module.** `support/outer_cleanup.rs` now owns everything
+  on the teardown path:
+  - the §11.2 constants: `TEARDOWN` 10 s, `ORDINARY_STOP` 2 s, `REAP` 1 s;
+  - the helpers `wait_by`/`reap_by`/`kill_and_reap` (poll, observe,
+    timestamp, reject late, then accept);
+  - `run_within(command, deadline)`: kills at the deadline minus a reap
+    reserve, reaps by the deadline, and returns a failure if the child was
+    not reaped;
+  - `teardown_child`: the ordinary stop gets at most 2 s, then the exit
+    wait, then the kill and a 1 s reap;
+  - `anchors_by`, `write_report` and `Teardown`.
+  `evidenced.rs` keeps no copy of any of these.
+- **`Teardown`.**
+  - It holds one final deadline (`begin`), every generation's record and
+    every failure (`record`).
+  - `daemon_generation(...)` is the single path each daemon guard takes. It
+    runs the direct child's teardown, then the anchor cleanup, which runs
+    whether or not the child was reaped. It then writes that generation's
+    report (`cleanup-<n>.json`) and records its failures, including an
+    unwritten report.
+  - `summary()` is complete only with at least one generation and no
+    failure.
+- **Intermediate vs final teardown is explicit.**
+  - A deliberate mid-test stop is `shutdown()`, or `stop_clean_between` in
+    `s1_store_failure`. It has its own §11.2 bound and never begins the
+    final teardown. A needed kill is a `Timeout`; any other cleanup failure
+    is `Infrastructure`.
+  - A final teardown is a drop or `finish()`/`verify_anchors()`. It begins
+    or joins the one deadline.
+  - No daemon starts after the final teardown began.
+- **`support/process.rs::exited(pid)`** is the one fallible process
+  observation:
+  - vanished (`ENOENT`/`ESRCH`) or state `Z`/`X` means exited;
+  - any other state means live;
+  - unreadable or malformed means `Err`.
+
+### Per-finding table
+
+Line numbers in the "Sites" column are the review's, at `a45ef81`.
+RED logs are in `scratchpad/s1/evidence2/`:
+- `r2-red-reviewer-probe-a45ef81.log`: the reviewer's own probe output.
+- `r2-red-probe-a45ef81.log`: the same probe binary re-run by me against
+  `a45ef81`.
+- `r2-red-harness-a45ef81.log`: a temporary test file, not committed. It
+  compiles the `a45ef81` copies of `daemon.rs`, `evidenced.rs`,
+  `outer_cleanup.rs`, `scenario.rs` and `evidence.rs` and runs this round's
+  assertions against them. All 6 failed.
+- `r2-red-f15-mutation.log`: the reviewer's mutation applied to the new
+  code.
+
+| # | Sites fixed | Regression test | RED evidence | Limitation |
+|---|---|---|---|---|
+| 1 | **`support/daemon.rs`:**<br>- Each generation has its own number, `cleanup-<n>.json` and a `=== daemon generation n ===` header in the appended `daemon.trace`; nothing is truncated.<br>- `collect_available(evidence, state, &teardown)` writes `cleanup.json` = `Teardown::summary()` first and fails unless every generation is complete.<br>- Every caller now passes the teardown: config, progress, bounds, blob, c1_reads, sessions, c1_intake, vendor_pipeline, evidence, f24.<br>**Same shape in other files:**<br>- `s1_recovery`, `s1_crash_points` and `s1_daemon_stop` record `cleanup-<n>-<run>.json` and append traces.<br>- `s1_prompt_to_result` records `cleanup-1.json`.<br>- The evidenced guards record into the sandbox's `Teardown`. | `s1_evidence::s1_evidence_every_daemon_generation_is_validated`: generation 2's report path is a directory; collection must fail with "cleanup report not written". `cleanup.json` must list both pids, and the trace must hold both headers. | harness `red_f1_final_report_covers_the_last_generation`: the old `cleanup.json` named generation 1's pid (`stale report`). | — |
+| 2 | `outer_cleanup::valid_identity`, the production predicate, is applied before any connect or probe: pid > 1, pgid > 1, pid = pgid, start ticks > 0, a known Store phase, and nonempty id, generation, marker, boot and namespace. An invalid row is `invalid_identity`/`not_probed`, so it stays uncertain. | `evidence_collector::outer_cleanup_invalid_identity_stays_uncertain`: pid 0, ticks 0, empty marker, pid ≠ pgid and an unknown phase are each `unverified`. | probe: `invalid_identity_cleanup` was `quiescent`, `absence_proven: true`. | — |
+| 3 | **`evidenced::park`:**<br>- Evidence waivers no longer touch the cleanup proof.<br>- Anchor cleanup runs whenever a Store exists, waiver or not.<br>- A missing Store is `unverified` past the deadline or when a Store was expected, otherwise `no_store`.<br>- A Store-evidence error under a waiver is written to `store_evidence.json`, beside the cleanup result, and never replaces it. | `evidence_collector::collector_evidence_waivers_never_waive_the_cleanup_proof`: an expired no-Store teardown and a waived Store error both keep a cleanup failure. | probe: `expired_no_store` and `waived_store_error` were `pass` with `evidence_complete: true`. | — |
+| 4 | **Owning helpers return or raise `ScenarioError::Timeout`:**<br>- `s1_turn_control`, `s1_lifecycle` and `s1_store_failure`: `run_command`, `wait_child`, `wait_until` and readiness (typed `timeout()`).<br>- `c1_protocol`: `timeout`/`is_timeout`/`verdict`; `run_cases` returns failures and timeouts separately.<br>- `route_drain`: the run timeout and `await_result` raise with `panic_any(ScenarioError::Timeout)`, which `evidenced` downcasts.<br>- `support/daemon.rs::refused`/`cli` and `s1_prompt_to_result::expect_request_error` classify a timeout before reading a refusal. | `evidence_collector::a_raised_typed_timeout_stays_a_timeout` | harness `red_f4_raised_timeout_stays_a_timeout`: the old code recorded `fail` ("non-string panic"). | Bodies that return plain strings for real assertion failures stay `fail`, as intended. |
+| 5 | **Outcome first, then attached failures:**<br>- `scenario::run_command`: `Captured.attached` carries output-read and reap failures, and never replaces a timeout.<br>- `daemon::write_output`/`note` write evidence after the outcome check: `support/daemon.rs` `cli`/`refused`, `s1_prompt_to_result` `cli`/`expect_request_error`, `s1_recovery`/`s1_crash_points`/`s1_daemon_stop` `run()`.<br>- The `scenario_runner` timeout self-test checks the outcome first. | `evidence_collector::run_command_bound_covers_the_reap` (timeout stays `Timeout`); the `scenario_runner` timeout test. | Structural: at `a45ef81` the `?` on the evidence write came before the outcome check at every listed site (review lines). | — |
+| 6 | **`evidenced::park`:**<br>- `cleanup()` runs first and always writes `cleanup.json` = `{exit_proof, teardown, anchors}`, even when the exit proof failed (anchors are then still processed).<br>- `collect()` then runs every evidence step and accumulates all errors into `Evidence::collection_failure`, beside `cleanup_failure`.<br>- `Evidence::cleanup_failed` accumulates entries instead of replacing them. | `evidence_collector::collector_failed_exit_still_records_cleanup`; `collector_launched_turn_without_its_folder_fails_the_evidence` now asserts both the folder failure and the unverified cleanup. | probe: `failed_exit` produced no `cleanup.json`. | — |
+| 7 | `outer_cleanup::run_within` keeps a reap reserve of min(1 s, a quarter of the budget) and returns a failure for an unreaped stop child. Callers record it in the teardown: the sandbox stops in `route_drain`, `s1_turn_control`, `s1_lifecycle`, `s1_store_failure` and `c1_protocol`, and every `daemon_generation` stop. `s1_crash_points::PendingClient` records an unreaped client in the teardown. | `evidence_collector::outer_cleanup_run_within_reaps_its_killed_child` | probe: `run_within` left a `sleep` zombie. | — |
+| 8 | **Final helpers join the one deadline:**<br>- `s1_turn_control`, `s1_lifecycle` and `s1_store_failure` `finish`/`verify_anchors` call `teardown.begin()`; `verify_anchors_by(deadline)`.<br>- The guards in `support/daemon.rs`, `s1_recovery`, `s1_crash_points` and `s1_daemon_stop` begin or join `Teardown`.<br>**Intermediate stops made explicit (line numbers at the fixed tip):**<br>- `shutdown()` in `s1_daemon_config` (447, 455, 707, 736, 891, 961, 1325, 1484), `s1_progress` 1324, `s1_lifecycle` (939, 995, 1956, 2012, 2246) and `s1_turn_control` 1846.<br>- `stop_clean_between` in `s1_store_failure`.<br>- `s1_bounds`: 4 scoped restarts and the SIGKILL block.<br>- `s1_crash_points` t2d (2 sites, new `Daemon::shutdown`). | `evidence_collector::collector_sandbox_teardown_shares_the_guards_deadline` (guard record and shared deadline). Every restart scenario refuses a start after `begin`, so a missed intermediate site fails loudly. | Static: at `a45ef81` these helpers took `Instant::now() + TEARDOWN` themselves. | — |
+| 9 | `evidenced::stop_daemons` gives the stop min(2 s, deadline). `teardown_child` does the same for every guard. The stop's record goes into the teardown. | `evidence_collector::collector_ordinary_stop_is_capped_at_two_seconds` | harness `red_f9_ordinary_stop_is_capped`: the old stop got 9.9987 s. | — |
+| 10 | **Every listed blocking `wait()` is now a bounded poll (`kill_and_reap`/`reap_by`) with an explicit unreaped result:**<br>- `s1_turn_control` 78; `s1_lifecycle` 64 and 690; `s1_store_failure` 64; `route_drain` 113; `c1_protocol` 542;<br>- `s1_crash_points` 322, 449 and 1037; `s1_recovery` 400; `s1_daemon_stop` 801 and 846; `s1_c1_intake` 1912.<br>The collector's fixture reaps (`evidence_collector::reap`) are bounded to 5 s. The two blocking reaper-thread joins were replaced by a `sleep 30` group reaped at the end. | the listed call sites are exercised by the suite | not forceable: needs a D-state child. | D-state child not reproducible. |
+| 11 | `scenario::run_command` takes an absolute deadline at entry. The kill fires at the deadline minus min(1 s, timeout/4); the reap ends by the deadline. A failed reap is a synthetic `ExitStatus` plus an attached failure. | `evidence_collector::run_command_bound_covers_the_reap` | Static: at `a45ef81` the reap had its own extra 1 s after the timeout. | Temp-file creation and `spawn` stay outside the bound: they are local syscalls with no peer. |
+| 12 | `outer_cleanup::snapshot(store, deadline)`: SQLite's busy wait is min(1 s, time left), and none is attempted when no time is left. | `evidence_collector::outer_cleanup_snapshot_is_bounded_by_the_deadline` | probe: an exclusive lock took 1,001 ms with any time left. | Row scanning itself is not interruptible; a late scan is caught by `verify`'s late check. |
+| 13 | `process::exited` replaces every "unreadable means exited" probe:<br>- `evidenced::scan_processes`; `s1_turn_control` `gone`; `s1_vendor_pipeline` `stopped` (parses the pid);<br>- `s1_lifecycle` `process_live`; `s1_store_failure` `process_live`; `s1_recovery` `process_live`; `s1_daemon_stop` `process_live`; `s1_progress` `await_exit`.<br>`absent_within` takes a fallible probe. | `s1_turn_control` F19 helper (unreadable state is an error); `s1_vendor_pipeline` F24 helper (malformed `stopped("x1")` is not stopped). | harness `red_f13_unreadable_process_is_not_stopped`: the old `stopped("x1")` returned `true`. | — |
+| 14 | **Observe, timestamp, reject late, then accept:**<br>- `outer_cleanup::wait_by` is used by every guard, `run_within` and `run_command`.<br>- `s1_lifecycle`/`s1_store_failure` `wait_child`/`wait_until`; `s1_recovery` 483 and 660; `s1_crash_points` `wait_child`; `s1_daemon_stop` 248, 381 and 841; `s1_turn_control` 431; `s1_prompt_to_result` 74 and 91; `s1_progress` 454–460.<br>- `support/daemon.rs` readiness. | `evidence_collector::outer_cleanup_reap_after_the_deadline_fails` | harness `red_f14_late_reap_is_not_accepted`: the old `reap_by` accepted a reap observed after its deadline. | — |
+| 15 | `evidence_collector` `returned_in_time(what, deadline)` with a named `TOLERANCE` of 500 ms (documented: 5–20 ms polls plus wake-up latency under the parallel gate). Asserted on the connect (measured by the waiter), the whole exchange, the snapshot and both collector teardowns. | the tests named in the "Sites" cell | `r2-red-f15-mutation.log`: the reviewer's mutation (`Bounded::remaining` returns 300 ms) now fails `outer_cleanup_exchange_is_bounded_as_a_whole` ("returned 1.06 s after its deadline"); it used to pass. | These are contract upper bounds (design T4-A50 exception). |
+| 16 | Every guard records its direct-child record through `Teardown::daemon_generation`. The fields are `pid`, `was_alive`, `stop`, `kill`, `reaped` and `elapsed_ms`. The guards are `c1_protocol`, `s1_turn_control`, `s1_lifecycle`, `s1_store_failure`, `support/daemon.rs`, `s1_recovery`, `s1_crash_points`, `s1_daemon_stop` and `s1_prompt_to_result`. `evidenced` includes `teardown` in `cleanup.json` on every path, including a failed exit proof. | `collector_sandbox_teardown_shares_the_guards_deadline` asserts `cleanup.json.teardown.generations[0].direct_child`. | probe: `cleanup.json` held only `anchors`. | — |
+| 17 | `c1_protocol::stop_by` sends `daemon/stop` with `"params":{"force":true}`. | covered by the C1 guard path in the suite | Static: the request had no `params`. | The C1 guard's blocking connect remains, as recorded. |
+| 18 | `outer_cleanup::verify_one` connects only to `arm_intent` anchors. A valid `intent` or `identified` row is `pre_arm_not_contacted` and gets the absence probe only, as in `via-host` reconciliation. | `evidence_collector::outer_cleanup_never_contacts_a_pre_arm_anchor` (both pre-ARM phases) | harness `red_f18_pre_arm_anchor_is_never_contacted`: the old verify connected to an `identified` anchor. | — |
+
+### Corrections made while running the suite
+
+The first failpoint run on the fixed tree had 12 failures
+(`r2-failpoints-pre.log`). All came from this round's new strictness, and
+none was a production defect:
+- **Phase validity was too strict.** I had limited valid phases to
+  `identified`/`arm_intent`. Production's `probe_absence`
+  (`crates/via-host/src/linux.rs`) accepts an identity row in any phase;
+  the phase only decides whether a connection is allowed. `intent` rows
+  with a full identity were therefore wrongly uncertain. The predicate now
+  accepts all three Store phases. The F18 test covers `intent`.
+- **Live mid-test drops before a restart.** These are the finding 8 sites
+  listed above. Each is now an explicit `shutdown()`.
+- **A Store file that does not exist.** `anchors_by` treats a Store file
+  that does not exist, observed within the deadline, as an empty committed
+  inventory. A Store that exists but cannot be opened stays `unverified`.
+  Regression: `outer_cleanup_absent_store_has_no_anchors`.
+  `s1_evidence_harness_readiness_never_starts_a_daemon` now collects the
+  teardown report instead of relying on a guard-written `cleanup.json`.
+- **`s1_crash_points` t2d scenarios.** They fabricate an `intent` row that
+  no process ever had. They now delete it after the run exited and was
+  reaped, and before the run's teardown checks the real anchors. Before
+  this round, only the first report was validated (finding 1), so the
+  fabricated row was never checked.
+
+### Updated tests (fix round 2)
+
+| Test | Reason |
+|---|---|
+| `evidence_collector` exit-proof, anchor-cleanup and shared-deadline tests | New `stop_daemons`/`park` API (`Teardown`, `Exited`). The shared-deadline test also asserts the guard record (finding 16) and bounded return (finding 15). No assertion was weakened. |
+| `evidence_collector::collector_launched_turn_without_its_folder_fails_the_evidence` | It now asserts both accumulated failures (finding 6). |
+| `evidence_collector::outer_cleanup_connect_is_bounded_by_the_deadline`, `outer_cleanup_exchange_is_bounded_as_a_whole` | Return time asserted (finding 15), tighter than before. |
+| `scenario_runner` cleanup closures and timeout test | New `run_scenario` cleanup signature; the timeout uses 400 ms and checks the outcome first (finding 5). |
+| `s1_crash_points` t2d (2 tests) | The fabricated row is deleted before the run's teardown (above). |
+| `s1_evidence_harness_readiness_never_starts_a_daemon` | It collects the teardown's report (finding 1). |
+
+### Gates (fix round 2)
+
+Logs in `scratchpad/s1/evidence2/`: `r2-gate.log`,
+`r2-failpoints-run2.log` and `r2-failpoints-run3.log`. The pre-fix run is
+`r2-failpoints-pre.log` (above).
+
+| Check | Result |
+|---|---|
+| fmt; Clippy default and failpoints | pass |
+| Default nextest | 363 passed, 1 skipped |
+| `cargo deny`; layers | pass |
+| Failpoint nextest, 3 runs | 570 passed, 1 skipped each (67.3 s, 67.2 s, 67.1 s) |
+| F08/F09/F10/F12 selector | 58 passed |
+| Release build and `check-release-features.py` | pass: 649 nodes, 0 of 117 markers |
+| Task 4 selector, 5 repeats | 90 passed each time |
+
+Gate exit 0. No process from this worktree was left afterwards.
+
+### Concerns (fix round 2)
+
+- **Not forceable, recorded instead of proven:**
+  - finding 10 and the reap half of finding 11 (a D-state child);
+  - the C1 guard's blocking connect (finding 17's limitation, kept by
+    instruction);
+  - `/proc/<pid>/environ` reads in `scan_processes`.
+- **Outside the bound:** temp-file creation and `spawn` in `run_command`,
+  and SQLite row scanning in `snapshot`. The first two are local syscalls.
+  A late scan is recorded by `verify`'s late check.
+- **`anchors_by` now accepts a missing Store file as an empty
+  inventory.** This is sound only because it runs after the direct child's
+  teardown, when no process of that generation remains to create the Store.
+  Revisit if a guard ever runs anchor cleanup before the reap.
+- **Every daemon generation is now validated (finding 1).** A scenario
+  that deliberately leaves an unprovable fabricated anchor must remove it
+  before that generation's teardown, as the two `s1_crash_points` t2d
+  tests now do.
+- **Timing assertions (finding 15).** These use a 500 ms tolerance under
+  the parallel gate. None failed in the 3 failpoint runs or the 5 selector
+  repeats.
