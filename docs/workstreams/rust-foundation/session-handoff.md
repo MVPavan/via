@@ -247,6 +247,34 @@ the historical checkpoint; its findings table is updated by this section.
     with exit and cleanup as evidence (C1 §7.6 row 3); the daemon force
     gives `ForceStopped` with Host's evidence; only a real delivery failure
     is `Overflow`; SQLite corruption latches as `corrupt_store`.
+- **Adapter interface design (`via-jm4.22`, closed 2026-09-30).** The owner
+  asked for template-like adapters behind C2 ("the language of VIA"),
+  designed from the real harnesses. Live re-probes:
+  [adapters/reprobe-*.md](adapters/); tool-process lifecycle research:
+  [adapters/lifecycle-harnesses.md](adapters/lifecycle-harnesses.md) and
+  [adapters/lifecycle-mechanisms.md](adapters/lifecycle-mechanisms.md).
+  The design [adapters/design.md](adapters/design.md), revision 9, reached
+  Sol SOUND after nine rounds ([adapters/reviews/](adapters/reviews/)).
+  Owner decisions are in §1 of the design:
+  - new vendor versions get a cheap live check;
+  - personal-setup categories are config switches (hooks and MCP off);
+  - adding an adapter means a VIA rebuild; ACP comes later;
+  - invariant 2 is reworded (AD12);
+  - experimental vendor features are allowed;
+  - OD3: agents own their processes. VIA soft-stops through the vendor,
+    hard-stops only the agent's own group, and reports leftovers (AD20)
+    without killing them.
+
+  **Pending owner choice:** conflict 4 on leftover detection. A: a
+  report-only marker scan that transiently reads same-uid environments,
+  touching invariant 1. B: anchor-subreaper detection. C: no report this
+  release. Recommended: A. It is decided in S-SPEC (`via-jm4.25`).
+  Slices: `via-jm4.25` S-SPEC → `via-jm4.26` S-CORE → each `x.3.2`;
+  `via-jm4.27` S-LAUNCH → each `x.3.2`; each `x.3.3` → `via-jm4.28`
+  S-LEFTOVER → `via-gvg.1`/`via-d9o.1`. Unreported leftover cases:
+  `via-jm4.24`. Live checks use Claude Haiku, Codex `gpt-6-luna`
+  low/medium and an OpenCode free model. Working files:
+  `scratchpad/execution/adapter-design/`.
 - Process rules and roster: [cloud-and-local.md](cloud-and-local.md) §6
   (review loop in the author's session; merge only after review; S3 Codex
   adapter by a local Opus 5.5 medium session).
