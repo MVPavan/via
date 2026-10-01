@@ -1476,9 +1476,11 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
                 .to_owned();
             setup.wait(evidence, "wait_passed", &format!("{passed}/1"))?;
             let models = cli(&setup.sandbox, evidence, "models", &["models", "--json"])?;
+            // S-CORE chunk 5: `models` answers through `AdapterSet::models`,
+            // whose bundled entries are `source: bundled` (C2 §2 `ModelEntry`).
             check(
                 models["models"]
-                    == json!([{"model":"fake","harness":"fake","aliases":[],"source":"builtin"}]),
+                    == json!([{"model":"fake","harness":"fake","aliases":[],"source":"bundled"}]),
                 || format!("models: {models}"),
             )?;
             let other = conn.call("models", &json!({"harness":"codex"}))?;

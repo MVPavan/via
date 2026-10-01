@@ -1566,9 +1566,13 @@ fn s1_c1_cwd_is_frozen_applied_and_reported() -> TestResult {
                         )
                     },
                 )?;
+                // S-CORE chunk 5 (adapter design §5.1 #25): the plan's
+                // effective inheritance states are frozen with the rest.
                 check(
                     params
-                        == json!({"harness":"fake","model":"fake","cwd":agent,"allow_untested":false}),
+                        == json!({"harness":"fake","model":"fake","cwd":agent,"allow_untested":false,
+                                  "inherit":{"hooks":"off","mcp_servers":"off","plugins":"on",
+                                             "skills":"on","agents":"on","instruction_files":"on"}}),
                     || format!("{name}: frozen params {params}"),
                 )?;
                 reported.push(agent);

@@ -429,6 +429,22 @@ fn object_of(bytes: usize) -> Value {
     json!({"pad":"p".repeat(bytes - r#"{"pad":""}"#.len())})
 }
 
+/// A C1 §4 `bound` whose encoding is `bytes` long: one extra writable
+/// directory takes the padding (S-CORE chunk 5: a `bound` is decoded to
+/// C1's shape before the route judges it).
+fn bound_of(bytes: usize) -> Value {
+    let fixed = r#"{"extra_write_dirs":["/"],"mode":"full","network":true}"#.len();
+    json!({"mode":"full","extra_write_dirs":[format!("/{}", "p".repeat(bytes - fixed))],
+           "network":true})
+}
+
+/// A C1 §4 `vendor` whose encoding is `bytes` long: one harness's options
+/// take the padding (S-CORE chunk 5: `vendor` is decoded to an object of
+/// option objects before the route judges it).
+fn vendor_of(bytes: usize) -> Value {
+    json!({"fake": object_of(bytes - r#"{"fake":}"#.len())})
+}
+
 /// Design §6.4, §13.2 [t4r16.7.8]: every envelope member at its maximum,
 /// with 1,500 denials and 1,500 declines whose targets are 64 KiB, encodes
 /// within 1 MiB; each list keeps 1,000 entries of at most 256 bytes citing
@@ -508,8 +524,8 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
                 })
             };
             for (id, (member, over, fits)) in [
-                ("bound", object_of(32 * 1024 + 1), object_of(32 * 1024)),
-                ("vendor", object_of(16 * 1024 + 1), object_of(16 * 1024)),
+                ("bound", bound_of(32 * 1024 + 1), bound_of(32 * 1024)),
+                ("vendor", vendor_of(16 * 1024 + 1), vendor_of(16 * 1024)),
                 (
                     "effort",
                     Value::String("e".repeat(1024 - 1)),
