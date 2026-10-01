@@ -1,0 +1,109 @@
+{
+  "source": "CC c1c, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "11111111-1111-4111-8111-111111111111",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with the single plain word PLAIN and no JSON.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.029871,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 4419,
+          "cached_input_tokens": 0,
+          "output_tokens": 52,
+          "scope": "turn"
+        },
+        "final_text": [
+          "PLAIN"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1,
+            "vendor_session_id": "11111111-1111-4111-8111-111111111111"
+          },
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. Third process on the same UUID; output_schema null clears the schema by omitting --json-schema (packet §4 output_schema)."
+      }
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "source": "CC c0_invalid_resume, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "33333333-3333-4333-8333-333333333333",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": "session_gone",
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
+        "exit": {
+          "code": 1,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. --resume of a missing session gives a pre-init result (error_during_execution, num_turns 0, errors 'No conversation found ...') that echoes the requested UUID. A pre-init rejection never confirms identity or opens (C2 §2 delayed identity); the definite, fixture-backed missing-session rejection is StartRejected::SessionGone and the same VIA session is kept (packet §2). No init was read, so vendor_version is null (C2 §5). The rejection carries TurnEvidence (C2 §2 AdapterError::Rejected): the launched process exited, so cleanup is quiescent on Host's group cleanup evidence."
+      }
+    }
+  ]
+}

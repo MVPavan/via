@@ -31,8 +31,9 @@ Experimental features follow the owner's policy (K17): used where they help,
 each confirmed by the per-version live check, with `Uncertain` as the
 fallback; no experimental capability is sent by default. Record observed
 binary and adapter versions. The version rule is C2 §5 (owner OD1): the
-instance version is parsed from `initialize.userAgent` (the parse rule is
-qualified in `via-5lr.3.1`); a version outside the adapter's `checked` set is
+instance version is parsed from `initialize.userAgent`: drop the
+`<clientInfo.name>/` prefix VIA itself sent, then read up to the first space
+(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); a version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
 cached per C2 §5.
@@ -150,11 +151,17 @@ Instructions map to `developerInstructions`; this adds instructions at that
 level and does not promise replacement of vendor/system/repository policy.
 The model catalog comes only from `model/list`, sent by the driver on an owned
 live server right after `initialize` and cached per server instance with its
-version; model-only resolution fails `unknown_model` before discovery, and an
+version. `model/list` is paginated (`nextCursor`); the driver follows it to
+the end within a bounded page count and byte budget. If a non-null
+`nextCursor` remains at either bound, discovery fails as a protocol
+failure and nothing is cached: a partial catalog is never used or published
+as complete. Model-only resolution fails `unknown_model` before discovery, and an
 explicit model passes to the vendor. A bad model or failed auth fails after
 acceptance as a Failed terminal (C2 §2). Effort (C2 §5): canonical efforts
 are checked in `plan` against the compiled mapping; model-advertised efforts
-are checked against `model/list` inside `run_turn` before `turn/start`, and a
+are checked against `model/list` inside `run_turn` before `thread/start` or
+`thread/resume` (so a rejected submission creates no vendor thread) and
+therefore before `turn/start`, and a
 mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` and no
 `turn/start` written. Live checks use `gpt-6-luna` at low or medium effort. Reject an
 unsupported explicit `max_steps`; this route has no matching control.
@@ -254,10 +261,12 @@ through a `-c` override is unverified. Both switches enter `config_hash`.
 | plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
 | skills (on) | **unverified** | `unknown`, no switch applied, warns |
 | agents (on) | **unverified** | `unknown`, no switch applied, warns |
-| instruction files (on) | AGENTS.md; switch and inventory **unverified** | `unknown`, no switch applied, warns |
+| instruction files (on) | AGENTS.md; switch **unverified**; `thread/start` `instructionSources` reported the loaded AGENTS.md paths (0.159.2), completeness **unverified** | `unknown`, no switch applied, warns |
 
-The only inventory source is `configWarning`; otherwise inventory is
-unavailable. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
+Inventory sources are `configWarning` and the `thread/start` response's
+`instructionSources`, which reported the loaded AGENTS.md paths in the
+0.159.2 re-probe (completeness unverified). The fixtures qualified no other
+inventory; `mcpServerStatus/list` stays schema-only. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
 switchable.
 
 ## 5. Correlation, events and bounds
@@ -478,12 +487,12 @@ time; retain raw-span evidence for every scenario.
 
 | Fixture name | Observable acceptance |
 |---|---|
-| `codex_pin_handshake` | One initialize/initialized per shared connection; version parsed from `userAgent`; a version outside `checked` warns and proceeds; malformed handshake or a policy/sandbox echo mismatch refuses the lease; no experimental capability sent by default (K17) and no opt-out. |
-| `codex_start_order` | Notification before response buffers; paired response accepts once; unknown/duplicate/mismatched response IDs fail; lost/partial start yields unknown and exactly one outbound start. |
+| `codex_pin_handshake` | One initialize/initialized per shared connection; version parsed from `userAgent`; a version outside `checked` warns and proceeds; malformed handshake or a policy/sandbox echo mismatch refuses the lease; no experimental capability sent by default (K17) and no opt-out. `model/list` pagination: a non-null `nextCursor` left at the page or byte bound fails discovery as `protocol` and caches nothing, so no partial catalog is used. |
+| `codex_start_order` | Notification before response buffers; paired response accepts once; unknown/duplicate/mismatched response IDs fail; lost/partial start yields unknown and exactly one outbound start. A malformed known notification is a `protocol` failure (C2 §4); a second or contradictory `turn/completed` for the same turn never replaces the retained terminal (C2 §4 `turn.late_terminal` revises only a turn whose `TurnEnd` carried none). |
 | `codex_resume_identity` | Persistent thread reopened with exact ID and excludeTurns; fresh/different ID fails resume_mismatch; no fallback start; schema/history-clear fields encode exactly. After a bound change and server retirement, resume the exact stored thread with the current sandbox mode, verify identity/policy and assert the next start carries the current full sandboxPolicy rather than spawn-time defaults. |
 | `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
 | `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 5 s deadline holds while data lane full; failed write never recorded as successful decline. |
-| `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. |
+| `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. Frozen non-null `instructions` are sent byte for byte as `developerInstructions` on `thread/start` and in the canonical thread settings of every `thread/resume`; null instructions send none. |
 | `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
 | `codex_cleanup_60s` | The driver applies the window from Core's `tool_grace`, not the stop order's `close_by`. With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; a tool ending 20 s after acknowledgement settles `quiescent`; final completion settles early. c3 (interrupt only) settles `uncertain` at the window. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |

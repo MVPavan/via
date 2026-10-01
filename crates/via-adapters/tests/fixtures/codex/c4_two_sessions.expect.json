@@ -1,0 +1,249 @@
+{
+  "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits) (A recorded read-only, B workspace-write); requests in VIA's per-session order (the probe sent both thread/start before both turn/start); A's tool start kept after B's as recorded; B's marker command simplified; B's changed-bound second turn dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "harness": "codex",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0,
+      "b": 0
+    },
+    "after_turn": [
+      1,
+      1
+    ]
+  },
+  "pure_writes": [],
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project-a",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "uncertain"
+      }
+    },
+    "b": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project-b",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Run the shell command sleep 12. Then say A_DONE.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": 300,
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
+        },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 20388,
+          "cached_input_tokens": 18176,
+          "output_tokens": 64,
+          "reasoning_output_tokens": 10,
+          "total_tokens": 20452,
+          "scope": "turn"
+        },
+        "final_text": null,
+        "error": null,
+        "cleanup": "uncertain",
+        "cleanup_settles": "at_p7_bound",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
+        },
+        "exit": null,
+        "group_absent": false,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "journal_uncertain": false,
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100001",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200001"
+          },
+          "progress",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400007",
+                "commandExecution"
+              ]
+            ]
+          }
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "Two VIA sessions on one owned server: `main` is session A, `b` is session B. The replay emits A's tool start only after B's turn is running (the recorded order), so A's interrupt cannot precede B's submission. A's interrupted sleep item never completed in the recording, so A is pending until, and settles uncertain at, the P7 bound (C2 §4.1); then A closes with thread/unsubscribe only, never stdin (C2 §2 Close(Graceful)); vendor_closed false (vendors/codex.md §2)."
+      }
+    },
+    {
+      "session": "b",
+      "start_after": {
+        "turn": 0,
+        "event": "accepted"
+      },
+      "params": {
+        "prompt": "Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
+        },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 62553,
+          "cached_input_tokens": 40192,
+          "output_tokens": 180,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 62733,
+          "scope": "turn"
+        },
+        "final_text": [
+          "B_DONE"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
+        },
+        "exit": null,
+        "group_absent": false,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "journal_uncertain": false,
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100002",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200002"
+          },
+          "progress",
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400006",
+                "commandExecution"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400008",
+                "commandExecution"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "exec-019a0000-0000-7000-8000-000000400006"
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "exec-019a0000-0000-7000-8000-000000400008"
+            ]
+          }
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "unasserted": [],
+        "notes": "Session B opens on the server A's lease already holds: prepare() pins the live connection, no second launch or initialize (C2 §3 Connection admission, AD16; top-level launches 1). B's events are attributed only to B; A's interrupt and unsubscribe leave B running to completion (vendors/codex.md §5; re-probe c4)."
+      }
+    }
+  ]
+}

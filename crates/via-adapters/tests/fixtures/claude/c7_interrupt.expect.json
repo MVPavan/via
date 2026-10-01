@@ -1,0 +1,142 @@
+{
+  "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [
+    {
+      "require": "cancel",
+      "refusal": "missing_capability:cancel"
+    },
+    {
+      "require": "cancel:partial",
+      "refusal": null
+    }
+  ],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Use Bash to run exactly sleep 12. Then say DONE.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "vendor_stop_reason": "tool_use",
+          "class_hint": null,
+          "cost": {
+            "usd": 0.0039688,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 7853,
+          "cached_input_tokens": 6538,
+          "output_tokens": 139,
+          "scope": "turn"
+        },
+        "final_text": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": {
+          "acknowledged": true,
+          "forced": false,
+          "shared": false
+        },
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 1,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
+          "turn.accepted",
+          "progress",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Bash"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [
+          {
+            "field": "leftovers",
+            "why": "S-LEFTOVER (via-jm4.28)"
+          }
+        ],
+        "notes": "AD19 cancel order, which also applies to a close order on a running turn (coordinator ruling): the interrupt control_request goes first on the control lane, then stdin EOF, then S1's close (C2 §6.2 Interrupt and Close; packet §7). The nested success receipt with the same request_id plus the result error_during_execution / aborted_tools acknowledge the cancel; the receipt alone would not (C2 §7 item 10). Cleanup is quiescent only on Host GroupAbsent for Claude's own group (C2 §2 Interrupt table). Live, Bash and sleep left the group: leftovers. Replay pins the stdin order: user, the interrupt, then EOF after the result (await_eof), then the recorded exit 1."
+      }
+    }
+  ]
+}

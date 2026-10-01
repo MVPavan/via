@@ -1,0 +1,66 @@
+{
+  "source": "Codex re-probe c4b (workspace-write then read-only on one thread), 0.159.2, 2026-09-30",
+  "harness": "codex",
+  "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      0
+    ]
+  },
+  "pure_writes": [],
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Sandbox conformance check.",
+        "effort": "low",
+        "bound": {
+          "mode": "workspace_write",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "workspace_write is refused as bound_unsupported before any launch until via-5lr.3.4 proves enforcement; no fallback to full (C1 §4.2; vendors/codex.md §3)."
+      }
+    }
+  ]
+}

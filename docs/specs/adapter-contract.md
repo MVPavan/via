@@ -198,14 +198,15 @@ pub struct VendorIdentity {
 | `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the input to `check_turn` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
 | `SteerInput` | `text`, `expected_vendor_turn: Option<VendorTurnId>` |
-| `SteerDelivery` | `Injected`, `Partial(&'static str)` |
+| `SteerDelivery` | `Injected`, `Partial(Cow<'static, str>)` (real adapters pass static text; the fake passes its profile's text) |
 | `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2) |
 | `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output?`, `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
 | `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict\|InvalidParam { field }\|MissingCapability { verb }`, `message`, `verb: Option<Verb>`, `route` (every refusal) |
-| `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), plus `Rejected(StartRejected)`, `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed) |
+| `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts, plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence: `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
+| `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
 | `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(VendorCode, String)`, `SessionGone`, `Protocol(String)` |
 
 Contract points:
@@ -216,7 +217,7 @@ Contract points:
   - Acceptance is reported once, as the `turn.accepted` observation
     `{correlation, vendor_turn_id}`.
   - A definite rejection before acceptance ends with
-    `Err(Rejected(StartRejected))`. An ambiguous submission ends with Route's
+    `Err(Rejected { reason, evidence })`. An ambiguous submission ends with Route's
     typed unknown-submission failure. Neither ever resends.
   - Interrupt and close of the running turn are S1 stop orders on
     `TurnCx.stop`. The daemon force is `TurnCx.force`.
@@ -250,9 +251,19 @@ Contract points:
   persists ID, verified true and exactly one `session.opened` or
   `session.reopened` before any same-message acceptance. A pre-init
   startup/resume rejection cannot confirm or open, even if it echoes the
-  expected ID. Every init/result ID is checked; mismatch fails
-  `resume_mismatch` without replacement or resend. This never delays the VIA
-  receipt.
+  expected ID. Every init/result ID is checked; a mismatch emits
+  `resume.mismatch` (§4), is never replaced or resent, and never delays the
+  VIA receipt:
+  - before acceptance: the turn is never accepted, `TurnEnd.terminal` is
+    `null` and `outcome` is `Err(ResumeMismatch { evidence })`; Core commits
+    `failed(resume_mismatch)`. It is never `Rejected` or `submit_failed`;
+  - after acceptance, before a terminal is retained: acceptance stands, the
+    mismatching message's terminal is not retained (`terminal: null`), and
+    the outcome is the same `Err(ResumeMismatch { evidence })`;
+  - after the turn's terminal was retained: that turn's terminal and outcome
+    stand (§4.1), and the mismatch fails health
+    (`DriverFailure::ResumeMismatch`), so no later turn runs on that
+    connection.
 - **Observations before turns.** The observation channel (`SessionCx`) is
   attached at `open_session`/`recover`, so session-level and late events have
   a path independent of any turn. Session-level observations (identity,
@@ -366,11 +377,11 @@ terminal is not an observation: it is retained in the turn's `TurnEnd`
 
 | Observation | Fields | Core commit |
 |---|---|---|
-| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id`, `transcript?` (committed with the ID; fills `evidence.transcript`) | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
+| `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id`, `vendor_version?` (when the confirming handshake carries it; the `session.opened`/`session.reopened` field, else null), `transcript?` (committed with the ID into the session record, never an event field; fills `evidence.transcript`) | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
 | `turn.accepted` | `correlation: AcceptanceToken`, `vendor_turn_id` | phase `accepted`, `turn.started` once |
 | `turn.late_terminal` | `VendorTerminal` | only for a turn whose `TurnEnd` carried no terminal: revises `unknown` under C1 §7.6 |
-| `session.vendor_closed` | `reason` | session close or `unknown` |
-| `resume.mismatch` | `requested`, `returned` | `failed(resume_mismatch)` |
+| `session.vendor_closed` | `reason` | no direct commit, and no session state change (C1 §7.1: a vendor-process idle shutdown leaves the session `idle`). A running turn is disposed from its `TurnEnd`; between turns the driver's next `prepare` reconnects, and the next turn reopens the vendor session (`session.reopened`) or fails its resume (`SessionGone`, `resume_mismatch`) when the vendor session no longer exists |
+| `resume.mismatch` | `requested`, `returned` | no direct turn commit: the turn is disposed from its `TurnEnd`, where `Err(ResumeMismatch)` gives `failed(resume_mismatch)`. When the turn's terminal was retained before the mismatch, the turn keeps its result, and the driver's `ResumeMismatch` health failure ends the connection (§2 identity) |
 | `progress` | `at`, `model: bool`, `tools_started: [(id, name)]`, `tools_ended: [id]`, `usage?: UsageSample` | no commit: Core folds it into the running turn's progress snapshot and commits a `steps` row when a step ends (C1 §3.7). `model` marks model output (text, reasoning or a tool request); `usage` is a per-model-call sample, never a cumulative total. A message with no mark sends no item |
 | `final_text` | `text` | no commit: Core appends the text to the turn's final text, inline up to 256 KiB encoded, else in the turn's `final_text.txt` (C1 §5). The adapter sends completed text only, cut so that the whole encoded observation, escaping included, is at most 256 KiB |
 
@@ -584,8 +595,8 @@ fake agent reports no version".
 - A value that can be judged only against a discovered catalog (a Codex
   model's advertised efforts, an OpenCode model's `variants`) is checked
   inside `run_turn` after discovery and before vendor submission (`turn/start`,
-  `prompt_async`). A mismatch ends with `Err(Rejected(InvalidParam
-  {field: "effort"}))` → `failed(submit_failed)` with
+  `prompt_async`). A mismatch ends with `Err(Rejected { reason:
+  InvalidParam {field: "effort"}, evidence })` → `failed(submit_failed)` with
   `failure.data.field:"effort"`. No vendor turn starts and nothing is resent.
 - Once the catalog is cached, `check_turn` applies it, so later turns get the
   pre-receipt `invalid_params`.
@@ -595,7 +606,7 @@ catalog cache of live instances; nothing is persisted.
 
 **Usage (AD6).** Usage is reported one of two ways, and each route declares
 which it uses:
-- per model call, as `progress.usage: UsageSample`, where a keyed sample
+- per model call, as `progress.usage: UsageSample` (`key: Option<String>` and the nullable counters `input`, `cached_input`, `output`, `reasoning_output`, `total`, which are C1's usage token fields), where a keyed sample
   supersedes an earlier sample with the same key and a keyless sample adds;
 - as a turn aggregate in `VendorTerminal.usage`, which supersedes every call
   sample of the turn for the envelope.
@@ -792,7 +803,7 @@ opt-in live check, never in the default gate):
     still complete. Codex per-thread Route ingress can quarantine earlier
     on its separate immediate lane limit (§4), without changing C2's timer.
 13. Bound re-validation: a turn whose bound the route cannot apply is
-    `Rejected(BoundUnsupported)` before submission; Codex `full` with
+    `Rejected` with reason `BoundUnsupported` before submission; Codex `full` with
     `network:false` is refused.
 14. Version rule: a version outside the `checked` set produces
     `untested` with warning `vendor_version_untested`, not a refusal; only a

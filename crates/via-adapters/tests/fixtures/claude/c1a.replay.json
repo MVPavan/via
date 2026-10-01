@@ -1,0 +1,127 @@
+{
+  "source": "CC c1a, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 1036 ms). The probe closed stdin after the result, so await_eof follows it.  First of the c1a-c1c chain; c1b and c1c resume it; their replays pin the literal --resume value (the resumed session ID their expectations state). The schema field and prompt word token became nonce: token is a credential name for the hygiene scan.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--json-schema",
+    "{\"properties\":{\"kind\":{\"const\":\"alpha\"},\"nonce\":{\"type\":\"string\"}},\"required\":[\"kind\",\"nonce\"],\"type\":\"object\"}"
+  ],
+  "version": "2.1.285 (Claude Code)",
+  "deadline_ms": 15000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Remember nonce NONCE0001. Return JSON with kind alpha and nonce equal to it."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 622
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/project\",\"session_id\":\"${sid}\",\"tools\":[\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\",\"StructuredOutput\"],\"mcp_servers\":[],\"model\":\"claude-haiku-4-5-20251001\",\"permissionMode\":\"dontAsk\",\"slash_commands\":[\"clear\",\"compact\",\"config\",\"context\",\"init\",\"model\",\"review\"],\"terminal_slash_commands\":[\"doctor\",\"color\",\"focus\",\"reload-plugins\"],\"apiKeySource\":\"none\",\"claude_code_version\":\"2.1.285\",\"output_style\":\"default\",\"agents\":[\"claude\",\"Explore\",\"general-purpose\",\"Plan\",\"statusline-setup\"],\"skills\":[\"example-skill\"],\"plugins\":[{\"name\":\"cc-plugin-agents-md\",\"path\":\"builtin\",\"source\":\"cc-plugin-agents-md@builtin\"},{\"name\":\"cc-plugin-telemetry\",\"path\":\"builtin\",\"source\":\"cc-plugin-telemetry@builtin\"}],\"capabilities\":[\"interrupt_receipt_v1\",\"interrupt_cancel_queued_v1\",\"msg_lifecycle_v1\",\"mcp_read_resource_v1\",\"mcp_tool_ui_meta_v1\"],\"analytics_disabled\":false,\"product_feedback_disabled\":false,\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"messaging_socket_path\":\"/tmp/cc-socks/4242.sock\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"per_turn_effort_active\":false,\"view_mode\":\"default\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":50,\"estimated_tokens_delta\":50,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000002\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 422
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":141,\"estimated_tokens_delta\":91,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000003\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SIGNATURE\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4667,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4667},\"output_tokens\":3,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000004\",\"timestamp\":\"2026-09-30T16:46:52.352Z\",\"request_id\":\"req_01SYNTH000001\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 373
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_01SYNTH000001\",\"name\":\"StructuredOutput\",\"input\":{\"kind\":\"alpha\",\"nonce\":\"NONCE0001\"},\"caller\":{\"type\":\"direct\"}}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4667,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4667},\"output_tokens\":3,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000005\",\"timestamp\":\"2026-09-30T16:46:52.724Z\",\"request_id\":\"req_01SYNTH000001\",\"wire_tool_inputs\":{\"toolu_01SYNTH000001\":{\"kind\":\"alpha\",\"nonce\":\"NONCE0001\"}}}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 6
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"toolu_01SYNTH000001\",\"type\":\"tool_result\",\"content\":\"Structured output provided successfully\"}]},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000006\",\"timestamp\":\"2026-09-30T16:46:52.730Z\",\"tool_use_result\":\"Structured output provided successfully\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 9
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":1790000000,\"rateLimitType\":\"five_hour\",\"utilization\":0.1,\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.1,\"resetsAt\":1790000000},\"seven_day\":{\"utilization\":0.1,\"resetsAt\":1790500000}}},\"uuid\":\"00000000-0000-4000-8000-000000000007\",\"session_id\":\"${sid}\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 5
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"duration_api_ms\":1837,\"stop_reason\":\"tool_use\",\"session_id\":\"${sid}\",\"total_cost_usd\":0.010124000000000001,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4667,\"cache_read_input_tokens\":0,\"output_tokens\":156,\"output_tokens_details\":{\"thinking_tokens\":72},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":4667,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":10,\"output_tokens\":156,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":4667,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4667},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":10,\"outputTokens\":156,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":4667,\"webSearchRequests\":0,\"costUSD\":0.010124000000000001,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"thinkingTokens\":72,\"canonicalModel\":\"claude-haiku-4-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":false,\"num_turns\":2,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"{\\\"kind\\\":\\\"alpha\\\",\\\"nonce\\\":\\\"NONCE0001\\\"}\",\"structured_output\":{\"kind\":\"alpha\",\"nonce\":\"NONCE0001\"},\"ttft_ms\":1477,\"type\":\"result\",\"duration_ms\":1869,\"uuid\":\"00000000-0000-4000-8000-000000000008\",\"ttft_stream_ms\":615,\"time_to_request_ms\":31,\"first_content_frame_ms\":615,\"queued_turn_count\":0,\"result_index\":0}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

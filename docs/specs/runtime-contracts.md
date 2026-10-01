@@ -351,7 +351,8 @@ system writes it; no VIA task reads it. When Route cannot decode a
 message, and when a message exceeds 1 MiB or ends unterminated, Wire
 writes its first 64 KiB to `undecoded.bin`, and the turn's failure names
 the file and the message's length. A final text too long for the
-envelope is written there as `final_text.txt` (C1 §5). The vendor's stderr
+envelope is written there as `final_text.txt`, and a structured output too
+long for it as `structured_output.json` (C1 §5). The vendor's stderr
 is not capped. The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
 
@@ -752,14 +753,15 @@ refused at open with a named error telling the user to recreate the dev Store
 untouched. `user_version = 0` is initialized only in a database file that
 open itself creates (exclusively); an existing file at version 0, empty or
 not, gets the same refusal before any writable open. Migrations as described
-above start with the first released schema. Schema v6 (v1 was the unreleased
+above start with the first released schema. Schema v7 (v1 was the unreleased
 single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
 per-turn values; v4 lacked the close admission state and cancel cause; v5
-lacked step rows, event columns, list order and evidence folders) is exactly:
+lacked step rows, event columns, list order and evidence folders; v6 lacked
+the session's persisted adapter version) is exactly:
 
 | Table | Implemented columns and constraints |
 |---|---|
-| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model, cwd, `allow_untested`); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2; `admission` `open` or `closing`; `close_result`; `created_ms`, `updated_ms` (the `at` of the transaction's highest-`seq` event: `last_active_at`); `harness`; `label`; `ord INTEGER NOT NULL UNIQUE` (its index serves `list`); nullable `vendor_session_id` and `transcript_hint` |
+| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model, cwd, `allow_untested`); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2; `admission` `open` or `closing`; `close_result`; `created_ms`, `updated_ms` (the `at` of the transaction's highest-`seq` event: `last_active_at`); `harness`; `label`; `ord INTEGER NOT NULL UNIQUE` (its index serves `list`); nullable `vendor_session_id` and `transcript_hint`; nullable `adapter_version` (the session's persisted adapter version, C2 §1 rule 2: written in the `turn.started` commit of each started turn; null until a turn starts; while the column is null, readers use the receipt's version) |
 | `session_ord` | one row, `only INTEGER PRIMARY KEY CHECK(only = 1)`, `next INTEGER NOT NULL`, created as `(1, 0)`; a spawn's receipt transaction increments `next` and stores it as `sessions.ord`; never decremented or reused |
 | `turns` | PK (`session_id`, `number`), FK session; `prompt` or `prompt_blob`, exactly one non-null; `effective` (the turn's frozen per-turn values, the receipt's `effective`, written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence); `envelope` (terminal); `cancel_cause` `cancel` or `close`; `ended_seq`, non-null exactly when the state is terminal; `evidence_dir` (relative to the state directory, written with `turn.submitted`). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
 | `steps` | PK (`session_id`, `turn`, `step`), `WITHOUT ROWID`; FK (`session_id`, `turn`) to turns; `step` ≥ 1; `started_ms`, `ended_ms`; nullable `tokens` ≥ 0; one row per completed model step |
@@ -888,6 +890,9 @@ mismatch the daemon is never stopped (amendment A13 in the Task 3 design). Expli
 choose a socket and can inspect status themselves. No new handshake field is
 needed. Diagnostics may contain paths but no handles or vendor payloads.
 
+The daemon refuses to start when the state directory's path is over 1 KiB
+encoded, which bounds every evidence path an envelope names (C1 §5).
+
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
@@ -896,7 +901,7 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
-  evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt
+  evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt, structured_output.json
   blobs/<blob-id>.blob       bounded immutable request/effective data
 <runtime>/
   daemon.lock                persistent daemon/socket-owner lock inode
@@ -923,7 +928,7 @@ socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder under it; Host opens the turn's `stderr.log` for
-the child; `final_text.txt` is written through `StoreClient`. Host owns
+the child; `final_text.txt` and `structured_output.json` are written through `StoreClient`. Host owns
 anchor sockets; daemon main owns the singleton/socket lock.
 
 Acquire nonblocking `daemon.lock` first, then nonblocking `store.lock`; hold

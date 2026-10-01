@@ -1,0 +1,205 @@
+{
+  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3's exchange (thread/start, turn/start, final_answer `ACK.` and its usage sample 20391/18176/6) borrowed from c5 turn 1 with gpt-6-luna substituted; thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
+  "argv": [
+    "app-server",
+    "--disable",
+    "hooks"
+  ],
+  "version": "codex-cli 0.159.2",
+  "deadline_ms": 20000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "method": "initialize",
+          "params": {
+            "clientInfo": {
+              "name": "via"
+            }
+          }
+        },
+        "capture": {
+          "init": "/id"
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${init},\"result\":{\"userAgent\":\"via/0.159.2 (Linux 6.0.0; x86_64) unknown (via; 0.0.0)\",\"codexHome\":\"/state/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "initialized"
+        }
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "model/list"
+        },
+        "capture": {
+          "models": "/id"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\",\"serverName\":\"host\",\"installationId\":\"00000000-0000-4000-8000-000000000000\",\"environmentId\":null},\"emittedAtMs\":1790000000005}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${models},\"result\":{\"data\":[{\"id\":\"gpt-6.1-sol\",\"model\":\"gpt-6.1-sol\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6.1-Sol\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"},{\"reasoningEffort\":\"ultra\",\"description\":\"Maximum reasoning with automatic task delegation\"}],\"defaultReasoningEffort\":\"low\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":true},{\"id\":\"gpt-6-sol\",\"model\":\"gpt-6-sol\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6-Sol\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"},{\"reasoningEffort\":\"ultra\",\"description\":\"Maximum reasoning with automatic task delegation\"}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":false},{\"id\":\"gpt-6-luna\",\"model\":\"gpt-6-luna\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6-Luna\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":false}],\"nextCursor\":null}}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "thread/start",
+          "params": {
+            "model": "gpt-6-luna",
+            "cwd": "/work/project",
+            "sandbox": "danger-full-access",
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "ephemeral": false
+          }
+        },
+        "capture": {
+          "thread": "/id"
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${thread},\"result\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100001\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project\",\"runtimeWorkspaceRoots\":[\"/work/project\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100001\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-luna\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000000,\"updatedAt\":1790000000,\"recencyAt\":1790000000,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]},\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\",\"serviceTier\":\"default\",\"disabledPluginIds\":[],\"cwd\":\"/work/project\",\"runtimeWorkspaceRoots\":[\"/work/project\"],\"instructionSources\":[\"/work/project/AGENTS.md\"],\"approvalPolicy\":\"never\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"dangerFullAccess\"},\"activePermissionProfile\":null,\"reasoningEffort\":\"medium\",\"multiAgentMode\":\"explicitRequestOnly\"}}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100001\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project\",\"runtimeWorkspaceRoots\":[\"/work/project\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100001\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-luna\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000000,\"updatedAt\":1790000000,\"recencyAt\":1790000000,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]}},\"emittedAtMs\":1790000000170}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "turn/start",
+          "params": {
+            "threadId": "019a0000-0000-7000-8000-000000100001",
+            "input": [
+              {
+                "type": "text",
+                "text": "Reply with ACK."
+              }
+            ],
+            "cwd": "/work/project",
+            "model": "gpt-6-luna",
+            "effort": "low",
+            "outputSchema": null,
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {
+              "type": "dangerFullAccess"
+            }
+          }
+        },
+        "capture": {
+          "turn": "/id"
+        },
+        "after_emit": 8
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${turn},\"result\":{\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200003\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":null,\"completedAt\":null,\"durationMs\":null}}}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"active\",\"activeFlags\":[]}},\"emittedAtMs\":1790000000181}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200003\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":1790000000,\"completedAt\":null,\"durationMs\":null}},\"emittedAtMs\":1790000000181}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"account/updated\",\"params\":{\"authMode\":\"chatgpt\",\"planType\":\"unknown\"},\"emittedAtMs\":1790000000481}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply with ACK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"startedAtMs\":1790000002481},\"emittedAtMs\":1790000002481}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply with ACK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"completedAtMs\":1790000002481},\"emittedAtMs\":1790000002481}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0002\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null,\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"startedAtMs\":1790000003481},\"emittedAtMs\":1790000003481}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"itemId\":\"msg_0002\",\"delta\":\"ACK.\"},\"emittedAtMs\":1790000003581}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0002\",\"text\":\"ACK.\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"completedAtMs\":1790000003981},\"emittedAtMs\":1790000003981}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200003\",\"tokenUsage\":{\"total\":{\"totalTokens\":20397,\"inputTokens\":20391,\"cachedInputTokens\":18176,\"cacheWriteInputTokens\":0,\"outputTokens\":6,\"reasoningOutputTokens\":0},\"last\":{\"totalTokens\":20397,\"inputTokens\":20391,\"cachedInputTokens\":18176,\"cacheWriteInputTokens\":0,\"outputTokens\":6,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000003991}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"idle\"}},\"emittedAtMs\":1790000003996}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200003\",\"items\":[{\"type\":\"agentMessage\",\"id\":\"msg_0002\",\"text\":\"ACK.\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null}],\"itemsView\":\"summary\",\"status\":\"completed\",\"error\":null,\"startedAt\":1790000000,\"completedAt\":1790000003,\"durationMs\":3996}},\"emittedAtMs\":1790000003996}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "thread/unsubscribe",
+          "params": {
+            "threadId": "019a0000-0000-7000-8000-000000100001"
+          }
+        },
+        "capture": {
+          "close": "/id"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${close},\"result\":{\"status\":\"unsubscribed\"}}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

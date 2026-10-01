@@ -445,7 +445,8 @@ is the turn's evidence folder in VIA's state directory, or `null` for a
 turn never submitted. `files` lists the files there that exist:
 `stderr.log` (the agent's stderr), `undecoded.bin` (the first 64 KiB of a
 vendor message VIA could not decode, named by the turn's failure) and
-`final_text.txt` (a final text too long for the envelope, §5). VIA does
+`final_text.txt` and `structured_output.json` (a final text or structured
+output too long for the envelope, §5). VIA does
 not read or decode them; the caller reads the files. There is no paging.
 
 ### 3.13 `models`; 3.14 `daemon/status`, `daemon/stop`
@@ -572,14 +573,34 @@ A longer final text is written to `final_text.txt` in the turn's evidence
 folder (§3.12): `final_text` is then `null` and `final_text_file` gives
 `{path, bytes, truncated}`. The file holds at most 64 MiB; a longer text is
 cut there at a character boundary with `truncated: true`, as is a text
-whose file write failed. `denied_actions` and `auto_declined_requests`
+whose file write failed. `structured_output` is inline up to 32 KiB
+encoded. A larger value is written to `structured_output.json` in the same
+folder: `structured_output` is then `null` and `structured_output_file`
+gives `{path, bytes}`. VIA writes the whole file and syncs it and its folder
+before committing the envelope or revision that names it, and never changes
+a written file. The write is part of the commit that names the file: if it
+fails, that commit fails and resolves under §7.6's Store rule, and a partial
+file is never named. Validation (Q2) runs on the
+value before it is stored, and a spilled value counts as present for
+`structured_output_missing`. `denied_actions` and `auto_declined_requests`
 hold the first 1,000 entries each; `denied_actions_total` and
 `auto_declined_requests_total` count all. An entry's strings are cut at a
 character boundary to keep it within 256 bytes; its `event_seq` cites the
 event with the full payload. At receipt a `bound` over 32 KiB, a `vendor`
-over 16 KiB, or a `model` or `effort` over 1 KiB encoded is
-`invalid_params` naming the member. `failure.message` is at most 2 KiB,
-cut at a character boundary.
+over 16 KiB, a `cwd` over 4 KiB, or a `model` or `effort` over 1 KiB encoded is
+`invalid_params` naming the member; `bound.effective` is at most 32 KiB
+encoded too. `failure.message` is at most 2 KiB,
+cut at a character boundary. `warnings` holds at most one entry per code
+(the closed list below), each with VIA's own `message` of at most 1 KiB and
+`data` of at most 4 KiB encoded. Adapter-reported warnings are durable
+`warning` events (§6) and reach the envelope only as these codes. An
+evidence `transcript` hint over 4 KiB encoded is `null`. The daemon refuses
+a state directory whose path is over 1 KiB encoded (runtime §6.1), so the
+evidence folder and file paths stay under 2 KiB. Numbers are 64-bit integers
+or finite doubles. With these caps, the IDs and versions of at most 1 KiB
+each (C2 A1) and `leftovers`' 16 processes, every variable-size field is
+bounded; their encoded sum stays
+below 1 MiB, and a conformance test assembles that maximum.
 
 ```json
 {"api_version":1,"session_id":"s_7f3k9q2mzr4c","turn":2,"address":"s_7f3k9q2mzr4c/2","revision":0,
@@ -589,7 +610,7 @@ cut at a character boundary.
  "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.157.1","version_status":"tested",
  "vendor_session_id":"0192f…","cwd":"/work/repo",
  "bound":{"requested":{…},"effective":{…},"inherited":true},
- "final_text":"","final_text_file":null,"structured_output":null,"leftovers":null,
+ "final_text":"","final_text_file":null,"structured_output":null,"structured_output_file":null,"leftovers":null,
  "denied_actions":[{"kind":"command","target":"curl …","reason":"network disabled","at":"…","event_seq":41}],
  "auto_declined_requests":[{"vendor_method":"item/tool/requestUserInput","summary":"2 questions","blocking":true,"at":"…","event_seq":52}],
  "denied_actions_total":1,"auto_declined_requests_total":1,
@@ -615,6 +636,7 @@ cut at a character boundary.
 | `steps` | the vendor's own count of model steps in the turn (Claude `num_turns`), or `null` when the vendor reports none; VIA's count is only in `status` `progress` (§3.7) |
 | `events` | `{first_seq, last_seq, count}` of the turn's durable events (§6.1) |
 | `final_text_file` | `{path, bytes, truncated}` when the final text is in `final_text.txt`, else `null` |
+| `structured_output_file` | `{path, bytes}` when the structured output is in `structured_output.json`, else `null` |
 | `denied_actions_total`, `auto_declined_requests_total` | entries of each list, including those past the first 1,000 |
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
@@ -784,7 +806,12 @@ that does not prove its submitted work had no effect.
 Rows 1–2 cover caller-originated cancels (`cancel`, `close`). A Core-deadline
 stop resolves `failed(deadline_*)` after rows 3–4. A `Deadline` coincident
 with an order's `force_at` takes the order's cause. Only the resolution
-cases in [Task 3 design](../workstreams/rust-foundation/t3/design.md) §7.2 (runtime §7) end `failed(store)`. A natural
+cases in [Task 3 design](../workstreams/rust-foundation/t3/design.md) §7.2 (runtime §7) end `failed(store)`; a failed write of
+a spilled `structured_output.json` (§5) is a failure of the commit that names
+it and resolves the same way. A revision known not to have committed, after
+the applicable retry, is not made and the turn stays `unknown`; an uncertain
+revision commit latches and is reconciled under runtime §7, never assumed
+absent. A natural
 terminal whose one retry commits keeps its result, and a dispatcher-owned
 queued cancellation whose retry commits stays `cancelled`.
 

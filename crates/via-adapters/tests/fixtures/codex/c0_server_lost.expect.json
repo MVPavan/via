@@ -1,0 +1,107 @@
+{
+  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the recorded exit 0 and its one stderr line (timestamp and pid neutralized) end the replay as an exit step",
+  "harness": "codex",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null,
+      "health": {
+        "state": "failed",
+        "first_cause": "server_lost"
+      }
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Run the shell command sleep 12. Then say done.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": "server_lost",
+        "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
+        },
+        "exit": null,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "journal_uncertain": false,
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100001",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200001"
+          },
+          "progress",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400004",
+                "commandExecution"
+              ]
+            ]
+          }
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [
+          {
+            "field": "leftovers",
+            "why": "S-LEFTOVER (via-jm4.28) owns every leftover-report assertion (C2 §4.2)"
+          }
+        ],
+        "notes": "The server process exits after the tool started, with no terminal: Host confirms the death, so Err(ServerLost) -> failed(server_lost), never resent (C2 §4.1 Persistent-server routes with no terminal). Cleanup follows the Server close or crash row: GroupAbsent for the server's own group (C2 §2 Interrupt table). The leftover report belongs to S-LEFTOVER and is not asserted here (C2 §4.2). Server-route evidence (C2 §2 AdapterError row): exit is null and cleanup is the turn's reported tool items, quiescent when none was reported; after a server crash cleanup is GroupAbsent for the server's group."
+      }
+    }
+  ]
+}
