@@ -5522,6 +5522,109 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
     });
 }
 
+/// Critical r3 #1 (Task 4 design §5, runtime §8): idle expiry is decided
+/// at the item frontier. Reconciliation at the fired deadline is itself
+/// held in an item's handling while more of the turn's progress, decoded
+/// before the moved deadline, is admitted; that progress is handled in
+/// order and moves the deadline again, so the turn does not expire at the
+/// deadline the first reconciled items gave.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn progress_admitted_while_reconciliation_commits_keeps_the_turn() {
+    let Some(root) = child("progress_admitted_while_reconciliation_commits_keeps_the_turn") else {
+        return;
+    };
+    let (intent, pause) = ("store.journal.anchor_intent", "core.observations.pause");
+    let points = count_points(&root, &[intent, pause]);
+    run(async {
+        use via_adapters::{Observation, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let first = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let start = tokio::time::Instant::now();
+        let item = |observation: Observation| via_adapters::Admitted {
+            item: via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: None,
+                observation,
+            },
+            permit: std::sync::Arc::clone(&budget)
+                .try_acquire_many_owned(10)
+                .unwrap(),
+        };
+        let progress = || {
+            Observation::Progress(ProgressMarks {
+                model: true,
+                ..ProgressMarks::default()
+            })
+        };
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let (expired, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // A final text piece holds Core across the first deadline (1.0).
+                sender
+                    .send(item(Observation::FinalText("a".to_owned())))
+                    .await
+                    .unwrap();
+                until(|| acked(&points, pause, first)).await;
+                // Progress at 0.6 moves the deadline to 1.6; the text piece
+                // after it holds reconciliation's handling.
+                tokio::time::sleep_until(at(6)).await;
+                sender.send(item(progress())).await.unwrap();
+                sender
+                    .send(item(Observation::FinalText("b".to_owned())))
+                    .await
+                    .unwrap();
+                let reconciling = first + 2;
+                let command =
+                    json!({"token":FAILPOINT_TOKEN,"occurrence":reconciling,"action":"pause"});
+                fs::write(points.join(format!("{pause}.json")), command.to_string()).unwrap();
+                tokio::time::sleep_until(at(12)).await;
+                release_point(&points, pause, first);
+                until(|| acked(&points, pause, reconciling)).await;
+                // Admitted while reconciliation is held: progress at 1.4
+                // (before 1.6) moves the deadline to 2.4, and at 2.2 to 3.2.
+                tokio::time::sleep_until(at(14)).await;
+                sender.send(item(progress())).await.unwrap();
+                tokio::time::sleep_until(at(22)).await;
+                sender.send(item(progress())).await.unwrap();
+                tokio::time::sleep_until(at(25)).await;
+                release_point(&points, pause, reconciling);
+                // Every item handled, or the deadline expired.
+                until(|| budget.available_permits() == 1_000 || probe.borrow().is_some()).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                expired
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(expired.is_none(), "the idle deadline expired: {expired:?}");
+    });
+}
+
 /// Critical r2 F3 (runtime §7, C2 §2 `journal_uncertain`): the driver's
 /// journal report has its own consumer, apart from the lane's turn jobs.
 /// Reported while a turn job runs, it latches Store failure before that
