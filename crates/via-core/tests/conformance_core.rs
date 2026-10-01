@@ -2216,10 +2216,11 @@ fn core_idle_lanes_past_the_bound_reopen_from_the_stored_identity() {
 }
 
 /// Critical r1b #8 (C2 §3 idle lanes): a dispatch racing the eviction of
-/// its session's lane waits for the evicted lane's end, its driver closed
-/// and its channel drained, before the turn is submitted and a new driver
-/// opened: one driver at a time. The turn is not lost: it runs on the
-/// reopened driver with the stored identity.
+/// its session's lane, acknowledged at its wait (critical r2 F8), waits
+/// for the evicted lane's end, its driver closed and its channel drained,
+/// before the turn is submitted and a new driver opened: one driver at a
+/// time. The turn is not lost: it runs on the reopened driver with the
+/// stored identity.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
@@ -2234,6 +2235,7 @@ fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
     // The first lane to end, the evicted one, is held after its driver's
     // close, before its channel's drain.
     arm(&root, "core.lane.admission_close", "pause");
+    acknowledge(&root, "core.lane.claim_wait", 1);
     run(async {
         let daemon = Daemon::open(&root);
         let evicted = daemon.spawn("first", &json!({})).await;
@@ -2242,8 +2244,9 @@ fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
         run_sessions(&daemon, IDLE_LANES).await;
         until_acked(&root, "core.lane.admission_close", 1).await;
         daemon.resume(&evicted, "again").await;
-        // The dispatch waits on the ending lane: nothing is submitted.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The dispatch reached its wait on the ending lane: nothing is
+        // submitted.
+        until_acked(&root, "core.lane.claim_wait", 1).await;
         let submitted = |events: &[Value]| {
             events
                 .iter()

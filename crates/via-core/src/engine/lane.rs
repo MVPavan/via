@@ -1216,6 +1216,9 @@ impl Engine {
             return Some(claim);
         }
         if lane.begin_retire() {
+            // Test builds: the dispatch waits for its lane's end.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.lane.claim_wait").await;
             lane.retired().await;
         }
         None
