@@ -1571,12 +1571,20 @@ impl Engine {
                     }
                 }
                 () = sleep_until_some(idle_at), if idle_at.is_some() => {
-                    // Design §5: no meaningful progress within the budget.
-                    control.idle_at = None;
-                    // The timer fired; its order is not issued yet (design §10).
-                    #[cfg(feature = "test-failpoints")]
-                    let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
-                    control.slot.idle_order(control.turn, tokio::time::Instant::now());
+                    // Design §5: no meaningful progress within the budget,
+                    // once what the channel holds is reconciled (critical
+                    // r2 F1).
+                    let expired = self
+                        .idle_expires(record, (lane, effective), control, (&mut run, &mut early), inbox)
+                        .await;
+                    if expired {
+                        control.idle_at = None;
+                        // The timer fired; its order is not issued yet
+                        // (design §10).
+                        #[cfg(feature = "test-failpoints")]
+                        let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
+                        control.slot.idle_order(control.turn, tokio::time::Instant::now());
+                    }
                 }
                 end = &mut run => {
                     // What the driver delivered by its return (critical
@@ -1588,22 +1596,14 @@ impl Engine {
                     break (end, delivered);
                 }
                 Some(admitted) = inbox.recv() => {
-                    let Admitted { item, permit } = admitted;
-                    if let Some(idle_at) = control.idle_at.as_mut()
-                        && current_progress(lane, control.turn, &item)
-                    {
-                        *idle_at = tokio::time::Instant::now() + control.idle;
-                    }
-                    while_polling((&mut run, &mut early), || inbox.len(), async {
-                        // Test builds: Core holds before handling an observation.
-                        #[cfg(feature = "test-failpoints")]
-                        let _ = via_store::failpoint::hit_async("core.observations.pause").await;
-                        self.observe(record, Some(lane), effective, control, item).await;
-                    })
+                    self.run_item(
+                        record,
+                        (lane, effective),
+                        control,
+                        (&mut run, &mut early),
+                        (admitted, &*inbox),
+                    )
                     .await;
-                    // Handled: its bytes return to the budget.
-                    drop(permit);
-                    stop_for_store(record, control);
                 }
             }
         };
@@ -1645,6 +1645,92 @@ impl Engine {
             }
             outcome => Driven::Finished(Box::new((terminal, outcome))),
         }
+    }
+
+    /// Handles one item the running turn's loop took, in decode order,
+    /// while the driver is polled (design §9); the driver's first `Ready`
+    /// keeps the channel's count then ([`while_polling`]). The turn's own
+    /// meaningful progress moves its idle deadline ([`note_progress`]).
+    async fn run_item<E>(
+        &self,
+        record: &mut TurnRecord,
+        (lane, effective): (&Lane, &Effective),
+        control: &mut Control<'_>,
+        run: (&mut E, &mut Option<(TurnEnd, usize)>),
+        (admitted, inbox): (Admitted, &Inbox),
+    ) where
+        E: std::future::Future<Output = TurnEnd> + Unpin,
+    {
+        let Admitted { item, permit } = admitted;
+        note_progress(lane, control, &item);
+        while_polling(run, || inbox.len(), async {
+            // Test builds: Core holds before handling an observation.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.observations.pause").await;
+            self.observe(record, Some(lane), effective, control, item)
+                .await;
+        })
+        .await;
+        // Handled: its bytes return to the budget.
+        drop(permit);
+        stop_for_store(record, control);
+    }
+
+    /// Whether the turn's idle deadline, whose timer fired, has expired
+    /// (critical r2 F1, Task 4 design §5): first the items the channel
+    /// holds now, a finite prefix, are handled in order as the run loop
+    /// handles them, the driver polled and the turn's order checked before
+    /// each (runtime §8). The turn's own progress among them moves the
+    /// deadline by its own `at`, so progress decoded before the deadline
+    /// counts however late Core reads it. Only a deadline still passed
+    /// after the prefix expires; none once the driver returned or an order
+    /// disarmed the timer. The rest of the prefix is then the run loop's,
+    /// or the final drain's.
+    async fn idle_expires<E>(
+        &self,
+        record: &mut TurnRecord,
+        (lane, effective): (&Lane, &Effective),
+        control: &mut Control<'_>,
+        (run, early): (&mut E, &mut Option<(TurnEnd, usize)>),
+        inbox: &mut Inbox,
+    ) -> bool
+    where
+        E: std::future::Future<Output = TurnEnd> + Unpin,
+    {
+        let mut handled = 0;
+        for _ in 0..inbox.len() {
+            if !control.observed && control.orders.has_changed().unwrap_or(false) {
+                let order = control.orders.borrow_and_update().clone();
+                if let Some(order) = order {
+                    while_polling(
+                        (&mut *run, &mut *early),
+                        || inbox.len(),
+                        self.observe_order(record, control, &order),
+                    )
+                    .await;
+                    stop_for_store(record, control);
+                }
+            }
+            if early.is_some() || control.idle_at.is_none() {
+                return false;
+            }
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
+            self.run_item(
+                record,
+                (lane, effective),
+                control,
+                (&mut *run, &mut *early),
+                (admitted, &*inbox),
+            )
+            .await;
+            super::lane::ready_item(&mut handled).await;
+        }
+        early.is_none()
+            && control
+                .idle_at
+                .is_some_and(|idle_at| idle_at <= tokio::time::Instant::now())
     }
 
     /// The turn's final drain (Sol r3 N2): what the driver delivered
@@ -1732,6 +1818,27 @@ impl Engine {
         (orders, inbox): (watch::Receiver<Option<StopOrder>>, &mut Inbox),
         (spec, cx): (TurnSpec, TurnCx),
     ) {
+        self.execute_turn_idle(
+            (slot, lane),
+            (record, effective),
+            (orders, inbox),
+            (spec, cx),
+            None,
+        )
+        .await;
+    }
+
+    /// Test builds: [`Self::execute_turn`] with an idle budget, its
+    /// deadline running from now.
+    #[cfg(test)]
+    pub(super) async fn execute_turn_idle(
+        &self,
+        (slot, lane): (&Slot, &Lane),
+        (record, effective): (&mut TurnRecord, &Effective),
+        (orders, inbox): (watch::Receiver<Option<StopOrder>>, &mut Inbox),
+        (spec, cx): (TurnSpec, TurnCx),
+        idle: Option<Duration>,
+    ) {
         let mut control = Control {
             slot,
             turn: record.turn,
@@ -1739,8 +1846,8 @@ impl Engine {
             observed: false,
             stored: false,
             refused: false,
-            idle_at: None,
-            idle: Duration::ZERO,
+            idle_at: idle.map(|idle| tokio::time::Instant::now() + idle),
+            idle: idle.unwrap_or_default(),
             final_text: FinalText::new(),
         };
         let _driven = self
@@ -2617,6 +2724,19 @@ where
     commit.await
 }
 
+/// Moves the running turn's idle deadline for `item`, the turn's own
+/// meaningful progress ([`current_progress`]) decoded before it, to the
+/// item's own `at` plus the idle budget (critical r2 F1): progress counts
+/// when it was decoded, not when Core reads it.
+fn note_progress(lane: &Lane, control: &mut Control<'_>, item: &ObservationItem) {
+    if let Some(idle_at) = control.idle_at.as_mut()
+        && item.at < *idle_at
+        && current_progress(lane, control.turn, item)
+    {
+        *idle_at = (*idle_at).max(item.at + control.idle);
+    }
+}
+
 /// Meaningful progress resets the idle deadline (Task 4 design §2.6):
 /// acceptance, and a `progress` item with a `model` mark or a tool start or
 /// end. Usage-only items never do; unknown messages send no item.
@@ -2638,10 +2758,6 @@ fn progress(observation: &Observation) -> bool {
     }
 }
 
-/// Whether `item` is meaningful progress of the running `turn` on `lane`,
-/// which resets the turn's idle deadline (critical r1 #7): its acceptance,
-/// the turn's by its correlation, or progress `lane` attributes to the
-/// turn. Late, expired and session-level progress never does.
 /// Maps an acceptance's vendor turn on the lane ([`Lane::map_vendor_turn`]).
 /// Sol r3 N6, critical r1 #6 (C2 §4.1): a collision or the tombstones'
 /// exhaustion failed the lane; the turn stops at once, once, and an
@@ -2678,6 +2794,10 @@ fn refused_evidence(record: &TurnRecord, terminal: &mut Terminal) {
     }
 }
 
+/// Whether `item` is meaningful progress of the running `turn` on `lane`,
+/// which resets the turn's idle deadline (critical r1 #7): its acceptance,
+/// the turn's by its correlation, or progress `lane` attributes to the
+/// turn. Late, expired and session-level progress never does.
 pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &ObservationItem) -> bool {
     progress(&item.observation)
         && (matches!(item.observation, Observation::Accepted(_))

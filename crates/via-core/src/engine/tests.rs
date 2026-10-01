@@ -5427,3 +5427,95 @@ fn an_item_admitted_after_the_driver_returned_is_left_for_the_lane() {
         assert_eq!(denied_targets(&engine, &session).await, ["first"]);
     });
 }
+
+/// Critical r2 F1 (Task 4 design §5, runtime §8): the turn's own progress
+/// decoded before its idle deadline is reconciled before the deadline
+/// expires, by the observation's own `at`, even when Core reads it only
+/// after the deadline passed. Core is held in another item's commit
+/// across the deadline while that progress waits in the channel; once
+/// released, the progress moves the deadline and the turn does not
+/// expire.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
+    let Some(root) = child("timely_progress_read_after_the_idle_deadline_keeps_the_turn") else {
+        return;
+    };
+    let (intent, pause) = ("store.journal.anchor_intent", "core.observations.pause");
+    let points = count_points(&root, &[intent, pause]);
+    run(async {
+        use via_adapters::{Observation, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let held_item = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let start = tokio::time::Instant::now();
+        let ((), ()) = tokio::join!(
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            },
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // A final text piece: its handling writes nothing.
+                let held = via_adapters::Admitted {
+                    item: via_adapters::ObservationItem {
+                        at: tokio::time::Instant::now(),
+                        vendor_turn: None,
+                        observation: Observation::FinalText("t".to_owned()),
+                    },
+                    permit: std::sync::Arc::clone(&budget)
+                        .try_acquire_many_owned(10)
+                        .unwrap(),
+                };
+                sender.send(held).await.unwrap();
+                until(|| acked(&points, pause, held_item)).await;
+                // The turn's own progress, decoded well before the deadline.
+                tokio::time::sleep_until(start + idle * 6 / 10).await;
+                let progress = via_adapters::Admitted {
+                    item: via_adapters::ObservationItem {
+                        at: tokio::time::Instant::now(),
+                        vendor_turn: None,
+                        observation: Observation::Progress(ProgressMarks {
+                            model: true,
+                            ..ProgressMarks::default()
+                        }),
+                    },
+                    permit: std::sync::Arc::clone(&budget)
+                        .try_acquire_many_owned(10)
+                        .unwrap(),
+                };
+                sender.send(progress).await.unwrap();
+                // Core is held past the deadline.
+                tokio::time::sleep_until(start + idle * 12 / 10).await;
+                release_point(&points, pause, held_item);
+                // Both items handled, or the deadline expired.
+                until(|| budget.available_permits() == 1_000 || probe.borrow().is_some()).await;
+                release_point(&points, intent, held_launch);
+            }
+        );
+        assert!(
+            probe.borrow().is_none(),
+            "the idle deadline expired: {:?}",
+            probe.borrow().as_ref().map(|order| order.cause)
+        );
+    });
+}
