@@ -1038,6 +1038,57 @@ fn conformance_persistent_slot_pinned_between_turns() {
     ));
 }
 
+/// Sol r2 #8 (C2 §4 `turn.accepted`, C1 §3.7): on a persistent
+/// connection every acceptance carries the connection's handshake. The
+/// second turn runs on the pinned connection whose handshake was read for
+/// the first; its acceptance still reports `1.0`, tested. The fake stands
+/// in for the server with one process per turn, each emitting the
+/// scenario's one handshake, which Route reads before each start.
+#[test]
+fn conformance_persistent_acceptances_carry_the_connection_handshake() {
+    let mut profile = persistent();
+    profile["handshake"] = handshake()["handshake"].clone();
+    let rig = Rig::new(
+        &profile,
+        &[
+            script(
+                1,
+                &[
+                    hello("1.0", &["turns"]),
+                    accepted(1),
+                    terminal(1, "completed", "end_turn"),
+                ],
+            ),
+            script(2, &[accepted(2), terminal(2, "completed", "end_turn")]),
+        ],
+    );
+    let instance = |items: &[ObservationItem]| {
+        items.iter().find_map(|item| match &item.observation {
+            Observation::Accepted(acceptance) => Some(acceptance.instance.clone()),
+            _ => None,
+        })
+    };
+    let (driver, mut receiver) = rig.session();
+    let (cx, _first) = turn_cx(1, driver.prepare(), WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let first = instance(&items).expect("turn 1 was accepted").unwrap();
+    assert_eq!(
+        (first.vendor_version.as_deref(), first.version_status),
+        (Some("1.0"), VersionStatus::Tested)
+    );
+    let pinned = driver.prepare();
+    assert!(matches!(pinned, Prepared::Pinned(_)));
+    let (cx, _second) = turn_cx(2, pinned, WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(
+        instance(&items).expect("turn 2 was accepted"),
+        Some(first),
+        "turn 2's acceptance carries the connection's handshake"
+    );
+}
+
 /// C2 §2 Recover: the fake never resumes. Host's proof that every anchor
 /// of the session is gone is `Dead`; anything less is `Unknown`.
 #[test]
