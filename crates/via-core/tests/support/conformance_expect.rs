@@ -100,6 +100,43 @@ const EXPECT_OTHER: &[&str] = &[
     "unasserted",
     "notes",
 ];
+const PLAN_CHECK: &[&str] = &["require", "refusal"];
+const START_AFTER: &[&str] = &["turn", "event"];
+const PARAMS: &[&str] = &["prompt", "effort", "bound", "output_schema", "max_steps"];
+const STOP: &[&str] = &["kind", "after"];
+const STEER: &[&str] = &["after", "text", "expected_vendor_turn", "result"];
+const UNASSERTED: &[&str] = &["field", "why"];
+const TERMINAL: &[&str] = &[
+    "status",
+    "stop_reason",
+    "vendor_stop_reason",
+    "vendor_code",
+    "class_hint",
+    "detail",
+    "structured_output",
+    "steps",
+    "cost",
+];
+const COST: &[&str] = &["usd", "scope", "provenance"];
+/// `from`, the C1 scope and provenance, and the C1 token names.
+const USAGE: &[&str] = &[
+    "from",
+    "scope",
+    "provenance",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+];
+const STOP_FACTS: &[&str] = &["acknowledged", "forced", "shared"];
+const INSTANCE: &[&str] = &["vendor_version", "version_status"];
+/// Observation fields that are lists of kinds.
+const KIND_LISTS: &[&str] = &[
+    "observations_include",
+    "observations_exclude",
+    "observations_order",
+];
 
 /// Reads `<dir>/<name>.expect.json`.
 pub(crate) fn load(dir: &Path, name: &str) -> Result<Value, String> {
@@ -140,13 +177,66 @@ fn known(value: &Value, keys: &[&str], at: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// [`known`] for an optional object: absent or null passes.
+fn known_if(value: Option<&Value>, keys: &[&str], at: &str) -> Result<(), String> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) => known(value, keys, at),
+    }
+}
+
+/// [`known`] for each object of an optional array: absent passes.
+fn known_entries(value: Option<&Value>, keys: &[&str], at: &str) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{at}: not an array"))?;
+    for (index, entry) in entries.iter().enumerate() {
+        known(entry, keys, &format!("{at}[{index}]"))?;
+    }
+    Ok(())
+}
+
+/// Refuses an observation field of the wrong type instead of reading it
+/// as empty: kind lists are arrays of strings, counts an object of
+/// non-negative integers. Absent fields pass.
+fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
+    for key in KIND_LISTS {
+        if let Some(value) = fields.get(*key)
+            && !value
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().all(Value::is_string))
+        {
+            return Err(format!("{at}.{key}: not an array of strings"));
+        }
+    }
+    if let Some(counts) = fields.get("observation_counts") {
+        let counts = counts
+            .as_object()
+            .ok_or_else(|| format!("{at}.observation_counts: not an object"))?;
+        for (kind, count) in counts {
+            if count.as_u64().is_none() {
+                return Err(format!(
+                    "{at}.observation_counts.{kind}: not a non-negative integer"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks the expectation's well-formedness for every harness: known fields
-/// only, required parts present, session labels and `start_after` turns
-/// resolvable, a non-empty reason for each `unasserted` entry, C2 names for
-/// enumerated values, `turn.accepted` counted exactly once on every accepted
-/// turn, and identity confirmation ordered before acceptance.
+/// at every level (usage only under `expect.usage`, never the retired
+/// `terminal.usage`), required parts present, observation fields of their
+/// types, session labels and `start_after` turns resolvable, a non-empty
+/// reason for each `unasserted` entry, C2 names for enumerated values,
+/// `turn.accepted` counted exactly once on every accepted turn, and identity
+/// confirmation ordered before acceptance.
 pub(crate) fn validate(expect: &Value) -> Result<(), String> {
     known(expect, TOP, "case")?;
+    known_entries(expect.get("plan_checks"), PLAN_CHECK, "plan_checks")?;
     let sessions = object(&expect["sessions"], "sessions")?;
     for (label, session) in sessions {
         known(session, SESSION, &format!("sessions.{label}"))?;
@@ -165,11 +255,19 @@ pub(crate) fn validate(expect: &Value) -> Result<(), String> {
         if !sessions.contains_key(label) {
             return Err(format!("{at}: unknown session {label}"));
         }
+        known_if(
+            turn.get("start_after"),
+            START_AFTER,
+            &format!("{at}.start_after"),
+        )?;
         if let Some(before) = turn["start_after"]["turn"].as_u64()
             && usize::try_from(before).map_or(true, |before| before >= index)
         {
             return Err(format!("{at}: start_after names a later turn"));
         }
+        known_if(turn.get("params"), PARAMS, &format!("{at}.params"))?;
+        known_if(turn.get("stop"), STOP, &format!("{at}.stop"))?;
+        known_entries(turn.get("steer"), STEER, &format!("{at}.steer"))?;
         let fields = turn["expect"]
             .as_object()
             .ok_or_else(|| format!("{at}: no expect"))?;
@@ -178,6 +276,37 @@ pub(crate) fn validate(expect: &Value) -> Result<(), String> {
                 return Err(format!("{at}.expect: unknown field {key}"));
             }
         }
+        let at = format!("{at}.expect");
+        known_entries(
+            fields.get("unasserted"),
+            UNASSERTED,
+            &format!("{at}.unasserted"),
+        )?;
+        observation_types(fields, &at)?;
+        if fields
+            .get("terminal")
+            .and_then(Value::as_object)
+            .is_some_and(|terminal| terminal.contains_key("usage"))
+        {
+            return Err(format!(
+                "{at}.terminal.usage: usage lives under expect.usage"
+            ));
+        }
+        known_if(fields.get("terminal"), TERMINAL, &format!("{at}.terminal"))?;
+        known_if(
+            fields
+                .get("terminal")
+                .and_then(|terminal| terminal.get("cost")),
+            COST,
+            &format!("{at}.terminal.cost"),
+        )?;
+        known_if(fields.get("usage"), USAGE, &format!("{at}.usage"))?;
+        known_if(
+            fields.get("stop_facts"),
+            STOP_FACTS,
+            &format!("{at}.stop_facts"),
+        )?;
+        known_if(fields.get("instance"), INSTANCE, &format!("{at}.instance"))?;
         for entry in turn["expect"]["unasserted"]
             .as_array()
             .into_iter()
@@ -185,7 +314,7 @@ pub(crate) fn validate(expect: &Value) -> Result<(), String> {
         {
             if entry["field"].as_str().is_none() || entry["why"].as_str().is_none_or(str::is_empty)
             {
-                return Err(format!("{at}.expect.unasserted: needs field and why"));
+                return Err(format!("{at}.unasserted: needs field and why"));
             }
         }
     }

@@ -94,62 +94,270 @@ fn conformance_codex_cases_match_fixture_files() {
     }
 }
 
-/// A named change that makes an expectation malformed.
-type Defect = (&'static str, fn(&mut Value));
+/// A named change that makes an expectation malformed, and a fragment of
+/// the refusal that names the rule it breaks.
+type Defect = (&'static str, &'static str, fn(&mut Value));
 
 /// Green: `validate` refuses each kind of malformed expectation, one
-/// mutation of a well-formed case per rule.
+/// mutation of a well-formed case per rule, for the reason that rule gives.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table row per validation rule keeps every witness beside its rule"
+)]
 fn conformance_codex_validate_refuses_each_defect() {
     let base = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
     conformance_expect::validate(&base).unwrap();
-    let defects: [Defect; 11] = [
-        ("accepted turn counts turn.accepted twice", |e| {
-            e["turns"][0]["expect"]["observation_counts"] = json!({"turn.accepted": 2});
-        }),
-        ("accepted turn omits the turn.accepted count", |e| {
-            e["turns"][0]["expect"]["observation_counts"] = json!({});
-        }),
-        ("identity confirmation after acceptance", |e| {
-            e["turns"][0]["expect"]["observations_order"] =
-                json!(["turn.accepted", "session.vendor_identity_confirmed"]);
-        }),
-        ("cleanup", |e| {
+    let defects: [Defect; 37] = [
+        (
+            "accepted turn counts turn.accepted twice",
+            "an accepted turn states",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"] = json!({"turn.accepted": 2});
+            },
+        ),
+        (
+            "accepted turn omits the turn.accepted count",
+            "an accepted turn states",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"] = json!({});
+            },
+        ),
+        (
+            "identity confirmation after acceptance",
+            "must precede",
+            |e| {
+                e["turns"][0]["expect"]["observations_order"] =
+                    json!(["turn.accepted", "session.vendor_identity_confirmed"]);
+            },
+        ),
+        ("cleanup", "expect.cleanup:", |e| {
             e["turns"][0]["expect"]["cleanup"] = json!("pending");
         }),
-        ("cleanup_settles", |e| {
+        ("cleanup_settles", "expect.cleanup_settles:", |e| {
             e["turns"][0]["expect"]["cleanup_settles"] = json!("later");
         }),
-        ("error", |e| {
+        ("error", "expect.error:", |e| {
             e["turns"][0]["expect"]["error"] = json!("timeout");
         }),
-        ("rejected", |e| {
+        ("rejected", "expect.rejected:", |e| {
             e["turns"][0]["expect"]["rejected"] = json!("invalid_param");
         }),
-        ("plan_refusal", |e| {
+        ("plan_refusal", "expect.plan_refusal:", |e| {
             e["turns"][0]["expect"]["plan_refusal"] = json!("invalid_params:effort");
         }),
-        ("terminal.status", |e| {
+        ("terminal.status", "terminal.status:", |e| {
             e["turns"][0]["expect"]["terminal"]["status"] = json!("done");
         }),
-        ("terminal.stop_reason", |e| {
+        ("terminal.stop_reason", "terminal.stop_reason:", |e| {
             e["turns"][0]["expect"]["terminal"]["stop_reason"] = json!("stop");
         }),
-        ("terminal.class_hint", |e| {
+        ("terminal.class_hint", "terminal.class_hint:", |e| {
             e["turns"][0]["expect"]["terminal"]["class_hint"] = json!("unauthorized");
         }),
+        (
+            "observations_include is a string",
+            "observations_include: not an array of strings",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] = json!("turn.accepted");
+            },
+        ),
+        (
+            "observations_include holds a number",
+            "observations_include: not an array of strings",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] = json!(["turn.accepted", 1]);
+            },
+        ),
+        (
+            "observations_include is null",
+            "observations_include: not an array of strings",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] = Value::Null;
+            },
+        ),
+        (
+            "observations_exclude is a string",
+            "observations_exclude: not an array of strings",
+            |e| {
+                e["turns"][0]["expect"]["observations_exclude"] = json!("action.denied");
+            },
+        ),
+        (
+            "observations_order is a string",
+            "observations_order: not an array of strings",
+            |e| {
+                e["turns"][0]["expect"]["observations_order"] = json!("turn.accepted");
+            },
+        ),
+        (
+            "observation_counts is an array",
+            "observation_counts: not an object",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"] = json!([["turn.accepted", 1]]);
+            },
+        ),
+        (
+            "observation_counts holds a negative count",
+            "observation_counts.final_text: not a non-negative integer",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"]["final_text"] = json!(-1);
+            },
+        ),
+        (
+            "observation_counts holds a fraction",
+            "observation_counts.final_text: not a non-negative integer",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"]["final_text"] = json!(1.5);
+            },
+        ),
+        (
+            "observation_counts holds a string",
+            "observation_counts.final_text: not a non-negative integer",
+            |e| {
+                e["turns"][0]["expect"]["observation_counts"]["final_text"] = json!("1");
+            },
+        ),
+        (
+            "usage under the retired terminal.usage",
+            "terminal.usage: usage lives under expect.usage",
+            |e| {
+                e["turns"][0]["expect"]["terminal"]["usage"] = json!({"from": "samples"});
+            },
+        ),
+        (
+            "unknown top-level field",
+            "case: unknown field usage",
+            |e| {
+                e["usage"] = json!({});
+            },
+        ),
+        (
+            "unknown plan_checks field",
+            "plan_checks[0]: unknown field verb",
+            |e| {
+                e["plan_checks"] = json!([{"require": "steer", "refusal": null, "verb": "steer"}]);
+            },
+        ),
+        (
+            "unknown session field",
+            "sessions.main: unknown field bound",
+            |e| {
+                e["sessions"]["main"]["bound"] = json!("full");
+            },
+        ),
+        (
+            "unknown close field",
+            "sessions.main.close: unknown field leftovers",
+            |e| {
+                e["sessions"]["main"]["close"]["leftovers"] = Value::Null;
+            },
+        ),
+        (
+            "unknown turn field",
+            "turns[0]: unknown field wall_ms",
+            |e| {
+                e["turns"][0]["wall_ms"] = json!(1000);
+            },
+        ),
+        (
+            "unknown start_after field",
+            "turns[1].start_after: unknown field delay_ms",
+            |e| {
+                let mut next = e["turns"][0].clone();
+                next["start_after"] = json!({"turn": 0, "event": "accepted", "delay_ms": 5});
+                e["turns"].as_array_mut().unwrap().push(next);
+            },
+        ),
+        (
+            "unknown params field",
+            "turns[0].params: unknown field wall",
+            |e| {
+                e["turns"][0]["params"]["wall"] = json!(1000);
+            },
+        ),
+        (
+            "unknown stop field",
+            "turns[0].stop: unknown field delay_ms",
+            |e| {
+                e["turns"][0]["stop"] =
+                    json!({"kind": "interrupt", "after": "accepted", "delay_ms": 5});
+            },
+        ),
+        (
+            "unknown steer field",
+            "turns[0].steer[1]: unknown field expected_turn",
+            |e| {
+                e["turns"][0]["steer"][1]["expected_turn"] = json!("t");
+            },
+        ),
+        (
+            "unknown expect field",
+            "turns[0].expect: unknown field stdin_sequence",
+            |e| {
+                e["turns"][0]["expect"]["stdin_sequence"] = json!([]);
+            },
+        ),
+        (
+            "unknown unasserted field",
+            "turns[0].expect.unasserted[0]: unknown field until",
+            |e| {
+                e["turns"][0]["expect"]["unasserted"] =
+                    json!([{"field": "leftovers", "why": "later", "until": "S-LEFTOVER"}]);
+            },
+        ),
+        (
+            "unknown terminal field",
+            "turns[0].expect.terminal: unknown field state",
+            |e| {
+                e["turns"][0]["expect"]["terminal"]["state"] = json!("completed");
+            },
+        ),
+        (
+            "unknown terminal.cost field",
+            "turns[0].expect.terminal.cost: unknown field total",
+            |e| {
+                e["turns"][0]["expect"]["terminal"]["cost"] = json!({"scope": "turn", "total": 1});
+            },
+        ),
+        (
+            "unknown usage field",
+            "turns[0].expect.usage: unknown field input",
+            |e| {
+                e["turns"][0]["expect"]["usage"]["input"] = json!(1);
+            },
+        ),
+        (
+            "unknown stop_facts field",
+            "turns[0].expect.stop_facts: unknown field late",
+            |e| {
+                e["turns"][0]["expect"]["stop_facts"] =
+                    json!({"acknowledged": true, "forced": false, "shared": true, "late": true});
+            },
+        ),
+        (
+            "unknown instance field",
+            "turns[0].expect.instance: unknown field build",
+            |e| {
+                e["turns"][0]["expect"]["instance"]["build"] = json!("x");
+            },
+        ),
     ];
-    let accepted: Vec<&str> = defects
+    let wrong: Vec<String> = defects
         .into_iter()
-        .filter_map(|(what, defect)| {
+        .filter_map(|(what, rule, defect)| {
             let mut expect = base.clone();
             defect(&mut expect);
-            conformance_expect::validate(&expect)
-                .is_ok()
-                .then_some(what)
+            match conformance_expect::validate(&expect) {
+                Ok(()) => Some(format!("{what}: accepted")),
+                Err(error) if !error.contains(rule) => {
+                    Some(format!("{what}: refused for another reason: {error}"))
+                }
+                Err(_) => None,
+            }
         })
         .collect();
-    assert!(accepted.is_empty(), "validate accepted: {accepted:?}");
+    assert!(wrong.is_empty(), "validate:\n{}", wrong.join("\n"));
 }
 
 /// A named change to an ideal outcome.
