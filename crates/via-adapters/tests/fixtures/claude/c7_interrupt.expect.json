@@ -1,0 +1,106 @@
+{
+  "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [
+    {
+      "require": "cancel",
+      "refusal": "missing_capability:cancel"
+    },
+    {
+      "require": "cancel:partial",
+      "refusal": null
+    }
+  ],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Use Bash to run exactly sleep 12. Then say DONE.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "vendor_stop_reason": "tool_use",
+          "class_hint": null,
+          "cost": {
+            "scope": "session_cumulative"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 7853,
+          "cached_input_tokens": 6538,
+          "output_tokens": 139,
+          "scope": "turn"
+        },
+        "final_text": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": {
+          "acknowledged": true,
+          "forced": false,
+          "shared": false
+        },
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [
+          {
+            "field": "exit",
+            "why": "the fixture replays exit 1 with empty stderr; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
+          },
+          {
+            "field": "cleanup_provenance",
+            "why": "GroupAbsent evidence and the S1 close sequence need driver-side Host evidence; via-p98.3.2's drive must collect them"
+          },
+          {
+            "field": "leftovers",
+            "why": "S-LEFTOVER (via-jm4.28)"
+          }
+        ],
+        "notes": "AD19 cancel order, which also applies to a close order on a running turn (coordinator ruling): the interrupt control_request goes first on the control lane, then stdin EOF, then S1's close (C2 §6.2 Interrupt and Close; packet §7). The nested success receipt with the same request_id plus the result error_during_execution / aborted_tools acknowledge the cancel; the receipt alone would not (C2 §7 item 10). Cleanup is quiescent only on Host GroupAbsent for Claude's own group (C2 §2 Interrupt table). Live, Bash and sleep left the group: leftovers. Replay pins the stdin order: user, the interrupt, then EOF after the result (await_eof), then the recorded exit 1."
+      }
+    }
+  ]
+}

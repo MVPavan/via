@@ -1,0 +1,226 @@
+{
+  "source": "CC c11b_stdio_prompt, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 1609 ms). The probe closed stdin after the result, so await_eof follows it.  The decline must arrive within 5 s of the request (within_ms) and carry no permission-allow payload (absent /response/response; vendor spec: never an invented allow). Recorded with --permission-mode default --permission-prompts host --permission-prompt-tool stdio, the only recipe that sends can_use_tool; the adapter's never-ask recipe does not, so here it stands for an unexpected control request.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash"
+  ],
+  "version": "2.1.285 (Claude Code)",
+  "deadline_ms": 15000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Use Edit to create probe.txt containing READY in the current directory. If permission is denied, say DENIED."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 565
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/project\",\"session_id\":\"${sid}\",\"tools\":[\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\"],\"mcp_servers\":[],\"model\":\"claude-haiku-4-5-20251001\",\"permissionMode\":\"dontAsk\",\"slash_commands\":[\"clear\",\"compact\",\"config\",\"context\",\"init\",\"model\",\"review\"],\"terminal_slash_commands\":[\"doctor\",\"color\",\"focus\",\"reload-plugins\"],\"apiKeySource\":\"none\",\"claude_code_version\":\"2.1.285\",\"output_style\":\"default\",\"agents\":[\"claude\",\"Explore\",\"general-purpose\",\"Plan\",\"statusline-setup\"],\"skills\":[\"example-skill\"],\"plugins\":[{\"name\":\"cc-plugin-agents-md\",\"path\":\"builtin\",\"source\":\"cc-plugin-agents-md@builtin\"},{\"name\":\"cc-plugin-telemetry\",\"path\":\"builtin\",\"source\":\"cc-plugin-telemetry@builtin\"}],\"capabilities\":[\"interrupt_receipt_v1\",\"interrupt_cancel_queued_v1\",\"msg_lifecycle_v1\",\"mcp_read_resource_v1\",\"mcp_tool_ui_meta_v1\"],\"analytics_disabled\":false,\"product_feedback_disabled\":false,\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"messaging_socket_path\":\"/tmp/cc-socks/4242.sock\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"per_turn_effort_active\":false,\"view_mode\":\"default\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":50,\"estimated_tokens_delta\":50,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000002\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":200,\"estimated_tokens_delta\":150,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000003\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":250,\"estimated_tokens_delta\":50,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000004\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 973
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":350,\"estimated_tokens_delta\":100,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000005\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":450,\"estimated_tokens_delta\":100,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000006\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":732,\"estimated_tokens_delta\":282,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000007\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SIGNATURE\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1171,\"cache_read_input_tokens\":4542,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1171},\"output_tokens\":3,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000008\",\"timestamp\":\"2026-09-30T16:49:26.608Z\",\"request_id\":\"req_01SYNTH000001\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 307
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I'll create the probe.txt file with the READY content using Edit.\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1171,\"cache_read_input_tokens\":4542,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1171},\"output_tokens\":3,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000009\",\"timestamp\":\"2026-09-30T16:49:26.914Z\",\"request_id\":\"req_01SYNTH000001\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 743
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_01SYNTH000001\",\"name\":\"Edit\",\"input\":{\"replace_all\":false,\"file_path\":\"/work/project/probe.txt\",\"old_string\":\"\",\"new_string\":\"READY\"},\"caller\":{\"type\":\"direct\"}}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1171,\"cache_read_input_tokens\":4542,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1171},\"output_tokens\":3,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000010\",\"timestamp\":\"2026-09-30T16:49:27.657Z\",\"request_id\":\"req_01SYNTH000001\",\"wire_tool_inputs\":{\"toolu_01SYNTH000001\":{\"file_path\":\"/work/project/probe.txt\",\"old_string\":\"\",\"new_string\":\"READY\"}}}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 6
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"control_request\",\"request_id\":\"00000000-0000-4000-8000-000000000011\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Edit\",\"display_name\":\"Edit\",\"input\":{\"file_path\":\"/work/project/probe.txt\",\"old_string\":\"\",\"new_string\":\"READY\",\"replace_all\":false},\"description\":\"probe.txt\",\"permission_suggestions\":[{\"type\":\"setMode\",\"mode\":\"acceptEdits\",\"destination\":\"session\"}],\"tool_use_id\":\"toolu_01SYNTH000001\"}}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "type": "control_response",
+          "response": {
+            "subtype": "error",
+            "request_id": "00000000-0000-4000-8000-000000000011",
+            "error": "VIA declines unsupported control request"
+          }
+        },
+        "within_ms": 5000,
+        "absent": [
+          "/response/response"
+        ]
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"Tool permission request failed: Error: VIA declines unsupported control request\",\"is_error\":true,\"tool_use_id\":\"toolu_01SYNTH000001\"}]},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000012\",\"timestamp\":\"2026-09-30T16:49:27.666Z\",\"tool_use_result\":\"Error: Tool permission request failed: Error: VIA declines unsupported control request\",\"tool_result_meta\":[{\"id\":\"toolu_01SYNTH000001\",\"non_execution_kind\":\"permission-rule\"}]}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 6
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":1790000000,\"rateLimitType\":\"five_hour\",\"utilization\":0.1,\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.1,\"resetsAt\":1790000000},\"seven_day\":{\"utilization\":0.1,\"resetsAt\":1790500000}}},\"uuid\":\"00000000-0000-4000-8000-000000000013\",\"session_id\":\"${sid}\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":50,\"estimated_tokens_delta\":50,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000014\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 260
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":159,\"estimated_tokens_delta\":109,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000015\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000002\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SIGNATURE\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":843,\"cache_read_input_tokens\":5713,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":843},\"output_tokens\":2,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000016\",\"timestamp\":\"2026-09-30T16:49:29.070Z\",\"request_id\":\"req_01SYNTH000002\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000002\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"DENIED\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":843,\"cache_read_input_tokens\":5713,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":843},\"output_tokens\":2,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000017\",\"timestamp\":\"2026-09-30T16:49:29.073Z\",\"request_id\":\"req_01SYNTH000002\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 16
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"duration_api_ms\":9360,\"stop_reason\":\"end_turn\",\"session_id\":\"${sid}\",\"total_cost_usd\":0.0093315,\"usage\":{\"input_tokens\":18,\"cache_creation_input_tokens\":2014,\"cache_read_input_tokens\":10255,\"output_tokens\":852,\"output_tokens_details\":{\"thinking_tokens\":686},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":2014,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":8,\"output_tokens\":82,\"cache_read_input_tokens\":5713,\"cache_creation_input_tokens\":843,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":843},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":18,\"outputTokens\":852,\"cacheReadInputTokens\":10255,\"cacheCreationInputTokens\":2014,\"webSearchRequests\":0,\"costUSD\":0.0093315,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"thinkingTokens\":686,\"canonicalModel\":\"claude-haiku-4-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[{\"tool_name\":\"Edit\",\"tool_use_id\":\"toolu_01SYNTH000001\",\"tool_input\":{\"file_path\":\"/work/project/probe.txt\",\"old_string\":\"\",\"new_string\":\"READY\",\"replace_all\":false}}],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":false,\"num_turns\":2,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"DENIED\",\"ttft_ms\":6914,\"type\":\"result\",\"duration_ms\":9394,\"uuid\":\"00000000-0000-4000-8000-000000000018\",\"ttft_stream_ms\":643,\"time_to_request_ms\":27,\"first_content_frame_ms\":643,\"queued_turn_count\":0,\"result_index\":0}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

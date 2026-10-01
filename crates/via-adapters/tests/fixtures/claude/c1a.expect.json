@@ -1,0 +1,96 @@
+{
+  "source": "CC c1a, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Remember token NONCE0001. Return JSON with kind alpha and token equal to it.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "alpha"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "other",
+          "vendor_stop_reason": "tool_use",
+          "class_hint": null,
+          "structured_output": {
+            "kind": "alpha",
+            "token": "NONCE0001"
+          },
+          "cost": {
+            "scope": "session_cumulative"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 4677,
+          "cached_input_tokens": 0,
+          "output_tokens": 156,
+          "scope": "turn"
+        },
+        "final_text": [
+          "{\"kind\":\"alpha\",\"token\":\"NONCE0001\"}"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "First launch: --session-id with the VIA-generated expected UUID (captured); the matching init confirms identity (session.opened) before acceptance (C2 §2). A schema result ends with vendor stop_reason tool_use, which is stop reason other (packet §5). Usage is the result.usage turn aggregate with input = input + cache creation + cache read and cached = cache read (vendor-spec ruling); total_cost_usd is session_cumulative (C2 §6.2; packet §5)."
+      }
+    }
+  ]
+}

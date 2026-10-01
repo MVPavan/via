@@ -1,0 +1,83 @@
+{
+  "source": "CC c4_never_ask, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Use Edit to create probe.txt containing READY in the current directory. If permission is denied, say DENIED.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "scope": "session_cumulative"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 20222,
+          "cached_input_tokens": 12684,
+          "output_tokens": 1531,
+          "scope": "turn"
+        },
+        "final_text": [
+          "DENIED"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied"
+        ],
+        "observations_exclude": [
+          "vendor.request_declined"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1,
+          "action.denied": 1,
+          "vendor.request_declined": 0
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "On the never-ask recipe the vendor denies the Edit itself: a live system/permission_denied and the same tool_use_id in the result's permission_denials are one denial, exactly one action.denied (C2 §6.2 auto-decline, §7 item 9; packet §5). No control request arrives, so nothing is declined."
+      }
+    }
+  ]
+}

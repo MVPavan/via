@@ -1,0 +1,78 @@
+{
+  "source": "CC c1c, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "11111111-1111-4111-8111-111111111111",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with the single plain word PLAIN and no JSON.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
+          "class_hint": null,
+          "cost": {
+            "scope": "session_cumulative"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 4419,
+          "cached_input_tokens": 0,
+          "output_tokens": 52,
+          "scope": "turn"
+        },
+        "final_text": [
+          "PLAIN"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Third process on the same UUID; output_schema null clears the schema by omitting --json-schema (packet §4 output_schema)."
+      }
+    }
+  ]
+}

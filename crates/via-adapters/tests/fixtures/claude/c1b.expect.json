@@ -1,0 +1,96 @@
+{
+  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "11111111-1111-4111-8111-111111111111",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "beta"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "other",
+          "vendor_stop_reason": "tool_use",
+          "class_hint": null,
+          "structured_output": {
+            "kind": "beta",
+            "token": "NONCE0001"
+          },
+          "cost": {
+            "scope": "session_cumulative"
+          }
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 4917,
+          "cached_input_tokens": 0,
+          "output_tokens": 167,
+          "scope": "turn"
+        },
+        "final_text": [
+          "{\"kind\":\"beta\",\"token\":\"NONCE0001\"}"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. A new private process resumes the exact confirmed UUID with a replaced schema (C2 §2 reopen; packet §4); the matching init confirms this generation (session.reopened). Tokens are this turn's aggregate; cost is session_cumulative (packet §5)."
+      }
+    }
+  ]
+}

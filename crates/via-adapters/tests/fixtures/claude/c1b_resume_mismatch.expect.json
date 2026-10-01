@@ -1,0 +1,84 @@
+{
+  "source": "CC c1b (derived), 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
+  "harness": "claude",
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "11111111-1111-4111-8111-111111111111",
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "effort": null,
+        "bound": "full",
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "beta"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": "resume_mismatch",
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "observations_include": [
+          "resume.mismatch"
+        ],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observation_counts": {
+          "resume.mismatch": 1
+        },
+        "observations_order": [],
+        "unasserted": [
+          {
+            "field": "resume.mismatch.fields",
+            "why": "requested = the captured --resume (sessions.main.resume), returned = 99999999-9999-4999-8999-999999999999; observation payloads are not in the schema"
+          },
+          {
+            "field": "exit",
+            "why": "the fixture replays exit 1 with empty stderr (c7's recorded exit after the interrupt); the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
+          }
+        ],
+        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Derived fixture: init and result carry a different, fixed session UUID. Init cannot accept, and wrong-session traffic cannot accept the requested turn, so acceptance and progress are absent. Every init/result ID is checked; mismatch emits resume.mismatch, never confirms or replaces the session and never resends (C2 §2 reopen, §4, §7 item 4; packet §2). The TurnEnd carries no terminal (coordinator ruling) and its outcome is Err(ResumeMismatch { evidence }), never Rejected (C2 §2 identity). Coordinator ruling: the mismatch is detected at init, before acceptance (C2 §2 identity, first case), and 'UUID mismatch yields resume_mismatch and cleanup' (vendor spec §2), so the adapter stops the vendor with the AD19 sequence: the interrupt control_request, wait for the result, then stdin EOF, then S1's close bound. Replay pins that order and no resend (strict trailing input). The fixture is a declared synthetic adaptation."
+      }
+    }
+  ]
+}
