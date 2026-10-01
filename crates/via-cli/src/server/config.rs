@@ -320,6 +320,11 @@ mod tests {
                 r#"{"harnesses":{"gemini":{}}}"#,
                 "harnesses.gemini: unknown harness",
             ),
+            // A key's control characters are escaped: one line, no escapes.
+            (
+                r#"{"harnesses":{"gem\nini\u001b":{}}}"#,
+                r"harnesses.gem\nini\u{1b}: unknown harness",
+            ),
             (
                 r#"{"harnesses":{"codex":{"bin":"/x"}}}"#,
                 "harnesses.codex.bin: unknown key",

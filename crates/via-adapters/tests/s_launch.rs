@@ -69,6 +69,57 @@ fn s_launch_bootstrap_env_names_and_debug() {
         Some(OsStr::new("/secret-home-value"))
     );
     assert!(!format!("{config:?}").contains("secret"));
+
+    // A complete fake fixture: its paths are bootstrap values too.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = "secret-fixture-dir";
+    let root = dir.path().join(marker);
+    fs::create_dir(&root).unwrap();
+    let binary = root.join("fake-agent");
+    executable(&binary);
+    let scenario = root.join("scenario.json");
+    fs::write(&scenario, r#"{"scripts":[]}"#).unwrap();
+    let sync = root.join("sync");
+    fs::create_dir(&sync).unwrap();
+    let env = BootstrapEnv::from_vars([
+        ("VIA_FAKE_AGENT_BINARY", binary.into_os_string()),
+        ("VIA_FAKE_SCENARIO", scenario.into_os_string()),
+        ("VIA_FAKE_SYNC_DIR", sync.into_os_string()),
+    ]);
+    let config = AdapterConfig::load(env, None).unwrap();
+    assert!(config.fake_fixture().is_some());
+    let shown = format!("{config:?}");
+    assert!(
+        !shown.contains(marker),
+        "Debug shows a fixture path: {shown}"
+    );
+    assert!(shown.contains("VIA_FAKE_AGENT_BINARY"), "{shown}");
+}
+
+/// Runtime §8 diagnostics: a key's control characters are escaped and a
+/// long key is cut, so the rule always survives in one bounded line.
+#[test]
+fn s_launch_harnesses_error_text_is_bounded() {
+    let long = "x".repeat(6000);
+    for text in [
+        "{\"cl\\naude\\u001b[31m\":{}}".to_owned(),
+        format!(r#"{{"{long}":{{}}}}"#),
+        format!(r#"{{"claude":{{"inherit":{{"{long}":true}}}}}}"#),
+    ] {
+        let error = AdapterConfig::check_harnesses(&raw(&text)).unwrap_err();
+        let shown = error.to_string();
+        assert!(
+            !shown.chars().any(char::is_control),
+            "control character in {shown:?}"
+        );
+        assert!(shown.len() <= 512, "{} bytes: {shown}", shown.len());
+        assert!(
+            shown.ends_with(": unknown harness") || shown.ends_with(": unknown key"),
+            "{shown}"
+        );
+        let loaded = load(&text).unwrap_err().to_string();
+        assert_eq!(loaded, shown);
+    }
 }
 
 /// Each invalid section, the member it names and the rule it breaks.
@@ -104,6 +155,11 @@ fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
         ),
         (
             r#"{"codex":{"binary":7}}"#,
+            "harnesses.codex.binary",
+            Binary,
+        ),
+        (
+            r#"{"codex":{"binary":"/opt/tool\u0000suffix"}}"#,
             "harnesses.codex.binary",
             Binary,
         ),
@@ -239,6 +295,20 @@ fn s_launch_binary_resolution() {
         path
     });
     fs::write(plain.join("tool"), "not executable").unwrap();
+    // Execute bits outside the class that applies to this user: owned by
+    // it, so only the owner bits count (0601 and 0610 are not executable
+    // by their owner). Root may run any file with an execute bit.
+    let [other_only, group_only] = ["other-only", "group-only"].map(|d| {
+        let path = dir.path().join(d);
+        fs::create_dir(&path).unwrap();
+        path
+    });
+    for (dir, mode) in [(&other_only, 0o601), (&group_only, 0o610)] {
+        let tool = dir.join("tool");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let root = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&other_only).unwrap()) == 0;
     fs::create_dir(sub.join("tool")).unwrap();
     executable(&exec.join("tool"));
     executable(&later.join("tool"));
@@ -247,13 +317,16 @@ fn s_launch_binary_resolution() {
         PathBuf::from("relative"),
         plain.clone(),
         sub.clone(),
+        other_only.clone(),
+        group_only.clone(),
         exec.clone(),
         later.clone(),
     ])
     .unwrap();
+    let expected = if root { &other_only } else { &exec };
     assert_eq!(
         resolve_binary(None, "tool", Some(&path)),
-        Some(exec.join("tool"))
+        Some(expected.join("tool"))
     );
     let pinned = Path::new("/opt/pinned/tool");
     assert_eq!(

@@ -152,7 +152,6 @@ pub enum HarnessesRule {
 
 /// The fake's validated fixture (runtime §11.1): its launch paths and the
 /// profile its scenario declares.
-#[derive(Debug)]
 pub struct FakeFixture {
     binary: PathBuf,
     scenario: PathBuf,
@@ -174,6 +173,18 @@ impl FakeFixture {
     /// The synchronization directory.
     pub fn sync_dir(&self) -> &Path {
         &self.sync_dir
+    }
+}
+
+impl fmt::Debug for FakeFixture {
+    /// The paths are bootstrap values: their names only (runtime §6.1).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FakeFixture")
+            .field("binary", &"VIA_FAKE_AGENT_BINARY")
+            .field("scenario", &"VIA_FAKE_SCENARIO")
+            .field("sync_dir", &"VIA_FAKE_SYNC_DIR")
+            .field("profile", &self.profile)
+            .finish()
     }
 }
 
@@ -300,23 +311,42 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
     for (name, entry) in members(raw, "harnesses")? {
         let key = format!("harnesses.{name}");
         let Some(index) = HARNESSES.iter().position(|row| row.name == name) else {
-            return Err(invalid(key, HarnessesRule::UnknownHarness));
+            return Err(invalid(&key, HarnessesRule::UnknownHarness));
         };
         let config = &mut harnesses[index];
         for (member, value) in members(&entry, &key)? {
             let key = format!("{key}.{member}");
             match member.as_str() {
-                "binary" => config.binary = Some(binary(&value, key)?),
+                "binary" => config.binary = Some(binary(&value, &key)?),
                 "inherit" => config.inherit = parse_inherit(&value, &key)?,
-                _ => return Err(invalid(key, HarnessesRule::UnknownKey)),
+                _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
             }
         }
     }
     Ok(harnesses)
 }
 
-fn invalid(key: String, rule: HarnessesRule) -> HarnessesError {
-    HarnessesError { key, rule }
+/// The most bytes of a key a diagnostic shows: the rule after it always
+/// fits the auto-start client's 4 KiB stderr capture.
+const KEY_SHOWN: usize = 256;
+
+/// The key as shown: control characters escaped, cut at [`KEY_SHOWN`]
+/// bytes with `...`, so the diagnostic stays one bounded line.
+fn invalid(key: &str, rule: HarnessesRule) -> HarnessesError {
+    let mut shown = String::new();
+    for character in key.chars() {
+        let piece: String = if character.is_control() {
+            character.escape_default().collect()
+        } else {
+            character.to_string()
+        };
+        if shown.len() + piece.len() > KEY_SHOWN {
+            shown.push_str("...");
+            break;
+        }
+        shown.push_str(&piece);
+    }
+    HarnessesError { key: shown, rule }
 }
 
 /// A JSON object's members in order, duplicates kept, so that a repeated
@@ -348,12 +378,12 @@ impl<'de> Deserialize<'de> for Members {
 /// The members of the object at `key`; a non-object or a repeated key is
 /// refused.
 fn members(raw: &RawValue, key: &str) -> Result<Vec<(String, Box<RawValue>)>, HarnessesError> {
-    let Members(members) = serde_json::from_str(raw.get())
-        .map_err(|_| invalid(key.to_owned(), HarnessesRule::NotAnObject))?;
+    let Members(members) =
+        serde_json::from_str(raw.get()).map_err(|_| invalid(key, HarnessesRule::NotAnObject))?;
     for (at, (name, _)) in members.iter().enumerate() {
         if members[..at].iter().any(|(earlier, _)| earlier == name) {
             return Err(invalid(
-                format!("{key}.{name}"),
+                &format!("{key}.{name}"),
                 HarnessesRule::DuplicateKey,
             ));
         }
@@ -361,11 +391,13 @@ fn members(raw: &RawValue, key: &str) -> Result<Vec<(String, Box<RawValue>)>, Ha
     Ok(members)
 }
 
-/// Runtime §6.1's path rule: absolute, no `..`, no expansion.
-fn binary(value: &RawValue, key: String) -> Result<PathBuf, HarnessesError> {
+/// Runtime §6.1's path rule: absolute, no `..`, no expansion; an embedded
+/// NUL names no file.
+fn binary(value: &RawValue, key: &str) -> Result<PathBuf, HarnessesError> {
     match serde_json::from_str::<String>(value.get()) {
         Ok(path)
-            if Path::new(&path).is_absolute()
+            if !path.contains('\0')
+                && Path::new(&path).is_absolute()
                 && !Path::new(&path)
                     .components()
                     .any(|part| part == Component::ParentDir) =>
@@ -381,10 +413,10 @@ fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError>
     for (name, value) in members(value, key)? {
         let key = format!("{key}.{name}");
         let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
-            return Err(invalid(key, HarnessesRule::UnknownKey));
+            return Err(invalid(&key, HarnessesRule::UnknownKey));
         };
         let Ok(on) = serde_json::from_str::<bool>(value.get()) else {
-            return Err(invalid(key, HarnessesRule::NotBoolean));
+            return Err(invalid(&key, HarnessesRule::NotBoolean));
         };
         states.set(
             category,
