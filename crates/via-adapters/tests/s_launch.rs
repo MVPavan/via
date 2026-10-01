@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use via_adapters::{
     AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
     Harness, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState, InstanceCache,
-    REFUSAL_TTL, VERSIONS_KEPT, resolve_binary,
+    VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -429,27 +429,6 @@ fn s_launch_refusal_cache_expires_after_ten_minutes() {
     );
 }
 
-/// Refusal retention is bounded: each refusal write sweeps the expired
-/// ones.
-#[test]
-fn s_launch_cache_retention_is_bounded() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("vendor");
-    executable(&binary);
-    let identity = identity_of(&binary);
-    let cache = InstanceCache::default();
-    let written = Instant::now();
-    let cause = Incompatibility::FeatureAbsent("tool_list");
-    for recipe in 0..1000 {
-        cache.record_refusal(identity, format!("recipe-{recipe}"), cause, written);
-    }
-    assert_eq!(cache.retained(), 1000);
-    let later = written + REFUSAL_TTL;
-    cache.record_refusal(identity, "fresh".to_owned(), cause, later);
-    assert_eq!(cache.retained(), 1, "expired refusals survived a write");
-    assert_eq!(cache.refusal(&identity, "fresh", later), Some(cause));
-}
-
 /// C2 §5: the last version is per binary identity, whatever path reached
 /// it: a symlink alias hits, a newer version seen through the alias is
 /// seen through the original path, a late handshake from an older
@@ -496,7 +475,6 @@ fn s_launch_version_cache_by_identity() {
         cache.record_version(identity, format!("0.{index}"));
         others.push(identity);
     }
-    assert_eq!(cache.retained(), VERSIONS_KEPT);
     assert_eq!(
         cache.last_version(&new),
         None,

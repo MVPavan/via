@@ -20,6 +20,12 @@ pub const REFUSAL_TTL: Duration = Duration::from_mins(10);
 /// The most binary identities whose last version the cache keeps.
 pub const VERSIONS_KEPT: usize = 16;
 
+/// The most refusal entries the cache keeps.
+pub const REFUSALS_KEPT: usize = 64;
+
+/// The longest recipe key, in bytes, whose refusal the cache remembers.
+pub const RECIPE_KEY_MAX: usize = 1024;
+
 /// The binary a harness runs: `configured` (`harnesses.<name>.binary`) when
 /// set, else the first regular file named `default_binary` in the captured
 /// `path` that this process may execute, as the kernel judges it for the
@@ -102,9 +108,15 @@ pub enum Incompatibility {
 /// The instance cache (C2 §5 AD7): the last version seen per binary
 /// identity, and refusal entries keyed by identity plus the route's
 /// recipe key (the adapter's canonical recipe string). Retention is
-/// bounded: at most [`VERSIONS_KEPT`] version entries, the least recently
-/// written evicted first (a lost entry costs one cache miss), and every
-/// refusal write sweeps the expired refusals.
+/// bounded: at most [`VERSIONS_KEPT`] version entries and
+/// [`REFUSALS_KEPT`] refusal entries, the least recently written evicted
+/// first (a lost entry costs one cache miss); every refusal write sweeps
+/// the expired refusals. What it holds is not inspectable from outside:
+///
+/// ```compile_fail
+/// let cache = via_adapters::InstanceCache::default();
+/// let _ = cache.retained();
+/// ```
 #[derive(Debug, Default)]
 pub struct InstanceCache {
     inner: Mutex<Entries>,
@@ -116,7 +128,16 @@ struct Entries {
     versions: HashMap<BinaryIdentity, (String, u64)>,
     /// The sequence number of the next version write.
     written: u64,
-    refusals: HashMap<BinaryIdentity, HashMap<String, (Instant, Incompatibility)>>,
+    /// At most [`REFUSALS_KEPT`], in write order, the oldest first.
+    refusals: Vec<Refusal>,
+}
+
+#[derive(Debug)]
+struct Refusal {
+    identity: BinaryIdentity,
+    recipe: String,
+    written: Instant,
+    cause: Incompatibility,
 }
 
 /// Whether an entry written at `written` is live at `now`.
@@ -159,7 +180,10 @@ impl InstanceCache {
     }
 
     /// Records a refusal written at `now`; it expires [`REFUSAL_TTL`] later.
-    /// Every refusal expired at `now` is dropped first.
+    /// Every refusal expired at `now` is dropped first, and past
+    /// [`REFUSALS_KEPT`] entries the least recently written is evicted. A
+    /// `recipe` longer than [`RECIPE_KEY_MAX`] bytes is not remembered: the
+    /// refusal still applies to its request.
     pub fn record_refusal(
         &self,
         identity: BinaryIdentity,
@@ -167,16 +191,23 @@ impl InstanceCache {
         cause: Incompatibility,
         now: Instant,
     ) {
+        if recipe.len() > RECIPE_KEY_MAX {
+            return;
+        }
         let mut entries = self.entries();
-        entries.refusals.retain(|_, recipes| {
-            recipes.retain(|_, (written, _)| live(*written, now));
-            !recipes.is_empty()
+        entries.refusals.retain(|refusal| {
+            live(refusal.written, now)
+                && !(refusal.identity == identity && refusal.recipe == recipe)
         });
-        entries
-            .refusals
-            .entry(identity)
-            .or_default()
-            .insert(recipe, (now, cause));
+        if entries.refusals.len() == REFUSALS_KEPT {
+            entries.refusals.remove(0);
+        }
+        entries.refusals.push(Refusal {
+            identity,
+            recipe,
+            written: now,
+            cause,
+        });
     }
 
     /// The live refusal for `identity` and `recipe` at `now`, if any; an
@@ -188,21 +219,93 @@ impl InstanceCache {
         now: Instant,
     ) -> Option<Incompatibility> {
         let mut entries = self.entries();
-        let recipes = entries.refusals.get_mut(identity)?;
-        let (written, cause) = *recipes.get(recipe)?;
-        if live(written, now) {
-            return Some(cause);
+        let index = entries
+            .refusals
+            .iter()
+            .position(|refusal| refusal.identity == *identity && refusal.recipe == recipe)?;
+        let refusal = &entries.refusals[index];
+        if live(refusal.written, now) {
+            return Some(refusal.cause);
         }
-        recipes.remove(recipe);
-        if recipes.is_empty() {
-            entries.refusals.remove(identity);
-        }
+        entries.refusals.remove(index);
         None
     }
+}
 
-    /// The entries held, versions and refusals together.
-    pub fn retained(&self) -> usize {
-        let entries = self.entries();
-        entries.versions.len() + entries.refusals.values().map(HashMap::len).sum::<usize>()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(ino: u64) -> BinaryIdentity {
+        BinaryIdentity {
+            dev: 1,
+            ino,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        }
+    }
+
+    fn refusals(cache: &InstanceCache) -> usize {
+        cache.entries().refusals.len()
+    }
+
+    /// Critical r1 #3: refusal retention has a hard bound. Within one TTL,
+    /// many distinct recipes keep 64 entries, the oldest written evicted
+    /// first; a recipe key over 1 KiB is not remembered.
+    #[test]
+    fn refusals_are_bounded_within_one_ttl() {
+        let cache = InstanceCache::default();
+        let now = Instant::now();
+        let cause = Incompatibility::FeatureAbsent("tool_list");
+        for recipe in 0..1000 {
+            cache.record_refusal(identity(1), format!("recipe-{recipe}"), cause, now);
+        }
+        assert_eq!(refusals(&cache), 64);
+        assert_eq!(cache.refusal(&identity(1), "recipe-935", now), None);
+        for recipe in 936..1000 {
+            let key = format!("recipe-{recipe}");
+            assert_eq!(cache.refusal(&identity(1), &key, now), Some(cause), "{key}");
+        }
+        // Across identities too, and a rewrite counts as the newest write.
+        cache.record_refusal(identity(1), "recipe-936".to_owned(), cause, now);
+        cache.record_refusal(identity(2), "recipe-0".to_owned(), cause, now);
+        assert_eq!(refusals(&cache), 64);
+        assert_eq!(cache.refusal(&identity(1), "recipe-936", now), Some(cause));
+        assert_eq!(cache.refusal(&identity(1), "recipe-937", now), None);
+        assert_eq!(cache.refusal(&identity(2), "recipe-0", now), Some(cause));
+
+        let oversized = "k".repeat(1025);
+        cache.record_refusal(identity(3), oversized.clone(), cause, now);
+        assert_eq!(cache.refusal(&identity(3), &oversized, now), None);
+        assert_eq!(refusals(&cache), 64);
+        let largest = "k".repeat(1024);
+        cache.record_refusal(identity(3), largest.clone(), cause, now);
+        assert_eq!(cache.refusal(&identity(3), &largest, now), Some(cause));
+    }
+
+    /// Each refusal write sweeps the expired refusals.
+    #[test]
+    fn refusal_writes_sweep_expired_ones() {
+        let cache = InstanceCache::default();
+        let written = Instant::now();
+        let cause = Incompatibility::FeatureAbsent("tool_list");
+        for recipe in 0..10 {
+            cache.record_refusal(identity(1), format!("recipe-{recipe}"), cause, written);
+        }
+        assert_eq!(refusals(&cache), 10);
+        let later = written + REFUSAL_TTL;
+        cache.record_refusal(identity(1), "fresh".to_owned(), cause, later);
+        assert_eq!(refusals(&cache), 1, "expired refusals survived a write");
+    }
+
+    /// At most [`VERSIONS_KEPT`] version entries are held.
+    #[test]
+    fn versions_are_bounded() {
+        let cache = InstanceCache::default();
+        for ino in 0..100 {
+            cache.record_version(identity(ino), format!("0.{ino}"));
+        }
+        assert_eq!(cache.entries().versions.len(), VERSIONS_KEPT);
     }
 }
