@@ -176,6 +176,28 @@ impl Inbox {
     pub(super) fn try_recv(&mut self) -> Option<Admitted> {
         self.0.as_mut()?.try_recv().ok()
     }
+
+    /// Closes the channel's admission: a send from now on is refused to
+    /// its sender, and [`Self::recv`] returns what was admitted before,
+    /// then `None` once no sender holds a slot.
+    fn close(&mut self) {
+        if let Some(receiver) = self.0.as_mut() {
+            receiver.close();
+        }
+    }
+}
+
+/// Ready data items a drain handles before it services its controls,
+/// deadlines and health again and yields (runtime §8; Sol r4 R5).
+pub(super) const READY_ITEMS: usize = 128;
+
+/// Counts one ready item `handled`; each [`READY_ITEMS`]th yields to the
+/// runtime, so no backlog holds the task's thread.
+pub(super) async fn ready_item(handled: &mut usize) {
+    *handled += 1;
+    if (*handled).is_multiple_of(READY_ITEMS) {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// One session's driver and observation channel.
@@ -572,14 +594,16 @@ impl Lane {
     }
 
     /// The lane's actor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3, Sol r3
-    /// N1-N5), on the daemon's tracker for the lane's life: it serves the
-    /// lane until it ends ([`Self::serve`]). Then it closes the driver,
-    /// unless the drivers' cancellation ended the lane, disposes of what
-    /// the channel still has, one item at a time (durable items committed,
-    /// the rest dropped), removes the lane from `lanes` when its session
-    /// closed, and only then publishes the lane's end. A turn handed over
-    /// meanwhile runs after, with no channel. Nothing cancels it but the
-    /// runtime's own end.
+    /// N1-N5, Sol r4 R2, R3), on the daemon's tracker for the lane's life:
+    /// it serves the lane until it ends ([`Self::serve`]). Then it closes
+    /// the driver, unless the drivers' cancellation ended the lane; closes
+    /// the channel's admission and disposes of everything admitted before,
+    /// to the channel's end, one item at a time (durable items committed,
+    /// the rest dropped); removes the lane from `lanes` when its session
+    /// closed; runs a turn handed over meanwhile, with no channel; and only
+    /// then publishes the lane's end. That one completion serves every
+    /// waiter: close, retirement, replacement and final shutdown. Nothing
+    /// cancels the actor but the runtime's own end.
     async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
         match self.serve(&mut inbox).await {
             Some(Ending::Retire) => {
@@ -593,10 +617,18 @@ impl Lane {
             // reconciliation owns their groups (final shutdown).
             None => {}
         }
-        while let Some(admitted) = inbox.try_recv() {
+        // Test builds: the actor holds before the channel's admission closes.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.admission_close").await;
+        // Admission closes first (Sol r4 R3): what the driver sends from now
+        // on is refused at its sink, and an empty channel is not its end
+        // until no sender holds a slot.
+        inbox.close();
+        let mut handled = 0;
+        while let Some(admitted) = inbox.recv().await {
             self.dispose(admitted).await;
+            ready_item(&mut handled).await;
         }
-        // What the driver sends from now on is refused at its sink.
         drop(inbox);
         let removed = lock(&self.core).removed;
         if removed {
@@ -608,15 +640,25 @@ impl Lane {
                 lanes.remove(&session);
             }
         }
-        let job = {
-            let mut core = lock(&self.core);
-            core.life = Life::Ended;
-            core.job.take()
-        };
-        self.changed.send_replace(());
-        if let Some(job) = job {
-            job(&mut Inbox::closed()).await;
+        // A turn handed over meanwhile (only at the drivers' cancellation:
+        // an ending lane is never claimed) runs to its end before the
+        // lane's end is published (Sol r4 R2); a later handover finds the
+        // lane ended under the same lock.
+        loop {
+            let job = {
+                let mut core = lock(&self.core);
+                let job = core.job.take();
+                if job.is_none() {
+                    core.life = Life::Ended;
+                }
+                job
+            };
+            match job {
+                Some(job) => job(&mut Inbox::closed()).await,
+                None => break,
+            }
         }
+        self.changed.send_replace(());
     }
 
     /// Serves the lane until it ends (Sol r3 N1-N3): runs each turn handed
@@ -632,6 +674,9 @@ impl Lane {
         let mut health = self.driver.health();
         let mut changes = self.changed.subscribe();
         let (mut open, mut watched) = (true, true);
+        // Each item is taken only after the job, the cancellation, the
+        // health and the lane's end were checked again (runtime §8).
+        let mut handled = 0;
         loop {
             changes.borrow_and_update();
             let job = lock(&self.core).job.take();
@@ -672,7 +717,10 @@ impl Lane {
                 moved = health.changed(), if watched => watched = moved.is_ok(),
                 _bumped = changes.changed() => {}
                 admitted = inbox.recv(), if open => match admitted {
-                    Some(admitted) => self.dispose(admitted).await,
+                    Some(admitted) => {
+                        self.dispose(admitted).await;
+                        ready_item(&mut handled).await;
+                    }
                     None => open = false,
                 },
             }

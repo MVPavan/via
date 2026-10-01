@@ -1501,8 +1501,12 @@ impl Engine {
     ) -> Driven {
         // The session channel (C2 A1): 1,024 items and a 4 MiB byte
         // budget; an item's permit is held until it is handled. What
-        // arrived before the turn is the session drain's (C2 §2).
+        // arrived before the turn is the session drain's (C2 §2), which
+        // keeps servicing the turn's order and idle deadline (runtime §8).
+        let mut handled = 0;
         while let Some(admitted) = inbox.try_recv() {
+            self.between_items(record, control, &mut handled, true)
+                .await;
             lane.dispose(admitted).await;
         }
         record.vendor.identity = lane.identity();
@@ -1561,10 +1565,8 @@ impl Engine {
             }
         };
         // The driver delivered the turn's items before it returned.
-        while let Some(admitted) = inbox.try_recv() {
-            self.drain_one(record, Some(lane), effective, control, admitted)
-                .await;
-        }
+        self.final_drain(record, (Some(lane), effective), control, inbox)
+            .await;
         let TurnEnd {
             terminal,
             instance,
@@ -1599,6 +1601,56 @@ impl Engine {
             }
             outcome => Driven::Finished(Box::new((terminal, outcome))),
         }
+    }
+
+    /// The turn's final drain (Sol r3 N2): what the driver delivered
+    /// before it returned, handled one item at a time in decode order,
+    /// each taken only once the one before it is done, while the turn's
+    /// order is still serviced (runtime §8, Sol r4 R5).
+    async fn final_drain(
+        &self,
+        record: &mut TurnRecord,
+        (lane, effective): (Option<&Lane>, &Effective),
+        control: &mut Control<'_>,
+        inbox: &mut Inbox,
+    ) {
+        let mut handled = 0;
+        while let Some(admitted) = inbox.try_recv() {
+            self.between_items(record, control, &mut handled, false)
+                .await;
+            self.drain_one(record, lane, effective, control, admitted)
+                .await;
+        }
+    }
+
+    /// Services the turn's controls before each ready item of a drain
+    /// (runtime §8: at most 128 ready data items between checks; Sol r4
+    /// R5): an order not yet observed is observed, and, `before` the
+    /// turn's run, an idle deadline that passed issues its order, as the
+    /// run loop does. Every [`super::lane::READY_ITEMS`]th item yields. The
+    /// driver's health is its own during the run, and the lane's actor's
+    /// between turns. After the run returned no deadline is issued: the
+    /// turn already ended.
+    async fn between_items(
+        &self,
+        record: &mut TurnRecord,
+        control: &mut Control<'_>,
+        handled: &mut usize,
+        before: bool,
+    ) {
+        let now = tokio::time::Instant::now();
+        if before && control.idle_at.is_some_and(|idle_at| idle_at <= now) {
+            control.idle_at = None;
+            control.slot.idle_order(control.turn, now);
+        }
+        if !control.observed && control.orders.has_changed().unwrap_or(false) {
+            let order = control.orders.borrow_and_update().clone();
+            if let Some(order) = order {
+                self.observe_order(record, control, &order).await;
+                stop_for_store(record, control);
+            }
+        }
+        super::lane::ready_item(handled).await;
     }
 
     /// Handles one observation queued on the session channel, in decode
@@ -1679,10 +1731,17 @@ impl Engine {
             idle: Duration::ZERO,
             final_text: FinalText::new(),
         };
+        let (sender, receiver) = tokio::sync::mpsc::channel(queued.len().max(1));
         for admitted in queued {
-            self.drain_one(record, lane, effective, &mut control, admitted)
-                .await;
+            assert!(
+                sender.try_send(admitted).is_ok(),
+                "the channel holds every queued item"
+            );
         }
+        drop(sender);
+        let mut inbox = Inbox::of(receiver);
+        self.final_drain(record, (lane, effective), &mut control, &mut inbox)
+            .await;
     }
 
     /// Handles one observation in decode order (C2 §4): commits the

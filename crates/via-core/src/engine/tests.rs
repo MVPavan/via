@@ -4357,6 +4357,16 @@ fn an_identity_drained_before_a_turn_is_the_turns() {
     });
 }
 
+/// Arms hit `occurrence` of `point` in `dir` with `action`'s members.
+#[cfg(feature = "test-failpoints")]
+fn arm_point(dir: &Path, point: &str, occurrence: u64, action: &Value) {
+    let mut command = json!({"token":FAILPOINT_TOKEN,"occurrence":occurrence});
+    for (member, value) in action.as_object().into_iter().flatten() {
+        command[member] = value.clone();
+    }
+    fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+}
+
 /// Sol r4 R1 (lane actor ruling): a turn whose lane ended before the
 /// handover, at the drivers' cancellation, is never run by its caller:
 /// aborting the dispatcher while the turn runs leaves it running to its
@@ -4401,5 +4411,191 @@ fn a_turn_its_ended_lane_gave_back_outlives_its_aborted_dispatcher() {
         })
         .await
         .expect("the turn reaches its terminal");
+    });
+}
+
+/// Sol r4 R2 (lane actor ruling): a turn handed over while the lane
+/// disposes of its channel at the drivers' cancellation runs before the
+/// lane's completion is published: whoever waits for that completion
+/// finds the turn ended.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_lane_completes_only_after_a_turn_handed_over_in_its_final_disposal() {
+    let Some(root) = child("a_lane_completes_only_after_a_turn_handed_over_in_its_final_disposal")
+    else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let claim = lane.claim().expect("an open lane");
+        send_denials(&sender, &budget, &["one"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        // The lane ends at the drivers' cancellation; its final disposal
+        // takes "two".
+        engine.cancel.cancel();
+        send_denials(&sender, &budget, &["two"]).await;
+        arm_point(&points, "core.lane.dispose", 2, &json!({"action":"pause"}));
+        release_point(&points, "core.lane.dispose", 1);
+        until(|| acked(&points, "core.lane.dispose", 2)).await;
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job = super::lane::turn_job({
+            let ended = std::sync::Arc::clone(&ended);
+            move |_inbox| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    ended.store(true, Ordering::Release);
+                    drop(claim);
+                })
+            }
+        });
+        assert!(lane.hand_over(job).is_ok(), "the lane has not ended");
+        release_point(&points, "core.lane.dispose", 2);
+        retired_within(&lane).await;
+        assert!(
+            ended.load(Ordering::Acquire),
+            "the turn ended before the lane's completion"
+        );
+        assert_eq!(denied_targets(&engine, &session).await, ["one", "two"]);
+    });
+}
+
+/// Sol r4 R3 (lane actor ruling): an item the channel admits after the
+/// lane's last empty read, before its admission closes, is committed
+/// before the lane's completion, never dropped with the channel.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_item_admitted_as_the_lane_ends_is_committed_before_its_end() {
+    let Some(root) = child("an_item_admitted_as_the_lane_ends_is_committed_before_its_end") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.admission_close");
+    run(async {
+        let engine = open(&root);
+        // No turn is dispatched: the session's only lane is this one.
+        let session = new_session(&engine).await;
+        let (lane, sender) = adopt_test_lane(&engine, &root, &session).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        assert!(lane.begin_retire(), "an unclaimed lane retires");
+        until(|| acked(&points, "core.lane.admission_close", 1)).await;
+        send_denials(&sender, &budget, &["late"]).await;
+        release_point(&points, "core.lane.admission_close", 1);
+        retired_within(&lane).await;
+        assert_eq!(denied_targets(&engine, &session).await, ["late"]);
+        assert_eq!(budget.available_permits(), 1_000);
+    });
+}
+
+/// A backlog of `count` denials, `d0` onwards, naming no vendor turn.
+fn denial_backlog(count: usize) -> Vec<via_adapters::ObservationItem> {
+    (0..count)
+        .map(|n| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
+            observation: denied(&format!("d{n}")),
+        })
+        .collect()
+}
+
+/// How many of the session's `action.denied` events precede its
+/// `cancel.requested`, and how many there are.
+async fn denials_before_the_order(engine: &Engine, session: &SessionId) -> (usize, usize) {
+    let types = event_types(engine, session).await;
+    let at = types
+        .iter()
+        .position(|kind| kind == "cancel.requested")
+        .expect("the drain serviced the order");
+    let denied = |kinds: &[String]| kinds.iter().filter(|kind| *kind == "action.denied").count();
+    (denied(&types[..at]), denied(&types))
+}
+
+/// Sol r4 R5 (runtime §8): a turn's final drain over a large ready backlog
+/// services the turn's pending stop order within 128 items: its
+/// `cancel.requested` commits before the backlog's 129th denial, and
+/// every denial is still committed.
+#[test]
+fn a_final_drain_services_a_pending_order_within_128_items() {
+    let Some(root) = child("a_final_drain_services_a_pending_order_within_128_items") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        slot.idle_order(turn(2), tokio::time::Instant::now());
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                denial_backlog(300),
+            )
+            .await;
+        let (before, all) = denials_before_the_order(&engine, &session).await;
+        assert!(before <= 128, "{before} denials before the order");
+        assert_eq!(all, 300);
+    });
+}
+
+/// Sol r4 R5 (runtime §8): a turn's pre-turn drain over a large ready
+/// backlog services the turn's pending stop order within 128 items, before
+/// the turn starts.
+#[test]
+fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
+    let Some(root) = child("a_pre_turn_drain_services_a_pending_order_within_128_items") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{Prepared, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let (session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        // The test committed turn 2's submission past the slot's head; the
+        // turn writes at the slot's head, as a dispatched turn does.
+        slot.head
+            .lock(&engine.store, &session)
+            .await
+            .unwrap()
+            .lost();
+        record.head = std::sync::Arc::clone(&slot.head);
+        slot.idle_order(turn(2), tokio::time::Instant::now());
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(10_000));
+        let (sender, receiver) = tokio::sync::mpsc::channel(512);
+        for n in 0..300 {
+            send_held(&sender, &budget, None, denied(&format!("d{n}"))).await;
+        }
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let now = tokio::time::Instant::now();
+        let (_stop, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(2),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        engine
+            .execute_turn(
+                (&slot, &claim),
+                (&mut record, &effective),
+                (orders, &mut inbox),
+                (spec, cx),
+            )
+            .await;
+        let (before, all) = denials_before_the_order(&engine, &session).await;
+        assert!(before <= 128, "{before} denials before the order");
+        assert_eq!(all, 300);
+        assert_eq!(budget.available_permits(), 10_000);
     });
 }
