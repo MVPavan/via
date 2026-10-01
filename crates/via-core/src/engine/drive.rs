@@ -1541,11 +1541,12 @@ impl Engine {
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
         // driver keeps servicing its controls; a result it returns early is
-        // kept and acted on after the commit.
+        // kept, with the channel's count at that return, and acted on after
+        // the commit.
         let mut early = None;
         let end = loop {
             if let Some(end) = early.take() {
-                break (end, inbox.len());
+                break end;
             }
             let idle_at = control.idle_at;
             // Critical r1b #12 (runtime §8): biased, controls first. A ready
@@ -1561,8 +1562,8 @@ impl Engine {
                         .and_then(|()| control.orders.borrow_and_update().clone());
                     if let Some(order) = order {
                         while_polling(
-                            &mut run,
-                            &mut early,
+                            (&mut run, &mut early),
+                            || inbox.len(),
                             self.observe_order(record, control, &order),
                         )
                         .await;
@@ -1578,10 +1579,13 @@ impl Engine {
                     control.slot.idle_order(control.turn, tokio::time::Instant::now());
                 }
                 end = &mut run => {
+                    // What the driver delivered by its return (critical
+                    // r2 F2), counted at its first `Ready`.
+                    let delivered = inbox.len();
                     // Test builds: the driver's turn returned.
                     #[cfg(feature = "test-failpoints")]
                     let _ = via_store::failpoint::hit_async("core.run.returned").await;
-                    break (end, inbox.len());
+                    break (end, delivered);
                 }
                 Some(admitted) = inbox.recv() => {
                     let Admitted { item, permit } = admitted;
@@ -1590,7 +1594,7 @@ impl Engine {
                     {
                         *idle_at = tokio::time::Instant::now() + control.idle;
                     }
-                    while_polling(&mut run, &mut early, async {
+                    while_polling((&mut run, &mut early), || inbox.len(), async {
                         // Test builds: Core holds before handling an observation.
                         #[cfg(feature = "test-failpoints")]
                         let _ = via_store::failpoint::hit_async("core.observations.pause").await;
@@ -1649,8 +1653,8 @@ impl Engine {
     /// one before it is done, while the turn's order is still serviced
     /// (runtime §8, Sol r4 R5). It is finite (critical r1 #1): the
     /// terminal follows, and what arrives later is the lane actor's
-    /// between turns. (After a driver that returned during a commit, the
-    /// count is read once that commit is done.)
+    /// between turns. The count is read at the driver's first `Ready`, even
+    /// when it returned during a commit (critical r2 F2).
     async fn final_drain(
         &self,
         record: &mut TurnRecord,
@@ -2584,9 +2588,15 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
 }
 
 /// Awaits `commit` while polling the adapter's `execute` (design §9): a
-/// result it returns meanwhile is kept in `early`, and a completed
-/// `execute` is never polled again.
-async fn while_polling<E, F>(execute: &mut E, early: &mut Option<E::Output>, commit: F) -> F::Output
+/// result it returns meanwhile is kept in `early` with the session
+/// channel's count at that first `Ready`, read by `delivered` (critical r2
+/// F2: what the driver delivered by its return is the final drain's), and
+/// a completed `execute` is never polled again.
+async fn while_polling<E, F>(
+    (execute, early): (&mut E, &mut Option<(E::Output, usize)>),
+    delivered: impl Fn() -> usize,
+    commit: F,
+) -> F::Output
 where
     E: std::future::Future + Unpin,
     F: std::future::Future,
@@ -2597,7 +2607,7 @@ where
             biased;
             output = &mut commit => return output,
             result = &mut *execute => {
-                *early = Some(result);
+                *early = Some((result, delivered()));
                 // Test builds: the driver's turn returned.
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.run.returned").await;

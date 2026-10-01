@@ -2297,6 +2297,12 @@ fn count_points(root: &Path, points: &[&str]) -> PathBuf {
 /// Arms counted `point` to fail its next hit (`fail_io`); returns that
 /// occurrence.
 fn arm_next(dir: &Path, point: &str) -> u64 {
+    arm_next_with(dir, point, &json!({"action":"fail_io"}))
+}
+
+/// Arms counted `point`'s next hit with `action`'s members; returns that
+/// occurrence.
+fn arm_next_with(dir: &Path, point: &str, action: &Value) -> u64 {
     let prefix = format!("{point}.");
     let counted = fs::read_dir(dir)
         .unwrap()
@@ -2310,7 +2316,9 @@ fn arm_next(dir: &Path, point: &str) -> u64 {
         .max()
         .unwrap_or(0);
     let next = counted + 1;
-    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":next,"action":"fail_io"});
+    let mut command = action.clone();
+    command["token"] = json!(FAILPOINT_TOKEN);
+    command["occurrence"] = json!(next);
     fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
     next
 }
@@ -5306,5 +5314,116 @@ fn a_claimed_or_queued_lane_is_never_taken_past_the_bound() {
             assert!(!lane.failed(), "within the bound");
         }
         drop(claim);
+    });
+}
+
+/// One admitted denial `target` naming no vendor turn, on `budget`.
+#[cfg(feature = "test-failpoints")]
+fn admitted_denial(
+    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+    target: &str,
+) -> via_adapters::Admitted {
+    via_adapters::Admitted {
+        item: via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
+            observation: denied(target),
+        },
+        permit: std::sync::Arc::clone(budget)
+            .try_acquire_many_owned(10)
+            .unwrap(),
+    }
+}
+
+/// A turn context for turn 2, opening a connection, with a 60 s wall.
+#[cfg(feature = "test-failpoints")]
+fn turn_2_cx() -> (via_adapters::TurnSpec, via_adapters::TurnCx) {
+    use via_adapters::{Prepared, TurnActivity, TurnCx, TurnSpec};
+    let now = tokio::time::Instant::now();
+    let (_stop, stop) = tokio::sync::watch::channel(None);
+    let (_force, force) = tokio::sync::watch::channel(None);
+    let cx = TurnCx {
+        turn: turn(2),
+        prepared: Prepared::NeedsConnection,
+        capacity: None,
+        activity: TurnActivity::new(now),
+        wall: Deadline::at(now + Duration::from_secs(60)),
+        tool_grace: Duration::from_secs(60),
+        stop,
+        force,
+    };
+    let spec = TurnSpec {
+        prompt: "p".to_owned(),
+        ..TurnSpec::default()
+    };
+    (spec, cx)
+}
+
+/// Critical r2 F2 (critical r1 #1: the final drain is what the driver
+/// delivered by its return): the driver's turn returns while Core is held
+/// in an observation's commit, and another item is admitted after. The
+/// final drain's watermark is captured with the driver's result, at its
+/// first `Ready`, so that item is left for the lane between turns.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_item_admitted_after_the_driver_returned_is_left_for_the_lane() {
+    let Some(root) = child("an_item_admitted_after_the_driver_returned_is_left_for_the_lane")
+    else {
+        return;
+    };
+    let (intent, pause, returned) = (
+        "store.journal.anchor_intent",
+        "core.observations.pause",
+        "core.run.returned",
+    );
+    let points = count_points(&root, &[intent, pause, returned]);
+    run(async {
+        let engine = open(&root);
+        let (session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let held_item = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        let returned_at = arm_next_with(&points, returned, &json!({"action":"delay","value":0}));
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let ((), ()) = tokio::join!(
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            },
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                sender
+                    .send(admitted_denial(&budget, "first"))
+                    .await
+                    .unwrap();
+                until(|| acked(&points, pause, held_item)).await;
+                release_point(&points, intent, held_launch);
+                until(|| acked(&points, returned, returned_at)).await;
+                sender
+                    .send(admitted_denial(&budget, "after"))
+                    .await
+                    .unwrap();
+                release_point(&points, pause, held_item);
+            }
+        );
+        assert_eq!(
+            inbox.len(),
+            1,
+            "the item admitted after the return is not the final drain's"
+        );
+        assert_eq!(denied_targets(&engine, &session).await, ["first"]);
     });
 }
