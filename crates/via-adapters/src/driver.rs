@@ -276,6 +276,14 @@ impl SessionDriver {
             .is_some_and(|adapter| adapter.profile().persistent)
     }
 
+    /// The running adapter's version (AD12), which each turn the driver
+    /// starts records as the session's (C1 §3.3); `None` without one.
+    pub fn adapter_version(&self) -> Option<String> {
+        self.adapter
+            .as_ref()
+            .map(|adapter| adapter.profile().adapter_version.clone())
+    }
+
     /// The ID identity confirmations name for the driver's current
     /// connection generation, the latest it opened (C2 §2 delayed identity:
     /// Core checks the current generation); `None` before the first.

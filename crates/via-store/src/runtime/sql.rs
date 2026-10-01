@@ -155,15 +155,16 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Schema v6 (Task 4 design §6.6), frozen by `s1_store_v6_schema_is_frozen`.
-const SCHEMA_V6: &str = "CREATE TABLE sessions (
+/// Schema v7 (runtime §6; Task 4 design §6.6 plus the session's persisted
+/// `adapter_version`), frozen by `s1_store_v6_schema_is_frozen`.
+const SCHEMA_V7: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
     next_seq INTEGER NOT NULL CHECK(next_seq>=2),
     admission TEXT NOT NULL DEFAULT 'open' CHECK(admission IN ('open','closing')),
     close_result TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
     harness TEXT NOT NULL, label TEXT, ord INTEGER NOT NULL UNIQUE,
-    vendor_session_id TEXT, transcript_hint TEXT);
+    vendor_session_id TEXT, transcript_hint TEXT, adapter_version TEXT);
  CREATE TABLE session_ord (only INTEGER PRIMARY KEY CHECK(only = 1), next INTEGER NOT NULL);
  INSERT INTO session_ord(only,next) VALUES (1,0);
  CREATE TABLE turns (
@@ -214,7 +215,7 @@ const SCHEMA_V6: &str = "CREATE TABLE sessions (
     absence_time TEXT,
     FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
  CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
- PRAGMA user_version=6;";
+ PRAGMA user_version=7;";
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
@@ -262,7 +263,7 @@ pub(super) fn configure(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(SCHEMA_V6)
+        tx.execute_batch(SCHEMA_V7)
             .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
@@ -1048,17 +1049,11 @@ fn read_keyed_operation(
 }
 
 /// The selected columns of a session's [`SessionRoute`], for a query whose
-/// `?1` is the session and whose row is `sessions` (decision H3): the
-/// adapter version the latest started turn recorded, else the receipt's,
-/// with the confirmed identity its `session.opened`/`session.reopened`
-/// wrote. A turn's unparseable frozen row records no version; it is that
-/// turn's own failure (design §7.3), not the session's.
+/// row is `sessions` (decision H3): the adapter version the latest
+/// `turn.started` commit persisted, else the receipt's (runtime §6), with
+/// the confirmed identity its `session.opened`/`session.reopened` wrote.
 const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
-    coalesce((SELECT CASE WHEN json_valid(effective)
-                          THEN json_extract(effective,'$.adapter_version') END
-              FROM turns WHERE session_id=?1 AND accepted_at IS NOT NULL
-              ORDER BY number DESC LIMIT 1),
-             json_extract(receipt,'$.adapter_version')),
+    coalesce(adapter_version,json_extract(receipt,'$.adapter_version')),
     vendor_session_id,transcript_hint";
 
 /// The route identity read at `first` and the four columns after it.
@@ -1323,20 +1318,21 @@ fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result
         ));
     }
     // The vendor correlation and accepted_at stay as internal C2 evidence; the
-    // public event is Core's canonical one. Its `effective` values, which
-    // record the adapter version that started the turn (decision H3),
-    // become the turn's.
-    let started = record
-        .event
-        .get("effective")
-        .filter(|values| values.is_object());
-    let effective = started.map(Value::to_string);
+    // public event is Core's canonical one.
     tx.execute(
-        "UPDATE turns SET correlation=?3,accepted_at=?4,effective=coalesce(?5,effective)
-         WHERE session_id=?1 AND number=?2",
-        params![session.as_str(), turn.get(), correlation, at, effective],
+        "UPDATE turns SET correlation=?3,accepted_at=?4 WHERE session_id=?1 AND number=?2",
+        params![session.as_str(), turn.get(), correlation, at],
     )
     .map_err(sql_error)?;
+    // C1 §3.3: the turn.started commit advances the session's recorded
+    // adapter version to the running adapter's (decision H3).
+    if let Some(version) = record.adapter_version.as_deref() {
+        tx.execute(
+            "UPDATE sessions SET adapter_version=?2 WHERE id=?1",
+            params![session.as_str(), version],
+        )
+        .map_err(sql_error)?;
+    }
     insert_event(&tx, session, &record.event)?;
     // Test builds: SQLite reports corruption on the acceptance write itself,
     // after its prerequisite read (design §7.1); the transaction rolls back.

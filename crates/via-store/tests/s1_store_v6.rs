@@ -1,5 +1,6 @@
-//! Task 4 design §6.6: schema v6 is frozen by a golden DDL. Written before
-//! the migration.
+//! Task 4 design §6.6, runtime §6: the schema, v7 since the session's
+//! persisted adapter version, is frozen by a golden DDL. The test keeps its
+//! v6 name, which the plan tracks.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -10,7 +11,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 use via_store::Store;
 
-/// The v6 schema: every `sqlite_master` entry as `type name tbl_name sql`,
+/// The v7 schema: every `sqlite_master` entry as `type name tbl_name sql`,
 /// with the SQL's whitespace collapsed. Changing it is a schema change.
 const GOLDEN: &[(&str, &str, &str, &str)] = &[
     (
@@ -86,7 +87,7 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
          admission TEXT NOT NULL DEFAULT 'open' CHECK(admission IN ('open','closing')), \
          close_result TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, \
          harness TEXT NOT NULL, label TEXT, ord INTEGER NOT NULL UNIQUE, \
-         vendor_session_id TEXT, transcript_hint TEXT)",
+         vendor_session_id TEXT, transcript_hint TEXT, adapter_version TEXT)",
     ),
     (
         "table",
@@ -131,7 +132,7 @@ fn collapse(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Design §6.6: a fresh Store is v6 exactly as frozen here, with the
+/// Design §6.6, runtime §6: a fresh Store is v7 exactly as frozen here, with the
 /// `session_ord` counter at `(1, 0)` and the evidence root beside it.
 #[test]
 fn s1_store_v6_schema_is_frozen() {
@@ -141,7 +142,7 @@ fn s1_store_v6_schema_is_frozen() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let mut query = conn
         .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
         .unwrap();

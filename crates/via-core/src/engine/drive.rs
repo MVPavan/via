@@ -1680,8 +1680,14 @@ impl Engine {
                     .vendor_turn_id
                     .as_ref()
                     .map(|id| id.as_str().to_owned());
-                self.observe_acceptance(record, slot, effective, (correlation, vendor_turn_id))
-                    .await;
+                let running = lane.and_then(|lane| lane.driver.adapter_version());
+                self.observe_acceptance(
+                    record,
+                    slot,
+                    effective,
+                    (correlation, vendor_turn_id, running),
+                )
+                .await;
             }
             Observation::Progress(marks) => {
                 // A refused item changes nothing; the run loop stops the
@@ -1851,13 +1857,14 @@ impl Engine {
     }
 
     /// Commits the turn's acceptance at the next sequence (C2 §4
-    /// `turn.accepted`), with its Store correlation and vendor turn ID.
+    /// `turn.accepted`), with its Store correlation, vendor turn ID and the
+    /// running adapter's version.
     async fn observe_acceptance(
         &self,
         record: &mut TurnRecord,
         slot: &Slot,
         effective: &Effective,
-        (correlation, vendor_turn_id): (String, Option<String>),
+        evidence: (String, Option<String>, Option<String>),
     ) {
         if let Some(delta) = record.steps.accept() {
             slot.publish_progress(record.turn, &delta);
@@ -1879,11 +1886,7 @@ impl Engine {
         };
         let seq = head.next();
         match self
-            .accept(
-                (&record.session, record.turn, seq),
-                effective,
-                (correlation, vendor_turn_id),
-            )
+            .accept((&record.session, record.turn, seq), effective, evidence)
             .await
         {
             Ok(accepted) => {
@@ -2233,12 +2236,14 @@ impl Engine {
     /// A failure carries its classified outcome ([`WriteOutcome::of`]) and,
     /// when the head is unknown, the acceptance and the event sent.
     /// `correlation` is the acceptance's Store correlation: the vendor turn
-    /// ID, else the acceptance token.
+    /// ID, else the acceptance token. `adapter_version`, the running
+    /// adapter's, becomes the session's recorded one in the same commit
+    /// (C1 §3.3, decision H3).
     async fn accept(
         &self,
         (session, turn, seq): (&SessionId, TurnNumber, u64),
         effective: &Effective,
-        (correlation, vendor_turn_id): (String, Option<String>),
+        (correlation, vendor_turn_id, adapter_version): (String, Option<String>, Option<String>),
     ) -> Result<Accepted, AcceptFailure> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
@@ -2268,6 +2273,7 @@ impl Engine {
                 turn,
                 correlation,
                 event: event.clone(),
+                adapter_version,
             })
             .await;
         let accepted = Accepted { at, vendor_turn_id };

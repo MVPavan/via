@@ -23,7 +23,7 @@ use crate::{
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -286,9 +286,9 @@ pub struct SessionSnapshot {
 }
 
 /// A session's frozen route identity (C2 §2 `SessionRef`): its harness, its
-/// receipt's route, and its recorded adapter version: the latest started
-/// turn's `adapter_version`, recorded in its `turn.started` effective values
-/// (decision H3), else the receipt's; with the vendor identity it last
+/// receipt's route, and its recorded adapter version: the running adapter's
+/// at the latest `turn.started` commit (C1 §3.3, decision H3), else the
+/// receipt's when no turn has started; with the vendor identity it last
 /// confirmed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionRoute {
@@ -351,6 +351,10 @@ pub struct AcceptanceRecord {
     pub correlation: String,
     /// Canonical event with the session's next sequence; its `at` becomes `accepted_at`.
     pub event: Value,
+    /// The running adapter's version, which becomes the session's recorded
+    /// adapter version in the same transaction (C1 §3.3, decision H3);
+    /// `None` leaves the recorded value.
+    pub adapter_version: Option<String>,
 }
 
 /// One canonical event inside a running turn, such as an adapter observation.

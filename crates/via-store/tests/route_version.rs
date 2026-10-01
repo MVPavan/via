@@ -1,7 +1,7 @@
-//! Decision H3, Sol r2 #6: a session's recorded adapter version is the
-//! latest *started* turn's, which records it in its `turn.started`
-//! effective values, else the receipt's. A turn cancelled before it was
-//! ever submitted changes nothing.
+//! C1 §3.3, decision H3, Sol r2 #6: a started turn advances the session's
+//! recorded adapter version to the running adapter's in its `turn.started`
+//! commit; before any turn started, the receipt's applies. A later turn
+//! cancelled before it was ever submitted changes nothing.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -65,7 +65,7 @@ async fn end(client: &StoreClient, number: u32, seq: u64, state: &str) {
 }
 
 #[test]
-fn the_recorded_adapter_version_is_the_latest_started_turns() {
+fn a_started_turn_records_the_running_adapter_version() {
     let root = TempDir::new().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root.path()).unwrap();
@@ -79,7 +79,7 @@ fn the_recorded_adapter_version_is_the_latest_started_turns() {
                 .commit_spawn(SpawnRecord {
                     session_id: session(),
                     handle_hash: [7_u8; 32],
-                    receipt: json!({"state":"queued","route":"fake","adapter_version":"1"}),
+                    receipt: json!({"state":"queued","route":"fake","adapter_version":"0.1.0"}),
                     params: json!({"harness":"fake"}),
                     label: None,
                     prompt: "p".into(),
@@ -89,7 +89,7 @@ fn the_recorded_adapter_version_is_the_latest_started_turns() {
                 .await
                 .unwrap();
             // No turn started: the receipt's.
-            assert_eq!(version(&client).await.as_deref(), Some("1"));
+            assert_eq!(version(&client).await.as_deref(), Some("0.1.0"));
             client
                 .commit_submission(SubmissionRecord {
                     session_id: session(),
@@ -98,22 +98,19 @@ fn the_recorded_adapter_version_is_the_latest_started_turns() {
                 })
                 .await
                 .unwrap();
-            assert_eq!(version(&client).await.as_deref(), Some("1"));
-            // Turn 1 starts on adapter version 2.
-            let mut started = event("turn.started", 3, 1);
-            let mut values = effective();
-            values["adapter_version"] = json!("2");
-            started["effective"] = values;
+            assert_eq!(version(&client).await.as_deref(), Some("0.1.0"));
+            // Turn 1 starts on a running adapter of version 9.9.9.
             client
                 .commit_acceptance(AcceptanceRecord {
                     session_id: session(),
                     turn: turn(1),
                     correlation: "fake-turn-1".to_owned(),
-                    event: started,
+                    event: event("turn.started", 3, 1),
+                    adapter_version: Some("9.9.9".to_owned()),
                 })
                 .await
                 .unwrap();
-            assert_eq!(version(&client).await.as_deref(), Some("2"));
+            assert_eq!(version(&client).await.as_deref(), Some("9.9.9"));
             end(&client, 1, 4, "completed").await;
             // Turn 2 is cancelled before it was ever submitted.
             client
@@ -128,6 +125,6 @@ fn the_recorded_adapter_version_is_the_latest_started_turns() {
                 .await
                 .unwrap();
             end(&client, 2, 6, "cancelled").await;
-            assert_eq!(version(&client).await.as_deref(), Some("2"));
+            assert_eq!(version(&client).await.as_deref(), Some("9.9.9"));
         });
 }

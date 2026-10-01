@@ -1781,3 +1781,50 @@ fn core_identity_verification_follows_the_connection_generation() {
         daemon.shutdown().await;
     });
 }
+
+/// C1 §3.3, decision H3, Sol r2 #6: a started turn advances the session's
+/// recorded adapter version to the running adapter's, here the profile's
+/// `9.9.9`, not the receipt's. A later turn cancelled before it was ever
+/// submitted changes nothing.
+#[test]
+fn core_started_turns_record_the_running_adapter_version() {
+    let scripts = [
+        script(
+            "first",
+            &[
+                accepted(1),
+                gate("hold"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        script("never", &completed(2)),
+    ];
+    let Some(root) = child(
+        "core_started_turns_record_the_running_adapter_version",
+        &scenario(&json!({"adapter_version":"9.9.9"}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        daemon.entered("hold").await;
+        daemon.resume(&session, "never").await;
+        cancel(&daemon, &session, 2, 1000).await;
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        daemon.release("hold");
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.stop().await;
+        let store = via_store::Store::open(&root.join("state")).unwrap();
+        let snapshot = store
+            .client()
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.route.adapter_version.as_deref(), Some("9.9.9"));
+    });
+}
