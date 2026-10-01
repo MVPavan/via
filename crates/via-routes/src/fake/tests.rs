@@ -51,7 +51,7 @@ fn c2_terminal_fields_decode_typed_and_bounded() {
 fn c2_messages_decode_typed() {
     assert!(matches!(
         decode(r#"{"type":"hello","vendor_version":"1.2","features":["x"]}"#).unwrap(),
-        FakeMessage::Hello(Handshake { vendor_version: Some(ref version), ref features })
+        FakeMessage::Hello(Handshake { vendor_version: Some(ref version), ref features, .. })
             if version == "1.2" && features == &["x"]
     ));
     assert!(matches!(
@@ -98,4 +98,50 @@ fn c2_messages_decode_typed() {
                 && sample.cached_input == Some(1)
                 && sample.total == Some(5)
     ));
+}
+
+/// C2 A1 tolerance: vendor usage and cost objects ignore fields VIA does
+/// not keep.
+#[test]
+fn usage_and_cost_ignore_unknown_vendor_fields() {
+    let terminal = decode(
+        r#"{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"","stop_reason":"end_turn","usage":{"total":2,"cache_write":7},"cost":{"usd":0.5,"scope":"turn","currency":"USD"}}"#,
+    )
+    .unwrap();
+    let FakeMessage::Terminal { details, .. } = terminal else {
+        panic!("expected a terminal");
+    };
+    assert_eq!(details.usage.as_ref().unwrap().total, Some(2));
+    assert_eq!(details.cost.as_ref().unwrap().scope, "turn");
+}
+
+/// C2 §2: a known payload over 256 KiB encoded fails protocol, except the
+/// terminal's final text, which the adapter splits into pieces, and a
+/// `text` message's text, which is not kept.
+#[test]
+fn known_payloads_over_256_kib_fail_protocol_except_final_text() {
+    let feature = "f".repeat(1000);
+    let features: Vec<&str> = (0..300).map(|_| feature.as_str()).collect();
+    let hello = serde_json::json!({"type":"hello","features":features}).to_string();
+    assert_eq!(refused(&hello), Some("fake known payload exceeds 256 KiB"));
+    let schema = format!(
+        r#"{{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"","stop_reason":"end_turn","structured_output":{{"x":"{}"}}}}"#,
+        "s".repeat(300 * 1024)
+    );
+    assert_eq!(refused(&schema), Some("fake known payload exceeds 256 KiB"));
+    let text = format!(
+        r#"{{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"{}","stop_reason":"end_turn"}}"#,
+        "t".repeat(300 * 1024)
+    );
+    assert!(matches!(decode(&text), Ok(FakeMessage::Terminal { .. })));
+    let model = format!(
+        r#"{{"type":"text","vendor_turn_id":"fake-turn-1","text":"{}"}}"#,
+        "é".repeat(140_000)
+    );
+    assert!(matches!(decode(&model), Ok(FakeMessage::Text { .. })));
+    let tool = format!(
+        r#"{{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"shell","text":"{}"}}"#,
+        "t".repeat(300 * 1024)
+    );
+    assert_eq!(refused(&tool), Some("fake known payload exceeds 256 KiB"));
 }

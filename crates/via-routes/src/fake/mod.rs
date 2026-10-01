@@ -4,13 +4,16 @@
 use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use serde_json::value::RawValue;
 
-use crate::{OutboundMessage, RouteError, SHORT_FIELD_MAX, TurnNumber, UNKNOWN_TAG_MAX};
+use crate::{
+    MAX_OBSERVATION_BYTES, OutboundMessage, RouteError, SHORT_FIELD_MAX, TurnNumber,
+    UNKNOWN_TAG_MAX,
+};
 
 mod runtime;
 
 pub use runtime::{
-    FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane, SteerRefused, SteerRequest,
-    TurnCause, TurnFailure,
+    CONTROL_BYTES, CONTROL_COMMANDS, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane,
+    Retirement, SteerRefused, SteerRequest, SteerSender, TurnCause, TurnFailure, steer_lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it
@@ -19,6 +22,9 @@ pub struct TurnStart {
     session_id: String,
     turn: TurnNumber,
     prompt: String,
+    /// The C2 lane's effective values, written before the prompt; empty on
+    /// the legacy lane.
+    values: serde_json::Map<String, serde_json::Value>,
 }
 
 impl TurnStart {
@@ -31,7 +37,23 @@ impl TurnStart {
             session_id,
             turn,
             prompt,
+            values: serde_json::Map::new(),
         })
+    }
+
+    /// The C2 lane's start (adapter design §3.2): the effective values the
+    /// vendor must apply, each a top-level member written before the
+    /// prompt. A reserved member name is refused.
+    pub fn with_values(
+        mut self,
+        values: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, &'static str> {
+        const RESERVED: [&str; 5] = ["type", "id", "session_id", "turn", "prompt"];
+        if values.keys().any(|key| RESERVED.contains(&key.as_str())) {
+            return Err("a fake start value cannot replace a start member");
+        }
+        self.values = values;
+        Ok(self)
     }
 
     /// Returns the vendor session identifier used across fake child processes.
@@ -46,16 +68,26 @@ impl TurnStart {
 
     /// The start as Wire writes it, one JSON line:
     /// `{"type":"start","id":1,"session_id":…,"turn":…,"prompt":"…"}`, the
-    /// prompt escaped slice by slice.
+    /// prompt escaped slice by slice; the C2 lane's values come before the
+    /// prompt.
     pub fn into_message(self) -> Result<OutboundMessage, RouteError> {
-        let session_id =
-            serde_json::to_string(&self.session_id).map_err(|_| RouteError::Protocol {
-                turn: self.turn,
-                detail: "cannot encode fake start",
-            })?;
+        let unencodable = || RouteError::Protocol {
+            turn: self.turn,
+            detail: "cannot encode fake start",
+        };
+        let session_id = serde_json::to_string(&self.session_id).map_err(|_| unencodable())?;
+        let mut values = String::new();
+        for (key, value) in &self.values {
+            let key = serde_json::to_string(key).map_err(|_| unencodable())?;
+            let value = serde_json::to_string(value).map_err(|_| unencodable())?;
+            values.push_str(&key);
+            values.push(':');
+            values.push_str(&value);
+            values.push(',');
+        }
         Ok(OutboundMessage::Start {
             prefix: format!(
-                r#"{{"type":"start","id":1,"session_id":{session_id},"turn":{},"prompt":""#,
+                r#"{{"type":"start","id":1,"session_id":{session_id},"turn":{},{values}"prompt":""#,
                 self.turn.get()
             )
             .into_bytes(),
@@ -64,6 +96,18 @@ impl TurnStart {
             escape: escape_json,
         })
     }
+}
+
+/// The bytes `text` encodes to inside a JSON string, quotes excluded, as
+/// `serde_json` escapes it.
+pub(crate) fn escaped_text_len(text: &str) -> usize {
+    text.chars()
+        .map(|character| match character {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            '\0'..='\u{1f}' => 6,
+            _ => character.len_utf8(),
+        })
+        .sum()
 }
 
 /// Appends `slice` as the contents of a JSON string, escaped as `serde_json`
@@ -123,9 +167,9 @@ pub enum FakeDenialKind {
     Other,
 }
 
-/// A usage sample's components (adapter design AD6).
+/// A usage sample's components (adapter design AD6). Members VIA does not
+/// keep are ignored (C2 A1 tolerance).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct FakeUsage {
     /// The sample key, if any: a keyed sample supersedes an earlier one.
     #[serde(default)]
@@ -147,9 +191,9 @@ pub struct FakeUsage {
     pub total: Option<u64>,
 }
 
-/// A vendor-reported cost.
+/// A vendor-reported cost. Members VIA does not keep are ignored (C2 A1
+/// tolerance).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct FakeCost {
     /// US dollars.
     pub usd: f64,
@@ -185,6 +229,9 @@ pub struct Handshake {
     pub vendor_version: Option<String>,
     /// The features it reports.
     pub features: Vec<String>,
+    /// The efforts its model catalog accepts, when it reports them (AD18):
+    /// a turn effort outside them is `invalid_params(effort)`.
+    pub efforts: Option<Vec<String>>,
 }
 
 /// C2 §2: the terminal's bounded vendor data is at most 16 KiB.
@@ -383,6 +430,20 @@ struct HelloFields {
     vendor_version: Option<String>,
     #[serde(default)]
     features: Vec<String>,
+    #[serde(default)]
+    efforts: Option<Vec<String>>,
+}
+
+/// The text a known message carries outside its observation payload,
+/// borrowed raw: a terminal's final text, which the adapter splits, and a
+/// `text` message's text, which is not kept. Both are exempt from the
+/// known-payload cap (C2 §2).
+#[derive(Deserialize)]
+struct ExemptRaw<'a> {
+    #[serde(borrow, default)]
+    final_text: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    text: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -472,6 +533,9 @@ impl FakeMessage {
         })?;
         let tag: Tag = known(input, turn)?;
         short(&[&tag.kind], turn)?;
+        if input.len() > MAX_OBSERVATION_BYTES && is_known(&tag.kind) {
+            known_payload_cap(input, &tag.kind, turn)?;
+        }
         let message = match tag.kind.as_str() {
             "accepted" => {
                 let fields: AcceptedFields = known(input, turn)?;
@@ -591,11 +655,13 @@ impl FakeMessage {
             "hello" => {
                 let fields: HelloFields = known(input, turn)?;
                 let mut kept: Vec<&str> = fields.features.iter().map(String::as_str).collect();
+                kept.extend(fields.efforts.iter().flatten().map(String::as_str));
                 kept.push(fields.vendor_version.as_deref().unwrap_or_default());
                 short(&kept, turn)?;
                 Self::Hello(Handshake {
                     vendor_version: fields.vendor_version,
                     features: fields.features,
+                    efforts: fields.efforts,
                 })
             }
             "identity" => {
@@ -734,6 +800,45 @@ impl FakeMessage {
 
 fn protocol(turn: TurnNumber, detail: &'static str) -> RouteError {
     RouteError::Protocol { turn, detail }
+}
+
+/// A type tag [`FakeMessage::decode`] decodes as a known message.
+fn is_known(kind: &str) -> bool {
+    matches!(
+        kind,
+        "accepted"
+            | "text"
+            | "terminal"
+            | "tool_started"
+            | "tool_ended"
+            | "usage"
+            | "interrupt_ack"
+            | "steer_delivered"
+            | "hello"
+            | "identity"
+            | "denial"
+            | "decline"
+            | "vendor_closed"
+    )
+}
+
+/// C2 §2: a known payload over 256 KiB encoded fails protocol. A
+/// terminal's final text does not count, as the adapter splits it into
+/// `final_text` pieces, nor does a `text` message's text, which the `model`
+/// mark does not keep.
+fn known_payload_cap(input: &[u8], kind: &str, turn: TurnNumber) -> Result<(), RouteError> {
+    let raw: ExemptRaw<'_> = serde_json::from_slice(input)
+        .map_err(|_| protocol(turn, "malformed known fake message"))?;
+    let field = match kind {
+        "terminal" => raw.final_text,
+        "text" => raw.text,
+        _ => None,
+    };
+    let exempt = field.map_or(0, |value| value.get().len());
+    if input.len().saturating_sub(exempt) > MAX_OBSERVATION_BYTES {
+        return Err(protocol(turn, "fake known payload exceeds 256 KiB"));
+    }
+    Ok(())
 }
 
 /// The steer request's connection-local ID; the start is 1 and the

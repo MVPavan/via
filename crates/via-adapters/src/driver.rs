@@ -7,25 +7,31 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::fake::FakeAdapter;
 use crate::observation::{ObservationSink, SteerDelivery, TurnEnd, TurnError};
 use crate::plan::{Bound, Inherit, VendorOptions};
 use crate::{
-    CapacityToken, Cleanup, Deadline, DriverHealth, SessionId, StopWatch, TurnActivity, TurnNumber,
+    CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
+    StopWatch, TurnActivity, TurnNumber, VendorTurnId,
 };
-use via_routes::{FakeRoute, SteerRefused, SteerRequest};
+use via_routes::{FakeRoute, Retirement, SteerRefused, SteerSender, WireCleanup};
 
 /// The daemon force: `None` until raised, then the instant it was raised.
 pub type ForceWatch = watch::Receiver<Option<tokio::time::Instant>>;
 
 /// A session's context, attached at `open_session` or `recover` (C2 §2).
-/// The fake driver spawns no task of its own, so it takes no task tracker
-/// or cancellation token yet.
 pub struct SessionCx {
     /// The session's observation channel: session-level and turn items.
     pub observations: ObservationSink,
+    /// Owns every task the driver starts: a turn's route work and its
+    /// process retirement, and the session's idle source.
+    pub tracker: TaskTracker,
+    /// The session's cancellation: it stops the driver's owned work.
+    pub cancel: CancellationToken,
 }
 
 /// What `open_session` needs of a session (C2 §2 `SessionSpec`).
@@ -109,6 +115,8 @@ pub struct TurnCx {
 pub struct SteerInput {
     /// The text.
     pub text: String,
+    /// The vendor turn the caller means; another running turn refuses it.
+    pub expected_vendor_turn: Option<VendorTurnId>,
 }
 
 /// Why steer input was not delivered.
@@ -118,8 +126,10 @@ pub enum SteerError {
     Unsupported,
     /// No turn is accepted and running.
     NoActiveTurn,
-    /// Another steer is still being delivered.
-    Busy,
+    /// The input names another vendor turn than the running one.
+    TurnMismatch,
+    /// The control lane's eight commands or 64 KiB are taken (C2 §2).
+    OverCapacity,
     /// The input was not written whole.
     NotDelivered,
 }
@@ -136,7 +146,7 @@ pub enum CloseMode {
 /// A session close's passive report (C2 §2 `CloseReport`).
 #[derive(Debug)]
 pub struct CloseReport {
-    /// The vendor session was closed.
+    /// The vendor reported that it closed the session.
     pub vendor_closed: bool,
     /// The connection's process exit, when this close stopped one.
     pub process_exit: Option<via_routes::ExitReport>,
@@ -167,16 +177,42 @@ pub enum Recovery {
 /// The driver's mutable state; never locked across an await.
 #[derive(Default)]
 pub(crate) struct DriverState {
-    /// The persistent profile's slot, held between turns (decision H1).
+    /// The persistent profile's committed slot, held between turns
+    /// (decision H1).
     pub(crate) capacity: Option<CapacityToken>,
-    /// The persistent connection is live.
+    /// The persistent connection is live and pinnable.
     pub(crate) live: bool,
     /// The connection generation; each new connection advances it.
     pub(crate) generation: u64,
-    /// The running turn's steer lane.
-    pub(crate) steer: Option<mpsc::Sender<SteerRequest>>,
+    /// The running turn, until its logical end.
+    pub(crate) active: Option<Active>,
+    /// Set once the last turn's process was retired.
+    pub(crate) retiring: Option<watch::Receiver<bool>>,
+    /// The last turn's retirement facts.
+    pub(crate) retirement: Option<Retirement>,
+    /// The session's confirmed vendor session ID, which every later
+    /// identity must match (C2 §2 Reopen).
+    pub(crate) identity: Option<String>,
+    /// The vendor reported that it closed the session.
+    pub(crate) vendor_closed: bool,
     /// The session was closed.
     pub(crate) closed: bool,
+}
+
+/// The running turn's driver-side lanes.
+pub(crate) struct Active {
+    /// The turn.
+    pub(crate) turn: TurnNumber,
+    /// Its steer lane.
+    pub(crate) steer: SteerSender,
+    /// Its driver-side stop order: a session close.
+    pub(crate) close: watch::Sender<Option<StopOrder>>,
+}
+
+/// Locks the driver's state. No code panics while holding the lock; a
+/// poisoned state is still the last consistent one.
+pub(crate) fn lock(state: &Mutex<DriverState>) -> MutexGuard<'_, DriverState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One session's driver (C2 §2).
@@ -186,8 +222,11 @@ pub struct SessionDriver {
     pub(crate) adapter: Option<Arc<FakeAdapter>>,
     pub(crate) spec: SessionSpec,
     pub(crate) observations: ObservationSink,
-    health: watch::Sender<DriverHealth>,
-    state: Mutex<DriverState>,
+    pub(crate) tracker: TaskTracker,
+    /// The session's cancellation, also cancelled by this driver's close.
+    pub(crate) cancel: CancellationToken,
+    health: Arc<watch::Sender<DriverHealth>>,
+    pub(crate) state: Arc<Mutex<DriverState>>,
 }
 
 impl SessionDriver {
@@ -197,20 +236,24 @@ impl SessionDriver {
         spec: SessionSpec,
         cx: SessionCx,
     ) -> Self {
+        let state = DriverState {
+            identity: spec.confirmed_vendor_session_id.clone(),
+            ..DriverState::default()
+        };
         Self {
             route,
             adapter,
             spec,
             observations: cx.observations,
-            health: watch::Sender::new(DriverHealth::Open),
-            state: Mutex::new(DriverState::default()),
+            tracker: cx.tracker,
+            cancel: cx.cancel.child_token(),
+            health: Arc::new(watch::Sender::new(DriverHealth::Open)),
+            state: Arc::new(Mutex::new(state)),
         }
     }
 
     pub(crate) fn state(&self) -> MutexGuard<'_, DriverState> {
-        // No code panics while holding the lock; a poisoned state is still
-        // the last consistent one.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     fn persistent(&self) -> bool {
@@ -241,107 +284,271 @@ impl SessionDriver {
     }
 
     /// Takes the turn's connection: a pin must name the live generation
-    /// (AD16 rule 4), and a new connection advances the generation. On the
-    /// persistent profile the slot stays with the driver; otherwise it goes
-    /// to Host with the process, which is returned.
+    /// (AD16 rule 4), and a new connection advances the generation and
+    /// replaces any earlier one. On the persistent profile the slot stays
+    /// with the turn's [`Reservation`] until its handshake succeeded;
+    /// otherwise it goes to Host with the process, and is returned.
     pub(crate) fn connect(
         &self,
         prepared: Prepared,
         capacity: Option<CapacityToken>,
-    ) -> Result<(u64, Option<CapacityToken>), TurnError> {
+    ) -> Result<(u64, Option<CapacityToken>, Reservation), TurnError> {
         let persistent = self.persistent();
         let mut state = self.state();
         if state.closed {
             return Err(TurnError::Rejected(crate::StartRejected::SessionGone));
         }
+        let reservation = |generation, slot| Reservation {
+            state: Arc::clone(&self.state),
+            generation,
+            slot,
+            persistent,
+            committed: false,
+        };
         match prepared {
             Prepared::Pinned(pin)
                 if persistent && state.live && pin.generation == state.generation =>
             {
-                Ok((state.generation, None))
+                Ok((state.generation, None, reservation(state.generation, None)))
             }
             // The pinned connection died before submission: nothing sent.
             Prepared::Pinned(_) => Err(TurnError::Rejected(crate::StartRejected::SessionGone)),
             Prepared::NeedsConnection => {
                 state.generation += 1;
+                state.live = false;
+                state.vendor_closed = false;
+                let generation = state.generation;
+                // A new connection replaces the earlier one, whose slot goes.
+                let replaced = state.capacity.take();
+                drop(state);
+                drop(replaced);
                 if persistent {
-                    state.capacity = capacity;
-                    state.live = true;
-                    Ok((state.generation, None))
+                    Ok((generation, None, reservation(generation, capacity)))
                 } else {
-                    Ok((state.generation, capacity))
+                    Ok((generation, capacity, reservation(generation, None)))
                 }
             }
         }
     }
 
-    /// The persistent connection is gone: its slot is released.
-    pub(crate) fn disconnect(&self) {
-        let mut state = self.state();
-        state.live = false;
-        state.capacity = None;
+    /// The connection of `generation` is gone: its slot is released and
+    /// nothing pins it.
+    pub(crate) fn disconnect(&self, generation: u64) {
+        let released = {
+            let mut state = self.state();
+            if state.generation != generation {
+                return;
+            }
+            state.live = false;
+            state.capacity.take()
+        };
+        drop(released);
     }
 
-    /// Delivers steer input into the running turn (C2 §2).
-    pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
-        let supported = self.adapter.as_ref().is_some_and(|adapter| {
-            !matches!(
-                adapter.profile().capabilities.verbs.steer,
-                crate::Support::Unsupported { .. }
-            )
+    /// Latches the first failure (C2 §2 sticky health); later failures and
+    /// a closed driver keep what they find.
+    pub(crate) fn fail(&self, cause: DriverFailure) {
+        self.health.send_if_modified(|health| {
+            if matches!(health, DriverHealth::Open) {
+                *health = DriverHealth::Failed { first_cause: cause };
+                true
+            } else {
+                false
+            }
         });
-        if !supported {
-            return Err(SteerError::Unsupported);
-        }
-        let Some(lane) = self.state().steer.clone() else {
+    }
+
+    /// Delivers steer input into the running turn (C2 §2): admitted at
+    /// once or refused; delivered once written and reported by the vendor.
+    pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
+        let delivery = match self
+            .adapter
+            .as_ref()
+            .map(|adapter| &adapter.profile().capabilities.verbs.steer)
+        {
+            Some(crate::Support::Native) => SteerDelivery::Injected,
+            Some(crate::Support::Partial { semantics }) => {
+                SteerDelivery::Partial(semantics.clone())
+            }
+            Some(crate::Support::Unsupported { .. }) | None => return Err(SteerError::Unsupported),
+        };
+        let lane = self
+            .state()
+            .active
+            .as_ref()
+            .map(|active| active.steer.clone());
+        let Some(lane) = lane else {
             return Err(SteerError::NoActiveTurn);
         };
-        let (reply, answer) = oneshot::channel();
-        let request = SteerRequest {
-            text: input.text,
-            reply,
-        };
-        match lane.try_send(request) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => return Err(SteerError::Busy),
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(SteerError::NoActiveTurn),
-        }
+        let expected = input
+            .expected_vendor_turn
+            .map(|turn| turn.as_str().to_owned());
+        let answer = lane.send(input.text, expected).map_err(steer_error)?;
         match answer.await {
-            Ok(Ok(())) => Ok(SteerDelivery::Injected),
-            Ok(Err(SteerRefused::NotWritten)) => Err(SteerError::NotDelivered),
-            // Not accepted yet, or the turn ended first.
-            Ok(Err(SteerRefused::NotActive)) | Err(_) => Err(SteerError::NoActiveTurn),
+            Ok(Ok(())) => Ok(delivery),
+            Ok(Err(refused)) => Err(steer_error(refused)),
+            // The turn ended first.
+            Err(_) => Err(SteerError::NoActiveTurn),
         }
     }
 
-    /// Closes the session (C2 §2). The fake has no connection between its
-    /// turns' processes: the persistent profile's held slot is released,
-    /// its idle retirement.
+    /// Closes the session (C2 §2). A running turn is stopped through its
+    /// own stop path: the soft stop, then the force rule at the midpoint
+    /// of `deadline` (at once for `Force`), under `deadline`. The report
+    /// waits, within `deadline`, for the last process's retirement and
+    /// carries only what was established: the vendor's own close, the exit
+    /// this close caused and the retirement's cleanup. The persistent
+    /// profile's slot is released after it.
     pub fn close(
         &self,
-        _mode: CloseMode,
-        _deadline: Deadline,
+        mode: CloseMode,
+        deadline: Deadline,
     ) -> impl Future<Output = CloseReport> + Send + use<> {
-        {
+        let (stop, retiring) = {
             let mut state = self.state();
             state.closed = true;
-            state.live = false;
-            state.capacity = None;
-            state.steer = None;
+            let stop = state.active.take().map(|active| active.close);
+            (stop, state.retiring.clone())
+        };
+        let state = Arc::clone(&self.state);
+        let health = Arc::clone(&self.health);
+        let cancel = self.cancel.clone();
+        async move {
+            let stopped = stop.is_some();
+            if let Some(stop) = stop {
+                let now = tokio::time::Instant::now();
+                let force_at = match mode {
+                    CloseMode::Graceful => {
+                        now + deadline.instant().saturating_duration_since(now) / 2
+                    }
+                    CloseMode::Force => now,
+                };
+                stop.send_replace(Some(StopOrder {
+                    cause: StopCause::Close,
+                    // Route acts only on the times; Core never sees this order.
+                    requested_at: String::new(),
+                    force_at: Deadline::at(force_at),
+                    close_by: deadline,
+                }));
+            }
+            let settled = match retiring {
+                Some(mut retiring) => matches!(
+                    tokio::time::timeout_at(deadline.instant(), retiring.wait_for(|done| *done))
+                        .await,
+                    Ok(Ok(_))
+                ),
+                // No turn ever ran: nothing to clean up.
+                None => true,
+            };
+            // The driver's own idle work ends with the session.
+            cancel.cancel();
+            let (released, retirement, vendor_closed) = {
+                let mut state = lock(&state);
+                state.live = false;
+                (state.capacity.take(), state.retirement, state.vendor_closed)
+            };
+            drop(released);
+            health.send_replace(DriverHealth::Closed);
+            let quiescent = match retirement {
+                Some(retirement) => {
+                    !retirement.launched || retirement.cleanup == Some(WireCleanup::Quiescent)
+                }
+                None => true,
+            };
+            CloseReport {
+                vendor_closed,
+                process_exit: retirement
+                    .filter(|_| stopped && settled)
+                    .and_then(|retirement| retirement.exit),
+                cleanup: if settled && quiescent {
+                    Cleanup::Quiescent
+                } else {
+                    Cleanup::Uncertain
+                },
+                warnings: Vec::new(),
+                leftovers: None,
+            }
         }
-        self.health.send_replace(DriverHealth::Closed);
-        std::future::ready(CloseReport {
-            vendor_closed: true,
-            process_exit: None,
-            cleanup: Cleanup::Quiescent,
-            warnings: Vec::new(),
-            leftovers: None,
-        })
     }
 
     /// The sticky health lane.
     pub fn health(&self) -> watch::Receiver<DriverHealth> {
         self.health.subscribe()
+    }
+}
+
+/// Route's refusal as the driver reports it.
+fn steer_error(refused: SteerRefused) -> SteerError {
+    match refused {
+        SteerRefused::NotActive => SteerError::NoActiveTurn,
+        SteerRefused::NotWritten => SteerError::NotDelivered,
+        SteerRefused::TurnMismatch => SteerError::TurnMismatch,
+        SteerRefused::OverCapacity => SteerError::OverCapacity,
+    }
+}
+
+/// One turn's hold on its connection (AD16), owned by the turn's task: the
+/// persistent profile's slot and pin are committed only once the logical
+/// turn kept its server. Dropped uncommitted, on any failure, a dropped
+/// task or an unwind, it invalidates the generation and releases the slot
+/// then, after the cleanup that ran before it.
+pub(crate) struct Reservation {
+    state: Arc<Mutex<DriverState>>,
+    generation: u64,
+    slot: Option<CapacityToken>,
+    persistent: bool,
+    committed: bool,
+}
+
+impl Reservation {
+    /// The logical turn kept its server: the slot and the pin are the
+    /// session's, unless it closed or was cancelled meanwhile.
+    pub(crate) fn commit(&mut self, cancelled: bool) {
+        if !self.persistent || cancelled {
+            return;
+        }
+        let mut state = lock(&self.state);
+        if state.closed || state.generation != self.generation {
+            return;
+        }
+        if let Some(slot) = self.slot.take() {
+            state.capacity = Some(slot);
+        }
+        state.live = true;
+        self.committed = true;
+    }
+
+    /// The logical turn ended its connection: the generation is invalid
+    /// and the slot released now, its cleanup already done.
+    pub(crate) fn release(&mut self) {
+        self.invalidate();
+    }
+
+    fn invalidate(&mut self) {
+        let released = {
+            let mut state = lock(&self.state);
+            if state.generation == self.generation {
+                state.live = false;
+                state.capacity.take()
+            } else {
+                None
+            }
+        };
+        drop(released);
+        self.slot = None;
+    }
+
+    /// Records the turn's process retirement for a later close.
+    pub(crate) fn retired(&self, retirement: Retirement) {
+        lock(&self.state).retirement = Some(retirement);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.invalidate();
+        }
     }
 }
 

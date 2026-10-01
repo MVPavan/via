@@ -65,6 +65,11 @@ impl FakeAdapter {
         })
     }
 
+    /// The scenario's synchronization directory.
+    pub(crate) fn sync_dir(&self) -> &std::path::Path {
+        self.fixture.sync_dir()
+    }
+
     /// The bundled catalog.
     pub(crate) fn catalog(&self) -> &[CatalogModel] {
         &self.fixture.profile.models

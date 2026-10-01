@@ -1,17 +1,24 @@
 //! The fake's driver turn (C2 §2, §4, §4.1; adapter design AD3–AD9):
-//! launches the turn's process through the C2 route lane, normalizes each
-//! decoded message into session observations in decode order, and builds
-//! the turn's one `TurnEnd`.
+//! launches the turn's process through the C2 route lane on a task the
+//! session's tracker owns, normalizes each decoded message into session
+//! observations in decode order, and builds the turn's one `TurnEnd`.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use serde_json::{Map, Value};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
-use super::FakeAdapter;
-use crate::driver::{SessionDriver, TurnCx, TurnSpec, rejected};
+use super::{FakeAdapter, FakeProfile};
+use crate::driver::{
+    Active, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx, TurnSpec, lock,
+    rejected,
+};
 use crate::harness::Harness;
 use crate::observation::{
     Acceptance, ClassHint, CostReport, Decline, Denial, DenialKind, Identity, InstanceReport,
@@ -21,13 +28,21 @@ use crate::observation::{
 use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
 use crate::{
-    AcceptanceToken, ProcessOwner, RouteError, StartRejected, VendorTerminalStatus, VendorTurnId,
+    AcceptanceToken, Deadline, DriverFailure, PrivateProcessSpec, ProcessOwner, RouteError,
+    StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus, VendorTurnId,
     final_text_pieces,
 };
 use via_routes::{
-    FakeClassHint, FakeDenialKind, FakeMessage, FakeTerminal, FakeTurn, FakeUsage, Lane,
+    FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
     RouteMessage, TerminalStatus, TurnCause, TurnFailure, TurnStart,
 };
+
+/// S1's cleanup allowance: the wall's one cutoff is this after the wall
+/// (C2 §4.1).
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
+
+/// How often the idle source looks for its scenario gate.
+const IDLE_POLL: Duration = Duration::from_millis(10);
 
 /// How the delivery after Route ended went.
 enum Rest {
@@ -44,25 +59,19 @@ type Delivery = Pin<Box<dyn Future<Output = Result<(), Undelivered>> + Send>>;
 
 /// Runs one submitted turn (C2 §4.1): per-turn values are checked before
 /// anything launches (AD18, C2 §7 item 13); then the turn's process runs
-/// through Route while each decoded message is delivered to the session
-/// channel. A delivery blocked for the stall bound drops the hop, so Route
-/// fails the turn `overflow`, keeping the decoded terminal (AD4).
+/// through Route on a tracker-owned task while each decoded message is
+/// delivered to the session channel. A delivery blocked for the stall bound
+/// drops the hop, so Route fails the turn `overflow`, keeping the decoded
+/// terminal (AD4). Dropping this future leaves the task, which owns the
+/// turn's cleanup and its connection's reservation, running.
 pub(crate) async fn run_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
-    spec: TurnSpec,
+    mut spec: TurnSpec,
     cx: TurnCx,
 ) -> TurnEnd {
-    let route = Harness::Fake.route();
-    let params = TurnParams {
-        effort: spec.effort.clone(),
-        bound: spec.bound.clone(),
-        output_schema: spec.output_schema.is_some(),
-        max_steps: spec.max_steps,
-        vendor: spec.vendor.clone(),
-    };
-    if let Some(refusal) = adapter.check_turn(route, &params).into_iter().next() {
-        return rejected(TurnError::Rejected(start_rejected(refusal)));
+    if let Some(refused) = refused_values(adapter, &spec) {
+        return refused;
     }
     let TurnCx {
         turn,
@@ -74,86 +83,490 @@ pub(crate) async fn run_turn(
         stop,
         force,
     } = cx;
-    let (generation, capacity) = match driver.connect(prepared, capacity) {
+    let first = matches!(prepared, Prepared::NeedsConnection);
+    let (generation, capacity, reservation) = match driver.connect(prepared, capacity) {
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
+    let (process, start) = match launch_inputs(driver, adapter, &mut spec, (turn, first), capacity)
+    {
+        Ok(inputs) => inputs,
+        Err(end) => return *end,
+    };
+    let profile = adapter.profile();
+    let persistent = profile.persistent;
+    let (steer, steer_lane) = via_routes::steer_lane();
+    let (close, close_rx) = watch::channel(None);
+    let (done, retiring) = watch::channel(false);
+    let identity = {
+        let mut state = driver.state();
+        state.active = Some(Active { turn, steer, close });
+        state.retiring = Some(retiring);
+        state.identity.clone()
+    };
+    // Route hands one message at a time: while it is full Route reads no
+    // further message.
+    let (hop, hop_rx) = mpsc::channel::<RouteMessage>(1);
+    let lane = Lane {
+        persistent,
+        handshake: profile.handshake.as_ref().map(|decl| decl.requires.clone()),
+        tool_grace,
+        steer: Some(steer_lane),
+        identity,
+        effort: spec.effort,
+    };
+    let (logical, logical_rx) = oneshot::channel();
+    driver.tracker.spawn(turn_task(TurnTask {
+        route: Arc::clone(&driver.route),
+        process,
+        start,
+        hop,
+        signals: (wall, force.clone(), stop),
+        close: close_rx,
+        cancel: driver.cancel.clone(),
+        lane,
+        logical,
+        reservation,
+        state: Arc::clone(&driver.state),
+        done,
+    }));
+    let mut normalizer = Normalizer {
+        generation,
+        state: Arc::clone(&driver.state),
+        steer: steer_delivery(profile),
+        vendor_closed: false,
+    };
+    let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
+    let (result, rest) = deliver_beside(
+        // A closed channel is the task ending without its turn, handled
+        // below as an owned-task failure.
+        async { logical_rx.await.ok() },
+        hop_rx,
+        &mut normalizer,
+        &driver.observations,
+        &activity,
+        (force, cutoff),
+    )
+    .await;
+    end_active(&driver.state, turn);
+    let Some(result) = result else {
+        // The task ended without its turn: it failed (C2 §2 health).
+        driver.fail(DriverFailure::OwnedTask);
+        return rejected(TurnError::TaskFailed);
+    };
+    report_mismatch(driver, &result, cutoff).await;
+    let end = turn_end(adapter, turn, result, &rest, persistent);
+    if let Some(cause) = health_failure(&end, &rest) {
+        driver.fail(cause);
+    }
+    if persistent {
+        after_persistent_turn(
+            driver,
+            adapter,
+            (turn, generation),
+            &end,
+            normalizer.vendor_closed,
+        );
+    }
+    end
+}
+
+/// AD18, C2 §7 item 13: a per-turn value the route refuses rejects the
+/// turn before anything launches.
+fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
+    let params = TurnParams {
+        effort: spec.effort.clone(),
+        bound: spec.bound.clone(),
+        output_schema: spec.output_schema.is_some(),
+        max_steps: spec.max_steps,
+        vendor: spec.vendor.clone(),
+    };
+    let refusal = adapter
+        .check_turn(Harness::Fake.route(), &params)
+        .into_iter()
+        .next()?;
+    Some(rejected(TurnError::Rejected(start_rejected(refusal))))
+}
+
+/// The turn's process and its C2 start. Per-turn profile: Host holds the
+/// slot for the group's life; the persistent profile's slot stays with the
+/// reservation (decision H1).
+fn launch_inputs(
+    driver: &SessionDriver,
+    adapter: &FakeAdapter,
+    spec: &mut TurnSpec,
+    (turn, first): (crate::TurnNumber, bool),
+    capacity: Option<crate::CapacityToken>,
+) -> Result<(PrivateProcessSpec, TurnStart), Box<TurnEnd>> {
     let session_id = driver.spec.session_id.clone();
     let owner = ProcessOwner {
         session_id: session_id.clone(),
         turn,
     };
     let Ok(mut process) = adapter.process_spec(owner, &driver.spec.cwd) else {
-        return rejected(TurnError::Unavailable);
+        return Err(Box::new(rejected(TurnError::Unavailable)));
     };
-    // Per-turn profile: Host holds the slot for the group's life. The
-    // persistent profile's slot stays with the driver (decision H1).
     process.capacity = capacity;
-    let Ok(start) = TurnStart::new(session_id.as_str().to_owned(), turn, spec.prompt) else {
-        return rejected(TurnError::Rejected(StartRejected::Protocol(
-            "the fake start cannot be built".to_owned(),
-        )));
+    let prompt = std::mem::take(&mut spec.prompt);
+    let start = start_values(driver, adapter.profile(), spec, first).and_then(|values| {
+        TurnStart::new(session_id.as_str().to_owned(), turn, prompt)?.with_values(values)
+    });
+    match start {
+        Ok(start) => Ok((process, start)),
+        Err(_) => Err(Box::new(rejected(TurnError::Rejected(
+            StartRejected::Protocol("the fake start cannot be built".to_owned()),
+        )))),
+    }
+}
+
+/// C2 §2 Reopen: a `resume_mismatch` failure is reported on the session
+/// channel by the wall's cutoff; one that cannot be is an overflow.
+async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Deadline) {
+    let Err(TurnFailure {
+        cause:
+            TurnCause::ResumeMismatch {
+                requested,
+                returned,
+                ..
+            },
+        ..
+    }) = &result.outcome
+    else {
+        return;
     };
-    let profile = adapter.profile();
-    let persistent = profile.persistent;
-    // Full: a second concurrent steer is refused `Busy`.
-    let (steer, steer_lane) = mpsc::channel(1);
-    driver.state().steer = Some(steer);
-    // Route hands one message at a time: while it is full Route reads no
-    // further message.
-    let (hop, hop_rx) = mpsc::channel::<RouteMessage>(1);
-    let lane = Lane {
-        persistent,
-        handshake: profile
-            .handshake
-            .as_ref()
-            .map(|handshake| handshake.requires.clone()),
-        tool_grace,
-        steer: Some(steer_lane),
+    let mismatch = ObservationItem {
+        at: tokio::time::Instant::now(),
+        vendor_turn: None,
+        observation: Observation::ResumeMismatch {
+            requested: requested.clone(),
+            returned: returned.clone(),
+        },
     };
-    let mut normalizer = Normalizer {
-        generation,
-        confirmed: driver.spec.confirmed_vendor_session_id.clone(),
-        vendor_closed: false,
-    };
-    let route_turn = driver
-        .route
-        .turn(process, start, hop, (wall, force.clone(), stop), lane);
-    let (result, rest) = deliver_beside(
-        route_turn,
-        hop_rx,
-        &mut normalizer,
-        &driver.observations,
-        &activity,
-        force,
+    let sent = tokio::time::timeout_at(
+        cutoff.instant(),
+        driver.observations.send(mismatch, event_stall()),
     )
     .await;
-    driver.state().steer = None;
-    let end = turn_end(adapter, turn, result, &rest, persistent);
-    let lost = matches!(
-        &end.outcome,
-        Err(TurnError::Route(TurnFailure {
-            cause: TurnCause::ServerLost { .. }
-                | TurnCause::Route(RouteError::TransportLost { .. }),
-            ..
-        }))
-    );
-    if persistent && (lost || normalizer.vendor_closed) {
-        driver.disconnect();
+    if !matches!(sent, Ok(Ok(()))) {
+        driver.fail(DriverFailure::ObservationOverflow);
     }
-    end
+}
+
+/// The persistent profile after a turn returned: a vendor close in the
+/// turn ends its connection, and the scenario's idle close starts now.
+fn after_persistent_turn(
+    driver: &SessionDriver,
+    adapter: &FakeAdapter,
+    (turn, generation): (crate::TurnNumber, u64),
+    end: &TurnEnd,
+    vendor_closed: bool,
+) {
+    if vendor_closed {
+        driver.state().vendor_closed = true;
+        driver.disconnect(generation);
+    }
+    if let Some(idle) = &adapter.profile().idle_close
+        && idle.after_turn == turn.get()
+        && end.outcome.is_ok()
+    {
+        driver.tracker.spawn(idle_source(
+            Arc::clone(&driver.state),
+            generation,
+            driver.observations.clone(),
+            (
+                adapter.sync_dir().join(format!("{}.release", idle.gate)),
+                idle.reason.clone(),
+            ),
+            driver.cancel.clone(),
+        ));
+    }
+}
+
+/// The C2 start's effective values (adapter design §3.2): the turn's own,
+/// which `check_turn` admitted, and on a connection generation's first
+/// turn the session's model and supported instructions.
+fn start_values(
+    driver: &SessionDriver,
+    profile: &FakeProfile,
+    spec: &TurnSpec,
+    first: bool,
+) -> Result<Map<String, Value>, &'static str> {
+    let unencodable = |_| "a fake start value cannot be encoded";
+    let mut values = Map::new();
+    if let Some(effort) = &spec.effort {
+        values.insert("effort".to_owned(), Value::from(effort.as_str()));
+    }
+    if let Some(bound) = &spec.bound {
+        values.insert(
+            "bound".to_owned(),
+            serde_json::to_value(bound).map_err(unencodable)?,
+        );
+    }
+    if let Some(schema) = &spec.output_schema {
+        values.insert(
+            "output_schema".to_owned(),
+            serde_json::from_str(schema.get()).map_err(unencodable)?,
+        );
+    }
+    if let Some(max_steps) = spec.max_steps {
+        values.insert("max_steps".to_owned(), Value::from(max_steps));
+    }
+    if first {
+        values.insert("model".to_owned(), Value::from(driver.spec.model.as_str()));
+        if let Some(instructions) = &driver.spec.instructions
+            && profile.capabilities.params.instructions.meets(true)
+        {
+            values.insert(
+                "instructions".to_owned(),
+                Value::from(instructions.as_str()),
+            );
+        }
+    }
+    Ok(values)
+}
+
+/// How the profile's steer support reports a delivery (C2 §2).
+fn steer_delivery(profile: &FakeProfile) -> SteerDelivery {
+    match &profile.capabilities.verbs.steer {
+        crate::Support::Partial { semantics } => SteerDelivery::Partial(semantics.clone()),
+        crate::Support::Native | crate::Support::Unsupported { .. } => SteerDelivery::Injected,
+    }
+}
+
+/// The running turn's steer lane and close order end with its logical
+/// turn; a later turn's are kept.
+fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
+    let mut state = lock(state);
+    if state
+        .active
+        .as_ref()
+        .is_some_and(|active| active.turn == turn)
+    {
+        state.active = None;
+    }
+}
+
+/// The first failure a turn latches in the health lane (C2 §2): protocol,
+/// transport loss or overflow.
+fn health_failure(end: &TurnEnd, rest: &Rest) -> Option<DriverFailure> {
+    let Err(TurnError::Route(failure)) = &end.outcome else {
+        return None;
+    };
+    match &failure.cause {
+        TurnCause::Route(RouteError::Overflow { .. }) if matches!(rest, Rest::Undelivered) => {
+            Some(DriverFailure::ObservationOverflow)
+        }
+        TurnCause::Route(
+            cause @ (RouteError::Protocol { .. }
+            | RouteError::TransportLost { .. }
+            | RouteError::Overflow { .. }),
+        ) => Some(DriverFailure::Route(cause.clone())),
+        TurnCause::Route(
+            RouteError::ProcessExited { .. }
+            | RouteError::Store { .. }
+            | RouteError::Stopped { .. }
+            | RouteError::Deadline { .. }
+            | RouteError::ForceStopped { .. },
+        )
+        | TurnCause::ServerLost { .. }
+        | TurnCause::HandshakeRefused { .. }
+        | TurnCause::InvalidParam { .. }
+        | TurnCause::ResumeMismatch { .. } => None,
+    }
+}
+
+/// One turn's route work, owned by the session's tracker.
+struct TurnTask {
+    route: Arc<FakeRoute>,
+    process: PrivateProcessSpec,
+    start: TurnStart,
+    hop: mpsc::Sender<RouteMessage>,
+    signals: (Deadline, ForceWatch, StopWatch),
+    close: watch::Receiver<Option<StopOrder>>,
+    cancel: CancellationToken,
+    lane: Lane,
+    logical: oneshot::Sender<FakeTurn>,
+    reservation: Reservation,
+    state: Arc<Mutex<DriverState>>,
+    done: watch::Sender<bool>,
+}
+
+/// Runs the turn through Route with Core's stop order merged with the
+/// driver's close and the session's cancellation. At the logical turn's
+/// end the reservation commits or releases, then the turn goes to
+/// `run_turn`; the process's retirement is recorded after it.
+async fn turn_task(task: TurnTask) {
+    let TurnTask {
+        route,
+        process,
+        start,
+        hop,
+        signals: (wall, force, core_stop),
+        close,
+        cancel,
+        lane,
+        logical,
+        mut reservation,
+        state,
+        done,
+    } = task;
+    let turn = start.turn();
+    let (merged, merged_rx) =
+        watch::channel(earliest(core_stop.borrow().clone(), close.borrow().clone()));
+    let (inner, inner_rx) = oneshot::channel();
+    let route_turn = route.turn(process, start, hop, (wall, force, merged_rx), lane, inner);
+    let relay = async {
+        let Ok(turn_result) = inner_rx.await else {
+            return;
+        };
+        if turn_result.server_kept {
+            reservation.commit(cancel.is_cancelled());
+        } else {
+            reservation.release();
+        }
+        end_active(&state, turn);
+        // `run_turn` was dropped: the retirement below is still owned here.
+        let _unread = logical.send(turn_result);
+    };
+    let retirement = tokio::select! {
+        (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
+        never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
+    };
+    reservation.retired(retirement);
+    // An uncommitted slot is released only now, after the cleanup.
+    drop(reservation);
+    done.send_replace(true);
+}
+
+/// Keeps `merged` at the earliest of Core's stop order, the driver's close
+/// order and, once the session is cancelled, an immediate close. Never
+/// returns.
+async fn merge_stops(
+    mut core: StopWatch,
+    mut close: watch::Receiver<Option<StopOrder>>,
+    cancel: &CancellationToken,
+    merged: &watch::Sender<Option<StopOrder>>,
+) -> Infallible {
+    let (mut core_open, mut close_open, mut cancelled) = (true, true, false);
+    loop {
+        let mut order = earliest(
+            core.borrow_and_update().clone(),
+            close.borrow_and_update().clone(),
+        );
+        if cancelled {
+            let now = tokio::time::Instant::now();
+            order = earliest(
+                order,
+                Some(StopOrder {
+                    cause: StopCause::Close,
+                    // Route acts only on the times; Core never sees this order.
+                    requested_at: String::new(),
+                    force_at: Deadline::at(now),
+                    close_by: Deadline::at(now + CLEANUP_ALLOWANCE),
+                }),
+            );
+        }
+        merged.send_if_modified(|current| {
+            if same_order(current.as_ref(), order.as_ref()) {
+                false
+            } else {
+                *current = order;
+                true
+            }
+        });
+        tokio::select! {
+            changed = core.changed(), if core_open => core_open = changed.is_ok(),
+            changed = close.changed(), if close_open => close_open = changed.is_ok(),
+            () = cancel.cancelled(), if !cancelled => cancelled = true,
+            else => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// The order whose `force_at` comes first.
+fn earliest(first: Option<StopOrder>, second: Option<StopOrder>) -> Option<StopOrder> {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            Some(if second.force_at.instant() < first.force_at.instant() {
+                second
+            } else {
+                first
+            })
+        }
+        (first, None) => first,
+        (None, second) => second,
+    }
+}
+
+/// Whether two orders act the same: cause and times.
+fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            first.cause == second.cause
+                && first.force_at.instant() == second.force_at.instant()
+                && first.close_by.instant() == second.close_by.instant()
+        }
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+/// The persistent emulation's idle source (decision H1, C2 §4): once the
+/// scenario's gate `release` exists, the emulated server closes its idle
+/// session: the slot is released, the pin invalidated, and a session-level
+/// `VendorClosed` sent. Started only after the turn before it returned;
+/// a later connection or the session's cancellation ends it.
+async fn idle_source(
+    state: Arc<Mutex<DriverState>>,
+    generation: u64,
+    sink: ObservationSink,
+    (release, reason): (PathBuf, String),
+    cancel: CancellationToken,
+) {
+    loop {
+        // An unreadable sync directory reads as a gate still held.
+        if tokio::fs::try_exists(&release).await.unwrap_or(false) {
+            break;
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(IDLE_POLL) => {}
+        }
+    }
+    let released = {
+        let mut state = lock(&state);
+        if state.generation != generation || !state.live || state.closed {
+            return;
+        }
+        state.live = false;
+        state.vendor_closed = true;
+        state.capacity.take()
+    };
+    drop(released);
+    let closed = ObservationItem {
+        at: tokio::time::Instant::now(),
+        vendor_turn: None,
+        observation: Observation::VendorClosed(reason),
+    };
+    tokio::select! {
+        () = cancel.cancelled() => {}
+        // Core stalled or went away: the session-level item is lost with
+        // the session channel; the close itself is already in effect.
+        _undelivered = sink.send(closed, event_stall()) => {}
+    }
 }
 
 /// Polls `route` while delivering what it hands over, then delivers the
-/// rest: data deliverable at once still goes under the daemon force.
+/// rest by the wall's cutoff: data deliverable at once still goes under
+/// the daemon force.
 async fn deliver_beside(
-    route: impl Future<Output = FakeTurn>,
+    route: impl Future<Output = Option<FakeTurn>>,
     hop_rx: mpsc::Receiver<RouteMessage>,
     normalizer: &mut Normalizer,
     sink: &ObservationSink,
     activity: &crate::TurnActivity,
-    mut force: watch::Receiver<Option<tokio::time::Instant>>,
-) -> (FakeTurn, Rest) {
+    (mut force, cutoff): (ForceWatch, Deadline),
+) -> (Option<FakeTurn>, Rest) {
     tokio::pin!(route);
     let stall = event_stall();
     let mut hop_rx = Some(hop_rx);
@@ -206,9 +619,10 @@ async fn deliver_beside(
         }
         Rest::Delivered
     };
+    // One cutoff (C2 §4.1): no delivery outlives the wall plus 3 s.
     let rest = tokio::select! {
         biased;
-        rest = rest => rest,
+        rest = tokio::time::timeout_at(cutoff.instant(), rest) => rest.unwrap_or(Rest::Undelivered),
         () = forced(&mut force) => Rest::Forced,
     };
     (result, rest)
@@ -216,7 +630,8 @@ async fn deliver_beside(
 
 /// The turn's one result (C2 §4.1). A Route failure is the first cause;
 /// undelivered data fails a success `overflow`, and the daemon force that
-/// ended the delivery `force_stopped`; either keeps Route's evidence.
+/// ended the delivery `force_stopped`; either keeps Route's evidence. An
+/// effort the instance's catalog lacks is the definite rejection it is.
 fn turn_end(
     adapter: &FakeAdapter,
     number: crate::TurnNumber,
@@ -229,6 +644,7 @@ fn turn_end(
         handshake,
         acknowledged,
         outcome,
+        ..
     } = turn;
     let instance = handshake.map(|handshake| {
         let checked = adapter.profile().handshake.as_ref().is_some_and(|decl| {
@@ -247,6 +663,10 @@ fn turn_end(
         }
     });
     let outcome = match outcome {
+        Err(TurnFailure {
+            cause: TurnCause::InvalidParam { field, .. },
+            ..
+        }) => Err(TurnError::Rejected(StartRejected::InvalidParam { field })),
         Err(failure) => Err(TurnError::Route(failure)),
         Ok(result) => {
             let exit =
@@ -365,8 +785,10 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
 struct Normalizer {
     /// The connection generation, named in identity confirmations.
     generation: u64,
-    /// The session's confirmed vendor ID, which a new connection must match.
-    confirmed: Option<String>,
+    /// The driver's state, which keeps the confirmed identity.
+    state: Arc<Mutex<DriverState>>,
+    /// How a steer delivery is reported.
+    steer: SteerDelivery,
     /// The vendor closed its session in this turn.
     vendor_closed: bool,
 }
@@ -376,6 +798,8 @@ impl Normalizer {
     /// text pieces. Unknown messages, the handshake and the interrupt
     /// acknowledgement move only the activity clock.
     fn items(&mut self, message: RouteMessage, at: tokio::time::Instant) -> Vec<ObservationItem> {
+        // Route pairs every vendor turn ID with `fake-turn-N`, never empty:
+        // the conversion cannot fail.
         let item = |vendor_turn: Option<String>, observation| ObservationItem {
             at,
             vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
@@ -412,6 +836,7 @@ impl Normalizer {
                 let accepted = Acceptance {
                     // Route admits exactly one acceptance per turn.
                     correlation: AcceptanceToken::FIRST,
+                    // Paired with `fake-turn-N`: never empty.
                     vendor_turn_id: VendorTurnId::try_from(vendor_turn_id.clone()).ok(),
                 };
                 Some((Some(vendor_turn_id), Observation::Accepted(accepted)))
@@ -487,7 +912,7 @@ impl Normalizer {
             )),
             FakeMessage::SteerDelivered { vendor_turn_id } => Some((
                 Some(vendor_turn_id),
-                Observation::SteerDelivered(SteerDelivery::Injected),
+                Observation::SteerDelivered(self.steer.clone()),
             )),
             FakeMessage::VendorClosed { reason } => {
                 self.vendor_closed = true;
@@ -500,20 +925,16 @@ impl Normalizer {
         }
     }
 
-    /// C2 §2 "Reopen": an identity that differs from the session's
-    /// confirmed one is `resume.mismatch`, never a replacement.
+    /// C2 §2 "Reopen": Route fails a turn on an identity that differs from
+    /// the session's (`resume_mismatch`), so every one handed over confirms
+    /// it for this connection generation, and the session keeps it.
     fn identity(&self, vendor_session_id: String, transcript: Option<String>) -> Observation {
-        match &self.confirmed {
-            Some(requested) if *requested != vendor_session_id => Observation::ResumeMismatch {
-                requested: requested.clone(),
-                returned: vendor_session_id,
-            },
-            _ => Observation::IdentityConfirmed(Identity {
-                vendor_session_id,
-                connection_id: format!("fake-{}", self.generation),
-                transcript: transcript.map(PathBuf::from),
-            }),
-        }
+        lock(&self.state).identity = Some(vendor_session_id.clone());
+        Observation::IdentityConfirmed(Identity {
+            vendor_session_id,
+            connection_id: format!("fake-{}", self.generation),
+            transcript: transcript.map(PathBuf::from),
+        })
     }
 }
 

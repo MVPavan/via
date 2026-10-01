@@ -130,12 +130,12 @@ pub struct Decline {
 }
 
 /// How steer input reached the vendor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SteerDelivery {
     /// Injected into the active turn.
     Injected,
-    /// Delivered with the named partial semantics.
-    Partial(&'static str),
+    /// Delivered with the profile's declared partial semantics.
+    Partial(String),
 }
 
 /// A normalized stop reason (AD5).
@@ -313,6 +313,9 @@ pub enum TurnError {
     /// No adapter serves the session's harness in this daemon.
     #[error("the harness is not available in this daemon")]
     Unavailable,
+    /// The driver's task for the turn ended without its result.
+    #[error("the driver's turn task failed")]
+    TaskFailed,
 }
 
 /// One observation in the session channel with its share of the session's
@@ -382,52 +385,162 @@ impl ObservationSink {
     }
 }
 
-/// An item's cost against the byte budget: `512 + Σ(64 + len)` over its
-/// strings (Task 4 design §2.3).
+/// An item's cost against the byte budget: `512 + Σ(64 + len)` over every
+/// variable-size field it keeps (Task 4 design §2.3), saturating.
 fn item_cost(item: &ObservationItem) -> usize {
-    let mut strings: Vec<&str> = Vec::new();
+    let mut lengths: Vec<usize> = Vec::new();
     if let Some(vendor_turn) = &item.vendor_turn {
-        strings.push(vendor_turn.as_str());
+        lengths.push(vendor_turn.as_str().len());
     }
     match &item.observation {
-        Observation::Accepted(_) | Observation::SteerDelivered(_) => {}
+        Observation::Accepted(_) => {}
+        Observation::SteerDelivered(delivery) => match delivery {
+            SteerDelivery::Injected => {}
+            SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
+        },
         Observation::IdentityConfirmed(identity) => {
-            strings.push(&identity.vendor_session_id);
-            strings.push(&identity.connection_id);
+            lengths.push(identity.vendor_session_id.len());
+            lengths.push(identity.connection_id.len());
+            if let Some(transcript) = &identity.transcript {
+                lengths.push(transcript.as_os_str().len());
+            }
         }
         Observation::Progress(marks) => {
             for (id, name) in &marks.tools_started {
-                strings.push(id);
-                strings.push(name);
+                lengths.push(id.len());
+                lengths.push(name.len());
             }
-            strings.extend(marks.tools_ended.iter().map(String::as_str));
+            lengths.extend(marks.tools_ended.iter().map(String::len));
             if let Some(key) = marks.usage.as_ref().and_then(|usage| usage.key.as_deref()) {
-                strings.push(key);
+                lengths.push(key.len());
             }
         }
-        Observation::FinalText(text) | Observation::VendorClosed(text) => strings.push(text),
+        Observation::FinalText(string) | Observation::VendorClosed(string) => {
+            lengths.push(string.len());
+        }
         Observation::ActionDenied(denial) => {
-            strings.push(&denial.target);
-            strings.push(&denial.reason);
+            lengths.push(denial.target.len());
+            lengths.push(denial.reason.len());
         }
         Observation::RequestDeclined(decline) => {
-            strings.push(&decline.vendor_method);
-            strings.push(&decline.summary);
+            lengths.push(decline.vendor_method.len());
+            lengths.push(decline.summary.len());
         }
-        Observation::Warning(warning) => strings.push(&warning.message),
+        Observation::Warning(warning) => {
+            lengths.push(warning.code.len());
+            lengths.push(warning.message.len());
+            if let Some(data) = &warning.data {
+                lengths.push(encoded_len(data));
+            }
+        }
         Observation::ResumeMismatch {
             requested,
             returned,
         } => {
-            strings.push(requested);
-            strings.push(returned);
+            lengths.push(requested.len());
+            lengths.push(returned.len());
         }
-        Observation::LateTerminal(terminal) => {
-            strings.push(&terminal.vendor_stop_reason);
+        Observation::LateTerminal(terminal) => terminal_lengths(terminal, &mut lengths),
+    }
+    lengths.iter().fold(512_usize, |cost, length| {
+        cost.saturating_add(length.saturating_add(64))
+    })
+}
+
+/// A late terminal's variable-size fields.
+fn terminal_lengths(terminal: &VendorTerminal, lengths: &mut Vec<usize>) {
+    let strings = [
+        Some(terminal.vendor_stop_reason.as_str()),
+        terminal.vendor_code.as_deref(),
+        terminal.detail.as_deref(),
+        terminal.structured_output.as_deref().map(RawValue::get),
+        terminal
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.key.as_deref()),
+        terminal.cost.as_ref().map(|cost| cost.scope.as_str()),
+        terminal.vendor.as_deref().map(RawValue::get),
+    ];
+    lengths.extend(strings.into_iter().flatten().map(str::len));
+}
+
+/// `value`'s encoded bytes, counted without keeping them.
+fn encoded_len(value: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
-    512 + strings
-        .iter()
-        .map(|string| 64 + string.len())
-        .sum::<usize>()
+    let mut count = Count(0);
+    // A `Value` always encodes; were it not to, what was counted stands.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Identity, Instant, Observation, ObservationItem, StopReason, VendorTerminal, item_cost,
+    };
+    use crate::VendorTerminalStatus;
+    use crate::plan::Warning;
+
+    fn cost(observation: Observation) -> usize {
+        item_cost(&ObservationItem {
+            at: Instant::now(),
+            vendor_turn: None,
+            observation,
+        })
+    }
+
+    /// The byte budget counts every retained variable-size field: the
+    /// identity's transcript path, warning data and the late terminal's
+    /// contents.
+    #[test]
+    fn item_cost_counts_every_retained_field() {
+        let identity = |transcript: Option<&str>| {
+            Observation::IdentityConfirmed(Identity {
+                vendor_session_id: "v".to_owned(),
+                connection_id: "c".to_owned(),
+                transcript: transcript.map(Into::into),
+            })
+        };
+        let path = "p".repeat(4096);
+        assert!(cost(identity(Some(&path))) >= cost(identity(None)) + 4096);
+
+        let warning = |data: Option<serde_json::Value>| {
+            Observation::Warning(Warning {
+                code: "w",
+                message: String::new(),
+                data,
+            })
+        };
+        let data = serde_json::json!({"categories": ["x".repeat(4096)]});
+        assert!(cost(warning(Some(data))) >= cost(warning(None)) + 4096);
+
+        let late = |big: &str| {
+            Observation::LateTerminal(VendorTerminal {
+                at: Instant::now(),
+                status: VendorTerminalStatus::Failed,
+                stop_reason: StopReason::Error,
+                vendor_stop_reason: "error".to_owned(),
+                vendor_code: Some(big.to_owned()),
+                class_hint: None,
+                detail: Some(big.to_owned()),
+                structured_output: Some(
+                    serde_json::value::to_raw_value(&serde_json::json!({ "x": big })).unwrap(),
+                ),
+                steps: None,
+                usage: None,
+                cost: None,
+                vendor: Some(serde_json::value::to_raw_value(&big).unwrap()),
+            })
+        };
+        assert!(cost(late(&"b".repeat(1024))) >= cost(late("")) + 4 * 1024);
+    }
 }

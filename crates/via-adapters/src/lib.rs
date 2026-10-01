@@ -135,6 +135,8 @@ pub enum DriverFailure {
     Route(RouteError),
     /// Normalized observations could not be drained within the bound.
     ObservationOverflow,
+    /// A task the driver owns ended without its result.
+    OwnedTask,
 }
 
 /// Driver health remains observable even when data observations are full.
@@ -182,6 +184,7 @@ pub use runtime::{
     AnchorRecovery, AnchorTurnRecovery, FakeRecovery, FakeShutdown, FakeTurnRecovery,
     OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink, observation_channel,
 };
+pub use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub use via_routes::{
     AnchorCohort, CapacityToken, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner,
     RuntimeConfig, RuntimeResources, SessionId, TurnCause, TurnFailure, WireCleanup,

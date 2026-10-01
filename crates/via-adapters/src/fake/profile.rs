@@ -38,6 +38,23 @@ pub(crate) struct FakeProfile {
     /// The instance's version handshake (AD7), when the profile has one.
     #[serde(default)]
     pub(crate) handshake: Option<HandshakeDecl>,
+    /// The persistent emulation's idle close, when the scenario has one.
+    #[serde(default)]
+    pub(crate) idle_close: Option<IdleCloseDecl>,
+}
+
+/// The persistent emulation's idle close (decision H1, C2 §4): after turn
+/// `after_turn` returned, once the scenario releases gate `gate`, the
+/// emulated server closes the idle session with `reason`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdleCloseDecl {
+    /// The turn after which the session goes idle.
+    pub(crate) after_turn: u32,
+    /// The sync-directory gate whose release closes it.
+    pub(crate) gate: String,
+    /// The vendor's reason.
+    pub(crate) reason: String,
 }
 
 /// A fake profile's handshake (AD7): the versions maintainers checked and
@@ -64,6 +81,7 @@ impl Default for FakeProfile {
             categories: BTreeMap::new(),
             persistent: false,
             handshake: None,
+            idle_close: None,
         }
     }
 }

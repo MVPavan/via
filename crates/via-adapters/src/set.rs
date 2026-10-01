@@ -43,6 +43,8 @@ impl AdapterSet {
         facts: &[AnchorRecovery],
         cx: SessionCx,
     ) -> impl Future<Output = Recovery> + Send + use<> {
+        // The fake never resumes: neither the session nor its context is
+        // used, and nothing is started.
         let _ = (session, cx);
         let recovery = if facts.is_empty() {
             Recovery::Unknown {
