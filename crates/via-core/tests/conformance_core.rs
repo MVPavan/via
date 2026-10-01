@@ -1,0 +1,1001 @@
+//! S-CORE chunk 4, Core halves (adapter design §7 S-CORE row): each case
+//! runs turns end to end through Core's public Engine, as daemon main
+//! drives it, over the real Store, Route, Wire and Host with the fake agent
+//! on scenario profiles (decisions H1, H2), and asserts the committed
+//! envelopes. The adapter halves are `conformance_driver.rs`. Each case
+//! re-executes this binary with its fake settings, which Core reads from
+//! the environment once at daemon start.
+#![expect(
+    clippy::unwrap_used,
+    reason = "test fixtures and assertions fail loudly"
+)]
+
+use std::{
+    env, fs,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use serde_json::{Value, json};
+use via_core::{
+    AdapterConfig, BootstrapEnv, CloseParams, Deadline, Engine, ResumeParams, SessionId,
+    SpawnParams, WaitParams,
+};
+
+const CHILD: &str = "VIA_CONFORMANCE_CORE_CHILD";
+const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/// Bound on one child case.
+const CHILD_LIMIT: Duration = Duration::from_secs(120);
+/// A wait for a turn expected to end by itself.
+const WAIT_MS: u64 = 60_000;
+
+/// A workspace test build's sibling binary.
+fn binary(name: &str) -> PathBuf {
+    let deps = env::current_exe().unwrap();
+    let path = deps.parent().unwrap().parent().unwrap().join(name);
+    assert!(
+        path.is_file(),
+        "missing {}; build the workspace first",
+        path.display()
+    );
+    path
+}
+
+/// In the parent, runs `name` again in a child whose fake deployment is
+/// `scenario`, with `env` set, and returns `None`; in that child, returns
+/// its root.
+fn child(name: &str, scenario: &Value, env: &[(&str, &str)]) -> Option<PathBuf> {
+    if let Some(root) = env::var_os(CHILD) {
+        return Some(PathBuf::from(root));
+    }
+    let root = tempfile::tempdir().unwrap();
+    for part in ["state", "runtime", "runtime/anchors", "sync", "points"] {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(part))
+            .unwrap();
+    }
+    let scenario_path = root.path().join("scenario.json");
+    fs::write(&scenario_path, scenario.to_string()).unwrap();
+    fs::set_permissions(&scenario_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, root.path())
+        .env("VIA_FAKE_AGENT_BINARY", binary("via-fake-agent"))
+        .env("VIA_FAKE_SCENARIO", &scenario_path)
+        .env("VIA_FAKE_SYNC_DIR", root.path().join("sync"));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut running = command.spawn().unwrap();
+    // A hung child is a failure, not a stuck suite.
+    let limit = Instant::now() + CHILD_LIMIT;
+    let status = loop {
+        if let Some(status) = running.try_wait().unwrap() {
+            break status;
+        }
+        let expired = Instant::now() >= limit;
+        if expired {
+            let _ = running.kill();
+            let _ = running.wait();
+        }
+        assert!(
+            !expired,
+            "{name} child did not finish within {CHILD_LIMIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{name} child failed: {status}");
+    None
+}
+
+/// Runs `body` on a current-thread runtime.
+fn run<F: Future<Output = ()>>(body: F) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(body);
+}
+
+/// One daemon's Engine, whose session dispatchers run as daemon main runs
+/// them: started from the Engine's start channel.
+struct Daemon {
+    engine: Arc<Engine>,
+    starter: tokio::task::JoinHandle<()>,
+    root: PathBuf,
+}
+
+impl Daemon {
+    fn open(root: &Path) -> Self {
+        let engine = Arc::new(
+            Engine::open(
+                &root.join("state"),
+                &root.join("runtime"),
+                AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
+                binary("via"),
+            )
+            .unwrap(),
+        );
+        let mut starts = engine.take_starts().unwrap();
+        let starting = Arc::clone(&engine);
+        let starter = tokio::spawn(async move {
+            while let Some(session) = starts.recv().await {
+                let engine = Arc::clone(&starting);
+                tokio::spawn(async move {
+                    let _ = engine.dispatcher(session).await;
+                });
+            }
+        });
+        Self {
+            engine,
+            starter,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Spawns a session whose first turn's prompt is `prompt`, with the
+    /// spawn members `extra`.
+    async fn spawn(&self, prompt: &str, extra: &Value) -> SessionId {
+        let mut raw = json!({"harness":"fake","model":"fake","prompt":prompt,"handle":HANDLE});
+        for (member, value) in extra.as_object().into_iter().flatten() {
+            raw[member] = value.clone();
+        }
+        let params: SpawnParams = serde_json::from_value(raw.clone()).unwrap();
+        let receipted = self.engine.spawn(params, &raw.to_string()).await.unwrap();
+        receipted.enqueued.unwrap().0
+    }
+
+    /// Queues turn `prompt` on `session`.
+    async fn resume(&self, session: &SessionId, prompt: &str) {
+        let raw = json!({"session":session,"handle":HANDLE,"prompt":prompt});
+        let params: ResumeParams = serde_json::from_value(raw.clone()).unwrap();
+        self.engine.resume(params, &raw.to_string()).await.unwrap();
+    }
+
+    /// The envelope of `session`'s turn `turn` once it is terminal.
+    async fn wait(&self, session: &SessionId, turn: u32) -> Value {
+        let params = WaitParams {
+            address: format!("{session}/{turn}"),
+            timeout_ms: Some(WAIT_MS),
+        };
+        let envelope = self.engine.wait(params).await.unwrap();
+        serde_json::from_str(envelope.get()).unwrap()
+    }
+
+    /// Closes `session` gracefully.
+    async fn close(&self, session: &SessionId) -> Value {
+        let raw = json!({"session":session,"handle":HANDLE});
+        let params: CloseParams = serde_json::from_value(raw.clone()).unwrap();
+        self.engine.close(params, &raw.to_string()).await.unwrap()
+    }
+
+    /// Releases the fake agent's gate `name`.
+    fn release(&self, name: &str) {
+        fs::write(self.root.join("sync").join(format!("{name}.release")), b"").unwrap();
+    }
+
+    /// Waits until the fake agent entered gate `name`.
+    async fn entered(&self, name: &str) {
+        let path = self.root.join("sync").join(format!("{name}.entered"));
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "gate {name} never entered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Final shutdown: every anchor is reconciled before the root goes.
+    async fn shutdown(self) {
+        let report = self
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        self.starter.abort();
+        assert!(report.is_clean(), "{report:?}");
+    }
+}
+
+fn vendor_turn(turn: u32) -> String {
+    format!("fake-turn-{turn}")
+}
+
+fn emit(message: &Value) -> Value {
+    json!({"action":"emit","message":message})
+}
+
+fn accepted(turn: u32) -> Value {
+    emit(&json!({"type":"accepted","id":1,"vendor_turn_id":vendor_turn(turn)}))
+}
+
+fn terminal(turn: u32, status: &str, stop_reason: &str) -> Value {
+    emit(
+        &json!({"type":"terminal","vendor_turn_id":vendor_turn(turn),
+                  "status":status,"final_text":"done","stop_reason":stop_reason}),
+    )
+}
+
+fn text(turn: u32) -> Value {
+    emit(&json!({"type":"text","vendor_turn_id":vendor_turn(turn),"text":"t"}))
+}
+
+fn tool_started(turn: u32, id: &str) -> Value {
+    emit(
+        &json!({"type":"tool_started","vendor_turn_id":vendor_turn(turn),
+                  "tool_id":id,"name":"bash"}),
+    )
+}
+
+fn tool_ended(turn: u32, id: &str) -> Value {
+    emit(&json!({"type":"tool_ended","vendor_turn_id":vendor_turn(turn),"tool_id":id}))
+}
+
+fn identity(id: &str) -> Value {
+    emit(&json!({"type":"identity","vendor_session_id":id}))
+}
+
+fn hello(version: &str, features: &[&str]) -> Value {
+    json!({"action":"hello","message":{"type":"hello","vendor_version":version,"features":features}})
+}
+
+fn gate(name: &str) -> Value {
+    json!({"action":"gate","name":name})
+}
+
+fn hang() -> Value {
+    json!({"action":"hang"})
+}
+
+fn expect_interrupt(turn: u32) -> Value {
+    json!({"action":"expect_request",
+           "expected":{"type":"interrupt","id":2,"vendor_turn_id":vendor_turn(turn)}})
+}
+
+/// The script run by the start whose prompt is `prompt`.
+fn script(prompt: &str, steps: &[Value]) -> Value {
+    json!({"expected_request":{"type":"start","prompt":prompt},"steps":steps})
+}
+
+/// A `{profile, scripts}` scenario (decision H2).
+fn scenario(profile: &Value, scripts: &[Value]) -> Value {
+    json!({"profile": profile, "scripts": scripts})
+}
+
+/// The persistent-connection profile (decision H1).
+fn persistent() -> Value {
+    json!({"persistent": true})
+}
+
+/// A handshake profile: `1.0` is checked; `turns` is relied on.
+fn handshake() -> Value {
+    json!({"handshake": {"checked": ["1.0"], "requires": ["turns"]}})
+}
+
+/// The failure class of `envelope`.
+fn class(envelope: &Value) -> &Value {
+    &envelope["failure"]["class"]
+}
+
+/// (2) A vendor `class_hint` decides the failure class (C1 §8.2): the
+/// fake's `rate_limit` terminal fails `rate_limit`, keeping its detail and
+/// vendor code.
+#[test]
+fn core_rate_limit_hint_fails_rate_limit() {
+    let steps = [
+        accepted(1),
+        emit(
+            &json!({"type":"terminal","vendor_turn_id":vendor_turn(1),"status":"failed",
+                      "final_text":"","stop_reason":"error","vendor_code":"429",
+                      "class_hint":"rate_limit","detail":"slow down"}),
+        ),
+    ];
+    let Some(root) = child(
+        "core_rate_limit_hint_fails_rate_limit",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "rate_limit", "{envelope}");
+        assert_eq!(envelope["failure"]["message"], "slow down", "{envelope}");
+        assert_eq!(envelope["failure"]["vendor_code"], "429", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// One usage message of `turn`.
+fn usage(turn: u32, key: Option<&str>, total: u64, cached: Option<u64>) -> Value {
+    let mut message = json!({"type":"usage","vendor_turn_id":vendor_turn(turn),
+                             "total_tokens":total,"input":total - 1,"output":1,
+                             "reasoning_output":0});
+    if let Some(key) = key {
+        message["key"] = json!(key);
+    }
+    if let Some(cached) = cached {
+        message["cached_input"] = json!(cached);
+    }
+    message
+}
+
+/// A step boundary: a tool round, then model output.
+fn tool_round(turn: u32, id: &str) -> Vec<Value> {
+    vec![tool_started(turn, id), tool_ended(turn, id), text(turn)]
+}
+
+/// `count` usage lines of `turn` with keys `k<from>`.., written at once.
+fn keyed_burst(turn: u32, from: usize, count: usize) -> Value {
+    let lines: String = (from..from + count)
+        .map(|index| usage(turn, Some(&format!("k{index}")), 1, Some(0)).to_string() + "\n")
+        .collect();
+    json!({"action":"emit_raw","text":lines})
+}
+
+/// (3) AD6 turn-wide ledger, end to end: a key repeated after a step
+/// boundary counts once and a keyless sample adds; a sample without
+/// `cached_input` makes it `null`; the 1,025th key overflows into
+/// `vendor_interval` with `usage_interval_unverified`; a turn aggregate
+/// supersedes the samples.
+#[test]
+fn core_usage_ledger_cases() {
+    let mut first = vec![accepted(1), text(1)];
+    first.push(emit(&usage(1, Some("a"), 10, Some(2))));
+    first.extend(tool_round(1, "t1"));
+    first.push(emit(&usage(1, Some("a"), 12, Some(3))));
+    first.push(emit(&usage(1, None, 5, None)));
+    first.push(terminal(1, "completed", "end_turn"));
+    // Three bursts of 342 keys, each below Wire's 1,024-message queue.
+    let second = vec![
+        accepted(2),
+        text(2),
+        keyed_burst(2, 0, 342),
+        gate("burst1"),
+        keyed_burst(2, 342, 342),
+        gate("burst2"),
+        keyed_burst(2, 684, 341),
+        terminal(2, "completed", "end_turn"),
+    ];
+    let third = vec![
+        accepted(3),
+        text(3),
+        emit(&usage(3, Some("m1"), 6, Some(0))),
+        emit(
+            &json!({"type":"terminal","vendor_turn_id":vendor_turn(3),"status":"completed",
+                      "final_text":"done","stop_reason":"end_turn",
+                      "usage":{"input":156,"output":177,"total":333}}),
+        ),
+    ];
+    let Some(root) = child(
+        "core_usage_ledger_cases",
+        &scenario(
+            &json!({}),
+            &[
+                script("first", &first),
+                script("second", &second),
+                script("third", &third),
+            ],
+        ),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        let usage = &envelope["usage"];
+        assert_eq!(usage["total_tokens"], 12 + 5, "{envelope}");
+        assert_eq!(usage["input_tokens"], 11 + 4, "{envelope}");
+        assert_eq!(usage["output_tokens"], 2, "{envelope}");
+        assert!(usage["cached_input_tokens"].is_null(), "{envelope}");
+        assert_eq!(usage["scope"], "turn", "{envelope}");
+
+        daemon.resume(&session, "second").await;
+        for gate in ["burst1", "burst2"] {
+            daemon.entered(gate).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            daemon.release(gate);
+        }
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["usage"]["total_tokens"], 1025, "{envelope}");
+        assert_eq!(envelope["usage"]["scope"], "vendor_interval", "{envelope}");
+        let warned = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "usage_interval_unverified");
+        assert!(warned, "{envelope}");
+
+        daemon.resume(&session, "third").await;
+        let envelope = daemon.wait(&session, 3).await;
+        let usage = &envelope["usage"];
+        assert_eq!(usage["input_tokens"], 156, "{envelope}");
+        assert_eq!(usage["output_tokens"], 177, "{envelope}");
+        assert_eq!(usage["total_tokens"], 333, "{envelope}");
+        assert!(usage["cached_input_tokens"].is_null(), "{envelope}");
+        assert_eq!(usage["scope"], "turn", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// (5) #36: the adapter's `StopReason` is kept. An unknown vendor reason
+/// (`tool_use`) is `other`, kept verbatim in `vendor_stop_reason`; a failed
+/// `max_steps` terminal keeps `max_steps`, its code and its step count.
+#[test]
+fn core_stop_reason_other_and_failed_max_steps_kept() {
+    let scripts = [
+        script(
+            "other",
+            &[accepted(1), terminal(1, "completed", "tool_use")],
+        ),
+        script(
+            "steps",
+            &[
+                accepted(2),
+                emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(2),
+                              "status":"failed","final_text":"","stop_reason":"max_steps",
+                              "vendor_code":"step_limit","steps":7})),
+            ],
+        ),
+    ];
+    let Some(root) = child(
+        "core_stop_reason_other_and_failed_max_steps_kept",
+        &scenario(&json!({}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("other", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["stop_reason"], "other", "{envelope}");
+        assert_eq!(envelope["vendor_stop_reason"], "tool_use", "{envelope}");
+
+        daemon.resume(&session, "steps").await;
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "vendor_error", "{envelope}");
+        assert_eq!(envelope["stop_reason"], "max_steps", "{envelope}");
+        assert_eq!(envelope["vendor_stop_reason"], "max_steps", "{envelope}");
+        assert_eq!(
+            envelope["failure"]["vendor_code"], "step_limit",
+            "{envelope}"
+        );
+        assert_eq!(envelope["steps"], 7, "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// Arms Core's failpoint `point` in the child's controller.
+#[cfg(feature = "test-failpoints")]
+fn arm(root: &Path, point: &str, action: &str) {
+    let command = json!({"token":"conformance-core","occurrence":1,"action":action});
+    fs::write(
+        root.join("points").join(format!("{point}.json")),
+        command.to_string(),
+    )
+    .unwrap();
+}
+
+/// (7) AD4: Core holds its first observation unhandled
+/// (`core.observations.pause`), so the session channel fills and the
+/// driver's delivery stalls past the lowered stall bound: the turn fails
+/// `overflow`, and the vendor terminal the driver retained still reaches
+/// the envelope as its `vendor_stop_reason`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_retained_terminal_under_stalled_observations() {
+    let flood_line = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
+    let steps = [
+        accepted(1),
+        json!({"action":"flood","text":flood_line,"count":512}),
+        gate("flood"),
+        json!({"action":"flood","text":flood_line,"count":512}),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_retained_terminal_under_stalled_observations",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[("VIA_TEST_EVENT_STALL_MS", "250")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.observations.pause", "pause");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let ack = root.join("points").join("core.observations.pause.1.ack");
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !ack.exists() {
+            assert!(tokio::time::Instant::now() < by, "Core never paused");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The first half reaches the channel before the second is written,
+        // so Wire's queue never holds a channel's worth.
+        daemon.entered("flood").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        daemon.release("flood");
+        // The stalled delivery fails the turn; then Core resumes.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        fs::write(
+            root.join("points")
+                .join("core.observations.pause.1.release"),
+            b"",
+        )
+        .unwrap();
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "overflow", "{envelope}");
+        assert_eq!(envelope["vendor_stop_reason"], "end_turn", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// Cancels `session`'s turn `turn` with `force_after_ms`.
+async fn cancel(daemon: &Daemon, session: &SessionId, turn: u32, force_after_ms: u64) {
+    let params = serde_json::from_value(json!({
+        "session":session,"handle":HANDLE,"turn":turn,"force_after_ms":force_after_ms
+    }))
+    .unwrap();
+    daemon.engine.cancel(params).await.unwrap();
+}
+
+/// (8) AD9's table on fake profiles, end to end. Per-turn route: a cancel
+/// during an open tool, the vendor interrupted and exited with the tool
+/// still open, gives `quiescent` from its own group's absence. Server
+/// route (persistent profile): a tool still open at P7's bound (here the
+/// wall) gives `uncertain`; one that ended gives `quiescent`. No settled
+/// envelope carries `pending`.
+#[test]
+fn core_cleanup_follows_ad9_on_fake_profiles() {
+    const NAME: &str = "core_cleanup_follows_ad9_on_fake_profiles";
+    let interrupted = |ends: bool, hangs: bool| {
+        let mut steps = vec![accepted(1), tool_started(1, "t1"), expect_interrupt(1)];
+        if ends {
+            steps.push(tool_ended(1, "t1"));
+        }
+        steps.push(terminal(1, "interrupted", "interrupted"));
+        if hangs {
+            steps.push(hang());
+        }
+        steps
+    };
+    let per_turn = scenario(&json!({}), &[script("p", &interrupted(false, false))]);
+    let server = scenario(
+        &persistent(),
+        &[
+            script("open", &interrupted(false, true)),
+            script("ended", &interrupted(true, false)),
+        ],
+    );
+    let Some(root) = child(NAME, &per_turn, &[]) else {
+        child_case(NAME, &server, "server");
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let cases: &[(&str, &str)] = if case().as_deref() == Some("server") {
+            &[("open", "uncertain"), ("ended", "quiescent")]
+        } else {
+            &[("p", "quiescent")]
+        };
+        for &(prompt, cleanup) in cases {
+            let session = daemon
+                .spawn(prompt, &json!({"deadlines":{"wall_ms":4000}}))
+                .await;
+            wait_for_tool(&daemon, &session).await;
+            cancel(&daemon, &session, 1, 30_000).await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "cancelled", "{prompt}: {envelope}");
+            assert_eq!(
+                envelope["cancel"]["outcome"], "acknowledged",
+                "{prompt}: {envelope}"
+            );
+            assert_eq!(
+                envelope["cancel"]["cleanup"], cleanup,
+                "{prompt}: {envelope}"
+            );
+        }
+        daemon.shutdown().await;
+    });
+}
+
+/// Selects a test's second child case.
+const CASE: &str = "VIA_CONFORMANCE_CORE_CASE";
+
+/// Runs test `name` again as its child case `case` with `scenario`.
+fn child_case(name: &str, scenario: &Value, case: &str) {
+    let _ = child(name, scenario, &[(CASE, case)]);
+}
+
+/// The child case this process runs, if any.
+fn case() -> Option<String> {
+    env::var(CASE).ok()
+}
+
+/// Waits until `session`'s running turn reports a running tool.
+async fn wait_for_tool(daemon: &Daemon, session: &SessionId) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let params = serde_json::from_value(json!({"session":session})).unwrap();
+        let status = daemon.engine.status(params).await.unwrap();
+        if status["progress"]["running_tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < by, "no tool ran: {status}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn completed(turn: u32) -> Vec<Value> {
+    vec![accepted(turn), terminal(turn, "completed", "end_turn")]
+}
+
+/// (9) AD16 (decision H1): four persistent sessions each keep their
+/// connection's slot between turns, so a fifth session waits for one;
+/// their next turns run on the pinned connections; closing one releases
+/// its slot and the fifth runs.
+#[test]
+fn core_persistent_sessions_hold_slots_until_close() {
+    let scripts = [
+        script("first", &completed(1)),
+        script("again", &completed(2)),
+    ];
+    let Some(root) = child(
+        "core_persistent_sessions_hold_slots_until_close",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let session = daemon.spawn("first", &json!({})).await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            held.push(session);
+        }
+        assert_eq!(daemon.engine.connections().in_use, 4);
+        let fifth = daemon.spawn("first", &json!({})).await;
+        let params = WaitParams {
+            address: format!("{fifth}/1"),
+            timeout_ms: Some(1500),
+        };
+        assert!(
+            daemon.engine.wait(params).await.is_err(),
+            "the fifth session waits for a slot"
+        );
+        for session in &held {
+            daemon.resume(session, "again").await;
+            let envelope = daemon.wait(session, 2).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+        }
+        assert_eq!(daemon.engine.connections().in_use, 4);
+        daemon.close(&held[0]).await;
+        let envelope = daemon.wait(&fifth, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// The AD7 members of `envelope`.
+fn version(envelope: &Value) -> (&Value, &Value) {
+    (&envelope["vendor_version"], &envelope["version_status"])
+}
+
+/// (16) AD7, end to end: once the instance's handshake was read, the
+/// envelope carries its version on a protocol failure, an overflow and a
+/// forced stop; before any handshake it is `null`.
+#[test]
+fn core_envelope_version_after_handshake_on_failures() {
+    const NAME: &str = "core_envelope_version_after_handshake_on_failures";
+    let big = "x".repeat(1024);
+    let scripts = [
+        script(
+            "protocol",
+            &[
+                hello("1.0", &["turns"]),
+                accepted(1),
+                json!({"action":"emit_raw","text":"not json\n"}),
+                hang(),
+            ],
+        ),
+        script(
+            "overflow",
+            &[
+                accepted(1),
+                json!({"action":"flood","text":big,"count":1100}),
+                hang(),
+            ],
+        ),
+        script("forced", &[accepted(1), gate("forced")]),
+    ];
+    let silent = scenario(&handshake(), &[script("silent", &[hang()])]);
+    let Some(root) = child(NAME, &scenario(&handshake(), &scripts), &[]) else {
+        child_case(NAME, &silent, "silent");
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        if case().is_some() {
+            let session = daemon
+                .spawn("silent", &json!({"deadlines":{"wall_ms":1500}}))
+                .await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(class(&envelope), "deadline_wall", "{envelope}");
+            assert_eq!(
+                version(&envelope),
+                (&Value::Null, &json!("untested")),
+                "{envelope}"
+            );
+            daemon.shutdown().await;
+            return;
+        }
+        for (prompt, state, failure) in [
+            ("protocol", "failed", json!("protocol")),
+            ("overflow", "failed", json!("overflow")),
+            ("forced", "cancelled", Value::Null),
+        ] {
+            let session = daemon.spawn(prompt, &json!({})).await;
+            if prompt == "forced" {
+                daemon.entered("forced").await;
+                cancel(&daemon, &session, 1, 200).await;
+            }
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], state, "{prompt}: {envelope}");
+            assert_eq!(class(&envelope), &failure, "{prompt}: {envelope}");
+            if prompt == "forced" {
+                assert_eq!(envelope["cancel"]["outcome"], "forced", "{envelope}");
+            }
+            assert_eq!(
+                version(&envelope),
+                (&json!("1.0"), &json!("tested")),
+                "{prompt}: {envelope}"
+            );
+        }
+        daemon.shutdown().await;
+    });
+}
+
+/// (16), (17) Persistent profile: the server's exit before a terminal
+/// fails the turn `server_lost`; on the session's replaced connection, a
+/// live server whose stdout closed is transport loss, `unknown`. Each
+/// envelope keeps the instance's handshake version.
+#[test]
+fn core_server_lost_versus_transport_lost() {
+    let mut profile = persistent();
+    profile["handshake"] = handshake()["handshake"].clone();
+    let scripts = [
+        script(
+            "exit",
+            &[
+                hello("1.1", &["turns"]),
+                accepted(1),
+                json!({"action":"exit","code":3}),
+            ],
+        ),
+        script(
+            "lost",
+            &[accepted(2), json!({"action":"close_stdout","name":"lost"})],
+        ),
+    ];
+    let Some(root) = child(
+        "core_server_lost_versus_transport_lost",
+        &scenario(&profile, &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("exit", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "server_lost", "{envelope}");
+        assert_eq!(
+            version(&envelope),
+            (&json!("1.1"), &json!("untested")),
+            "{envelope}"
+        );
+        daemon.resume(&session, "lost").await;
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
+        assert_eq!(envelope["vendor_version"], "1.1", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// (20) AD4, end to end (persistent profile): at the wall the turn fails
+/// `deadline_wall`; an interrupted terminal after the interrupt gives
+/// `{acknowledged, quiescent}`, no answer `{requested, uncertain}`. A
+/// cancel whose force is capped at the wall, unanswered, on the shared
+/// server that is never killed, ends `unknown` with outcome `unknown`.
+#[test]
+fn core_wall_soft_stop_on_the_persistent_profile() {
+    let scripts = [
+        script(
+            "answers",
+            &[
+                accepted(1),
+                expect_interrupt(1),
+                terminal(1, "interrupted", "interrupted"),
+            ],
+        ),
+        script("silent", &[accepted(1), hang()]),
+        script("capped", &[accepted(1), gate("capped")]),
+    ];
+    let Some(root) = child(
+        "core_wall_soft_stop_on_the_persistent_profile",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let wall = json!({"deadlines":{"wall_ms":1500}});
+        for (prompt, outcome, cleanup) in [
+            ("answers", "acknowledged", "quiescent"),
+            ("silent", "requested", "uncertain"),
+        ] {
+            let session = daemon.spawn(prompt, &wall).await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "failed", "{prompt}: {envelope}");
+            assert_eq!(class(&envelope), "deadline_wall", "{prompt}: {envelope}");
+            assert_eq!(
+                (
+                    &envelope["cancel"]["outcome"],
+                    &envelope["cancel"]["cleanup"]
+                ),
+                (&json!(outcome), &json!(cleanup)),
+                "{prompt}: {envelope}"
+            );
+        }
+        let session = daemon.spawn("capped", &wall).await;
+        daemon.entered("capped").await;
+        cancel(&daemon, &session, 1, 60_000).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// AD7, chunk 3 carry-over: a handshake missing a relied-on feature is
+/// `submit_failed` with `failure.data.reason: "handshake_refused"`, the
+/// instance's version kept; no start reached the vendor.
+#[test]
+fn core_handshake_refused_is_submit_failed() {
+    let scripts = [script(
+        "p",
+        &[hello("2.0", &["turns"]), json!({"action":"report_pids"})],
+    )];
+    let Some(root) = child(
+        "core_handshake_refused_is_submit_failed",
+        &scenario(
+            &json!({"handshake": {"requires": ["turns", "steer"]}}),
+            &scripts,
+        ),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "submit_failed", "{envelope}");
+        assert_eq!(
+            envelope["failure"]["data"],
+            json!({"reason":"handshake_refused"}),
+            "{envelope}"
+        );
+        assert_eq!(envelope["vendor_version"], "2.0", "{envelope}");
+        assert!(
+            !root.join("sync").join("agent.pid").exists(),
+            "no start reached the vendor"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// C2 §2 Reopen (spec amendment r3), end to end. Turn 1 confirmed `v1`.
+/// Before acceptance, a turn whose connection returns `v2` fails
+/// `resume_mismatch`. After a retained terminal, a mismatch keeps the
+/// turn's result and fails only the driver: the session's next turn runs
+/// on a replaced one, which resumes `v1`.
+#[test]
+fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
+    let scripts = [
+        script(
+            "first",
+            &[
+                identity("v1"),
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        script(
+            "other",
+            &[
+                identity("v2"),
+                accepted(2),
+                terminal(2, "completed", "end_turn"),
+            ],
+        ),
+        script(
+            "after",
+            &[
+                identity("v1"),
+                accepted(3),
+                terminal(3, "completed", "end_turn"),
+                identity("v2"),
+            ],
+        ),
+        script(
+            "next",
+            &[
+                identity("v1"),
+                accepted(4),
+                terminal(4, "completed", "end_turn"),
+            ],
+        ),
+    ];
+    let Some(root) = child(
+        "core_resume_mismatch_before_acceptance_and_after_the_terminal",
+        &scenario(&json!({}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+
+        daemon.resume(&session, "other").await;
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "resume_mismatch", "{envelope}");
+
+        daemon.resume(&session, "after").await;
+        let envelope = daemon.wait(&session, 3).await;
+        assert_eq!(
+            envelope["state"], "completed",
+            "the turn keeps its result: {envelope}"
+        );
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+
+        daemon.resume(&session, "next").await;
+        let envelope = daemon.wait(&session, 4).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
