@@ -19,14 +19,14 @@ mod process;
 mod scenario;
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use evidenced::evidenced;
 use scenario::{Captured, run_command};
@@ -127,9 +127,9 @@ impl Sandbox {
     }
 
     /// Writes `<state>/daemon.json` (0600).
-    fn config(&self, config: &Value) -> TestResult {
+    fn config(&self, text: &str) -> TestResult {
         let path = self.state.join("daemon.json");
-        fs::write(&path, config.to_string())?;
+        fs::write(&path, text)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
@@ -278,10 +278,13 @@ fn s_launch_describe_starts_nothing() -> TestResult {
         for name in ["claude", "codex", "opencode"] {
             marking_script(&sandbox.bin.join(name), &marker)?;
         }
-        sandbox.config(&json!({"harnesses":{
-            "claude":{"binary":pinned.join("claude-pinned")},
-            "codex":{"binary":pinned.join("codex-pinned"),"inherit":{"hooks":true}},
-        }}))?;
+        sandbox.config(
+            &json!({"harnesses":{
+                "claude":{"binary":pinned.join("claude-pinned")},
+                "codex":{"binary":pinned.join("codex-pinned"),"inherit":{"hooks":true}},
+            }})
+            .to_string(),
+        )?;
         auto_started(&sandbox)?;
         let mut outcomes = Vec::new();
         for harness in ["claude", "codex", "opencode"] {
@@ -313,26 +316,96 @@ fn s_launch_describe_starts_nothing() -> TestResult {
     })
 }
 
-/// Runtime §8, design §5.4: an invalid `harnesses` refuses daemon start
-/// with its named error and leaves no socket.
+/// Every entry under `dir`, recursively, with its size and modification
+/// time: the evidence that a refused start touched nothing.
+fn listing(dir: &Path, into: &mut BTreeMap<PathBuf, (u64, SystemTime)>) -> TestResult {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        into.insert(path.clone(), (metadata.len(), metadata.modified()?));
+        if metadata.is_dir() {
+            listing(&path, into)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runtime §8, design §5.4: an invalid `harnesses` is an invalid
+/// `daemon.json`, like every other key: `via daemon` exits 78 with one
+/// `via: daemon config invalid: <key>: <rule>` line, touching nothing in
+/// the state or runtime directory (no lock, no `via.log`, no Store, no
+/// socket). A duplicate key at any level is refused like the rest of
+/// the file's.
 #[test]
 fn s_launch_invalid_harnesses_refuse_start() -> TestResult {
     evidenced(|| {
         let mut sandbox = Sandbox::new()?;
         sandbox.store = false;
-        sandbox.config(&json!({"harnesses":{"claude":{"binary":"bin/claude"}}}))?;
-        let mut command = sandbox.command();
-        command.arg("daemon");
-        let run = run_command(&mut command, Duration::from_secs(10))?;
-        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
-        check(
-            !run.timed_out
-                && !run.status.success()
-                && stderr.contains("harnesses.claude.binary: must be an absolute path"),
-            || format!("daemon start: {:?} {stderr}", run.status),
-        )?;
-        check(!sandbox.runtime.join("via.sock").exists(), || {
-            "a socket was left".to_owned()
-        })
+        let cases = [
+            (
+                r#"{"harnesses":{"claude":{"binary":"bin/claude"}}}"#,
+                "harnesses.claude.binary",
+                "must be an absolute path",
+            ),
+            (
+                r#"{"harnesses":{"gemini":{}}}"#,
+                "harnesses.gemini",
+                "unknown harness",
+            ),
+            (
+                r#"{"harnesses":{"codex":{"inherit":{"hooks":"yes"}}}}"#,
+                "harnesses.codex.inherit.hooks",
+                "must be a boolean",
+            ),
+            (
+                r#"{"harnesses":{"claude":{},"claude":{}}}"#,
+                "harnesses.claude",
+                "duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"binary":"/a","binary":"/b"}}}"#,
+                "harnesses.claude.binary",
+                "duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{},"inherit":{}}}}"#,
+                "harnesses.claude.inherit",
+                "duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"hooks":true,"hooks":false}}}}"#,
+                "harnesses.claude.inherit.hooks",
+                "duplicate key",
+            ),
+        ];
+        for (text, key, rule) in cases {
+            sandbox.config(text)?;
+            let mut before = BTreeMap::new();
+            listing(&sandbox.state, &mut before)?;
+            listing(&sandbox.runtime, &mut before)?;
+            let mut command = sandbox.command();
+            command.arg("daemon");
+            let run = run_command(&mut command, Duration::from_secs(10))?;
+            let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+            let prefix = format!("via: daemon config invalid: {key}: ");
+            check(
+                !run.timed_out
+                    && run.status.code() == Some(78)
+                    && stderr.lines().any(|line| {
+                        line.starts_with(&prefix) && line[prefix.len()..].contains(rule)
+                    }),
+                || format!("{text}: exit {:?}, {stderr}", run.status),
+            )?;
+            let mut after = BTreeMap::new();
+            listing(&sandbox.state, &mut after)?;
+            listing(&sandbox.runtime, &mut after)?;
+            check(before == after, || {
+                format!("{text} changed the state or runtime directory: {before:?} {after:?}")
+            })?;
+            check(!sandbox.runtime.join("via.sock").exists(), || {
+                format!("{text} left a socket")
+            })?;
+        }
+        Ok(())
     })
 }

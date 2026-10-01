@@ -2,8 +2,9 @@
 //! once at start, before any Store or socket change; absent means every
 //! default. An invalid file names its key and the rule it broke.
 //!
-//! `harnesses` is kept opaque here: an object is passed to the adapter
-//! layer, anything else is refused (S-CORE H4).
+//! `harnesses` is validated here by the adapter layer's own pure parser
+//! (runtime §8), so an invalid section is an invalid file like any other
+//! key; the validated text is then passed to `AdapterConfig::load`.
 
 use std::{
     fmt,
@@ -15,7 +16,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
-use via_core::{Limits, PAGE_BYTES};
+use via_core::{AdapterConfig, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -96,7 +97,7 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// What `daemon.json` configures: the validated limits and the opaque
+/// What `daemon.json` configures: the validated limits and the validated
 /// `harnesses` object, if present.
 #[derive(Debug, Default)]
 pub(super) struct Config {
@@ -154,12 +155,9 @@ pub(super) fn read(state: &Path) -> Result<Config, Invalid> {
 /// Parses and validates the file's text (§5.5).
 fn parse(text: &[u8]) -> Result<Config, Invalid> {
     let file: File = serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
-    if file
-        .harnesses
-        .as_ref()
-        .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
-    {
-        return Err(Invalid::new("harnesses", "must be an object"));
+    if let Some(raw) = &file.harnesses {
+        AdapterConfig::check_harnesses(raw)
+            .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?;
     }
     let mut limits = Limits::default();
     if let Some(raw) = file.disk {
@@ -295,24 +293,71 @@ mod tests {
         );
     }
 
-    /// S-CORE H4: `harnesses` is accepted as an opaque object and refused
-    /// otherwise.
+    /// Runtime §8, S-LAUNCH: `harnesses` is validated at read, like every
+    /// other key, by the adapter layer's rules; each refusal names its
+    /// member, and a duplicate key at any level is refused.
     #[test]
-    fn harnesses_is_an_opaque_object() {
-        let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("object");
+    fn harnesses_are_validated_like_other_keys() {
+        let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("valid");
         assert_eq!(
             config.harnesses.expect("kept").get(),
             r#"{"claude":{"binary":"/x"}}"#
         );
         assert!(parse(b"{}").expect("empty").harnesses.is_none());
-        for refused in [
-            r#"{"harnesses":[]}"#,
-            r#"{"harnesses":null}"#,
-            r#"{"harnesses":1}"#,
-        ] {
+        let cases = [
+            (r#"{"harnesses":[]}"#, "harnesses: must be an object"),
+            (r#"{"harnesses":null}"#, "harnesses: must be an object"),
+            (r#"{"harnesses":1}"#, "harnesses: must be an object"),
+            (
+                r#"{"harnesses":{"claude":5}}"#,
+                "harnesses.claude: must be an object",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"binary":"bin/claude"}}}"#,
+                "harnesses.claude.binary: must be an absolute path without `..`",
+            ),
+            (
+                r#"{"harnesses":{"gemini":{}}}"#,
+                "harnesses.gemini: unknown harness",
+            ),
+            (
+                r#"{"harnesses":{"codex":{"bin":"/x"}}}"#,
+                "harnesses.codex.bin: unknown key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"memory":true}}}}"#,
+                "harnesses.claude.inherit.memory: unknown key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"hooks":1}}}}"#,
+                "harnesses.claude.inherit.hooks: must be a boolean",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":true}}}"#,
+                "harnesses.claude.inherit: must be an object",
+            ),
+            (
+                r#"{"harnesses":{"claude":{},"claude":{}}}"#,
+                "harnesses.claude: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"binary":"/a","binary":"/b"}}}"#,
+                "harnesses.claude.binary: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{},"inherit":{}}}}"#,
+                "harnesses.claude.inherit: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"hooks":true,"hooks":false}}}}"#,
+                "harnesses.claude.inherit.hooks: duplicate key",
+            ),
+        ];
+        for (text, message) in cases {
             assert_eq!(
-                invalid(refused),
-                "daemon config invalid: harnesses: must be an object"
+                invalid(text),
+                format!("daemon config invalid: {message}"),
+                "{text}"
             );
         }
     }
