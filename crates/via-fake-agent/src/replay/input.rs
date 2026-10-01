@@ -8,7 +8,7 @@
 //!
 //! A line is on time if and only if its arrival is at or before its limit:
 //! `within_ms` after the previous step's completion, capped by the run
-//! deadline.
+//! deadline. An expect step completes at its line's arrival.
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
@@ -149,16 +149,18 @@ impl Input {
         Some((at, event))
     }
 
-    /// Takes the expected line. `previous` is the previous step's
-    /// completion, from which `within_ms` counts.
+    /// Takes the expected line and its arrival, which is when the expect
+    /// step completes. `previous` is the previous step's completion, from
+    /// which `within_ms` counts.
     pub(super) fn expect_line(
         &mut self,
         previous: Instant,
         within_ms: Option<u64>,
-    ) -> Result<Value, String> {
+    ) -> Result<(Instant, Value), String> {
         let (limit, name) = limit(previous, within_ms, self.deadline);
         match self.next(limit) {
             Some((at, Event::Line(bytes))) if at <= limit => serde_json::from_slice(&bytes)
+                .map(|line| (at, line))
                 .map_err(|error| format!("input line is not JSON: {error}")),
             Some((at, Event::Eof)) if at <= limit => {
                 Err("stdin ended before the expected line".to_owned())
@@ -378,5 +380,20 @@ mod tests {
         );
         let mut equal = queued(vec![(previous, Event::Eof)], deadline);
         assert_eq!(equal.await_eof(previous, 4), Ok(()));
+    }
+
+    #[test]
+    fn an_expect_completes_at_its_line_arrival() {
+        // The line and the EOF were both published before the main thread
+        // took the line: the EOF follows the expect's completion.
+        let previous = past(2_000 * MS);
+        let arrival = previous + 100 * MS;
+        let mut input = queued(
+            vec![(arrival, line()), (arrival + MS, Event::Eof)],
+            previous + 60_000 * MS,
+        );
+        let (completed, _) = input.expect_line(previous, None).expect("the line");
+        assert_eq!(completed, arrival);
+        assert_eq!(input.await_eof(completed, 2), Ok(()));
     }
 }
