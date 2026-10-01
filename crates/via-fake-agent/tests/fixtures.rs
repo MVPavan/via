@@ -7,7 +7,9 @@
 //!   line (a subset matches itself), reads back each emitted line, and
 //!   delivers each `await_signal`, completes the fixture with exit 0.
 //! - No fixture file contains a home path, an email address, a token-like
-//!   value or a credential field with a real value.
+//!   value or a credential field with a real value. Every key and string is
+//!   scanned, the new step fields (`exit.stderr`, `absent` pointers)
+//!   included; a credential assigned in free text (`api_key=…`) is a finding.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -461,22 +463,24 @@ fn value_finding(value: &Value) -> Option<String> {
             hygiene_finding(key).or_else(|| value_finding(item))
         }),
         Value::Array(items) => items.iter().find_map(value_finding),
-        Value::String(text) => hygiene_finding(text).or_else(|| {
-            let trimmed = text.trim_start();
-            if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-                return None;
-            }
-            match serde_json::from_str::<Value>(&neutralize_captures(text)) {
-                Ok(inner) => value_finding(&inner),
-                // An object-shaped emit that cannot be decoded cannot be
-                // shown clean; bracketed prose is covered by the text scan
-                // plus a credential-name check.
-                Err(error) if trimmed.starts_with('{') => {
-                    Some(format!("embedded JSON does not parse: {error}"))
+        Value::String(text) => hygiene_finding(text)
+            .or_else(|| secret_assignment(text))
+            .or_else(|| {
+                let trimmed = text.trim_start();
+                if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+                    return None;
                 }
-                Err(_) => secret_mention(text),
-            }
-        }),
+                match serde_json::from_str::<Value>(&neutralize_captures(text)) {
+                    Ok(inner) => value_finding(&inner),
+                    // An object-shaped emit that cannot be decoded cannot be
+                    // shown clean; bracketed prose is covered by the text scan
+                    // plus a credential-name check.
+                    Err(error) if trimmed.starts_with('{') => {
+                        Some(format!("embedded JSON does not parse: {error}"))
+                    }
+                    Err(_) => secret_mention(text),
+                }
+            }),
         Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
 }
@@ -489,6 +493,33 @@ fn file_finding(text: &str) -> Option<String> {
         Ok(value) => value_finding(&value),
         Err(_) => secret_mention(text),
     }
+}
+
+/// A credential field assigned a value in free text, such as stderr: the
+/// name, an optional quote, `=` or `:`, then a value that is not exactly a
+/// placeholder (or `null`).
+fn secret_assignment(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let quote = |c: char| c == '"' || c == '\'';
+    for key in SECRET_KEYS {
+        for (at, _) in lower.match_indices(key) {
+            let rest = text[at + key.len()..]
+                .trim_start_matches(quote)
+                .trim_start();
+            let Some(rest) = rest.strip_prefix(['=', ':']) else {
+                continue;
+            };
+            let rest = rest.trim_start().trim_start_matches(quote);
+            let end = rest
+                .find(|c: char| c.is_whitespace() || quote(c) || ",;&}".contains(c))
+                .unwrap_or(rest.len());
+            let value = &rest[..end];
+            if !value.is_empty() && value != "null" && !PLACEHOLDERS.contains(&value) {
+                return Some(format!("{key} is assigned a non-placeholder value"));
+            }
+        }
+    }
+    None
 }
 
 /// A credential field name in text that is not JSON.
@@ -565,6 +596,33 @@ fn fixtures_hygiene_scan_detects_each_pattern() {
         r#"{"line":"{\"request_id\":${rid},\"session_id\":\"${sid}\",\"cmd\":\"echo $${HOME}\"}"}"#,
         r#"{"capabilities":["msg_lifecycle_v1"]}"#,
         r#"{"text":"[Request interrupted by user for tool use]"}"#,
+    ];
+    for text in clean {
+        assert_eq!(file_finding(text), None, "flagged {text}");
+    }
+}
+
+#[test]
+fn fixtures_hygiene_scan_covers_the_new_step_fields() {
+    let bad = [
+        // An exit step's stderr is text, scanned like every other string.
+        r#"{"steps":[{"exit":{"code":1,"stderr":"cannot open /home/someone/.config\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"cannot open \/home\/someone\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"Error: api_key=abc123\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"refresh_token: \"abc\"\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[auth] {\"access_token\":\"abc\"}\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"Authorization: Bearer abc\n"}}]}"#,
+        // An absent pointer is a string too.
+        r#"{"steps":[{"expect":{"line":{},"absent":["/home/someone"]}}]}"#,
+    ];
+    for text in bad {
+        assert!(file_finding(text).is_some(), "missed {text}");
+    }
+    let clean = [
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[claude-code:unrecognized_model] {\"model\":\"m\",\"query_source\":\"sdk\"}\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"api_key=<redacted>\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"set the API key first\n"}}]}"#,
+        r#"{"steps":[{"expect":{"line":{},"absent":["/response/response"],"within_ms":5000}},{"await_eof":{}}]}"#,
     ];
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
