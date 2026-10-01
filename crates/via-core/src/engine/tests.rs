@@ -5710,6 +5710,59 @@ fn lanes_idle_only_by_a_queued_cancel_come_back_to_the_bound() {
     });
 }
 
+/// Critical r3 #2 (runtime §8 idle session lanes): a session's original
+/// spawn slot enforces the bound when it empties too. With `IDLE_LANES`
+/// lanes idle, a spawned session's lane is adopted while its first turn
+/// is still queued in that slot, so it does not count; cancelling the turn
+/// empties the spawn slot, and exactly `IDLE_LANES` idle lanes remain.
+#[test]
+fn a_spawn_slot_emptied_by_a_queued_cancel_comes_back_to_the_bound() {
+    use super::lane::IDLE_LANES;
+    let Some(root) = child("a_spawn_slot_emptied_by_a_queued_cancel_comes_back_to_the_bound")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut senders = Vec::new();
+        for _ in 0..IDLE_LANES {
+            let session = new_session(&engine).await;
+            dispatch(&engine, &session).await;
+            let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            engine.adopt_lane(
+                &session,
+                (driver, receiver, via_adapters::ObservationBudget::new()),
+                (reference, &route),
+            );
+            senders.push(sender);
+        }
+        assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES);
+        // Its first turn queued in the spawn slot, with no dispatcher.
+        let session = new_session(&engine).await;
+        let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        engine.adopt_lane(
+            &session,
+            (driver, receiver, via_adapters::ObservationBudget::new()),
+            (reference, &route),
+        );
+        senders.push(sender);
+        assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 1);
+        cancel(&engine, &session, 1).await.unwrap();
+        let bounded = tokio::time::timeout(Duration::from_secs(10), async {
+            while super::lock(&engine.lanes).len() > IDLE_LANES {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let lanes = super::lock(&engine.lanes).len();
+        assert!(bounded.is_ok(), "{lanes} lanes stay registered");
+        assert_eq!(lanes, IDLE_LANES, "exactly the bound remains");
+        drop(senders);
+    });
+}
+
 /// Critical r2 F6 (C2 §3 idle lanes, C1 §3.6): a C1 close that arrives
 /// after an eviction was chosen, before the lane's actor started its
 /// driver close, replaces the eviction's mode and deadline with its own.
