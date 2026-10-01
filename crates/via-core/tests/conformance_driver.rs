@@ -1063,9 +1063,12 @@ fn conformance_persistent_acceptances_carry_the_connection_handshake() {
         ],
     );
     let instance = |items: &[ObservationItem]| {
-        items.iter().find_map(|item| match &item.observation {
-            Observation::Accepted(acceptance) => Some(acceptance.instance.clone()),
-            _ => None,
+        items.iter().find_map(|item| {
+            if let Observation::Accepted(acceptance) = &item.observation {
+                Some(acceptance.instance.clone())
+            } else {
+                None
+            }
         })
     };
     let (driver, mut receiver) = rig.session();
