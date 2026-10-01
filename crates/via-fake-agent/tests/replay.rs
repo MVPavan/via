@@ -771,3 +771,52 @@ fn replay_within_ms_bounds_the_wait_for_an_expected_line() -> TestResult {
     assert_eq!(run.finish(true)?.code, Some(0));
     Ok(())
 }
+
+#[test]
+fn replay_exit_step_writes_stderr_and_exits_with_its_code() -> TestResult {
+    let end = run_closed(
+        &json!([
+            {"emit": {"line": "partial"}},
+            {"exit": {"code": 7, "stderr": "Error: rate limited\n"}}
+        ]),
+        10_000,
+    )?;
+    assert_eq!(end.code, Some(7));
+    assert_eq!(end.stdout, vec![line("partial")]);
+    assert_eq!(end.stderr, "Error: rate limited\n");
+
+    let at_bound = "e".repeat(1024);
+    let end = run_closed(&json!([{"exit": {"code": 1, "stderr": at_bound}}]), 10_000)?;
+    assert_eq!(end.code, Some(1));
+    assert_eq!(end.stderr, at_bound);
+    Ok(())
+}
+
+#[test]
+fn replay_exit_step_is_checked_at_load() -> TestResult {
+    // Each fixture is refused before its first step runs.
+    for (steps, reason) in [
+        (
+            json!([{"emit": {"line": "x"}}, {"exit": {"code": 3, "stderr": ""}}]),
+            "reserved",
+        ),
+        (
+            json!([
+                {"emit": {"line": "x"}},
+                {"exit": {"code": 1, "stderr": ""}},
+                {"emit": {"line": "y"}}
+            ]),
+            "last step",
+        ),
+        (
+            json!([{"emit": {"line": "x"}}, {"exit": {"code": 1, "stderr": "e".repeat(1025)}}]),
+            "1024 bytes",
+        ),
+    ] {
+        let end = run_closed(&steps, 10_000)?;
+        assert_eq!(end.code, Some(FAILED), "{steps}");
+        assert!(end.stdout.is_empty(), "{steps}");
+        assert!(end.stderr.contains(reason), "{}", end.stderr);
+    }
+    Ok(())
+}

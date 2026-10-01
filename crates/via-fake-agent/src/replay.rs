@@ -8,7 +8,9 @@
 //!   milliseconds of the previous step's end;
 //! - `emit` writes one verbatim line;
 //! - `delay` sleeps; `await_signal` waits for a signal;
-//! - `await_eof` waits for stdin to end; any input instead fails.
+//! - `await_eof` waits for stdin to end; any input instead fails;
+//! - `exit`, only as the last step, writes its `stderr` text (at most 1 KiB)
+//!   verbatim and exits with its `code`, which may not be [`FAILED`].
 //!
 //! An `argv` entry is an exact string or `{"capture": "<name>"}`, which
 //! captures that argument. In emit lines and in expected string values,
@@ -52,6 +54,8 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Longest diagnostic written to stderr, prefix and newline included;
 /// longer messages are truncated.
 const MAX_DIAGNOSTIC: usize = 1024;
+/// Longest `stderr` of an `exit` step, checked at load.
+const MAX_EXIT_STDERR: usize = 1024;
 const DIAGNOSTIC_PREFIX: &str = "fake replay: ";
 /// The watchdog's deadline from process start until the fixture is loaded.
 const LOAD_LIMIT: Duration = Duration::from_secs(5);
@@ -116,6 +120,11 @@ enum Step {
         signal: SignalName,
     },
     AwaitEof {},
+    /// The last step: writes `stderr` verbatim and exits with `code`.
+    Exit {
+        code: u8,
+        stderr: String,
+    },
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -173,7 +182,7 @@ pub(crate) fn run_if_selected() {
         return;
     };
     let code = match replay(&fixture, started, &step, &watchdog) {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(error) => {
             diagnostic(&error);
             FAILED
@@ -198,7 +207,7 @@ fn replay(
     started: Instant,
     step: &AtomicUsize,
     watchdog: &SyncSender<Arm>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let fixture = load(fixture)?;
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
@@ -211,7 +220,7 @@ fn replay(
         let version = fixture
             .version
             .ok_or("fixture has no version for --version")?;
-        return write_line(&version);
+        return write_line(&version).map(|()| 0);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -222,7 +231,11 @@ fn replay(
     let mut signals = BTreeMap::new();
     for name in fixture.steps.iter().filter_map(|step| match step {
         Step::AwaitSignal { signal } => Some(*signal),
-        Step::Expect { .. } | Step::Emit { .. } | Step::Delay { .. } | Step::AwaitEof {} => None,
+        Step::Expect { .. }
+        | Step::Emit { .. }
+        | Step::Delay { .. }
+        | Step::AwaitEof {}
+        | Step::Exit { .. } => None,
     }) {
         if let Entry::Vacant(entry) = signals.entry(name) {
             let kind = match name {
@@ -233,6 +246,11 @@ fn replay(
             entry.insert(signal(kind).map_err(|error| error.to_string())?);
         }
     }
+    // Load allows an exit step only as the last step.
+    let code = match fixture.steps.last() {
+        Some(Step::Exit { code, .. }) => i32::from(*code),
+        _ => 0,
+    };
     let mut input = io::stdin().lock();
     for (index, current) in fixture.steps.into_iter().enumerate() {
         let number = index + 1;
@@ -247,7 +265,7 @@ fn replay(
         )
         .map_err(|error| format!("step {number}: {error}"))?;
     }
-    Ok(())
+    Ok(code)
 }
 
 fn load(path: &Path) -> Result<Fixture, String> {
@@ -272,9 +290,30 @@ fn load(path: &Path) -> Result<Fixture, String> {
             Arg::Exact(_) => None,
         })
         .collect();
-    for step in &fixture.steps {
-        if let Step::Expect { capture, .. } = step {
-            names.extend(capture.keys().map(String::as_str));
+    for (index, step) in fixture.steps.iter().enumerate() {
+        match step {
+            Step::Expect { capture, .. } => names.extend(capture.keys().map(String::as_str)),
+            Step::Exit { code, stderr } => {
+                if index + 1 != fixture.steps.len() {
+                    return Err(format!("step {}: exit must be the last step", index + 1));
+                }
+                if i32::from(*code) == FAILED {
+                    return Err(format!(
+                        "step {}: exit code {FAILED} is reserved for replay failure",
+                        index + 1
+                    ));
+                }
+                if stderr.len() > MAX_EXIT_STDERR {
+                    return Err(format!(
+                        "step {}: exit stderr exceeds {MAX_EXIT_STDERR} bytes",
+                        index + 1
+                    ));
+                }
+            }
+            Step::Emit { .. }
+            | Step::Delay { .. }
+            | Step::AwaitSignal { .. }
+            | Step::AwaitEof {} => {}
         }
     }
     names.sort_unstable();
@@ -457,6 +496,12 @@ fn run_step<R: BufRead>(
             } else {
                 Err("unexpected input while awaiting EOF".to_owned())
             }
+        }
+        Step::Exit { code: _, stderr } => {
+            let mut out = io::stderr().lock();
+            out.write_all(stderr.as_bytes())
+                .and_then(|()| out.flush())
+                .map_err(|error| format!("cannot write stderr: {error}"))
         }
     }
 }
