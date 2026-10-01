@@ -514,10 +514,15 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
                 let passed = spawn_error(&mut raw, id + 1, &json!({member: fits}))?;
                 // Design §5.2 (S-CORE chunk 4, design-listed): an
                 // uncatalogued model with an explicit harness passes
-                // through, so the model at its maximum is receipted.
-                let route_rule = passed.is_some() || member == "model";
-                check(route_rule && !named(&passed, member), || {
-                    format!("{member} at its maximum was refused for its size: {passed:?}")
+                // through, so the model at its maximum is receipted. The
+                // others keep S1's route refusal, never for their size.
+                let fits_rule = if member == "model" {
+                    passed.is_none()
+                } else {
+                    passed.is_some() && !named(&passed, member)
+                };
+                check(fits_rule, || {
+                    format!("{member} at its maximum was not handled as fitting: {passed:?}")
                 })?;
             }
             let receipt = cli(
