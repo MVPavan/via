@@ -2046,7 +2046,7 @@ fn read_terminal_facts(
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT session_id,number,submitted_at,correlation FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
+            "SELECT session_id,number,submitted_at,correlation,effective FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
         )
         .map_err(sql_error)?;
     let rows = statement
@@ -2056,12 +2056,13 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
                 row.get::<_, u32>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(sql_error)?;
     let mut turns = Vec::new();
     for row in rows {
-        let (session, number, submitted_at, correlation) = row.map_err(sql_error)?;
+        let (session, number, submitted_at, correlation, effective) = row.map_err(sql_error)?;
         turns.push(UnfinishedTurn {
             session_id: SessionId::try_from(session.as_str())
                 .map_err(|_| StoreError::CorruptEvidence)?,
@@ -2069,6 +2070,7 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             // A running turn always has its submission time.
             submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
             correlation,
+            effective: effective.and_then(|text| serde_json::from_str(&text).ok()),
         });
     }
     Ok(turns)

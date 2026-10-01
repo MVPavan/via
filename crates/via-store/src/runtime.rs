@@ -656,6 +656,9 @@ pub struct UnfinishedTurn {
     pub submitted_at: String,
     /// Recorded vendor acceptance correlation, if acceptance committed.
     pub correlation: Option<String>,
+    /// The turn's frozen effective values, as stored; `None` when the
+    /// stored text is not JSON (a recovered envelope then omits them).
+    pub effective: Option<Value>,
 }
 
 /// A committed anchor and its owning turn; no marker, identity or control path.

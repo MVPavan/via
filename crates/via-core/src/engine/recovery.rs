@@ -544,6 +544,7 @@ impl Engine {
             turn,
             submitted_at,
             correlation,
+            effective,
         } = unfinished;
         let History {
             last_seq,
@@ -558,7 +559,9 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_history).await;
-        let (cwd, identity, plan) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
+        let (cwd, identity, mut plan) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
+        // Sol r1 #12: the envelope reports this turn's own frozen values.
+        plan.effective = effective.and_then(|effective| serde_json::from_value(effective).ok());
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));

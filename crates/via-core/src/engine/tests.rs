@@ -3167,6 +3167,92 @@ fn recovery_asks_the_adapter_per_session_with_the_reconciled_facts() {
     });
 }
 
+/// Sol r1 #12 (C1 §5): a recovered turn's envelope reads the recovering
+/// turn's own frozen values: the resolved model, effort, bound and its
+/// inheritance, and the vendor options, not the session's spawn request.
+#[test]
+fn a_recovered_envelope_reads_the_turns_own_frozen_values() {
+    let Some(root) = child("a_recovered_envelope_reads_the_turns_own_frozen_values") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({
+        "models": [{"model":"fake-pro","aliases":["pro"]}],
+        "efforts": ["high"],
+        "capabilities": {
+            "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                      "steer":unsupported,"cancel":{"support":"native"},
+                      "close":{"support":"native"}},
+            "params": {"instructions":unsupported,"output_schema":unsupported,
+                       "effort":{"support":"native"},"max_steps":unsupported},
+            "bounds": ["full"], "network_control": false, "recover": unsupported,
+            "usage": {"tokens":"turn","cost":"unavailable"}
+        },
+    });
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    let bound = json!({"mode":"full","extra_write_dirs":[],"network":true});
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let raw = json!({"harness":"fake","model":"pro","prompt":"p","handle":HANDLE,
+                             "effort":"high","bound":bound,"vendor":{"fake":{}}});
+            let receipted = earlier
+                .spawn(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap();
+            let session = receipted.enqueued.unwrap().0;
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &rfc3339(std::time::SystemTime::now()),
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(
+            envelope["model"],
+            json!({"requested":"pro","resolved":"fake-pro"}),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["effort"],
+            json!({"requested":"high","resolved":"high"}),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["bound"],
+            json!({"requested":bound,"effective":bound,"inherited":false}),
+            "{envelope}"
+        );
+        assert_eq!(envelope["vendor_options"], json!({"fake":{}}), "{envelope}");
+    });
+}
+
 /// Sol r1 F2, F13, Sol r2 F13 (C2 §2 health, `TurnAbandoned`): a turn
 /// whose run is dropped while pending abandons its `run_turn`, which fails
 /// the driver's health. Under the lane actor only a test drops a turn's
