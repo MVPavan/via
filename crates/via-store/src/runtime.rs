@@ -303,6 +303,13 @@ pub struct SessionRoute {
     pub vendor_session_id: Option<String>,
     /// That event's transcript hint.
     pub transcript: Option<String>,
+    /// The frozen session parameters (`sessions.params`) as stored JSON
+    /// text, which Core reads its frozen session values from (adapter
+    /// design §5.1 #25).
+    pub params: Option<String>,
+    /// The receipt's `capabilities` as stored JSON text: the route's
+    /// declared capabilities frozen at spawn (#15, #26).
+    pub capabilities: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -498,6 +505,13 @@ pub struct SessionStatus {
     pub route: Option<String>,
     /// The confirmed vendor session ID.
     pub vendor_session_id: Option<String>,
+    /// The session's route identity and frozen parameters, as
+    /// [`SessionSnapshot`] reads them (adapter design §5.1 #38, #39).
+    pub frozen: SessionRoute,
+    /// The selected turn's envelope `vendor_version`, once terminal.
+    pub vendor_version: Option<String>,
+    /// The selected turn's envelope `version_status`, once terminal.
+    pub version_status: Option<String>,
     /// A group of the session's turns lacks a durable absence proof.
     pub cleanup_uncertain: bool,
     /// The newest [`STATUS_ANCHORS`] anchors of the session with no

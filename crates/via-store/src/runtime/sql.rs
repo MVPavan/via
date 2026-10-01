@@ -1051,12 +1051,13 @@ fn read_keyed_operation(
 /// The selected columns of a session's [`SessionRoute`], for a query whose
 /// row is `sessions` (decision H3): the adapter version the latest
 /// `turn.started` commit persisted, else the receipt's (runtime §6), with
-/// the confirmed identity its `session.opened`/`session.reopened` wrote.
+/// the confirmed identity its `session.opened`/`session.reopened` wrote,
+/// and the frozen session parameters and capabilities as stored text.
 const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
     coalesce(adapter_version,json_extract(receipt,'$.adapter_version')),
-    vendor_session_id,transcript_hint";
+    vendor_session_id,transcript_hint,params,json_extract(receipt,'$.capabilities')";
 
-/// The route identity read at `first` and the four columns after it.
+/// The route identity read at `first` and the six columns after it.
 fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRoute> {
     Ok(SessionRoute {
         harness: row.get(first)?,
@@ -1064,6 +1065,8 @@ fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRo
         adapter_version: row.get(first + 2)?,
         vendor_session_id: row.get(first + 3)?,
         transcript: row.get(first + 4)?,
+        params: row.get(first + 5)?,
+        capabilities: row.get(first + 6)?,
     })
 }
 
@@ -2358,26 +2361,28 @@ fn read_session_status(
     conn: &Connection,
     query: &StatusQuery,
 ) -> Result<Option<SessionStatus>, StoreError> {
-    /// Session columns, `model`, `cwd` and `route`.
+    /// Session columns, `model`, `cwd` and the route identity.
     type Session = (
         String,
         String,
-        String,
         Option<String>,
         i64,
         i64,
         Option<String>,
         Option<String>,
-        Option<String>,
-        Option<String>,
+        SessionRoute,
     );
+    /// Number, state, and the envelope's `vendor_version` and
+    /// `version_status`.
+    type Selected = (u32, String, Option<String>, Option<String>);
     let session = query.session.as_str();
     let row: Option<Session> = conn
         .query_row(
-            "SELECT state,admission,harness,label,created_ms,updated_ms,
-                json_extract(params,'$.model'),json_extract(params,'$.cwd'),
-                json_extract(receipt,'$.route'),vendor_session_id
-             FROM sessions WHERE id=?1",
+            &format!(
+                "SELECT state,admission,label,created_ms,updated_ms,
+                    json_extract(params,'$.model'),json_extract(params,'$.cwd'),{ROUTE_COLUMNS}
+                 FROM sessions WHERE id=?1"
+            ),
             [session],
             |row| {
                 Ok((
@@ -2388,31 +2393,35 @@ fn read_session_status(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
+                    route_at(row, 7)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((state, admission, harness, label, created_ms, updated_ms, model, cwd, route, vendor)) =
-        row
-    else {
+    let Some((state, admission, label, created_ms, updated_ms, model, cwd, frozen)) = row else {
         return Ok(None);
     };
     let unproven_anchors = read_unproven_anchors(conn, session)?;
     let active = read_active_turn(conn, session)?;
-    let selected: Option<(u32, String)> = conn
+    let selected: Option<Selected> = conn
         .query_row(
-            "SELECT number,state FROM turns WHERE session_id=?1 AND number=coalesce(?2,
+            "SELECT number,state,json_extract(envelope,'$.vendor_version'),
+                json_extract(envelope,'$.version_status')
+             FROM turns WHERE session_id=?1 AND number=coalesce(?2,
                 (SELECT number FROM turns WHERE session_id=?1 AND state='running'),
                 (SELECT max(number) FROM turns WHERE session_id=?1))",
             params![session, query.turn.map(TurnNumber::get)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?;
+    let (selected, version) = match selected {
+        Some((number, state, vendor_version, version_status)) => {
+            (Some((number, state)), (vendor_version, version_status))
+        }
+        None => (None, (None, None)),
+    };
     let queue = read_status_queue(conn, session)?;
     let turns = read_status_turns(conn, session)?;
     let (steps, more) = match &selected {
@@ -2422,14 +2431,17 @@ fn read_session_status(
     Ok(Some(SessionStatus {
         state,
         admission,
-        harness,
+        harness: frozen.harness.clone(),
         label,
         created_ms,
         updated_ms,
         model,
         cwd,
-        route,
-        vendor_session_id: vendor,
+        route: frozen.route.clone(),
+        vendor_session_id: frozen.vendor_session_id.clone(),
+        frozen,
+        vendor_version: version.0,
+        version_status: version.1,
         cleanup_uncertain: !unproven_anchors.is_empty(),
         unproven_anchors,
         selected,
