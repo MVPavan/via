@@ -89,7 +89,14 @@ pub struct SteerRequest {
     pub reply: oneshot::Sender<Result<(), SteerRefused>>,
     /// The request's share of the control budget, returned when it is
     /// dropped.
-    permit: OwnedSemaphorePermit,
+    permit: ControlPermit,
+}
+
+/// One admitted command's share of the control budget (C2 §2): a command
+/// slot and its encoded bytes, held until the command is resolved.
+pub(super) struct ControlPermit {
+    _command: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
 }
 
 /// Why Route did not deliver a steer input.
@@ -107,18 +114,28 @@ pub enum SteerRefused {
 
 /// The admitting side of a turn's steer lane (C2 §2 independent lanes): at
 /// most [`CONTROL_COMMANDS`] requests and [`CONTROL_BYTES`] encoded in
-/// total; anything more is refused before it is enqueued.
+/// total are outstanding, queued or awaiting their answer; anything more is
+/// refused before it is enqueued.
 #[derive(Clone)]
 pub struct SteerSender {
     sender: mpsc::Sender<SteerRequest>,
+    commands: Arc<Semaphore>,
     budget: Arc<Semaphore>,
 }
 
 /// A turn's steer lane: the admitting sender and Route's receiver.
 pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
     let (sender, receiver) = mpsc::channel(CONTROL_COMMANDS);
+    let commands = Arc::new(Semaphore::new(CONTROL_COMMANDS));
     let budget = Arc::new(Semaphore::new(CONTROL_BYTES));
-    (SteerSender { sender, budget }, receiver)
+    (
+        SteerSender {
+            sender,
+            commands,
+            budget,
+        },
+        receiver,
+    )
 }
 
 impl SteerSender {
@@ -128,12 +145,19 @@ impl SteerSender {
         text: String,
         expected_vendor_turn: Option<String>,
     ) -> Result<oneshot::Receiver<Result<(), SteerRefused>>, SteerRefused> {
+        let command = Arc::clone(&self.commands)
+            .try_acquire_owned()
+            .map_err(|_| SteerRefused::OverCapacity)?;
         let encoded = escaped_text_len(&text).saturating_add(STEER_OVERHEAD);
         // A size past `u32` is past the budget too: both refuse it.
-        let permit = u32::try_from(encoded)
+        let bytes = u32::try_from(encoded)
             .ok()
             .and_then(|bytes| Arc::clone(&self.budget).try_acquire_many_owned(bytes).ok())
             .ok_or(SteerRefused::OverCapacity)?;
+        let permit = ControlPermit {
+            _command: command,
+            _bytes: bytes,
+        };
         let (reply, answer) = oneshot::channel();
         let request = SteerRequest {
             text,
@@ -261,8 +285,8 @@ pub struct TurnFailure {
     /// Cleanup certainty, when Route established one.
     pub cleanup: Option<WireCleanup>,
     /// Host stopped the group while its vendor was live. On the persistent
-    /// profile only the daemon force or the server's death says so: a
-    /// shared server is never killed for a turn (C2 §4.1).
+    /// profile only the server's death says so: a shared server is never
+    /// killed for a turn (C2 §4.1).
     pub forced: bool,
     /// A Host journal write had an uncertain outcome: the daemon latches.
     pub journal_uncertain: bool,
@@ -298,6 +322,8 @@ pub(super) struct Facts {
     /// ended the turn with.
     pub(super) cause: Option<TurnCause>,
     pub(super) acknowledged: bool,
+    /// Every reported tool item ended (AD9).
+    pub(super) tools_settled: bool,
     /// Where the logical turn goes, until it is sent.
     pub(super) logical: Option<oneshot::Sender<FakeTurn>>,
 }
@@ -336,10 +362,7 @@ pub(super) struct LaneState {
     pub(super) steer_write: Option<via_wire::PendingWrite>,
     /// The steer awaiting its write and the vendor's delivery report, with
     /// its share of the control budget.
-    pub(super) steer_reply: Option<(
-        oneshot::Sender<Result<(), SteerRefused>>,
-        OwnedSemaphorePermit,
-    )>,
+    pub(super) steer_reply: Option<(oneshot::Sender<Result<(), SteerRefused>>, ControlPermit)>,
     /// The vendor reported the steer's delivery before its write answered.
     steer_evidence: bool,
     pub(super) accepted: bool,
@@ -397,8 +420,10 @@ impl LaneState {
     /// The facts at the turn's end.
     pub(super) fn into_facts(self) -> Facts {
         let acknowledged = self.acknowledged();
+        let tools_settled = self.tools_settled();
         Facts {
             acknowledged,
+            tools_settled,
             ..self.facts
         }
     }
@@ -805,8 +830,11 @@ impl Serving<'_> {
 }
 
 /// Builds the C2-lane result from Route's S1 result and the lane's facts.
-/// On the persistent profile `forced` stays only for the daemon force and
-/// the server's death: a turn never kills a shared server (C2 §4.1).
+/// On the persistent profile a failure reports the logical connection
+/// (decision H1): only the server's death carries the helper's Host facts.
+/// Any other launched failure has no exit and no force, and its cleanup is
+/// the reported tool items' (AD9 server-route row); the helper's facts are
+/// its retirement's.
 pub(super) fn turn_result(
     result: Result<FakeRouteResult, RouteFailure>,
     facts: Facts,
@@ -817,6 +845,7 @@ pub(super) fn turn_result(
         handshake,
         cause: lane_cause,
         acknowledged,
+        tools_settled,
         ..
     } = facts;
     let outcome = match result {
@@ -835,17 +864,25 @@ pub(super) fn turn_result(
                 | RouteError::Deadline { .. }
                 | RouteError::ForceStopped { .. }) => TurnCause::Route(cause),
             };
-            let host_force = matches!(
-                cause,
-                TurnCause::ServerLost { .. } | TurnCause::Route(RouteError::ForceStopped { .. })
-            );
+            let logical =
+                persistent && failure.launched && !matches!(cause, TurnCause::ServerLost { .. });
+            let (exit, cleanup, forced) = if logical {
+                let cleanup = if tools_settled {
+                    WireCleanup::Quiescent
+                } else {
+                    WireCleanup::Uncertain
+                };
+                (None, Some(cleanup), false)
+            } else {
+                (failure.exit, failure.cleanup, failure.forced)
+            };
             Err(TurnFailure {
                 cause,
                 undecoded: failure.undecoded,
-                exit: failure.exit,
+                exit,
                 launched: failure.launched,
-                cleanup: failure.cleanup,
-                forced: failure.forced && (!persistent || host_force),
+                cleanup,
+                forced,
                 journal_uncertain: failure.journal_uncertain,
                 acknowledged,
                 shared: persistent,
