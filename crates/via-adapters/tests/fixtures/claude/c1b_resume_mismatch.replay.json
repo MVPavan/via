@@ -1,5 +1,5 @@
 {
-  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 943 ms). The probe closed stdin after the result, so await_eof follows it.  DERIVED, not recorded: c1b with every vendor session_id replaced by a fixed different UUID, so init and result do not match the captured --resume value. No mismatch was observed live.",
+  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 595 ms). The probe closed stdin after the result, so await_eof follows it. The recorded exit code (1) and sanitized stderr are replayed by the exit step. SYNTHETIC ADAPTATION under the recipe (as c4 and c11b), not recorded: c1b's prompt and init with every vendor session_id replaced by a fixed different UUID, so the init does not match the captured --resume value; the adapter stops the vendor at the mismatched init with the AD19 sequence. After the init come c7_interrupt's recorded interrupt request, control response and interrupted result (content kept, session id replaced, c7's tool-result messages dropped) and c7's recorded exit. No mismatch was observed live.",
   "argv": [
     "-p",
     "--input-format",
@@ -56,67 +56,36 @@
       }
     },
     {
-      "delay": {
-        "ms": 943
+      "expect": {
+        "line": {
+          "type": "control_request",
+          "request": {
+            "subtype": "interrupt"
+          }
+        },
+        "capture": {
+          "rid": "/request_id"
+        }
       }
     },
     {
       "emit": {
-        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":50,\"estimated_tokens_delta\":50,\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"uuid\":\"00000000-0000-4000-8000-000000000002\"}"
-      }
-    },
-    {
-      "delay": {
-        "ms": 331
+        "line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"
       }
     },
     {
       "emit": {
-        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":138,\"estimated_tokens_delta\":88,\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"uuid\":\"00000000-0000-4000-8000-000000000003\"}"
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SIGNATURE\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4907,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4907},\"output_tokens\":4,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":{\"cache_miss_reason\":{\"type\":\"tools_changed\",\"cache_missed_input_tokens\":4938}},\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"uuid\":\"00000000-0000-4000-8000-000000000004\",\"timestamp\":\"2026-09-30T16:46:55.531Z\",\"request_id\":\"req_01SYNTH000001\"}"
-      }
-    },
-    {
-      "delay": {
-        "ms": 349
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_01SYNTH000001\",\"name\":\"StructuredOutput\",\"input\":{\"kind\":\"beta\",\"token\":\"NONCE0001\"},\"caller\":{\"type\":\"direct\"}}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4907,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4907},\"output_tokens\":4,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":{\"cache_miss_reason\":{\"type\":\"tools_changed\",\"cache_missed_input_tokens\":4938}},\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"uuid\":\"00000000-0000-4000-8000-000000000005\",\"timestamp\":\"2026-09-30T16:46:55.879Z\",\"request_id\":\"req_01SYNTH000001\",\"wire_tool_inputs\":{\"toolu_01SYNTH000001\":{\"kind\":\"beta\",\"token\":\"NONCE0001\"}}}"
-      }
-    },
-    {
-      "delay": {
-        "ms": 6
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"toolu_01SYNTH000001\",\"type\":\"tool_result\",\"content\":\"Structured output provided successfully\"}]},\"parent_tool_use_id\":null,\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"uuid\":\"00000000-0000-4000-8000-000000000006\",\"timestamp\":\"2026-09-30T16:46:55.886Z\",\"tool_use_result\":\"Structured output provided successfully\"}"
-      }
-    },
-    {
-      "delay": {
-        "ms": 8
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":1790000000,\"rateLimitType\":\"five_hour\",\"utilization\":0.1,\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.1,\"resetsAt\":1790000000},\"seven_day\":{\"utilization\":0.1,\"resetsAt\":1790500000}}},\"uuid\":\"00000000-0000-4000-8000-000000000007\",\"session_id\":\"99999999-9999-4999-8999-999999999999\"}"
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"duration_api_ms\":3466,\"stop_reason\":\"tool_use\",\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"total_cost_usd\":0.020783000000000003,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":4907,\"cache_read_input_tokens\":0,\"output_tokens\":167,\"output_tokens_details\":{\"thinking_tokens\":84},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":4907,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":10,\"output_tokens\":167,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":4907,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4907},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":20,\"outputTokens\":323,\"thinkingTokens\":156,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":9574,\"webSearchRequests\":0,\"costUSD\":0.020783000000000003,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"canonicalModel\":\"claude-haiku-4-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":false,\"num_turns\":2,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"{\\\"kind\\\":\\\"beta\\\",\\\"token\\\":\\\"NONCE0001\\\"}\",\"structured_output\":{\"kind\":\"beta\",\"token\":\"NONCE0001\"},\"ttft_ms\":1293,\"type\":\"result\",\"duration_ms\":1661,\"uuid\":\"00000000-0000-4000-8000-000000000008\",\"ttft_stream_ms\":638,\"time_to_request_ms\":31,\"first_content_frame_ms\":639,\"queued_turn_count\":0,\"result_index\":0}"
+        "line": "{\"duration_api_ms\":1646,\"stop_reason\":\"tool_use\",\"session_id\":\"99999999-9999-4999-8999-999999999999\",\"total_cost_usd\":0.0039688,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1305,\"cache_read_input_tokens\":6538,\"output_tokens\":139,\"output_tokens_details\":{\"thinking_tokens\":61},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":1305,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":10,\"output_tokens\":139,\"cache_read_input_tokens\":6538,\"cache_creation_input_tokens\":1305,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1305},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":10,\"outputTokens\":139,\"cacheReadInputTokens\":6538,\"cacheCreationInputTokens\":1305,\"webSearchRequests\":0,\"costUSD\":0.0039688,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"thinkingTokens\":61,\"canonicalModel\":\"claude-haiku-4-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[],\"terminal_reason\":\"aborted_tools\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":true,\"num_turns\":3,\"subtype\":\"error_during_execution\",\"errors\":[\"[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use\"],\"type\":\"result\",\"duration_ms\":1893,\"uuid\":\"00000000-0000-4000-8000-000000000002\",\"queued_turn_count\":0,\"result_index\":0}"
       }
     },
     {
       "await_eof": {}
+    },
+    {
+      "exit": {
+        "code": 1,
+        "stderr": ""
+      }
     }
   ]
 }
