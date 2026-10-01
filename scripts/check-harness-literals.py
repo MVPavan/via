@@ -276,15 +276,41 @@ def braced_end(tokens, index):
     return None
 
 
+def macro_input_end(tokens, index):
+    """If a macro invocation `name!(…)`, `name![…]`, `name!{…}` or a
+    `macro_rules! name {…}` starts at `index`, the index of its input's
+    closing bracket (the last token if unmatched); otherwise None."""
+    if tokens[index].kind != "ident":
+        return None
+    bang = code_at(tokens, index + 1)
+    if text_at(tokens, bang) != "!" or tokens[bang].kind != "punct":
+        return None
+    opening = code_at(tokens, bang + 1)
+    if tokens[index].text == "macro_rules" and opening < len(tokens):
+        if tokens[opening].kind == "ident":
+            opening = code_at(tokens, opening + 1)
+    if text_at(tokens, opening) not in OPEN:
+        return None
+    end = closing(tokens, opening)
+    return len(tokens) - 1 if end is None else end
+
+
 def test_regions(tokens):
     """Token index ranges `(start, end)` of items under `#[cfg(test)]`.
 
     A region starts at the item's attribute and doc-comment cluster. Only
     the exact attribute `cfg(test)` counts; composite forms are scanned.
+    Nothing inside a macro invocation's input is excluded, since the macro
+    may emit it as production code; a `#[cfg(test)] macro_rules!` item is
+    still excluded as an item.
     """
     regions = []
     i = 0
     while i < len(tokens):
+        macro_end = macro_input_end(tokens, i)
+        if macro_end is not None:
+            i = macro_end + 1
+            continue
         if not (is_doc(tokens[i]) or attribute_end(tokens, i) is not None):
             i += 1
             continue
@@ -406,8 +432,16 @@ def load_allow(root):
 # --- file exclusion ----------------------------------------------------------
 
 
+def include_arguments(code):
+    """The argument tokens of each `include!` in comment-free `code`."""
+    for k, token in enumerate(code):
+        if token.text == "include" and k + 2 < len(code) and code[k + 1].text == "!":
+            end = closing(code, k + 2) if code[k + 2].text in OPEN else None
+            yield code[k + 3 : end] if end is not None else None
+
+
 def path_mentions(lexed):
-    """Strings named by `#[path = ...]` or `include!`; None means any file."""
+    """Strings in `#[path = ...]` attributes and `include!` arguments."""
     mentions = []
     for tokens in lexed.values():
         code = [t for t in tokens if t.kind != "comment"]
@@ -415,13 +449,25 @@ def path_mentions(lexed):
             if token.text == "path" and k + 2 < len(code) and code[k + 1].text == "=":
                 if code[k + 2].kind == "str":
                     mentions.append(code[k + 2].text)
-            if token.text == "include" and k + 2 < len(code) and code[k + 1].text == "!":
-                end = closing(code, k + 2) if code[k + 2].text in OPEN else None
-                strings = [t.text for t in code[k + 2 : (end or k + 2) + 1] if t.kind == "str"]
-                if not strings:
-                    return None
-                mentions.extend(strings)
+        for argument in include_arguments(code):
+            mentions.extend(t.text for t in argument or [] if t.kind == "str")
     return mentions
+
+
+def computed_include(lexed):
+    """True if any `include!` argument is not exactly one plain string literal."""
+    for tokens in lexed.values():
+        code = [t for t in tokens if t.kind != "comment"]
+        for argument in include_arguments(code):
+            plain = (
+                argument is not None
+                and len(argument) == 1
+                and argument[0].kind == "str"
+                and argument[0].text.startswith('"')
+            )
+            if not plain:
+                return True
+    return False
 
 
 def module_declarations(tokens, name):
@@ -447,12 +493,16 @@ def module_declarations(tokens, name):
 def excluded_files(scope, lexed, regions, mentions):
     """Files reached only through one top-level `#[cfg(test)] mod name;`.
 
-    Deliberately conservative: the file is excluded only when its standard
-    layout declaring file holds exactly one `mod name` declaration, at top
-    level and test-only; no `#[path]` or `include!` names it; and it is not a
-    crate root. Anything else is scanned.
+    Deliberately conservative: the file is excluded only when the crate
+    holds exactly one `mod name` declaration (inline or not, at any depth,
+    in any of its files), and that one is a top-level, test-only
+    `mod name;` in the file's standard-layout declaring file; no `#[path]`
+    or `include!` names it; no `include!` in the crate has a computed
+    argument; and it is not a crate root. Anything else is scanned.
     """
     excluded = set()
+    if computed_include(lexed):
+        return excluded
     for path in lexed:
         relative = path.relative_to(scope)
         if path.name in ("lib.rs", "main.rs") and path.parent == scope:
@@ -470,14 +520,13 @@ def excluded_files(scope, lexed, regions, mentions):
         else:
             parents = [directory.parent / f"{directory.name}.rs", directory / "mod.rs"]
         declarations = [
-            (parent, index, top)
-            for parent in parents
-            if parent in lexed
-            for index, top in module_declarations(lexed[parent], name)
+            (declaring, index, top)
+            for declaring in lexed
+            for index, top in module_declarations(lexed[declaring], name)
         ]
         if len(declarations) == 1:
-            parent, index, top = declarations[0]
-            if top and in_regions(index, regions[parent]):
+            declaring, index, top = declarations[0]
+            if declaring in parents and top and in_regions(index, regions[declaring]):
                 excluded.add(path)
     return excluded
 
@@ -745,10 +794,10 @@ mod /* c */ helpers /* d */;
             CORE + "tests.rs": "fn fake() {}\nmod deep;\n",
             CORE + "tests/deep.rs": "fn fake_deep() {}\n",
             CORE + "helpers.rs": "fn fake_helper() {}\n",
-            CORE + "engine.rs": "#[cfg(test)]\nmod tests;\n",
-            CORE + "engine/tests.rs": "fn codex() {}\n",
-            CORE + "nested/mod.rs": "#[cfg(test)]\nmod tests;\n",
-            CORE + "nested/tests.rs": "fn claude() {}\n",
+            CORE + "engine.rs": "#[cfg(test)]\nmod engine_tests;\n",
+            CORE + "engine/engine_tests.rs": "fn codex() {}\n",
+            CORE + "nested/mod.rs": "#[cfg(test)]\nmod nested_tests;\n",
+            CORE + "nested/nested_tests.rs": "fn claude() {}\n",
         },
         "expect": [
             # A child of a test-only file is scanned: that is conservative.
@@ -799,6 +848,54 @@ mod /* c */ helpers /* d */;
             CORE + "lib.rs": "fn fake_root() {}\n",
         },
         "expect": [(CORE + "lib.rs", "fake_root", "fake")],
+    },
+    {
+        "name": "same module name declared elsewhere in the crate",
+        "files": {
+            CORE + "lib.rs": "mod engine { mod tests; }\n",
+            CORE + "engine.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "engine/tests.rs": 'const S: &str = "codex";\n',
+        },
+        "expect": [(CORE + "engine/tests.rs", "const S", "codex")],
+    },
+    {
+        "name": "two test-only declarations of one name",
+        "files": {
+            CORE + "lib.rs": "mod a;\nmod b;\n",
+            CORE + "a.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "a/tests.rs": "fn fake_a() {}\n",
+            CORE + "b.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "b/tests.rs": "fn fake_b() {}\n",
+        },
+        "expect": [
+            (CORE + "a/tests.rs", "fake_a", "fake"),
+            (CORE + "b/tests.rs", "fake_b", "fake"),
+        ],
+    },
+    {
+        "name": "computed include",
+        "files": {
+            CORE + "lib.rs": '#[cfg(test)]\nmod tests;\ninclude!(concat!("tests", ".rs"));\n',
+            CORE + "tests.rs": 'const S: &str = "codex";\n',
+        },
+        "expect": [(CORE + "tests.rs", "const S", "codex")],
+    },
+    {
+        "name": "test item inside macro input",
+        "files": {
+            CORE + "lib.rs": """\
+macro_rules! strip {
+    (#[cfg(test)] $item:item) => { $item };
+}
+strip! {
+    #[cfg(test)]
+    fn emitted() -> &'static str { "codex" }
+}
+#[cfg(test)]
+fn after_macro() -> &'static str { "fake" }
+""",
+        },
+        "expect": [(CORE + "lib.rs", "fn emitted", "codex")],
     },
     {
         "name": "duplicate declaration",
