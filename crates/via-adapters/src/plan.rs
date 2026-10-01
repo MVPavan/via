@@ -9,10 +9,15 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
+use std::sync::Arc;
+
+use via_routes::FakeRoute;
+
 use crate::capabilities::{BoundMode, Capabilities, Verb, VerbReq};
 use crate::config::AdapterConfig;
 use crate::fake::FakeAdapter;
 use crate::harness::Harness;
+use crate::{AdapterError, RuntimeConfig, RuntimeResources};
 
 /// A C1 §4 `bound`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -495,22 +500,33 @@ pub fn resolve_model<'a>(
     found.ok_or(RefusalKind::UnknownModel)
 }
 
-/// The adapters this daemon can plan for: in S-CORE only the fake, when its
-/// fixture is configured.
+/// The adapters this daemon can plan for and run: in S-CORE only the fake,
+/// when its fixture is configured, over the Route runtime.
 pub struct AdapterSet {
-    fake: Option<FakeAdapter>,
+    pub(crate) fake: Option<Arc<FakeAdapter>>,
+    /// The Route runtime: Wire and Host, which own every connection.
+    pub(crate) route: Arc<FakeRoute>,
 }
 
 impl AdapterSet {
-    /// One adapter per configured harness.
-    pub fn new(config: AdapterConfig) -> Self {
-        Self {
-            fake: config.into_fake().map(FakeAdapter::new),
-        }
+    /// One adapter per configured harness over the Route runtime; Core
+    /// hands the unopened Store resources down unsplit (C2 §2).
+    pub fn new(
+        config: AdapterConfig,
+        runtime: RuntimeConfig,
+        resources: RuntimeResources,
+    ) -> Result<Self, AdapterError> {
+        let route = FakeRoute::new(runtime, resources)?;
+        Ok(Self {
+            fake: config
+                .into_fake()
+                .map(|fixture| Arc::new(FakeAdapter::new(fixture))),
+            route: Arc::new(route),
+        })
     }
 
     /// The configured adapter for `harness`, if any.
-    fn adapter(&self, harness: Harness) -> Option<&FakeAdapter> {
+    pub(crate) fn adapter(&self, harness: Harness) -> Option<&Arc<FakeAdapter>> {
         match harness {
             Harness::Fake => self.fake.as_ref(),
             Harness::Vendor(_) => None,
@@ -587,7 +603,7 @@ impl AdapterSet {
         }
         self.fake
             .iter()
-            .flat_map(FakeAdapter::catalog)
+            .flat_map(|fake| fake.catalog())
             .map(|entry| ModelEntry {
                 model: entry.model.clone(),
                 harness: name,

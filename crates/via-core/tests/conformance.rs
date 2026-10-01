@@ -1,22 +1,27 @@
 //! C2 conformance kit, planning half (adapter design §8 item 2): the pure
 //! `plan`, `check_turn` and `models` surface of `AdapterSet`, run on
 //! `Adapter::Fake` scenario profiles. Written before the planning code.
+//! It lives in Core's tests since `AdapterSet::new` takes Store's runtime
+//! resources (C2 §2), which only a crate above Store can open; the run
+//! half is `conformance_driver.rs`.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
 )]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::ops::Deref;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use via_adapters::observation::{Observation, ProgressMarks, UsageSample};
 use via_adapters::{
     AdapterConfig, AdapterSet, BOOTSTRAP_ENV, BootstrapEnv, Bound, CatalogModel, Category,
-    CategoryDecl, DescribeRequest, InheritState, ModelSource, RefusalKind, SessionRef, Switch,
-    TurnParams, Verb, VerbReq, harness_names, resolve_model,
+    CategoryDecl, DescribeRequest, InheritState, ModelSource, RefusalKind, RuntimeConfig,
+    SessionRef, Switch, TurnParams, Verb, VerbReq, harness_names, resolve_model,
 };
+use via_store::Store;
 
 /// A fake fixture deployment whose scenario file holds `scenario`.
 fn fixture(scenario: &Value) -> (TempDir, BootstrapEnv) {
@@ -36,16 +41,57 @@ fn fixture(scenario: &Value) -> (TempDir, BootstrapEnv) {
     (dir, env)
 }
 
+/// An adapter set over a private Store; planning never reaches Route, so
+/// its anchor binary need not exist.
+struct Planner {
+    set: AdapterSet,
+    _store: Store,
+    _dir: TempDir,
+}
+
+impl Deref for Planner {
+    type Target = AdapterSet;
+
+    fn deref(&self) -> &AdapterSet {
+        &self.set
+    }
+}
+
+fn planner(config: AdapterConfig) -> Planner {
+    let dir = tempfile::tempdir().unwrap();
+    for part in ["state", "runtime"] {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path().join(part))
+            .unwrap();
+    }
+    let store = Store::open(&dir.path().join("state")).unwrap();
+    let set = AdapterSet::new(
+        config,
+        RuntimeConfig {
+            anchor_binary: dir.path().join("anchor"),
+            anchor_dir: dir.path().join("runtime"),
+        },
+        store.runtime_resources(),
+    )
+    .unwrap();
+    Planner {
+        set,
+        _store: store,
+        _dir: dir,
+    }
+}
+
 /// An adapter set whose fake runs `profile` (object scenario form, H2).
-fn fake_set(profile: &Value) -> AdapterSet {
+fn fake_set(profile: &Value) -> Planner {
     let (_dir, env) = fixture(&json!({"profile": profile, "scripts": []}));
-    AdapterSet::new(AdapterConfig::load(env, None).unwrap())
+    planner(AdapterConfig::load(env, None).unwrap())
 }
 
 /// The fake with the default profile (legacy scenario form, no profile).
-fn default_set() -> AdapterSet {
+fn default_set() -> Planner {
     let (_dir, env) = fixture(&json!({"scripts": []}));
-    AdapterSet::new(AdapterConfig::load(env, None).unwrap())
+    planner(AdapterConfig::load(env, None).unwrap())
 }
 
 fn describe(harness: Option<&str>, model: Option<&str>) -> DescribeRequest {
@@ -143,9 +189,8 @@ fn conformance_model_only_catalog_match() {
     );
 
     // With no fake fixture, nothing is configured, so nothing resolves.
-    let unconfigured = AdapterSet::new(
-        AdapterConfig::load(BootstrapEnv::from_vars::<_, &str, &str>([]), None).unwrap(),
-    );
+    let unconfigured =
+        planner(AdapterConfig::load(BootstrapEnv::from_vars::<_, &str, &str>([]), None).unwrap());
     assert_eq!(
         unconfigured
             .plan(&describe(None, Some("fake")))
@@ -370,9 +415,8 @@ fn conformance_models_are_bundled() {
     );
     assert_eq!(set.models(Some("fake"))[0].source, ModelSource::Bundled);
     assert!(set.models(Some("codex")).is_empty());
-    let unconfigured = AdapterSet::new(
-        AdapterConfig::load(BootstrapEnv::from_vars::<_, &str, &str>([]), None).unwrap(),
-    );
+    let unconfigured =
+        planner(AdapterConfig::load(BootstrapEnv::from_vars::<_, &str, &str>([]), None).unwrap());
     assert!(unconfigured.models(None).is_empty());
 }
 
@@ -652,7 +696,7 @@ fn conformance_config_load() {
     ] {
         let (dir, env) = fixture(&json!(null));
         fs::write(dir.path().join("scenario.json"), scenario).unwrap();
-        let set = AdapterSet::new(AdapterConfig::load(env, None).unwrap());
+        let set = planner(AdapterConfig::load(env, None).unwrap());
         assert_eq!(set.models(None).len(), 1, "{scenario}");
     }
     // Anything else is refused, never defaulted.

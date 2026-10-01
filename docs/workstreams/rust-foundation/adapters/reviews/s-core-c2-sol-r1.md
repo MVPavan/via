@@ -27,7 +27,7 @@ Paths below are relative to `crates/via-adapters/`.
    **Smallest fix:** add the opaque optional field, initialize it to `None` for the fake, and exclude it from C1 `describe` serialization.
 
 7. **Minor — conformance coverage misses required defect classes.**  
-   [tests/conformance.rs:264](../../../../../crates/via-adapters/tests/conformance.rs#L264) exercises only OD2’s fixed requested states. It misses an unverified **on** switch, requested **off** with observed **on**, and requested **off** with neither switch nor observation. Its warning helper selects the first matching warning, so duplicate `config_switch_unverified` warnings would pass. There are also no `check_turn` assertions for schema, step-limit, bound or vendor refusals, and no nonempty-refusal serialization assertions.  
+   `crates/via-adapters/tests/conformance.rs:264` (since moved to `crates/via-core/tests/conformance.rs`) exercises only OD2’s fixed requested states. It misses an unverified **on** switch, requested **off** with observed **on**, and requested **off** with neither switch nor observation. Its warning helper selects the first matching warning, so duplicate `config_switch_unverified` warnings would pass. There are also no `check_turn` assertions for schema, step-limit, bound or vendor refusals, and no nonempty-refusal serialization assertions.  
    **Smallest fix:** add a directional state table, assert exactly one warning with the complete categories, and add focused refusal/serialization cases.
 
 8. **Minor — public Boolean contract parameter violates coding style.**  
