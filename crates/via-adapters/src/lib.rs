@@ -164,7 +164,9 @@ pub use driver::{
     SessionDriver, SessionSpec, SteerError, SteerInput, TurnCx, TurnSpec,
 };
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
-pub use instance::{BinaryIdentity, Incompatibility, InstanceCache, REFUSAL_TTL, resolve_binary};
+pub use instance::{
+    BinaryIdentity, Incompatibility, InstanceCache, REFUSAL_TTL, VERSIONS_KEPT, resolve_binary,
+};
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
     LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,

@@ -17,6 +17,9 @@ use rustix::fs::{Access, AtFlags, CWD, accessat};
 /// How long a refusal entry stays live after it was written (C2 §5).
 pub const REFUSAL_TTL: Duration = Duration::from_mins(10);
 
+/// The most binary identities whose last version the cache keeps.
+pub const VERSIONS_KEPT: usize = 16;
+
 /// The binary a harness runs: `configured` (`harnesses.<name>.binary`) when
 /// set, else the first regular file named `default_binary` in the captured
 /// `path` that this process may execute, as the kernel judges it for the
@@ -99,8 +102,9 @@ pub enum Incompatibility {
 /// The instance cache (C2 §5 AD7): the last version seen per binary
 /// identity, and refusal entries keyed by identity plus the route's
 /// recipe key (the adapter's canonical recipe string). Retention is
-/// bounded: one version entry per resolved binary path, and every refusal
-/// write sweeps the expired refusals.
+/// bounded: at most [`VERSIONS_KEPT`] version entries, the least recently
+/// written evicted first (a lost entry costs one cache miss), and every
+/// refusal write sweeps the expired refusals.
 #[derive(Debug, Default)]
 pub struct InstanceCache {
     inner: Mutex<Entries>,
@@ -108,8 +112,10 @@ pub struct InstanceCache {
 
 #[derive(Debug, Default)]
 struct Entries {
-    /// Per resolved path: the identity it had and the version it reported.
-    versions: HashMap<PathBuf, (BinaryIdentity, String)>,
+    /// Per identity: the last version seen and its write's sequence number.
+    versions: HashMap<BinaryIdentity, (String, u64)>,
+    /// The sequence number of the next version write.
+    written: u64,
     refusals: HashMap<BinaryIdentity, HashMap<String, (Instant, Incompatibility)>>,
 }
 
@@ -124,22 +130,32 @@ impl InstanceCache {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records the version an instance of the binary at `path`, with
-    /// `identity`, reported at its handshake; it replaces the path's entry.
-    pub fn record_version(&self, path: &Path, identity: BinaryIdentity, version: String) {
-        self.entries()
-            .versions
-            .insert(path.to_path_buf(), (identity, version));
+    /// Records the version an instance of the binary with `identity`
+    /// reported at its handshake. Past [`VERSIONS_KEPT`] identities, the
+    /// least recently written entry is evicted.
+    pub fn record_version(&self, identity: BinaryIdentity, version: String) {
+        let mut entries = self.entries();
+        let sequence = entries.written;
+        entries.written += 1;
+        entries.versions.insert(identity, (version, sequence));
+        if entries.versions.len() > VERSIONS_KEPT {
+            let oldest = entries
+                .versions
+                .iter()
+                .min_by_key(|(_, (_, written))| *written)
+                .map(|(identity, _)| *identity);
+            if let Some(oldest) = oldest {
+                entries.versions.remove(&oldest);
+            }
+        }
     }
 
-    /// The last version seen for the binary at `path`, while it still has
-    /// `identity`.
-    pub fn last_version(&self, path: &Path, identity: &BinaryIdentity) -> Option<String> {
+    /// The last version seen for the binary `identity` (C2 §5).
+    pub fn last_version(&self, identity: &BinaryIdentity) -> Option<String> {
         self.entries()
             .versions
-            .get(path)
-            .filter(|(seen, _)| seen == identity)
-            .map(|(_, version)| version.clone())
+            .get(identity)
+            .map(|(version, _)| version.clone())
     }
 
     /// Records a refusal written at `now`; it expires [`REFUSAL_TTL`] later.

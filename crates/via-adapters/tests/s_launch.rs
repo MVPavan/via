@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use via_adapters::{
     AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
     Harness, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState, InstanceCache,
-    REFUSAL_TTL, resolve_binary,
+    REFUSAL_TTL, VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -364,16 +364,13 @@ fn s_launch_refusal_cache_key_and_version() {
     assert_eq!(cache.refusal(&identity, "recipe-a", now), Some(cause));
     assert_eq!(cache.refusal(&identity, "recipe-b", now), None);
 
-    assert_eq!(cache.last_version(&binary, &identity), None);
-    cache.record_version(&binary, identity, "2.1.0".to_owned());
-    cache.record_version(&binary, identity, "2.1.1".to_owned());
-    assert_eq!(
-        cache.last_version(&binary, &identity).as_deref(),
-        Some("2.1.1")
-    );
+    assert_eq!(cache.last_version(&identity), None);
+    cache.record_version(identity, "2.1.0".to_owned());
+    cache.record_version(identity, "2.1.1".to_owned());
+    assert_eq!(cache.last_version(&identity).as_deref(), Some("2.1.1"));
     let other = dir.path().join("other");
     executable(&other);
-    assert_eq!(cache.last_version(&other, &identity_of(&other)), None);
+    assert_eq!(cache.last_version(&identity_of(&other)), None);
 }
 
 /// Touching the binary (size or mtime) gives a new identity, which misses.
@@ -387,14 +384,14 @@ fn s_launch_refusal_cache_identity_change_misses() {
     let now = Instant::now();
     let cause = Incompatibility::ReadbackDiffers("permission_mode");
     cache.record_refusal(before, "recipe".to_owned(), cause, now);
-    cache.record_version(&binary, before, "1.0.0".to_owned());
+    cache.record_version(before, "1.0.0".to_owned());
 
     // Size change.
     fs::write(&binary, "#!/bin/sh\nexit 0\n# grown\n").unwrap();
     let grown = identity_of(&binary);
     assert_ne!(grown, before);
     assert_eq!(cache.refusal(&grown, "recipe", now), None);
-    assert_eq!(cache.last_version(&binary, &grown), None);
+    assert_eq!(cache.last_version(&grown), None);
 
     // Mtime change only, same size.
     let file = fs::File::options().write(true).open(&binary).unwrap();
@@ -452,16 +449,62 @@ fn s_launch_cache_retention_is_bounded() {
     cache.record_refusal(identity, "fresh".to_owned(), cause, later);
     assert_eq!(cache.retained(), 1, "expired refusals survived a write");
     assert_eq!(cache.refusal(&identity, "fresh", later), Some(cause));
+}
 
+/// C2 §5: the last version is per binary identity, whatever path reached
+/// it: a symlink alias hits, a newer version seen through the alias is
+/// seen through the original path, a late handshake from an older
+/// identity leaves the newer identity's record alone, and at most
+/// [`VERSIONS_KEPT`] identities are kept, the least recently written
+/// evicted first.
+#[test]
+fn s_launch_version_cache_by_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("vendor");
+    executable(&binary);
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&binary, &alias).unwrap();
     let cache = InstanceCache::default();
-    cache.record_version(&binary, identity, "1.0.0".to_owned());
-    fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
-    let upgraded = identity_of(&binary);
-    cache.record_version(&binary, upgraded, "1.1.0".to_owned());
-    assert_eq!(cache.retained(), 1, "one version entry per path");
-    assert_eq!(cache.last_version(&binary, &identity), None);
+
+    let old = identity_of(&binary);
+    cache.record_version(old, "1.0.0".to_owned());
     assert_eq!(
-        cache.last_version(&binary, &upgraded).as_deref(),
-        Some("1.1.0")
+        cache.last_version(&identity_of(&alias)).as_deref(),
+        Some("1.0.0")
     );
+    cache.record_version(identity_of(&alias), "1.0.1".to_owned());
+    assert_eq!(
+        cache.last_version(&identity_of(&binary)).as_deref(),
+        Some("1.0.1")
+    );
+
+    // The binary is upgraded; the old instance's handshake arrives late.
+    fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
+    let new = identity_of(&binary);
+    assert_ne!(new, old);
+    cache.record_version(new, "2.0.0".to_owned());
+    cache.record_version(old, "1.0.2".to_owned());
+    assert_eq!(cache.last_version(&new).as_deref(), Some("2.0.0"));
+    assert_eq!(cache.last_version(&old).as_deref(), Some("1.0.2"));
+
+    // The bound: one more identity than kept evicts the least recently
+    // written, here `new` (`old` was written after it).
+    let mut others = Vec::new();
+    for index in 0..VERSIONS_KEPT - 1 {
+        let path = dir.path().join(format!("other-{index}"));
+        executable(&path);
+        let identity = identity_of(&path);
+        cache.record_version(identity, format!("0.{index}"));
+        others.push(identity);
+    }
+    assert_eq!(cache.retained(), VERSIONS_KEPT);
+    assert_eq!(
+        cache.last_version(&new),
+        None,
+        "the oldest write is evicted"
+    );
+    assert_eq!(cache.last_version(&old).as_deref(), Some("1.0.2"));
+    for (index, identity) in others.iter().enumerate() {
+        assert_eq!(cache.last_version(identity), Some(format!("0.{index}")));
+    }
 }
