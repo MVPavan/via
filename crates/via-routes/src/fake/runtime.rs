@@ -549,6 +549,9 @@ impl FakeRoute {
         serving: &mut Serving<'_>,
         messages: &mut WireMessages,
     ) -> Result<ExitReport, Failed> {
+        // Test builds: the terminal is decoded and finalization begins.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_wire::failpoint::hit_async("routes.finalize.entered").await;
         let turn = serving.turn;
         let close = serving.sender.close_input(serving.deadline);
         serving

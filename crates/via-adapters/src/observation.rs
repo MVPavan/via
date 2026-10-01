@@ -474,31 +474,54 @@ pub fn observation_channel_in(
     (ObservationSink { sender, budget }, receiver)
 }
 
-/// An item the channel did not take within the stall bound, or whose
-/// receiver is gone.
+/// An item the channel did not take.
 #[derive(Debug)]
-pub(crate) struct Undelivered;
+pub(crate) enum Undelivered {
+    /// Not within the stall bound, or past what the budget can ever admit.
+    Stalled,
+    /// The receiver is gone.
+    Closed,
+}
 
 impl ObservationSink {
     /// Sends `item`: acquires its byte cost, then a slot. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
+    /// Test builds: `adapter.observation.admitted` acknowledges each item
+    /// the channel took, and `adapter.observation.stalled` a send that gave
+    /// up at its stall deadline.
     pub(crate) async fn send(
         &self,
         item: ObservationItem,
         stall: Duration,
     ) -> Result<(), Undelivered> {
+        let sent = self.admit(item, stall).await;
+        #[cfg(feature = "test-failpoints")]
+        {
+            let point = match &sent {
+                Ok(()) => Some("adapter.observation.admitted"),
+                Err(Undelivered::Stalled) => Some("adapter.observation.stalled"),
+                Err(Undelivered::Closed) => None,
+            };
+            if let Some(point) = point {
+                let _ = via_routes::failpoint::hit_async(point).await;
+            }
+        }
+        sent
+    }
+
+    async fn admit(&self, item: ObservationItem, stall: Duration) -> Result<(), Undelivered> {
         let mut stall_at = None;
-        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered)?;
+        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered::Stalled)?;
         let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
                     .await
-                    .map_err(|_| Undelivered)?
-                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
             }
-            Err(TryAcquireError::Closed) => return Err(Undelivered),
+            Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
         };
         let admitted = Admitted { item, permit };
         match self.sender.try_send(admitted) {
@@ -507,10 +530,10 @@ impl ObservationSink {
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, self.sender.send(admitted))
                     .await
-                    .map_err(|_| Undelivered)?
-                    .map_err(|_| Undelivered)
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
         }
     }
 }

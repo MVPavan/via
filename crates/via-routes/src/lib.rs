@@ -227,6 +227,9 @@ pub use fake::{
     TurnStart, VENDOR_DATA_MAX, steer_lane,
 };
 pub use via_wire::StoreError;
+/// Test builds only: the failpoint controller, for the layers above.
+#[cfg(feature = "test-failpoints")]
+pub use via_wire::failpoint;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
     RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,

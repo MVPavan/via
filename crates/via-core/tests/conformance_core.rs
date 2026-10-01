@@ -198,6 +198,7 @@ impl Daemon {
     /// A forced `daemon/stop`, as daemon main runs it: the force, then
     /// every dispatcher joined, then final shutdown (design §6.8). Returns
     /// the shutdown report.
+    #[cfg(feature = "test-failpoints")]
     async fn force_stop(self) -> via_core::EngineShutdown {
         let force = serde_json::from_value(json!({"force":true})).unwrap();
         self.engine.request_stop(&force).await.unwrap();
@@ -404,13 +405,20 @@ fn core_usage_ledger_cases() {
     first.push(emit(&usage(1, Some("a"), 12, Some(3))));
     first.push(emit(&usage(1, None, 5, None)));
     first.push(terminal(1, "completed", "end_turn"));
-    // Three bursts of 342 keys, each below Wire's 1,024-message queue.
+    // Three bursts of 342 keys, each below Wire's 1,024-message queue; a
+    // durable marker after each tells the test Core handled the burst.
+    let marker = |name: &str| {
+        emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(2),
+                     "kind":"command","target":name,"reason":"policy"}))
+    };
     let second = vec![
         accepted(2),
         text(2),
         keyed_burst(2, 0, 342),
+        marker("burst1"),
         gate("burst1"),
         keyed_burst(2, 342, 342),
+        marker("burst2"),
         gate("burst2"),
         keyed_burst(2, 684, 341),
         terminal(2, "completed", "end_turn"),
@@ -453,7 +461,8 @@ fn core_usage_ledger_cases() {
         daemon.resume(&session, "second").await;
         for gate in ["burst1", "burst2"] {
             daemon.entered(gate).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Core handled the burst: Wire's queue holds none of it.
+            until_denied(&daemon, &session, gate).await;
             daemon.release(gate);
         }
         let envelope = daemon.wait(&session, 2).await;
@@ -546,6 +555,34 @@ fn arm_at(root: &Path, point: &str, occurrence: u64, action: &str) {
     .unwrap();
 }
 
+/// Arms `point`'s hit `occurrence` to be acknowledged only.
+#[cfg(feature = "test-failpoints")]
+fn acknowledge(root: &Path, point: &str, occurrence: u64) {
+    let command = json!({"token":"conformance-core","occurrence":occurrence,
+                         "action":"delay","value":0});
+    fs::write(
+        root.join("points").join(format!("{point}.json")),
+        command.to_string(),
+    )
+    .unwrap();
+}
+
+/// Waits for `point`'s hit `occurrence` to be acknowledged.
+#[cfg(feature = "test-failpoints")]
+async fn until_acked(root: &Path, point: &str, occurrence: u64) {
+    let ack = root
+        .join("points")
+        .join(format!("{point}.{occurrence}.ack"));
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ack.exists() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "{point} hit {occurrence} was never acknowledged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// (7) AD4: Core holds its first observation unhandled
 /// (`core.observations.pause`), so the session channel fills and the
 /// driver's delivery stalls past the lowered stall bound: the turn fails
@@ -571,6 +608,8 @@ fn core_retained_terminal_under_stalled_observations() {
     };
     via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
     arm(&root, "core.observations.pause", "pause");
+    acknowledge(&root, "adapter.observation.admitted", 513);
+    acknowledge(&root, "adapter.observation.stalled", 1);
     run(async {
         let daemon = Daemon::open(&root);
         let session = daemon.spawn("p", &json!({})).await;
@@ -580,13 +619,14 @@ fn core_retained_terminal_under_stalled_observations() {
             assert!(tokio::time::Instant::now() < by, "Core never paused");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The first half reaches the channel before the second is written,
-        // so Wire's queue never holds a channel's worth.
+        // The first half reaches the channel (the acceptance and 512
+        // items) before the second is written, so Wire's queue never holds
+        // a channel's worth.
         daemon.entered("flood").await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        until_acked(&root, "adapter.observation.admitted", 513).await;
         daemon.release("flood");
         // The stalled delivery fails the turn; then Core resumes.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        until_acked(&root, "adapter.observation.stalled", 1).await;
         fs::write(
             root.join("points")
                 .join("core.observations.pause.1.release"),
@@ -1151,6 +1191,7 @@ fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
 /// Sol r1 F7: a daemon force that arrives after the vendor terminal was
 /// decoded, while the per-turn process still runs, keeps that terminal's
 /// vendor stop reason in the forced envelope (AD4).
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn core_terminal_then_daemon_force_keeps_the_vendor_stop_reason() {
     // The terminal's structured output spills on the forced path too.
@@ -1163,12 +1204,14 @@ fn core_terminal_then_daemon_force_keeps_the_vendor_stop_reason() {
     ) else {
         return;
     };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    acknowledge(&root, "routes.finalize.entered", 1);
     run(async {
         let daemon = Daemon::open(&root);
         let session = daemon.spawn("p", &json!({})).await;
         daemon.entered("after_terminal").await;
         // Route has decoded the terminal and waits for the process's exit.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        until_acked(&root, "routes.finalize.entered", 1).await;
         let engine = Arc::clone(&daemon.engine);
         let report = daemon.force_stop().await;
         assert_eq!(report.unresolved_turns, 0, "{report:?}");
@@ -1570,10 +1613,11 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(daemon.engine.connections().in_use, 4);
+        // The dispatch's ask ended the actor's hold (its pause was given
+        // up, so this release has no waiter) and the actor retired the
+        // lane before turn 2 ran: the successor keeps its slot and serves
+        // the session's next turn.
         fs::write(root.join("points").join("core.lane.retire.1.release"), b"").unwrap();
-        // The released hold retires nothing: the successor keeps its
-        // slot and serves the session's next turn.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(daemon.engine.connections().in_use, 4);
         daemon.resume(&failed, "third").await;
         let envelope = daemon.wait(&failed, 3).await;
@@ -1644,6 +1688,25 @@ fn core_late_denial_is_committed_late_end_to_end() {
         );
         daemon.shutdown().await;
     });
+}
+
+/// Waits until `session` committed an `action.denied` naming `target`.
+async fn until_denied(daemon: &Daemon, session: &SessionId, target: &str) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let events = events(daemon, session).await;
+        if events
+            .iter()
+            .any(|event| event["type"] == "action.denied" && event["target"] == target)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < by,
+            "{target} was never committed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// The session's committed events, in order.

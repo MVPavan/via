@@ -3564,7 +3564,9 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
             lane.map_vendor_turn(&format!("v{number}"), turn(number));
         }
         assert!(lane.failed(), "the overflow fails the lane");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The actor's health read kept the failure, and its claim check
+        // follows with no await between them.
+        until(|| lane.first_cause().is_some()).await;
         assert_eq!(
             *lane.driver.health().borrow(),
             via_adapters::DriverHealth::Open,
