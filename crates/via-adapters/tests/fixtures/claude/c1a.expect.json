@@ -2,6 +2,16 @@
   "source": "CC c1a, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [],
   "sessions": {
     "main": {
@@ -17,22 +27,26 @@
       "session": "main",
       "start_after": null,
       "params": {
-        "prompt": "Remember token NONCE0001. Return JSON with kind alpha and token equal to it.",
+        "prompt": "Remember nonce NONCE0001. Return JSON with kind alpha and nonce equal to it.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": {
           "type": "object",
           "properties": {
             "kind": {
               "const": "alpha"
             },
-            "token": {
+            "nonce": {
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "token"
+            "nonce"
           ]
         },
         "max_steps": null
@@ -51,10 +65,12 @@
           "class_hint": null,
           "structured_output": {
             "kind": "alpha",
-            "token": "NONCE0001"
+            "nonce": "NONCE0001"
           },
           "cost": {
-            "scope": "session_cumulative"
+            "usd": 0.010124000000000001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
           }
         },
         "usage": {
@@ -65,20 +81,48 @@
           "scope": "turn"
         },
         "final_text": [
-          "{\"kind\":\"alpha\",\"token\":\"NONCE0001\"}"
+          "{\"kind\":\"alpha\",\"nonce\":\"NONCE0001\"}"
         ],
         "error": null,
         "cleanup": "quiescent",
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
           "turn.accepted",
           "progress",
-          "final_text"
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "StructuredOutput"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
         ],
         "observations_exclude": [],
         "observation_counts": {

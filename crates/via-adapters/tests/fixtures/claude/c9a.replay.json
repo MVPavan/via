@@ -1,5 +1,5 @@
 {
-  "source": "CC c9a, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 1352 ms). The probe closed stdin after the result, so await_eof follows it.  First of the c9a-c9b chain; c9b resumes it; its --resume value is captured.",
+  "source": "CC c9a, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 1352 ms). The probe closed stdin after the result, so await_eof follows it.  First of the c9a-c9b chain; c9b resumes it; its replay pins the literal --resume value (the resumed session ID its expectation states).",
   "argv": [
     "-p",
     "--input-format",

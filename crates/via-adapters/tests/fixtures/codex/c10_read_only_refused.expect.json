@@ -2,6 +2,16 @@
   "source": "Codex re-probe c10 (read-only bound: a slow denied write gave a failed item), 0.159.2, 2026-09-30",
   "harness": "codex",
   "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      0
+    ]
+  },
+  "pure_writes": [],
   "sessions": {
     "main": {
       "model": "gpt-6-sol",
@@ -18,7 +28,11 @@
       "params": {
         "prompt": "Sandbox conformance check.",
         "effort": "low",
-        "bound": "read_only",
+        "bound": {
+          "mode": "read_only",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -33,8 +47,10 @@
         "usage": null,
         "final_text": null,
         "error": null,
+        "cleanup": null,
         "stop_facts": null,
         "instance": null,
+        "warnings": [],
         "observations_include": [],
         "observations_exclude": [
           "turn.accepted"

@@ -6,6 +6,11 @@
 //! lost to a timeout. The gap between the kernel delivering the bytes and
 //! the reader taking the lock is inherent to any reader.
 //!
+//! When it publishes a line or EOF the reader also acknowledges it in the
+//! progress log (`read <k>` for the *k*th line, `eof`), still under the
+//! lock, so the ack is written before the main thread can take the event
+//! and a driver can order its next action after the arrival.
+//!
 //! A line is on time if and only if its arrival is at or before its limit:
 //! `within_ms` after the previous step's completion, capped by the run
 //! deadline. An expect step completes at its line's arrival.
@@ -18,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::MAX_LINE;
+use super::{MAX_LINE, Progress};
 
 /// Most events queued; the reader waits for room before it reads more.
 const QUEUE: usize = 2;
@@ -100,12 +105,12 @@ fn limit(previous: Instant, within_ms: Option<u64>, deadline: Instant) -> (Insta
 
 impl Input {
     /// Starts the reader thread.
-    pub(super) fn start(deadline: Instant) -> Result<Self, String> {
+    pub(super) fn start(deadline: Instant, progress: Progress) -> Result<Self, String> {
         let shared = Arc::new(Shared::default());
         let reader = Arc::clone(&shared);
         // Detached on purpose: it may block reading stdin until the process exits.
         thread::Builder::new()
-            .spawn(move || read_stdin(&reader))
+            .spawn(move || read_stdin(&reader, &progress))
             .map_err(|error| format!("cannot start the stdin reader: {error}"))?;
         Ok(Self::new(shared, deadline))
     }
@@ -171,8 +176,14 @@ impl Input {
     }
 
     /// Waits for EOF, which must not arrive before `previous`, the
-    /// completion of step `number - 1`.
-    pub(super) fn await_eof(&mut self, previous: Instant, number: usize) -> Result<(), String> {
+    /// completion of step `number - 1`, and returns its arrival: the
+    /// step's completion. A cached EOF is returned again, so consecutive
+    /// `await_eof` steps all pass.
+    pub(super) fn await_eof(
+        &mut self,
+        previous: Instant,
+        number: usize,
+    ) -> Result<Instant, String> {
         match self.next(self.deadline) {
             Some((at, Event::Eof)) if at > self.deadline => {
                 Err("deadline passed while awaiting EOF".to_owned())
@@ -180,7 +191,7 @@ impl Input {
             Some((at, Event::Eof)) if at < previous => {
                 Err(format!("stdin closed before step {} completed", number - 1))
             }
-            Some((_, Event::Eof)) => Ok(()),
+            Some((at, Event::Eof)) => Ok(at),
             Some((_, Event::Line(_))) => Err("unexpected input while awaiting EOF".to_owned()),
             Some((_, Event::Error(error))) => Err(error),
             None => Err("deadline passed while awaiting EOF".to_owned()),
@@ -201,18 +212,20 @@ impl Input {
                 self.eof = Some(at);
                 Ok(())
             }
-            Some((_, Event::Line(_) | Event::Error(_))) => {
-                Err("unexpected input after the last expect".to_owned())
-            }
+            Some((_, Event::Line(_))) => Err("unexpected input after the last expect".to_owned()),
+            Some((_, Event::Error(error))) => Err(error),
             None => Ok(()),
         }
     }
 }
 
 /// Reads stdin line by line until EOF or an error. It waits for room before
-/// each read, reads without the lock, then stamps and publishes under it.
-fn read_stdin(shared: &Shared) {
+/// each read, reads without the lock, then stamps, publishes and
+/// acknowledges a line or EOF in the progress log under it. An event whose
+/// acknowledgement failed is replaced by that input error.
+fn read_stdin(shared: &Shared, progress: &Progress) {
     let mut input = io::stdin().lock();
+    let mut lines = 0_usize;
     loop {
         let mut queue = shared.lock();
         while queue.len() >= QUEUE {
@@ -233,8 +246,27 @@ fn read_stdin(shared: &Shared) {
             }
             Ok(_) => Event::Error("stdin ended within a partial line".to_owned()),
         };
+        let ack = match event {
+            Event::Line(_) => {
+                lines += 1;
+                Some(format!("read {lines}"))
+            }
+            Event::Eof => Some("eof".to_owned()),
+            Event::Error(_) => None,
+        };
+        let mut queue = shared.lock();
+        let at = Instant::now();
+        // Acknowledged under the lock, so the main thread cannot take the
+        // event (and the process cannot end on it) before the ack is written.
+        // An event whose ack failed is published as that error instead, so
+        // it can never be taken as a good line or EOF.
+        let event = match ack.and_then(|ack| progress.log(&ack).err()) {
+            Some(error) => Event::Error(error),
+            None => event,
+        };
         let last = !matches!(event, Event::Line(_));
-        shared.lock().push_back((Instant::now(), event));
+        queue.push_back((at, event));
+        drop(queue);
         shared.changed.notify_all();
         if last {
             return;
@@ -379,7 +411,9 @@ mod tests {
             Err("stdin closed before step 3 completed".to_owned())
         );
         let mut equal = queued(vec![(previous, Event::Eof)], deadline);
-        assert_eq!(equal.await_eof(previous, 4), Ok(()));
+        assert_eq!(equal.await_eof(previous, 4), Ok(previous));
+        // The cached EOF completes a second wait at the same instant.
+        assert_eq!(equal.await_eof(previous, 5), Ok(previous));
     }
 
     #[test]
@@ -394,6 +428,6 @@ mod tests {
         );
         let (completed, _) = input.expect_line(previous, None).expect("the line");
         assert_eq!(completed, arrival);
-        assert_eq!(input.await_eof(completed, 2), Ok(()));
+        assert_eq!(input.await_eof(completed, 2), Ok(arrival + MS));
     }
 }

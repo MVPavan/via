@@ -1,5 +1,6 @@
 {
   "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 1054 ms). The probe closed stdin after the result, so await_eof follows it. The recorded exit code (1) and sanitized stderr are replayed by the exit step. The interrupt is answered with the captured request_id. AD19 order: user, interrupt, then EOF after the result (vendor spec Interrupt and Close).",
+  "notes": "Step 14 (the interrupt control_request) names step 11, the Bash tool_use, as its causal predecessor (after_emit): VIA writes it at the case's tool_started stop point, independently of the rate_limit_event the vendor wrote 10 ms later.",
   "argv": [
     "-p",
     "--input-format",
@@ -113,7 +114,8 @@
         },
         "capture": {
           "rid": "/request_id"
-        }
+        },
+        "after_emit": 11
       }
     },
     {

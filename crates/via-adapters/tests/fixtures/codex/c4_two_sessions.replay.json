@@ -1,5 +1,6 @@
 {
   "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits) (A recorded read-only, B workspace-write); requests in VIA's per-session order (the probe sent both thread/start before both turn/start); A's tool start kept after B's as recorded; B's marker command simplified; B's changed-bound second turn dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "notes": "Step 10 (A's turn/start) names step 8, A's thread/start reply, as its causal predecessor (after_emit), independently of the thread/started notification. Step 22 (B's thread/start) names step 11, A's turn/start reply: the case starts B on A's acceptance, independently of A's later item traffic. Step 25 (B's turn/start) names step 23, B's thread/start reply, independently of B's thread/started notification.",
   "argv": [
     "app-server",
     "--disable",
@@ -115,7 +116,8 @@
         },
         "capture": {
           "turn_a": "/id"
-        }
+        },
+        "after_emit": 8
       }
     },
     {
@@ -191,7 +193,8 @@
         },
         "absent": [
           "/params/developerInstructions"
-        ]
+        ],
+        "after_emit": 11
       }
     },
     {
@@ -229,7 +232,8 @@
         },
         "capture": {
           "turn_b": "/id"
-        }
+        },
+        "after_emit": 23
       }
     },
     {

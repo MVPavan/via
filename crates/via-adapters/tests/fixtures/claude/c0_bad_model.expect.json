@@ -2,6 +2,16 @@
   "source": "CC c0_bad_model, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [],
   "sessions": {
     "main": {
@@ -19,7 +29,11 @@
       "params": {
         "prompt": "Reply with just READY.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -36,7 +50,12 @@
           "vendor_stop_reason": "stop_sequence",
           "class_hint": "vendor_error",
           "vendor_code": "model_not_found",
-          "detail": "There's an issue with the selected model (claude-nonexistent-model-9). It may not exist or you may not have access to it. Run --model to pick a different model."
+          "detail": "There's an issue with the selected model (claude-nonexistent-model-9). It may not exist or you may not have access to it. Run --model to pick a different model.",
+          "cost": {
+            "usd": 0,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          }
         },
         "usage": {
           "from": "terminal",
@@ -51,10 +70,23 @@
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 1,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
           "turn.accepted"
         ],
         "observations_exclude": [
@@ -72,10 +104,6 @@
           {
             "field": "acceptance_timing",
             "why": "acceptance on the result, not the synthetic message: pinned by via-p98.3.2's normalizer unit test, not by replay"
-          },
-          {
-            "field": "exit",
-            "why": "the fixture replays exit 1 with the sanitized unrecognized_model stderr line; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
           }
         ],
         "notes": "An explicit model id outside the bundled catalog passes to the vendor (packet §2 models, §4 model). Init echoes the unresolved name and confirms identity. The synthetic model_not_found message is no progress and no acceptance; the post-init result (subtype success, is_error true, terminal_reason api_error, api_error_status 404) accepts the turn and is a Failed terminal, class vendor_error, vendor_code model_not_found, its text in detail (C2 §2, §6.2 class hints; packet §5; coordinator ruling on is_error text). Replay pins stdin EOF after the result and replays the recorded exit 1 and stderr line."

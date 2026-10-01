@@ -2,6 +2,16 @@
   "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [],
   "sessions": {
     "main": {
@@ -17,22 +27,26 @@
       "session": "main",
       "start_after": null,
       "params": {
-        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "prompt": "Return JSON with kind beta and nonce equal to the nonce I asked you to remember in the previous turn.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": {
           "type": "object",
           "properties": {
             "kind": {
               "const": "beta"
             },
-            "token": {
+            "nonce": {
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "token"
+            "nonce"
           ]
         },
         "max_steps": null
@@ -51,10 +65,12 @@
           "class_hint": null,
           "structured_output": {
             "kind": "beta",
-            "token": "NONCE0001"
+            "nonce": "NONCE0001"
           },
           "cost": {
-            "scope": "session_cumulative"
+            "usd": 0.020783000000000003,
+            "scope": "session_cumulative",
+            "provenance": "reported"
           }
         },
         "usage": {
@@ -65,20 +81,49 @@
           "scope": "turn"
         },
         "final_text": [
-          "{\"kind\":\"beta\",\"token\":\"NONCE0001\"}"
+          "{\"kind\":\"beta\",\"nonce\":\"NONCE0001\"}"
         ],
         "error": null,
         "cleanup": "quiescent",
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1,
+            "vendor_session_id": "11111111-1111-4111-8111-111111111111"
+          },
           "turn.accepted",
           "progress",
-          "final_text"
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "StructuredOutput"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
         ],
         "observations_exclude": [],
         "observation_counts": {
@@ -89,7 +134,7 @@
           "turn.accepted"
         ],
         "unasserted": [],
-        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. A new private process resumes the exact confirmed UUID with a replaced schema (C2 §2 reopen; packet §4); the matching init confirms this generation (session.reopened). Tokens are this turn's aggregate; cost is session_cumulative (packet §5)."
+        "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. A new private process resumes the exact confirmed UUID with a replaced schema (C2 §2 reopen; packet §4); the matching init confirms this generation (session.reopened). Tokens are this turn's aggregate; cost is session_cumulative (packet §5)."
       }
     }
   ]

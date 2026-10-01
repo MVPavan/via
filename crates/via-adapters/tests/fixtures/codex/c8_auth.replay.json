@@ -1,5 +1,6 @@
 {
   "source": "Codex re-probe c8 (no login: 9 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized) (model/list was never recorded without a login); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); reduced to two retries, the transport-fallback warning and the final error; URLs, cf-ray and request ids removed; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
   "argv": [
     "app-server",
     "--disable",
@@ -115,7 +116,8 @@
         },
         "capture": {
           "turn": "/id"
-        }
+        },
+        "after_emit": 8
       }
     },
     {

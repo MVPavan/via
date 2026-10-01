@@ -2,6 +2,16 @@
   "source": "CC c0_bad_effort, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      0
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [],
   "sessions": {
     "main": {
@@ -19,7 +29,11 @@
       "params": {
         "prompt": "Reply with just READY.",
         "effort": "bogus",
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -38,6 +52,7 @@
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": null,
+        "warnings": [],
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",

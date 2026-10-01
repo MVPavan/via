@@ -2,6 +2,16 @@
   "source": "CC c3_queue, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [
     {
       "require": "steer",
@@ -24,7 +34,11 @@
       "params": {
         "prompt": "Use Bash to run exactly sleep 3, then reply FIRST_DONE.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -47,7 +61,9 @@
           "vendor_stop_reason": "end_turn",
           "class_hint": null,
           "cost": {
-            "scope": "session_cumulative"
+            "usd": 0.007379400000000001,
+            "scope": "session_cumulative",
+            "provenance": "reported"
           }
         },
         "usage": {
@@ -65,13 +81,41 @@
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
           "turn.accepted",
           "progress",
-          "final_text"
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Bash"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
         ],
         "observations_exclude": [
           "steer.delivered"

@@ -1,5 +1,6 @@
 {
   "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the recorded exit 0 and its one stderr line (timestamp and pid neutralized) end the replay as an exit step",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
   "argv": [
     "app-server",
     "--disable",
@@ -115,7 +116,8 @@
         },
         "capture": {
           "turn": "/id"
-        }
+        },
+        "after_emit": 8
       }
     },
     {

@@ -2,6 +2,16 @@
   "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [
     {
       "require": "cancel",
@@ -28,7 +38,11 @@
       "params": {
         "prompt": "Use Bash to run exactly sleep 12. Then say DONE.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -48,7 +62,9 @@
           "vendor_stop_reason": "tool_use",
           "class_hint": null,
           "cost": {
-            "scope": "session_cumulative"
+            "usd": 0.0039688,
+            "scope": "session_cumulative",
+            "provenance": "reported"
           }
         },
         "usage": {
@@ -68,12 +84,40 @@
           "shared": false
         },
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 1,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
           "turn.accepted",
-          "progress"
+          "progress",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Bash"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "toolu_01SYNTH000001"
+            ]
+          }
         ],
         "observations_exclude": [
           "final_text"
@@ -86,14 +130,6 @@
           "turn.accepted"
         ],
         "unasserted": [
-          {
-            "field": "exit",
-            "why": "the fixture replays exit 1 with empty stderr; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
-          },
-          {
-            "field": "cleanup_provenance",
-            "why": "GroupAbsent evidence and the S1 close sequence need driver-side Host evidence; via-p98.3.2's drive must collect them"
-          },
           {
             "field": "leftovers",
             "why": "S-LEFTOVER (via-jm4.28)"

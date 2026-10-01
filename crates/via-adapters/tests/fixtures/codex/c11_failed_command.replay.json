@@ -1,5 +1,6 @@
 {
   "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded workspace-write policy to dangerFullAccess; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
   "argv": [
     "app-server",
     "--disable",
@@ -115,7 +116,8 @@
         },
         "capture": {
           "turn": "/id"
-        }
+        },
+        "after_emit": 8
       }
     },
     {
