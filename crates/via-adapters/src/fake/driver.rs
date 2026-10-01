@@ -112,7 +112,7 @@ pub(crate) async fn run_turn(
         force,
     } = cx;
     let first = matches!(prepared, Prepared::NeedsConnection);
-    let (generation, capacity, reservation) = match driver.connect(prepared, capacity) {
+    let (generation, capacity, reservation) = match driver.connect(prepared, capacity).await {
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
@@ -339,7 +339,7 @@ fn after_persistent_turn(
         && end.outcome.is_ok()
     {
         driver.tracker.spawn(idle_source(
-            Arc::clone(&driver.state),
+            (Arc::clone(&driver.state), Arc::clone(&driver.barrier)),
             generation,
             (driver.observations.clone(), Arc::clone(&driver.health)),
             (
@@ -671,9 +671,11 @@ fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
 /// session: the slot is released, the pin invalidated, and a session-level
 /// `VendorClosed` sent; one the channel does not take latches `overflow`.
 /// Started only after the turn before it returned; a later connection or
-/// the session's cancellation ends it.
+/// the session's cancellation ends it. It holds the generation barrier
+/// from its check until its item was delivered or given up, so the next
+/// connection's first observation follows it.
 async fn idle_source(
-    state: Arc<Mutex<DriverState>>,
+    (state, barrier): (Arc<Mutex<DriverState>>, Arc<tokio::sync::Mutex<()>>),
     generation: u64,
     (sink, health): (ObservationSink, Arc<watch::Sender<DriverHealth>>),
     (release, reason): (PathBuf, String),
@@ -689,6 +691,11 @@ async fn idle_source(
             () = tokio::time::sleep(IDLE_POLL) => {}
         }
     }
+    // Held until the close's item was delivered (C2 §4 generation barrier).
+    let _barrier = tokio::select! {
+        () = cancel.cancelled() => return,
+        barrier = barrier.lock() => barrier,
+    };
     let released = {
         let mut state = lock(&state);
         if state.generation != generation || !state.live || state.closed {

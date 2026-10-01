@@ -2418,6 +2418,113 @@ fn an_idle_close_the_stalled_channel_cannot_take_latches_overflow() {
     assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
 }
 
+/// C2 §4 generation barrier (persistent profile): a driver admits a new
+/// generation's first observation only after the previous generation's
+/// last. The old generation's idle `VendorClosed` is in flight, blocked on
+/// the full channel, when the next turn opens a new connection; draining
+/// then reads every old item before the new generation's first.
+#[test]
+fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    // The accepted mark, 1022 model marks and the final text: a full channel.
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS - 2),
+        vec![terminal(1, "completed", "end_turn")],
+    ]
+    .concat();
+    let rig = Rig::new(
+        &profile,
+        &[
+            script(1, &steps),
+            script(2, &[accepted(2), terminal(2, "completed", "end_turn")]),
+        ],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + (OBSERVATION_ITEMS - 2) / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(receiver.len(), OBSERVATION_ITEMS, "the channel is full");
+    assert!(matches!(driver.prepare(), Prepared::Pinned(_)));
+    assert!(!controls.released());
+    release(&sync, "idle");
+    // The slot goes before the close's item is offered: once it is released
+    // the `VendorClosed` waits on the full channel.
+    rig.runtime.block_on(async {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !controls.released() {
+            assert!(tokio::time::Instant::now() < by, "the idle close never ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let prepared = driver.prepare();
+    assert!(matches!(prepared, Prepared::NeedsConnection));
+    let (mut cx, _controls) = turn_cx(2, prepared, WALL);
+    // A base in the past: the first arrival reads as a nonzero clock.
+    cx.activity = TurnActivity::new(
+        tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap(),
+    );
+    let activity = cx.activity.clone();
+    let (end, items) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        // Nothing is drained until the new generation's acceptance is in
+        // flight, or for a second: a driver that holds the barrier offers
+        // nothing before the old close was taken. The window only gives a
+        // driver without it the chance to; the order holds whatever its
+        // length.
+        let window = tokio::time::Instant::now() + Duration::from_secs(1);
+        while activity.last_ms() == 0 && tokio::time::Instant::now() < window {
+            tokio::select! {
+                end = &mut run => panic!("turn 2 ended undelivered: {end:?}"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        let mut items = Vec::new();
+        let end = loop {
+            tokio::select! {
+                Some(admitted) = receiver.recv() => items.push(admitted.item),
+                end = &mut run => break end,
+            }
+        };
+        while let Ok(admitted) = receiver.try_recv() {
+            items.push(admitted.item);
+        }
+        (checked(end), items)
+    });
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let new = |item: &ObservationItem| {
+        item.vendor_turn
+            .as_ref()
+            .is_some_and(|id| id.as_str() == vendor_turn(2))
+    };
+    let first_new = items.iter().position(new).unwrap();
+    let old = &items[..first_new];
+    assert!(
+        old.len() == OBSERVATION_ITEMS + 1
+            && matches!(
+                old[OBSERVATION_ITEMS].observation,
+                Observation::VendorClosed(_)
+            ),
+        "the old generation's close was not read before the new generation's first item: {:?}",
+        items[OBSERVATION_ITEMS - 1..]
+            .iter()
+            .map(|item| (&item.vendor_turn, &item.observation))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        items[first_new..].iter().all(new),
+        "no old item after the new generation's first"
+    );
+}
+
 /// C2 §2 Close: a `close()` dropped before it was polled leaves the driver
 /// untouched; a later close stops the running turn.
 #[test]

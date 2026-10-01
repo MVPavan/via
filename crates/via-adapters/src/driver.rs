@@ -247,6 +247,11 @@ pub struct SessionDriver {
     /// outcome ([`Self::journal_uncertain`]).
     pub(crate) journal: Arc<watch::Sender<bool>>,
     pub(crate) state: Arc<Mutex<DriverState>>,
+    /// The C2 §4 generation barrier: an idle close holds it from its
+    /// generation check until its `VendorClosed` was delivered, and a new
+    /// connection takes it to advance the generation. So a new
+    /// generation's first observation follows the previous one's last.
+    pub(crate) barrier: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionDriver {
@@ -274,6 +279,7 @@ impl SessionDriver {
             health: Arc::new(watch::Sender::new(DriverHealth::Open)),
             journal: Arc::new(watch::Sender::new(false)),
             state: Arc::new(Mutex::new(state)),
+            barrier: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -328,12 +334,18 @@ impl SessionDriver {
     /// (AD16 rule 4), and a new connection advances the generation and
     /// replaces any earlier one. On the persistent profile the slot stays
     /// with the turn's [`Reservation`] until its handshake succeeded;
-    /// otherwise it goes to Host with the process, and is returned.
-    pub(crate) fn connect(
+    /// otherwise it goes to Host with the process, and is returned. A new
+    /// connection first waits for an older generation's idle close in
+    /// flight (C2 §4 generation barrier).
+    pub(crate) async fn connect(
         &self,
         prepared: Prepared,
         capacity: Option<CapacityToken>,
     ) -> Result<(u64, Option<CapacityToken>, Reservation), AdapterError> {
+        let _barrier = match prepared {
+            Prepared::NeedsConnection => Some(self.barrier.lock().await),
+            Prepared::Pinned(_) => None,
+        };
         let persistent = self.persistent();
         let mut state = self.state();
         if state.closed {
