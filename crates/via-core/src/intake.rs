@@ -340,7 +340,6 @@ pub(crate) fn refused(refusal: &Refusal) -> ApiError {
     }
 }
 
-/// The harness `route` serves, when this build knows it.
 /// The static name of a known `route`, as frozen in a session.
 pub(crate) fn route_name(route: &str) -> Option<&'static str> {
     harness_names()
@@ -349,6 +348,7 @@ pub(crate) fn route_name(route: &str) -> Option<&'static str> {
         .find(|known| *known == route)
 }
 
+/// The harness `route` serves, when this build knows it.
 fn harness_of(route: &str) -> Option<&'static str> {
     harness_names()
         .filter_map(Harness::parse)
