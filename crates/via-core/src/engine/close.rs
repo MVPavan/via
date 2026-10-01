@@ -264,9 +264,20 @@ impl Engine {
             }
         }
         // Step 4: the bounded absence check, selecting on force [r5.9].
+        // C2 §2 Close: the session's driver closes first, releasing any
+        // connection it holds, by the same bound.
         let bound = task
             .deadline
             .min(tokio::time::Instant::now() + CLOSE_ALLOWANCE);
+        let mode = match task.mode {
+            CloseMode::Graceful => via_adapters::CloseMode::Graceful,
+            CloseMode::Force => via_adapters::CloseMode::Force,
+        };
+        tokio::select! {
+            biased;
+            _ = force.wait_for(Option::is_some) => return Some(Step::Next),
+            () = self.close_lane(session, mode, Deadline::at(bound)) => {}
+        }
         tokio::select! {
             biased;
             _ = force.wait_for(Option::is_some) => return Some(Step::Next),

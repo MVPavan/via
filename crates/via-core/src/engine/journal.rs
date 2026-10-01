@@ -380,8 +380,23 @@ pub(super) async fn commit_event_at(
     body: EventBody,
     at: &str,
 ) {
+    let own = (record.turn.get(), false);
+    commit_event_as(journal, record, body, at, own).await;
+}
+
+/// [`commit_event_at`] attributed to `(turn, late)`: a late observation of
+/// an earlier turn is committed under the running turn's record, the one
+/// the Store admits events for, with its own turn and `late: true` (C1
+/// §6.1, AD4). Returns the event's sequence once it committed.
+pub(super) async fn commit_event_as(
+    journal: &impl TurnJournal,
+    record: &mut TurnRecord,
+    body: EventBody,
+    at: &str,
+    (turn, late): (u32, bool),
+) -> Option<u64> {
     if record.first_failure.is_some() {
-        return;
+        return None;
     }
     let failed = |outcome| {
         Some(FailureNote {
@@ -395,22 +410,22 @@ pub(super) async fn commit_event_at(
         Err(error) => {
             // The head's read failed: nothing was written; corruption latches.
             record.first_failure = failed(WriteOutcome::of_read(&error));
-            return;
+            return None;
         }
     };
     let seq = head.next();
     let event = Event {
         seq,
         session_id: &record.session,
-        turn: Some(record.turn.get()),
-        late: false,
+        turn: Some(turn),
+        late,
         at,
         body,
     }
     .to_value();
     let Ok(event) = event else {
         record.first_failure = failed(WriteOutcome::NotCommitted);
-        return;
+        return None;
     };
     // Test builds: the event is about to be sent to the Store writer, which
     // stays free while this pauses (design §10 [r5.7]).
@@ -434,9 +449,10 @@ pub(super) async fn commit_event_at(
                 accepted: None,
             });
         }
-        return;
+        return None;
     }
     head.committed(1);
+    Some(seq)
 }
 
 /// Settles an uncertain event against the durable stream: a durable event

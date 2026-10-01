@@ -19,7 +19,10 @@ use super::{
 use crate::api::{Event, EventBody, FailureClass};
 use crate::engine::drive::SubmitFailure;
 use crate::engine::{Engine, Started, Terminal, TurnRecord, failure};
-use crate::{ApiError, FakeConfig, SessionId, SpawnParams, TurnNumber, TurnState, WaitParams};
+use crate::{
+    AdapterConfig, ApiError, BootstrapEnv, SessionId, SpawnParams, TurnNumber, TurnState,
+    WaitParams,
+};
 
 const SESSION: &str = "s_0123456789ab";
 /// The turn's evidence folder as `Started` carries it.
@@ -224,6 +227,7 @@ fn record() -> TurnRecord {
         first_failure: None,
         uncertain: None,
         steps: crate::engine::progress::StepTracker::default(),
+        vendor: crate::engine::lane::VendorRecord::default(),
     }
 }
 
@@ -447,8 +451,8 @@ fn engine(root: &tempfile::TempDir) -> Engine {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
     });
-    let fake = FakeConfig::from_environment().unwrap();
-    Engine::open(&state, &runtime, fake, root.path().join("via")).unwrap()
+    let adapters = AdapterConfig::load(BootstrapEnv::capture(), None).unwrap();
+    Engine::open(&state, &runtime, adapters, root.path().join("via")).unwrap()
 }
 
 /// Commits the receipt of `session` through `store`, with `turn.submitted` if `submitted`.

@@ -252,6 +252,7 @@ impl CloseOrder {
 
 /// The close pass's view of the close order.
 pub(super) struct CloseTask {
+    pub(super) mode: CloseMode,
     pub(super) deadline: tokio::time::Instant,
     pub(super) requested_at: String,
     pub(super) operation: Option<CloseIntent>,
@@ -921,6 +922,7 @@ impl Slot {
     /// The close pass's copy of the close order.
     pub(super) fn close_task(&self) -> Option<CloseTask> {
         lock(&self.state).close.as_ref().map(|close| CloseTask {
+            mode: close.mode,
             deadline: close.deadline,
             requested_at: close.requested_at.clone(),
             operation: close.operation.clone(),

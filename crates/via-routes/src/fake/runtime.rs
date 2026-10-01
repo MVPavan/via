@@ -19,7 +19,7 @@ mod lane;
 
 pub use lane::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeTerminal, FakeTurn, Lane, Retirement, SteerRefused,
-    SteerRequest, SteerSender, TurnCause, TurnFailure, steer_lane,
+    SteerRequest, SteerSender, steer_lane,
 };
 
 /// Final fake protocol evidence, including independently confirmed process exit.
@@ -57,7 +57,10 @@ impl FakeRoute {
         Ok(Self { wire })
     }
 
-    /// Sends one prompt after durable submission and awaits paired terminal and real exit.
+    /// Sends one prompt after durable submission and awaits the paired
+    /// terminal and real exit (adapter design §3.2), with the `lane`'s
+    /// handshake, steer control, interrupt acknowledgement and persistent
+    /// profile.
     ///
     /// Every decoded message, including acceptance, the terminal and late
     /// observations after it, is sent on the `hop` in decode order. While
@@ -77,33 +80,11 @@ impl FakeRoute {
     /// ends the turn normally, and at `force_at` without one the group is
     /// force-closed under `close_by`. Either stop is
     /// [`RouteError::Stopped`].
-    pub async fn execute(
-        &self,
-        process: PrivateProcessSpec,
-        start: TurnStart,
-        hop: mpsc::Sender<RouteMessage>,
-        deadline: Deadline,
-        force: watch::Receiver<Option<tokio::time::Instant>>,
-        stop: StopWatch,
-    ) -> Result<FakeRouteResult, RouteFailure> {
-        self.run(
-            process,
-            start,
-            hop,
-            (deadline, force, stop),
-            Lane::legacy(),
-            None,
-        )
-        .await
-        .0
-    }
-
-    /// The C2 driver lane's turn (adapter design §3.2): [`Self::execute`]
-    /// with the `lane`'s handshake, steer control, interrupt
-    /// acknowledgement and persistent profile. The logical turn, with the
-    /// terminal and handshake retained on every outcome (AD4, AD7), goes on
-    /// `logical` when it ends: on the persistent profile that can be before
-    /// its process is retired (C2 §4.1). Returns the process's retirement.
+    ///
+    /// The logical turn, with the terminal and handshake retained on every
+    /// outcome (AD4, AD7), goes on `logical` when it ends: on the persistent
+    /// profile that can be before its process is retired (C2 §4.1).
+    /// Returns the process's retirement.
     pub async fn turn(
         &self,
         process: PrivateProcessSpec,
@@ -119,14 +100,7 @@ impl FakeRoute {
     ) -> Retirement {
         let persistent = lane.persistent;
         let (result, mut facts) = self
-            .run(
-                process,
-                start,
-                hop,
-                (deadline, force, stop),
-                lane,
-                Some(logical),
-            )
+            .run(process, start, hop, (deadline, force, stop), lane, logical)
             .await;
         let retirement = Retirement::of(&result);
         if let Some(logical) = facts.logical.take() {
@@ -136,7 +110,7 @@ impl FakeRoute {
         retirement
     }
 
-    /// The entry checks of both lanes, then the turn while the waker runs.
+    /// The entry checks, then the turn while the waker runs.
     async fn run(
         &self,
         process: PrivateProcessSpec,
@@ -148,9 +122,10 @@ impl FakeRoute {
             StopWatch,
         ),
         lane: Lane,
-        logical: Option<oneshot::Sender<FakeTurn>>,
+        logical: oneshot::Sender<FakeTurn>,
     ) -> (Result<FakeRouteResult, RouteFailure>, Facts) {
         let turn = start.turn();
+        let logical = Some(logical);
         let not_launched = |cause| RouteFailure {
             cause,
             undecoded: None,
@@ -159,6 +134,8 @@ impl FakeRoute {
             cleanup: None,
             forced: false,
             journal_uncertain: false,
+            acknowledged: false,
+            shared: false,
         };
         let unlaunched = |logical| Facts {
             logical,
@@ -208,7 +185,7 @@ impl FakeRoute {
         }
     }
 
-    /// [`Self::execute`] after its entry checks, while the waker runs. Every
+    /// [`Self::turn`] after its entry checks, while the waker runs. Every
     /// exit after the connection opened finishes it once, under the graceful
     /// close's `close_by`, the force close's cleanup deadline or the stop
     /// order's `close_by` (design §8.6).
@@ -305,7 +282,11 @@ impl FakeRoute {
             | RouteError::Overflow { .. }
             | RouteError::Store { .. }
             | RouteError::Stopped { .. }
-            | RouteError::ForceStopped { .. } => failed.close_by.unwrap_or_else(cleanup_deadline),
+            | RouteError::ForceStopped { .. }
+            | RouteError::ServerLost { .. }
+            | RouteError::HandshakeRefused { .. }
+            | RouteError::InvalidParam { .. }
+            | RouteError::ResumeMismatch { .. } => failed.close_by.unwrap_or_else(cleanup_deadline),
         };
         if serving.keeps_server(&failed.cause) {
             // AD4 (persistent profile): at the wall, the cleanup step is the
@@ -324,6 +305,8 @@ impl FakeRoute {
                 cleanup: Some(report.cleanup),
                 forced: report.forced,
                 journal_uncertain: report.journal_uncertain,
+                acknowledged: false,
+                shared: false,
             });
         }
         let report = sender
@@ -345,6 +328,8 @@ impl FakeRoute {
             cleanup: Some(report.cleanup),
             forced: report.forced,
             journal_uncertain: report.journal_uncertain,
+            acknowledged: false,
+            shared: false,
         })
     }
 
@@ -760,6 +745,8 @@ impl<'a> Serving<'a> {
             cleanup: Some(result.cleanup),
             forced: result.forced,
             journal_uncertain: result.journal_uncertain,
+            acknowledged: false,
+            shared: false,
         }
     }
 
@@ -833,7 +820,10 @@ impl<'a> Serving<'a> {
                     self.phase
                         .advance(&payload, turn, interrupted)
                         .map_err(Failed::from)?;
-                    self.note(&payload)?;
+                    if !self.note(&payload)? {
+                        // Recorded, not handed over (C2 §2 Reopen).
+                        continue;
+                    }
                     Ok(Next::Message(RouteMessage { payload }))
                 }
                 Err(cause) => {
@@ -1209,6 +1199,8 @@ fn acquire_failure(
         cleanup,
         forced,
         journal_uncertain,
+        acknowledged: false,
+        shared: false,
     }
 }
 

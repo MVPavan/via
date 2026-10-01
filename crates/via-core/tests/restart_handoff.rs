@@ -17,7 +17,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use via_core::{Engine, FakeConfig, ResumeParams, SessionId, SpawnParams};
+use via_core::{AdapterConfig, BootstrapEnv, Engine, ResumeParams, SessionId, SpawnParams};
 
 const CHILD: &str = "VIA_RESTART_HANDOFF_CHILD";
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -73,7 +73,7 @@ fn open(root: &Path) -> Engine {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),
-        FakeConfig::from_environment().unwrap(),
+        AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
         binary("via"),
     )
     .unwrap()

@@ -3290,7 +3290,7 @@ fn s1_f12_exit_observed_under_force_is_the_force_row() -> TestResult {
 #[test]
 fn s1_store_harness_final_stop_is_within_the_teardown_deadline() -> TestResult {
     evidenced(|| {
-        let mut sandbox = Sandbox::new(&json!({}))?;
+        let mut sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // No collection: this checks the stop helper alone.
         drop(sandbox.evidence.take());
         let mock = sandbox.root.path().join("mock-via");
@@ -3355,7 +3355,7 @@ fn s1_store_harness_final_stop_is_within_the_teardown_deadline() -> TestResult {
 #[test]
 fn s1_store_harness_background_timeout_stays_typed() -> TestResult {
     evidenced(|| {
-        let mut sandbox = Sandbox::new(&json!({}))?;
+        let mut sandbox = Sandbox::new(&json!({"scripts": []}))?;
         drop(sandbox.evidence.take());
         let mock = sandbox.root.path().join("hanging-via");
         fs::write(&mock, b"#!/bin/sh\nexec sleep 30\n")?;

@@ -4,7 +4,7 @@
 //! blocked past the lowered stall fails the turn `overflow`. The 4 MiB byte
 //! budget (`512 + Σ(64 + len)`) is out of the fake route's reach, whose
 //! strings are at most 1 KiB (design §2.2 rule 1): 1,024 items cost under
-//! 3 MiB. `crates/via-adapters/src/runtime.rs` checks it at the delivery. The test holds the channel's receiver
+//! 3 MiB. `crates/via-adapters/src/observation.rs` checks it at the delivery. The test holds the channel's receiver
 //! and never drains it, so it can pace the vendor on what the channel
 //! admitted: each batch is released once the channel holds every item
 //! before it. Written before the bounded channel. Each case re-executes
@@ -24,17 +24,18 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use via_adapters::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Deadline, FakeConfig, OBSERVATION_ITEMS,
-    RouteError, RuntimeConfig, SessionId, TurnNumber,
-};
+use via_adapters::{AdapterError, Deadline, OBSERVATION_ITEMS, RouteError, SessionId};
 use via_store::{SpawnRecord, Store};
+
+#[path = "support/one_turn.rs"]
+mod one_turn;
 
 const SESSION: &str = "s_0123456789ab";
 const CHILD: &str = "VIA_OBSERVATION_BUDGET_CHILD";
 /// Bound on one child case.
 const CHILD_LIMIT: Duration = Duration::from_secs(60);
-/// The vendor releases batch `i` once `go.<i>` exists in its sync dir.
+/// The vendor releases batch `i` once `go.<i>` exists in its sync dir. The
+/// batches are sidecars of the scenario, which is valid JSON (decision H2).
 const VENDOR: &str = r#"#!/bin/sh
 read -r start
 i=0
@@ -78,7 +79,7 @@ fn run_child(name: &str, batches: &[Vec<Value>]) {
     fs::write(&vendor, VENDOR).unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
     let scenario = root.path().join("scenario");
-    fs::write(&scenario, b"").unwrap();
+    fs::write(&scenario, br#"{"scripts":[]}"#).unwrap();
     for (index, batch) in batches.iter().enumerate() {
         let body: String = batch.iter().map(|line| line.to_string() + "\n").collect();
         fs::write(root.path().join(format!("scenario.{index}")), body).unwrap();
@@ -133,33 +134,19 @@ fn run_turn(root: &Path, admitted: &[usize]) -> (usize, AdapterError) {
             initial_event: json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
         }))
         .unwrap();
-    let adapter = AdapterRuntime::new(
-        AdapterRuntimeConfig {
-            runtime: RuntimeConfig {
-                anchor_binary: via_binary(),
-                anchor_dir: root.join("runtime"),
-            },
-            fake: FakeConfig::from_environment().unwrap(),
-        },
-        store.runtime_resources(),
-    )
-    .unwrap();
+    let adapter = one_turn::OneTurn::new(&store, root, via_binary());
     let sync = root.join("sync");
     fs::write(sync.join("go.0"), b"").unwrap();
-    let (sink, receiver) = via_adapters::observation_channel();
+    let (driver, receiver) = adapter.session(SESSION, root);
     let (_force, force) = tokio::sync::watch::channel(None);
     let result = runtime.block_on(async {
-        let execute = adapter.execute(
-            SessionId::try_from(SESSION).unwrap(),
-            TurnNumber::try_from(1).unwrap(),
-            ("hello".to_owned(), adapter.fake_cwd().to_path_buf()),
-            sink,
-            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
+        let cx = one_turn::turn_cx(
+            driver.prepare(),
             Deadline::at(tokio::time::Instant::now() + Duration::from_secs(40)),
             force,
             tokio::sync::watch::channel(None).1,
-            Box::new(()),
         );
+        let execute = driver.run_turn(one_turn::hello(), cx);
         let pace = async {
             for (index, &items) in admitted.iter().enumerate() {
                 let bound = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -174,10 +161,11 @@ fn run_turn(root: &Path, admitted: &[usize]) -> (usize, AdapterError) {
                 fs::write(sync.join(format!("go.{}", index + 1)), b"").unwrap();
             }
         };
-        let (result, ()) = tokio::join!(execute, pace);
-        result
+        let (end, ()) = tokio::join!(execute, pace);
+        end.outcome
     });
     let held = receiver.len();
+    drop(driver);
     drop(adapter);
     drop(store);
     // The undrained turn never completes.

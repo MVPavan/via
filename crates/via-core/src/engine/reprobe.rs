@@ -219,7 +219,7 @@ impl Engine {
     /// Holds a slot for each anchor of the page Host did not prove absent,
     /// as startup reconciliation does (design §11): Host keeps its token
     /// until a later proof.
-    fn hold_unread(&self, owners: &[AnchorOwner], reports: &[via_adapters::FakeRecovery]) {
+    fn hold_unread(&self, owners: &[AnchorOwner], reports: &[via_adapters::AnchorRecovery]) {
         for owner in owners {
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent

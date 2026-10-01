@@ -18,8 +18,8 @@ use via_store::{SubmissionRecord, TerminalRecord};
 use super::{Engine, Receipted};
 use crate::api::{Event, EventBody, rfc3339};
 use crate::{
-    ApiError, DaemonStopParams, Deadline, FakeConfig, ResumeParams, SessionId, SpawnParams,
-    TurnNumber,
+    AdapterConfig, ApiError, BootstrapEnv, DaemonStopParams, Deadline, ResumeParams, SessionId,
+    SpawnParams, TurnNumber,
 };
 
 const CHILD: &str = "VIA_ENGINE_TEST_CHILD";
@@ -46,7 +46,7 @@ fn child(name: &str) -> Option<PathBuf> {
     fs::write(&vendor, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
     let scenario = root.path().join("scenario.json");
-    fs::write(&scenario, b"{}").unwrap();
+    fs::write(&scenario, br#"{"scripts":[]}"#).unwrap();
     let status = Command::new(env::current_exe().unwrap())
         .args(["--exact", &format!("engine::tests::{name}"), "--nocapture"])
         .env(CHILD, root.path())
@@ -75,7 +75,7 @@ fn open_with(root: &Path, start_capacity: usize) -> Engine {
     Engine::open_with(
         &root.join("state"),
         &root.join("runtime"),
-        FakeConfig::from_environment().unwrap(),
+        AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
         root.join("absent-anchor"),
         start_capacity,
         None,
@@ -2047,6 +2047,7 @@ fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
             }),
             uncertain: None,
             steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
         };
         assert!(!engine.store_failed(), "the clean failure is scoped");
         let cause = via_adapters::RouteError::Store {
@@ -2095,6 +2096,7 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             first_failure: None,
             uncertain: None,
             steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
         };
         let effective: crate::api::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
@@ -2104,9 +2106,10 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
         // Model output after a tool result ends step 1: its row's commit
         // is the drained write (Task 4 design §3.2).
         let _ = record.steps.accept();
-        let marks = |model: bool, ended: &[&str]| via_adapters::FakeObservation::Data {
+        let marks = |model: bool, ended: &[&str]| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
             observation: via_adapters::Observation::Progress(via_adapters::ProgressMarks {
-                at: tokio::time::Instant::now(),
                 model,
                 tools_started: Vec::new(),
                 tools_ended: ended.iter().map(|id| (*id).to_owned()).collect(),
@@ -2185,6 +2188,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             first_failure: None,
             uncertain: None,
             steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
         };
         let terminal = super::Terminal {
             state: "failed",
@@ -2262,7 +2266,7 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
         // frozen `cwd` for the envelope it builds.
         assert_eq!(
             queueing.cwd.as_deref(),
-            engine.adapter.fake_cwd().to_str(),
+            engine.cwd.to_str(),
             "the rebuilt queueing lost the frozen cwd"
         );
         let slot = super::queue::Slot::new(super::journal::Head::new(None));
@@ -2380,6 +2384,7 @@ fn turn_one(session: &SessionId, uncertain: bool) -> super::TurnRecord {
             accepted: None,
         }),
         steps: super::progress::StepTracker::default(),
+        vendor: super::lane::VendorRecord::default(),
     }
 }
 
@@ -2582,11 +2587,17 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
         .unwrap();
-        let accepted =
-            via_adapters::FakeObservation::Accepted(via_adapters::FakeAcceptanceObservation {
-                correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
-                vendor_turn_id: via_adapters::VendorTurnId::try_from("v_1".to_owned()).unwrap(),
-            });
+        let vendor_turn = via_adapters::VendorTurnId::try_from("v_1".to_owned()).unwrap();
+        let accepted = via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(vendor_turn.clone()),
+            observation: via_adapters::Observation::Accepted(
+                via_adapters::observation::Acceptance {
+                    correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
+                    vendor_turn_id: Some(vendor_turn),
+                },
+            ),
+        };
         let n = arm_next(&points, point);
         engine
             .drain_queued(&slot, &mut record, &effective, orders, vec![accepted])

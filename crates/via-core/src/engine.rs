@@ -15,8 +15,11 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 use crate::api::{Cancel, Exit, Failure, FailureClass, Warning};
-use crate::{FakeConfig, SessionId, TurnNumber};
-use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
+use crate::{SessionId, TurnNumber};
+use via_adapters::{
+    AdapterConfig, AdapterSet, CancellationToken, DescribeRequest, RefusalKind, RuntimeConfig,
+    TaskTracker,
+};
 use via_store::{Store, StoreClient, StoreLock};
 
 mod batch;
@@ -25,6 +28,7 @@ mod control;
 mod drive;
 mod final_text;
 mod journal;
+mod lane;
 mod latch;
 mod progress;
 mod queue;
@@ -65,7 +69,17 @@ pub struct Receipted {
 pub struct Engine {
     _store_owner: Store,
     store: StoreClient,
-    adapter: AdapterRuntime,
+    adapter: AdapterSet,
+    /// The daemon's working directory at startup: a session that names no
+    /// `cwd` is frozen with it (design §11.1, §5.1 #22).
+    cwd: PathBuf,
+    /// Sessions' lanes on their drivers (C2 §2): opened at a session's
+    /// first dispatch, kept while a live connection can be pinned.
+    lanes: StdMutex<HashMap<SessionId, Arc<lane::Lane>>>,
+    /// Owns every task the drivers start (C2 §2 `SessionCx`).
+    tracker: TaskTracker,
+    /// The drivers' cancellation; final shutdown cancels it.
+    cancel: CancellationToken,
     active: AtomicUsize,
     admission: tokio::sync::Mutex<()>,
     /// The stop mode, the force watch and the latch's phase one with the
@@ -259,14 +273,15 @@ fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
 }
 
 impl Engine {
-    /// Opens the sole Store owner and passes unopened lower resources to Adapter/Wire.
+    /// Opens the sole Store owner and passes unopened lower resources to
+    /// Adapter/Wire, with the adapters' validated configuration.
     pub fn open(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
     ) -> Result<Self, String> {
-        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT, None)
+        Self::open_with(state, runtime, adapters, binary, DAEMON_QUEUE_LIMIT, None)
     }
 
     /// [`Engine::open`] under `lock`, the `store.lock` daemon main took
@@ -275,14 +290,14 @@ impl Engine {
     pub fn open_locked(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
         (lock, limits): (StoreLock, Limits),
     ) -> Result<Self, String> {
         Self::open_with(
             state,
             runtime,
-            fake,
+            adapters,
             binary,
             DAEMON_QUEUE_LIMIT,
             Some((lock, limits)),
@@ -295,7 +310,7 @@ impl Engine {
     fn open_with(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
         start_capacity: usize,
         locked: Option<(StoreLock, Limits)>,
@@ -303,6 +318,8 @@ impl Engine {
         // Test builds only: the named failpoints activate before any Store write.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::activate_from_environment()?;
+        let cwd = std::env::current_dir()
+            .map_err(|_| "daemon working directory is unavailable".to_owned())?;
         let limits = locked
             .as_ref()
             .map_or_else(Limits::default, |(_, limits)| *limits);
@@ -319,13 +336,11 @@ impl Engine {
         let observer = Arc::clone(&signal);
         owner.on_read_corruption(move || observer.read_corrupt());
         let store = owner.client();
-        let adapter = AdapterRuntime::new(
-            AdapterRuntimeConfig {
-                runtime: RuntimeConfig {
-                    anchor_binary: binary,
-                    anchor_dir: runtime.join("anchors"),
-                },
-                fake,
+        let adapter = AdapterSet::new(
+            adapters,
+            RuntimeConfig {
+                anchor_binary: binary,
+                anchor_dir: runtime.join("anchors"),
             },
             owner.runtime_resources(),
         )
@@ -336,6 +351,10 @@ impl Engine {
             _store_owner: owner,
             store,
             adapter,
+            cwd,
+            lanes: StdMutex::new(HashMap::new()),
+            tracker: TaskTracker::new(),
+            cancel: CancellationToken::new(),
             active: AtomicUsize::new(0),
             admission: tokio::sync::Mutex::new(()),
             signal,
@@ -460,6 +479,19 @@ impl Engine {
         self.adapter.pending_cleanup()
     }
 
+    /// Whether an adapter of this daemon serves `harness`: planning it is
+    /// not refused `harness_unavailable` (C2 §2 `plan`; pure).
+    fn harness_available(&self, harness: &str) -> bool {
+        let request = DescribeRequest {
+            harness: Some(harness.to_owned()),
+            ..DescribeRequest::default()
+        };
+        !matches!(
+            self.adapter.plan(&request),
+            Err(refusal) if refusal.kind == RefusalKind::HarnessUnavailable
+        )
+    }
+
     /// The session's dispatch slot, created when it has none. Whether a new
     /// turn may run behind earlier ones is decided from their durable state.
     fn slot_for(&self, session: &SessionId) -> Arc<Slot> {
@@ -475,7 +507,8 @@ impl Engine {
 #[derive(Clone)]
 struct Accepted {
     at: String,
-    vendor_turn_id: String,
+    /// The vendor's turn ID, when the route has one.
+    vendor_turn_id: Option<String>,
 }
 
 /// Durable progress of a running turn: the session's shared event head and
@@ -496,6 +529,8 @@ struct TurnRecord {
     /// The step tracker (Task 4 design §2.4) and the rows the terminal
     /// carries (§3.2).
     steps: progress::StepTracker,
+    /// What the turn's observations and end established for its envelope.
+    vendor: lane::VendorRecord,
 }
 
 /// A turn's first failed Store write: where it failed and whether it may
@@ -540,5 +575,6 @@ fn failure(class: FailureClass, message: String, vendor_code: Option<String>) ->
         message: crate::api::failure_message(message),
         vendor_code,
         retryable: false,
+        data: None,
     }
 }

@@ -1,7 +1,6 @@
 //! C2 §4 observation and turn-end types (adapter design §3.2, AD4, AD6,
 //! AD7, AD20) and the per-session observation channel the driver lane
-//! sends them on. Kept in this module, not re-exported at the crate root,
-//! because the legacy `Observation` and channel still live there.
+//! sends them on.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -15,11 +14,12 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::plan::{VersionStatus, Warning};
 use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
-use crate::{AcceptanceToken, Cleanup, StartRejected, VendorTerminalStatus, VendorTurnId};
+use crate::{
+    AcceptanceToken, Cleanup, RouteFailure, StartRejected, VendorTerminalStatus, VendorTurnId,
+};
 
 /// A vendor message's progress marks (C2 §4 `progress`); the arrival time
-/// is the item's `at`. Replaces the legacy root `ProgressMarks` once Core
-/// moves to this surface.
+/// is the item's `at`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProgressMarks {
     /// Model output: text, reasoning or a tool request.
@@ -275,8 +275,9 @@ pub struct LeftoverReport {
     pub incomplete: bool,
 }
 
-/// Process and cleanup facts of a turn that ran to its end.
-#[derive(Debug)]
+/// Process and cleanup facts of a turn (C2 §4.1), on every outcome: the
+/// cleanup gate always has facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnEvidence {
     /// The confirmed process exit, when there is one.
     pub exit: Option<via_routes::ExitReport>,
@@ -284,6 +285,38 @@ pub struct TurnEvidence {
     pub cleanup: Cleanup,
     /// A Host journal write had an uncertain outcome.
     pub journal_uncertain: bool,
+}
+
+impl TurnEvidence {
+    /// A failure before any vendor launch (C2 §2, AD9 no-launch row): no
+    /// exit, and `Quiescent` only when Host's journal is complete.
+    pub fn no_launch(journal_uncertain: bool) -> Self {
+        Self {
+            exit: None,
+            cleanup: if journal_uncertain {
+                Cleanup::Uncertain
+            } else {
+                Cleanup::Quiescent
+            },
+            journal_uncertain,
+        }
+    }
+
+    /// Route's evidence of a failed turn: a launched one's exit and
+    /// cleanup, unproven when Route established none; otherwise the
+    /// no-launch evidence.
+    pub fn of_failure(failure: &RouteFailure) -> Self {
+        if !failure.launched {
+            return Self::no_launch(failure.journal_uncertain);
+        }
+        Self {
+            exit: failure.exit,
+            cleanup: failure
+                .cleanup
+                .map_or(Cleanup::Uncertain, crate::runtime::cleanup),
+            journal_uncertain: failure.journal_uncertain,
+        }
+    }
 }
 
 /// The one result of `run_turn` (C2 §4.1).
@@ -297,26 +330,80 @@ pub struct TurnEnd {
     /// Per-turn routes on every outcome, and server loss (AD20).
     pub leftovers: Option<LeftoverReport>,
     /// Process and cleanup facts, or a typed failure.
-    pub outcome: Result<TurnEvidence, TurnError>,
+    pub outcome: Result<TurnEvidence, AdapterError>,
 }
 
-/// A failed driver-lane turn (C2 §2 `AdapterError` for the lane; the legacy
-/// `AdapterError` stays for the legacy path until Core moves).
+/// A failed turn or adapter construction (C2 §2 `AdapterError`). Every turn
+/// failure carries its evidence ([`Self::evidence`]).
 #[derive(Debug, Error)]
-pub enum TurnError {
+pub enum AdapterError {
     /// A route cause with Route's evidence: S1's causes, `ServerLost` and
     /// transport loss on the persistent profile, and `HandshakeRefused`.
-    #[error("fake route failed: {0:?}")]
-    Route(via_routes::TurnFailure),
-    /// A definite rejection before submission; nothing was sent.
-    #[error("the turn was rejected before submission: {0:?}")]
-    Rejected(StartRejected),
-    /// No adapter serves the session's harness in this daemon.
+    #[error("fake route failed: {0}")]
+    Route(RouteFailure),
+    /// A definite rejection before acceptance; nothing was resent.
+    #[error("the turn was rejected before submission: {reason:?}")]
+    Rejected {
+        /// Why.
+        reason: StartRejected,
+        /// The turn's process facts, or the no-launch evidence.
+        evidence: TurnEvidence,
+    },
+    /// The vendor returned another session than the one VIA continues,
+    /// before the turn's terminal (C2 §2 Reopen); never `Rejected`.
+    #[error("the vendor returned another session")]
+    ResumeMismatch {
+        /// The turn's process facts.
+        evidence: TurnEvidence,
+    },
+    /// No adapter serves the session's harness in this daemon; nothing
+    /// launched.
     #[error("the harness is not available in this daemon")]
     Unavailable,
     /// The driver's task for the turn ended without its result.
     #[error("the driver's turn task failed")]
     TaskFailed,
+    /// The lower runtime could not initialize, or a Host-fact operation
+    /// failed.
+    #[error("adapter runtime failed: {0}")]
+    Open(#[from] via_routes::WireError),
+}
+
+impl AdapterError {
+    /// The failure's process and cleanup facts (C2 §4.1): Route's for a
+    /// route cause, the no-launch evidence where nothing launched, and an
+    /// unproven cleanup where the driver lost the turn's task.
+    pub fn evidence(&self) -> TurnEvidence {
+        match self {
+            Self::Route(failure) => TurnEvidence::of_failure(failure),
+            Self::Rejected { evidence, .. } | Self::ResumeMismatch { evidence } => evidence.clone(),
+            Self::Unavailable | Self::Open(_) => TurnEvidence::no_launch(false),
+            Self::TaskFailed => TurnEvidence {
+                exit: None,
+                cleanup: Cleanup::Uncertain,
+                journal_uncertain: false,
+            },
+        }
+    }
+
+    /// Durable Store state could not be read or written; other failures leave
+    /// evidence unproven without making Store unusable.
+    pub fn is_store_failure(&self) -> bool {
+        matches!(self, Self::Open(error) if error.is_store_failure())
+    }
+
+    /// A Host journal write had an uncertain outcome: the daemon latches
+    /// (design §7.2 row 12).
+    pub fn journal_uncertain(&self) -> bool {
+        match self {
+            Self::Open(error) => error.journal_uncertain(),
+            Self::Route(failure) => failure.journal_uncertain,
+            Self::Rejected { evidence, .. } | Self::ResumeMismatch { evidence } => {
+                evidence.journal_uncertain
+            }
+            Self::Unavailable | Self::TaskFailed => false,
+        }
+    }
 }
 
 /// One observation in the session channel with its share of the session's
@@ -486,10 +573,55 @@ fn encoded_len(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Identity, Instant, Observation, ObservationItem, StopReason, VendorTerminal, item_cost,
+        Identity, Instant, Observation, ObservationItem, ProgressMarks, StopReason, VendorTerminal,
+        item_cost, observation_channel,
     };
     use crate::VendorTerminalStatus;
     use crate::plan::Warning;
+    use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
+    use std::time::Duration;
+
+    fn tool(name: &str) -> ObservationItem {
+        ObservationItem {
+            at: Instant::now(),
+            vendor_turn: None,
+            observation: Observation::Progress(ProgressMarks {
+                tools_started: vec![("t".to_owned(), name.to_owned())],
+                ..ProgressMarks::default()
+            }),
+        }
+    }
+
+    /// Design §2.3 Bounds: an item costs `512 + Σ(64 + len)` of the
+    /// session's 4 MiB; with the receiver never drained, large items fill
+    /// the budget well before 1,024 items and the next send stays blocked
+    /// until the stall. The fake route's short fields (at most 1 KiB)
+    /// cannot reach 4 MiB within 1,024 items, so the byte bound is checked
+    /// here.
+    #[test]
+    fn the_byte_budget_admits_items_to_4_mib_then_the_next_stalls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let name = "n".repeat(100 * 1024);
+        let cost = 512 + (64 + 1) + (64 + name.len());
+        let fits = OBSERVATION_BYTES / cost;
+        assert!(fits < OBSERVATION_ITEMS);
+        let (sink, receiver) = observation_channel();
+        runtime.block_on(async {
+            let stall = Duration::from_millis(50);
+            for _ in 0..fits {
+                assert!(sink.send(tool(&name), stall).await.is_ok());
+            }
+            assert_eq!(receiver.len(), fits);
+            assert!(sink.send(tool(&name), stall).await.is_err());
+            assert_eq!(receiver.len(), fits);
+            // A small item still fits what is left.
+            assert!(sink.send(tool("n"), stall).await.is_ok());
+            assert_eq!(receiver.len(), fits + 1);
+        });
+    }
 
     fn cost(observation: Observation) -> usize {
         item_cost(&ObservationItem {

@@ -158,7 +158,8 @@ impl Engine {
     /// `describe` (Task 4 design §4.6): the route one set of parameters
     /// would take, with nothing written.
     pub fn describe(&self, params: &DescribeParams) -> Result<Value, ApiError> {
-        params.describe(self.adapter.fake_available())
+        // The intake stays fake-shaped until `describe` goes through `plan`.
+        params.describe(self.harness_available(via_adapters::FAKE))
     }
 
     /// `models` (Task 4 design §4.6).

@@ -13,7 +13,7 @@ mod runtime;
 
 pub use runtime::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane,
-    Retirement, SteerRefused, SteerRequest, SteerSender, TurnCause, TurnFailure, steer_lane,
+    Retirement, SteerRefused, SteerRequest, SteerSender, steer_lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it
@@ -22,8 +22,8 @@ pub struct TurnStart {
     session_id: String,
     turn: TurnNumber,
     prompt: String,
-    /// The C2 lane's effective values, written before the prompt; empty on
-    /// the legacy lane.
+    /// The turn's effective values, written before the prompt; empty when
+    /// the turn sets none.
     values: serde_json::Map<String, serde_json::Value>,
 }
 

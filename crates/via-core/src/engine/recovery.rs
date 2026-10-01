@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
-use via_adapters::FakeRecovery;
+use via_adapters::AnchorRecovery;
 use via_store::{
     ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, StoreError, TerminalRecord, UnfinishedTurn,
 };
@@ -410,7 +410,7 @@ impl Engine {
     /// not prove, holds a connection slot until a later Host absence proof
     /// drops its token. Past the pool the groups share the permits held, so
     /// no new child starts until cleanup proves room.
-    fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
+    fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
@@ -471,6 +471,7 @@ impl Engine {
             first_failure: None,
             uncertain: None,
             steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
         };
         let cancel = self
             .settle_recovered(&mut record, reconciled, requested_at, settled)
@@ -570,7 +571,7 @@ impl Engine {
             });
         }
         let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn);
-        let (outcome, cleanup) = stop_outcome(quiescent, forced);
+        let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let requested_at = if let Some(at) = requested {
             at
         } else {
@@ -675,7 +676,11 @@ fn recovered_terminal(cancel: Cancel) -> Terminal {
 /// Acceptance is reported only when both its evidence and its event committed.
 fn recovered_acceptance(correlation: Option<String>, started: Option<String>) -> Option<Accepted> {
     match (correlation, started) {
-        (Some(vendor_turn_id), Some(at)) => Some(Accepted { at, vendor_turn_id }),
+        (Some(correlation), Some(at)) => Some(Accepted {
+            at,
+            vendor_turn_id: (!correlation.starts_with(super::drive::TOKEN_CORRELATION))
+                .then_some(correlation),
+        }),
         _ => None,
     }
 }
@@ -739,7 +744,7 @@ struct Reconciled {
 
 impl Reconciled {
     /// Folds one inventory page and Host's reports for the same id range.
-    fn add(&mut self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
+    fn add(&mut self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
             let report = reports.iter().find(|report| {
                 report.anchor_id == owner.anchor_id
@@ -782,7 +787,7 @@ impl Reconciled {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorOwner, Cleanup, DurableSettlement, FakeRecovery, Reconciled, SessionId, TurnNumber,
+        AnchorOwner, AnchorRecovery, Cleanup, DurableSettlement, Reconciled, SessionId, TurnNumber,
     };
     use via_store::AnchorPhase;
 
@@ -810,8 +815,8 @@ mod tests {
         }
     }
 
-    fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> FakeRecovery {
-        FakeRecovery {
+    fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> AnchorRecovery {
+        AnchorRecovery {
             session_id: session.clone(),
             anchor_id: anchor_id.to_owned(),
             generation: "g".to_owned(),

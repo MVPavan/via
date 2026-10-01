@@ -249,11 +249,8 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<Starting> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0);
-    for name in [
-        "VIA_FAKE_AGENT_BINARY",
-        "VIA_FAKE_SCENARIO",
-        "VIA_FAKE_SYNC_DIR",
-    ] {
+    // Design §5.1 #43: the adapters' bootstrap names.
+    for &name in via_core::BOOTSTRAP_ENV {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }

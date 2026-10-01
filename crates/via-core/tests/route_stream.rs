@@ -22,11 +22,11 @@ use std::{
 mod stand_in_anchor;
 
 use serde_json::{Value, json};
-use via_adapters::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Deadline, FakeConfig, FakeObservation,
-    Observation, RouteError, RuntimeConfig, SessionId, TurnNumber,
-};
+use via_adapters::{AdapterError, Deadline, Observation, RouteError, SessionId, TurnEnd};
 use via_store::{SpawnRecord, Store};
+
+#[path = "support/one_turn.rs"]
+mod one_turn;
 
 const SESSION: &str = "s_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STREAM_CHILD";
@@ -48,7 +48,8 @@ fn via_binary() -> PathBuf {
 }
 
 /// Runs `name` again in a child process whose fake vendor is `script`, emitting
-/// the NDJSON `lines` from its scenario file.
+/// the NDJSON `lines` from the sidecar `$VIA_FAKE_SCENARIO.lines`: the
+/// scenario itself must be valid JSON (decision H2).
 fn run_child(name: &str, script: &str, lines: &[Value]) {
     let root = tempfile::tempdir().unwrap();
     let dirs = ["state", "runtime", "sync"].map(|part| {
@@ -59,9 +60,14 @@ fn run_child(name: &str, script: &str, lines: &[Value]) {
     let vendor = root.path().join("vendor.sh");
     fs::write(&vendor, format!("#!/bin/sh\n{script}")).unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
-    let scenario = root.path().join("scenario.ndjson");
+    let scenario = root.path().join("scenario.json");
+    fs::write(&scenario, r#"{"scripts":[]}"#).unwrap();
     let body: Vec<String> = lines.iter().map(ToString::to_string).collect();
-    fs::write(&scenario, body.join("\n") + "\n").unwrap();
+    fs::write(
+        root.path().join("scenario.json.lines"),
+        body.join("\n") + "\n",
+    )
+    .unwrap();
     let mut child = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, root.path())
@@ -93,8 +99,8 @@ fn run_child(name: &str, script: &str, lines: &[Value]) {
 /// The child's isolated Store and adapter over the real Route, Wire and Host.
 struct Child {
     root: PathBuf,
-    store: Option<Store>,
-    adapter: AdapterRuntime,
+    _store: Store,
+    adapter: one_turn::OneTurn,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -121,72 +127,59 @@ impl Child {
                 initial_event: json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
             }))
             .unwrap();
-        let adapter = AdapterRuntime::new(
-            AdapterRuntimeConfig {
-                runtime: RuntimeConfig {
-                    anchor_binary: anchor,
-                    anchor_dir: root.join("runtime"),
-                },
-                fake: FakeConfig::from_environment().unwrap(),
-            },
-            store.runtime_resources(),
-        )
-        .unwrap();
+        let adapter = one_turn::OneTurn::new(&store, root, anchor);
         Self {
             root: root.to_path_buf(),
-            store: Some(store),
+            _store: store,
             adapter,
             runtime,
         }
     }
 
-    /// Runs one turn under a `turn` deadline, calling `on_observation` with the
-    /// Store owner, the sandbox root and each observation as it arrives.
-    fn execute(
-        &mut self,
-        turn: Duration,
-        mut on_observation: impl FnMut(&mut Option<Store>, &Path, &FakeObservation),
-    ) -> (Vec<FakeObservation>, Result<(), AdapterError>) {
-        let Self {
-            root,
-            store,
-            adapter,
-            runtime,
-        } = self;
-        let (sender, mut receiver) = via_adapters::observation_channel();
-        let deadline = Deadline::at(tokio::time::Instant::now() + turn);
-        let mut observed = Vec::new();
+    /// Turn 1 on a new session, under the wall `wall`, the daemon force
+    /// `force` and no stop order.
+    fn run_turn(
+        &self,
+        wall: Duration,
+        force: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    ) -> (
+        via_adapters::SessionDriver,
+        tokio::sync::mpsc::Receiver<via_adapters::Admitted>,
+        via_adapters::TurnCx,
+    ) {
+        let (driver, receiver) = self.adapter.session(SESSION, &self.root);
+        let deadline = Deadline::at(tokio::time::Instant::now() + wall);
+        let cx = one_turn::turn_cx(
+            driver.prepare(),
+            deadline,
+            force,
+            tokio::sync::watch::channel(None).1,
+        );
+        (driver, receiver, cx)
+    }
+
+    /// Runs one turn under a `turn` deadline, collecting each observation.
+    fn execute(&self, turn: Duration) -> (Vec<Observation>, TurnEnd) {
         // Never set: these turns are not force-stopped.
         let (_force, force) = tokio::sync::watch::channel(None);
-        let result = runtime.block_on(async {
-            let execute = adapter.execute(
-                SessionId::try_from(SESSION).unwrap(),
-                TurnNumber::try_from(1).unwrap(),
-                ("hello".to_owned(), adapter.fake_cwd().to_path_buf()),
-                sender,
-                via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-                deadline,
-                force,
-                tokio::sync::watch::channel(None).1,
-                Box::new(()),
-            );
+        let (driver, mut receiver, cx) = self.run_turn(turn, force);
+        let mut observed = Vec::new();
+        let end = self.runtime.block_on(async {
+            let execute = driver.run_turn(one_turn::hello(), cx);
             tokio::pin!(execute);
             loop {
                 tokio::select! {
-                    Some(admitted) = receiver.recv() => {
-                        on_observation(store, root, &admitted.observation);
-                        observed.push(admitted.observation);
-                    }
-                    result = &mut execute => {
+                    Some(admitted) = receiver.recv() => observed.push(admitted.item.observation),
+                    end = &mut execute => {
                         while let Ok(admitted) = receiver.try_recv() {
-                            observed.push(admitted.observation);
+                            observed.push(admitted.item.observation);
                         }
-                        break result.map(|_| ());
+                        break end;
                     }
                 }
             }
         });
-        (observed, result)
+        (observed, end)
     }
 }
 
@@ -208,13 +201,13 @@ fn route_forwards_every_observation_in_order() {
     let Some(root) = child_root() else {
         return run_child(
             "route_forwards_every_observation_in_order",
-            "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO\"\n",
+            "read -r start\n/bin/cat \"$VIA_FAKE_SCENARIO.lines\"\n",
             &lines,
         );
     };
-    let mut child = Child::open(&root);
-    let (observed, result) = child.execute(TURN, |_, _, _| {});
-    result.unwrap();
+    let child = Child::open(&root);
+    let (observed, end) = child.execute(TURN);
+    end.outcome.unwrap();
     // Everything except the terminal, which travels in the route result,
     // and unknown messages, which send no observation (Task 4 design §2.3).
     let expected: Vec<&Value> = lines
@@ -227,20 +220,19 @@ fn route_forwards_every_observation_in_order() {
     assert_eq!(observed.len(), expected.len());
     for (observation, line) in observed.iter().zip(expected) {
         match observation {
-            FakeObservation::Accepted(accepted) => {
+            Observation::Accepted(accepted) => {
                 assert_eq!(line["type"], "accepted");
-                assert_eq!(accepted.vendor_turn_id.as_str(), "fake-turn-1");
+                assert_eq!(
+                    accepted.vendor_turn_id.as_ref().unwrap().as_str(),
+                    "fake-turn-1"
+                );
             }
             // Task 4 design §2.3: the terminal's final text, one piece.
-            FakeObservation::Data {
-                observation: Observation::FinalText(text),
-            } => {
+            Observation::FinalText(text) => {
                 assert_eq!(line["type"], "terminal");
                 assert_eq!(line["final_text"], text.as_str());
             }
-            FakeObservation::Data {
-                observation: Observation::Progress(marks),
-            } => {
+            Observation::Progress(marks) => {
                 let started: Vec<(&str, &str)> = marks
                     .tools_started
                     .iter()
@@ -261,6 +253,16 @@ fn route_forwards_every_observation_in_order() {
                     kind => panic!("{kind} became {marks:?}"),
                 }
             }
+            Observation::IdentityConfirmed(_)
+            | Observation::ActionDenied(_)
+            | Observation::RequestDeclined(_)
+            | Observation::SteerDelivered(_)
+            | Observation::Warning(_)
+            | Observation::VendorClosed(_)
+            | Observation::ResumeMismatch { .. }
+            | Observation::LateTerminal(_) => {
+                panic!("{} became {observation:?}", line["type"]);
+            }
         }
     }
 }
@@ -270,9 +272,9 @@ fn route_forwards_every_observation_in_order() {
 /// reader take a whole burst before Route runs, so one burst of all
 /// 1,045 lines fails `overflow` by design (§8.2).
 const TWO_BURSTS: &str = "read -r start
-/usr/bin/head -n 1000 \"$VIA_FAKE_SCENARIO\"
+/usr/bin/head -n 1000 \"$VIA_FAKE_SCENARIO.lines\"
 sleep 0.2
-/usr/bin/tail -n +1001 \"$VIA_FAKE_SCENARIO\"
+/usr/bin/tail -n +1001 \"$VIA_FAKE_SCENARIO.lines\"
 printf 'unterminated tail'
 exec sleep 30
 ";
@@ -298,21 +300,10 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
     };
     let child = Child::open(&root);
     // Never read: the adapter and then Route block on observation capacity.
-    let (sender, receiver) = via_adapters::observation_channel();
     let (force_tx, force) = tokio::sync::watch::channel(None);
-    let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
+    let (driver, receiver, cx) = child.run_turn(Duration::from_secs(20), force);
     let (result, elapsed) = child.runtime.block_on(async {
-        let execute = child.adapter.execute(
-            SessionId::try_from(SESSION).unwrap(),
-            TurnNumber::try_from(1).unwrap(),
-            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
-            sender,
-            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-            deadline,
-            force,
-            tokio::sync::watch::channel(None).1,
-            Box::new(()),
-        );
+        let execute = driver.run_turn(one_turn::hello(), cx);
         tokio::pin!(execute);
         // Force only once backpressure is observed: the channel is full, so the
         // adapter's next delivery waits for capacity (W4-H Sol r2).
@@ -340,7 +331,7 @@ fn force_while_forwarding_is_blocked_ends_the_turn() {
         );
         let forced_at = tokio::time::Instant::now();
         force_tx.send_replace(Some(tokio::time::Instant::now()));
-        let result = execute.await;
+        let result = execute.await.outcome;
         (result, forced_at.elapsed())
     });
     assert!(elapsed < Duration::from_secs(5), "force took {elapsed:?}");
@@ -369,26 +360,16 @@ fn post_arm_acquisition_deadline_keeps_its_cause() {
     let anchor = root.join("stand-in-anchor");
     stand_in_anchor::AfterArm::Stall { line: LINE }.install(&anchor);
     let child = Child::open_with_anchor(&root, anchor);
-    let (sender, _receiver) = via_adapters::observation_channel();
     // Never set: this failure is the acquisition deadline, not a force.
     let (_force, force) = tokio::sync::watch::channel(None);
+    let (driver, _receiver, cx) = child.run_turn(Duration::from_secs(3), force);
     let result = child.runtime.block_on(async {
-        let execute = child.adapter.execute(
-            SessionId::try_from(SESSION).unwrap(),
-            TurnNumber::try_from(1).unwrap(),
-            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
-            sender,
-            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-            Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
-            force,
-            tokio::sync::watch::channel(None).1,
-            Box::new(()),
-        );
+        let execute = driver.run_turn(one_turn::hello(), cx);
         // The stand-in writes flags beside its anchor directory.
         let flags = root.clone();
         // The vendor launched and wrote before the deadline.
-        let (result, ()) = tokio::join!(execute, stand_in_anchor::wait_flag(&flags, "wrote"));
-        result
+        let (end, ()) = tokio::join!(execute, stand_in_anchor::wait_flag(&flags, "wrote"));
+        end.outcome
     });
     let Err(AdapterError::Route(failure)) = result else {
         panic!("expected a route failure: {:?}", result.map(|_| ()));
@@ -417,26 +398,16 @@ fn stalled_acquisition_with_force(
     }
     .install(&anchor);
     let child = Child::open_with_anchor(&root, anchor);
-    let (sender, _receiver) = via_adapters::observation_channel();
     let (force_tx, force) = tokio::sync::watch::channel(None);
+    let (driver, _receiver, cx) = child.run_turn(deadline, force);
     let result = child.runtime.block_on(async {
-        let deadline = tokio::time::Instant::now() + deadline;
-        let execute = child.adapter.execute(
-            SessionId::try_from(SESSION).unwrap(),
-            TurnNumber::try_from(1).unwrap(),
-            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
-            sender,
-            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-            Deadline::at(deadline),
-            force,
-            tokio::sync::watch::channel(None).1,
-            Box::new(()),
-        );
-        let (result, ()) = tokio::join!(execute, async {
+        let deadline = cx.wall.instant();
+        let execute = driver.run_turn(one_turn::hello(), cx);
+        let (end, ()) = tokio::join!(execute, async {
             force_at(&root, deadline).await;
             force_tx.send_replace(Some(tokio::time::Instant::now()));
         });
-        result
+        end.outcome
     });
     let failure = match result {
         Err(AdapterError::Route(failure)) => Some(failure),

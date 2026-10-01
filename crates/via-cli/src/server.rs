@@ -15,7 +15,8 @@ use tokio::{
     task::JoinSet,
 };
 
-use via_core::{ApiError, Engine, FakeConfig, Limits, SessionId, StoreLock};
+use serde_json::value::RawValue;
+use via_core::{AdapterConfig, ApiError, BootstrapEnv, Engine, Limits, SessionId, StoreLock};
 
 mod config;
 mod dispatch;
@@ -108,8 +109,8 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     let paths = super::client::paths()?;
     // Task 4 design §5.5: read once, before any Store or socket change.
-    let limits = match config::read(&paths.state) {
-        Ok(limits) => limits,
+    let config::Config { limits, harnesses } = match config::read(&paths.state) {
+        Ok(config) => config,
         Err(invalid) => {
             let _ = writeln!(io::stderr().lock(), "via: {invalid}");
             return Ok(CONFIG_INVALID);
@@ -159,7 +160,14 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
-    let served = serve_bound(listener, &socket, &paths, (store_lock, limits)).await;
+    let served = serve_bound(
+        listener,
+        &socket,
+        &paths,
+        (store_lock, limits),
+        harnesses.as_deref(),
+    )
+    .await;
     if served.is_err() {
         // A failure after bind unlinks the socket before the locks are
         // released (design §6.1). Best effort: a stale socket refuses
@@ -176,10 +184,11 @@ async fn serve_bound(
     socket: &Path,
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
+    harnesses: Option<&RawValue>,
 ) -> anyhow::Result<i32> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let engine = open_engine(paths, locked).await?;
+    let engine = open_engine(paths, locked, harnesses).await?;
     // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
     let starts = engine
         .take_starts()
@@ -269,14 +278,18 @@ async fn serve_bound(
 async fn open_engine(
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
+    harnesses: Option<&RawValue>,
 ) -> anyhow::Result<Arc<Engine>> {
-    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
+    // Design §5.1 #42: the bootstrap names the client forwarded, and the
+    // config's `harnesses`.
+    let adapters =
+        AdapterConfig::load(BootstrapEnv::capture(), harnesses).map_err(anyhow::Error::msg)?;
     let state = paths.state.clone();
     let runtime = paths.runtime.clone();
     let binary = std::env::current_exe()?;
     let engine = Arc::new(
         tokio::task::spawn_blocking(move || {
-            Engine::open_locked(&state, &runtime, fake, binary, locked)
+            Engine::open_locked(&state, &runtime, adapters, binary, locked)
         })
         .await?
         .map_err(anyhow::Error::msg)?,

@@ -22,7 +22,9 @@ mod stand_in_anchor;
 
 use serde_json::{Value, json};
 use stand_in_anchor::{AfterArm, wait_flag};
-use via_core::{DaemonStopParams, Deadline, Engine, FakeConfig, SpawnParams, StopMode};
+use via_core::{
+    AdapterConfig, BootstrapEnv, DaemonStopParams, Deadline, Engine, SpawnParams, StopMode,
+};
 
 const CHILD: &str = "VIA_FORCE_STOP_CHILD";
 
@@ -53,7 +55,7 @@ fn run_child(name: &str) {
     fs::write(&vendor, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
     let scenario = root.path().join("scenario.json");
-    fs::write(&scenario, b"{}").unwrap();
+    fs::write(&scenario, br#"{"scripts":[]}"#).unwrap();
     let status = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, root.path())
@@ -76,7 +78,7 @@ fn open(root: &Path) -> Engine {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),
-        FakeConfig::from_environment().unwrap(),
+        AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
         via_binary(),
     )
     .unwrap()
@@ -190,7 +192,7 @@ fn force_during_stalled_acquisition_settles_the_turn() {
         let engine = Engine::open(
             &root.join("state"),
             &root.join("runtime"),
-            FakeConfig::from_environment().unwrap(),
+            AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
             anchor,
         )
         .unwrap();
@@ -273,7 +275,7 @@ fn force_over_stand_in_within(
         let engine = Engine::open(
             &root.join("state"),
             &root.join("runtime"),
-            FakeConfig::from_environment().unwrap(),
+            AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
             anchor,
         )
         .unwrap();

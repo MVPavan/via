@@ -22,20 +22,20 @@ use crate::driver::{
 };
 use crate::harness::Harness;
 use crate::observation::{
-    Acceptance, ClassHint, CostReport, Decline, Denial, DenialKind, Identity, InstanceReport,
-    Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery, StopReason,
-    TurnEnd, TurnError, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
+    Acceptance, AdapterError, ClassHint, CostReport, Decline, Denial, DenialKind, Identity,
+    InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
+    StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
 };
 use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
 use crate::{
     AcceptanceToken, Deadline, DriverFailure, DriverHealth, PrivateProcessSpec, ProcessOwner,
-    RouteError, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus, VendorTurnId,
-    final_text_pieces,
+    RouteError, RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus,
+    VendorTurnId, final_text_pieces,
 };
 use via_routes::{
     FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
-    Retirement, RouteMessage, TerminalStatus, TurnCause, TurnFailure, TurnStart, WireCleanup,
+    Retirement, RouteMessage, TerminalStatus, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -180,7 +180,7 @@ pub(crate) async fn run_turn(
     let Some(result) = result else {
         // The task ended without its turn: it failed (C2 §2 health).
         driver.fail(DriverFailure::OwnedTask);
-        return rejected(TurnError::TaskFailed);
+        return rejected(AdapterError::TaskFailed);
     };
     settle(driver, &reservation, &result, &rest, &normalizer);
     drop(reservation);
@@ -200,8 +200,8 @@ pub(crate) async fn run_turn(
 
 /// After the final delivery: one that failed latches `overflow` (C2 §2),
 /// and a kept server stays the session's only once its whole logical turn
-/// was delivered and the vendor did not close it (AD16); otherwise its
-/// generation is invalid.
+/// was delivered, the vendor did not close it and it reported no other
+/// session (AD16, C2 §2 Reopen); otherwise its generation is invalid.
 fn settle(
     driver: &SessionDriver,
     reservation: &Shared,
@@ -216,7 +216,10 @@ fn settle(
         return;
     }
     let mut share = held(reservation);
-    if matches!(rest, Rest::Delivered) && !normalizer.vendor_closed {
+    if matches!(rest, Rest::Delivered)
+        && !normalizer.vendor_closed
+        && result.late_mismatch.is_none()
+    {
         share.commit(driver.cancel.is_cancelled());
     } else {
         share.release();
@@ -237,7 +240,10 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         .check_turn(Harness::Fake.route(), &params)
         .into_iter()
         .next()?;
-    Some(rejected(TurnError::Rejected(start_rejected(refusal))))
+    Some(rejected(AdapterError::Rejected {
+        reason: start_rejected(refusal),
+        evidence: TurnEvidence::no_launch(false),
+    }))
 }
 
 /// The turn's process and its C2 start. Per-turn profile: Host holds the
@@ -256,7 +262,7 @@ fn launch_inputs(
         turn,
     };
     let Ok(mut process) = adapter.process_spec(owner, &driver.spec.cwd) else {
-        return Err(Box::new(rejected(TurnError::Unavailable)));
+        return Err(Box::new(rejected(AdapterError::Unavailable)));
     };
     process.capacity = capacity;
     let prompt = std::mem::take(&mut spec.prompt);
@@ -265,24 +271,30 @@ fn launch_inputs(
     });
     match start {
         Ok(start) => Ok((process, start)),
-        Err(_) => Err(Box::new(rejected(TurnError::Rejected(
-            StartRejected::Protocol("the fake start cannot be built".to_owned()),
-        )))),
+        Err(_) => Err(Box::new(rejected(AdapterError::Rejected {
+            reason: StartRejected::Protocol("the fake start cannot be built".to_owned()),
+            evidence: TurnEvidence::no_launch(false),
+        }))),
     }
 }
 
-/// C2 §2 Reopen: a `resume_mismatch` failure is reported on the session
-/// channel by the wall's cutoff; one that cannot be is an overflow.
+/// C2 §2 Reopen: a mismatching identity, the turn's failure or one after
+/// its terminal, is reported on the session channel by the wall's cutoff;
+/// one that cannot be is an overflow.
 async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Deadline) {
-    let Err(TurnFailure {
-        cause:
-            TurnCause::ResumeMismatch {
-                requested,
-                returned,
-                ..
-            },
-        ..
-    }) = &result.outcome
+    let ((
+        Err(RouteFailure {
+            cause:
+                RouteError::ResumeMismatch {
+                    requested,
+                    returned,
+                    ..
+                },
+            ..
+        }),
+        _,
+    )
+    | (_, Some((requested, returned)))) = (&result.outcome, &result.late_mismatch)
     else {
         return;
     };
@@ -402,28 +414,30 @@ fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
 
 /// The failure a Route result latches in the health lane (C2 §2):
 /// protocol, transport loss, overflow, a Store failure, the server's loss
-/// or a resume mismatch.
+/// or a resume mismatch, the turn's own or one after its terminal.
 fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
     let Err(failure) = &turn.outcome else {
-        return None;
+        return turn
+            .late_mismatch
+            .as_ref()
+            .map(|_| DriverFailure::ResumeMismatch);
     };
     match &failure.cause {
-        TurnCause::Route(
-            cause @ (RouteError::Protocol { .. }
-            | RouteError::TransportLost { .. }
-            | RouteError::Overflow { .. }
-            | RouteError::Store { .. }),
-        ) => Some(DriverFailure::Route(cause.clone())),
-        TurnCause::ServerLost { .. } => Some(DriverFailure::ServerLost),
-        TurnCause::ResumeMismatch { .. } => Some(DriverFailure::ResumeMismatch),
-        TurnCause::Route(
-            RouteError::ProcessExited { .. }
-            | RouteError::Stopped { .. }
-            | RouteError::Deadline { .. }
-            | RouteError::ForceStopped { .. },
-        )
-        | TurnCause::HandshakeRefused { .. }
-        | TurnCause::InvalidParam { .. } => None,
+        cause @ (RouteError::Protocol { .. }
+        | RouteError::TransportLost { .. }
+        | RouteError::Overflow { .. }
+        | RouteError::Store { .. }) => Some(DriverFailure::Route(cause.clone())),
+        RouteError::ServerLost { .. } => Some(DriverFailure::ServerLost),
+        RouteError::ResumeMismatch { .. } => Some(DriverFailure::ResumeMismatch),
+        RouteError::ProcessExited { .. }
+        | RouteError::Stopped { .. }
+        | RouteError::Deadline { .. }
+        | RouteError::ForceStopped { .. }
+        | RouteError::HandshakeRefused { .. }
+        | RouteError::InvalidParam { .. } => turn
+            .late_mismatch
+            .as_ref()
+            .map(|_| DriverFailure::ResumeMismatch),
     }
 }
 
@@ -738,11 +752,24 @@ fn turn_end(
         }
     });
     let outcome = match outcome {
-        Err(TurnFailure {
-            cause: TurnCause::InvalidParam { field, .. },
-            ..
-        }) => Err(TurnError::Rejected(StartRejected::InvalidParam { field })),
-        Err(failure) => Err(TurnError::Route(failure)),
+        Err(
+            ref failure @ RouteFailure {
+                cause: RouteError::InvalidParam { field, .. },
+                ..
+            },
+        ) => Err(AdapterError::Rejected {
+            reason: StartRejected::InvalidParam { field },
+            evidence: TurnEvidence::of_failure(failure),
+        }),
+        Err(
+            ref failure @ RouteFailure {
+                cause: RouteError::ResumeMismatch { .. },
+                ..
+            },
+        ) => Err(AdapterError::ResumeMismatch {
+            evidence: TurnEvidence::of_failure(failure),
+        }),
+        Err(failure) => Err(AdapterError::Route(failure)),
         Ok(result) => {
             let exit =
                 (result.exit.code.is_some() || result.exit.signal.is_some()).then_some(result.exit);
@@ -757,8 +784,8 @@ fn turn_end(
                     cleanup: cleanup(result.cleanup),
                     journal_uncertain: result.journal_uncertain,
                 }),
-                Some(cause) => Err(TurnError::Route(TurnFailure {
-                    cause: TurnCause::Route(cause),
+                Some(cause) => Err(AdapterError::Route(RouteFailure {
+                    cause,
                     undecoded: None,
                     exit,
                     launched: true,
@@ -1001,8 +1028,9 @@ impl Normalizer {
     }
 
     /// C2 §2 "Reopen": Route fails a turn on an identity that differs from
-    /// the session's (`resume_mismatch`), so every one handed over confirms
-    /// it for this connection generation, and the session keeps it.
+    /// the session's before its terminal, and drops one after it
+    /// (`resume_mismatch`), so every one handed over confirms it for this
+    /// connection generation, and the session keeps it.
     fn identity(&self, vendor_session_id: String, transcript: Option<String>) -> Observation {
         lock(&self.state).identity = Some(vendor_session_id.clone());
         Observation::IdentityConfirmed(Identity {

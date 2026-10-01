@@ -2,20 +2,22 @@
 
 use serde_json::json;
 use via_adapters::{
-    AdapterError, Cleanup, FakeTerminalEvidence, RouteError, RouteFailure, StopCause, StopOrder,
-    VendorTerminalStatus, WireCleanup,
+    AdapterError, ClassHint, Cleanup, RouteError, RouteFailure, StartRejected, StopCause,
+    StopOrder, StopReason, TurnEvidence, VendorTerminal, VendorTerminalStatus, WireCleanup,
 };
 use via_store::CancelCause;
 
+use super::lane::VendorRecord;
 use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
-    AutoDeclined, Bound, Cost, DeniedAction, Envelope, EventRange, EvidenceRef, Exit, FailureClass,
-    Kept, Requested, RoutePlan, Timestamps, Usage, VendorFields, Warning,
+    Bound, Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, Requested, RoutePlan,
+    Timestamps, Usage, VendorFields, Warning,
 };
 use crate::{SessionId, TurnNumber};
 
-/// Assembles the C1 §5 envelope; `events` runs from the turn's `turn.queued` to
+/// Assembles the C1 §5 envelope of a turn that reported nothing to its
+/// vendor record: `events` runs from the turn's `turn.queued` to
 /// its `turn.ended`, other turns' events of the session included. `cwd` is
 /// the session's frozen working directory (design §11.1), `None` where the
 /// caller did not read it; `folder` is the turn's absolute evidence folder,
@@ -35,9 +37,76 @@ pub(super) fn terminal_envelope(
     (first_seq, last_seq): (u64, u64),
     usage: Usage,
 ) -> Envelope {
-    let plan = RoutePlan::fake();
+    assemble(
+        (session, turn),
+        terminal,
+        accepted,
+        (cwd, folder),
+        (timestamps, duration_ms),
+        (first_seq, last_seq),
+        (usage, false),
+        VendorRecord::default(),
+    )
+}
+
+/// [`terminal_envelope`] of a run turn, with what its observations and its
+/// end established (design §5.1 #33): the confirmed identity and
+/// transcript, the denials and declines it committed, the instance's
+/// version (AD7), the retained terminal's structured output, steps, cost
+/// and vendor data (AD4), and the usage ledger's figure, which a turn
+/// aggregate supersedes (AD6).
+pub(super) fn turn_envelope(
+    (session, turn): (&SessionId, TurnNumber),
+    terminal: Terminal,
+    accepted: Option<Accepted>,
+    paths: (Option<String>, Option<String>),
+    times: (Timestamps, Option<u64>),
+    range: (u64, u64),
+    vendor: VendorRecord,
+) -> Envelope {
+    let aggregate = vendor
+        .retained
+        .as_ref()
+        .and_then(|retained| retained.usage.as_ref());
+    let figure = vendor.ledger.figure(aggregate);
+    let interval = figure.as_ref().is_some_and(|(_, interval)| *interval);
+    let usage = Usage::reported(figure.map(|(tokens, _)| tokens), interval);
+    assemble(
+        (session, turn),
+        terminal,
+        accepted,
+        paths,
+        times,
+        range,
+        (usage, interval),
+        vendor,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct committed fact of the one turn"
+)]
+fn assemble(
+    (session, turn): (&SessionId, TurnNumber),
+    terminal: Terminal,
+    accepted: Option<Accepted>,
+    (cwd, folder): (Option<String>, Option<String>),
+    (timestamps, duration_ms): (Timestamps, Option<u64>),
+    (first_seq, last_seq): (u64, u64),
+    (usage, interval): (Usage, bool),
+    vendor: VendorRecord,
+) -> Envelope {
+    let mut plan = RoutePlan::fake();
+    if let Some((version, tested)) = vendor.instance {
+        // AD7: the version the turn's own instance reported.
+        plan = plan.instance(version, tested);
+    }
     let mut warnings = plan.warnings();
     warnings.extend(terminal.warnings);
+    if interval {
+        warnings.push(Warning::USAGE_INTERVAL_UNVERIFIED);
+    }
     if terminal
         .cancel
         .as_ref()
@@ -48,9 +117,15 @@ pub(super) fn terminal_envelope(
     // Design §6.4: one entry per code; a repeated code keeps its first.
     let mut codes = std::collections::HashSet::new();
     warnings.retain(|warning| codes.insert(warning.code()));
-    let (denied_actions, denied_actions_total) = Kept::<DeniedAction>::default().into_parts();
-    let (auto_declined_requests, auto_declined_requests_total) =
-        Kept::<AutoDeclined>::default().into_parts();
+    let (denied_actions, denied_actions_total) = vendor.denied.into_parts();
+    let (auto_declined_requests, auto_declined_requests_total) = vendor.declined.into_parts();
+    let retained = vendor.retained.unwrap_or_default();
+    let mut data = retained.vendor;
+    // The acceptance's own turn ID is the envelope's.
+    data.remove("turn_id");
+    let (vendor_session_id, transcript) = vendor.identity.map_or((None, None), |identity| {
+        (Some(identity.vendor_session_id), identity.transcript)
+    });
     let envelope = Envelope {
         api_version: 1,
         session_id: session.clone(),
@@ -73,19 +148,23 @@ pub(super) fn terminal_envelope(
         },
         warnings,
         plan,
-        vendor_session_id: None,
+        vendor_session_id,
         cwd,
         bound: Bound::NONE,
         final_text: terminal.final_text,
         final_text_file: terminal.final_text_file,
-        structured_output: None,
+        // Passed through; validation against the frozen schema is #37's.
+        structured_output: retained.structured_output,
+        leftovers: None,
         denied_actions,
         auto_declined_requests,
         denied_actions_total,
         auto_declined_requests_total,
-        steps: None,
+        steps: retained.steps,
         usage,
-        cost: Cost::UNAVAILABLE,
+        cost: retained.cost.map_or(Cost::UNAVAILABLE, |(usd, scope)| {
+            Cost::reported(usd, &scope)
+        }),
         timestamps,
         duration_ms,
         exit: terminal.exit,
@@ -94,14 +173,11 @@ pub(super) fn terminal_envelope(
             last_seq,
             count: last_seq + 1 - first_seq,
         },
-        // The fake reports no vendor transcript (design §7.4).
-        evidence: EvidenceRef {
-            folder,
-            transcript: None,
-        },
+        evidence: EvidenceRef { folder, transcript },
         vendor_options: json!({}),
         vendor: VendorFields {
-            turn_id: accepted.map(|accepted| accepted.vendor_turn_id),
+            turn_id: accepted.and_then(|accepted| accepted.vendor_turn_id),
+            data,
         },
     };
     // Design §6.4: every member has a fixed maximum, so the envelope fits
@@ -121,6 +197,15 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         RouteError::Overflow { .. } => ("failed", Some(FailureClass::Overflow), "error"),
         RouteError::Store { .. } => ("failed", Some(FailureClass::Store), "error"),
         RouteError::Deadline { .. } => ("failed", Some(FailureClass::DeadlineWall), "deadline"),
+        // C1 §7.6: Host-confirmed death of the persistent server.
+        RouteError::ServerLost { .. } => ("failed", Some(FailureClass::ServerLost), "error"),
+        // C1 §8.2: an adapter-side rejection before any vendor submission.
+        RouteError::HandshakeRefused { .. } | RouteError::InvalidParam { .. } => {
+            ("failed", Some(FailureClass::SubmitFailed), "error")
+        }
+        RouteError::ResumeMismatch { .. } => {
+            ("failed", Some(FailureClass::ResumeMismatch), "error")
+        }
         // Core settles a force stop itself, and `dispose` a stop order's
         // `Stopped`; this is only the C1 §7.6 force row.
         RouteError::ForceStopped { .. } | RouteError::Stopped { .. } => {
@@ -128,6 +213,27 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         }
         // Input may have reached the vendor and no exit is confirmed (§7.6).
         RouteError::TransportLost { .. } => ("unknown", None, "error"),
+    }
+}
+
+/// C1 §5 `failure.data` of an adapter-side `submit_failed`: the reason,
+/// and with `invalid_param` the C1 parameter; never vendor text.
+fn submit_data(cause: &RouteError) -> Option<serde_json::Value> {
+    match cause {
+        RouteError::HandshakeRefused { .. } => Some(json!({"reason": "handshake_refused"})),
+        RouteError::InvalidParam { field, .. } => {
+            Some(json!({"reason": "invalid_param", "field": field}))
+        }
+        RouteError::Protocol { .. }
+        | RouteError::ProcessExited { .. }
+        | RouteError::Overflow { .. }
+        | RouteError::Store { .. }
+        | RouteError::Deadline { .. }
+        | RouteError::ServerLost { .. }
+        | RouteError::ResumeMismatch { .. }
+        | RouteError::ForceStopped { .. }
+        | RouteError::Stopped { .. }
+        | RouteError::TransportLost { .. } => None,
     }
 }
 
@@ -141,17 +247,20 @@ pub(super) struct Disposed {
     pub(super) cancel_cause: Option<CancelCause>,
 }
 
-/// Design §2's disposition table (C1 §7.6; the first matching row wins).
-/// `wall` is the turn's wall deadline: a `Deadline` coincident with an
-/// order's `force_at` takes the order's row [r1.9].
+/// Design §2's disposition table (C1 §7.6; the first matching row wins)
+/// over the turn's one result (AD4): its retained vendor terminal, if any,
+/// and its evidence or typed failure. A failure stays the first cause, as
+/// in S1; the retained terminal still gives the envelope its vendor stop
+/// reason. `wall` is the turn's wall deadline: a `Deadline` coincident with
+/// an order's `force_at` takes the order's row [r1.9].
 pub(super) fn dispose(
     accepted: bool,
-    outcome: Result<FakeTerminalEvidence, AdapterError>,
+    (vendor, outcome): (Option<&VendorTerminal>, Result<TurnEvidence, AdapterError>),
     order: Option<&StopOrder>,
     wall: tokio::time::Instant,
 ) -> Disposed {
     let Some(order) = order else {
-        // C1 §7.6: Core's deadline cancels the turn; Route force-closed its group.
+        // C1 §7.6: Core's deadline cancels the turn; Route stopped it.
         let stop = match &outcome {
             Err(AdapterError::Route(route))
                 if matches!(route.cause, RouteError::Deadline { .. }) =>
@@ -159,12 +268,13 @@ pub(super) fn dispose(
                 Some(stop_outcome(
                     route.cleanup == Some(WireCleanup::Quiescent),
                     route.forced,
+                    route.acknowledged,
                 ))
             }
             Ok(_) | Err(_) => None,
         };
         return Disposed {
-            terminal: classify(accepted, outcome),
+            terminal: classify(accepted, vendor, outcome),
             stop,
             cancel_cause: None,
         };
@@ -178,8 +288,9 @@ pub(super) fn dispose(
     match outcome {
         Ok(evidence) => {
             let cleanup = cleanup_word(evidence.cleanup == Cleanup::Quiescent);
-            let interrupted = evidence.status == VendorTerminalStatus::Interrupted;
-            let mut terminal = classify(accepted, Ok(evidence));
+            let interrupted =
+                vendor.is_some_and(|vendor| vendor.status == VendorTerminalStatus::Interrupted);
+            let mut terminal = classify(accepted, vendor, Ok(evidence));
             let stop = match (interrupted, cause) {
                 (_, StopCause::Store) => {
                     terminal.fail(FailureClass::Store, STORE_STOP);
@@ -208,13 +319,18 @@ pub(super) fn dispose(
                 cancel_cause: requested,
             }
         }
-        Err(AdapterError::Route(route)) => stopped(route, cause, order, wall, requested),
-        // Nothing launched: the adapter refused the turn before Route.
-        Err(error) => Disposed {
-            terminal: failed_terminal(error),
-            stop: Some(("requested", "quiescent")),
-            cancel_cause: None,
-        },
+        Err(AdapterError::Route(route)) => stopped((route, vendor), cause, order, wall, requested),
+        // A definite rejection or a resume mismatch: the turn fails as it
+        // would without the order, which it outlived; the cleanup facts are
+        // the rejection's own.
+        Err(error) => {
+            let cleanup = cleanup_word(error.evidence().cleanup == Cleanup::Quiescent);
+            Disposed {
+                terminal: failed_terminal(&error, vendor),
+                stop: Some(("requested", cleanup)),
+                cancel_cause: None,
+            }
+        }
     }
 }
 
@@ -225,7 +341,7 @@ const STORE_STOP: &str = "a turn event could not be recorded";
 /// (review r1).
 pub(super) const TOKENS_STOP: &str = "the vendor reported a token count that cannot be represented";
 
-/// C1 §3.5 cleanup word.
+/// C1 §3.5 cleanup word: a settled result never carries `pending` (AD9).
 fn cleanup_word(quiescent: bool) -> &'static str {
     if quiescent { "quiescent" } else { "uncertain" }
 }
@@ -241,7 +357,7 @@ fn idle(terminal: &mut Terminal) {
 
 /// Route's failure under a stop order (design §2's table).
 fn stopped(
-    route: RouteFailure,
+    (route, vendor): (RouteFailure, Option<&VendorTerminal>),
     cause: StopCause,
     order: &StopOrder,
     wall: tokio::time::Instant,
@@ -260,7 +376,7 @@ fn stopped(
                 )
         }
     };
-    let (outcome, cleanup) = stop_outcome(quiescent, route.forced);
+    let (outcome, cleanup) = stop_outcome(quiescent, route.forced, route.acknowledged);
     let by_order = match route.cause {
         RouteError::Stopped { .. } => true,
         RouteError::Deadline { .. } => order.force_at.instant() == wall,
@@ -269,11 +385,16 @@ fn stopped(
         | RouteError::ProcessExited { .. }
         | RouteError::Overflow { .. }
         | RouteError::Store { .. }
-        | RouteError::ForceStopped { .. } => false,
+        | RouteError::ForceStopped { .. }
+        | RouteError::ServerLost { .. }
+        | RouteError::HandshakeRefused { .. }
+        | RouteError::InvalidParam { .. }
+        | RouteError::ResumeMismatch { .. } => false,
     };
     let launched = route.launched;
     let forced = route.forced;
-    let mut terminal = failed_terminal(AdapterError::Route(route));
+    let shared = route.shared;
+    let mut terminal = failed_terminal(&AdapterError::Route(route), vendor);
     if matches!(cause, StopCause::Store | StopCause::Protocol) {
         if cause == StopCause::Store {
             terminal.fail(FailureClass::Store, STORE_STOP);
@@ -316,10 +437,12 @@ fn stopped(
                 terminal.stop_reason = "interrupted";
                 ("forced", cleanup)
             } else {
-                // A vendor may have run with neither stop nor terminal proved.
+                // A vendor may have run with neither stop nor terminal
+                // proved. AD4, C1 §7.6 "Force deadline, shared server": a
+                // shared server is never killed, so the outcome is unknown.
                 terminal.state = "unknown";
                 terminal.stop_reason = "error";
-                ("requested", cleanup)
+                (if shared { "unknown" } else { outcome }, cleanup)
             };
             Disposed {
                 cancel_cause: requested.filter(|_| terminal.state == "cancelled"),
@@ -330,36 +453,57 @@ fn stopped(
     }
 }
 
+/// C1 §7.6 rows 3–4 and §8.2 from the turn's retained vendor terminal: a
+/// `completed` terminal is `completed`; a failed or interrupted one fails
+/// with the class its hint suggests (`vendor_error` without one) and the
+/// vendor's code and detail. Before acceptance the turn is
+/// `submit_failed`. The adapter's normalized stop reason is kept (#34,
+/// #36); the process exit is optional (#35).
 pub(super) fn classify(
     accepted: bool,
-    outcome: Result<FakeTerminalEvidence, AdapterError>,
+    vendor: Option<&VendorTerminal>,
+    outcome: Result<TurnEvidence, AdapterError>,
 ) -> Terminal {
     let evidence = match outcome {
         Ok(evidence) => evidence,
-        Err(error) => return failed_terminal(error),
+        Err(error) => return failed_terminal(&error, vendor),
     };
-    let failed = |class, message: &str| Some(failure(class, message.to_owned(), None));
+    let exit = exit_of(&evidence);
+    let Some(vendor) = vendor else {
+        // C2 §4.1: a turn ends well only with its terminal; nothing here
+        // proves the vendor's result.
+        let mut terminal = blank("failed", "error", exit);
+        terminal.fail(
+            FailureClass::Protocol,
+            "the turn ended without a vendor terminal",
+        );
+        return terminal;
+    };
     let failure = if accepted {
-        match evidence.status {
+        match vendor.status {
             // C1 §7.6 row 3: a decoded `completed` is `completed`; the exit
             // and cleanup stay independent evidence (C1 §7.5).
             VendorTerminalStatus::Completed => None,
             VendorTerminalStatus::Interrupted | VendorTerminalStatus::Failed => Some(failure(
-                FailureClass::VendorError,
-                "the vendor reported a failed turn".to_owned(),
-                evidence.vendor_code.clone(),
+                vendor.class_hint.map_or(FailureClass::VendorError, class),
+                vendor
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "the vendor reported a failed turn".to_owned()),
+                vendor.vendor_code.clone(),
             )),
         }
     } else {
-        failed(
+        Some(failure(
             FailureClass::SubmitFailed,
-            "the vendor did not accept the submission",
-        )
+            "the vendor did not accept the submission".to_owned(),
+            None,
+        ))
     };
-    let stop_reason = match (&failure, evidence.status) {
-        (None, _) => canonical_stop_reason(&evidence.stop_reason),
-        (Some(_), VendorTerminalStatus::Interrupted) => "interrupted",
-        (Some(_), VendorTerminalStatus::Completed | VendorTerminalStatus::Failed) => "error",
+    let stop_reason = match (&failure, accepted, vendor.status) {
+        (None, _, _) | (Some(_), true, _) => stop_word(vendor.stop_reason),
+        (Some(_), false, VendorTerminalStatus::Interrupted) => "interrupted",
+        (Some(_), false, VendorTerminalStatus::Completed | VendorTerminalStatus::Failed) => "error",
     };
     Terminal {
         state: if failure.is_none() {
@@ -369,65 +513,110 @@ pub(super) fn classify(
         },
         failure,
         stop_reason,
-        vendor_stop_reason: Some(evidence.stop_reason),
+        vendor_stop_reason: Some(vendor.vendor_stop_reason.clone()),
         // The drive sets the text it accumulated from `final_text` pieces.
         final_text: Some(String::new()),
         final_text_file: None,
-        exit: Some(Exit {
-            code: evidence.exit.code,
-            signal: evidence.exit.signal,
-        }),
+        exit,
+        warnings: Vec::new(),
+        cancel: None,
+    }
+}
+
+/// C1 §8.2's class for an adapter's hint (#18, AD11).
+fn class(hint: ClassHint) -> FailureClass {
+    match hint {
+        ClassHint::Auth => FailureClass::Auth,
+        ClassHint::RateLimit => FailureClass::RateLimit,
+        ClassHint::ContextExceeded => FailureClass::ContextExceeded,
+        ClassHint::BudgetExceeded => FailureClass::BudgetExceeded,
+        ClassHint::VendorError => FailureClass::VendorError,
+        ClassHint::Protocol => FailureClass::Protocol,
+        ClassHint::ResumeMismatch => FailureClass::ResumeMismatch,
+    }
+}
+
+/// C1 §5's `stop_reason` for the adapter's normalized one (AD5).
+fn stop_word(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxSteps => "max_steps",
+        StopReason::Budget => "budget",
+        StopReason::Refusal => "refusal",
+        StopReason::Interrupted => "interrupted",
+        StopReason::Error => "error",
+        StopReason::Other => "other",
+    }
+}
+
+/// The envelope's `exit`: the confirmed process exit, `null` without one
+/// (server routes).
+fn exit_of(evidence: &TurnEvidence) -> Option<Exit> {
+    evidence.exit.map(|exit| Exit {
+        code: exit.code,
+        signal: exit.signal,
+    })
+}
+
+/// A terminal with no failure yet, no text and no cancel.
+fn blank(state: &'static str, stop_reason: &'static str, exit: Option<Exit>) -> Terminal {
+    Terminal {
+        state,
+        failure: None,
+        stop_reason,
+        vendor_stop_reason: None,
+        final_text: Some(String::new()),
+        final_text_file: None,
+        exit,
         warnings: Vec::new(),
         cancel: None,
     }
 }
 
 /// Keeps the typed cause, the undecoded message's note and the confirmed
-/// exit of a failed drive.
-fn failed_terminal(error: AdapterError) -> Terminal {
+/// exit of a failed drive; a retained vendor terminal gives its stop
+/// reason (AD4).
+fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Terminal {
     let message = error.to_string();
-    let (state, class, stop_reason, route) = match error {
+    let exit = exit_of(&error.evidence());
+    let (state, class, stop_reason, data) = match error {
         AdapterError::Route(route) => {
             let (state, class, stop_reason) = route_disposition(&route.cause);
-            (state, class, stop_reason, Some(route))
+            (state, class, stop_reason, submit_data(&route.cause))
+        }
+        // C1 §8.2: a definite rejection before acceptance; only the
+        // adapter-side parameter rejection names its reason.
+        AdapterError::Rejected { reason, .. } => {
+            let data = match reason {
+                StartRejected::InvalidParam { field } => {
+                    Some(json!({"reason": "invalid_param", "field": field}))
+                }
+                StartRejected::BoundUnsupported(_)
+                | StartRejected::VendorError(..)
+                | StartRejected::SessionGone
+                | StartRejected::Protocol(_) => None,
+            };
+            ("failed", Some(FailureClass::SubmitFailed), "error", data)
+        }
+        // C2 §2 Reopen: the vendor returned another session.
+        AdapterError::ResumeMismatch { .. } => {
+            ("failed", Some(FailureClass::ResumeMismatch), "error", None)
         }
         // No process was launched for the submission.
         AdapterError::Unavailable => ("failed", Some(FailureClass::SubmitFailed), "error", None),
-        AdapterError::Open(_) | AdapterError::Protocol => {
-            ("failed", Some(FailureClass::Protocol), "error", None)
-        }
+        // The driver lost the turn's task: nothing proves what the vendor
+        // did.
+        AdapterError::TaskFailed => ("unknown", None, "error", None),
+        AdapterError::Open(_) => ("failed", Some(FailureClass::Protocol), "error", None),
     };
-    Terminal {
-        state,
-        failure: class.map(|class| failure(class, message, None)),
-        stop_reason,
-        vendor_stop_reason: None,
-        final_text: Some(String::new()),
-        final_text_file: None,
-        exit: route
-            .as_ref()
-            .and_then(|route| route.exit)
-            .map(|exit| Exit {
-                code: exit.code,
-                signal: exit.signal,
-            }),
-        warnings: Vec::new(),
-        cancel: None,
-    }
-}
-
-/// Maps a vendor stop word onto C1's closed `stop_reason` set.
-fn canonical_stop_reason(vendor: &str) -> &'static str {
-    match vendor {
-        "end_turn" => "end_turn",
-        "max_steps" => "max_steps",
-        "budget" => "budget",
-        "refusal" => "refusal",
-        "interrupted" => "interrupted",
-        "deadline" => "deadline",
-        "error" => "error",
-        _ => "other",
-    }
+    let mut terminal = blank(state, stop_reason, exit);
+    terminal.failure = class.map(|class| {
+        let mut failure = failure(class, message, None);
+        failure.data = data;
+        failure
+    });
+    terminal.vendor_stop_reason = vendor.map(|vendor| vendor.vendor_stop_reason.clone());
+    terminal
 }
 
 /// Test builds only (Task 4 design §6.4, §13.2): the encoded envelope with
@@ -482,7 +671,7 @@ pub fn envelope_at_maximum(
     };
     let accepted = Accepted {
         at: at.to_owned(),
-        vendor_turn_id: short("t"),
+        vendor_turn_id: Some(short("t")),
     };
     let timestamps = Timestamps {
         queued_at: at.to_owned(),
@@ -499,7 +688,16 @@ pub fn envelope_at_maximum(
         timestamps,
         Some(u64::MAX),
         (1, u64::MAX - 1),
-        Usage::fake(Some(u64::MAX)),
+        Usage::reported(
+            Some(crate::api::Tokens {
+                input: Some(u64::MAX),
+                cached_input: Some(u64::MAX),
+                output: Some(u64::MAX),
+                reasoning_output: Some(u64::MAX),
+                total: Some(u64::MAX),
+            }),
+            true,
+        ),
     );
     envelope.model = Requested {
         requested: "m".repeat(1022),
@@ -512,11 +710,18 @@ pub fn envelope_at_maximum(
     envelope.bound = maxima::bound();
     envelope.vendor_options = maxima::object_of(16 * 1024);
     envelope.vendor_session_id = Some(short("s"));
-    let mut denied_list = Kept::default();
+    envelope.evidence.transcript = Some("/".repeat(4096));
+    // AD6: the terminal's vendor data, at most 16 KiB encoded.
+    if let serde_json::Value::Object(data) = maxima::object_of(16 * 1024) {
+        envelope.vendor.data = data;
+    }
+    envelope.steps = Some(u64::MAX);
+    envelope.cost = Cost::reported(f64::MAX, "session_cumulative");
+    let mut denied_list = crate::api::Kept::default();
     for index in 0..denied {
         denied_list.push(maxima::denied(entry_bytes, at, index + 1));
     }
-    let mut declined_list = Kept::default();
+    let mut declined_list = crate::api::Kept::default();
     for index in 0..declined {
         declined_list.push(maxima::declined(entry_bytes, at, index + 1));
     }
@@ -530,8 +735,16 @@ pub fn envelope_at_maximum(
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureClass, TurnNumber, failed_terminal};
+    use super::{FailureClass, TurnNumber};
     use via_adapters::{AdapterError, RouteError, RouteFailure};
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the cases build their failure inline"
+    )]
+    fn failed_terminal(error: AdapterError) -> super::Terminal {
+        super::failed_terminal(&error, None)
+    }
 
     fn route(cause: RouteError, undecoded: Option<&str>) -> AdapterError {
         AdapterError::Route(RouteFailure {
@@ -542,6 +755,8 @@ mod tests {
             cleanup: None,
             forced: false,
             journal_uncertain: false,
+            acknowledged: false,
+            shared: false,
         })
     }
 

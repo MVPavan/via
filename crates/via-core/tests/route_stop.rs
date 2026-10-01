@@ -18,11 +18,13 @@ use std::{
 
 use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, Cleanup, Deadline, FakeConfig,
-    FakeObservation, FakeTerminalEvidence, Observation, RouteError, RouteFailure, RuntimeConfig,
-    SessionId, StopCause, StopOrder, StoreFailure, TurnNumber, VendorTerminalStatus,
+    AdapterError, Cleanup, Deadline, Observation, RouteError, RouteFailure, SessionId, StopCause,
+    StopOrder, StoreFailure, TurnEnd, VendorTerminalStatus,
 };
 use via_store::{SpawnRecord, Store, failpoint};
+
+#[path = "support/one_turn.rs"]
+mod one_turn;
 
 const SESSION: &str = "s_0123456789ab";
 const CHILD: &str = "VIA_ROUTE_STOP_CHILD";
@@ -54,8 +56,9 @@ fn run_child(name: &str, script: &str) {
     let vendor = root.path().join("vendor.sh");
     fs::write(&vendor, format!("#!/bin/sh\n{script}")).unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
-    let scenario = root.path().join("scenario.ndjson");
-    fs::write(&scenario, "").unwrap();
+    // A valid scenario the shell vendor never reads (decision H2).
+    let scenario = root.path().join("scenario.json");
+    fs::write(&scenario, r#"{"scripts":[]}"#).unwrap();
     let mut child = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, root.path())
@@ -91,11 +94,18 @@ fn child_root() -> Option<PathBuf> {
 struct Child {
     root: PathBuf,
     _store: Store,
-    adapter: AdapterRuntime,
+    adapter: one_turn::OneTurn,
     runtime: tokio::runtime::Runtime,
 }
 
-type Outcome = Result<FakeTerminalEvidence, AdapterError>;
+type Outcome = TurnEnd;
+
+/// The status of the turn's kept terminal and its cleanup, for a turn
+/// that ended without a failure.
+fn completed(outcome: &Outcome) -> (VendorTerminalStatus, Cleanup) {
+    let evidence = outcome.outcome.as_ref().unwrap();
+    (outcome.terminal.as_ref().unwrap().status, evidence.cleanup)
+}
 
 impl Child {
     fn open(root: &Path) -> Self {
@@ -117,17 +127,7 @@ impl Child {
                 initial_event: serde_json::json!({"seq":1,"type":"turn.queued","turn":1,"at":"2026-01-01T00:00:00.000Z"}),
             }))
             .unwrap();
-        let adapter = AdapterRuntime::new(
-            AdapterRuntimeConfig {
-                runtime: RuntimeConfig {
-                    anchor_binary: via_binary(),
-                    anchor_dir: root.join("runtime"),
-                },
-                fake: FakeConfig::from_environment().unwrap(),
-            },
-            store.runtime_resources(),
-        )
-        .unwrap();
+        let adapter = one_turn::OneTurn::new(&store, root, via_binary());
         Self {
             root: root.to_path_buf(),
             _store: store,
@@ -158,28 +158,21 @@ impl Child {
             watch::Sender<Option<StopOrder>>,
             watch::Receiver<Option<StopOrder>>,
         ),
-        mut on_observation: impl FnMut(&watch::Sender<Option<StopOrder>>, &FakeObservation),
+        mut on_observation: impl FnMut(&watch::Sender<Option<StopOrder>>, &Observation),
     ) -> Outcome {
-        let (sender, mut receiver) = via_adapters::observation_channel();
+        let (driver, mut receiver) = self.adapter.session(SESSION, &self.root);
         let deadline = Deadline::at(tokio::time::Instant::now() + turn);
         let (_force, force) = watch::channel(None);
         let (order, orders) = stop;
         self.runtime.block_on(async {
-            let execute = self.adapter.execute(
-                SessionId::try_from(SESSION).unwrap(),
-                TurnNumber::try_from(1).unwrap(),
-                ("hello".to_owned(), self.adapter.fake_cwd().to_path_buf()),
-                sender,
-                via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-                deadline,
-                force,
-                orders,
-                Box::new(()),
-            );
+            let cx = one_turn::turn_cx(driver.prepare(), deadline, force, orders);
+            let execute = driver.run_turn(one_turn::hello(), cx);
             tokio::pin!(execute);
             loop {
                 tokio::select! {
-                    Some(admitted) = receiver.recv() => on_observation(&order, &admitted.observation),
+                    Some(admitted) = receiver.recv() => {
+                        on_observation(&order, &admitted.item.observation);
+                    }
                     result = &mut execute => break result,
                 }
             }
@@ -202,10 +195,10 @@ fn order(force_after: Duration) -> StopOrder {
 }
 
 fn route_failure(outcome: Outcome) -> RouteFailure {
-    match outcome {
+    match outcome.outcome {
         Err(AdapterError::Route(failure)) => failure,
         Err(other) => panic!("not a route failure: {other}"),
-        Ok(evidence) => panic!("unexpected terminal {:?}", evidence.status),
+        Ok(_) => panic!("unexpected terminal {:?}", outcome.terminal),
     }
 }
 
@@ -256,14 +249,15 @@ fn an_order_sends_one_interrupt_and_the_terminal_ends_the_turn() {
         Duration::from_secs(10),
         watch::channel(None),
         |order, observation| {
-            if matches!(observation, FakeObservation::Accepted(_)) {
+            if matches!(observation, Observation::Accepted(_)) {
                 order.send_replace(Some(self::order(Duration::from_secs(10))));
             }
         },
     );
-    let evidence = outcome.unwrap();
-    assert_eq!(evidence.status, VendorTerminalStatus::Interrupted);
-    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
+    assert_eq!(
+        completed(&outcome),
+        (VendorTerminalStatus::Interrupted, Cleanup::Quiescent)
+    );
     let controls = fs::read_to_string(child.sync("controls")).unwrap();
     assert_eq!(
         controls,
@@ -288,7 +282,7 @@ fn force_at_without_a_terminal_force_closes_the_group() {
         Duration::from_secs(20),
         watch::channel(None),
         |order, observation| {
-            if matches!(observation, FakeObservation::Accepted(_)) {
+            if matches!(observation, Observation::Accepted(_)) {
                 order.send_replace(Some(self::order(Duration::from_millis(300))));
             }
         },
@@ -351,23 +345,20 @@ fn a_decoded_terminal_survives_wall_expiry_in_finalization() {
     // The final text arrives as `final_text` pieces before the terminal
     // (Task 4 design §2.3).
     let mut text = String::new();
-    let evidence = child
-        .execute(
-            Duration::from_secs(2),
-            watch::channel(None),
-            |_, observation| {
-                if let FakeObservation::Data {
-                    observation: Observation::FinalText(piece),
-                } = observation
-                {
-                    text.push_str(piece);
-                }
-            },
-        )
-        .unwrap();
-    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
+    let outcome = child.execute(
+        Duration::from_secs(2),
+        watch::channel(None),
+        |_, observation| {
+            if let Observation::FinalText(piece) = observation {
+                text.push_str(piece);
+            }
+        },
+    );
+    assert_eq!(
+        completed(&outcome),
+        (VendorTerminalStatus::Completed, Cleanup::Quiescent)
+    );
     assert_eq!(text, "done");
-    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
 }
 
 /// S1 critic r2 finding 2 (design §2 rule 3 [r1.23], Task 4 design §2.3):
@@ -382,9 +373,10 @@ fn a_held_terminal_is_delivered_after_wall_expiry() {
         return run_child(name, &held_terminal_script(false));
     };
     let run = held_terminal(&Child::open(&root), true, None);
-    let evidence = run.outcome.unwrap();
-    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
-    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
+    assert_eq!(
+        completed(&run.outcome),
+        (VendorTerminalStatus::Completed, Cleanup::Quiescent)
+    );
     assert_eq!(run.text, "done", "a completed turn lost its final text");
 }
 
@@ -436,9 +428,10 @@ fn a_latch_during_late_delivery_keeps_the_held_terminal() {
     };
     let run = held_terminal(&Child::open(&root), true, Some(Late::Latch));
     assert!(run.late_entered, "the late path was not taken");
-    let evidence = run.outcome.unwrap();
-    assert_eq!(evidence.status, VendorTerminalStatus::Completed);
-    assert_eq!(evidence.cleanup, Cleanup::Quiescent);
+    assert_eq!(
+        completed(&run.outcome),
+        (VendorTerminalStatus::Completed, Cleanup::Quiescent)
+    );
     assert_eq!(
         run.text, "done",
         "the latched late delivery dropped the terminal"
@@ -576,30 +569,18 @@ fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
     if late.is_some() {
         child.arm("routes.late.entered", "pause");
     }
-    let (sender, mut receiver) = via_adapters::observation_channel();
+    let (driver, mut receiver) = child.adapter.session(SESSION, &child.root);
     let expiry = tokio::time::Instant::now() + Duration::from_secs(3);
     let (forcing, forced) = watch::channel(None);
     let (_order, orders) = watch::channel(None);
     let points = child.root.join("points");
     child.runtime.block_on(async {
-        let execute = child.adapter.execute(
-            SessionId::try_from(SESSION).unwrap(),
-            TurnNumber::try_from(1).unwrap(),
-            ("hello".to_owned(), child.adapter.fake_cwd().to_path_buf()),
-            sender,
-            via_adapters::TurnActivity::new(tokio::time::Instant::now()),
-            Deadline::at(expiry),
-            forced,
-            orders,
-            Box::new(()),
-        );
+        let cx = one_turn::turn_cx(driver.prepare(), Deadline::at(expiry), forced, orders);
+        let execute = driver.run_turn(one_turn::hello(), cx);
         tokio::pin!(execute);
         let mut text = String::new();
-        let mut collect = |observation: FakeObservation| {
-            if let FakeObservation::Data {
-                observation: Observation::FinalText(piece),
-            } = observation
-            {
+        let mut collect = |observation: Observation| {
+            if let Observation::FinalText(piece) = observation {
                 text.push_str(&piece);
             }
         };
@@ -630,12 +611,12 @@ fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
                     waiting = None;
                     draining = drain;
                 }
-                Some(admitted) = receiver.recv(), if draining => collect(admitted.observation),
+                Some(admitted) = receiver.recv(), if draining => collect(admitted.item.observation),
                 outcome = &mut execute => break outcome,
             }
         };
         while let Ok(admitted) = receiver.try_recv() {
-            collect(admitted.observation);
+            collect(admitted.item.observation);
         }
         HeldRun {
             outcome,

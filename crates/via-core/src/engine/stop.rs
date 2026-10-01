@@ -259,7 +259,7 @@ impl Engine {
     async fn finalize_forced(
         &self,
         turn: super::ForcedTurn,
-        report: &via_adapters::FakeShutdown,
+        report: &via_adapters::AdapterShutdown,
         deadline: Deadline,
         batches: &mut FailureBatches,
     ) -> bool {
@@ -327,7 +327,7 @@ impl Engine {
     )]
     async fn forced_facts(
         turn: &super::ForcedTurn,
-        report: &via_adapters::FakeShutdown,
+        report: &via_adapters::AdapterShutdown,
     ) -> (bool, bool) {
         let evidence = report.recovery.iter().find(|record| {
             record.session_id == turn.started.session && record.turn == turn.started.turn
@@ -366,7 +366,8 @@ impl Engine {
         } else {
             "unknown"
         };
-        let (outcome, cleanup) = stop_outcome(quiescent, forced);
+        // A private route's own close: no vendor acknowledgement.
+        let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let mut record = turn.record;
         let cancel = self
             .settle_on(
@@ -478,7 +479,18 @@ impl Engine {
         // Host keeps evidence only for receipted, unresolved turns (at most
         // the unresolved cap), which include every force-stopped turn.
         let turns = self.unresolved.turns();
+        // Every driver's owned work stops with the daemon (C2 §2
+        // `SessionCx`); Host's reconciliation below owns their groups.
+        self.drop_lanes();
         let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
+        // The drivers' tasks end once Host stopped their groups; one still
+        // running then counts as pending work.
+        let drivers_joined = tokio::time::timeout_at(
+            host_by.max(tokio::time::Instant::now()),
+            self.tracker.wait(),
+        )
+        .await
+        .is_ok();
         // A dispatcher that has not joined still owns its session: none of
         // its turns is settled here, and they stay unresolved for restart
         // recovery (design §6.8 step 3).
@@ -518,7 +530,7 @@ impl Engine {
         EngineShutdown {
             anchors: report.anchors,
             uncertain_owners: report.uncertain_anchors,
-            pending_tasks: report.pending_tasks,
+            pending_tasks: report.pending_tasks + usize::from(!drivers_joined),
             failed_tasks: report.failed_tasks,
             failure: report.failure,
             uncommitted_turns,
@@ -670,12 +682,24 @@ impl Engine {
 }
 
 /// C1 §7.4 outcome and §3.5 cleanup of a stop Core ordered, as independent
-/// facts: `forced` needs Host's evidence that its stop found the vendor live,
-/// otherwise the cancel was only `requested`; cleanup is `quiescent` only with
-/// proved group absence.
-pub(super) fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'static str) {
+/// facts: `forced` needs Host's evidence that its stop found the vendor
+/// live; else `acknowledged` needs the vendor's acknowledgement within the
+/// cutoff (AD4); otherwise the cancel was only `requested`. Cleanup is
+/// `quiescent` only with proved group absence, or on a server route every
+/// reported tool ended (AD9).
+pub(super) fn stop_outcome(
+    quiescent: bool,
+    forced: bool,
+    acknowledged: bool,
+) -> (&'static str, &'static str) {
     (
-        if forced { "forced" } else { "requested" },
+        if forced {
+            "forced"
+        } else if acknowledged {
+            "acknowledged"
+        } else {
+            "requested"
+        },
         if quiescent { "quiescent" } else { "uncertain" },
     )
 }

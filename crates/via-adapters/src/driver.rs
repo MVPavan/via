@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::fake::FakeAdapter;
-use crate::observation::{ObservationSink, SteerDelivery, TurnEnd, TurnError};
+use crate::observation::{AdapterError, ObservationSink, SteerDelivery, TurnEnd, TurnEvidence};
 use crate::plan::{Bound, Inherit, VendorOptions};
 use crate::{
     CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
@@ -292,7 +292,7 @@ impl SessionDriver {
     /// Runs one submitted turn to its one result (C2 §4.1).
     pub async fn run_turn(&self, spec: TurnSpec, cx: TurnCx) -> TurnEnd {
         let Some(adapter) = self.adapter.clone() else {
-            return rejected(TurnError::Unavailable);
+            return rejected(AdapterError::Unavailable);
         };
         crate::fake::run_turn(self, &adapter, spec, cx).await
     }
@@ -306,11 +306,11 @@ impl SessionDriver {
         &self,
         prepared: Prepared,
         capacity: Option<CapacityToken>,
-    ) -> Result<(u64, Option<CapacityToken>, Reservation), TurnError> {
+    ) -> Result<(u64, Option<CapacityToken>, Reservation), AdapterError> {
         let persistent = self.persistent();
         let mut state = self.state();
         if state.closed {
-            return Err(TurnError::Rejected(crate::StartRejected::SessionGone));
+            return Err(session_gone());
         }
         let reservation = |generation, slot| Reservation {
             state: Arc::clone(&self.state),
@@ -326,7 +326,7 @@ impl SessionDriver {
                 Ok((state.generation, None, reservation(state.generation, None)))
             }
             // The pinned connection died before submission: nothing sent.
-            Prepared::Pinned(_) => Err(TurnError::Rejected(crate::StartRejected::SessionGone)),
+            Prepared::Pinned(_) => Err(session_gone()),
             Prepared::NeedsConnection => {
                 state.generation += 1;
                 state.live = false;
@@ -583,8 +583,16 @@ impl Drop for Reservation {
     }
 }
 
+/// The session or its pinned connection is gone: nothing launched.
+fn session_gone() -> AdapterError {
+    AdapterError::Rejected {
+        reason: crate::StartRejected::SessionGone,
+        evidence: TurnEvidence::no_launch(false),
+    }
+}
+
 /// A turn rejected before anything ran.
-pub(crate) fn rejected(error: TurnError) -> TurnEnd {
+pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
     TurnEnd {
         terminal: None,
         instance: None,

@@ -777,7 +777,9 @@ fn s1_c1_status_progress_only_for_the_selected_turn() -> TestResult {
 
 /// Design §2.4, §13.2: two keyless usage samples in one step supersede;
 /// steps add; `tokens.scope` is the fake's declared `usage.tokens`, `turn`.
-/// The envelope's `usage` reports the turn's total, the sum of its rows.
+/// The envelope's `usage` reports the turn-wide ledger's total (adapter
+/// design AD6, §5.1 #19, S-CORE chunk 4): keyless samples add across the
+/// turn, 100 + 120 + 50, unlike the step rows' per-step rule.
 #[test]
 fn s1_progress_tokens_sum_per_step_and_label_scope() -> TestResult {
     let mut steps = vec![accepted(1)];
@@ -816,7 +818,7 @@ fn s1_progress_tokens_sum_per_step_and_label_scope() -> TestResult {
             check(rows == [(1, Some(120)), (2, Some(50)), (3, None)], || {
                 format!("rows: {rows:?}")
             })?;
-            let sum: i64 = rows.iter().filter_map(|(_, tokens)| *tokens).sum();
+            let sum = 100 + 120 + 50;
             check(
                 envelope["usage"]
                     == json!({"input_tokens":null,"cached_input_tokens":null,
