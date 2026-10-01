@@ -6,7 +6,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::{FakeMessage, RouteMessage, TerminalStatus, TurnStart};
 use crate::{
     Deadline, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure, RuntimeConfig,
-    RuntimeResources, SendOutcome, StopWatch, StoreFailure, TurnNumber, WireRecovery, WireShutdown,
+    RuntimeResources, SendOutcome, StopSources, StopWatch, StoreFailure, TurnNumber, WireRecovery,
+    WireShutdown,
 };
 use lane::{Facts, Interrupt, LaneState, steer_request, turn_result};
 use via_wire::{
@@ -79,7 +80,9 @@ impl FakeRoute {
     /// force-closed at once; after it, one interrupt is sent, a terminal still
     /// ends the turn normally, and at `force_at` without one the group is
     /// force-closed under `close_by`. Either stop is
-    /// [`RouteError::Stopped`].
+    /// [`RouteError::Stopped`]. `sources` reports an order set where a
+    /// relayed `stop` has not caught up yet; the entry check and the
+    /// launch gate read it too.
     ///
     /// The logical turn, with the terminal and handshake retained on every
     /// outcome (AD4, AD7), goes on `logical` when it ends: on the persistent
@@ -93,7 +96,7 @@ impl FakeRoute {
         (deadline, force, stop): (
             Deadline,
             watch::Receiver<Option<tokio::time::Instant>>,
-            StopWatch,
+            (StopWatch, StopSources),
         ),
         lane: Lane,
         logical: oneshot::Sender<FakeTurn>,
@@ -116,10 +119,10 @@ impl FakeRoute {
         process: PrivateProcessSpec,
         start: TurnStart,
         hop: mpsc::Sender<RouteMessage>,
-        (deadline, force, stop): (
+        (deadline, force, (stop, sources)): (
             Deadline,
             watch::Receiver<Option<tokio::time::Instant>>,
-            StopWatch,
+            (StopWatch, StopSources),
         ),
         lane: Lane,
         logical: oneshot::Sender<FakeTurn>,
@@ -149,7 +152,7 @@ impl FakeRoute {
         }
         // An order set before submission reached Route: nothing starts, and
         // no anchor intent exists.
-        if stop.borrow().is_some() {
+        if stop.borrow().is_some() || sources() {
             return (
                 Err(not_launched(RouteError::Stopped { turn })),
                 unlaunched(logical),
@@ -159,7 +162,7 @@ impl FakeRoute {
         let gate = {
             let force = force.clone();
             let stop = stop.clone();
-            Arc::new(move || force.borrow().is_some() || stop.borrow().is_some())
+            Arc::new(move || force.borrow().is_some() || stop.borrow().is_some() || sources())
         };
         let signals = WireSignals {
             force: force.clone(),

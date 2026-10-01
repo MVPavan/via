@@ -35,7 +35,7 @@ use crate::{
 };
 use via_routes::{
     FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
-    Retirement, RouteMessage, TerminalStatus, TurnStart, WireCleanup,
+    Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -491,8 +491,17 @@ async fn turn_task(task: TurnTask) {
     let persistent = lane.persistent;
     let (merged, merged_rx) =
         watch::channel(earliest(core_stop.borrow().clone(), close.borrow().clone()));
+    // Route reads the sources too where the relay below may lag: an order
+    // set before the pre-ARM launch gate wins there (design §2 rule 1).
+    let sources: StopSources = {
+        let (core, close, cancel) = (core_stop.clone(), close.clone(), cancel.clone());
+        Arc::new(move || {
+            core.borrow().is_some() || close.borrow().is_some() || cancel.is_cancelled()
+        })
+    };
     let (inner, inner_rx) = oneshot::channel();
-    let route_turn = route.turn(process, start, hop, (wall, force, merged_rx), lane, inner);
+    let stop = (merged_rx, sources);
+    let route_turn = route.turn(process, start, hop, (wall, force, stop), lane, inner);
     let relay = async {
         let Ok(turn_result) = inner_rx.await else {
             return;

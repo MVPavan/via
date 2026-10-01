@@ -172,6 +172,11 @@ pub struct StopOrder {
 /// The turn's stop-order watch: `None` until Core orders a stop.
 pub type StopWatch = tokio::sync::watch::Receiver<Option<StopOrder>>;
 
+/// Whether an order is already set at the sources a relayed [`StopWatch`]
+/// merges, read where the relay may not have caught up: Route's entry
+/// check and the pre-ARM launch gate (design §2 rule 1).
+pub type StopSources = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// A failed route turn: the first typed cause plus the evidence Route still holds
 /// after its forced cleanup and bounded drain, and the two facts Core's stop
 /// outcome needs (AD4 Core handoff).
