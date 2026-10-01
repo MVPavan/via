@@ -31,8 +31,9 @@ Experimental features follow the owner's policy (K17): used where they help,
 each confirmed by the per-version live check, with `Uncertain` as the
 fallback; no experimental capability is sent by default. Record observed
 binary and adapter versions. The version rule is C2 §5 (owner OD1): the
-instance version is parsed from `initialize.userAgent` (the parse rule is
-qualified in `via-5lr.3.1`); a version outside the adapter's `checked` set is
+instance version is parsed from `initialize.userAgent`: drop the
+`<clientInfo.name>/` prefix VIA itself sent, then read up to the first space
+(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); a version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
 cached per C2 §5.
@@ -150,11 +151,17 @@ Instructions map to `developerInstructions`; this adds instructions at that
 level and does not promise replacement of vendor/system/repository policy.
 The model catalog comes only from `model/list`, sent by the driver on an owned
 live server right after `initialize` and cached per server instance with its
-version; model-only resolution fails `unknown_model` before discovery, and an
+version. `model/list` is paginated (`nextCursor`); the driver follows it to
+the end within a bounded page count and byte budget. If a non-null
+`nextCursor` remains at either bound, discovery fails as a protocol
+failure and nothing is cached: a partial catalog is never used or published
+as complete. Model-only resolution fails `unknown_model` before discovery, and an
 explicit model passes to the vendor. A bad model or failed auth fails after
 acceptance as a Failed terminal (C2 §2). Effort (C2 §5): canonical efforts
 are checked in `plan` against the compiled mapping; model-advertised efforts
-are checked against `model/list` inside `run_turn` before `turn/start`, and a
+are checked against `model/list` inside `run_turn` before `thread/start` or
+`thread/resume` (so a rejected submission creates no vendor thread) and
+therefore before `turn/start`, and a
 mismatch is `failed(submit_failed)` with `failure.data.field:"effort"` and no
 `turn/start` written. Live checks use `gpt-6-luna` at low or medium effort. Reject an
 unsupported explicit `max_steps`; this route has no matching control.
@@ -254,10 +261,12 @@ through a `-c` override is unverified. Both switches enter `config_hash`.
 | plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
 | skills (on) | **unverified** | `unknown`, no switch applied, warns |
 | agents (on) | **unverified** | `unknown`, no switch applied, warns |
-| instruction files (on) | AGENTS.md; switch and inventory **unverified** | `unknown`, no switch applied, warns |
+| instruction files (on) | AGENTS.md; switch **unverified**; `thread/start` `instructionSources` reported the loaded AGENTS.md paths (0.159.2), completeness **unverified** | `unknown`, no switch applied, warns |
 
-The only inventory source is `configWarning`; otherwise inventory is
-unavailable. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
+Inventory sources are `configWarning` and the `thread/start` response's
+`instructionSources`, which reported the loaded AGENTS.md paths in the
+0.159.2 re-probe (completeness unverified). The fixtures qualified no other
+inventory; `mcpServerStatus/list` stays schema-only. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
 switchable.
 
 ## 5. Correlation, events and bounds

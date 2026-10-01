@@ -280,7 +280,9 @@ synthetic `error` code, never on `subtype` (a `success` subtype can carry
 `is_error:true`): `authentication_failed` or HTTP 401/403 → Failed `auth`;
 `model_not_found` → Failed `vendor_error` with that `vendor_code`. A vendor
 failure after acceptance and before model output is a Failed terminal with
-vendor code, class hint and `detail`, never `submit_failed` (C2 §2). Other
+vendor code, class hint and `detail`, never `submit_failed` (C2 §2). On
+`is_error:true` the result text is that bounded `detail`, never final text;
+the synthetic assistant message stays excluded from final text and progress. Other
 errors → Failed `vendor_error`, except exact fixture-backed auth/rate-limit/
 context/budget codes; never infer classes from free-text substrings. Host exit
 without terminal and uncertain transport loss follow C1 §7.6, not fabricated
@@ -296,7 +298,10 @@ not override the terminal result's success flag.
 
 `result.usage` is the turn aggregate (C2 §5 usage) and supersedes any
 assistant snapshot; preserve input/output/cache categories separately, with no
-double-counted totals. `total_cost_usd` → `cost {scope: session_cumulative}`;
+double-counted totals. C1 mapping: `input_tokens` = `input_tokens` +
+`cache_creation_input_tokens` + `cache_read_input_tokens` (all input
+processed, as on Codex); `cached_input_tokens` = `cache_read_input_tokens`;
+the cache-creation count also goes to bounded `vendor` data. `total_cost_usd` → `cost {scope: session_cumulative}`;
 raw C1a/C1b/C1c values increased across resumed processes while output-token
 counts were 159, 162, 44. No subtraction into a per-turn billing claim.
 `fallback_credit` and `modelUsage.costBasis` go to `vendor`. Missing values stay
