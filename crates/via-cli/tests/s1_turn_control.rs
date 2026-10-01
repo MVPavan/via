@@ -1034,8 +1034,10 @@ fn s1_f19_idle_deadline_fails_turn_and_clears_group() -> TestResult {
         // but not the monotonic clock: the idle order is then bounded on the
         // harness's one monotonic clock, from before the spawn request (at or
         // before the idle origin, the submission clock) to the first read of
-        // `cancel.requested` (10 ms polling) [s2-r1.2, s2-r2.4].
-        let stepped = wall.abs_diff(monotonic) > Duration::from_millis(250);
+        // `cancel.requested` (10 ms polling) [s2-r1.2, s2-r2.4]. Any step larger
+        // than the window's 50 ms lower slack counts: a 68 ms slew made a timely
+        // order read 1934 ms on the durable timestamps.
+        let stepped = wall.abs_diff(monotonic) > Duration::from_millis(50);
         let timely = if stepped {
             (Duration::from_millis(1950)..Duration::from_millis(3000)).contains(&ordered_seen)
         } else {
