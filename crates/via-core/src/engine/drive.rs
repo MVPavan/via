@@ -548,8 +548,7 @@ impl Engine {
         slot: &Slot,
         turn: TurnNumber,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.reserve(&self.slots, (slot, turn), "core.dispatch.awaiting_slot")
-            .await
+        self.reserve(&self.slots, (slot, turn), Pool::Slots).await
     }
 
     /// Waits for a resident lane, FIFO daemon-wide, for a dispatch that
@@ -561,7 +560,7 @@ impl Engine {
         slot: &Slot,
         turn: TurnNumber,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.reserve(&self.resident, (slot, turn), "core.dispatch.awaiting_lane")
+        self.reserve(&self.resident, (slot, turn), Pool::Resident)
             .await
     }
 
@@ -572,16 +571,16 @@ impl Engine {
     /// cancel or a close order changes it). `None` once force is accepted
     /// or Store failure is pending (the force signal carries both), or once
     /// the head changed: the permit, if any, is dropped and the dispatcher
-    /// decides again. Test builds: `point` acknowledges the registered
-    /// wait.
+    /// decides again. Test builds: `kind`'s point acknowledges the
+    /// registered wait.
     async fn reserve(
         &self,
         pool: &Arc<tokio::sync::Semaphore>,
         (slot, turn): (&Slot, TurnNumber),
-        point: &'static str,
+        kind: Pool,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         #[cfg(not(feature = "test-failpoints"))]
-        let _ = point;
+        let _ = kind;
         if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
             return Some(permit);
         }
@@ -596,7 +595,7 @@ impl Engine {
         }
         // The reservation is pending and registered (design §10).
         #[cfg(feature = "test-failpoints")]
-        if via_store::failpoint::hit_async(point).await.is_err() {
+        if via_store::failpoint::hit_async(kind.point()).await.is_err() {
             return None;
         }
         loop {
@@ -2683,6 +2682,27 @@ fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
         control
             .slot
             .store_order(control.turn, tokio::time::Instant::now());
+    }
+}
+
+/// A daemon-wide pool a dispatch waits on with its turn queued
+/// ([`Engine::reserve`]).
+#[derive(Clone, Copy)]
+enum Pool {
+    /// Connection slots (design §11).
+    Slots,
+    /// Resident session lanes (runtime §8).
+    Resident,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Pool {
+    /// The point that acknowledges a registered wait on the pool.
+    fn point(self) -> &'static str {
+        match self {
+            Self::Slots => "core.dispatch.awaiting_slot",
+            Self::Resident => "core.dispatch.awaiting_lane",
+        }
     }
 }
 
