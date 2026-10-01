@@ -545,6 +545,7 @@ impl Engine {
             submitted_at,
             correlation,
             effective,
+            instance,
         } = unfinished;
         let History {
             last_seq,
@@ -618,7 +619,8 @@ impl Engine {
             (queued_seq, seq),
             // The crashed daemon's samples are gone with it.
             Usage::UNAVAILABLE,
-            (identity, &plan),
+            // Sol r2 #6 (C1 §3.7): the instance the turn recorded.
+            (identity, instance, &plan),
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(

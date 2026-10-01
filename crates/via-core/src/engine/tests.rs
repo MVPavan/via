@@ -5561,6 +5561,88 @@ fn a_recovered_envelope_keeps_the_stored_identity() {
     });
 }
 
+/// Sol r2 #6 (C1 §3.7): a turn accepted on a tested instance keeps that
+/// instance's version across a restart: its recovered envelope reports the
+/// recorded `vendor_version` and `tested`, with no untested warning.
+#[test]
+fn a_recovered_envelope_keeps_the_turns_instance() {
+    let Some(root) = child("a_recovered_envelope_keeps_the_turns_instance") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            let at = rfc3339(std::time::SystemTime::now());
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            let started = Event {
+                seq: 3,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnStarted {
+                    effective: json!({}),
+                },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_acceptance(via_store::AcceptanceRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    correlation: "t:vt-1".to_owned(),
+                    event: started,
+                    adapter_version: None,
+                    instance: Some(via_store::InstanceRecord {
+                        vendor_version: Some("1.0".to_owned()),
+                        tested: true,
+                    }),
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(
+            (&envelope["vendor_version"], &envelope["version_status"]),
+            (&json!("1.0"), &json!("tested")),
+            "{envelope}"
+        );
+        assert!(
+            !envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "vendor_version_untested"),
+            "{envelope}"
+        );
+    });
+}
+
 /// Critical r1 #2 (runtime §8: one owner of a session's sequence): a
 /// session whose recovery resumes its driver gets its lane only after
 /// recovery committed that session's writes. A durable observation the

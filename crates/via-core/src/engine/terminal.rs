@@ -6,7 +6,7 @@ use via_adapters::{
     StopOrder, StopReason, TurnEvidence, VendorTerminal, VendorTerminalStatus, VersionStatus,
     WireCleanup,
 };
-use via_store::CancelCause;
+use via_store::{CancelCause, InstanceRecord};
 
 use super::lane::{Identity, VendorRecord};
 use super::stop::stop_outcome;
@@ -24,8 +24,10 @@ use crate::{SessionId, TurnNumber};
 /// the session's frozen working directory (design §11.1), `None` where the
 /// caller did not read it; `folder` is the turn's absolute evidence folder,
 /// `None` for a turn never submitted. `identity` is the session's stored
-/// one where the caller read it (critical r1 #11); `plan` is the session's
-/// frozen plan and the turn's frozen values (design §5.1 #33).
+/// one where the caller read it (critical r1 #11); `instance` is the
+/// turn's recorded instance version and whether it was tested (C1 §3.7);
+/// `plan` is the session's frozen plan and the turn's frozen values
+/// (design §5.1 #33).
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -40,7 +42,7 @@ pub(super) fn terminal_envelope(
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
     usage: Usage,
-    (identity, plan): (Option<Identity>, &TurnPlan),
+    (identity, instance, plan): (Option<Identity>, Option<InstanceRecord>, &TurnPlan),
 ) -> Envelope {
     assemble(
         (session, turn, plan),
@@ -52,6 +54,7 @@ pub(super) fn terminal_envelope(
         (usage, false),
         VendorRecord {
             identity,
+            instance: instance.map(|instance| (instance.vendor_version, instance.tested)),
             ..VendorRecord::default()
         },
     )

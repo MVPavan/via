@@ -684,6 +684,10 @@ pub struct UnfinishedTurn {
     /// The turn's frozen effective values, as stored; `None` when the
     /// stored text is not JSON (a recovered envelope then omits them).
     pub effective: Option<Value>,
+    /// The recorded `vendor_version` and `version_status` of the instance
+    /// that accepted the turn (C1 §3.7); `None` before an acceptance
+    /// recorded one.
+    pub instance: Option<InstanceRecord>,
 }
 
 /// A committed anchor and its owning turn; no marker, identity or control path.

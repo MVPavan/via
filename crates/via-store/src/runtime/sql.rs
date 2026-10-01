@@ -5,16 +5,17 @@ use super::{
     AcceptanceRecord, ActiveTurn, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
     CommitOutcome, Connection, Duration, EventRecord, EventsPage, EventsQuery, EventsRead,
     EvidenceRefs, EvidenceRoot, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity,
-    KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord, OperationVerb,
-    OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors, Prompt,
-    QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT,
-    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId, SessionRoute,
-    SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow,
-    StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
-    TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber,
-    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
-    commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
-    oneshot, params, read_anchor_cohort, read_anchor_owners, read_anchor_records,
+    InstanceRecord, KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord,
+    OperationVerb, OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors,
+    Prompt, QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord,
+    SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId,
+    SessionRoute, SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord,
+    StatusQuery, StepRow, StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
+    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
+    commit_vendor_facts, count_unproven_anchors, fs, oneshot, params, read_anchor_cohort,
+    read_anchor_owners, read_anchor_records,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -2068,7 +2069,7 @@ fn read_terminal_facts(
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT session_id,number,submitted_at,correlation,effective FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
+            "SELECT session_id,number,submitted_at,correlation,effective,vendor_version,version_status FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
         )
         .map_err(sql_error)?;
     let rows = statement
@@ -2079,12 +2080,24 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(sql_error)?;
     let mut turns = Vec::new();
     for row in rows {
-        let (session, number, submitted_at, correlation, effective) = row.map_err(sql_error)?;
+        let (session, number, submitted_at, correlation, effective, vendor_version, status) =
+            row.map_err(sql_error)?;
+        // The acceptance records a status with every instance it records.
+        let instance = match status.as_deref() {
+            None => None,
+            Some(status @ ("tested" | "untested")) => Some(InstanceRecord {
+                vendor_version,
+                tested: status == "tested",
+            }),
+            Some(_) => return Err(StoreError::CorruptEvidence),
+        };
         turns.push(UnfinishedTurn {
             session_id: SessionId::try_from(session.as_str())
                 .map_err(|_| StoreError::CorruptEvidence)?,
@@ -2093,6 +2106,7 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
             correlation,
             effective: effective.and_then(|text| serde_json::from_str(&text).ok()),
+            instance,
         });
     }
     Ok(turns)
