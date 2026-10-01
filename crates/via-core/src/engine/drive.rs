@@ -554,7 +554,9 @@ impl Engine {
     /// Waits for a resident lane, FIFO daemon-wide, for a dispatch that
     /// needs a new lane (runtime §8 session lanes, critical r3 #3): the
     /// lane holds it until it has ended ([`Self::reserve`] at
-    /// `core.dispatch.awaiting_lane`).
+    /// `core.dispatch.awaiting_lane`). Blocked, it has the least recently
+    /// used idle lane retired for it (critical r4 #2,
+    /// [`Self::press_resident`]).
     async fn reserve_resident(
         &self,
         slot: &Slot,
@@ -593,6 +595,9 @@ impl Engine {
             permit = &mut acquire => return permit.ok().filter(|_| slot.waiting_head(turn)),
             () = std::future::ready(()) => {}
         }
+        // A resident wait is owed an idle lane's retirement (critical r4
+        // #2): the lane's end frees the permit this waiter takes in turn.
+        let _pressed = matches!(kind, Pool::Resident).then(|| self.press_resident());
         // The reservation is pending and registered (design §10).
         #[cfg(feature = "test-failpoints")]
         if via_store::failpoint::hit_async(kind.point()).await.is_err() {

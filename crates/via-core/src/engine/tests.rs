@@ -6039,6 +6039,55 @@ fn a_dispatch_past_the_resident_lanes_waits_queued() {
     });
 }
 
+/// Critical r4 #2 (runtime §8 session lanes): capacity pressure reclaims
+/// an idle lane. With the resident lanes lowered to one by explicit test
+/// config and held by an idle lane, well within the idle bound, a dispatch
+/// that needs a new lane retires that least recently used idle lane,
+/// waits for its end and proceeds, with no external close.
+#[test]
+fn a_blocked_dispatch_reclaims_an_idle_lane() {
+    use super::lane::RESIDENT_LANES;
+    let Some(root) = child("a_blocked_dispatch_reclaims_an_idle_lane") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        engine.resident.forget_permits(RESIDENT_LANES - 1);
+        let idle = new_session(&engine).await;
+        dispatch(&engine, &idle).await;
+        // The dispatch's lane, retired at its failed launch, has ended.
+        until(|| engine.lane_drained(&idle)).await;
+        let (driver, reference, route) = open_test_driver(&engine, &root, &idle).await;
+        let (_sender, receiver) = tokio::sync::mpsc::channel(4);
+        engine
+            .adopt_lane(
+                &idle,
+                (driver, receiver, via_adapters::ObservationBudget::new()),
+                (reference, &route),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.resident.available_permits(),
+            0,
+            "the idle lane holds the one"
+        );
+        let next = new_session(&engine).await;
+        let dispatched =
+            tokio::time::timeout(Duration::from_secs(5), engine.dispatcher(next.clone())).await;
+        assert!(dispatched.is_ok(), "the dispatch never got a resident lane");
+        let result = engine
+            .result(&format!("{}/1", next.as_str()))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(result.get()).unwrap();
+        assert!(
+            !result["timestamps"]["submitted_at"].is_null(),
+            "the waiting turn ran: {result}"
+        );
+        assert!(engine.lane_drained(&idle), "the idle lane was retired");
+    });
+}
+
 /// The default resident-lane ceiling (runtime §8): 320 daemon-wide, above
 /// the unresolved turns plus the idle lanes, and the Engine starts with
 /// every one free.

@@ -128,6 +128,9 @@ pub struct Engine {
     /// Resident session lanes (runtime §8, [`lane::RESIDENT_LANES`]): each
     /// lane holds one from its creation until it has ended. FIFO waiters.
     resident: Arc<tokio::sync::Semaphore>,
+    /// Dispatches waiting for a resident lane (critical r4 #2): each is
+    /// owed the retirement of an idle lane ([`Self::evict_idle`]).
+    pressed: AtomicUsize,
     /// Slots held for groups an earlier daemon left unproven (design §11).
     recovered: slots::RecoveredSlots,
     /// Sessions durably `closing`, or treated so after an uncertain
@@ -398,6 +401,7 @@ impl Engine {
             slots,
             slot_limit,
             resident: Arc::new(tokio::sync::Semaphore::new(lane::RESIDENT_LANES)),
+            pressed: AtomicUsize::new(0),
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),

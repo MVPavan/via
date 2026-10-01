@@ -29,7 +29,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -72,11 +72,22 @@ const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 pub(super) const IDLE_LANES: usize = 32;
 
 /// Session lanes resident daemon-wide (runtime §8): each holds one from its
-/// creation until it has ended, whether serving, idle or retiring. Above
-/// the unresolved turns plus [`IDLE_LANES`], so normal work never waits; a
+/// creation until it has ended, whether serving, idle or retiring. A
 /// dispatch that needs a new lane while none is free waits, its turn
-/// still queued ([`Engine::reserve_resident`]).
+/// still queued ([`Engine::reserve_resident`]), and has the least recently
+/// used idle lane retired, within [`IDLE_LANES`] too, for its permit
+/// ([`Engine::evict_idle`]); with none idle it waits for a lane to end.
 pub(super) const RESIDENT_LANES: usize = 320;
+
+/// A dispatch waiting for a resident lane ([`Engine::press_resident`]);
+/// dropped when it stops waiting.
+pub(super) struct Pressed<'a>(&'a AtomicUsize);
+
+impl Drop for Pressed<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The daemon's lane use clock: each lane's last use is a tick of it, so
 /// the least recently used idle lane is the one with the oldest.
@@ -1416,6 +1427,15 @@ impl Engine {
     /// or ending is never taken. A dispatch that finds its lane taken
     /// waits for its end, then opens the successor ([`Self::claim_lane`],
     /// [`Self::open_lane`]): one driver at a time, and no turn lost.
+    ///
+    /// Capacity pressure (critical r4 #2): each dispatch waiting for a
+    /// resident lane ([`Self::press_resident`]) is owed one idle lane's
+    /// retirement, within the bound too, less the registered lanes
+    /// already ending, whose permits the waiters take in FIFO order. With
+    /// none idle, a lane that becomes idle later is taken by this same
+    /// check. Racing a waiter that is taking an ended lane's permit, one
+    /// more idle lane than needed may be retired; its session reopens on
+    /// its next dispatch.
     pub(super) fn evict_idle(&self) {
         // Selection and every eviction under one registry lock (critical
         // r2 F5): concurrent checks neither over- nor under-evict.
@@ -1431,13 +1451,28 @@ impl Engine {
                 .map(|(_, lane)| lane)
                 .collect()
         };
-        let Some(excess) = idle.len().checked_sub(IDLE_LANES) else {
+        let ending = lanes.values().filter(|lane| lane.life() != Life::Open);
+        let owed = self
+            .pressed
+            .load(Ordering::SeqCst)
+            .saturating_sub(ending.count());
+        let excess = idle.len().saturating_sub(IDLE_LANES).max(owed);
+        if excess == 0 {
             return;
-        };
+        }
         idle.sort_unstable_by_key(|lane| lane.used.load(Ordering::Relaxed));
         for lane in idle.into_iter().take(excess) {
             lane.begin_evict();
         }
+    }
+
+    /// Registers a dispatch waiting for a resident lane, for as long as the
+    /// returned guard lives, and has an idle lane retired for it
+    /// ([`Self::evict_idle`], critical r4 #2).
+    pub(super) fn press_resident(&self) -> Pressed<'_> {
+        self.pressed.fetch_add(1, Ordering::SeqCst);
+        self.evict_idle();
+        Pressed(&self.pressed)
     }
 
     /// Test builds: the lanes registered, those of them whose actor has
