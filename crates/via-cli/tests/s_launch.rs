@@ -26,10 +26,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use evidenced::evidenced;
-use scenario::{Captured, run_command};
+use scenario::{Captured, ScenarioError, run_command};
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -117,11 +117,20 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> TestResult<Captured> {
+        self.run_within(args, Duration::from_secs(20))
+    }
+
+    /// Runs the CLI by `timeout`; a timed-out run is a typed
+    /// [`ScenarioError::Timeout`] with its cleanup notes (runtime §11.2).
+    fn run_within(&self, args: &[&str], timeout: Duration) -> TestResult<Captured> {
         let mut command = self.command();
         command.args(args);
-        let captured = run_command(&mut command, Duration::from_secs(20))?;
+        let captured = run_command(&mut command, timeout)?;
         if captured.timed_out {
-            return Err(format!("via {args:?} timed out{}", captured.notes()).into());
+            return Err(Box::new(ScenarioError::Timeout(format!(
+                "via {args:?} timed out{}",
+                captured.notes()
+            ))));
         }
         Ok(captured)
     }
@@ -136,18 +145,26 @@ impl Sandbox {
 }
 
 /// Every daemon the CLI auto-started is force-stopped and proved gone,
-/// then the evidence is collected (runtime §11.2).
+/// then the evidence is collected (runtime §11.2). When the ordinary stop
+/// leaves a sandbox process alive, it is killed by identity and the
+/// incomplete clean stop is recorded as a cleanup failure.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let exited =
+            let mut exited =
                 evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
                     outer_cleanup::run_within(
                         self.command().args(["daemon", "stop", "--force", "--json"]),
                         by,
                     )
                 });
+            if exited.proof.is_err() {
+                let killed = kill_survivors(&self.runtime, &self.state);
+                exited.failures.push(format!(
+                    "the ordinary stop left the sandbox's daemon running; killed: {killed}"
+                ));
+            }
             let expected = evidenced::Expected {
                 store: self.store,
                 folders: false,
@@ -160,6 +177,77 @@ impl Drop for Sandbox {
                 exited,
             );
         }
+    }
+}
+
+/// Sends `signal` to process `pid` only while it is still the process that
+/// started at `start` (clock ticks, `/proc/<pid>/stat`): its pidfd pins one
+/// process, and the start time is checked again after the pidfd is open, so
+/// a reused pid is never signalled. `false` when it is already gone.
+fn signal_identified(pid: u32, start: u64, signal: rustix::process::Signal) -> TestResult<bool> {
+    let raw = i32::try_from(pid)?;
+    let Some(target) = rustix::process::Pid::from_raw(raw) else {
+        return Err(format!("invalid pid {pid}").into());
+    };
+    let Ok(pidfd) = rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty())
+    else {
+        return Ok(false);
+    };
+    if outer_cleanup::process_stat(pid).map(|(_, now)| now) != Some(start) {
+        return Ok(false);
+    }
+    match rustix::process::pidfd_send_signal(&pidfd, signal) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the process `pid` that started at `start` has exited: gone, a
+/// zombie, or the pid now another process's.
+fn gone(pid: u32, start: u64) -> TestResult<bool> {
+    Ok(
+        process::exited(pid)?
+            || outer_cleanup::process_stat(pid).map(|(_, now)| now) != Some(start),
+    )
+}
+
+/// Kills the identified process `pid` (started at `start`) and waits, by a
+/// bound, until it is gone. Returns its record.
+fn kill_identified(pid: u32, start: u64) -> Value {
+    let signalled = match signal_identified(pid, start, rustix::process::Signal::KILL) {
+        Ok(signalled) => signalled,
+        Err(error) => return json!({"pid":pid,"status":"kill_failed","reason":error.to_string()}),
+    };
+    let deadline = Instant::now() + outer_cleanup::REAP * 5;
+    loop {
+        match gone(pid, start) {
+            Ok(true) => return json!({"pid":pid,"killed":signalled,"status":"gone"}),
+            Ok(false) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(false) => return json!({"pid":pid,"killed":signalled,"status":"alive"}),
+            Err(error) => {
+                return json!({"pid":pid,"killed":signalled,"status":"unknown",
+                    "reason":error.to_string()});
+            }
+        }
+    }
+}
+
+/// Kills every sandbox process still alive: one whose environment names
+/// the sandbox's runtime or State directory ([`evidenced::scan_processes`]),
+/// identified by its start time ([`kill_identified`]). Returns the record.
+fn kill_survivors(runtime: &Path, state: &Path) -> Value {
+    match evidenced::scan_processes(runtime, state, |path| fs::read(path)) {
+        Ok(pids) => pids
+            .into_iter()
+            .map(|pid| match outer_cleanup::process_stat(pid) {
+                Some((_, start)) => kill_identified(pid, start),
+                None => json!({"pid":pid,"status":"gone"}),
+            })
+            .collect(),
+        Err(error) => json!({"status":"scan_failed","reason":error}),
     }
 }
 
@@ -407,5 +495,58 @@ fn s_launch_invalid_harnesses_refuse_start() -> TestResult {
             })?;
         }
         Ok(())
+    })
+}
+
+/// Sol r1 #2, runtime §11.2: a daemon whose stop request cannot be served
+/// (here, stopped by SIGSTOP) is still gone after the sandbox's teardown,
+/// killed by identity after the ordinary stop, and the incomplete clean
+/// stop fails the scenario.
+#[test]
+fn s_launch_teardown_kills_an_unresponsive_daemon() -> TestResult {
+    let mut paused = None;
+    let outcome = evidenced(|| {
+        let sandbox = Sandbox::new()?;
+        let pid = auto_started(&sandbox)?;
+        let (_, start) = outer_cleanup::process_stat(pid).ok_or("no daemon stat")?;
+        paused = Some((pid, start));
+        check(
+            signal_identified(pid, start, rustix::process::Signal::STOP)?,
+            || format!("daemon {pid} vanished before it was paused"),
+        )
+    });
+    let (pid, start) = paused.ok_or("the daemon was never paused")?;
+    if !gone(pid, start)? {
+        // Leave nothing behind, then fail.
+        let record = kill_identified(pid, start);
+        return Err(format!("the paused daemon survived the teardown: {record}").into());
+    }
+    let error = outcome
+        .err()
+        .ok_or("an incomplete clean stop passed the scenario")?;
+    check(error.to_string().contains("killed"), || {
+        format!("the failure does not record the kill: {error}")
+    })
+}
+
+/// Sol r1 #5, runtime §11.2: a CLI run that outlives its bound is a typed
+/// timeout, not a plain failure.
+#[test]
+fn s_launch_cli_timeout_is_typed() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        sandbox.store = false;
+        // The foreground daemon serves until killed at the bound.
+        let error = sandbox
+            .run_within(&["daemon"], Duration::from_millis(300))
+            .err()
+            .ok_or("the foreground daemon returned")?;
+        check(
+            matches!(
+                error.downcast_ref::<ScenarioError>(),
+                Some(ScenarioError::Timeout(_))
+            ),
+            || format!("not a typed timeout: {error:?}"),
+        )
     })
 }
