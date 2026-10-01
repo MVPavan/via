@@ -115,20 +115,26 @@ fn usage_and_cost_ignore_unknown_vendor_fields() {
     assert_eq!(details.cost.as_ref().unwrap().scope, "turn");
 }
 
-/// C2 §2: a known payload over 256 KiB encoded fails protocol, except the
-/// terminal's final text, which the adapter splits into pieces, and a
-/// `text` message's text, which is not kept.
+/// C2 §2: a retained payload over 256 KiB encoded fails protocol. A
+/// terminal's final text is emitted in pieces and a `text` message's text
+/// is not retained: neither is part of it.
 #[test]
-fn known_payloads_over_256_kib_fail_protocol_except_final_text() {
+fn retained_payloads_over_256_kib_fail_protocol() {
     let feature = "f".repeat(1000);
     let features: Vec<&str> = (0..300).map(|_| feature.as_str()).collect();
     let hello = serde_json::json!({"type":"hello","features":features}).to_string();
-    assert_eq!(refused(&hello), Some("fake known payload exceeds 256 KiB"));
+    assert_eq!(
+        refused(&hello),
+        Some("fake retained payload exceeds 256 KiB")
+    );
     let schema = format!(
         r#"{{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"","stop_reason":"end_turn","structured_output":{{"x":"{}"}}}}"#,
         "s".repeat(300 * 1024)
     );
-    assert_eq!(refused(&schema), Some("fake known payload exceeds 256 KiB"));
+    assert_eq!(
+        refused(&schema),
+        Some("fake retained payload exceeds 256 KiB")
+    );
     let text = format!(
         r#"{{"type":"terminal","vendor_turn_id":"fake-turn-1","status":"completed","final_text":"{}","stop_reason":"end_turn"}}"#,
         "t".repeat(300 * 1024)
@@ -143,5 +149,8 @@ fn known_payloads_over_256_kib_fail_protocol_except_final_text() {
         r#"{{"type":"tool_started","vendor_turn_id":"fake-turn-1","tool_id":"t1","name":"shell","text":"{}"}}"#,
         "t".repeat(300 * 1024)
     );
-    assert_eq!(refused(&tool), Some("fake known payload exceeds 256 KiB"));
+    assert_eq!(
+        refused(&tool),
+        Some("fake retained payload exceeds 256 KiB")
+    );
 }

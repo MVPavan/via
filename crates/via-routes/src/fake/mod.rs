@@ -434,12 +434,11 @@ struct HelloFields {
     efforts: Option<Vec<String>>,
 }
 
-/// The text a known message carries outside its observation payload,
-/// borrowed raw: a terminal's final text, which the adapter splits, and a
-/// `text` message's text, which is not kept. Both are exempt from the
-/// known-payload cap (C2 §2).
+/// A known message's text bodies, borrowed raw, for its retained payload
+/// (C2 §2): a terminal's final text is emitted as `final_text` pieces, and a
+/// `text` message's text is not retained at all.
 #[derive(Deserialize)]
-struct ExemptRaw<'a> {
+struct TextBodies<'a> {
     #[serde(borrow, default)]
     final_text: Option<&'a RawValue>,
     #[serde(borrow, default)]
@@ -534,7 +533,7 @@ impl FakeMessage {
         let tag: Tag = known(input, turn)?;
         short(&[&tag.kind], turn)?;
         if input.len() > MAX_OBSERVATION_BYTES && is_known(&tag.kind) {
-            known_payload_cap(input, &tag.kind, turn)?;
+            retained_payload_cap(input, &tag.kind, turn)?;
         }
         let message = match tag.kind.as_str() {
             "accepted" => {
@@ -822,21 +821,24 @@ fn is_known(kind: &str) -> bool {
     )
 }
 
-/// C2 §2: a known payload over 256 KiB encoded fails protocol. A
-/// terminal's final text does not count, as the adapter splits it into
-/// `final_text` pieces, nor does a `text` message's text, which the `model`
-/// mark does not keep.
-fn known_payload_cap(input: &[u8], kind: &str, turn: TurnNumber) -> Result<(), RouteError> {
-    let raw: ExemptRaw<'_> = serde_json::from_slice(input)
+/// C2 §2: the payload VIA retains or emits whole from a known message is
+/// at most 256 KiB encoded, else protocol failure. That is the message
+/// less its text body: a terminal's final text goes out in `final_text`
+/// pieces, and a `text` message becomes a `model` mark that keeps none of
+/// its text; Wire's line cap bounds both.
+fn retained_payload_cap(input: &[u8], kind: &str, turn: TurnNumber) -> Result<(), RouteError> {
+    let bodies: TextBodies<'_> = serde_json::from_slice(input)
         .map_err(|_| protocol(turn, "malformed known fake message"))?;
-    let field = match kind {
-        "terminal" => raw.final_text,
-        "text" => raw.text,
+    let body = match kind {
+        "terminal" => bodies.final_text,
+        "text" => bodies.text,
         _ => None,
     };
-    let exempt = field.map_or(0, |value| value.get().len());
-    if input.len().saturating_sub(exempt) > MAX_OBSERVATION_BYTES {
-        return Err(protocol(turn, "fake known payload exceeds 256 KiB"));
+    let retained = input
+        .len()
+        .saturating_sub(body.map_or(0, |body| body.get().len()));
+    if retained > MAX_OBSERVATION_BYTES {
+        return Err(protocol(turn, "fake retained payload exceeds 256 KiB"));
     }
     Ok(())
 }
