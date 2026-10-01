@@ -18,8 +18,9 @@ use tempfile::TempDir;
 use via_adapters::observation::{Observation, ProgressMarks, UsageSample};
 use via_adapters::{
     AdapterConfig, AdapterSet, BOOTSTRAP_ENV, BootstrapEnv, Bound, CatalogModel, Category,
-    CategoryDecl, DescribeRequest, InheritState, ModelSource, RefusalKind, RuntimeConfig,
-    SessionRef, Switch, TurnCheck, TurnParams, Verb, VerbReq, harness_names, resolve_model,
+    CategoryDecl, DescribeRequest, HARNESSES, InheritState, ModelSource, RefusalKind,
+    RuntimeConfig, SessionRef, Switch, TurnCheck, TurnParams, Verb, VerbReq, harness_names,
+    resolve_model,
 };
 use via_store::Store;
 
@@ -699,15 +700,22 @@ fn conformance_progress_carries_usage_sample() {
     assert_eq!(marks.usage, Some(usage));
 }
 
-/// H2/H4 configuration: only the three fixture names are read; the fixture
-/// is all or nothing and kept with its profile; `harnesses` is opaque but
-/// must be an object, and is kept; the legacy scenario forms keep the
-/// default profile; malformed or non-JSON scenarios are refused.
+/// H2 configuration: only the bootstrap names are read (S-LAUNCH: runtime
+/// §6.1's nine); the fixture is all or nothing and kept with its profile;
+/// `harnesses` must be an object, and is parsed (S-LAUNCH's own tests
+/// cover its rules); the legacy scenario forms keep the default profile;
+/// malformed or non-JSON scenarios are refused.
 #[test]
 fn conformance_config_load() {
     assert_eq!(
         BOOTSTRAP_ENV,
         [
+            "HOME",
+            "PATH",
+            "LANG",
+            "USER",
+            "LOGNAME",
+            "XDG_RUNTIME_DIR",
             "VIA_FAKE_AGENT_BINARY",
             "VIA_FAKE_SCENARIO",
             "VIA_FAKE_SYNC_DIR"
@@ -720,7 +728,8 @@ fn conformance_config_load() {
     let array = serde_json::value::RawValue::from_string("[]".to_owned()).unwrap();
     let none = || BootstrapEnv::from_vars::<_, &str, &str>([]);
     let config = AdapterConfig::load(none(), Some(&object)).unwrap();
-    assert_eq!(config.harnesses().unwrap().get(), r#"{"codex":{}}"#);
+    let codex = HARNESSES.iter().find(|row| row.name == "codex").unwrap();
+    assert_eq!(config.harness(codex).binary(), None);
     assert!(config.fake_fixture().is_none());
     assert!(AdapterConfig::load(none(), Some(&array)).is_err());
 

@@ -305,7 +305,7 @@ impl Inherit {
         self.0[category.index()]
     }
 
-    fn set(&mut self, category: Category, state: InheritState) {
+    pub(crate) fn set(&mut self, category: Category, state: InheritState) {
         self.0[category.index()] = state;
     }
 }
@@ -512,6 +512,8 @@ pub fn resolve_model<'a>(
 /// when its fixture is configured, over the Route runtime.
 pub struct AdapterSet {
     pub(crate) fake: Option<Arc<FakeAdapter>>,
+    /// The rest of the start-time configuration (design §5.4).
+    config: AdapterConfig,
     /// The Route runtime: Wire and Host, which own every connection.
     pub(crate) route: Arc<FakeRoute>,
 }
@@ -520,15 +522,16 @@ impl AdapterSet {
     /// One adapter per configured harness over the Route runtime; Core
     /// hands the unopened Store resources down unsplit (C2 §2).
     pub fn new(
-        config: AdapterConfig,
+        mut config: AdapterConfig,
         runtime: RuntimeConfig,
         resources: RuntimeResources,
     ) -> Result<Self, AdapterError> {
         let route = FakeRoute::new(runtime, resources)?;
         Ok(Self {
             fake: config
-                .into_fake()
+                .take_fake()
                 .map(|fixture| Arc::new(FakeAdapter::new(fixture))),
+            config,
             route: Arc::new(route),
         })
     }
@@ -582,8 +585,9 @@ impl AdapterSet {
                 requested: req.model.clone(),
                 resolved,
             },
-            // `harnesses` stays opaque in S-CORE (H4): the OD2 default applies.
-            Inherit::OD2_DEFAULT,
+            // Design §5.4: the harness's configured `inherit`; the fake's
+            // is the OD2 default.
+            self.config.inherit(harness),
         ))
     }
 

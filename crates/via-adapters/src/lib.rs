@@ -146,6 +146,7 @@ mod config;
 mod driver;
 mod fake;
 mod harness;
+mod instance;
 pub mod observation;
 mod plan;
 mod runtime;
@@ -154,12 +155,19 @@ mod set;
 pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
-pub use config::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture};
+pub use config::{
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture, HarnessConfig,
+    HarnessSettings, HarnessesError, HarnessesRule,
+};
 pub use driver::{
     CloseMode, CloseReport, ConnectionPin, ForceWatch, Prepared, Recovery, SessionCx,
     SessionDriver, SessionSpec, SteerError, SteerInput, TurnCx, TurnSpec,
 };
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
+pub use instance::{
+    BinaryIdentity, Incompatibility, InstanceCache, RECIPE_KEY_MAX, REFUSAL_TTL, REFUSALS_KEPT,
+    VERSIONS_KEPT, resolve_binary,
+};
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
     LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,

@@ -2,8 +2,9 @@
 //! once at start, before any Store or socket change; absent means every
 //! default. An invalid file names its key and the rule it broke.
 //!
-//! `harnesses` is kept opaque here: an object is passed to the adapter
-//! layer, anything else is refused (S-CORE H4).
+//! `harnesses` is parsed here, once, by the adapter layer's own pure parser
+//! (runtime §8), so an invalid section is an invalid file like any other
+//! key; the typed settings are then passed to `AdapterConfig::with_harnesses`.
 
 use std::{
     fmt,
@@ -15,7 +16,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
-use via_core::{Limits, PAGE_BYTES};
+use via_core::{ConfigError, HarnessSettings, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -29,7 +30,8 @@ const MIN_WAL: u64 = 4 * 1024 * 1024;
 /// The file's name, also the key of a file-level failure.
 const FILE: &str = "daemon.json";
 
-/// Why `daemon.json` is invalid: the key and the rule it broke.
+/// Why `daemon.json` is invalid: the key, as [`ConfigError::shown_key`]
+/// shows it, and the rule it broke.
 #[derive(Debug)]
 pub(super) struct Invalid {
     key: String,
@@ -37,9 +39,9 @@ pub(super) struct Invalid {
 }
 
 impl Invalid {
-    fn new(key: impl Into<String>, rule: impl Into<String>) -> Self {
+    fn new(key: impl AsRef<str>, rule: impl Into<String>) -> Self {
         Self {
-            key: key.into(),
+            key: ConfigError::shown_key(key.as_ref()),
             rule: rule.into(),
         }
     }
@@ -96,12 +98,12 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// What `daemon.json` configures: the validated limits and the opaque
-/// `harnesses` object, if present.
+/// What `daemon.json` configures: the validated limits and `harnesses`
+/// settings.
 #[derive(Debug, Default)]
 pub(super) struct Config {
     pub(super) limits: Limits,
-    pub(super) harnesses: Option<Box<RawValue>>,
+    pub(super) harnesses: HarnessSettings,
 }
 
 /// Reads `<state>/daemon.json`: defaults when it is absent, else the
@@ -154,13 +156,11 @@ pub(super) fn read(state: &Path) -> Result<Config, Invalid> {
 /// Parses and validates the file's text (§5.5).
 fn parse(text: &[u8]) -> Result<Config, Invalid> {
     let file: File = serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
-    if file
-        .harnesses
-        .as_ref()
-        .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
-    {
-        return Err(Invalid::new("harnesses", "must be an object"));
-    }
+    let harnesses = match &file.harnesses {
+        Some(raw) => HarnessSettings::parse(raw)
+            .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?,
+        None => HarnessSettings::default(),
+    };
     let mut limits = Limits::default();
     if let Some(raw) = file.disk {
         let disk: Disk =
@@ -215,10 +215,7 @@ fn parse(text: &[u8]) -> Result<Config, Invalid> {
             "must be above wal.checkpoint_bytes",
         ));
     }
-    Ok(Config {
-        limits,
-        harnesses: file.harnesses,
-    })
+    Ok(Config { limits, harnesses })
 }
 
 /// A value in bytes: a non-negative integer at most 2^62.
@@ -295,24 +292,106 @@ mod tests {
         );
     }
 
-    /// S-CORE H4: `harnesses` is accepted as an opaque object and refused
-    /// otherwise.
+    /// Every echoed key is escaped and bounded like `harnesses`' keys: an
+    /// unknown top-level, `disk` or `wal` key cannot garble the one-line
+    /// diagnostic, and its rule always survives.
     #[test]
-    fn harnesses_is_an_opaque_object() {
-        let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("object");
+    fn echoed_keys_are_escaped_and_bounded() {
         assert_eq!(
-            config.harnesses.expect("kept").get(),
-            r#"{"claude":{"binary":"/x"}}"#
+            invalid(r#"{"me\nmo\u001bry":1}"#),
+            r"daemon config invalid: me\nmo\u{1b}ry: unknown key"
         );
-        assert!(parse(b"{}").expect("empty").harnesses.is_none());
-        for refused in [
-            r#"{"harnesses":[]}"#,
-            r#"{"harnesses":null}"#,
-            r#"{"harnesses":1}"#,
-        ] {
+        assert_eq!(
+            invalid(r#"{"disk":{"fl\u0007oor":1}}"#),
+            r"daemon config invalid: disk.fl\u{7}oor: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"wal":{"m\tax":1}}"#),
+            r"daemon config invalid: wal.m\tax: unknown key"
+        );
+        let long = "k".repeat(6000);
+        let shown = invalid(&format!(r#"{{"{long}":1}}"#));
+        assert!(shown.len() <= 512, "{} bytes", shown.len());
+        assert!(shown.ends_with("...: unknown key"), "{shown}");
+    }
+
+    /// Runtime §8, S-LAUNCH: `harnesses` is validated at read, like every
+    /// other key, by the adapter layer's rules; each refusal names its
+    /// member, and a duplicate key at any level is refused. The section is
+    /// parsed once: the read keeps the typed settings for the adapters.
+    #[test]
+    fn harnesses_are_validated_like_other_keys() {
+        let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("valid");
+        let section =
+            RawValue::from_string(r#"{"claude":{"binary":"/x"}}"#.to_owned()).expect("section");
+        assert_eq!(
+            config.harnesses,
+            HarnessSettings::parse(&section).expect("settings")
+        );
+        assert_ne!(config.harnesses, HarnessSettings::default());
+        assert_eq!(
+            parse(b"{}").expect("empty").harnesses,
+            HarnessSettings::default()
+        );
+        let cases = [
+            (r#"{"harnesses":[]}"#, "harnesses: must be an object"),
+            (r#"{"harnesses":null}"#, "harnesses: must be an object"),
+            (r#"{"harnesses":1}"#, "harnesses: must be an object"),
+            (
+                r#"{"harnesses":{"claude":5}}"#,
+                "harnesses.claude: must be an object",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"binary":"bin/claude"}}}"#,
+                "harnesses.claude.binary: must be an absolute path without `..`",
+            ),
+            (
+                r#"{"harnesses":{"gemini":{}}}"#,
+                "harnesses.gemini: unknown harness",
+            ),
+            // A key's control characters are escaped: one line, no escapes.
+            (
+                r#"{"harnesses":{"gem\nini\u001b":{}}}"#,
+                r"harnesses.gem\nini\u{1b}: unknown harness",
+            ),
+            (
+                r#"{"harnesses":{"codex":{"bin":"/x"}}}"#,
+                "harnesses.codex.bin: unknown key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"memory":true}}}}"#,
+                "harnesses.claude.inherit.memory: unknown key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"hooks":1}}}}"#,
+                "harnesses.claude.inherit.hooks: must be a boolean",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":true}}}"#,
+                "harnesses.claude.inherit: must be an object",
+            ),
+            (
+                r#"{"harnesses":{"claude":{},"claude":{}}}"#,
+                "harnesses.claude: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"binary":"/a","binary":"/b"}}}"#,
+                "harnesses.claude.binary: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{},"inherit":{}}}}"#,
+                "harnesses.claude.inherit: duplicate key",
+            ),
+            (
+                r#"{"harnesses":{"claude":{"inherit":{"hooks":true,"hooks":false}}}}"#,
+                "harnesses.claude.inherit.hooks: duplicate key",
+            ),
+        ];
+        for (text, message) in cases {
             assert_eq!(
-                invalid(refused),
-                "daemon config invalid: harnesses: must be an object"
+                invalid(text),
+                format!("daemon config invalid: {message}"),
+                "{text}"
             );
         }
     }
