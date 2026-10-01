@@ -304,7 +304,7 @@ pub(super) fn dispose(
                     ("requested", cleanup)
                 }
                 (_, StopCause::Protocol) => {
-                    terminal.fail(FailureClass::Protocol, TOKENS_STOP);
+                    terminal.fail(FailureClass::Protocol, PROTOCOL_STOP);
                     ("requested", cleanup)
                 }
                 (true, StopCause::Cancel | StopCause::Close) => {
@@ -343,6 +343,12 @@ pub(super) fn dispose(
 
 /// Message of a turn stopped because its own Store write failed.
 const STORE_STOP: &str = "a turn event could not be recorded";
+
+/// Message of a turn Core stopped because it refused the vendor's evidence
+/// (a `protocol` order, Sol r4 R6): an acceptance naming a vendor turn the
+/// lane keeps for another turn, or a token count, whose own message
+/// [`TOKENS_STOP`] replaces this once the turn's record shows it.
+pub(super) const PROTOCOL_STOP: &str = "Core refused the vendor's evidence for the turn";
 
 /// Message of a turn whose vendor reported a token count past `i64::MAX`
 /// (review r1).
@@ -406,7 +412,7 @@ fn stopped(
         if cause == StopCause::Store {
             terminal.fail(FailureClass::Store, STORE_STOP);
         } else {
-            terminal.fail(FailureClass::Protocol, TOKENS_STOP);
+            terminal.fail(FailureClass::Protocol, PROTOCOL_STOP);
         }
         return Disposed {
             terminal,
@@ -903,6 +909,33 @@ mod tests {
         assert_eq!(failure.class, FailureClass::SubmitFailed);
         assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
         assert_eq!(failure.message, "quota exhausted");
+    }
+
+    /// Sol r4 R6: a turn stopped by a `protocol` order, as an acceptance
+    /// naming a vendor turn the lane keeps for another turn is, fails
+    /// `protocol` with a message that claims no unrepresentable token
+    /// count, whether the vendor ended the turn or Route stopped it.
+    #[test]
+    fn a_protocol_order_claims_no_token_count() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        let now = tokio::time::Instant::now();
+        let order = crate::engine::queue::StopSpec::Protocol.order(
+            "2026-01-01T00:00:00.000Z".to_owned(),
+            now,
+            None,
+        );
+        let evidence = via_adapters::TurnEvidence {
+            exit: None,
+            cleanup: via_adapters::Cleanup::Quiescent,
+            journal_uncertain: false,
+        };
+        for outcome in [Ok(evidence), Err(route(RouteError::Stopped { turn }, None))] {
+            let disposed = super::dispose(true, (None, outcome), Some(&order), now);
+            let failure = disposed.terminal.failure.expect("a protocol failure");
+            assert_eq!(failure.class, FailureClass::Protocol);
+            assert_ne!(failure.message, super::TOKENS_STOP);
+            assert_eq!(failure.message, super::PROTOCOL_STOP);
+        }
     }
 
     /// C1 §5 (spill amendment): a warning keeps a `message` of at most
