@@ -31,6 +31,43 @@ pub(crate) struct FakeProfile {
     /// AD13 declarations; an absent category is switchable and verified.
     #[serde(default)]
     pub(crate) categories: BTreeMap<Category, CategoryDecl>,
+    /// The persistent-connection test profile (decision H1): the driver
+    /// keeps its connection slot between turns and pins it.
+    #[serde(default)]
+    pub(crate) persistent: bool,
+    /// The instance's version handshake (AD7), when the profile has one.
+    #[serde(default)]
+    pub(crate) handshake: Option<HandshakeDecl>,
+    /// The persistent emulation's idle close, when the scenario has one.
+    #[serde(default)]
+    pub(crate) idle_close: Option<IdleCloseDecl>,
+}
+
+/// The persistent emulation's idle close (decision H1, C2 §4): after turn
+/// `after_turn` returned, once the scenario releases gate `gate`, the
+/// emulated server closes the idle session with `reason`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdleCloseDecl {
+    /// The turn after which the session goes idle.
+    pub(crate) after_turn: u32,
+    /// The sync-directory gate whose release closes it.
+    pub(crate) gate: String,
+    /// The vendor's reason.
+    pub(crate) reason: String,
+}
+
+/// A fake profile's handshake (AD7): the versions maintainers checked and
+/// the features VIA relies on.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HandshakeDecl {
+    /// Versions reported `tested`; any other is `untested`.
+    #[serde(default)]
+    pub(crate) checked: Vec<String>,
+    /// Features the handshake must report, else the instance is refused.
+    #[serde(default)]
+    pub(crate) requires: Vec<String>,
 }
 
 impl Default for FakeProfile {
@@ -42,6 +79,9 @@ impl Default for FakeProfile {
             models: default_models(),
             efforts: Vec::new(),
             categories: BTreeMap::new(),
+            persistent: false,
+            handshake: None,
+            idle_close: None,
         }
     }
 }

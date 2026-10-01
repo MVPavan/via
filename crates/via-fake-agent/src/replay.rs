@@ -2,10 +2,34 @@
 //!
 //! Started as `<dir>/<name>` with `<dir>/<name>.replay.json` beside it, the
 //! fake checks its argv, answers `--version`, then runs the fixture's steps:
-//! - `expect` reads one stdin line and matches a JSON subset, capturing
-//!   values by JSON pointer;
+//! - `expect` takes one stdin line and matches a JSON subset, capturing
+//!   values by JSON pointer; its `absent` pointers must not resolve in the
+//!   line, and with `within_ms` the line must arrive within that many
+//!   milliseconds of the previous step's completion;
 //! - `emit` writes one verbatim line;
-//! - `delay` sleeps; `await_signal` waits for a signal.
+//! - `delay` sleeps; `await_signal` waits for a signal;
+//! - `await_eof` waits for stdin to end; an input line instead fails, and so
+//!   does an EOF that arrived before the previous step completed;
+//! - `exit`, only as the last step, writes its `stderr` text (at most 1 KiB)
+//!   verbatim and exits with its `code`, which may not be [`FAILED`].
+//!
+//! Stdin is read by one thread (see [`input`]), which stamps each line, EOF
+//! or input error with its arrival: the instant it publishes the event. A
+//! line is on time if and only if it arrived at or before its limit:
+//! `within_ms` after the previous step's completion, capped by the run
+//! deadline. An emit completes just before its write, since the adapter may
+//! react as soon as the line is visible.
+//!
+//! Put `await_eof` right after the step the adapter must wait for (for
+//! example the terminal emit), and vendor output that follows the close
+//! after it; a correct adapter then cannot fail it. An early close that the
+//! reader sees late is missed, never falsely failed. A partial line with
+//! stdin held open is never a line: `await_eof` then fails at the run
+//! deadline, or at EOF as a partial line.
+//!
+//! Before an `exit` step, and after the last step otherwise, any input line
+//! or input error already read fails. This is best effort: input that comes
+//! later, even after the process ends, is not detected.
 //!
 //! An `argv` entry is an exact string or `{"capture": "<name>"}`, which
 //! captures that argument. In emit lines and in expected string values,
@@ -13,6 +37,9 @@
 //! verbatim, a stdin capture's JSON text.
 //!
 //! `$${` writes a literal `${`.
+//!
+//! Each start appends its pid as one line to `<dir>/<name>.launches`, so a
+//! test can count launches.
 //!
 //! Lines, the fixture, the captures and the whole run are bounded. Any
 //! failure exits [`FAILED`], naming the 1-based step where one was running.
@@ -22,12 +49,12 @@ use std::collections::btree_map::Entry;
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +63,9 @@ use serde_json::Value;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::contains_expected;
+use input::Input;
+
+mod input;
 
 /// Longest line, read or written, in bytes (newline excluded).
 const MAX_LINE: usize = 1024 * 1024;
@@ -49,6 +79,8 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Longest diagnostic written to stderr, prefix and newline included;
 /// longer messages are truncated.
 const MAX_DIAGNOSTIC: usize = 1024;
+/// Longest `stderr` of an `exit` step, checked at load.
+const MAX_EXIT_STDERR: usize = 1024;
 const DIAGNOSTIC_PREFIX: &str = "fake replay: ";
 /// The watchdog's deadline from process start until the fixture is loaded.
 const LOAD_LIMIT: Duration = Duration::from_secs(5);
@@ -92,6 +124,12 @@ enum Step {
         /// Capture name to a JSON pointer into the received line.
         #[serde(default)]
         capture: BTreeMap<String, String>,
+        /// JSON pointers that must not resolve in the received line.
+        #[serde(default)]
+        absent: Vec<String>,
+        /// Most milliseconds the line may take, from the previous step's end.
+        #[serde(default)]
+        within_ms: Option<u64>,
     },
     Emit {
         line: String,
@@ -101,6 +139,12 @@ enum Step {
     },
     AwaitSignal {
         signal: SignalName,
+    },
+    AwaitEof {},
+    /// The last step: writes `stderr` verbatim and exits with `code`.
+    Exit {
+        code: u8,
+        stderr: String,
     },
 }
 
@@ -153,30 +197,51 @@ pub(crate) fn run_if_selected() {
         process::exit(FAILED)
     };
     let watchdog = arm(load_deadline, Arc::clone(&step));
-    let Some(fixture) = fixture_path() else {
+    let Some((fixture, launches)) = fixture_paths() else {
         // If the watchdog is gone it can no longer act; nothing to disarm.
         let _ = watchdog.send(Arm::Disarm);
         return;
     };
-    let code = match replay(&fixture, started, &step, &watchdog) {
-        Ok(()) => 0,
-        Err(error) => {
-            diagnostic(&error);
-            FAILED
-        }
-    };
+    let code =
+        match log_launch(&launches).and_then(|()| replay(&fixture, started, &step, &watchdog)) {
+            Ok(code) => code,
+            Err(error) => {
+                diagnostic(&error);
+                FAILED
+            }
+        };
     process::exit(code)
 }
 
-/// The sibling fixture of `argv[0]`, when the fake runs in replay mode.
-fn fixture_path() -> Option<PathBuf> {
+/// The sibling fixture and launch log of `argv[0]`, when the fake runs in
+/// replay mode.
+fn fixture_paths() -> Option<(PathBuf, PathBuf)> {
     let argv0 = PathBuf::from(env::args_os().next()?);
     // A bare name was found through PATH; it has no directory to look beside.
     argv0.parent().filter(|dir| !dir.as_os_str().is_empty())?;
-    let mut name = OsString::from(argv0.as_os_str());
-    name.push(".replay.json");
-    let fixture = PathBuf::from(name);
-    fixture.is_file().then_some(fixture)
+    let sibling = |suffix: &str| {
+        let mut name = OsString::from(argv0.as_os_str());
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let fixture = sibling(".replay.json");
+    fixture.is_file().then(|| (fixture, sibling(".launches")))
+}
+
+/// Appends this process's pid as one line, in a single `O_APPEND` write so
+/// that concurrent starts never interleave.
+fn log_launch(path: &Path) -> Result<(), String> {
+    let line = format!("{}\n", process::id());
+    let written = File::options()
+        .append(true)
+        .create(true)
+        .open(path)
+        .and_then(|mut file| file.write(line.as_bytes()))
+        .map_err(|error| format!("cannot write the launch log: {error}"))?;
+    if written != line.len() {
+        return Err("short write to the launch log".to_owned());
+    }
+    Ok(())
 }
 
 fn replay(
@@ -184,7 +249,7 @@ fn replay(
     started: Instant,
     step: &AtomicUsize,
     watchdog: &SyncSender<Arm>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let fixture = load(fixture)?;
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
@@ -198,7 +263,7 @@ fn replay(
         let version = fixture
             .version
             .ok_or("fixture has no version for --version")?;
-        return write_line(&version);
+        return write_line(&version).map(|()| 0);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -209,7 +274,11 @@ fn replay(
     let mut signals = BTreeMap::new();
     for name in fixture.steps.iter().filter_map(|step| match step {
         Step::AwaitSignal { signal } => Some(*signal),
-        Step::Expect { .. } | Step::Emit { .. } | Step::Delay { .. } => None,
+        Step::Expect { .. }
+        | Step::Emit { .. }
+        | Step::Delay { .. }
+        | Step::AwaitEof {}
+        | Step::Exit { .. } => None,
     }) {
         if let Entry::Vacant(entry) = signals.entry(name) {
             let kind = match name {
@@ -220,14 +289,40 @@ fn replay(
             entry.insert(signal(kind).map_err(|error| error.to_string())?);
         }
     }
-    let mut input = io::stdin().lock();
+    // Load allows an exit step only as the last step.
+    let exit = match fixture.steps.last() {
+        Some(Step::Exit { code, .. }) => Some(i32::from(*code)),
+        _ => None,
+    };
+    let count = fixture.steps.len();
+    // Taken before the reader starts, so no input can arrive before it.
+    let mut previous = Instant::now();
+    let mut input = Input::start(deadline)?;
     for (index, current) in fixture.steps.into_iter().enumerate() {
         let number = index + 1;
         step.store(number, Ordering::SeqCst);
-        run_step(current, &mut input, &mut captures, &runtime, &mut signals)
-            .map_err(|error| format!("step {number}: {error}"))?;
+        if matches!(current, Step::Exit { .. }) {
+            input
+                .check_trailing()
+                .map_err(|error| format!("step {number}: {error}"))?;
+        }
+        previous = run_step(
+            current,
+            number,
+            previous,
+            &mut input,
+            &mut captures,
+            &runtime,
+            &mut signals,
+        )
+        .map_err(|error| format!("step {number}: {error}"))?;
     }
-    Ok(())
+    if exit.is_none() {
+        input
+            .check_trailing()
+            .map_err(|error| format!("after step {count}: {error}"))?;
+    }
+    Ok(exit.unwrap_or(0))
 }
 
 fn load(path: &Path) -> Result<Fixture, String> {
@@ -252,9 +347,30 @@ fn load(path: &Path) -> Result<Fixture, String> {
             Arg::Exact(_) => None,
         })
         .collect();
-    for step in &fixture.steps {
-        if let Step::Expect { capture, .. } = step {
-            names.extend(capture.keys().map(String::as_str));
+    for (index, step) in fixture.steps.iter().enumerate() {
+        match step {
+            Step::Expect { capture, .. } => names.extend(capture.keys().map(String::as_str)),
+            Step::Exit { code, stderr } => {
+                if index + 1 != fixture.steps.len() {
+                    return Err(format!("step {}: exit must be the last step", index + 1));
+                }
+                if i32::from(*code) == FAILED {
+                    return Err(format!(
+                        "step {}: exit code {FAILED} is reserved for replay failure",
+                        index + 1
+                    ));
+                }
+                if stderr.len() > MAX_EXIT_STDERR {
+                    return Err(format!(
+                        "step {}: exit stderr exceeds {MAX_EXIT_STDERR} bytes",
+                        index + 1
+                    ));
+                }
+            }
+            Step::Emit { .. }
+            | Step::Delay { .. }
+            | Step::AwaitSignal { .. }
+            | Step::AwaitEof {} => {}
         }
     }
     names.sort_unstable();
@@ -302,14 +418,26 @@ fn arm(deadline: Instant, step: Arc<AtomicUsize>) -> SyncSender<Arm> {
         let mut deadline = deadline;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            match receiver.recv_timeout(left) {
-                Ok(Arm::Deadline(next)) => deadline = next,
-                Ok(Arm::Disarm) => return,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => thread::sleep(left),
+            let message = if left.is_zero() {
+                // A queued update may postpone the expiry: take it first and
+                // re-evaluate against the newest deadline.
+                match receiver.try_recv() {
+                    Ok(message) => message,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
+            } else {
+                match receiver.recv_timeout(left) {
+                    Ok(message) => message,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        thread::sleep(left);
+                        continue;
+                    }
+                }
+            };
+            match message {
+                Arm::Deadline(next) => deadline = next,
+                Arm::Disarm => return,
             }
         }
         expire(step.load(Ordering::SeqCst));
@@ -339,21 +467,37 @@ fn expire(step: usize) -> ! {
     process::exit(FAILED)
 }
 
-fn run_step<R: BufRead>(
+/// Runs one step and returns the instant it completed, from which later
+/// steps measure `within_ms` and order EOF. An emit completes just before
+/// its write: a reader may react as soon as the line is visible.
+fn run_step(
     step: Step,
-    input: &mut R,
+    number: usize,
+    previous: Instant,
+    input: &mut Input,
     captures: &mut Captures,
     runtime: &tokio::runtime::Runtime,
     signals: &mut BTreeMap<SignalName, Signal>,
-) -> Result<(), String> {
+) -> Result<Instant, String> {
     match step {
-        Step::Expect { line, capture } => {
+        Step::Expect {
+            line,
+            capture,
+            absent,
+            within_ms,
+        } => {
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
-            let actual = read_line(input)?;
+            let actual = input.expect_line(previous, within_ms)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
+            }
+            if let Some(pointer) = absent
+                .iter()
+                .find(|pointer| actual.pointer(pointer).is_some())
+            {
+                return Err(format!("{pointer} must be absent in {actual}"));
             }
             for (name, pointer) in capture {
                 let value = actual
@@ -361,40 +505,30 @@ fn run_step<R: BufRead>(
                     .ok_or_else(|| format!("capture {name}: {pointer} is absent in {actual}"))?;
                 captures.insert(&name, value.to_string())?;
             }
-            Ok(())
         }
         Step::Emit { line } => {
             let mut budget = MAX_LINE;
-            write_line(&substitute(&line, captures, &mut budget)?)
+            let line = substitute(&line, captures, &mut budget)?;
+            let completed = Instant::now();
+            write_line(&line)?;
+            return Ok(completed);
         }
-        Step::Delay { ms } => {
-            thread::sleep(Duration::from_millis(ms));
-            Ok(())
-        }
+        Step::Delay { ms } => thread::sleep(Duration::from_millis(ms)),
         Step::AwaitSignal { signal } => {
             let stream = signals.get_mut(&signal).ok_or("signal handler missing")?;
             runtime
                 .block_on(stream.recv())
-                .ok_or_else(|| "signal stream closed".to_owned())
+                .ok_or("signal stream closed")?;
+        }
+        Step::AwaitEof {} => input.await_eof(previous, number)?,
+        Step::Exit { code: _, stderr } => {
+            let mut out = io::stderr().lock();
+            out.write_all(stderr.as_bytes())
+                .and_then(|()| out.flush())
+                .map_err(|error| format!("cannot write stderr: {error}"))?;
         }
     }
-}
-
-fn read_line<R: BufRead>(input: &mut R) -> Result<Value, String> {
-    let mut bytes = Vec::new();
-    let limit = u64::try_from(MAX_LINE + 1).map_err(|error| error.to_string())?;
-    let read = Read::take(&mut *input, limit)
-        .read_until(b'\n', &mut bytes)
-        .map_err(|error| error.to_string())?;
-    if read == 0 {
-        return Err("stdin ended before the expected line".to_owned());
-    }
-    if bytes.last() != Some(&b'\n') {
-        return Err(format!(
-            "input line exceeds {MAX_LINE} bytes or has no newline"
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|error| format!("input line is not JSON: {error}"))
+    Ok(Instant::now())
 }
 
 /// Replaces each `${name}` with its captured text and each `$${` with a

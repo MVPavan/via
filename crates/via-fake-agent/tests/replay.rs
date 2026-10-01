@@ -654,3 +654,372 @@ fn replay_bounds_expected_value_substitution_in_aggregate() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn replay_await_eof_passes_at_eof_and_fails_on_input() -> TestResult {
+    let steps = json!([{"await_eof": {}}, {"emit": {"line": "done"}}]);
+    let end = run_closed(&steps, 10_000)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    assert_eq!(end.stdout, vec![line("done")]);
+
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    assert!(
+        end.stderr.contains("step 1") && end.stderr.contains("unexpected input while awaiting EOF"),
+        "{}",
+        end.stderr
+    );
+
+    // With stdin left open, only the run deadline ends the wait.
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 300, &steps))?;
+    let end = spawn::<&str>(&binary, &[])?.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
+fn replay_absent_pointer_fails_when_it_resolves() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {"type": "user"}, "absent": ["/session_id", "/message/model"]}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user", "message": {"content": "hi"}}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+
+    for sent in [
+        json!({"type": "user", "session_id": null}),
+        json!({"type": "user", "message": {"model": "m"}}),
+    ] {
+        let mut run = spawn::<&str>(&binary, &[])?;
+        run.send(&sent)?;
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(FAILED), "{sent}");
+        assert!(end.stdout.is_empty());
+        assert!(
+            end.stderr.contains("step 1") && end.stderr.contains("must be absent"),
+            "{}",
+            end.stderr
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn replay_within_ms_bounds_the_wait_for_an_expected_line() -> TestResult {
+    // A missed 300 ms limit fails on its own name, long before the 3 s run
+    // deadline; a longer limit would fail naming the deadline instead.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            3_000,
+            &json!([
+                {"emit": {"line": "ready"}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "late"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("ready")]);
+    assert!(
+        end.stderr.contains("step 2: within_ms") && !end.stderr.contains("deadline"),
+        "{}",
+        end.stderr
+    );
+
+    // It counts from the previous step's completion, not from the start.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"delay": {"ms": 500}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "decline"}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+    Ok(())
+}
+
+#[test]
+fn replay_exit_step_writes_stderr_and_exits_with_its_code() -> TestResult {
+    let end = run_closed(
+        &json!([
+            {"emit": {"line": "partial"}},
+            {"exit": {"code": 7, "stderr": "Error: rate limited\n"}}
+        ]),
+        10_000,
+    )?;
+    assert_eq!(end.code, Some(7));
+    assert_eq!(end.stdout, vec![line("partial")]);
+    assert_eq!(end.stderr, "Error: rate limited\n");
+
+    let at_bound = "e".repeat(1024);
+    let end = run_closed(&json!([{"exit": {"code": 1, "stderr": at_bound}}]), 10_000)?;
+    assert_eq!(end.code, Some(1));
+    assert_eq!(end.stderr, at_bound);
+    Ok(())
+}
+
+#[test]
+fn replay_exit_step_is_checked_at_load() -> TestResult {
+    // Each fixture is refused before its first step runs.
+    for (steps, reason) in [
+        (
+            json!([{"emit": {"line": "x"}}, {"exit": {"code": 3, "stderr": ""}}]),
+            "reserved",
+        ),
+        (
+            json!([
+                {"emit": {"line": "x"}},
+                {"exit": {"code": 1, "stderr": ""}},
+                {"emit": {"line": "y"}}
+            ]),
+            "last step",
+        ),
+        (
+            json!([{"emit": {"line": "x"}}, {"exit": {"code": 1, "stderr": "e".repeat(1025)}}]),
+            "1024 bytes",
+        ),
+    ] {
+        let end = run_closed(&steps, 10_000)?;
+        assert_eq!(end.code, Some(FAILED), "{steps}");
+        assert!(end.stdout.is_empty(), "{steps}");
+        assert!(end.stderr.contains(reason), "{}", end.stderr);
+    }
+    Ok(())
+}
+
+#[test]
+fn replay_appends_each_start_to_the_launch_log() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &json!({"argv": [], "version": "1.0", "deadline_ms": 10_000, "steps": []}),
+    )?;
+    let mut pids = Vec::new();
+    for args in [&[][..], &["--version"][..], &[][..]] {
+        let run = spawn(&binary, args)?;
+        pids.push(format!("{}\n", run.child.id()));
+        assert_eq!(run.finish(true)?.code, Some(0));
+    }
+    assert_eq!(
+        fs::read_to_string(root.path().join("vendor.launches"))?,
+        pids.concat()
+    );
+
+    // A launch log that cannot be written fails the run.
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &json!([])))?;
+    fs::create_dir(root.path().join("vendor.launches"))?;
+    let end = spawn::<&str>(&binary, &[])?.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stderr.contains("launch log"), "{}", end.stderr);
+    Ok(())
+}
+
+/// A fixture whose second step must see its line within 300 ms, run with a
+/// 5 s deadline; the line is sent `wait` after "ready" is read.
+fn within_ms_after(wait: Duration) -> TestResult<Finished> {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            5_000,
+            &json!([
+                {"emit": {"line": "ready"}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "got"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    thread::sleep(wait);
+    // The fake may already have exited; then the write fails.
+    let _ = run.send(&json!({"type": "decline"}));
+    run.finish(false)
+}
+
+#[test]
+fn replay_within_ms_late_line_fails_before_the_run_deadline() -> TestResult {
+    let end = within_ms_after(Duration::from_millis(800))?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("ready")]);
+    assert!(
+        end.stderr.contains("step 2: within_ms") && !end.stderr.contains("deadline"),
+        "{}",
+        end.stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_within_ms_limit_ends_with_its_step() -> TestResult {
+    // The second expect has no limit of its own; its line comes after the
+    // first one's 300 ms but well within the 5 s run deadline.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            5_000,
+            &json!([
+                {"expect": {"line": {"type": "first"}, "within_ms": 300}},
+                {"expect": {"line": {"type": "second"}}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "first"}))?;
+    thread::sleep(Duration::from_millis(800));
+    run.send(&json!({"type": "second"}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_await_eof_fails_when_stdin_closed_before_the_previous_step() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {"type": "user"}}},
+                {"delay": {"ms": 1_000}},
+                {"emit": {"line": "terminal"}},
+                {"await_eof": {}}
+            ]),
+        ),
+    )?;
+    // Closed at once, before the terminal is emitted.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("terminal")]);
+    assert!(
+        end.stderr
+            .contains("step 4: stdin closed before step 3 completed"),
+        "{}",
+        end.stderr
+    );
+
+    // Closed only after the terminal is read.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    assert_eq!(run.next_line()?, line("terminal"));
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_trailing_input_after_the_last_expect_fails() -> TestResult {
+    // The delay gives the reader time to see the extra line; nothing is
+    // asserted about time.
+    for steps in [
+        json!([
+            {"expect": {"line": {"type": "user"}}},
+            {"delay": {"ms": 300}},
+            {"exit": {"code": 1, "stderr": "vendor failed\n"}}
+        ]),
+        json!([
+            {"expect": {"line": {"type": "user"}}},
+            {"delay": {"ms": 300}},
+            {"emit": {"line": "done"}}
+        ]),
+    ] {
+        let root = tempfile::tempdir()?;
+        let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        run.send(&json!({"type": "user"}))?;
+        run.send(&json!({"type": "user", "resent": true}))?;
+        let end = run.finish(false)?;
+        assert_eq!(end.code, Some(FAILED), "{steps}");
+        assert!(
+            end.stderr
+                .contains("unexpected input after the last expect"),
+            "{}",
+            end.stderr
+        );
+        assert!(!end.stderr.contains("vendor failed"), "{}", end.stderr);
+    }
+    Ok(())
+}
+
+#[test]
+fn replay_await_eof_fails_on_a_partial_line() -> TestResult {
+    // Held open, the partial line is never a line, so the run deadline ends the wait.
+    let steps = json!([{"await_eof": {}}, {"emit": {"line": "done"}}]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 1_000, &steps))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.stdin.as_mut().ok_or("stdin closed")?.write_all(b"{")?;
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+
+    // Closed after it, the partial line fails at EOF.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.stdin.as_mut().ok_or("stdin closed")?.write_all(b"{")?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
+fn replay_concurrent_starts_each_log_one_launch() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &json!([])))?;
+    let runs = (0..8)
+        .map(|_| spawn::<&str>(&binary, &[]))
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut pids: Vec<String> = runs.iter().map(|run| run.child.id().to_string()).collect();
+    for run in runs {
+        assert_eq!(run.finish(true)?.code, Some(0));
+    }
+    let log = fs::read_to_string(root.path().join("vendor.launches"))?;
+    assert!(log.ends_with('\n'), "{log:?}");
+    let mut logged: Vec<String> = log.lines().map(str::to_owned).collect();
+    pids.sort();
+    logged.sort();
+    assert_eq!(logged, pids);
+    Ok(())
+}
