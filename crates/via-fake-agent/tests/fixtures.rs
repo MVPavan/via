@@ -8,8 +8,8 @@
 //!   each `await_signal` and closes stdin at each `await_eof`, completes the
 //!   fixture with the exit code and stderr of its `exit` step (0 and none
 //!   without one), with one launch logged per start. Ordered EOF and strict
-//!   trailing input hold: a resent line or an EOF right after the first
-//!   line fails replay.
+//!   trailing input hold: a line resent before an `await_eof`, or an EOF
+//!   right after the first line, fails replay.
 //! - No fixture file contains a home path, an email address, a token-like
 //!   value or a credential field with a real value. Every key and string is
 //!   scanned, the new step fields (`exit.stderr`, `absent` pointers)
@@ -32,9 +32,6 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Outer bound for one fixture run; each fixture's own deadline is shorter.
 const OUTER: Duration = Duration::from_secs(30);
-/// How long the driver waits after answering an expect before it closes
-/// stdin for the `await_eof` that follows (see [`drive`]).
-const EXPECT_SETTLE: Duration = Duration::from_millis(200);
 /// The value the driver passes for every argv capture.
 const CAPTURED_ARG: &str = "0f1de11e-0000-4000-8000-000000000001";
 /// Credential fields that may hold only a placeholder.
@@ -323,7 +320,6 @@ struct Run<'a> {
 /// exit 0 with no stderr, unless an exit step says otherwise.
 fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
     let mut end = (0, String::new());
-    let mut previous_is_expect = false;
     let mut last_answer = None;
     for (index, step) in fixture["steps"]
         .as_array()
@@ -394,12 +390,6 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
                 writeln!(input, "{line}")?;
                 input.flush()?;
             }
-            if previous_is_expect {
-                // An expect completes when the fake has matched the line,
-                // which the driver cannot observe; an EOF before that is a
-                // replay failure, so let the fake take the line first.
-                thread::sleep(EXPECT_SETTLE);
-            }
             drop(run.stdin.take());
         } else if let Some(exit) = step.get("exit") {
             let code = exit["code"]
@@ -412,7 +402,6 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
         } else if step.get("delay").is_none() {
             return Err(fail(format!("unknown step {step}")).into());
         }
-        previous_is_expect = step.get("expect").is_some();
     }
     Ok(end)
 }
@@ -762,25 +751,41 @@ fn drive_all(deviation: Deviation) -> TestResult<Vec<(PathBuf, Result<(), String
         .collect()
 }
 
+/// The fixture's steps.
+fn steps_of(path: &Path) -> TestResult<Vec<Value>> {
+    let fixture: Value = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(fixture["steps"].as_array().ok_or("steps")?.clone())
+}
+
+/// Whether the fixture has a step of this kind.
+fn has_step(steps: &[Value], kind: &str) -> bool {
+    steps.iter().any(|step| step.get(kind).is_some())
+}
+
 /// Whether the fixture's first `await_eof` directly follows its first
 /// expect: there an EOF right after the first line is the recorded order.
-fn eof_follows_first_expect(path: &Path) -> TestResult<bool> {
-    let fixture: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let steps = fixture["steps"].as_array().ok_or("steps")?;
+fn eof_follows_first_expect(steps: &[Value]) -> bool {
     let first = steps.iter().position(|step| step.get("expect").is_some());
-    Ok(first.is_some_and(|at| {
+    first.is_some_and(|at| {
         steps
             .get(at + 1)
             .is_some_and(|step| step.get("await_eof").is_some())
-    }))
+    })
 }
 
+/// A resent line before an `await_eof` is strict trailing input, and an EOF
+/// right after the first line is an early EOF; both fail replay. Fixtures
+/// without an `await_eof` (the resend is never written) or without an
+/// expect (nothing to close after) are not exercised by that deviation.
 #[test]
 fn fixtures_fail_replay_on_trailing_input_or_early_eof() -> TestResult {
     let mut misses = Vec::new();
+    let mut exercised = 0;
     for (path, result) in drive_all(Deviation::ExtraInput)? {
-        // Every fixture ends its input with await_eof, so a resent line is
-        // strict trailing input.
+        if !has_step(&steps_of(&path)?, "await_eof") {
+            continue;
+        }
+        exercised += 1;
         match result {
             Err(error) if error.contains("fake replay: ") && error.contains("unexpected input") => {
             }
@@ -788,14 +793,17 @@ fn fixtures_fail_replay_on_trailing_input_or_early_eof() -> TestResult {
         }
     }
     for (path, result) in drive_all(Deviation::EarlyEof)? {
-        if eof_follows_first_expect(&path)? {
+        let steps = steps_of(&path)?;
+        if !has_step(&steps, "expect") || eof_follows_first_expect(&steps) {
             continue;
         }
+        exercised += 1;
         match result {
             Err(error) if error.contains("fake replay: ") && error.contains("exit status: 3") => {}
             other => misses.push(format!("{}: early EOF gave {other:?}", path.display())),
         }
     }
+    assert!(exercised > 0, "no fixture exercised a deviation");
     assert!(misses.is_empty(), "{}", misses.join("\n"));
     Ok(())
 }
