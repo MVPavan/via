@@ -1,0 +1,338 @@
+//! S-LAUNCH (adapter design §5.4, §7; runtime §6.1, §8; C2 §7 item 1)
+//! through the real `via` binary and an auto-started daemon: the daemon's
+//! environment is exactly the bootstrap names, and `describe` and `models`
+//! start nothing for a configured vendor harness. Written before the code.
+//! Environment values are never read or shown: only names (runtime §6.1).
+
+#[path = "support/daemon.rs"]
+#[expect(dead_code, reason = "shared support; this file uses its probe only")]
+mod daemon;
+#[path = "support/evidenced.rs"]
+mod evidenced;
+#[path = "support/outer_cleanup.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
+mod outer_cleanup;
+#[path = "support/process.rs"]
+mod process;
+#[path = "support/scenario.rs"]
+#[expect(dead_code, reason = "shared support; this file uses part of it")]
+mod scenario;
+mod support;
+
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use evidenced::evidenced;
+use scenario::{Captured, run_command};
+use serde_json::{Value, json};
+
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// Credential-like names the client sets; none may reach the daemon.
+const CREDENTIALS: [&str; 3] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "VIA_UNLISTED_SECRET"];
+
+/// One isolated deployment whose CLI runs with a known environment: every
+/// bootstrap name set, plus credential-like names. Its drop force-stops
+/// whatever daemon the CLI auto-started and collects the evidence.
+struct Sandbox {
+    root: tempfile::TempDir,
+    state: PathBuf,
+    runtime: PathBuf,
+    sync: PathBuf,
+    fake: PathBuf,
+    fixture: PathBuf,
+    /// Prepended to the client's `PATH`.
+    bin: PathBuf,
+    evidence: Option<support::evidence::Evidence>,
+    teardown: outer_cleanup::Teardown,
+    /// Cleared by a scenario whose daemon never opens a Store.
+    store: bool,
+}
+
+impl Sandbox {
+    fn new() -> TestResult<Self> {
+        let via = Path::new(env!("CARGO_BIN_EXE_via"));
+        let fake = via
+            .parent()
+            .ok_or("via binary has no parent directory")?
+            .join("via-fake-agent");
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let [state, runtime, sync, bin, xdg] =
+            ["state", "runtime", "sync", "bin", "xdg"].map(|name| root.path().join(name));
+        for dir in [&state, &runtime, &sync, &bin, &xdg] {
+            daemon::private_dir(dir)?;
+        }
+        let fixture = root.path().join("fixture.json");
+        fs::write(&fixture, br#"{"scripts":[]}"#)?;
+        let evidence = Some(evidenced::open(&fake, &fixture)?);
+        Ok(Self {
+            root,
+            state,
+            runtime,
+            sync,
+            fake,
+            fixture,
+            bin,
+            evidence,
+            teardown: outer_cleanup::Teardown::new(),
+            store: true,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut path = OsString::from(self.bin.as_os_str());
+        if let Some(inherited) = std::env::var_os("PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_via"));
+        command
+            .env_clear()
+            .env("HOME", self.root.path())
+            .env("PATH", path)
+            .env("LANG", "C.UTF-8")
+            .env("USER", "via-test")
+            .env("LOGNAME", "via-test")
+            .env("XDG_RUNTIME_DIR", self.root.path().join("xdg"))
+            .env("VIA_FAKE_AGENT_BINARY", &self.fake)
+            .env("VIA_FAKE_SCENARIO", &self.fixture)
+            .env("VIA_FAKE_SYNC_DIR", &self.sync)
+            .env("VIA_STATE_DIR", &self.state)
+            .env("VIA_RUNTIME_DIR", &self.runtime);
+        for name in CREDENTIALS {
+            command.env(name, "not-a-real-credential");
+        }
+        // Test builds forward their own names (client.rs): one of them.
+        #[cfg(feature = "test-failpoints")]
+        command.env("VIA_TEST_IDLE_EXIT_MS", "600000");
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> TestResult<Captured> {
+        let mut command = self.command();
+        command.args(args);
+        let captured = run_command(&mut command, Duration::from_secs(20))?;
+        if captured.timed_out {
+            return Err(format!("via {args:?} timed out{}", captured.notes()).into());
+        }
+        Ok(captured)
+    }
+
+    /// Writes `<state>/daemon.json` (0600).
+    fn config(&self, config: &Value) -> TestResult {
+        let path = self.state.join("daemon.json");
+        fs::write(&path, config.to_string())?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+}
+
+/// Every daemon the CLI auto-started is force-stopped and proved gone,
+/// then the evidence is collected (runtime §11.2).
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if let Some(evidence) = self.evidence.take() {
+            self.root.disable_cleanup(true);
+            let exited =
+                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
+                    outer_cleanup::run_within(
+                        self.command().args(["daemon", "stop", "--force", "--json"]),
+                        by,
+                    )
+                });
+            let expected = evidenced::Expected {
+                store: self.store,
+                folders: false,
+            };
+            evidenced::park(
+                evidence,
+                self.root.path().to_owned(),
+                &self.state,
+                expected,
+                exited,
+            );
+        }
+    }
+}
+
+fn check(condition: bool, message: impl FnOnce() -> String) -> TestResult {
+    if condition {
+        Ok(())
+    } else {
+        Err(message().into())
+    }
+}
+
+/// The names in `/proc/<pid>/environ`; the values are never kept.
+fn environ_names(pid: u32) -> TestResult<BTreeSet<String>> {
+    let bytes = fs::read(format!("/proc/{pid}/environ"))?;
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let name = entry.split(|byte| *byte == b'=').next().unwrap_or_default();
+            String::from_utf8_lossy(name).into_owned()
+        })
+        .collect())
+}
+
+/// The serving daemon's pid from an auto-starting `daemon status`, checked
+/// against the direct, never auto-starting, socket probe.
+fn auto_started(sandbox: &Sandbox) -> TestResult<u32> {
+    let run = sandbox.run(&["daemon", "status", "--json"])?;
+    check(run.status.success(), || {
+        format!(
+            "auto-start failed: {} {}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        )
+    })?;
+    let status: Value = serde_json::from_slice(&run.stdout)?;
+    let pid = u32::try_from(status["pid"].as_u64().ok_or("status has no pid")?)?;
+    check(daemon::serving_pid(&sandbox.runtime) == Some(pid), || {
+        format!("pid {pid} does not serve the sandbox socket")
+    })?;
+    Ok(pid)
+}
+
+/// Design §7 S-LAUNCH (1), runtime §6.1: the auto-started daemon's
+/// environment names are exactly the bootstrap names the client set
+/// (`HOME`, `PATH`, `LANG`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR` and the
+/// fake's three) plus the explicit state, runtime and test-build settings;
+/// no credential-like client name reaches it.
+#[test]
+fn s_launch_autostarted_daemon_gets_bootstrap_env() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new()?;
+        let pid = auto_started(&sandbox)?;
+        let names = environ_names(pid)?;
+        let bootstrap = [
+            "HOME",
+            "PATH",
+            "LANG",
+            "USER",
+            "LOGNAME",
+            "XDG_RUNTIME_DIR",
+            "VIA_FAKE_AGENT_BINARY",
+            "VIA_FAKE_SCENARIO",
+            "VIA_FAKE_SYNC_DIR",
+        ];
+        let mut expected: BTreeSet<String> = bootstrap.map(str::to_owned).into();
+        expected.extend(["VIA_STATE_DIR".to_owned(), "VIA_RUNTIME_DIR".to_owned()]);
+        #[cfg(feature = "test-failpoints")]
+        expected.insert("VIA_TEST_IDLE_EXIT_MS".to_owned());
+        check(names == expected, || {
+            format!("daemon environment names {names:?}, expected {expected:?}")
+        })?;
+        for name in CREDENTIALS {
+            check(!names.contains(name), || {
+                format!("{name} reached the daemon")
+            })?;
+        }
+        check(
+            via_core::BOOTSTRAP_ENV
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                == bootstrap.into_iter().collect(),
+            || format!("BOOTSTRAP_ENV is {:?}", via_core::BOOTSTRAP_ENV),
+        )?;
+        Ok(())
+    })
+}
+
+/// Writes an executable that appends its name to `marker` when it runs.
+fn marking_script(path: &Path, marker: &Path) -> TestResult {
+    fs::write(
+        path,
+        format!("#!/bin/sh\necho \"$0\" >> '{}'\nexit 0\n", marker.display()),
+    )?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`
+/// and `harnesses.codex` pinned to marker-writing executables, and
+/// `opencode` (and the defaults) on the client's `PATH`, `describe` and
+/// `models` for each vendor harness run no binary. Their result is the
+/// merged base's: no adapter exists before x.3.2, so `describe` refuses
+/// `harness_unavailable` and `models` lists nothing. A guard for x.3.2.
+#[test]
+fn s_launch_describe_starts_nothing() -> TestResult {
+    evidenced(|| {
+        let sandbox = Sandbox::new()?;
+        let marker = sandbox.root.path().join("ran.marker");
+        let pinned = sandbox.root.path().join("pinned");
+        daemon::private_dir(&pinned)?;
+        for name in ["claude", "codex"] {
+            marking_script(&pinned.join(format!("{name}-pinned")), &marker)?;
+        }
+        for name in ["claude", "codex", "opencode"] {
+            marking_script(&sandbox.bin.join(name), &marker)?;
+        }
+        sandbox.config(&json!({"harnesses":{
+            "claude":{"binary":pinned.join("claude-pinned")},
+            "codex":{"binary":pinned.join("codex-pinned"),"inherit":{"hooks":true}},
+        }}))?;
+        auto_started(&sandbox)?;
+        let mut outcomes = Vec::new();
+        for harness in ["claude", "codex", "opencode"] {
+            let described = sandbox.run(&["describe", "--harness", harness, "--json"])?;
+            // A request error is printed on stderr.
+            let reply: Value = serde_json::from_slice(&described.stderr).unwrap_or(Value::Null);
+            outcomes.push(json!({"describe":harness,"exit":described.status.code(),
+                "stdout":reply,"stderr":String::from_utf8_lossy(&described.stderr)}));
+            check(
+                described.status.code() == Some(2)
+                    && reply["data"]["kind"] == "harness_unavailable",
+                || format!("describe {harness}: {outcomes:?}"),
+            )?;
+            let models = sandbox.run(&["models", "--harness", harness, "--json"])?;
+            let listed: Value = serde_json::from_slice(&models.stdout).unwrap_or(Value::Null);
+            outcomes.push(json!({"models":harness,"exit":models.status.code(),
+                "stdout":listed,"stderr":String::from_utf8_lossy(&models.stderr)}));
+            check(
+                models.status.success() && listed["models"] == json!([]),
+                || format!("models {harness}: {outcomes:?}"),
+            )?;
+        }
+        check(!marker.exists(), || {
+            format!(
+                "a vendor binary ran: {}",
+                fs::read_to_string(&marker).unwrap_or_default()
+            )
+        })
+    })
+}
+
+/// Runtime §8, design §5.4: an invalid `harnesses` refuses daemon start
+/// with its named error and leaves no socket.
+#[test]
+fn s_launch_invalid_harnesses_refuse_start() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        sandbox.store = false;
+        sandbox.config(&json!({"harnesses":{"claude":{"binary":"bin/claude"}}}))?;
+        let mut command = sandbox.command();
+        command.arg("daemon");
+        let run = run_command(&mut command, Duration::from_secs(10))?;
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+        check(
+            !run.timed_out
+                && !run.status.success()
+                && stderr.contains("harnesses.claude.binary: must be an absolute path"),
+            || format!("daemon start: {:?} {stderr}", run.status),
+        )?;
+        check(!sandbox.runtime.join("via.sock").exists(), || {
+            "a socket was left".to_owned()
+        })
+    })
+}
