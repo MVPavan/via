@@ -6,9 +6,10 @@
 //! lost to a timeout. The gap between the kernel delivering the bytes and
 //! the reader taking the lock is inherent to any reader.
 //!
-//! After publishing a line or EOF the reader acknowledges it in the
-//! progress log (`read <k>` for the *k*th line, `eof`), so a driver can
-//! order its next action after the arrival.
+//! When it publishes a line or EOF the reader also acknowledges it in the
+//! progress log (`read <k>` for the *k*th line, `eof`), still under the
+//! lock, so the ack is written before the main thread can take the event
+//! and a driver can order its next action after the arrival.
 //!
 //! A line is on time if and only if its arrival is at or before its limit:
 //! `within_ms` after the previous step's completion, capped by the run
@@ -220,8 +221,8 @@ impl Input {
 }
 
 /// Reads stdin line by line until EOF or an error. It waits for room before
-/// each read, reads without the lock, then stamps and publishes under it,
-/// and acknowledges a line or EOF in the progress log. A failed
+/// each read, reads without the lock, then stamps, publishes and
+/// acknowledges a line or EOF in the progress log under it. A failed
 /// acknowledgement is published as an input error.
 fn read_stdin(shared: &Shared, progress: &Progress) {
     let mut input = io::stdin().lock();
@@ -254,19 +255,19 @@ fn read_stdin(shared: &Shared, progress: &Progress) {
             Event::Eof => Some("eof".to_owned()),
             Event::Error(_) => None,
         };
-        shared.lock().push_back((Instant::now(), event));
-        shared.changed.notify_all();
-        let Some(ack) = ack else {
-            return;
-        };
-        if let Err(error) = progress.log(&ack) {
-            shared
-                .lock()
-                .push_back((Instant::now(), Event::Error(error)));
-            shared.changed.notify_all();
-            return;
+        let last = !matches!(event, Event::Line(_));
+        let mut queue = shared.lock();
+        queue.push_back((Instant::now(), event));
+        // Acknowledged under the lock, so the main thread cannot take the
+        // event (and the process cannot end on it) before the ack is written.
+        let failed = ack.and_then(|ack| progress.log(&ack).err());
+        let stop = last || failed.is_some();
+        if let Some(error) = failed {
+            queue.push_back((Instant::now(), Event::Error(error)));
         }
-        if ack == "eof" {
+        drop(queue);
+        shared.changed.notify_all();
+        if stop {
             return;
         }
     }
