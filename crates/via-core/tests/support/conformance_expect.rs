@@ -120,14 +120,18 @@
 //! replay `await_signal` step they release (1-based; `lifetime` 1-based,
 //! default 1). A gate's `expect` is a partial outcome: any turn `expect`
 //! field but `unasserted`, validated like a final expectation except that
-//! `cleanup` may also be `pending`.
+//! `cleanup` may also be `pending` (and identity confirmed with no
+//! acceptance yet is a valid prefix).
 //!
 //! The fake reports its side on the progress log `<name>.progress` beside
-//! the replay, one line per event: `at <step>` when it starts waiting for
-//! the step's signal and `signalled <step>` once it has consumed it (with
-//! ` lifetime <n>` appended in a lifetimes fixture). For each gate, in
+//! the replay, one line per event: `at <step> launch <n>` when it starts
+//! waiting for the step's signal and `signalled <step> launch <n>` once it
+//! has consumed it, where *n* is that start's launch ordinal (the position
+//! of the fake's pid in the launch log; in a lifetimes fixture, the
+//! lifetime). The driver matches only its own launch's lines, never a
+//! marker an earlier launch of the same fixture left. For each gate, in
 //! order, the driver:
-//! 1. waits for `at <step>` before anything else for the gate;
+//! 1. waits for `at <step> launch <n>` before anything else for the gate;
 //! 2. polls the adapter until it is pending on what the gate guards (for
 //!    c6, the handshake: the adapter has written `initialize`, which the
 //!    fake consumed before reaching the step, and waits for its reply), and
@@ -138,7 +142,7 @@
 //!    [`check`] compares with the gate's `expect`;
 //! 5. sends the step's signal to the fake (the fake's pid is its line in
 //!    the launch log);
-//! 6. waits for `signalled <step>` before letting the adapter run again, so
+//! 6. waits for `signalled <step> launch <n>` before letting the adapter run again, so
 //!    everything the adapter does next (stdin EOF included) comes after the
 //!    step's completion, which the fake orders by true arrival times.
 //!
@@ -162,10 +166,13 @@
 //!   own count; each case starts with no log. `pure_writes` lists the files
 //!   that the pure operations created, changed or removed in the case's
 //!   fixture and scratch directories, the launch log excepted.
-//! - The replay's own verdict is part of the case. For every launch the
-//!   driver calls [`replay_exit`] with the fixture (or lifetime) it ran and
-//!   the fake's exit status and stderr: the fixture's `exit` step's code and
-//!   stderr, or 0 and none, is required. A fake that exits 3 (unmatched or
+//! - The replay's own verdict is part of the case. For every launch that
+//!   runs the steps the driver calls [`replay_exit`] with the fixture (or
+//!   lifetime) it ran and the fake's exit status and stderr: the fixture's
+//!   `exit` step's code and stderr, or 0 and none, is required. A
+//!   `--version` probe launch never runs the steps; the driver judges it
+//!   with [`probe_exit`] instead: the fixture's `version` line, exit 0 and
+//!   no stderr. A fake that exits 3 (unmatched or
 //!   unexpected input, an absent field that was sent, a line that came late
 //!   or before its causal predecessor, stdin closed early), one ended by a
 //!   signal (a shared server killed before its last steps), or any other end
@@ -190,19 +197,24 @@ use serde_json::{Map, Value, json};
 #[path = "replay_exit.rs"]
 mod replay_exit;
 
-pub(crate) use replay_exit::replay_exit;
+pub(crate) use replay_exit::{probe_exit, replay_exit};
 
 /// Checks [`replay_exit`] against every `*.replay.json` in `dir`, one
 /// lifetime at a time: the fixture's own end is accepted, and a signal
 /// death, the replay's failure code, another code or other stderr are
-/// refused. Returns the number of lifetimes checked.
+/// refused; a fixture with a `version` also has its `--version` probe end
+/// checked by [`probe_exit`]. Returns the number of lifetimes checked.
 pub(crate) fn replay_exit_self_check(dir: &Path) -> Result<usize, String> {
     let mut checked = 0;
-    let mut paths: Vec<_> = fs::read_dir(dir)
-        .map_err(|error| error.to_string())?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.to_string_lossy().ends_with(".replay.json"))
-        .collect();
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
+        let path = entry
+            .map_err(|error| format!("{}: {error}", dir.display()))?
+            .path();
+        if path.to_string_lossy().ends_with(".replay.json") {
+            paths.push(path);
+        }
+    }
     paths.sort();
     for path in paths {
         let at = path.display().to_string();
@@ -228,6 +240,21 @@ pub(crate) fn replay_exit_self_check(dir: &Path) -> Result<usize, String> {
                     return Err(format!(
                         "{at}: an end of {ended:?} with {text:?} was accepted"
                     ));
+                }
+            }
+            if let Some(version) = fixture["version"].as_str() {
+                let line = format!("{version}\n");
+                probe_exit(fixture, Some(0), &line, "").map_err(|e| format!("{at}: {e}"))?;
+                let wrong = [
+                    (None, line.as_str(), ""),
+                    (Some(1), line.as_str(), ""),
+                    (Some(0), "", ""),
+                    (Some(0), line.as_str(), "warning"),
+                ];
+                for (ended, out, err) in wrong {
+                    if probe_exit(fixture, ended, out, err).is_ok() {
+                        return Err(format!("{at}: a probe end of {ended:?} was accepted"));
+                    }
                 }
             }
             checked += 1;
@@ -418,6 +445,18 @@ const OPAQUE: &[&str] = &["structured_output", "vendor"];
 const COST: &[&str] = &["usd", "scope", "provenance"];
 /// C1 §5 cost provenance.
 const PROVENANCE: &[&str] = &["reported", "estimated", "unavailable"];
+/// C1 §5 usage provenance: only cost may be `estimated`.
+const USAGE_PROVENANCE: &[&str] = &["reported", "unavailable"];
+/// C2 `UsageSample` (`via-adapters`' observation type): `key`, then the
+/// token counters.
+const USAGE_SAMPLE: &[&str] = &[
+    "key",
+    "input",
+    "cached_input",
+    "output",
+    "reasoning_output",
+    "total",
+];
 /// C1 §5 usage and cost scope.
 const SCOPE: &[&str] = &["turn", "session_cumulative", "vendor_interval"];
 /// Where a turn's usage came from.
@@ -579,8 +618,6 @@ enum Ty {
     Number,
     /// An array of `[id, name]` string pairs.
     Pairs,
-    /// An object whose members are non-negative integers or null.
-    Counts,
     /// One of these names.
     Name(&'static [&'static str]),
 }
@@ -604,11 +641,6 @@ impl Ty {
                         .is_some_and(|pair| pair.len() == 2 && pair.iter().all(Value::is_string))
                 })
             }),
-            Self::Counts => value.as_object().is_some_and(|counts| {
-                counts
-                    .values()
-                    .all(|count| count.is_null() || count.as_u64().is_some())
-            }),
             Self::Name(names) => value.as_str().is_some_and(|text| names.contains(&text)),
         }
     }
@@ -624,7 +656,6 @@ impl Ty {
             Self::Integer => "an integer".to_owned(),
             Self::Number => "a number".to_owned(),
             Self::Pairs => "an array of [id, name] string pairs".to_owned(),
-            Self::Counts => "an object of non-negative integers".to_owned(),
             Self::Name(names) => format!("one of {names:?}"),
         }
     }
@@ -995,6 +1026,9 @@ fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String
                     let (ty, nullable) = observation_field_type(field);
                     typed(map, field, ty, nullable, &format!("{at}.{key}.{kind}"))?;
                 }
+                if let Some(sample) = map.get("usage").filter(|usage| usage.is_object()) {
+                    usage_sample(sample, &format!("{at}.{key}.{kind}.usage"))?;
+                }
             }
         }
     }
@@ -1025,7 +1059,7 @@ fn observation_field_type(field: &str) -> (Ty, bool) {
         "model" | "blocking" => (Ty::Bool, false),
         "tools_started" => (Ty::Pairs, false),
         "tools_ended" => (Ty::Strings, false),
-        "usage" => (Ty::Counts, true),
+        "usage" => (Ty::Object, true),
         "denial_kind" => (Ty::Name(DENIAL_KIND), false),
         "code" => (Ty::Name(WARNING), false),
         "vendor_turn_id" => (Ty::Str, true),
@@ -1033,6 +1067,18 @@ fn observation_field_type(field: &str) -> (Ty, bool) {
         // delivery, requested, returned.
         _ => (Ty::Str, false),
     }
+}
+
+/// Checks a C2 `UsageSample` (`progress.usage`): a nullable string `key`
+/// and the named nullable token counters, nothing else.
+fn usage_sample(sample: &Value, at: &str) -> Result<(), String> {
+    known(sample, USAGE_SAMPLE, at)?;
+    let sample = object(sample, at)?;
+    typed(sample, "key", Ty::Str, true, at)?;
+    for counter in &USAGE_SAMPLE[1..] {
+        typed(sample, counter, Ty::Count, true, at)?;
+    }
+    Ok(())
 }
 
 /// Checks the members of the stated `terminal.cost`, `usage`,
@@ -1052,7 +1098,7 @@ fn member_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
         let at = format!("{at}.usage");
         typed(usage, "from", Ty::Name(USAGE_FROM), false, &at)?;
         typed(usage, "scope", Ty::Name(SCOPE), false, &at)?;
-        typed(usage, "provenance", Ty::Name(PROVENANCE), false, &at)?;
+        typed(usage, "provenance", Ty::Name(USAGE_PROVENANCE), false, &at)?;
         for count in &USAGE[3..] {
             typed(usage, count, Ty::Count, true, &at)?;
         }
@@ -1333,17 +1379,23 @@ fn expect_rules(at: &str, e: &Value, cleanups: &[&str]) -> Vec<String> {
     let order = kinds(&e["observations_order"]);
     let first = |kind| order.iter().position(|&seen| seen == kind);
     // C2 §2 identity: on every route, identity is persisted before any
-    // same-message acceptance, so an accepted turn that asserts the
-    // confirmation anywhere must also order it.
-    let confirmation_asserted = kinds(&e["observations_include"]).contains(&CONFIRMED)
-        || e["observation_counts"][CONFIRMED]
-            .as_u64()
-            .is_some_and(|count| count > 0);
-    if e["accepted"] == json!(true) && confirmation_asserted && first(CONFIRMED).is_none() {
+    // same-message acceptance, so an expectation that asserts both must
+    // order them. Identity alone (a gate before acceptance) is a valid
+    // prefix.
+    let asserted = |kind: &str| {
+        kinds(&e["observations_include"]).contains(&kind)
+            || e["observation_counts"][kind]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+    };
+    let acceptance_asserted =
+        e["accepted"] == json!(true) || asserted(ACCEPTED) || first(ACCEPTED).is_some();
+    if acceptance_asserted && asserted(CONFIRMED) && first(CONFIRMED).is_none() {
         wrong.push(format!(
             "{at}.observations_order: {CONFIRMED} must precede {ACCEPTED}"
         ));
     } else if let Some(confirmed) = first(CONFIRMED)
+        && acceptance_asserted
         && first(ACCEPTED).is_none_or(|accepted| accepted < confirmed)
     {
         wrong.push(format!(

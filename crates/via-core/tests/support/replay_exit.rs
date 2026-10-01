@@ -1,4 +1,5 @@
-//! The replay's own verdict on one launch, shared by the conformance
+//! The replay's own verdict on one launch ([`replay_exit`] for a run of
+//! the steps, [`probe_exit`] for a `--version` probe), shared by the conformance
 //! drivers (through `conformance_expect.rs`) and by `via-fake-agent`'s
 //! fidelity driver (`tests/fixtures.rs`), so all three judge a fake's end
 //! the same way.
@@ -44,5 +45,28 @@ pub(crate) fn replay_exit(fixture: &Value, code: Option<i32>, stderr: &str) -> R
             "the fake ended with {code} and stderr {stderr:?}; the fixture says {want} and {text:?}"
         )),
         Some(_) => Ok(()),
+    }
+}
+
+/// Checks that a `--version` probe launch of `fixture` (the file's fixture,
+/// or the lifetime the probe took) ended as the fake answers one, whatever
+/// the fixture's steps: its `version` line on `stdout`, exit 0 and no
+/// stderr.
+pub(crate) fn probe_exit(
+    fixture: &Value,
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    let version = fixture["version"]
+        .as_str()
+        .ok_or("the fixture has no version for a --version probe")?;
+    if code == Some(0) && stdout == format!("{version}\n") && stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the --version probe ended with {code:?}, stdout {stdout:?} and stderr {stderr:?}; \
+             the fixture says 0, {version:?} and none"
+        ))
     }
 }

@@ -16,11 +16,11 @@
 //! - `emit` writes one verbatim line;
 //! - `delay` sleeps;
 //! - `await_signal` waits for `SIGINT`, `SIGTERM` or `SIGUSR1` (a test
-//!   driver's gate, never a vendor signal). It appends `at <step>` to the
-//!   progress log when it starts waiting and `signalled <step>` once it has
-//!   consumed the signal, and completes just before that second line, so a
-//!   driver that waits for it orders everything it does next after the
-//!   step (see [`signals`]). A signal that arrived after the run deadline
+//!   driver's gate, never a vendor signal). It appends `at <step> launch
+//!   <n>` to the progress log when it starts waiting and `signalled <step>
+//!   launch <n>` once it has consumed the signal, and completes just before
+//!   that second line, so a driver that waits for it orders everything it
+//!   does next after the step (see [`signals`]). A signal that arrived after the run deadline
 //!   fails;
 //! - `await_eof` waits for stdin to end and completes at the EOF's arrival;
 //!   an input line instead fails, and so does an EOF that arrived before the
@@ -72,9 +72,14 @@
 //!
 //! Each start appends its pid as one line to `<dir>/<name>.launches`, so a
 //! test can count launches. The progress log `<dir>/<name>.progress` gets
-//! one line per `await_signal` event, each in a single append: `at <step>`
-//! and `signalled <step>`, with ` lifetime <n>` added in the lifetimes
-//! form below. A `<name>.replay.json` may instead be
+//! one line per `await_signal` event, each in a single append: `at <step>
+//! launch <n>` and `signalled <step> launch <n>`, where *n* is this start's
+//! launch ordinal (below), so a reader matches its own launch and never a
+//! marker an earlier launch of the same fixture left. The stdin reader
+//! appends `read <k> launch <n>` once it has stamped and published the
+//! *k*th input line, and `eof launch <n>` once it has stamped and published
+//! EOF, so a driver can know its input arrived before it lets the fake
+//! move on. A `<name>.replay.json` may instead be
 //! `{"source", "lifetimes": [fixture, …]}`: launch *n*, the *n*th line of
 //! the launch log (`--version` probes included), runs lifetime *n*, and a
 //! launch past the last lifetime fails. The ordinal is the line's position,
@@ -336,22 +341,23 @@ fn log_launch(path: &Path) -> Result<usize, String> {
     Ok(ordinal)
 }
 
-/// Where `await_signal` reports progress: the log and the suffix that
-/// names this launch's lifetime, if any.
-struct Progress<'a> {
-    path: &'a Path,
-    suffix: String,
+/// Where `await_signal` and the stdin reader report progress: the log and
+/// this start's launch ordinal.
+#[derive(Clone)]
+struct Progress {
+    path: PathBuf,
+    launch: usize,
 }
 
-impl Progress<'_> {
-    /// Appends `<event> <step><suffix>` as one line, in a single write.
-    fn log(&self, event: &str, step: usize) -> Result<(), String> {
-        let line = format!("{event} {step}{}\n", self.suffix);
+impl Progress {
+    /// Appends `<event> launch <n>` as one line, in a single write.
+    fn log(&self, event: &str) -> Result<(), String> {
+        let line = format!("{event} launch {}\n", self.launch);
         let fail = |error: io::Error| format!("cannot write the progress log: {error}");
         let mut file = File::options()
             .append(true)
             .create(true)
-            .open(self.path)
+            .open(&self.path)
             .map_err(fail)?;
         let written = file.write(line.as_bytes()).map_err(fail)?;
         if written == line.len() {
@@ -369,14 +375,10 @@ fn replay(
     step: &AtomicUsize,
     watchdog: &SyncSender<Arm>,
 ) -> Result<i32, String> {
-    let (fixture, lifetimes) = load(fixture, launch)?;
+    let fixture = load(fixture, launch)?;
     let progress = Progress {
-        path: progress,
-        suffix: if lifetimes {
-            format!(" lifetime {launch}")
-        } else {
-            String::new()
-        },
+        path: progress.to_owned(),
+        launch,
     };
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
@@ -417,7 +419,7 @@ fn replay(
     // Taken before the reader starts, so no input can arrive before it.
     let mut previous = Instant::now();
     let mut emitted = Emitted::new();
-    let mut input = Input::start(deadline)?;
+    let mut input = Input::start(deadline, progress.clone())?;
     for (index, current) in fixture.steps.into_iter().enumerate() {
         let number = index + 1;
         step.store(number, Ordering::SeqCst);
@@ -463,8 +465,8 @@ struct Lifetimes {
 }
 
 /// Loads the fixture that launch `launch` (1-based) runs: the file's only
-/// fixture, or its lifetime `launch`, and whether the file has lifetimes.
-fn load(path: &Path, launch: usize) -> Result<(Fixture, bool), String> {
+/// fixture, or its lifetime `launch`.
+fn load(path: &Path, launch: usize) -> Result<Fixture, String> {
     let file = File::open(path).map_err(|error| format!("cannot open fixture: {error}"))?;
     let mut bytes = Vec::new();
     file.take(MAX_FIXTURE + 1)
@@ -476,8 +478,7 @@ fn load(path: &Path, launch: usize) -> Result<(Fixture, bool), String> {
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|error| format!("invalid fixture: {error}"))?;
     let invalid = |error: serde_json::Error| format!("invalid fixture: {error}");
-    let lifetimes = value.get("lifetimes").is_some();
-    let fixture = if lifetimes {
+    let fixture = if value.get("lifetimes").is_some() {
         let Lifetimes { lifetimes, .. } = Lifetimes::deserialize(value).map_err(invalid)?;
         if lifetimes.len() > MAX_LIFETIMES {
             return Err(format!("fixture has more than {MAX_LIFETIMES} lifetimes"));
@@ -490,7 +491,7 @@ fn load(path: &Path, launch: usize) -> Result<(Fixture, bool), String> {
     } else {
         Fixture::deserialize(value).map_err(invalid)?
     };
-    check(fixture).map(|fixture| (fixture, lifetimes))
+    check(fixture)
 }
 
 /// Checks one fixture's bounds and step placement.
@@ -683,7 +684,7 @@ fn run_step(
     at: &Context<'_>,
     input: &mut Input,
     captures: &mut Captures,
-    (signals, progress): (&Signals, &Progress<'_>),
+    (signals, progress): (&Signals, &Progress),
 ) -> Result<Instant, String> {
     match step {
         Step::Expect {
@@ -737,10 +738,10 @@ fn run_step(
             Ok(Instant::now())
         }
         Step::AwaitSignal { signal } => {
-            progress.log("at", at.number)?;
+            progress.log(&format!("at {}", at.number))?;
             signals.take(signal)?;
             let completed = Instant::now();
-            progress.log("signalled", at.number)?;
+            progress.log(&format!("signalled {}", at.number))?;
             Ok(completed)
         }
         Step::AwaitEof {} => input.await_eof(at.previous, at.number),

@@ -6,6 +6,10 @@
 //! lost to a timeout. The gap between the kernel delivering the bytes and
 //! the reader taking the lock is inherent to any reader.
 //!
+//! After publishing a line or EOF the reader acknowledges it in the
+//! progress log (`read <k>` for the *k*th line, `eof`), so a driver can
+//! order its next action after the arrival.
+//!
 //! A line is on time if and only if its arrival is at or before its limit:
 //! `within_ms` after the previous step's completion, capped by the run
 //! deadline. An expect step completes at its line's arrival.
@@ -18,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::MAX_LINE;
+use super::{MAX_LINE, Progress};
 
 /// Most events queued; the reader waits for room before it reads more.
 const QUEUE: usize = 2;
@@ -100,12 +104,12 @@ fn limit(previous: Instant, within_ms: Option<u64>, deadline: Instant) -> (Insta
 
 impl Input {
     /// Starts the reader thread.
-    pub(super) fn start(deadline: Instant) -> Result<Self, String> {
+    pub(super) fn start(deadline: Instant, progress: Progress) -> Result<Self, String> {
         let shared = Arc::new(Shared::default());
         let reader = Arc::clone(&shared);
         // Detached on purpose: it may block reading stdin until the process exits.
         thread::Builder::new()
-            .spawn(move || read_stdin(&reader))
+            .spawn(move || read_stdin(&reader, &progress))
             .map_err(|error| format!("cannot start the stdin reader: {error}"))?;
         Ok(Self::new(shared, deadline))
     }
@@ -216,9 +220,12 @@ impl Input {
 }
 
 /// Reads stdin line by line until EOF or an error. It waits for room before
-/// each read, reads without the lock, then stamps and publishes under it.
-fn read_stdin(shared: &Shared) {
+/// each read, reads without the lock, then stamps and publishes under it,
+/// and acknowledges a line or EOF in the progress log. A failed
+/// acknowledgement is published as an input error.
+fn read_stdin(shared: &Shared, progress: &Progress) {
     let mut input = io::stdin().lock();
+    let mut lines = 0_usize;
     loop {
         let mut queue = shared.lock();
         while queue.len() >= QUEUE {
@@ -239,10 +246,27 @@ fn read_stdin(shared: &Shared) {
             }
             Ok(_) => Event::Error("stdin ended within a partial line".to_owned()),
         };
-        let last = !matches!(event, Event::Line(_));
+        let ack = match event {
+            Event::Line(_) => {
+                lines += 1;
+                Some(format!("read {lines}"))
+            }
+            Event::Eof => Some("eof".to_owned()),
+            Event::Error(_) => None,
+        };
         shared.lock().push_back((Instant::now(), event));
         shared.changed.notify_all();
-        if last {
+        let Some(ack) = ack else {
+            return;
+        };
+        if let Err(error) = progress.log(&ack) {
+            shared
+                .lock()
+                .push_back((Instant::now(), Event::Error(error)));
+            shared.changed.notify_all();
+            return;
+        }
+        if ack == "eof" {
             return;
         }
     }

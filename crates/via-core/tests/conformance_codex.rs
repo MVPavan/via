@@ -124,7 +124,7 @@ type Defect = (&'static str, &'static str, fn(&mut Value));
 fn conformance_codex_validate_refuses_each_defect() {
     let base = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
     conformance_expect::validate(&base).unwrap();
-    let defects: [Defect; 92] = [
+    let defects: [Defect; 96] = [
         (
             "accepted turn counts turn.accepted twice",
             "an accepted turn states",
@@ -649,6 +649,35 @@ fn conformance_codex_validate_refuses_each_defect() {
             e["turns"][0]["expect"]["stop_facts"] =
                 json!({"acknowledged": true, "forced": "no", "shared": false});
         }),
+        // Review r3 #2 and #5: a usage sample is a C2 `UsageSample`, and
+        // token provenance is never `estimated`.
+        ("usage sample key a number", ".progress.usage.key:", |e| {
+            e["turns"][0]["expect"]["observations_include"] =
+                json!([{"kind": "progress", "usage": {"key": 123}}]);
+        }),
+        (
+            "usage sample member unknown",
+            ".progress.usage: unknown field invented_counter",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] =
+                    json!([{"kind": "progress", "usage": {"key": 123, "invented_counter": 456}}]);
+            },
+        ),
+        (
+            "usage sample counter a string",
+            ".progress.usage.output:",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] =
+                    json!([{"kind": "progress", "usage": {"key": null, "output": "5"}}]);
+            },
+        ),
+        (
+            "usage provenance estimated",
+            "expect.usage.provenance:",
+            |e| {
+                e["turns"][0]["expect"]["usage"]["provenance"] = json!("estimated");
+            },
+        ),
         // Review r2 #6: gates share the final expectations' enum rules.
         ("gate error unknown", "gates[0].expect.error:", |e| {
             e["turns"][0]["gates"] = json!([{"step": 1, "expect": {"error": "nonsense"}}]);
@@ -695,6 +724,41 @@ fn conformance_codex_pending_cleanup_only_in_gates() {
         refused
             .as_ref()
             .is_err_and(|error| error.contains("turns[0].expect.cleanup:")),
+        "{refused:?}"
+    );
+}
+
+/// Green: a keyed C2 `UsageSample` validates (review r3 #2).
+#[test]
+fn conformance_codex_keyed_usage_samples_validate() {
+    let mut expect = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
+    expect["turns"][0]["expect"]["observations_include"] = json!([{
+        "kind": "progress",
+        "usage": {"key": "call-1", "input": 10, "cached_input": null, "output": 2,
+                  "reasoning_output": 0, "total": 12}
+    }]);
+    conformance_expect::validate(&expect).unwrap();
+}
+
+/// Green: a gate whose snapshot holds identity before any acceptance
+/// validates; one that states acceptance still needs the order (review r3
+/// #3).
+#[test]
+fn conformance_codex_identity_only_gate_prefix_validates() {
+    let mut expect = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
+    expect["turns"][0]["gates"] = json!([{"step": 1, "expect": {
+        "accepted": false,
+        "observations_order": ["session.vendor_identity_confirmed"]
+    }}]);
+    conformance_expect::validate(&expect).unwrap();
+    // Acceptance stated in the same snapshot still needs the order.
+    expect["turns"][0]["gates"][0]["expect"]["observations_order"] =
+        json!(["turn.accepted", "session.vendor_identity_confirmed"]);
+    let refused = conformance_expect::validate(&expect);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.contains("must precede")),
         "{refused:?}"
     );
 }

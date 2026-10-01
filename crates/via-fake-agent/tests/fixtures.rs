@@ -6,9 +6,11 @@
 //! - A generic driver that answers each expect step with that step's own
 //!   line (a subset matches itself), reads back each emitted line, delivers
 //!   each `await_signal` between the fake's `at` and `signalled` progress
-//!   lines and closes stdin at each `await_eof`, completes the fixture with
-//!   the end the shared `replay_exit` check expects (its `exit` step's code
-//!   and stderr, or 0 and none), with one launch logged per start. A line
+//!   lines for its own launch (once the fake has acknowledged every line
+//!   written so far) and closes stdin at each `await_eof`, completes the
+//!   fixture with the end the shared `replay_exit` check expects (its `exit`
+//!   step's code and stderr, or 0 and none), with one launch logged per
+//!   start; a `--version` probe is judged by the shared `probe_exit`. A line
 //!   written ahead of its `after_emit` predecessor fails. Ordered EOF and
 //!   strict trailing input hold: a line resent before an `await_eof`, or an
 //!   EOF right after the first line, fails replay.
@@ -77,6 +79,28 @@ const CREDENTIAL_SUFFIXES: [&str; 10] = [
 /// Identity-bearing fields, normalized: a string value is a placeholder.
 const IDENTITY_FIELDS: [&str; 5] = ["user", "username", "login", "email", "account"];
 /// The only values a credential or identity field may hold.
+/// The options of the recorded vendor argv recipes. A credential option
+/// followed by one of these was given no value; any other following word,
+/// hyphenated or quoted, is its value.
+const KNOWN_OPTIONS: [&str; 17] = [
+    "-p",
+    "--allowedTools",
+    "--append-system-prompt",
+    "--disable",
+    "--effort",
+    "--input-format",
+    "--json-schema",
+    "--model",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompts",
+    "--restricted",
+    "--resume",
+    "--session-id",
+    "--strict-mcp-config",
+    "--tools",
+    "--verbose",
+];
 const PLACEHOLDERS: [&str; 4] = ["", "<redacted>", "REDACTED", "PLACEHOLDER"];
 /// Fixtures whose input is not sealed by a final `await_eof` (alone, or
 /// right before the closing `exit`), each with its reason.
@@ -258,6 +282,11 @@ impl Supervisor {
         }
     }
 
+    /// Whether the child has exited (its status is kept for [`Self::wait`]).
+    fn ended(&self) -> bool {
+        matches!(lock(&self.child).try_wait(), Ok(Some(_)) | Err(_))
+    }
+
     /// Waits for the child's exit, polling until the supervisor kills it.
     fn wait(&self) -> TestResult<ExitStatus> {
         loop {
@@ -346,8 +375,9 @@ enum Deviation {
     EarlyEof,
     /// Writes each `after_emit` step's line together with the last answer
     /// before its predecessor emit, as an adapter that did not wait for that
-    /// reply would. The fixture gets a delay before each such emit (see
-    /// [`slowed`]), so the early line surely arrives before the emit.
+    /// reply would. The fixture gets a gate before each such emit (see
+    /// [`gated`]), released only once the fake acknowledged the early line,
+    /// so it provably arrives before the emit.
     Hoisted,
 }
 
@@ -385,9 +415,11 @@ fn after_emit_have_reasons(fixture: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// `fixture` with a 200 ms delay before each emit that an `after_emit`
-/// names, every `after_emit` renumbered to match.
-fn slowed(fixture: &Value) -> Value {
+/// `fixture` with a `SIGUSR1` gate before each emit that an `after_emit`
+/// names, every `after_emit` renumbered to match. The driver releases a
+/// gate only once the fake has acknowledged every line written so far, so
+/// a hoisted line has provably arrived before its predecessor's emit.
+fn gated(fixture: &Value) -> Value {
     let steps = fixture["steps"].as_array().cloned().unwrap_or_default();
     let named: Vec<u64> = steps
         .iter()
@@ -399,7 +431,7 @@ fn slowed(fixture: &Value) -> Value {
     for (index, step) in steps.into_iter().enumerate() {
         let number = index as u64 + 1;
         if named.contains(&number) {
-            out.push(serde_json::json!({"delay": {"ms": 200}}));
+            out.push(serde_json::json!({"await_signal": {"signal": "SIGUSR1"}}));
         }
         moved.insert(number, out.len() as u64 + 1);
         out.push(step);
@@ -429,14 +461,7 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
         after_emit_have_reasons(fixture)?;
     }
     if deviation == Deviation::Hoisted {
-        file = match file.get("lifetimes").and_then(Value::as_array) {
-            Some(lifetimes) => {
-                let mut slow = file.clone();
-                slow["lifetimes"] = lifetimes.iter().map(slowed).collect();
-                slow
-            }
-            None => slowed(&file),
-        };
+        file = gated_file(&file);
         fs::write(
             root.path().join("vendor.replay.json"),
             serde_json::to_vec(&file)?,
@@ -445,17 +470,13 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     let lifetimes = lifetimes_of(&file);
     let single = file.get("lifetimes").is_none();
     let mut starts = 0;
-    if single && let Some(version) = file.get("version").and_then(Value::as_str) {
-        probe_version(&binary, version)?;
+    if single && file.get("version").is_some() {
+        probe_version(&binary, &file)?;
         starts += 1;
     }
     for (index, fixture) in lifetimes.into_iter().enumerate() {
-        let suffix = if single {
-            String::new()
-        } else {
-            format!(" lifetime {}", index + 1)
-        };
-        run_lifetime(&binary, fixture, (deviation, &suffix))
+        // This start's launch ordinal: the probe, if any, was the first.
+        run_lifetime(&binary, fixture, (deviation, starts + 1))
             .map_err(|error| format!("lifetime {}: {error}", index + 1))?;
         starts += 1;
     }
@@ -466,23 +487,42 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     Ok(())
 }
 
-/// Runs `--version` under the outer bound and checks its line.
-fn probe_version(binary: &Path, version: &str) -> TestResult {
+/// [`gated`] applied to the file's fixture or to each of its lifetimes.
+fn gated_file(file: &Value) -> Value {
+    match file.get("lifetimes").and_then(Value::as_array) {
+        Some(lifetimes) => {
+            let mut gated_file = file.clone();
+            gated_file["lifetimes"] = lifetimes.iter().map(gated).collect();
+            gated_file
+        }
+        None => gated(file),
+    }
+}
+
+/// Runs `--version` under the outer bound and judges it with the shared
+/// probe verdict.
+fn probe_version(binary: &Path, fixture: &Value) -> TestResult {
     let mut child = Command::new(binary)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+    let stderr = thread::spawn(move || {
+        let mut text = String::new();
+        // A read error leaves it short, which the verdict reports.
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
     let supervisor = Supervisor::start(child, Instant::now() + OUTER);
-    let mut out = Vec::new();
+    let mut out = String::new();
     // Ends at the fake's exit, or when the supervisor kills it.
-    stdout.read_to_end(&mut out)?;
+    stdout.read_to_string(&mut out)?;
     let status = supervisor.wait()?;
-    if status.code() != Some(0) || out != format!("{version}\n").as_bytes() {
-        return Err(format!("--version gave {status} with {out:?}").into());
-    }
+    let stderr = stderr.join().map_err(|_| "stderr reader panicked")?;
+    replay_exit::probe_exit(fixture, status.code(), &out, &stderr)?;
     Ok(())
 }
 
@@ -490,7 +530,7 @@ fn probe_version(binary: &Path, version: &str) -> TestResult {
 fn run_lifetime(
     binary: &Path,
     fixture: &Value,
-    (deviation, suffix): (Deviation, &str),
+    (deviation, launch): (Deviation, usize),
 ) -> TestResult {
     let mut captures = BTreeMap::new();
     let args = args_of(fixture, &mut captures)?;
@@ -523,7 +563,9 @@ fn run_lifetime(
             stdin: &mut stdin,
             stdout: &stdout,
             pid,
-            progress: (Path::new(&progress), suffix),
+            progress: (Path::new(&progress), launch),
+            written: 0,
+            supervisor: &supervisor,
             deadline,
             captures,
             deviation,
@@ -548,8 +590,12 @@ struct Run<'a> {
     stdin: &'a mut Option<ChildStdin>,
     stdout: &'a Receiver<Result<String, String>>,
     pid: u32,
-    /// The fake's progress log and this launch's line suffix.
-    progress: (&'a Path, &'a str),
+    /// The fake's progress log and this start's launch ordinal.
+    progress: (&'a Path, usize),
+    /// Lines written to the fake's stdin so far.
+    written: usize,
+    /// Whether the fake has ended, so a wait for progress stops early.
+    supervisor: &'a Supervisor,
     deadline: Instant,
     captures: BTreeMap<String, String>,
     deviation: Deviation,
@@ -625,35 +671,20 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult {
             }
             input.write_all(text.as_bytes())?;
             input.flush()?;
+            run.written += text.lines().count();
             last_answer = Some(line);
             if run.deviation == Deviation::EarlyEof {
                 drop(run.stdin.take());
             }
         } else if let Some(wait) = step.get("await_signal") {
-            let signal = match wait["signal"].as_str() {
-                Some("SIGINT") => "-INT",
-                Some("SIGTERM") => "-TERM",
-                Some("SIGUSR1") => "-USR1",
-                other => return Err(fail(format!("unknown signal {other:?}")).into()),
-            };
-            // The gate obligations: signal only once the fake reports it is
-            // at the step, and go on only once it reports the signal taken.
-            let (log, suffix) = run.progress;
-            wait_for_progress(log, &format!("at {number}{suffix}"), run.deadline).map_err(fail)?;
-            let status = Command::new("kill")
-                .args([signal, &run.pid.to_string()])
-                .status()?;
-            if !status.success() {
-                return Err(fail("kill failed".to_owned()).into());
-            }
-            wait_for_progress(log, &format!("signalled {number}{suffix}"), run.deadline)
-                .map_err(fail)?;
+            release_gate(wait, number, run).map_err(fail)?;
         } else if step.get("await_eof").is_some() {
             if run.deviation == Deviation::ExtraInput
                 && let (Some(input), Some(line)) = (run.stdin.as_mut(), &last_answer)
             {
                 writeln!(input, "{line}")?;
                 input.flush()?;
+                run.written += 1;
             }
             drop(run.stdin.take());
         } else if step.get("exit").is_some() {
@@ -665,14 +696,45 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult {
     Ok(())
 }
 
-/// Waits until the progress log holds `line`, polling until `deadline`.
-fn wait_for_progress(log: &Path, line: &str, deadline: Instant) -> Result<(), String> {
+/// Releases the `await_signal` step `number` as the gate obligations say:
+/// signal only once the fake reports it is at the step and has published
+/// every line written so far, and go on only once it reports the signal
+/// taken.
+fn release_gate(wait: &Value, number: usize, run: &Run<'_>) -> Result<(), String> {
+    let signal = match wait["signal"].as_str() {
+        Some("SIGINT") => "-INT",
+        Some("SIGTERM") => "-TERM",
+        Some("SIGUSR1") => "-USR1",
+        other => return Err(format!("unknown signal {other:?}")),
+    };
+    let (log, launch) = run.progress;
+    let wait = |line: String| wait_for_progress(log, &line, run);
+    wait(format!("at {number} launch {launch}"))?;
+    if run.written > 0 {
+        wait(format!("read {} launch {launch}", run.written))?;
+    }
+    let status = Command::new("kill")
+        .args([signal, &run.pid.to_string()])
+        .status()
+        .map_err(|error| format!("kill: {error}"))?;
+    if !status.success() {
+        return Err("kill failed".to_owned());
+    }
+    wait(format!("signalled {number} launch {launch}"))
+}
+
+/// Waits until the progress log holds `line`, polling until the run's
+/// deadline or the fake's end.
+fn wait_for_progress(log: &Path, line: &str, run: &Run<'_>) -> Result<(), String> {
     loop {
+        // Checked before the read, so a line written just before the end
+        // is still seen.
+        let over = Instant::now() >= run.deadline || run.supervisor.ended();
         let text = fs::read_to_string(log).unwrap_or_default();
         if text.lines().any(|seen| seen == line) {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if over {
             return Err(format!("the progress log never showed {line:?}: {text:?}"));
         }
         thread::sleep(Duration::from_millis(2));
@@ -985,7 +1047,8 @@ fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// stderr or prefixed JSON: the name (normalized), an optional quote, `=`
 /// or `:`, then a value that is not exactly a placeholder (or a bare
 /// `null`). A credential option (`--password VALUE`, `--token VALUE`) takes
-/// the next word as its value. A quoted value is taken whole, through its
+/// the next word as its value unless that word is one of [`KNOWN_OPTIONS`]
+/// (no value), whatever its leading hyphens. A quoted value is taken whole, through its
 /// closing quote, so whitespace inside it hides nothing. An identity value
 /// that is a number, boolean, object or array is not an identity string.
 /// `\u` escapes are decoded first.
@@ -1023,8 +1086,8 @@ fn secret_assignment(text: &str) -> Option<String> {
                 (&rest[..end], false)
             }
         };
-        // An option followed by another option, or `-` for stdin, has no value.
-        if option && value.starts_with('-') {
+        // An option followed by a known option of the recipes has no value.
+        if option && !quoted && KNOWN_OPTIONS.contains(&value) {
             continue;
         }
         if !secret
@@ -1047,7 +1110,7 @@ fn secret_assignment(text: &str) -> Option<String> {
 }
 
 /// A credential option in an argument list (`["--token", "abc"]`) whose
-/// next element is not a placeholder.
+/// next element is not a placeholder or a known option of the recipes.
 fn credential_argument(items: &[Value]) -> Option<String> {
     items.windows(2).find_map(|pair| {
         let flag = pair[0].as_str()?;
@@ -1055,7 +1118,9 @@ fn credential_argument(items: &[Value]) -> Option<String> {
         (flag.starts_with("--")
             && credential(flag).is_some()
             && !placeholder(value)
-            && !value.as_str().is_some_and(|next| next.starts_with('-')))
+            && !value
+                .as_str()
+                .is_some_and(|next| KNOWN_OPTIONS.contains(&next)))
         .then(|| format!("{flag} is passed a non-placeholder value"))
     })
 }
@@ -1220,6 +1285,10 @@ fn fixtures_hygiene_scan_detects_the_r2_probes() {
         r#"{"t":"vendor --api-key abc --verbose"}"#,
         r#"{"argv":["--token","abc"]}"#,
         r#"{"argv":["-p","--client-secret","abc"]}"#,
+        // Review r3 #4: a hyphen-prefixed value, quoted or not, is a value.
+        r#"{"stderr":"--password \"-hunter2\""}"#,
+        r#"{"argv":["--password","-hunter2"]}"#,
+        r#"{"t":"pass --password - to read it from stdin"}"#,
     ];
     let missed: Vec<&str> = bad
         .into_iter()
@@ -1231,7 +1300,8 @@ fn fixtures_hygiene_scan_detects_the_r2_probes() {
         r#"{"t":"The user doesn't want to proceed; account/updated arrived."}"#,
         r#"{"t":"username=REDACTED login: PLACEHOLDER"}"#,
         r#"{"argv":["--max-tokens","5","--token","<redacted>","--token-file","-"]}"#,
-        r#"{"t":"pass --password - to read it from stdin"}"#,
+        r#"{"argv":["--token","--verbose"]}"#,
+        r#"{"t":"run --password --model m"}"#,
     ];
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
@@ -1324,14 +1394,19 @@ fn fixtures_fail_replay_on_a_line_before_its_after_emit() -> TestResult {
     let mut misses = Vec::new();
     let mut exercised = Vec::new();
     for (path, result) in drive_all(Deviation::Hoisted)? {
-        let fixture: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        let steps = slowed(&fixture)["steps"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let Some(first) = steps
-            .iter()
-            .position(|step| step["expect"].get("after_emit").is_some())
+        let file = gated_file(&serde_json::from_slice(&fs::read(&path)?)?);
+        // The first lifetime with an `after_emit` is the one that fails.
+        let Some((lifetime, steps, first)) =
+            lifetimes_of(&file)
+                .into_iter()
+                .enumerate()
+                .find_map(|(index, fixture)| {
+                    let steps = fixture["steps"].as_array()?;
+                    let first = steps
+                        .iter()
+                        .position(|step| step["expect"].get("after_emit").is_some())?;
+                    Some((index + 1, steps.clone(), first))
+                })
         else {
             continue;
         };
@@ -1341,8 +1416,9 @@ fn fixtures_fail_replay_on_a_line_before_its_after_emit() -> TestResult {
             "step {}: the line arrived before step {emit}'s emit",
             first + 1
         );
+        let at = format!("lifetime {lifetime}: ");
         match result {
-            Err(error) if error.contains(&wanted) => {}
+            Err(error) if error.starts_with(&at) && error.contains(&wanted) => {}
             other => misses.push(format!("{}: gave {other:?}", path.display())),
         }
     }

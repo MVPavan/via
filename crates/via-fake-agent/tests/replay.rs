@@ -1190,18 +1190,18 @@ fn replay_await_signal_orders_input_through_the_progress_log() -> TestResult {
         let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
         let mut run = spawn::<&str>(&binary, &[])?;
         assert_eq!(run.next_line()?, line("ready"));
-        wait_for_progress(root.path(), "at 3")?;
+        wait_for_progress(root.path(), "at 3 launch 1")?;
         let kill = Command::new("kill")
             .args(["-INT", &run.child.id().to_string()])
             .status()?;
         assert!(kill.success());
-        wait_for_progress(root.path(), "signalled 3")?;
+        wait_for_progress(root.path(), "signalled 3 launch 1")?;
         let end = run.finish(true)?;
         assert_eq!(end.code, Some(0), "{}", end.stderr);
         assert_eq!(end.stdout, vec![line("ready"), line("done")]);
         assert_eq!(
             fs::read_to_string(root.path().join("vendor.progress"))?,
-            "at 3\nsignalled 3\n"
+            "at 3 launch 1\nsignalled 3 launch 1\neof launch 1\n"
         );
     }
 
@@ -1210,8 +1210,10 @@ fn replay_await_signal_orders_input_through_the_progress_log() -> TestResult {
 
 #[test]
 fn replay_eof_before_the_signal_fails() -> TestResult {
-    // Review r2 #3: stdin closed 20 ms before the signal precedes the
-    // `await_signal` step, however close the two were.
+    // Review r2 #3: stdin closed before the signal precedes the
+    // `await_signal` step, however close the two were. Review r3 #8: the
+    // fake acknowledges reaching the step and publishing the EOF, so the
+    // order is established, not slept for.
     let steps = json!([
         {"emit": {"line": "ready"}},
         {"await_signal": {"signal": "SIGINT"}},
@@ -1222,9 +1224,9 @@ fn replay_eof_before_the_signal_fails() -> TestResult {
     let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
     let mut run = spawn::<&str>(&binary, &[])?;
     assert_eq!(run.next_line()?, line("ready"));
-    thread::sleep(Duration::from_millis(100));
+    wait_for_progress(root.path(), "at 2 launch 1")?;
     drop(run.stdin.take());
-    thread::sleep(Duration::from_millis(20));
+    wait_for_progress(root.path(), "eof launch 1")?;
     let kill = Command::new("kill")
         .args(["-INT", &run.child.id().to_string()])
         .status()?;
@@ -1236,6 +1238,43 @@ fn replay_eof_before_the_signal_fails() -> TestResult {
             .contains("step 3: stdin closed before step 2 completed"),
         "{}",
         end.stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_progress_markers_name_their_launch() -> TestResult {
+    // Review r3 #1: two launches of one fixture each wait for their own
+    // markers, so the second never acts on the first's stale readiness.
+    let steps = json!([
+        {"emit": {"line": "ready"}},
+        {"await_signal": {"signal": "SIGUSR1"}},
+        {"expect": {"line": {"n": 1}}},
+        {"await_eof": {}},
+        {"emit": {"line": "done"}}
+    ]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    for launch in 1..=2 {
+        let mut run = spawn::<&str>(&binary, &[])?;
+        assert_eq!(run.next_line()?, line("ready"));
+        wait_for_progress(root.path(), &format!("at 2 launch {launch}"))?;
+        let kill = Command::new("kill")
+            .args(["-USR1", &run.child.id().to_string()])
+            .status()?;
+        assert!(kill.success());
+        wait_for_progress(root.path(), &format!("signalled 2 launch {launch}"))?;
+        let input = run.stdin.as_mut().ok_or("no stdin")?;
+        input.write_all(b"{\"n\":1}\n")?;
+        input.flush()?;
+        wait_for_progress(root.path(), &format!("read 1 launch {launch}"))?;
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(0), "launch {launch}: {}", end.stderr);
+    }
+    assert_eq!(
+        fs::read_to_string(root.path().join("vendor.progress"))?,
+        "at 2 launch 1\nsignalled 2 launch 1\nread 1 launch 1\neof launch 1\n\
+         at 2 launch 2\nsignalled 2 launch 2\nread 1 launch 2\neof launch 2\n"
     );
     Ok(())
 }
