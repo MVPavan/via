@@ -172,9 +172,9 @@ the set.
   positive absence on each platform before claiming it.
 - **Environment.** Build each vendor's environment from an explicit,
   reviewed per-adapter allow-list plus the VIA marker; never pass the
-  caller's full environment. The marker is launch data only and is never
-  recovered by reading vendor environments for identity, recovery or
-  signalling. The anchor's private marker and control token are never
+  caller's full environment. The marker is launch data, matched otherwise only by
+  the report-only leftover scan, and is never recovered by reading vendor
+  environments for identity, recovery or signalling. The anchor's private marker and control token are never
   inherited by the vendor. Invariant 1: never read, copy or log vendor
   credentials. The single exception is the report-only leftover scan
   (C2 §4.2, runtime §5): it may transiently read the environment of a

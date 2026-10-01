@@ -271,14 +271,16 @@ B7/VIA qualification; the probe did not prove complete config isolation:
 | `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` | VIA-generated private config/file paths; fixed digest in key |
 | `OPENCODE_DISABLE_PROJECT_CONFIG`, `OPENCODE_DISABLE_AUTOUPDATE`, `OPENCODE_DISABLE_PRUNE` | `1`; source-supported policy switches, to be exercised in isolation tests |
 | `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` | Fixed username and generated instance secret as above |
-| VIA vendor marker | Launch-only marker; distinct from Host anchor's private marker |
+| VIA vendor marker | Launch data, also matched solely by the report-only leftover scan (C2 §4.2, runtime §5); distinct from Host anchor's private marker |
 
 Do not forward provider API-key variables, `OPENCODE_AUTH_CONTENT`, console
 tokens, arbitrary `OPENCODE_*`, proxy credentials, telemetry headers or
 caller config-content strings. If a deployment needs extra nonsecret TLS or
 proxy settings, review a new explicit profile/allowlist; never inherit broadly
 to repair an auth failure. VIA never reads, copies, hashes or extracts any
-user/provider credential or vendor auth file. Do not discover, mount, symlink
+user/provider credential or vendor auth file; the one exception is the
+transient read of the report-only leftover scan (C2 §4.2, runtime §5), which
+matches only the marker and keeps nothing, and never touches auth files. Do not discover, mount, symlink
 or forward saved-auth locations from the caller's HOME/XDG directories. A
 missing/unavailable free route is an explicit vendor/infrastructure outcome,
 not permission to use a saved login or paid model.
@@ -688,8 +690,8 @@ lifecycle: cancel active work under the rule above; then
 has not exited, S1's hard stop within the close bound (the server has no
 SIGTERM handler); preserve the private DB and vendor history
 (`DELETE /session/{id}` is not a close implementation); commit the close
-result and `session.closed`, which carry `leftovers` (C2 §4.2; `null` while
-detection is pending). Idle retirement stops the server the same way but
+result and `session.closed`, which carry `leftovers` (the best-effort report of
+C2 §4.2 and runtime §5). Idle retirement stops the server the same way but
 has no close result and reports nothing. Cancel of an undispatched
 queued turn is Core-local and sends no abort for the currently running turn.
 
