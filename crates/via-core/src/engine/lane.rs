@@ -143,6 +143,8 @@ pub(super) struct VendorRecord {
 /// The retained vendor terminal's envelope facts.
 #[derive(Clone, Default)]
 pub(super) struct Retained {
+    /// The vendor's own stop reason, kept on every outcome (AD4, #36).
+    pub(super) vendor_stop_reason: String,
     pub(super) structured_output: Option<Value>,
     pub(super) steps: Option<u64>,
     pub(super) usage: Option<UsageSample>,
@@ -160,6 +162,7 @@ impl Retained {
             _ => Map::new(),
         };
         Self {
+            vendor_stop_reason: terminal.vendor_stop_reason.clone(),
             structured_output: terminal.structured_output.as_deref().and_then(parse),
             steps: terminal.steps,
             usage: terminal.usage.clone(),

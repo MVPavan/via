@@ -107,6 +107,7 @@ fn run<F: Future<Output = ()>>(body: F) {
 struct Daemon {
     engine: Arc<Engine>,
     starter: tokio::task::JoinHandle<()>,
+    dispatchers: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     root: PathBuf,
 }
 
@@ -123,16 +124,20 @@ impl Daemon {
         );
         let mut starts = engine.take_starts().unwrap();
         let starting = Arc::clone(&engine);
+        let dispatchers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joins = Arc::clone(&dispatchers);
         let starter = tokio::spawn(async move {
             while let Some(session) = starts.recv().await {
                 let engine = Arc::clone(&starting);
-                tokio::spawn(async move {
+                let join = tokio::spawn(async move {
                     let _ = engine.dispatcher(session).await;
                 });
+                joins.lock().unwrap().push(join);
             }
         });
         Self {
             engine,
+            dispatchers,
             starter,
             root: root.to_path_buf(),
         }
@@ -190,6 +195,29 @@ impl Daemon {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// A forced `daemon/stop`, as daemon main runs it: the force, then
+    /// every dispatcher joined, then final shutdown (design §6.8). Returns
+    /// the shutdown report.
+    async fn force_stop(self) -> via_core::EngineShutdown {
+        let force = serde_json::from_value(json!({"force":true})).unwrap();
+        self.engine.request_stop(&force).await.unwrap();
+        let joins = std::mem::take(&mut *self.dispatchers.lock().unwrap());
+        for join in joins {
+            tokio::time::timeout(Duration::from_secs(20), join)
+                .await
+                .expect("a dispatcher joins after the force")
+                .unwrap();
+        }
+        let report = self
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        self.starter.abort();
+        report
     }
 
     /// Final shutdown: every anchor is reconciled before the root goes.
@@ -997,5 +1025,37 @@ fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
         daemon.shutdown().await;
+    });
+}
+
+/// Sol r1 F7: a daemon force that arrives after the vendor terminal was
+/// decoded, while the per-turn process still runs, keeps that terminal's
+/// vendor stop reason in the forced envelope (AD4).
+#[test]
+fn core_terminal_then_daemon_force_keeps_the_vendor_stop_reason() {
+    let steps = [
+        accepted(1),
+        terminal(1, "completed", "end_turn"),
+        gate("after_terminal"),
+    ];
+    let Some(root) = child(
+        "core_terminal_then_daemon_force_keeps_the_vendor_stop_reason",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        daemon.entered("after_terminal").await;
+        // Route has decoded the terminal and waits for the process's exit.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let engine = Arc::clone(&daemon.engine);
+        let report = daemon.force_stop().await;
+        assert_eq!(report.unresolved_turns, 0, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["vendor_stop_reason"], "end_turn", "{envelope}");
     });
 }

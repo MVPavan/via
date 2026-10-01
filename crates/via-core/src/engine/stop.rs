@@ -386,7 +386,13 @@ impl Engine {
             } else {
                 "error"
             },
-            vendor_stop_reason: None,
+            // AD4: a terminal decoded before the force keeps its vendor
+            // stop reason.
+            vendor_stop_reason: record
+                .vendor
+                .retained
+                .as_ref()
+                .map(|retained| retained.vendor_stop_reason.clone()),
             final_text: Some(String::new()),
             final_text_file: None,
             exit: None,
