@@ -209,6 +209,16 @@ struct Faults {
     /// Recover): the session, how many Host facts it was given, and its
     /// answer (`resumed`, `unknown` or `dead`).
     recoveries: std::sync::Mutex<Vec<(SessionId, usize, &'static str)>>,
+    /// The next restart recovery of a session answers `Resumed` with this
+    /// driver and session channel: the fake never resumes.
+    resume: std::sync::Mutex<
+        Option<(
+            via_adapters::SessionDriver,
+            tokio::sync::mpsc::Receiver<via_adapters::Admitted>,
+        )>,
+    >,
+    /// The next recovered turn waits for `release` after its history read.
+    hold_after_history: AtomicBool,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.

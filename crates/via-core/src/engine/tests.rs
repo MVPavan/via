@@ -3264,9 +3264,29 @@ async fn adopt_test_lane(
     std::sync::Arc<super::lane::Lane>,
     tokio::sync::mpsc::Sender<via_adapters::Admitted>,
 ) {
-    use via_adapters::{
-        Inherit, ObservationBudget, SessionCx, SessionSpec, VendorOptions, observation_channel,
-    };
+    let (driver, reference, route) = open_test_driver(engine, root, session).await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    engine.adopt_lane(
+        session,
+        (driver, receiver, via_adapters::ObservationBudget::new()),
+        (reference, &route),
+    );
+    let lane = super::lock(&engine.lanes).get(session).cloned().unwrap();
+    (lane, sender)
+}
+
+/// A fake driver opened for `session` from its stored route, with that
+/// route and its reference.
+async fn open_test_driver(
+    engine: &Engine,
+    root: &Path,
+    session: &SessionId,
+) -> (
+    via_adapters::SessionDriver,
+    via_adapters::SessionRef,
+    via_store::SessionRoute,
+) {
+    use via_adapters::{Inherit, SessionCx, SessionSpec, VendorOptions, observation_channel};
     let route = engine
         .store
         .session_snapshot(session)
@@ -3295,14 +3315,7 @@ async fn adopt_test_lane(
             cancel: engine.cancel.child_token(),
         },
     );
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    engine.adopt_lane(
-        session,
-        (driver, receiver, ObservationBudget::new()),
-        (reference, &route),
-    );
-    let lane = super::lock(&engine.lanes).get(session).cloned().unwrap();
-    (lane, sender)
+    (driver, reference, route)
 }
 
 /// Sends `observation`, naming `vendor_turn`, into a test lane's channel
@@ -5093,5 +5106,67 @@ fn a_recovered_envelope_keeps_the_stored_identity() {
         );
         assert!(envelope["usage"]["total_tokens"].is_null(), "{envelope}");
         assert!(envelope["duration_ms"].is_null(), "{envelope}");
+    });
+}
+
+/// Critical r1 #2 (runtime §8: one owner of a session's sequence): a
+/// session whose recovery resumes its driver gets its lane only after
+/// recovery committed that session's writes. A durable observation the
+/// resumed driver delivers while recovery holds its history read is not
+/// committed under recovery's sequence: recovery succeeds, and the
+/// observation commits afterwards.
+#[test]
+fn a_resumed_session_has_one_sequence_owner_during_recovery() {
+    let Some(root) = child("a_resumed_session_has_one_sequence_owner_during_recovery") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &rfc3339(std::time::SystemTime::now()),
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        let (driver, _, _) = open_test_driver(&engine, &root, &session).await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        *super::lock(&engine.faults.resume) = Some((driver, receiver));
+        engine
+            .faults
+            .hold_after_history
+            .store(true, Ordering::Release);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let between = [(json!("between"), Value::Null, json!(false))];
+        let (recovered, ()) = tokio::join!(engine.recover(), async {
+            engine.faults.granted.notified().await;
+            send_held(&sender, &budget, None, denied("between")).await;
+            if super::lock(&engine.lanes).contains_key(&session) {
+                // A lane serving during recovery commits it at once.
+                until_denials(&engine, &session, &between).await;
+            }
+            engine.faults.release.notify_one();
+        });
+        assert_eq!(recovered, Ok(1), "recovery owns the session's sequence");
+        // Committed once the lane is the session's.
+        until_denials(&engine, &session, &between).await;
+        until(|| budget.available_permits() == 1_000).await;
     });
 }

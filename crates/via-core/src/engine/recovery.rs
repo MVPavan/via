@@ -9,10 +9,12 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use via_adapters::{
-    AnchorRecovery, ObservationBudget, Recovery, SessionCx, observation_channel_in,
+    Admitted, AnchorRecovery, ObservationBudget, Recovery, SessionCx, SessionDriver, SessionRef,
+    observation_channel_in,
 };
 use via_store::{
-    ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, StoreError, TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, SessionRoute, StoreError, TerminalRecord,
+    UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
@@ -76,6 +78,11 @@ impl Engine {
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
         let mut asked = HashSet::new();
+        // Critical r1 #2: a resumed driver's lane becomes the session's
+        // only once recovery committed every write of its own, so one owner
+        // writes the session's sequence at a time; until then the driver's
+        // channel holds what it delivers.
+        let mut resumed = Vec::new();
         loop {
             let turns = self
                 .store
@@ -83,15 +90,21 @@ impl Engine {
                 .await
                 .map_err(|error| format!("store_error: {error}"))?;
             if turns.is_empty() {
+                for (session, resumed) in resumed {
+                    Resumed::adopt(resumed, self, &session);
+                }
                 return Ok(recovered);
             }
             // Each resolution commits or fails recovery, so the next read
             // never returns the same turn again.
             for turn in turns {
-                if asked.insert(turn.session_id.clone()) {
-                    self.recover_session(&turn.session_id, &reconciled)
+                if asked.insert(turn.session_id.clone())
+                    && let Some(driver) = self
+                        .recover_session(&turn.session_id, &reconciled)
                         .await
-                        .map_err(|error| format!("store_error: {}", error.kind))?;
+                        .map_err(|error| format!("store_error: {}", error.kind))?
+                {
+                    resumed.push((turn.session_id.clone(), driver));
                 }
                 on_turn(&turn.session_id, turn.turn);
                 self.recover_turn(turn, &reconciled)
@@ -423,14 +436,15 @@ impl Engine {
 
     /// C2 §2 Recover (AD9, Sol r1 F12): asks the adapter set about
     /// `session` from its stored route identity, with Host's reconciled
-    /// facts for it; nothing is submitted. A resumed driver becomes the
-    /// session's lane. The session's unfinished turns still end `unknown`
+    /// facts for it; nothing is submitted. A resumed driver is returned, to
+    /// become the session's lane once its unfinished turn is recovered
+    /// (critical r1 #2). The session's unfinished turns still end `unknown`
     /// (C1 §7.5), with the cleanup Host's facts prove.
     async fn recover_session(
         &self,
         session: &SessionId,
         reconciled: &Reconciled,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<Resumed>, ApiError> {
         let snapshot = self
             .store
             .session_snapshot(session)
@@ -448,6 +462,11 @@ impl Engine {
         let reference = super::lane::session_ref(&snapshot.route);
         let recovery = bounded(self.adapter.recover(&reference, facts, cx).await, complete);
         #[cfg(test)]
+        let (recovery, receiver) = match super::lock(&self.faults.resume).take() {
+            Some((driver, receiver)) => (Recovery::Resumed(Box::new(driver)), receiver),
+            None => (recovery, receiver),
+        };
+        #[cfg(test)]
         {
             let answer = match &recovery {
                 Recovery::Resumed(_) => "resumed",
@@ -456,14 +475,16 @@ impl Engine {
             };
             super::lock(&self.faults.recoveries).push((session.clone(), facts.len(), answer));
         }
-        if let Recovery::Resumed(driver) = recovery {
-            self.adopt_lane(
-                session,
-                (*driver, receiver, budget),
-                (reference, &snapshot.route),
-            );
-        }
-        Ok(())
+        Ok(match recovery {
+            Recovery::Resumed(driver) => Some(Resumed {
+                driver: *driver,
+                receiver,
+                budget,
+                reference,
+                route: snapshot.route,
+            }),
+            Recovery::Unknown { .. } | Recovery::Dead { .. } => None,
+        })
     }
 
     /// Design §11: a group an earlier daemon left, whose absence recovery did
@@ -516,6 +537,8 @@ impl Engine {
             .history(&session, turn)
             .await
             .map_err(|_| ApiError::STORE)?;
+        #[cfg(test)]
+        self.hold(&self.faults.hold_after_history).await;
         let (cwd, identity) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
@@ -743,6 +766,27 @@ fn recovered_acceptance(correlation: Option<String>, started: Option<String>) ->
                 .map(str::to_owned),
         }),
         _ => None,
+    }
+}
+
+/// A driver recovery resumed, with its session channel, not yet the
+/// session's lane ([`Engine::recover_session`], [`Engine::recover_logged`]).
+struct Resumed {
+    driver: SessionDriver,
+    receiver: tokio::sync::mpsc::Receiver<Admitted>,
+    budget: ObservationBudget,
+    reference: SessionRef,
+    route: SessionRoute,
+}
+
+impl Resumed {
+    /// Makes the driver `session`'s lane: its actor starts consuming.
+    fn adopt(self, engine: &Engine, session: &SessionId) {
+        engine.adopt_lane(
+            session,
+            (self.driver, self.receiver, self.budget),
+            (self.reference, &self.route),
+        );
     }
 }
 
