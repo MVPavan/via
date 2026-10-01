@@ -277,7 +277,10 @@ impl Engine {
         // the driver close starts, this close takes it over with its mode
         // and deadline and owns its report; after, it waits for it, and
         // that driver close stays an idle-lane close with no destination
-        // (`leftovers` null; `close_lane` returns no report). The result is
+        // (`leftovers` null; `close_lane` returns no report). Either way
+        // this waits for the lane's end: the 3 s bounds the driver close
+        // only, and the lane's drain follows it, so the wait may outlast
+        // that bound and this close's own deadline (critical r4 #3). The result is
         // still derived from durable rows only (T3 design §4 [r1.8]):
         // folding an owned report's cleanup and leftovers into it belongs to
         // S-LEFTOVER (via-jm4.28).

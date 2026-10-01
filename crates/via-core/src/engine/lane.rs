@@ -61,7 +61,8 @@ pub(super) const VENDOR_TURNS: usize = 64;
 pub(super) const TOMBSTONES: usize = 1024;
 
 /// How long retiring a failed or replaced driver, or closing an idle
-/// one, waits for its close.
+/// one, waits for its driver close; the lane's drain follows it, unbounded
+/// by this.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 
 /// Idle session lanes kept daemon-wide (runtime §8; C2 §3 idle lanes):
