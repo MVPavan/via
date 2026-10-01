@@ -2118,7 +2118,7 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
         };
         let queued = vec![marks(false, &["t"]), marks(true, &[])];
         engine
-            .drain_queued(&slot, &mut record, &effective, orders, queued)
+            .drain_queued((&slot, None), &mut record, &effective, orders, queued)
             .await;
         let note = record.first_failure.expect("the drained write failed");
         assert_eq!(note.outcome, super::latch::WriteOutcome::NotCommitted);
@@ -2600,7 +2600,13 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
         };
         let n = arm_next(&points, point);
         engine
-            .drain_queued(&slot, &mut record, &effective, orders, vec![accepted])
+            .drain_queued(
+                (&slot, None),
+                &mut record,
+                &effective,
+                orders,
+                vec![accepted],
+            )
             .await;
         assert!(acked(&points, point, n), "{point} #{n} was not reached");
         let note = record.first_failure.expect("the acceptance write failed");
@@ -2775,5 +2781,117 @@ fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
         assert_eq!(report.unclosed_sessions, 1, "{report:?}");
         let types = event_types(&engine, &open_unjoined).await;
         assert!(!types.contains(&"session.closed".to_owned()), "{types:?}");
+    });
+}
+
+/// (14) AD4, C1 §6.1: a denial naming an earlier, ended turn's vendor turn
+/// arrives while turn 2 runs. It is committed `action.denied` with that
+/// turn's number and `late: true`, under the running turn, and stays out
+/// of turn 2's `denied_actions`; turn 2's own denial is kept there. The
+/// fake cannot emit it end to end: its decoder refuses a denial naming
+/// another turn, and its persistent helper retires at the terminal.
+#[test]
+fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
+    let Some(root) = child("a_late_denial_is_committed_late_and_kept_out_of_the_running_turn")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        // Turn 1 ends: the absent anchor fails its launch.
+        dispatch(&engine, &session).await;
+        assert!(engine.result(&format!("{session}/1")).await.is_ok());
+        resume(&engine, &session, None).await;
+        // Turn 2 is running.
+        let next = events_page(&engine, &session).await["events"]
+            .as_array()
+            .unwrap()
+            .len() as u64
+            + 1;
+        let submitted = Event {
+            seq: next,
+            session_id: &session,
+            turn: Some(2),
+            late: false,
+            at: &rfc3339(std::time::SystemTime::now()),
+            body: EventBody::TurnSubmitted { attempt: 1 },
+        }
+        .to_value()
+        .unwrap();
+        engine
+            .store
+            .commit_submission(SubmissionRecord {
+                session_id: session.clone(),
+                turn: turn(2),
+                event: submitted,
+            })
+            .await
+            .unwrap();
+        let slot = engine.slot(&session).unwrap();
+        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let (_route, orders) =
+            slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
+        let lane = engine.lane(&session, "fake", root.clone()).await;
+        lane.map_vendor_turn("fake-turn-1", turn(1));
+        let mut record = super::TurnRecord {
+            session: session.clone(),
+            turn: turn(2),
+            head: super::journal::Head::new(None),
+            accepted: None,
+            first_failure: None,
+            uncertain: None,
+            steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
+        };
+        let effective: crate::api::Effective = serde_json::from_value(json!({
+            "model":"fake","effort":null,"bound":null,
+            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+        }))
+        .unwrap();
+        let denial = |vendor_turn: &str, target: &str| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(
+                via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+            ),
+            observation: via_adapters::Observation::ActionDenied(via_adapters::Denial {
+                kind: via_adapters::DenialKind::Command,
+                target: target.to_owned(),
+                reason: "policy".to_owned(),
+            }),
+        };
+        let queued = vec![denial("fake-turn-1", "late"), denial("fake-turn-2", "own")];
+        engine
+            .drain_queued(
+                (&slot, Some(&lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        let page = events_page(&engine, &session).await;
+        let denied: Vec<&Value> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 2, "{page}");
+        assert_eq!(
+            (&denied[0]["turn"], &denied[0]["late"], &denied[0]["target"]),
+            (&json!(1), &json!(true), &json!("late")),
+            "{page}"
+        );
+        assert_eq!(
+            (&denied[1]["turn"], &denied[1]["late"], &denied[1]["target"]),
+            (&json!(2), &json!(false), &json!("own")),
+            "{page}"
+        );
+        let (kept, total) = record.vendor.denied.into_parts();
+        let kept = serde_json::to_value(&kept).unwrap();
+        assert_eq!(total, 1, "only turn 2's own denial: {kept}");
+        assert_eq!(kept[0]["target"], "own", "{kept}");
     });
 }

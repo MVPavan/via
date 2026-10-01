@@ -1473,11 +1473,12 @@ impl Engine {
 
     /// Test builds: drains `queued` for the running `turn` of `slot` as
     /// `execute`'s completion does, with the run loop's own order receiver
-    /// and no lane: every item is the running turn's.
+    /// and the session's `lane`; without one every item is the running
+    /// turn's.
     #[cfg(test)]
     pub(super) async fn drain_queued(
         &self,
-        slot: &Slot,
+        (slot, lane): (&Slot, Option<&Lane>),
         record: &mut TurnRecord,
         effective: &Effective,
         orders: watch::Receiver<Option<StopOrder>>,
@@ -1505,7 +1506,7 @@ impl Engine {
             idle: Duration::ZERO,
             final_text: FinalText::new(),
         };
-        self.drain(record, None, effective, &mut control, &mut observed)
+        self.drain(record, lane, effective, &mut control, &mut observed)
             .await;
     }
 
