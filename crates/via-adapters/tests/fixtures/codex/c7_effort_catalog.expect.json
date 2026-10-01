@@ -1,86 +1,108 @@
 {
-  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3 text from c5",
+  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3's exchange (thread/start, turn/start, final_answer `ACK.` and its usage sample 20391/18176/6) borrowed from c5 turn 1 with gpt-6-luna substituted; thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-luna",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-luna",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with ACK.",
         "effort": "ultra",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": "invalid_param:effort",
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
-        "cleanup": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 0
         },
-        "notes": "`ultra` is not a canonical C1 effort, so plan passes it; run_turn discovers the catalog with model/list right after initialize, finds gpt-6-luna does not list it, and ends Err(Rejected(InvalidParam{field: effort})) -> failed(submit_failed), failure.data.field effort; no turn/start is written (C2 §5 AD18; adapters design §3.3 AD18 tests). This fixture also pins no thread/start before the check."
+        "unasserted": [
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending: absent will pin that no thread/start or turn/start is written for this turn; until then the excluded identity confirmation pins the missing thread/start"
+          }
+        ],
+        "notes": "`ultra` is not a canonical C1 effort, so plan passes it; run_turn discovers the catalog with model/list right after initialize, finds gpt-6-luna does not list it, and ends Err(Rejected(InvalidParam{field: effort})) -> failed(submit_failed), failure.data.field effort; no turn/start is written (C2 §5 AD18; adapters design §3.3 AD18 tests). Adopted requirement (coordinator ruling, 2026-10-01, recorded in vendors/codex.md): the catalog is fetched right after initialize, so the check runs before thread/start or thread/resume and a rejected submission creates no vendor thread."
       }
     },
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with ACK.",
         "effort": "ultra",
         "output_schema": null,
         "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": "invalid_param:effort",
         "rejected": null,
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
-        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
         "observations_include": [],
         "observations_exclude": [
           "turn.accepted"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": null,
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
         "notes": "The same value on the next turn is refused by check_turn from the cached catalog, before a receipt and with no vendor I/O (C2 §5 AD18)."
       }
     },
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with ACK.",
         "effort": "low",
         "output_schema": null,
         "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -90,20 +112,8 @@
           "stop_reason": "end_turn",
           "class_hint": null
         },
-        "error": null,
-        "cleanup": "quiescent",
-        "observations_include": [
-          "session.vendor_identity_confirmed",
-          "turn.accepted",
-          "progress",
-          "final_text"
-        ],
-        "observations_exclude": [],
-        "steer": null,
-        "final_text": [
-          "ACK."
-        ],
         "usage": {
+          "from": "samples",
           "input_tokens": 20391,
           "cached_input_tokens": 18176,
           "output_tokens": 6,
@@ -111,9 +121,31 @@
           "total_tokens": 20397,
           "scope": "turn"
         },
+        "final_text": [
+          "ACK."
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "stop_facts": null,
         "instance": {
           "vendor_version": "0.159.2"
         },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "unasserted": [],
         "notes": "A listed effort proceeds on the same server: thread/start, then turn/start with effort low (vendors/codex.md §3)."
       }
     }

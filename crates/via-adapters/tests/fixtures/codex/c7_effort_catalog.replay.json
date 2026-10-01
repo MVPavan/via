@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3 text from c5",
+  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3's exchange (thread/start, turn/start, final_answer `ACK.` and its usage sample 20391/18176/6) borrowed from c5 turn 1 with gpt-6-luna substituted; thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "argv": [
     "app-server",
     "--disable",

@@ -1,31 +1,34 @@
 {
-  "source": "Codex re-probe cat (first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME) and c6 (tool-free turn), 0.159.2, 2026-09-30; the 38.1 s wait is replayed as 1.5 s",
+  "source": "Codex re-probe c6 (tool-free turn) and cat (the first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME; replayed as 1.5 s), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); c6's hook/started and hook/completed notifications dropped (c6 ran with hooks on; VIA launches with --disable hooks)",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with exactly VIA_ENV_159. Do not use any tools.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -35,20 +38,8 @@
           "stop_reason": "end_turn",
           "class_hint": null
         },
-        "error": null,
-        "cleanup": "quiescent",
-        "observations_include": [
-          "session.vendor_identity_confirmed",
-          "turn.accepted",
-          "progress",
-          "final_text"
-        ],
-        "observations_exclude": [],
-        "steer": null,
-        "final_text": [
-          "VIA_ENV_159"
-        ],
         "usage": {
+          "from": "samples",
           "input_tokens": 21998,
           "cached_input_tokens": 7168,
           "output_tokens": 9,
@@ -56,9 +47,31 @@
           "total_tokens": 22007,
           "scope": "turn"
         },
+        "final_text": [
+          "VIA_ENV_159"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "stop_facts": null,
         "instance": {
           "vendor_version": "0.159.2"
         },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "unasserted": [],
         "notes": "The initialize reply is delayed (38.1 s live, 1.5 s here): the handshake deadline is the turn's remaining wall time, never a shorter fixed bound (vendors/codex.md §2 Shared ownership; adapters design §2 cold start). The instance version is parsed from initialize.userAgent `via/0.159.2 (...)`: the token after the client name and `/` (C2 §5; vendors/codex.md §1). argv pins `--disable hooks` (vendors/codex.md §4). One keyless usage sample gives scope turn (C2 §5 AD6)."
       }
     }

@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c7 (thread/start and turn/start with an unknown model), 0.159.2, 2026-09-30",
+  "source": "Codex re-probe c7 (thread/start and turn/start with an unknown model on its own thread, with the recorded warning and failed-turn order), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); c7's other probes omitted; the error text shortened",
   "argv": [
     "app-server",
     "--disable",
@@ -133,27 +133,32 @@
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply OK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"startedAtMs\":1790000002186},\"emittedAtMs\":1790000002186}"
+        "line": "{\"method\":\"account/updated\",\"params\":{\"authMode\":\"chatgpt\",\"planType\":\"unknown\"},\"emittedAtMs\":1790000000486}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply OK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"completedAtMs\":1790000002186},\"emittedAtMs\":1790000002186}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply OK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"startedAtMs\":1790000002486},\"emittedAtMs\":1790000002486}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"{\\\"type\\\":\\\"error\\\",\\\"status\\\":400,\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"The 'via-nonexistent-model' model is not supported.\\\"}}\",\"codexErrorInfo\":\"other\",\"additionalDetails\":null,\"misalignment\":null},\"willRetry\":false,\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\"},\"emittedAtMs\":1790000003686}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300001\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Reply OK.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"completedAtMs\":1790000002486},\"emittedAtMs\":1790000002486}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"idle\"}},\"emittedAtMs\":1790000003691}"
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"systemError\"}},\"emittedAtMs\":1790000003986}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200001\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"failed\",\"error\":{\"message\":\"{\\\"type\\\":\\\"error\\\",\\\"status\\\":400,\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"The 'via-nonexistent-model' model is not supported.\\\"}}\",\"codexErrorInfo\":\"other\",\"additionalDetails\":null,\"misalignment\":null},\"startedAt\":1790000000,\"completedAt\":1790000003,\"durationMs\":3691}},\"emittedAtMs\":1790000003691}"
+        "line": "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"{\\\"type\\\":\\\"error\\\",\\\"status\\\":400,\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"The 'via-nonexistent-model' model is not supported.\\\"}}\",\"codexErrorInfo\":\"other\",\"additionalDetails\":null,\"misalignment\":null},\"willRetry\":false,\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\"},\"emittedAtMs\":1790000003986}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200001\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"failed\",\"error\":{\"message\":\"{\\\"type\\\":\\\"error\\\",\\\"status\\\":400,\\\"error\\\":{\\\"type\\\":\\\"invalid_request_error\\\",\\\"message\\\":\\\"The 'via-nonexistent-model' model is not supported.\\\"}}\",\"codexErrorInfo\":\"other\",\"additionalDetails\":null,\"misalignment\":null},\"startedAt\":1790000000,\"completedAt\":1790000003,\"durationMs\":3991}},\"emittedAtMs\":1790000003991}"
       }
     },
     {

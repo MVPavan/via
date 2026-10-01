@@ -1,42 +1,48 @@
 {
   "source": "Codex re-probe c10 (read-only bound: a slow denied write gave a failed item), 0.159.2, 2026-09-30",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": null
-  },
   "launches": 0,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Sandbox conformance check.",
         "effort": "low",
+        "bound": "read_only",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "read_only",
-          "extra_write_dirs": [],
-          "network": false
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": "bound_unsupported",
         "rejected": null,
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
-        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
         "observations_include": [],
         "observations_exclude": [
           "turn.accepted"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": null,
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
         "notes": "read_only is protocol-mapped but unverified, so plan refuses it as bound_unsupported before any launch; the fixture has no steps (C1 §4.2 codex-app-server row; vendors/codex.md §3 Bound mapping and gate)."
       }
     }

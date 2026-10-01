@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30",
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; a 500 ms keep-alive ends the script until the replay gains await_eof",
   "argv": [
     "app-server",
     "--disable",

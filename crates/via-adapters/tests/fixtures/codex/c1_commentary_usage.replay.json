@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c1 (two turns on one thread), 0.159.2, 2026-09-30; model text neutralized",
+  "source": "Codex re-probe c1 (two turns on one thread), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); model text neutralized; rate-limit notifications dropped",
   "argv": [
     "app-server",
     "--disable",
@@ -266,62 +266,57 @@
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"call_0001\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":\"async\",\"questions\":[{\"title\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"options\":null}],\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000013517},\"emittedAtMs\":1790000013517}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"call_0001\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":\"async\",\"questions\":[{\"title\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"options\":null}],\"text\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\"},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000013517},\"emittedAtMs\":1790000013517}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"itemId\":\"call_0001\",\"delta\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\"},\"emittedAtMs\":1790000013617}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"call_0001\",\"text\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":\"async\",\"questions\":[{\"title\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"options\":null}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000013917},\"emittedAtMs\":1790000013917}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"call_0001\",\"text\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":\"async\",\"questions\":[{\"title\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"options\":null}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000014017},\"emittedAtMs\":1790000014017}"
+        "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"tokenUsage\":{\"total\":{\"totalTokens\":65920,\"inputTokens\":65630,\"cachedInputTokens\":58752,\"cacheWriteInputTokens\":0,\"outputTokens\":290,\"reasoningOutputTokens\":115},\"last\":{\"totalTokens\":24785,\"inputTokens\":24648,\"cachedInputTokens\":20352,\"cacheWriteInputTokens\":0,\"outputTokens\":137,\"reasoningOutputTokens\":89},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000013927}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"tokenUsage\":{\"total\":{\"totalTokens\":65920,\"inputTokens\":65630,\"cachedInputTokens\":58752,\"cacheWriteInputTokens\":0,\"outputTokens\":290,\"reasoningOutputTokens\":115},\"last\":{\"totalTokens\":24785,\"inputTokens\":24648,\"cachedInputTokens\":20352,\"cacheWriteInputTokens\":0,\"outputTokens\":137,\"reasoningOutputTokens\":89},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000014027}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_0008\",\"summary\":[],\"content\":[]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000015927},\"emittedAtMs\":1790000015927}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_0008\",\"summary\":[],\"content\":[]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000016027},\"emittedAtMs\":1790000016027}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_0008\",\"summary\":[],\"content\":[]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000016427},\"emittedAtMs\":1790000016427}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_0008\",\"summary\":[],\"content\":[]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000016527},\"emittedAtMs\":1790000016527}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null,\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000017427},\"emittedAtMs\":1790000017427}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null,\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000017527},\"emittedAtMs\":1790000017527}"
+        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"itemId\":\"msg_0009\",\"delta\":\"What would you like me to answer: the `note.txt` result or a new request?\"},\"emittedAtMs\":1790000017527}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"itemId\":\"msg_0009\",\"delta\":\"What would you like me to answer: the `note.txt` result or a new request?\"},\"emittedAtMs\":1790000017627}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"text\":\"What would you like me to answer: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000017927},\"emittedAtMs\":1790000017927}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"text\":\"What would you like me to answer: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000018027},\"emittedAtMs\":1790000018027}"
+        "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"tokenUsage\":{\"total\":{\"totalTokens\":90832,\"inputTokens\":90433,\"cachedInputTokens\":83200,\"cacheWriteInputTokens\":0,\"outputTokens\":399,\"reasoningOutputTokens\":198},\"last\":{\"totalTokens\":24912,\"inputTokens\":24803,\"cachedInputTokens\":24448,\"cacheWriteInputTokens\":0,\"outputTokens\":109,\"reasoningOutputTokens\":83},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000017937}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"tokenUsage\":{\"total\":{\"totalTokens\":90832,\"inputTokens\":90433,\"cachedInputTokens\":83200,\"cacheWriteInputTokens\":0,\"outputTokens\":399,\"reasoningOutputTokens\":198},\"last\":{\"totalTokens\":24912,\"inputTokens\":24803,\"cachedInputTokens\":24448,\"cacheWriteInputTokens\":0,\"outputTokens\":109,\"reasoningOutputTokens\":83},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000018037}"
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"idle\"}},\"emittedAtMs\":1790000017942}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"idle\"}},\"emittedAtMs\":1790000018042}"
-      }
-    },
-    {
-      "emit": {
-        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200002\",\"items\":[{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"text\":\"What would you like me to answer: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null}],\"itemsView\":\"summary\",\"status\":\"completed\",\"error\":null,\"startedAt\":1790000000,\"completedAt\":1790000018,\"durationMs\":18042}},\"emittedAtMs\":1790000018042}"
+        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200002\",\"items\":[{\"type\":\"agentMessage\",\"id\":\"msg_0009\",\"text\":\"What would you like me to answer: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null}],\"itemsView\":\"summary\",\"status\":\"completed\",\"error\":null,\"startedAt\":1790000000,\"completedAt\":1790000017,\"durationMs\":17942}},\"emittedAtMs\":1790000017942}"
       }
     },
     {

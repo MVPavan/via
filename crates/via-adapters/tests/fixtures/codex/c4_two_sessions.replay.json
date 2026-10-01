@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; reordered to VIA's per-session order and B's changed-bound turn dropped",
+  "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits) (A recorded read-only, B workspace-write); requests in VIA's per-session order (the probe sent both thread/start before both turn/start); A's tool start kept after B's as recorded; B's marker command simplified; B's changed-bound second turn dropped",
   "argv": [
     "app-server",
     "--disable",
@@ -167,11 +167,6 @@
       }
     },
     {
-      "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400004\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 12'\",\"cwd\":\"/work/project-a\",\"processId\":\"1004\",\"source\":\"unifiedExecStartup\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 12\"}],\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"startedAtMs\":1790000007781},\"emittedAtMs\":1790000007781}"
-      }
-    },
-    {
       "expect": {
         "line": {
           "method": "thread/start",
@@ -191,12 +186,12 @@
     },
     {
       "emit": {
-        "line": "{\"id\":${thread_b},\"result\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100002\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100002\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-sol\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000007,\"updatedAt\":1790000007,\"recencyAt\":1790000007,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project-b\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]},\"model\":\"gpt-6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":\"default\",\"disabledPluginIds\":[],\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"],\"instructionSources\":[\"/work/project-b/AGENTS.md\"],\"approvalPolicy\":\"never\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"dangerFullAccess\"},\"activePermissionProfile\":null,\"reasoningEffort\":\"medium\",\"multiAgentMode\":\"explicitRequestOnly\"}}"
+        "line": "{\"id\":${thread_b},\"result\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100002\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100002\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-sol\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000006,\"updatedAt\":1790000006,\"recencyAt\":1790000006,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project-b\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]},\"model\":\"gpt-6-sol\",\"modelProvider\":\"openai\",\"serviceTier\":\"default\",\"disabledPluginIds\":[],\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"],\"instructionSources\":[\"/work/project-b/AGENTS.md\"],\"approvalPolicy\":\"never\",\"approvalsReviewer\":\"user\",\"sandbox\":{\"type\":\"dangerFullAccess\"},\"activePermissionProfile\":null,\"reasoningEffort\":\"medium\",\"multiAgentMode\":\"explicitRequestOnly\"}}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100002\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100002\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-sol\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000007,\"updatedAt\":1790000007,\"recencyAt\":1790000007,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project-b\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]}},\"emittedAtMs\":1790000007946}"
+        "line": "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"019a0000-0000-7000-8000-000000100002\",\"environments\":[{\"environmentId\":\"local\",\"cwd\":\"/work/project-b\",\"runtimeWorkspaceRoots\":[\"/work/project-b\"]}],\"extra\":null,\"sessionId\":\"019a0000-0000-7000-8000-000000100002\",\"forkedFromId\":null,\"parentThreadId\":null,\"preview\":\"\",\"ephemeral\":false,\"section\":null,\"sectionEnteredAt\":null,\"projectId\":null,\"historyMode\":\"paginated\",\"modelProvider\":\"openai\",\"model\":\"gpt-6-sol\",\"reasoningEffort\":\"medium\",\"createdAt\":1790000006,\"updatedAt\":1790000006,\"recencyAt\":1790000006,\"status\":{\"type\":\"idle\"},\"path\":null,\"cwd\":\"/work/project-b\",\"cliVersion\":\"0.159.2\",\"originator\":\"via\",\"source\":\"vscode\",\"canAcceptDirectInput\":true,\"threadSource\":null,\"agentNickname\":null,\"agentRole\":null,\"gitInfo\":null,\"name\":null,\"daybreakEnabled\":null,\"turns\":[]}},\"emittedAtMs\":1790000006646}"
       }
     },
     {
@@ -234,42 +229,47 @@
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"status\":{\"type\":\"active\",\"activeFlags\":[]}},\"emittedAtMs\":1790000007957}"
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"status\":{\"type\":\"active\",\"activeFlags\":[]}},\"emittedAtMs\":1790000006657}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200002\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":1790000007,\"completedAt\":null,\"durationMs\":null}},\"emittedAtMs\":1790000007957}"
+        "line": "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200002\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"inProgress\",\"error\":null,\"startedAt\":1790000006,\"completedAt\":null,\"durationMs\":null}},\"emittedAtMs\":1790000006657}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300005\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000009957},\"emittedAtMs\":1790000009957}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300004\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000008657},\"emittedAtMs\":1790000008657}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300005\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000009957},\"emittedAtMs\":1790000009957}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"userMessage\",\"id\":\"019a0000-0000-7000-8000-000000300004\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.\",\"text_elements\":[]}]},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000008657},\"emittedAtMs\":1790000008657}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0006\",\"phase\":\"commentary\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null,\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000010957},\"emittedAtMs\":1790000010957}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0005\",\"phase\":\"commentary\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null,\"text\":\"\"},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000009657},\"emittedAtMs\":1790000009657}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"itemId\":\"msg_0006\",\"delta\":\"I’ll run the sleep command, create the marker file, and verify its contents.\"},\"emittedAtMs\":1790000011057}"
+        "line": "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"itemId\":\"msg_0005\",\"delta\":\"I’ll run the sleep command, create the marker file, and verify its contents.\"},\"emittedAtMs\":1790000009757}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0006\",\"text\":\"I’ll run the sleep command, create the marker file, and verify its contents.\",\"phase\":\"commentary\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000011457},\"emittedAtMs\":1790000011457}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_0005\",\"text\":\"I’ll run the sleep command, create the marker file, and verify its contents.\",\"phase\":\"commentary\",\"memoryCitation\":null,\"delivery\":null,\"questions\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000010157},\"emittedAtMs\":1790000010157}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400007\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 14'\",\"cwd\":\"/work/project-b\",\"processId\":\"1007\",\"source\":\"unifiedExecStartup\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 14\"}],\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000012757},\"emittedAtMs\":1790000012757}"
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400006\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 14'\",\"cwd\":\"/work/project-b\",\"processId\":\"1006\",\"source\":\"unifiedExecStartup\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 14\"}],\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"startedAtMs\":1790000011457},\"emittedAtMs\":1790000011457}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400007\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 12'\",\"cwd\":\"/work/project-a\",\"processId\":\"1007\",\"source\":\"unifiedExecStartup\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 12\"}],\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"startedAtMs\":1790000012757},\"emittedAtMs\":1790000012757}"
       }
     },
     {
@@ -326,7 +326,7 @@
     },
     {
       "emit": {
-        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400007\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 14'\",\"cwd\":\"/work/project-b\",\"processId\":\"1007\",\"source\":\"unifiedExecStartup\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 14\"}],\"aggregatedOutput\":null,\"exitCode\":0,\"durationMs\":13965},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000026737},\"emittedAtMs\":1790000026737}"
+        "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400006\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 14'\",\"cwd\":\"/work/project-b\",\"processId\":\"1006\",\"source\":\"unifiedExecStartup\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 14\"}],\"aggregatedOutput\":null,\"exitCode\":0,\"durationMs\":13965},\"threadId\":\"019a0000-0000-7000-8000-000000100002\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000026737},\"emittedAtMs\":1790000026737}"
       }
     },
     {

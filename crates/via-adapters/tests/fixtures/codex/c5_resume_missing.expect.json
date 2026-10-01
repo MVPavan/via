@@ -1,46 +1,57 @@
 {
-  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30",
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; a 500 ms keep-alive ends the script until the replay gains await_eof",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": "019a0000-0000-7000-8000-000000100007",
-    "cwd": "/work/project",
-    "close": null
-  },
   "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": "019a0000-0000-7000-8000-000000100007",
+      "close": null
+    }
+  },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Continue.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": "session_gone",
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
-        "cleanup": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 0
         },
+        "unasserted": [
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending: await_eof replaces the 500 ms keep-alive and absent pins that no thread/start or turn/start follows"
+          }
+        ],
         "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600."
       }
     }

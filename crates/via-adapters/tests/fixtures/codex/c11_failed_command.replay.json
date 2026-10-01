@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; recorded under workspace-write, replayed under the full bound",
+  "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded workspace-write policy to dangerFullAccess",
   "argv": [
     "app-server",
     "--disable",

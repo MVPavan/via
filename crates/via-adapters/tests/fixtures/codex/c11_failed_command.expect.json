@@ -1,31 +1,34 @@
 {
-  "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; recorded under workspace-write, replayed under the full bound",
+  "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded workspace-write policy to dangerFullAccess",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Run this exact shell command once: ls /nonexistent-via-dir ; then report its exit status.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -35,8 +38,24 @@
           "stop_reason": "end_turn",
           "class_hint": null
         },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 41573,
+          "cached_input_tokens": 24576,
+          "output_tokens": 111,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 41684,
+          "scope": "turn"
+        },
+        "final_text": [
+          "Exit status: 2."
+        ],
         "error": null,
         "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -46,21 +65,15 @@
         "observations_exclude": [
           "action.denied"
         ],
-        "steer": null,
-        "final_text": [
-          "Exit status: 2."
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
         ],
-        "usage": {
-          "input_tokens": 41573,
-          "cached_input_tokens": 24576,
-          "output_tokens": 111,
-          "reasoning_output_tokens": 8,
-          "total_tokens": 41684,
-          "scope": "turn"
-        },
-        "instance": {
-          "vendor_version": "0.159.2"
-        },
+        "unasserted": [],
         "notes": "A commandExecution item that ends failed with exit 2 is tools_started then tools_ended progress; a failed item or the model's prose is not a sandbox denial, so no action.denied (vendors/codex.md §4, §5)."
       }
     }

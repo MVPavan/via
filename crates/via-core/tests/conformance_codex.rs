@@ -3,14 +3,17 @@
 //!
 //! Each case pairs `<case>.replay.json` (the recorded `codex app-server`
 //! exchange, replayed by the fake agent) with `<case>.expect.json` (what the
-//! C2 driver must produce). The case tests are red by construction until the
-//! adapter slice `via-5lr.3.2` replaces [`drive`] and removes the `ignore`.
+//! C2 driver must produce, in the unified expectation schema). The case
+//! tests are red by construction until the adapter slice `via-5lr.3.2`
+//! replaces [`drive`] and removes the `ignore`.
 
-use std::collections::BTreeSet;
-use std::fs;
+#[path = "support/conformance_expect.rs"]
+mod conformance_expect;
+
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use conformance_expect::Outcome;
+use serde_json::{Value, json};
 
 /// The bead whose adapter makes these cases pass.
 const ADAPTER_BEAD: &str = "via-5lr.3.2";
@@ -19,101 +22,21 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures/codex")
 }
 
-/// One fixture and its expectation.
-struct Case {
-    name: String,
-    /// The fixture the fake agent replays, installed beside it as `<case>`.
-    #[expect(dead_code, reason = "read by the adapter driver in via-5lr.3.2")]
-    replay: PathBuf,
-    expect: Value,
-}
-
-/// What the C2 driver produced, one entry per expected turn, in the
-/// expectation schema's terms plus `observations`: the kinds it emitted.
-struct Outcome {
-    turns: Vec<Value>,
-}
-
-fn load(name: &str) -> Result<Case, String> {
-    let dir = fixtures();
-    let text = fs::read_to_string(dir.join(format!("{name}.expect.json")))
-        .map_err(|error| format!("{name}.expect.json: {error}"))?;
-    Ok(Case {
-        name: name.to_owned(),
-        replay: dir.join(format!("{name}.replay.json")),
-        expect: serde_json::from_str(&text)
-            .map_err(|error| format!("{name}.expect.json: {error}"))?,
-    })
-}
-
-/// The string members of an optional JSON array.
-fn strings(value: &Value) -> BTreeSet<&str> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect()
-}
-
 /// Runs the case's sessions and turns through the Codex C2 driver against
-/// the replayed server. Replaced by `via-5lr.3.2`.
-fn drive(case: &Case) -> Result<Outcome, String> {
+/// the fake agent replaying `<case>.replay.json`, with controlled time, and
+/// collects the outcome (see the checker's module docs for its obligations).
+/// Replaced by `via-5lr.3.2`.
+fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
     Err(format!(
-        "adapter not implemented: {ADAPTER_BEAD} (case {})",
-        case.name
+        "adapter not implemented: {ADAPTER_BEAD} (case {name})"
     ))
 }
 
-/// Fields of a turn's `expect` compared by value; the rest are checked below
-/// or are prose.
-const COMPARED: &[&str] = &[
-    "plan_refusal",
-    "rejected",
-    "accepted",
-    "terminal",
-    "error",
-    "cleanup",
-    "steer",
-    "final_text",
-    "usage",
-    "instance",
-    "stop_facts",
-    "structured_output",
-];
-
 fn check(name: &str) -> Result<(), String> {
-    let case = load(name)?;
-    let outcome = drive(&case).map_err(|error| format!("{name}: {error}"))?;
-    let turns = case.expect["turns"]
-        .as_array()
-        .ok_or_else(|| format!("{name}: no turns"))?;
-    assert_eq!(outcome.turns.len(), turns.len(), "{name}: turn count");
-    for (index, (turn, actual)) in turns.iter().zip(&outcome.turns).enumerate() {
-        let expect = &turn["expect"];
-        let open = strings(&expect["unasserted"]);
-        for field in COMPARED {
-            if open.contains(field) || expect.get(*field).is_none() {
-                continue;
-            }
-            assert_eq!(
-                actual.get(*field),
-                expect.get(*field),
-                "{name} turn {index}: {field}"
-            );
-        }
-        let seen = strings(&actual["observations"]);
-        for kind in strings(&expect["observations_include"]) {
-            assert!(seen.contains(kind), "{name} turn {index}: missing {kind}");
-        }
-        for kind in strings(&expect["observations_exclude"]) {
-            assert!(
-                !seen.contains(kind),
-                "{name} turn {index}: unexpected {kind}"
-            );
-        }
-    }
-    Ok(())
+    let dir = fixtures();
+    let expect = conformance_expect::load(&dir, name)?;
+    let outcome = drive(name, &expect, &dir.join(format!("{name}.replay.json")))?;
+    conformance_expect::check(&expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
 }
 
 macro_rules! cases {
@@ -153,34 +76,96 @@ cases! {
 }
 
 /// Green now: every expectation file has a case test and a replay fixture,
-/// and names this harness.
+/// names this harness and validates against the unified schema.
 #[test]
 fn conformance_codex_cases_match_fixture_files() {
-    let mut names = BTreeSet::new();
-    for entry in fs::read_dir(fixtures()).expect("fixture directory") {
-        let path = entry.expect("fixture entry").path();
-        let file = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if let Some(name) = file.strip_suffix(".expect.json") {
-            names.insert(name.to_owned());
-        }
-    }
-    let listed: BTreeSet<String> = CASES.iter().map(|&n| n.to_owned()).collect();
-    assert_eq!(names, listed, "expect files and case tests differ");
-    for name in &names {
-        let case = load(name).unwrap();
-        assert_eq!(case.expect["harness"], "codex", "{name}: harness");
+    let dir = fixtures();
+    let mut listed: Vec<&str> = CASES.to_vec();
+    listed.sort_unstable();
+    assert_eq!(conformance_expect::case_names(&dir).unwrap(), listed);
+    for name in CASES {
+        let expect = conformance_expect::load(&dir, name).unwrap();
+        assert_eq!(expect["harness"], "codex", "{name}: harness");
+        conformance_expect::validate(&expect).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(
-            case.expect["turns"]
-                .as_array()
-                .is_some_and(|t| !t.is_empty()),
-            "{name}: no turns"
-        );
-        assert!(
-            fixtures().join(format!("{name}.replay.json")).is_file(),
+            dir.join(format!("{name}.replay.json")).is_file(),
             "{name}: replay fixture missing"
         );
+    }
+}
+
+/// A named change to an ideal outcome.
+type Mutation = (&'static str, fn(&mut Outcome));
+
+/// Green now: the checker accepts the ideal outcome of every case and
+/// reports a change in any compared part of it.
+#[test]
+fn conformance_codex_checker_detects_each_difference() {
+    let dir = fixtures();
+    for name in CASES {
+        let expect = conformance_expect::load(&dir, name).unwrap();
+        conformance_expect::check(&expect, &conformance_expect::ideal(&expect))
+            .unwrap_or_else(|e| panic!("{name}: ideal outcome refused:\n{e}"));
+        let mutations: [Mutation; 12] = [
+            ("usage", |o| {
+                o.turns[0].usage = Some(json!({"input_tokens": 1}));
+            }),
+            ("final_text", |o| {
+                o.turns[0].final_text = Some(vec!["other".to_owned()]);
+            }),
+            ("cleanup_settles", |o| {
+                o.turns[0].cleanup_settles = Some("never".to_owned());
+            }),
+            ("steer", |o| o.turns[0].steer.push("injected".to_owned())),
+            ("launches", |o| o.launches += 1),
+            ("close", |o| {
+                for close in o.closes.values_mut() {
+                    *close = match close.take() {
+                        Some(_) => None,
+                        None => Some(json!({"vendor_closed": true})),
+                    };
+                }
+            }),
+            ("accepted", |o| o.turns[0].accepted = !o.turns[0].accepted),
+            ("terminal", |o| {
+                o.turns[0].terminal = Some(json!({"status": "other"}));
+            }),
+            ("cleanup", |o| {
+                o.turns[0].cleanup = Some("pending".to_owned());
+            }),
+            ("observations", |o| {
+                o.turns[0].observations.push("turn.accepted".to_owned());
+                o.turns[0].observations.push("action.denied".to_owned());
+            }),
+            ("instance", |o| {
+                o.turns[0].instance = Some(json!({"vendor_version": "0.0.0"}));
+            }),
+            ("turns", |o| {
+                o.turns.pop();
+            }),
+        ];
+        for (what, mutate) in mutations {
+            let mut outcome = conformance_expect::ideal(&expect);
+            mutate(&mut outcome);
+            let first = &expect["turns"][0]["expect"];
+            let stated = match what {
+                "launches" => expect.get("launches").is_some(),
+                "close" => expect["sessions"]
+                    .as_object()
+                    .is_some_and(|s| s.values().any(|s| s.get("close").is_some())),
+                "observations" => {
+                    first.get("observation_counts").is_some()
+                        || first.get("observations_exclude").is_some()
+                }
+                "turns" | "steer" => true,
+                field => first.get(field).is_some(),
+            };
+            if stated {
+                assert!(
+                    conformance_expect::check(&expect, &outcome).is_err(),
+                    "{name}: a changed {what} passed"
+                );
+            }
+        }
     }
 }

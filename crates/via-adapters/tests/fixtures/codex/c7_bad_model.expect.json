@@ -1,31 +1,34 @@
 {
-  "source": "Codex re-probe c7 (thread/start and turn/start with an unknown model), 0.159.2, 2026-09-30",
+  "source": "Codex re-probe c7 (thread/start and turn/start with an unknown model on its own thread, with the recorded warning and failed-turn order), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); c7's other probes omitted; the error text shortened",
   "harness": "codex",
-  "session": {
-    "model": "via-nonexistent-model",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "via-nonexistent-model",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply OK.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -35,8 +38,14 @@
           "stop_reason": "error",
           "class_hint": "vendor_error"
         },
+        "usage": null,
+        "final_text": null,
         "error": null,
         "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted"
@@ -44,12 +53,14 @@
         "observations_exclude": [
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 1
         },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
         "notes": "An explicit model passes to the vendor even though model/list lacks it; thread/start and turn/start are accepted, then turn/completed failed with codexErrorInfo `other` and HTTP 400: a Failed terminal after acceptance, class hint vendor_error, not submit_failed (C2 §2 Submission boundary, §6.2 Class hints; adapters design §5.3). The vendor `warning` notification is activity only (vendors/codex.md §5)."
       }
     }

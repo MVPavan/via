@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c5 (thread/resume with excludeTurns after unsubscribe), 0.159.2, 2026-09-30; modelled as the next server lifetime of a confirmed session",
+  "source": "Codex re-probe c5 second turn (thread/resume with excludeTurns, then recall of the token), 0.159.2, 2026-09-30; modelled as the next server lifetime of a confirmed session, so c5's first turn and unsubscribe are omitted; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "argv": [
     "app-server",
     "--disable",

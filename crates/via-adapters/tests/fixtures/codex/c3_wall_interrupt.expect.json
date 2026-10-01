@@ -1,42 +1,67 @@
 {
-  "source": "Codex re-probe c3 (sleep 75, interrupt), 0.159.2, 2026-09-30; the stop here is the wall deadline instead of a caller interrupt",
+  "source": "Codex re-probe c3 (interrupt during sleep 75), 0.159.2, 2026-09-30; the stop is the wall deadline instead of a caller interrupt; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "uncertain"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Run the shell command sleep 75. Then say done.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": 300,
       "stop": {
         "kind": "wall",
         "after": "tool_started"
       },
-      "tool_grace_ms": 300,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
         "accepted": true,
-        "terminal": null,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "class_hint": null
+        },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 20390,
+          "cached_input_tokens": 7168,
+          "output_tokens": 65,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 20455,
+          "scope": "turn"
+        },
+        "final_text": null,
         "error": "deadline",
         "cleanup": "uncertain",
+        "cleanup_settles": "at_terminal",
+        "stop_facts": {
+          "acknowledged": true,
+          "shared": true,
+          "forced": false
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -45,22 +70,15 @@
         "observations_exclude": [
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "stop_facts": {
-          "acknowledged": true,
-          "shared": true,
-          "forced": false
-        },
-        "unasserted": [
-          "terminal",
-          "usage"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "notes": "At the wall Route fails the turn with the typed Deadline failure, and its one cleanup step for Codex is turn/interrupt, written before run_turn returns; the shared server is never closed (C2 §4.1 Wall expiry, What is per route). The interrupted terminal arrives within S1's 3 s cleanup bound, so the failure carries acknowledged:true and shared:true; Core then gives failed(deadline_wall) with cancel.outcome acknowledged. The wall has passed, so P7's cap settles cleanup at once: the tool item is still open, so uncertain (C2 §4.1 Core handoff). Whether TurnEnd.terminal also carries the post-wall interrupted terminal is not fixed by C2, so terminal is unasserted."
+        "unasserted": [],
+        "notes": "At the wall Route fails the turn with the typed Deadline failure, and its one cleanup step for Codex is turn/interrupt, written before run_turn returns; the shared server is never closed (C2 §4.1 Wall expiry, What is per route). The interrupted terminal arrives within S1's 3 s cleanup bound, so the failure carries acknowledged:true and shared:true; Core then gives failed(deadline_wall) with cancel.outcome acknowledged. The wall has passed, so P7's cap settles cleanup at once: the tool item is still open, so uncertain, settled with the terminal (C2 §4.1 Core handoff). The interrupted terminal is decoded within the cutoff, so TurnEnd retains it beside the Deadline failure (C2 §4.1 One result per turn), with the turn's keyless usage sample (C2 §5 AD6)."
       }
     }
   ]

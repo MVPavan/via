@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c8 (no login: 10 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; reduced to two retries and the final error, URLs and request ids removed",
+  "source": "Codex re-probe c8 (no login: 9 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized) (model/list was never recorded without a login); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); reduced to two retries, the transport-fallback warning and the final error; URLs, cf-ray and request ids removed",
   "argv": [
     "app-server",
     "--disable",
@@ -153,17 +153,17 @@
     },
     {
       "emit": {
-        "line": "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"unexpected status 401 Unauthorized: Missing authentication in header\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}},\"additionalDetails\":null,\"misalignment\":null},\"willRetry\":false,\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\"},\"emittedAtMs\":1790000004181}"
+        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"systemError\"}},\"emittedAtMs\":1790000005181}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"status\":{\"type\":\"idle\"}},\"emittedAtMs\":1790000004186}"
+        "line": "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"unexpected status 401 Unauthorized: Missing authentication in header\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}},\"additionalDetails\":null,\"misalignment\":null},\"willRetry\":false,\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\"},\"emittedAtMs\":1790000005181}"
       }
     },
     {
       "emit": {
-        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200001\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"failed\",\"error\":{\"message\":\"unexpected status 401 Unauthorized: Missing authentication in header\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}},\"additionalDetails\":null,\"misalignment\":null},\"startedAt\":1790000000,\"completedAt\":1790000004,\"durationMs\":4186}},\"emittedAtMs\":1790000004186}"
+        "line": "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turn\":{\"id\":\"019a0000-0000-7000-8000-000000200001\",\"items\":[],\"itemsView\":\"notLoaded\",\"status\":\"failed\",\"error\":{\"message\":\"unexpected status 401 Unauthorized: Missing authentication in header\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}},\"additionalDetails\":null,\"misalignment\":null},\"startedAt\":1790000000,\"completedAt\":1790000005,\"durationMs\":5186}},\"emittedAtMs\":1790000005186}"
       }
     },
     {

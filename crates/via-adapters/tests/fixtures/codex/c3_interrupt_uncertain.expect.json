@@ -1,35 +1,37 @@
 {
-  "source": "Codex re-probe c3 (interrupt during sleep 75), 0.159.2, 2026-09-30; interrupt reply and interrupted terminal arrived in one 2 ms read; the tool was alive at 65 s with no item/completed",
+  "source": "Codex re-probe c3 (interrupt during sleep 75; the interrupt reply and interrupted terminal arrived in one 2 ms read; the tool was alive at 65 s with no item/completed), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "uncertain"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Run the shell command sleep 75. Then say done.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": 300,
       "stop": {
         "kind": "interrupt",
         "after": "tool_started"
       },
-      "tool_grace_ms": 300,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -39,8 +41,23 @@
           "stop_reason": "interrupted",
           "class_hint": null
         },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 20390,
+          "cached_input_tokens": 7168,
+          "output_tokens": 65,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 20455,
+          "scope": "turn"
+        },
+        "final_text": null,
         "error": null,
         "cleanup": "uncertain",
+        "cleanup_settles": "at_p7_bound",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -49,20 +66,15 @@
         "observations_exclude": [
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": {
-          "input_tokens": 20390,
-          "cached_input_tokens": 7168,
-          "output_tokens": 65,
-          "reasoning_output_tokens": 8,
-          "total_tokens": 20455,
-          "scope": "turn"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "instance": {
-          "vendor_version": "0.159.2"
-        },
-        "notes": "Interrupt sends only turn/interrupt; {} confirms handling only, the matching turn/completed interrupted is the acknowledgement (C2 §6.2 Interrupt). The reported commandExecution item never completes, so run_turn returns at min(ack + tool_grace, wall) with cleanup uncertain (C2 §2 Interrupt table, §4.1; C1 P7). tool_grace_ms scales C1 P7's 60 s for the test. The commentary message is not final text. The shared server is never killed."
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "Interrupt sends only turn/interrupt; {} confirms handling only, the matching turn/completed interrupted is the acknowledgement (C2 §6.2 Interrupt). The reported commandExecution item never completes, so run_turn returns at min(ack + tool_grace, wall) with cleanup uncertain (C2 §2 Interrupt table, §4.1; C1 P7): pending before that bound, settled at it (cleanup_settles at_p7_bound, checked with controlled time). tool_grace_ms scales C1 P7's 60 s for the test. The close (unsubscribe) retains the cleanup uncertainty (vendors/codex.md §3 Close). The commentary message is not final text. The shared server is never killed."
       }
     }
   ]

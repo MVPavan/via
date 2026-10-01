@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight",
+  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "argv": [
     "app-server",
     "--disable",

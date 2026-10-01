@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c2 (steer during a running tool), 0.159.2, 2026-09-30; tool wait not replayed",
+  "source": "Codex re-probe c2 (steer during a running tool), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the stale steer's expected id is synthetic; the idle steer after the terminal dropped",
   "argv": [
     "app-server",
     "--disable",

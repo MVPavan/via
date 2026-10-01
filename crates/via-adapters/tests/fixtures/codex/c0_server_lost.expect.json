@@ -1,34 +1,43 @@
 {
-  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight",
+  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": null
-  },
   "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Run the shell command sleep 12. Then say done.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
         "accepted": true,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": "server_lost",
         "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -37,14 +46,18 @@
         "observations_exclude": [
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 1
         },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
         "unasserted": [
-          "leftovers"
+          {
+            "field": "leftovers",
+            "why": "S-LEFTOVER (via-jm4.28) owns every leftover-report assertion (C2 §4.2)"
+          }
         ],
         "notes": "The server process exits after the tool started, with no terminal: Host confirms the death, so Err(ServerLost) -> failed(server_lost), never resent (C2 §4.1 Persistent-server routes with no terminal). Cleanup follows the Server close or crash row: GroupAbsent for the server's own group (C2 §2 Interrupt table). The leftover report belongs to S-LEFTOVER and is not asserted here (C2 §4.2)."
       }

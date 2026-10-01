@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c3 (sleep 75, interrupt), 0.159.2, 2026-09-30; the stop here is the wall deadline instead of a caller interrupt",
+  "source": "Codex re-probe c3 (interrupt during sleep 75), 0.159.2, 2026-09-30; the stop is the wall deadline instead of a caller interrupt; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
   "argv": [
     "app-server",
     "--disable",

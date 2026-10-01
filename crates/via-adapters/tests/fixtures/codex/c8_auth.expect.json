@@ -1,31 +1,34 @@
 {
-  "source": "Codex re-probe c8 (no login: 10 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; reduced to two retries and the final error, URLs and request ids removed",
+  "source": "Codex re-probe c8 (no login: 9 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized) (model/list was never recorded without a login); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); reduced to two retries, the transport-fallback warning and the final error; URLs, cf-ray and request ids removed",
   "harness": "codex",
-  "session": {
-    "model": "gpt-6-sol",
-    "resume": null,
-    "cwd": "/work/project",
-    "close": {
-      "mode": "graceful",
-      "after": "turns",
-      "vendor_closed": false
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
     }
   },
-  "launches": 1,
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply OK.",
         "effort": "low",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "full",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -35,8 +38,14 @@
           "stop_reason": "error",
           "class_hint": "auth"
         },
+        "usage": null,
+        "final_text": null,
         "error": null,
         "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted"
@@ -44,12 +53,14 @@
         "observations_exclude": [
           "final_text"
         ],
-        "steer": null,
-        "final_text": [],
-        "usage": null,
-        "instance": {
-          "vendor_version": "0.159.2"
+        "observation_counts": {
+          "turn.accepted": 1
         },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
         "notes": "Without a login thread/start and turn/start are accepted; error notifications with willRetry:true are progress diagnostics, not terminals; turn/completed failed with codexErrorInfo httpConnectionFailed{401} gives class hint auth (C2 §6.2 Class hints; vendors/codex.md §5). The `warning` is activity only."
       }
     }

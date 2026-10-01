@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe cat (first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME) and c6 (tool-free turn), 0.159.2, 2026-09-30; the 38.1 s wait is replayed as 1.5 s",
+  "source": "Codex re-probe c6 (tool-free turn) and cat (the first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME; replayed as 1.5 s), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); c6's hook/started and hook/completed notifications dropped (c6 ran with hooks on; VIA launches with --disable hooks)",
   "argv": [
     "app-server",
     "--disable",
