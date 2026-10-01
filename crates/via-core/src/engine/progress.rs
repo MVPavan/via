@@ -321,7 +321,9 @@ impl StepTracker {
 const LEDGER_KEYS: usize = 1024;
 
 /// One component's sum over the samples that contributed to it; `None`
-/// once any contributing sample lacked it (AD6).
+/// once any contributing sample lacked it (AD6), or once the sum no
+/// longer fits: an overflowing component is unavailable, never a
+/// saturated count reported as exact (C1 §5 per-field usage).
 #[derive(Clone, Copy, Debug, Default)]
 struct Sum {
     value: u64,
@@ -330,8 +332,8 @@ struct Sum {
 
 impl Sum {
     fn add(&mut self, component: Option<u64>) {
-        match component {
-            Some(value) => self.value = self.value.saturating_add(value),
+        match component.and_then(|value| self.value.checked_add(value)) {
+            Some(value) => self.value = value,
             None => self.missing = true,
         }
     }
@@ -724,6 +726,20 @@ mod tests {
         // A superseded sample no longer contributes.
         ledger.add(&call(Some("b"), 10, Some(4), 11));
         assert_eq!(ledger.figure(None).unwrap().0.cached_input, Some(5));
+    }
+
+    /// Sol r1 F10: a component whose sum does not fit `u64` is reported
+    /// unavailable (`null`), never saturated as an exact count; the other
+    /// components keep their sums.
+    #[test]
+    fn an_overflowing_component_is_unavailable() {
+        let mut ledger = UsageLedger::default();
+        ledger.add(&call(Some("a"), u64::MAX - 1, Some(1), 11));
+        ledger.add(&call(None, 5, Some(1), 6));
+        let (tokens, _) = ledger.figure(None).unwrap();
+        assert_eq!(tokens.input, None);
+        assert_eq!(tokens.cached_input, Some(2));
+        assert_eq!(tokens.total, Some(17));
     }
 
     /// AD6: a turn aggregate supersedes every call sample; no sample and no
