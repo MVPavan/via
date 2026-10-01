@@ -8,8 +8,12 @@ implementation develops.
 
 1. **Subscription/credential rule.** VIA invokes only the vendor's own binary
    or official SDK in its documented headless/programmatic mode, and never
-   reads, copies or reuses vendor credentials; the user logs in through the
-   vendor's tool. Terms uncertainty does not block development: build the
+   reads, copies or reuses vendor credentials. One narrow, owner-approved
+   exception (2026-10-01): a report-only leftover scan may transiently read
+   the environment of same-uid processes started at or after a vendor launch,
+   solely to match VIA's exact process marker; nothing else is parsed, kept,
+   logged or sent (C2 AD20). The user logs in through the vendor's tool.
+   Terms uncertainty does not block development: build the
    adapter properly, disable it if the vendor does not permit the route, and
    record terms status per adapter (not a gate).
    Source: `docs/brainstorms/README.md` §7; `docs/workstreams/handoff.md`.
