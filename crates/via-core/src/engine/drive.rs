@@ -1589,6 +1589,12 @@ impl Engine {
             .vendor_turn
             .as_ref()
             .map(|turn| turn.as_str().to_owned());
+        // C2 §2: a confirmed identity is the session's, whichever vendor
+        // turn its message names.
+        if let Observation::IdentityConfirmed(identity) = item.observation {
+            self.confirm_identity(record, lane, identity).await;
+            return;
+        }
         let attribution = lane.map_or(Attribution::Current, |lane| {
             lane.attribute(vendor_turn.as_deref(), Some(record.turn))
         });
@@ -1660,19 +1666,6 @@ impl Engine {
                     self.final_text_failed(record).await;
                 }
             }
-            Observation::IdentityConfirmed(identity) => {
-                // C1 §5: the session's vendor ID and transcript hint.
-                let identity = Identity {
-                    vendor_session_id: identity.vendor_session_id,
-                    transcript: identity
-                        .transcript
-                        .map(|path| path.to_string_lossy().into_owned()),
-                };
-                if let Some(lane) = lane {
-                    lane.confirm(identity.clone());
-                }
-                record.vendor.identity = Some(identity);
-            }
             Observation::ActionDenied(denial) => {
                 let own = (Some(record.turn.get()), false);
                 self.commit_denial(record, own, denial).await;
@@ -1684,12 +1677,78 @@ impl Engine {
             // C2 §4: a mismatch commits nothing itself; the turn is
             // disposed from its end (r3). A vendor close ends the driver's
             // connection, which the driver tracks. Steer reports, warnings
-            // and late terminals are not committed here.
-            Observation::ResumeMismatch { .. }
+            // and late terminals are not committed here. An identity was
+            // handled before attribution.
+            Observation::IdentityConfirmed(_)
+            | Observation::ResumeMismatch { .. }
             | Observation::VendorClosed(_)
             | Observation::SteerDelivered(_)
             | Observation::Warning(_)
             | Observation::LateTerminal(_) => {}
+        }
+    }
+
+    /// Commits a confirmed identity (C2 §2 delayed identity, C1 §6.1):
+    /// the first confirmation of a connection generation commits exactly
+    /// one `session.opened` (the session's first) or `session.reopened`,
+    /// carrying the ID and transcript hint, before any acceptance of the
+    /// same message, which the driver sends after it. Only a committed
+    /// identity becomes the session's (decision H3: the journal holds it);
+    /// a failed commit is the turn's first failure.
+    async fn confirm_identity(
+        &self,
+        record: &mut TurnRecord,
+        lane: Option<&Lane>,
+        identity: via_adapters::observation::Identity,
+    ) {
+        let mut confirmed = Identity {
+            vendor_session_id: identity.vendor_session_id,
+            transcript: identity
+                .transcript
+                .map(|path| path.to_string_lossy().into_owned()),
+        };
+        // The same vendor session keeps its transcript hint when a later
+        // confirmation names none.
+        if let (None, Some(known)) = (&confirmed.transcript, lane.and_then(Lane::identity))
+            && known.vendor_session_id == confirmed.vendor_session_id
+        {
+            confirmed.transcript = known.transcript;
+        }
+        let Some(lane) = lane else {
+            record.vendor.identity = Some(confirmed);
+            return;
+        };
+        let Some(first) = lane.opens(&identity.connection_id) else {
+            lane.confirm(confirmed.clone());
+            record.vendor.identity = Some(confirmed);
+            return;
+        };
+        let route = lane.reference.route.clone();
+        let vendor_session_id = confirmed.vendor_session_id.clone();
+        let transcript = confirmed.transcript.clone();
+        let body = if first {
+            EventBody::SessionOpened {
+                route,
+                vendor_session_id,
+                vendor_version: None,
+                transcript,
+            }
+        } else {
+            EventBody::SessionReopened {
+                route,
+                vendor_session_id,
+                vendor_version: None,
+                reason: "resume",
+                transcript,
+            }
+        };
+        let at = rfc3339(SystemTime::now());
+        let failed = record.first_failure.is_some();
+        let seq = journal::commit_event_as(&self.store, record, body, &at, (None, false)).await;
+        self.report_first_failure(record, failed).await;
+        if seq.is_some() {
+            lane.opened(identity.connection_id, confirmed.clone());
+            record.vendor.identity = Some(confirmed);
         }
     }
 

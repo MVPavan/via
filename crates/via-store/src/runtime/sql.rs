@@ -1053,13 +1053,36 @@ const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
               ORDER BY number DESC LIMIT 1),
              json_extract(receipt,'$.adapter_version'))";
 
-/// The route identity read at `first` and the two columns after it.
+/// `member` of the session's latest committed `session.opened` or
+/// `session.reopened` (decision H3: the confirmed vendor identity is the
+/// committed observation, never a Store update), for a query whose `?1` is
+/// the session.
+fn confirmed(member: &str) -> String {
+    format!(
+        "(SELECT CASE WHEN json_valid(event) THEN json_extract(event,'$.{member}') END FROM events
+          WHERE session_id=?1 AND type IN ('session.opened','session.reopened')
+          ORDER BY seq DESC LIMIT 1)"
+    )
+}
+
+/// The route identity read at `first` and the four columns after it.
 fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRoute> {
     Ok(SessionRoute {
         harness: row.get(first)?,
         route: row.get(first + 1)?,
         adapter_version: row.get(first + 2)?,
+        vendor_session_id: row.get(first + 3)?,
+        transcript: row.get(first + 4)?,
     })
+}
+
+/// [`ROUTE_COLUMNS`] with the confirmed identity's two columns.
+fn route_columns() -> String {
+    format!(
+        "{ROUTE_COLUMNS},{},{}",
+        confirmed("vendor_session_id"),
+        confirmed("transcript")
+    )
 }
 
 fn read_snapshot(
@@ -1077,6 +1100,7 @@ fn read_snapshot(
         Option<String>,
         SessionRoute,
     );
+    let route = route_columns();
     let row: Option<Row> = conn
         .query_row(
             &format!(
@@ -1084,7 +1108,7 @@ fn read_snapshot(
                     (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
                     (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
                     (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
-                    json_extract(params,'$.cwd'),{ROUTE_COLUMNS}
+                    json_extract(params,'$.cwd'),{route}
                  FROM sessions WHERE id=?1"
             ),
             [session.as_str()],
@@ -1167,11 +1191,12 @@ fn read_queued_turn(
         Option<String>,
         SessionRoute,
     );
+    let route = route_columns();
     let row: Option<Row> = conn
         .query_row(
             &format!(
                 "SELECT t.prompt,t.prompt_blob,t.effective,t.queued_at,t.queued_seq,
-                        json_extract(s.params,'$.cwd'),{ROUTE_COLUMNS}
+                        json_extract(s.params,'$.cwd'),{route}
                  FROM turns t JOIN sessions s ON s.id=t.session_id
                  WHERE t.session_id=?1 AND t.number=?2 AND t.state='queued'"
             ),
@@ -2270,12 +2295,17 @@ fn read_evidence_refs(
     type Row = (Option<String>, Option<String>, Option<u32>, Option<String>);
     let row: Option<Row> = conn
         .query_row(
-            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir
-             FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
-                (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
-                (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
-                (SELECT max(number) FROM turns WHERE session_id=s.id))
-             WHERE s.id=?1",
+            &format!(
+                "SELECT coalesce(s.vendor_session_id,{}),coalesce(s.transcript_hint,{}),
+                    t.number,t.evidence_dir
+                 FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
+                    (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
+                    (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
+                    (SELECT max(number) FROM turns WHERE session_id=s.id))
+                 WHERE s.id=?1",
+                confirmed("vendor_session_id"),
+                confirmed("transcript")
+            ),
             params![session.as_str(), turn.map(TurnNumber::get)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -2319,10 +2349,13 @@ fn read_session_status(
     let session = query.session.as_str();
     let row: Option<Session> = conn
         .query_row(
-            "SELECT state,admission,harness,label,created_ms,updated_ms,
-                json_extract(params,'$.model'),json_extract(params,'$.cwd'),
-                json_extract(receipt,'$.route'),vendor_session_id
-             FROM sessions WHERE id=?1",
+            &format!(
+                "SELECT state,admission,harness,label,created_ms,updated_ms,
+                    json_extract(params,'$.model'),json_extract(params,'$.cwd'),
+                    json_extract(receipt,'$.route'),coalesce(vendor_session_id,{})
+                 FROM sessions WHERE id=?1",
+                confirmed("vendor_session_id")
+            ),
             [session],
             |row| {
                 Ok((

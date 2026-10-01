@@ -44,8 +44,7 @@ const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 /// One session's driver and observation channel.
 pub(super) struct Lane {
     pub(super) driver: SessionDriver,
-    /// Test builds: the route identity the driver was opened with.
-    #[cfg(test)]
+    /// The session's route identity the driver was opened with.
     pub(super) reference: SessionRef,
     /// The session channel's receiver; the session's dispatcher holds it
     /// for the whole of a turn.
@@ -65,6 +64,10 @@ struct LaneState {
     tombstones: VecDeque<u64>,
     /// The session's confirmed vendor identity.
     identity: Option<Identity>,
+    /// A `session.opened` is committed: later generations reopen.
+    opened: bool,
+    /// The driver's connection generation whose identity is committed.
+    committed: Option<String>,
 }
 
 /// A confirmed vendor identity and its transcript hint (C1 §5, AD6).
@@ -89,14 +92,32 @@ pub(super) enum Attribution {
 }
 
 impl LaneState {
+    /// A new lane's state after a daemon restart or a close (C2 §2,
+    /// decision H3): the identity the session last committed, with its
+    /// transcript.
+    fn recovered(route: &SessionRoute) -> Self {
+        let identity = route.vendor_session_id.clone().map(|vendor_session_id| Identity {
+            vendor_session_id,
+            transcript: route.transcript.clone(),
+        });
+        Self {
+            opened: identity.is_some(),
+            identity,
+            ..Self::default()
+        }
+    }
+
     /// A replacing lane's state (C2 §2 health): the confirmed identity,
     /// with every vendor turn the failed lane mapped or tombstoned now
     /// tombstoned, so its traffic never becomes current or session-level.
+    /// Its driver's connection generations are new.
     fn successor(&self) -> Self {
         let mut successor = Self {
             turns: VecDeque::new(),
             tombstones: self.tombstones.clone(),
             identity: self.identity.clone(),
+            opened: self.opened,
+            committed: None,
         };
         for (vendor_turn, _) in &self.turns {
             successor.tombstone(vendor_turn);
@@ -219,6 +240,30 @@ impl Lane {
     pub(super) fn confirm(&self, identity: Identity) {
         lock(&self.state).identity = Some(identity);
     }
+
+    /// The event connection `generation`'s confirmed identity commits
+    /// (C2 §2 delayed identity): `None` once the generation committed one,
+    /// else whether it is the session's first (`session.opened`) or a
+    /// later one (`session.reopened`).
+    pub(super) fn opens(&self, generation: &str) -> Option<bool> {
+        let state = lock(&self.state);
+        (state.committed.as_deref() != Some(generation)).then_some(!state.opened)
+    }
+
+    /// Records the committed open of connection `generation` with its
+    /// confirmed `identity`.
+    pub(super) fn opened(&self, generation: String, identity: Identity) {
+        let mut state = lock(&self.state);
+        state.opened = true;
+        state.committed = Some(generation);
+        state.identity = Some(identity);
+    }
+
+    /// Whether this daemon committed the confirmed identity of the lane's
+    /// connection (C1 §3.7 `vendor_identity_verified`, decision H3).
+    pub(super) fn verified(&self) -> bool {
+        lock(&self.state).committed.is_some()
+    }
 }
 
 /// What a turn's observations and its end established for its envelope
@@ -317,7 +362,7 @@ impl Engine {
         cwd: PathBuf,
     ) -> Arc<Lane> {
         let kept = lock(&self.lanes).get(session).cloned();
-        let mut state = LaneState::default();
+        let mut state = LaneState::recovered(route);
         if let Some(lane) = kept {
             if !lane.failed() {
                 return lane;
@@ -350,7 +395,6 @@ impl Engine {
         };
         let lane = Arc::new(Lane {
             driver: self.adapter.open_session(&reference, spec, cx),
-            #[cfg(test)]
             reference,
             observations: tokio::sync::Mutex::new(receiver),
             state: StdMutex::new(state),
@@ -366,18 +410,13 @@ impl Engine {
         &self,
         session: &SessionId,
         (driver, receiver): (SessionDriver, mpsc::Receiver<Admitted>),
-        #[cfg_attr(
-            not(test),
-            expect(unused_variables, reason = "kept by test builds only")
-        )]
-        reference: &SessionRef,
+        (reference, route): (SessionRef, &SessionRoute),
     ) {
         let lane = Arc::new(Lane {
             driver,
-            #[cfg(test)]
-            reference: reference.clone(),
+            reference,
             observations: tokio::sync::Mutex::new(receiver),
-            state: StdMutex::new(LaneState::default()),
+            state: StdMutex::new(LaneState::recovered(route)),
             retired: std::sync::atomic::AtomicBool::new(false),
         });
         lock(&self.lanes).insert(session.clone(), lane);

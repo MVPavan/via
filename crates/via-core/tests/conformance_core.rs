@@ -232,6 +232,26 @@ impl Daemon {
         self.starter.abort();
         assert!(report.is_clean(), "{report:?}");
     }
+
+    /// Shuts down cleanly, then ends every task holding the Engine, so its
+    /// Store lock is free for the next daemon on the same root.
+    async fn stop(self) {
+        let report = self
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
+        self.starter.abort();
+        let _ = self.starter.await;
+        let handles = std::mem::take(&mut *self.dispatchers.lock().unwrap());
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert_eq!(Arc::strong_count(&self.engine), 1, "the Engine is held");
+    }
 }
 
 fn vendor_turn(turn: u32) -> String {
@@ -1270,5 +1290,106 @@ fn core_failed_lane_retires_before_reserving_replacement_capacity() {
             ))
             .await;
         daemon.starter.abort();
+    });
+}
+
+/// The session's committed events, in order.
+async fn events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
+    let params = serde_json::from_value(json!({"session":session,"limit":1000})).unwrap();
+    let page = daemon.engine.events(params).await.unwrap();
+    let page: Value = serde_json::from_str(page.get()).unwrap();
+    page["events"].as_array().unwrap().clone()
+}
+
+/// Sol r1 F1 (C2 §2 delayed identity, C1 §6.1, decision H3): a confirmed
+/// vendor identity is committed through the session journal, as one
+/// `session.opened` (`turn: null`, the route, the ID and its transcript)
+/// for the session's first connection generation and one
+/// `session.reopened` for each later one, before the same message's
+/// acceptance. After a daemon restart the lane recovers the committed
+/// identity, so a resume whose vendor returns another session is
+/// `resume_mismatch`; status and logs keep the ID and its transcript.
+#[test]
+fn core_confirmed_identity_is_durable_across_a_restart() {
+    let with_transcript = emit(&json!({"type":"identity","vendor_session_id":"v1",
+                                       "transcript":"/t/v1.jsonl"}));
+    let scripts = [
+        script(
+            "first",
+            &[with_transcript, accepted(1), terminal(1, "completed", "end_turn")],
+        ),
+        script(
+            "second",
+            &[identity("v1"), accepted(2), terminal(2, "completed", "end_turn")],
+        ),
+        script(
+            "other",
+            &[identity("v2"), accepted(3), terminal(3, "completed", "end_turn")],
+        ),
+    ];
+    let Some(root) = child(
+        "core_confirmed_identity_is_durable_across_a_restart",
+        &scenario(&json!({}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let session = {
+            let daemon = Daemon::open(&root);
+            let session = daemon.spawn("first", &json!({})).await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            daemon.resume(&session, "second").await;
+            let envelope = daemon.wait(&session, 2).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            let events = events(&daemon, &session).await;
+            let opens: Vec<&Value> = events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "session.opened" || event["type"] == "session.reopened"
+                })
+                .collect();
+            assert_eq!(opens.len(), 2, "one per connection generation: {events:?}");
+            assert_eq!(opens[0]["type"], "session.opened", "{events:?}");
+            assert_eq!(opens[1]["type"], "session.reopened", "{events:?}");
+            for open in &opens {
+                assert!(open["turn"].is_null(), "{open}");
+                assert_eq!(open["vendor_session_id"], "v1", "{open}");
+                assert_eq!(open["route"], "fake", "{open}");
+            }
+            assert_eq!(opens[0]["transcript"], "/t/v1.jsonl", "{events:?}");
+            // Committed before the same turn's acceptance.
+            for (open, turn) in opens.iter().zip([1, 2]) {
+                let started = events
+                    .iter()
+                    .find(|event| event["type"] == "turn.started" && event["turn"] == turn)
+                    .unwrap();
+                assert!(open["seq"].as_u64() < started["seq"].as_u64(), "{events:?}");
+            }
+            let params = serde_json::from_value(json!({"session":session})).unwrap();
+            let status = daemon.engine.status(params).await.unwrap();
+            assert_eq!(status["vendor_identity_verified"], true, "{status}");
+            daemon.stop().await;
+            session
+        };
+        let daemon = Daemon::open(&root);
+        daemon.engine.recover().await.unwrap();
+        daemon.engine.hand_off_queued().await.unwrap();
+        let params = serde_json::from_value(json!({"session":session})).unwrap();
+        let status = daemon.engine.status(params).await.unwrap();
+        assert_eq!(status["vendor_session_id"], "v1", "{status}");
+        // C1 §3.7: the historical ID, unverified until a new generation
+        // confirms.
+        assert_eq!(status["vendor_identity_verified"], false, "{status}");
+        let params = serde_json::from_value(json!({"turn":format!("{session}/1")})).unwrap();
+        let logs = daemon.engine.logs(params).await.unwrap();
+        assert_eq!(logs["vendor_session_id"], "v1", "{logs}");
+        assert_eq!(logs["transcript"], "/t/v1.jsonl", "{logs}");
+        daemon.resume(&session, "other").await;
+        let envelope = daemon.wait(&session, 3).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "resume_mismatch", "{envelope}");
+        daemon.shutdown().await;
     });
 }

@@ -2515,6 +2515,26 @@ pub(crate) enum EventBody {
     },
     #[serde(rename = "session.closed")]
     SessionClosed { reason: &'static str },
+    /// C1 §6.1, C2 §2: the session's first confirmed connection
+    /// generation. `transcript` is C2's hint, committed with the ID.
+    #[serde(rename = "session.opened")]
+    SessionOpened {
+        route: String,
+        vendor_session_id: String,
+        vendor_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcript: Option<String>,
+    },
+    /// C1 §6.1, C2 §2: a later confirmed connection generation.
+    #[serde(rename = "session.reopened")]
+    SessionReopened {
+        route: String,
+        vendor_session_id: String,
+        vendor_version: Option<String>,
+        reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcript: Option<String>,
+    },
 }
 
 /// C1 §6.1 event with every common field.

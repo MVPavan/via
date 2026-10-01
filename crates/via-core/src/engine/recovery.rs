@@ -447,7 +447,7 @@ impl Engine {
             super::lock(&self.faults.recoveries).push((session.clone(), facts.len(), answer));
         }
         if let Recovery::Resumed(driver) = recovery {
-            self.adopt_lane(session, (*driver, receiver), &reference);
+            self.adopt_lane(session, (*driver, receiver), (reference, &snapshot.route));
         }
         Ok(())
     }

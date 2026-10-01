@@ -288,7 +288,7 @@ pub struct SessionSnapshot {
 /// A session's frozen route identity (C2 §2 `SessionRef`): its harness, its
 /// receipt's route, and its recorded adapter version: the latest submitted
 /// turn's frozen `adapter_version` where one was recorded (decision H3),
-/// else the receipt's.
+/// else the receipt's; with the vendor identity it last confirmed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionRoute {
     /// `sessions.harness`.
@@ -297,6 +297,11 @@ pub struct SessionRoute {
     pub route: Option<String>,
     /// The recorded adapter version.
     pub adapter_version: Option<String>,
+    /// The confirmed vendor session ID: the latest committed
+    /// `session.opened` or `session.reopened`'s (decision H3).
+    pub vendor_session_id: Option<String>,
+    /// That event's transcript hint.
+    pub transcript: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
