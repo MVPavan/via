@@ -1865,6 +1865,12 @@ fn core_an_aborted_dispatcher_strands_no_turn_work() {
     // acceptance's is the first, the first denial's the second).
     arm(&root, "core.observations.pause", "pause");
     arm_at(&root, "store.commit.event", 3, "pause");
+    // Acknowledged only: the driver's turn returned.
+    fs::write(
+        root.join("points").join("core.run.returned.json"),
+        json!({"token":"conformance-core","occurrence":1,"action":"delay","value":0}).to_string(),
+    )
+    .unwrap();
     run(async {
         let daemon = Daemon::open(&root);
         let session = daemon.spawn("p", &json!({})).await;
@@ -1878,8 +1884,8 @@ fn core_an_aborted_dispatcher_strands_no_turn_work() {
             }
         };
         until("core.observations.pause.1.ack").await;
-        // The driver delivers the turn's items and returns.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The driver delivered the turn's items and returned.
+        until("core.run.returned.1.ack").await;
         fs::write(points.join("core.observations.pause.1.release"), b"").unwrap();
         until("store.commit.event.3.ack").await;
         let dispatchers = std::mem::take(&mut *daemon.dispatchers.lock().unwrap());

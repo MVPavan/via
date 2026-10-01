@@ -1563,7 +1563,12 @@ impl Engine {
                     let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
                     control.slot.idle_order(control.turn, tokio::time::Instant::now());
                 }
-                end = &mut run => break end,
+                end = &mut run => {
+                    // Test builds: the driver's turn returned.
+                    #[cfg(feature = "test-failpoints")]
+                    let _ = via_store::failpoint::hit_async("core.run.returned").await;
+                    break end;
+                }
             }
         };
         // The driver delivered the turn's items before it returned.
@@ -2552,7 +2557,12 @@ where
         tokio::select! {
             biased;
             output = &mut commit => return output,
-            result = &mut *execute => *early = Some(result),
+            result = &mut *execute => {
+                *early = Some(result);
+                // Test builds: the driver's turn returned.
+                #[cfg(feature = "test-failpoints")]
+                let _ = via_store::failpoint::hit_async("core.run.returned").await;
+            }
         }
     }
     commit.await

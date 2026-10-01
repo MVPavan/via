@@ -4105,6 +4105,13 @@ fn a_force_during_close_still_closes_and_drains_the_lane() {
         return;
     };
     let points = pause_first(&root, "core.lane.dispose");
+    // Acknowledged only: the close asked the lane's actor for its end.
+    arm_point(
+        &points,
+        "core.lane.close_requested",
+        1,
+        &json!({"action":"delay","value":0}),
+    );
     run(async {
         let engine = open(&root);
         let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
@@ -4112,9 +4119,9 @@ fn a_force_during_close_still_closes_and_drains_the_lane() {
         send_denials(&sender, &budget, &["one", "two", "three"]).await;
         until(|| acked(&points, "core.lane.dispose", 1)).await;
         let forcing = async {
-            // The close pass reaches the lane's close, which waits for the
-            // item in flight; then the daemon is forced.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // The close pass asked for the lane's close, which waits for
+            // the item in flight; then the daemon is forced.
+            until(|| acked(&points, "core.lane.close_requested", 1)).await;
             engine.request_stop(&force()).await.unwrap();
         };
         let (_closed, (), ()) = tokio::join!(

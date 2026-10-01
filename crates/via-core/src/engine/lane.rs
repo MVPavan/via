@@ -1092,6 +1092,9 @@ impl Engine {
             return;
         };
         lane.begin_close(mode, deadline);
+        // Test builds: the close is the lane actor's request.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.close_requested").await;
         lane.retired().await;
         let mut lanes = lock(&self.lanes);
         if lanes
