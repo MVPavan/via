@@ -291,9 +291,18 @@ cases! {
     conformance_claude_c7_interrupt => "c7_interrupt",
     conformance_claude_c9a => "c9a",
     conformance_claude_c9b => "c9b",
-    conformance_claude_c10_early_eof => "c10_early_eof",
     conformance_claude_c11b_stdio_prompt => "c11b_stdio_prompt",
 }
+
+/// Vendor-behaviour records: fixtures with an expectation file that are not
+/// adapter conformance cases, so they have no test. `fixtures.rs` still
+/// replays and scans them.
+const VENDOR_RECORDS: [(&str, &str); 1] = [(
+    "c10_early_eof",
+    "stdin EOF right after the prompt still completes the turn: the evidence \
+     behind AD15/VC7. No C2 verb makes a correct adapter close stdin early; \
+     c7's AD19 order pins the adapter side",
+)];
 
 const REFUSALS: [&str; 8] = [
     "unsupported_verb",
@@ -512,7 +521,7 @@ fn check_case(name: &str) -> Result<(), String> {
         .try_for_each(|turn| check_turn(name, sessions, turn))
 }
 
-/// Green now: every expectation has a test and a fixture, and uses only the
+/// Green now: every expectation has a test or is a vendor record, has a fixture, and uses only the
 /// unified schema's fields and C2's names.
 #[test]
 fn conformance_claude_expectations_are_well_formed() -> Result<(), String> {
@@ -523,10 +532,20 @@ fn conformance_claude_expectations_are_well_formed() -> Result<(), String> {
             files.insert(case.to_owned());
         }
     }
-    let cases: BTreeSet<String> = CASES.iter().map(|case| (*case).to_owned()).collect();
+    let mut cases: BTreeSet<String> = CASES.iter().map(|case| (*case).to_owned()).collect();
+    for (record, why) in VENDOR_RECORDS {
+        ensure!(
+            !why.is_empty(),
+            "{record}: a vendor record needs its reason"
+        );
+        ensure!(
+            cases.insert(record.to_owned()),
+            "{record} is both a case and a vendor record"
+        );
+    }
     ensure!(
         files == cases,
-        "expect files {files:?} differ from tests {cases:?}"
+        "expect files {files:?} differ from tests and vendor records {cases:?}"
     );
-    CASES.iter().try_for_each(|name| check_case(name))
+    cases.iter().try_for_each(|name| check_case(name))
 }
