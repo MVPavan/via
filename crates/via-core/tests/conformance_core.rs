@@ -2105,3 +2105,167 @@ fn core_an_aborted_dispatcher_strands_no_turn_work() {
         daemon.starter.abort();
     });
 }
+
+/// Idle session lanes the daemon keeps (runtime §8).
+#[cfg(feature = "test-failpoints")]
+const IDLE_LANES: usize = 32;
+
+/// The scripts of the idle-lane cases: every session's first turn
+/// confirms `v1`; a later one confirms `v2`, or `v1` again (as turn 2
+/// or 3).
+#[cfg(feature = "test-failpoints")]
+fn idle_lane_scripts() -> Vec<Value> {
+    let turn = |prompt: &str, id: &str, number: u32| {
+        script(
+            prompt,
+            &[
+                identity(id),
+                accepted(number),
+                terminal(number, "completed", "end_turn"),
+            ],
+        )
+    };
+    vec![
+        turn("first", "v1", 1),
+        turn("other", "v2", 2),
+        turn("second", "v1", 3),
+        turn("again", "v1", 2),
+    ]
+}
+
+/// Runs `count` more sessions, one after another, each to the end of its
+/// first turn.
+#[cfg(feature = "test-failpoints")]
+async fn run_sessions(daemon: &Daemon, count: usize) {
+    for _ in 0..count {
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+    }
+}
+
+/// Waits until the daemon's lanes and tracked tasks are within the idle
+/// lanes' bound, with nothing running.
+#[cfg(feature = "test-failpoints")]
+async fn until_bounded(daemon: &Daemon) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (lanes, tasks) = daemon.engine.lane_census();
+        if lanes <= IDLE_LANES && tasks <= IDLE_LANES {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < by,
+            "(lanes, tracked tasks) ({lanes}, {tasks}) past the bound {IDLE_LANES}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Critical r1b #8 (runtime §8 idle session lanes, C2 §3 idle lanes):
+/// sessions run one after another to completion past the bound keep at
+/// most `IDLE_LANES` lanes registered and their actors' tasks live: the
+/// least recently used idle lane's driver is closed, which is not the
+/// session's close. Its session keeps its stored identity, unverified as
+/// after a restart, and its next turn opens a new driver from it: another
+/// vendor session is `resume_mismatch`, and the same one completes.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_idle_lanes_past_the_bound_reopen_from_the_stored_identity() {
+    let Some(root) = child(
+        "core_idle_lanes_past_the_bound_reopen_from_the_stored_identity",
+        &scenario(&json!({}), &idle_lane_scripts()),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let evicted = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&evicted, 1).await;
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        assert_eq!(verified(&daemon, &evicted).await, true);
+        run_sessions(&daemon, IDLE_LANES + 1).await;
+        until_bounded(&daemon).await;
+        // C1 §3.7: the historical ID, unverified until a new generation
+        // confirms; the session is not closed.
+        let params = serde_json::from_value(json!({"session":evicted})).unwrap();
+        let status = daemon.engine.status(params).await.unwrap();
+        assert_eq!(status["vendor_session_id"], "v1", "{status}");
+        assert_eq!(status["vendor_identity_verified"], false, "{status}");
+        assert_eq!(status["state"], "idle", "{status}");
+        let types: Vec<Value> = events(&daemon, &evicted)
+            .await
+            .iter()
+            .map(|event| event["type"].clone())
+            .collect();
+        assert!(!types.contains(&json!("session.closed")), "{types:?}");
+
+        daemon.resume(&evicted, "other").await;
+        let envelope = daemon.wait(&evicted, 2).await;
+        assert_eq!(class(&envelope), "resume_mismatch", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        daemon.resume(&evicted, "second").await;
+        let envelope = daemon.wait(&evicted, 3).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// Critical r1b #8 (C2 §3 idle lanes): a dispatch racing the eviction of
+/// its session's lane waits for the evicted lane's end, its driver closed
+/// and its channel drained, before the turn is submitted and a new driver
+/// opened: one driver at a time. The turn is not lost: it runs on the
+/// reopened driver with the stored identity.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
+    let Some(root) = child(
+        "core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once",
+        &scenario(&json!({}), &idle_lane_scripts()),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // The first lane to end, the evicted one, is held after its driver's
+    // close, before its channel's drain.
+    arm(&root, "core.lane.admission_close", "pause");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let evicted = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&evicted, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        run_sessions(&daemon, IDLE_LANES).await;
+        until_acked(&root, "core.lane.admission_close", 1).await;
+        daemon.resume(&evicted, "again").await;
+        // The dispatch waits on the ending lane: nothing is submitted.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let submitted = |events: &[Value]| {
+            events
+                .iter()
+                .any(|event| event["type"] == "turn.submitted" && event["turn"] == 2)
+        };
+        let held = events(&daemon, &evicted).await;
+        assert!(!submitted(&held), "{held:?}");
+        fs::write(
+            root.join("points")
+                .join("core.lane.admission_close.1.release"),
+            b"",
+        )
+        .unwrap();
+        let envelope = daemon.wait(&evicted, 2).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        let after = events(&daemon, &evicted).await;
+        assert!(submitted(&after), "{after:?}");
+        let reopened = after
+            .iter()
+            .filter(|event| event["type"] == "session.reopened")
+            .count();
+        assert_eq!(reopened, 1, "one new driver's generation: {after:?}");
+        until_bounded(&daemon).await;
+        daemon.shutdown().await;
+    });
+}
