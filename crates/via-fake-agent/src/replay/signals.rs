@@ -1,10 +1,10 @@
 //! Signals for replay: one watcher thread owns the handlers and publishes
 //! each delivered signal to a queue of at most [`QUEUE`] entries, stamped
-//! with its arrival, the instant the watcher publishes it (as stdin's
-//! reader does for lines). An `await_signal` step takes the first queued
-//! signal of its kind and completes at that arrival, not when the step
-//! handles it, so an adapter that signals and then closes stdin at once
-//! passes an `await_eof` that follows (via-jm4.33).
+//! with its arrival, the instant the watcher publishes it. An
+//! `await_signal` step takes the first queued signal of its kind; one that
+//! arrived after the run deadline fails, whether or not the watchdog has
+//! ended the run yet. Ordering against later input is the progress log's
+//! job, not these stamps' (see the replay docs).
 //!
 //! The handlers are installed before [`Signals::start`] returns, so a
 //! signal that comes before its step is held for it. Signals of a kind no
@@ -71,9 +71,9 @@ impl Signals {
         Ok(Self { shared, deadline })
     }
 
-    /// Takes the first arrival of `name`, waiting until the run deadline,
-    /// and returns its arrival instant.
-    pub(super) fn take(&self, name: SignalName) -> Result<Instant, String> {
+    /// Takes the first arrival of `name`, waiting until the run deadline;
+    /// an arrival after the deadline fails.
+    pub(super) fn take(&self, name: SignalName) -> Result<(), String> {
         let mut queue = self.shared.lock();
         loop {
             if queue.overflowed {
@@ -84,7 +84,11 @@ impl Signals {
                     .arrivals
                     .remove(at)
                     .ok_or("the signal queue changed under its lock")?;
-                return Ok(arrived);
+                return if arrived > self.deadline {
+                    Err(format!("{} arrived after the run deadline", name.text()))
+                } else {
+                    Ok(())
+                };
             }
             let left = self.deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -166,5 +170,34 @@ fn watch(
         }
         drop(queue);
         shared.arrived.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn an_arrival_after_the_deadline_fails_even_when_queued() {
+        let deadline = Instant::now();
+        let signals = Signals {
+            shared: Arc::default(),
+            deadline,
+        };
+        signals
+            .shared
+            .lock()
+            .arrivals
+            .push_back((deadline + Duration::from_secs(1), SignalName::Usr1));
+        let late = signals.take(SignalName::Usr1);
+        assert!(late.is_err(), "a late arrival was taken");
+        signals
+            .shared
+            .lock()
+            .arrivals
+            .push_back((deadline, SignalName::Usr1));
+        assert!(signals.take(SignalName::Usr1).is_ok());
     }
 }

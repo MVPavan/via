@@ -1,6 +1,6 @@
 {
   "source": "Codex re-probe c6 (tool-free turn) and cat (the first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME; replayed behind the driver's gate), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); c6's hook/started and hook/completed notifications dropped (c6 ran with hooks on; VIA launches with --disable hooks); the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
-  "notes": "Step 11 (turn/start) is pipelined: VIA writes it on the thread/start reply (step 9), independently of the thread/started notification the server wrote after that reply. Step 2 holds the initialize reply until the driver's gate (SIGUSR1): the recorded first initialize took 38.1 s on a fresh home, so the case's gate advances controlled time by 40,000 ms before releasing it. The handshake deadline is the turn's remaining wall time (vendor spec §2), so an adapter with a fixed short handshake timeout fails this case.",
+  "notes": "Step 11 (turn/start) names step 9, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it. Step 2 holds the initialize reply until the driver's gate (SIGUSR1): the recorded first initialize took 38.1 s on a fresh home, so the case's gate advances controlled time by 40,000 ms before releasing it. The handshake deadline is the turn's remaining wall time (vendor spec §2), so an adapter with a fixed short handshake timeout fails this case.",
   "argv": [
     "app-server",
     "--disable",
@@ -122,7 +122,7 @@
         "capture": {
           "turn": "/id"
         },
-        "pipelined": true
+        "after_emit": 9
       }
     },
     {

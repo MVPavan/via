@@ -5,12 +5,13 @@
 //! - Every `*.replay.json` loads in replay mode and names its source run.
 //! - A generic driver that answers each expect step with that step's own
 //!   line (a subset matches itself), reads back each emitted line, delivers
-//!   each `await_signal` once the fake catches that signal and closes stdin
-//!   at each `await_eof`, completes the fixture with the exit code and
-//!   stderr of its `exit` step (0 and none without one), with one launch
-//!   logged per start. Ordered EOF and strict
-//!   trailing input hold: a line resent before an `await_eof`, or an EOF
-//!   right after the first line, fails replay.
+//!   each `await_signal` between the fake's `at` and `signalled` progress
+//!   lines and closes stdin at each `await_eof`, completes the fixture with
+//!   the end the shared `replay_exit` check expects (its `exit` step's code
+//!   and stderr, or 0 and none), with one launch logged per start. A line
+//!   written ahead of its `after_emit` predecessor fails. Ordered EOF and
+//!   strict trailing input hold: a line resent before an `await_eof`, or an
+//!   EOF right after the first line, fails replay.
 //! - No fixture file contains a home path (`/home/`, `/Users/`, `/root/`,
 //!   `X:\Users\` on any drive), an email address, a token-like value
 //!   (`sk-`, `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`, `github_pat_`, `xox?-`,
@@ -22,11 +23,14 @@
 //!   `ANTHROPIC_AUTH_TOKEN`, …: any name ending in one of
 //!   [`CREDENTIAL_SUFFIXES`]). JSON `\u` escapes are decoded before matching,
 //!   including inside prefixed stderr. Every key and string is scanned, the
-//!   step fields (`exit.stderr`, `absent` pointers) included; a credential
-//!   assigned in free text (`api_key=…`) is a finding.
+//!   step fields (`exit.stderr`, `absent` pointers) included. A credential
+//!   or identity name assigned in free text or prefixed JSON (`api_key=…`,
+//!   `WARN {"username":"…"}`), and a credential option given a value
+//!   (`--password VALUE`, `["--token", "VALUE"]`), are findings unless the
+//!   value is a placeholder.
 //! - Every file under the fixtures root is scanned, nested directories
-//!   included. Test sources are outside the scan: they are covered by normal
-//!   review.
+//!   included; a symlink in the tree fails the scan. Test sources are
+//!   outside the scan: they are covered by normal review.
 //! - Every fixture that does not model a crash seals its input with a final
 //!   `await_eof` (alone, or right before its `exit`); the exceptions are
 //!   listed with their reasons.
@@ -46,6 +50,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+#[path = "../../via-core/tests/support/replay_exit.rs"]
+mod replay_exit;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -98,16 +105,21 @@ fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures")
 }
 
-/// Every file under `root`, nested directories included, sorted.
+/// Every file under `root`, nested directories included, sorted. A
+/// symlink anywhere in the tree is an error: it could loop or lead outside
+/// the fixtures, and a fixture has no reason to be one.
 fn files_under(root: &Path) -> TestResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            if path.is_dir() {
+            let kind = fs::symlink_metadata(&path)?.file_type();
+            if kind.is_symlink() {
+                return Err(format!("{} is a symlink", path.display()).into());
+            } else if kind.is_dir() {
                 dirs.push(path);
-            } else if path.is_file() {
+            } else if kind.is_file() {
                 files.push(path);
             }
         }
@@ -332,10 +344,12 @@ enum Deviation {
     ExtraInput,
     /// Closes stdin right after the first answered line.
     EarlyEof,
+    /// Writes each `after_emit` step's line together with the last answer
+    /// before its predecessor emit, as an adapter that did not wait for that
+    /// reply would. The fixture gets a delay before each such emit (see
+    /// [`slowed`]), so the early line surely arrives before the emit.
+    Hoisted,
 }
-
-/// What the fake must end with: its exit code and stderr.
-type End = (i64, String);
 
 /// The fixtures one file holds, in launch order: the file itself, or each
 /// of its `lifetimes`.
@@ -346,8 +360,9 @@ fn lifetimes_of(file: &Value) -> Vec<&Value> {
     }
 }
 
-/// Every pipelined expect step names its reason in the fixture's notes.
-fn pipelined_have_reasons(fixture: &Value) -> Result<(), String> {
+/// Every expect step with an `after_emit` names its reason in the
+/// fixture's notes.
+fn after_emit_have_reasons(fixture: &Value) -> Result<(), String> {
     let notes = fixture
         .get("notes")
         .and_then(Value::as_str)
@@ -360,28 +375,73 @@ fn pipelined_have_reasons(fixture: &Value) -> Result<(), String> {
         .enumerate()
     {
         let number = index + 1;
-        if step["expect"]["pipelined"] == Value::Bool(true)
-            && !notes.contains(&format!("step {number}"))
+        if step["expect"].get("after_emit").is_some() && !notes.contains(&format!("step {number}"))
         {
             return Err(format!(
-                "step {number} is pipelined with no reason in notes"
+                "step {number} names an after_emit with no reason in notes"
             ));
         }
     }
     Ok(())
 }
 
+/// `fixture` with a 200 ms delay before each emit that an `after_emit`
+/// names, every `after_emit` renumbered to match.
+fn slowed(fixture: &Value) -> Value {
+    let steps = fixture["steps"].as_array().cloned().unwrap_or_default();
+    let named: Vec<u64> = steps
+        .iter()
+        .filter_map(|step| step["expect"]["after_emit"].as_u64())
+        .collect();
+    // Old step number to new, 1-based.
+    let mut moved = BTreeMap::new();
+    let mut out = Vec::new();
+    for (index, step) in steps.into_iter().enumerate() {
+        let number = index as u64 + 1;
+        if named.contains(&number) {
+            out.push(serde_json::json!({"delay": {"ms": 200}}));
+        }
+        moved.insert(number, out.len() as u64 + 1);
+        out.push(step);
+    }
+    for step in &mut out {
+        if let Some(emit) = step["expect"]["after_emit"].as_u64() {
+            step["expect"]["after_emit"] = Value::from(moved[&emit]);
+        }
+    }
+    let mut fixture = fixture.clone();
+    fixture["steps"] = Value::Array(out);
+    fixture
+}
+
 /// Runs one fixture file with the generic driver: each lifetime as its own
 /// launch, in order. A single fixture's `--version` is probed first; a
 /// lifetime's is not, since a probe would take a lifetime's launch.
 fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
-    let file: Value = serde_json::from_slice(&fs::read(fixture_path)?)?;
+    let mut file: Value = serde_json::from_slice(&fs::read(fixture_path)?)?;
     let source = file.get("source").and_then(Value::as_str).unwrap_or("");
     if source.trim().is_empty() {
         return Err("the fixture names no source run".into());
     }
     let root = tempfile::tempdir()?;
     let binary = install(root.path(), fixture_path)?;
+    for fixture in lifetimes_of(&file) {
+        after_emit_have_reasons(fixture)?;
+    }
+    if deviation == Deviation::Hoisted {
+        file = match file.get("lifetimes").and_then(Value::as_array) {
+            Some(lifetimes) => {
+                let mut slow = file.clone();
+                slow["lifetimes"] = lifetimes.iter().map(slowed).collect();
+                slow
+            }
+            None => slowed(&file),
+        };
+        fs::write(
+            root.path().join("vendor.replay.json"),
+            serde_json::to_vec(&file)?,
+        )?;
+    }
     let lifetimes = lifetimes_of(&file);
     let single = file.get("lifetimes").is_none();
     let mut starts = 0;
@@ -390,8 +450,12 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
         starts += 1;
     }
     for (index, fixture) in lifetimes.into_iter().enumerate() {
-        pipelined_have_reasons(fixture)?;
-        run_lifetime(&binary, fixture, deviation)
+        let suffix = if single {
+            String::new()
+        } else {
+            format!(" lifetime {}", index + 1)
+        };
+        run_lifetime(&binary, fixture, (deviation, &suffix))
             .map_err(|error| format!("lifetime {}: {error}", index + 1))?;
         starts += 1;
     }
@@ -423,7 +487,11 @@ fn probe_version(binary: &Path, version: &str) -> TestResult {
 }
 
 /// Runs one launch of the fake against `fixture`'s steps.
-fn run_lifetime(binary: &Path, fixture: &Value, deviation: Deviation) -> TestResult {
+fn run_lifetime(
+    binary: &Path,
+    fixture: &Value,
+    (deviation, suffix): (Deviation, &str),
+) -> TestResult {
     let mut captures = BTreeMap::new();
     let args = args_of(fixture, &mut captures)?;
     let mut child = Command::new(binary)
@@ -442,6 +510,8 @@ fn run_lifetime(binary: &Path, fixture: &Value, deviation: Deviation) -> TestRes
         text
     });
     let pid = child.id();
+    let mut progress = binary.as_os_str().to_owned();
+    progress.push(".progress");
     let deadline = Instant::now() + OUTER;
     // From here every blocking step is bounded: at the deadline the
     // supervisor kills the fake, which ends writes, reads and the wait.
@@ -453,6 +523,7 @@ fn run_lifetime(binary: &Path, fixture: &Value, deviation: Deviation) -> TestRes
             stdin: &mut stdin,
             stdout: &stdout,
             pid,
+            progress: (Path::new(&progress), suffix),
             deadline,
             captures,
             deviation,
@@ -464,13 +535,8 @@ fn run_lifetime(binary: &Path, fixture: &Value, deviation: Deviation) -> TestRes
         return Err("the fake outlived the outer bound".into());
     }
     let stderr = stderr.join().map_err(|_| "stderr reader panicked")?;
-    let (code, text) =
-        steps.map_err(|error| format!("{error}; the fake ended {status}: {stderr}"))?;
-    if status.code().map(i64::from) != Some(code) || stderr != text {
-        return Err(
-            format!("{status} with stderr {stderr:?}; fixture says {code} {text:?}").into(),
-        );
-    }
+    steps.map_err(|error| format!("{error}; the fake ended {status}: {stderr}"))?;
+    replay_exit::replay_exit(fixture, status.code(), &stderr)?;
     if let Ok(Ok(extra)) = stdout.recv_timeout(Duration::from_millis(100)) {
         return Err(format!("unexpected extra output {extra}").into());
     }
@@ -482,22 +548,21 @@ struct Run<'a> {
     stdin: &'a mut Option<ChildStdin>,
     stdout: &'a Receiver<Result<String, String>>,
     pid: u32,
+    /// The fake's progress log and this launch's line suffix.
+    progress: (&'a Path, &'a str),
     deadline: Instant,
     captures: BTreeMap<String, String>,
     deviation: Deviation,
 }
 
-/// Answers the fixture's steps in order and returns how the fake must end:
-/// exit 0 with no stderr, unless an exit step says otherwise.
-fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
-    let mut end = (0, String::new());
+/// Answers the fixture's steps in order; how the fake must end is
+/// [`replay_exit::replay_exit`]'s to judge.
+fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult {
     let mut last_answer = None;
-    for (index, step) in fixture["steps"]
-        .as_array()
-        .ok_or("steps is not an array")?
-        .iter()
-        .enumerate()
-    {
+    let steps = fixture["steps"].as_array().ok_or("steps is not an array")?;
+    // Hoisted lines, by the step that expects them.
+    let mut hoisted: BTreeMap<usize, Value> = BTreeMap::new();
+    for (index, step) in steps.iter().enumerate() {
         let number = index + 1;
         let fail = |message: String| format!("step {number}: {message}");
         if let Some(emit) = step.get("emit") {
@@ -512,6 +577,8 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
             if line != expected {
                 return Err(fail(format!("emitted {line}, fixture says {expected}")).into());
             }
+        } else if let Some(line) = hoisted.remove(&number) {
+            last_answer = Some(line);
         } else if let Some(expect) = step.get("expect") {
             let line = answer(expect, &mut run.captures).map_err(fail)?;
             // The answer is the fixture's own subset, so an absent pointer
@@ -533,29 +600,54 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
                 .stdin
                 .as_mut()
                 .ok_or_else(|| fail("stdin already closed".to_owned()))?;
-            // Answered at once, so any `within_ms` is met.
-            writeln!(input, "{line}")?;
+            // Answered at once, so any `within_ms` is met. Hoisted lines go
+            // in the same write, ahead of the emit they should wait for.
+            let mut text = format!("{line}\n");
+            if run.deviation == Deviation::Hoisted {
+                for (later, ahead) in steps.iter().enumerate().skip(index + 1) {
+                    let Some(emit) = ahead["expect"]["after_emit"]
+                        .as_u64()
+                        .and_then(|emit| usize::try_from(emit).ok())
+                    else {
+                        continue;
+                    };
+                    // The last expect before the predecessor emit carries it.
+                    let carrier = steps[..emit.saturating_sub(1)]
+                        .iter()
+                        .rposition(|step| step.get("expect").is_some());
+                    if carrier == Some(index) {
+                        let early = answer(&ahead["expect"], &mut run.captures).map_err(fail)?;
+                        text.push_str(&early.to_string());
+                        text.push('\n');
+                        hoisted.insert(later + 1, early);
+                    }
+                }
+            }
+            input.write_all(text.as_bytes())?;
             input.flush()?;
             last_answer = Some(line);
             if run.deviation == Deviation::EarlyEof {
                 drop(run.stdin.take());
             }
         } else if let Some(wait) = step.get("await_signal") {
-            let (signal, number) = match wait["signal"].as_str() {
-                Some("SIGINT") => ("-INT", 2),
-                Some("SIGTERM") => ("-TERM", 15),
-                Some("SIGUSR1") => ("-USR1", 10),
+            let signal = match wait["signal"].as_str() {
+                Some("SIGINT") => "-INT",
+                Some("SIGTERM") => "-TERM",
+                Some("SIGUSR1") => "-USR1",
                 other => return Err(fail(format!("unknown signal {other:?}")).into()),
             };
-            // A gate before any emit can come before the fake's setup, so
-            // wait until the fake catches the signal instead of dying of it.
-            wait_until_caught(run.pid, number, run.deadline).map_err(fail)?;
+            // The gate obligations: signal only once the fake reports it is
+            // at the step, and go on only once it reports the signal taken.
+            let (log, suffix) = run.progress;
+            wait_for_progress(log, &format!("at {number}{suffix}"), run.deadline).map_err(fail)?;
             let status = Command::new("kill")
                 .args([signal, &run.pid.to_string()])
                 .status()?;
             if !status.success() {
                 return Err(fail("kill failed".to_owned()).into());
             }
+            wait_for_progress(log, &format!("signalled {number}{suffix}"), run.deadline)
+                .map_err(fail)?;
         } else if step.get("await_eof").is_some() {
             if run.deviation == Deviation::ExtraInput
                 && let (Some(input), Some(line)) = (run.stdin.as_mut(), &last_answer)
@@ -564,40 +656,26 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
                 input.flush()?;
             }
             drop(run.stdin.take());
-        } else if let Some(exit) = step.get("exit") {
-            let code = exit["code"]
-                .as_i64()
-                .ok_or_else(|| fail("exit code".to_owned()))?;
-            let text = exit["stderr"]
-                .as_str()
-                .ok_or_else(|| fail("exit stderr".to_owned()))?;
-            end = (code, text.to_owned());
+        } else if step.get("exit").is_some() {
+            // Judged after the fake ends.
         } else if step.get("delay").is_none() && step.get("spawn_survivor").is_none() {
             return Err(fail(format!("unknown step {step}")).into());
         }
     }
-    Ok(end)
+    Ok(())
 }
 
-/// Waits until process `pid` catches signal `number` (Linux: its bit in
-/// `SigCgt` of `/proc/<pid>/status`), polling until `deadline`.
-fn wait_until_caught(pid: u32, number: u32, deadline: Instant) -> Result<(), String> {
-    let bit = 1_u64 << (number - 1);
+/// Waits until the progress log holds `line`, polling until `deadline`.
+fn wait_for_progress(log: &Path, line: &str, deadline: Instant) -> Result<(), String> {
     loop {
-        let status = fs::read_to_string(format!("/proc/{pid}/status"))
-            .map_err(|error| format!("cannot read the fake's status: {error}"))?;
-        let caught = status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigCgt:"))
-            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-            .ok_or("no SigCgt in the fake's status")?;
-        if caught & bit != 0 {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        if text.lines().any(|seen| seen == line) {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("the fake never caught signal {number}"));
+            return Err(format!("the progress log never showed {line:?}: {text:?}"));
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -848,7 +926,9 @@ fn value_finding(value: &Value) -> Option<String> {
             }
             hygiene_finding(key).or_else(|| value_finding(item))
         }),
-        Value::Array(items) => items.iter().find_map(value_finding),
+        Value::Array(items) => {
+            credential_argument(items).or_else(|| items.iter().find_map(value_finding))
+        }
         Value::String(text) => hygiene_finding(text)
             .or_else(|| secret_assignment(text))
             .or_else(|| {
@@ -901,23 +981,32 @@ fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
         })
 }
 
-/// A credential assigned a value in free text, such as stderr: a credential
-/// name (normalized), an optional quote, `=` or `:`, then a value that is
-/// not exactly a placeholder (or a bare `null`). A quoted value is taken
-/// whole, through its closing quote, so whitespace inside it hides nothing.
+/// A credential or identity name assigned a value in free text, such as
+/// stderr or prefixed JSON: the name (normalized), an optional quote, `=`
+/// or `:`, then a value that is not exactly a placeholder (or a bare
+/// `null`). A credential option (`--password VALUE`, `--token VALUE`) takes
+/// the next word as its value. A quoted value is taken whole, through its
+/// closing quote, so whitespace inside it hides nothing. An identity value
+/// that is a number, boolean, object or array is not an identity string.
 /// `\u` escapes are decoded first.
 fn secret_assignment(text: &str) -> Option<String> {
     let text = unescape(text);
     let quote = |c: char| c == '"' || c == '\'';
     for (at, name) in words(&text) {
-        if credential(name).is_none() {
+        let secret = credential(name).is_some();
+        if !secret && !identity(name) {
             continue;
         }
-        let rest = text[at + name.len()..]
-            .trim_start_matches(quote)
-            .trim_start();
-        let Some(rest) = rest.strip_prefix(['=', ':']) else {
-            continue;
+        let after = &text[at + name.len()..];
+        let rest = after.trim_start_matches(quote).trim_start();
+        let option = !rest.starts_with(['=', ':']);
+        let rest = match rest.strip_prefix(['=', ':']) {
+            Some(rest) => rest,
+            // A credential option's value is the next word.
+            None if secret && name.starts_with("--") && after.starts_with(char::is_whitespace) => {
+                rest
+            }
+            None => continue,
         };
         let rest = rest.trim_start();
         // A quoted value runs through its closing quote (or to the end),
@@ -934,14 +1023,41 @@ fn secret_assignment(text: &str) -> Option<String> {
                 (&rest[..end], false)
             }
         };
+        // An option followed by another option, or `-` for stdin, has no value.
+        if option && value.starts_with('-') {
+            continue;
+        }
+        if !secret
+            && !quoted
+            && (rest.starts_with(['{', '['])
+                || ["true", "false"].contains(&value)
+                || value.parse::<f64>().is_ok())
+        {
+            continue;
+        }
         // `PLACEHOLDERS` includes the empty value; a bare `null` is JSON's.
         let placeholder =
             PLACEHOLDERS.contains(&value) || (!quoted && (value.is_empty() || value == "null"));
         if !placeholder {
-            return Some(format!("{name} is assigned a non-placeholder value"));
+            let kind = if secret { "" } else { "identity " };
+            return Some(format!("{kind}{name} is assigned a non-placeholder value"));
         }
     }
     None
+}
+
+/// A credential option in an argument list (`["--token", "abc"]`) whose
+/// next element is not a placeholder.
+fn credential_argument(items: &[Value]) -> Option<String> {
+    items.windows(2).find_map(|pair| {
+        let flag = pair[0].as_str()?;
+        let value = &pair[1];
+        (flag.starts_with("--")
+            && credential(flag).is_some()
+            && !placeholder(value)
+            && !value.as_str().is_some_and(|next| next.starts_with('-')))
+        .then(|| format!("{flag} is passed a non-placeholder value"))
+    })
 }
 
 /// A compound credential name (`access_token`, `client-secret`, not a bare
@@ -1091,6 +1207,37 @@ fn fixtures_hygiene_scan_detects_the_review_probes() {
     }
 }
 
+/// Review r2 #9: identity values in prefixed text and credential options
+/// are findings; ordinary text that only names them is not.
+#[test]
+fn fixtures_hygiene_scan_detects_the_r2_probes() {
+    let bad = [
+        r#"{"stderr":"WARN {\"username\":\"alice\"}"}"#,
+        r#"{"stderr":"username=alice"}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[auth] login: alice\n"}}]}"#,
+        r#"{"t":"[cfg] {\"account\":\"acme-corp\"}"}"#,
+        r#"{"t":"run with --password hunter2"}"#,
+        r#"{"t":"vendor --api-key abc --verbose"}"#,
+        r#"{"argv":["--token","abc"]}"#,
+        r#"{"argv":["-p","--client-secret","abc"]}"#,
+    ];
+    let missed: Vec<&str> = bad
+        .into_iter()
+        .filter(|text| file_finding(text).is_none())
+        .collect();
+    assert!(missed.is_empty(), "missed:\n{}", missed.join("\n"));
+    let clean = [
+        r#"{"stderr":"WARN {\"username\":\"<redacted>\",\"user\":0,\"account\":{\"type\":\"chatgpt\"}}"}"#,
+        r#"{"t":"The user doesn't want to proceed; account/updated arrived."}"#,
+        r#"{"t":"username=REDACTED login: PLACEHOLDER"}"#,
+        r#"{"argv":["--max-tokens","5","--token","<redacted>","--token-file","-"]}"#,
+        r#"{"t":"pass --password - to read it from stdin"}"#,
+    ];
+    for text in clean {
+        assert_eq!(file_finding(text), None, "flagged {text}");
+    }
+}
+
 #[test]
 fn fixtures_hygiene_scan_covers_the_new_step_fields() {
     let bad = [
@@ -1168,6 +1315,47 @@ fn eof_follows_first_expect(steps: &[Value]) -> bool {
     })
 }
 
+/// Review r2 #1: a line written before its `after_emit` predecessor, as an
+/// adapter that sent `turn/start` before reading the `thread/start` reply
+/// would (c11), fails replay at that step. Every fixture with an
+/// `after_emit` is exercised.
+#[test]
+fn fixtures_fail_replay_on_a_line_before_its_after_emit() -> TestResult {
+    let mut misses = Vec::new();
+    let mut exercised = Vec::new();
+    for (path, result) in drive_all(Deviation::Hoisted)? {
+        let fixture: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let steps = slowed(&fixture)["steps"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let Some(first) = steps
+            .iter()
+            .position(|step| step["expect"].get("after_emit").is_some())
+        else {
+            continue;
+        };
+        exercised.push(path.display().to_string());
+        let emit = &steps[first]["expect"]["after_emit"];
+        let wanted = format!(
+            "step {}: the line arrived before step {emit}'s emit",
+            first + 1
+        );
+        match result {
+            Err(error) if error.contains(&wanted) => {}
+            other => misses.push(format!("{}: gave {other:?}", path.display())),
+        }
+    }
+    assert!(
+        exercised
+            .iter()
+            .any(|path| path.ends_with("codex/c11_failed_command.replay.json")),
+        "c11 not exercised: {exercised:?}"
+    );
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+    Ok(())
+}
+
 /// A resent line before an `await_eof` is strict trailing input, and an EOF
 /// right after the first line is an early EOF; both fail replay. Fixtures
 /// without an `await_eof` (the resend is never written) or without an
@@ -1194,7 +1382,10 @@ fn fixtures_fail_replay_on_trailing_input_or_early_eof() -> TestResult {
         }
         exercised += 1;
         match result {
-            Err(error) if error.contains("fake replay: ") && error.contains("exit status: 3") => {}
+            Err(error)
+                if error.contains("fake replay: ")
+                    && (error.contains("exit status: 3")
+                        || error.contains("the replay failed")) => {}
             other => misses.push(format!("{}: early EOF gave {other:?}", path.display())),
         }
     }
@@ -1261,6 +1452,32 @@ fn fixtures_scan_reaches_nested_directories() -> TestResult {
             nested.join("deep.replay.json"),
             root.path().join("top.json")
         ]
+    );
+    Ok(())
+}
+
+/// Review r2 #10: a symlink in the fixture tree, to a file outside it or to
+/// an ancestor directory, fails the scan instead of being followed.
+#[test]
+fn fixtures_scan_rejects_symlinks() -> TestResult {
+    let outside = tempfile::tempdir()?;
+    fs::write(outside.path().join("secret.json"), "{}")?;
+    let root = tempfile::tempdir()?;
+    symlink(
+        outside.path().join("secret.json"),
+        root.path().join("linked.json"),
+    )?;
+    assert!(
+        files_under(root.path()).is_err(),
+        "a file symlink was followed"
+    );
+    let root = tempfile::tempdir()?;
+    let nested = root.path().join("claude");
+    fs::create_dir(&nested)?;
+    symlink(root.path(), nested.join("loop"))?;
+    assert!(
+        files_under(root.path()).is_err(),
+        "a directory symlink was followed"
     );
     Ok(())
 }

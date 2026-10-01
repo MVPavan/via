@@ -1052,76 +1052,191 @@ fn replay_expect_then_close_at_once_passes_await_eof() -> TestResult {
 }
 
 #[test]
-fn replay_reply_before_its_request_fails_unless_pipelined() -> TestResult {
-    // The request is emitted 300 ms in; a reply sent at once arrived before
-    // it was written, which no adapter answering the request can do.
-    let steps = |pipelined: bool| {
+fn replay_reply_before_its_causal_emit_fails() -> TestResult {
+    // The request is emitted 300 ms in, a notice 300 ms after it. A reply
+    // sent at once arrived before the request was written, which no adapter
+    // answering it can do, whatever predecessor the step names.
+    let steps = |after_emit: Option<u64>| {
         let mut expect = json!({"line": {"type": "reply"}});
-        if pipelined {
-            expect["pipelined"] = json!(true);
+        if let Some(step) = after_emit {
+            expect["after_emit"] = json!(step);
         }
         json!([
             {"delay": {"ms": 300}},
             {"emit": {"line": "request"}},
+            {"delay": {"ms": 300}},
+            {"emit": {"line": "notice"}},
             {"expect": expect},
             {"emit": {"line": "done"}}
         ])
     };
-    let root = tempfile::tempdir()?;
-    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps(false)))?;
-    let mut run = spawn::<&str>(&binary, &[])?;
-    run.send(&json!({"type": "reply"}))?;
-    let end = run.finish(false)?;
-    assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
-    assert!(
-        end.stderr
-            .contains("step 3: the line arrived before step 2's emit was written"),
-        "{}",
-        end.stderr
-    );
+    for after_emit in [None, Some(2)] {
+        let root = tempfile::tempdir()?;
+        let binary = install(
+            root.path(),
+            &fixture(&json!([]), 10_000, &steps(after_emit)),
+        )?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        run.send(&json!({"type": "reply"}))?;
+        let end = run.finish(false)?;
+        assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
+        assert!(
+            end.stderr
+                .contains("step 5: the line arrived before step 2's emit was written")
+                || end
+                    .stderr
+                    .contains("step 5: the line arrived before step 4's emit was written"),
+            "{}",
+            end.stderr
+        );
+    }
 
-    // Answered after the request is read, it passes.
-    let mut run = spawn::<&str>(&binary, &[])?;
-    assert_eq!(run.next_line()?, line("request"));
-    run.send(&json!({"type": "reply"}))?;
-    assert_eq!(run.next_line()?, line("done"));
-    assert_eq!(run.finish(true)?.code, Some(0));
+    // Answered on the request, before the notice: the default floor (the
+    // notice) fails it, and naming the request as its predecessor passes.
+    for (after_emit, code) in [(None, FAILED), (Some(2), 0)] {
+        let root = tempfile::tempdir()?;
+        let binary = install(
+            root.path(),
+            &fixture(&json!([]), 10_000, &steps(after_emit)),
+        )?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        assert_eq!(run.next_line()?, line("request"));
+        run.send(&json!({"type": "reply"}))?;
+        let end = run.finish(false)?;
+        assert_eq!(
+            end.code,
+            Some(code),
+            "after_emit {after_emit:?}: {}",
+            end.stderr
+        );
+        if code == FAILED {
+            assert!(
+                end.stderr
+                    .contains("step 5: the line arrived before step 4's emit was written"),
+                "{}",
+                end.stderr
+            );
+        }
+    }
 
-    // A pipelined step opts out.
-    let root = tempfile::tempdir()?;
-    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps(true)))?;
-    let mut run = spawn::<&str>(&binary, &[])?;
-    run.send(&json!({"type": "reply"}))?;
-    let end = run.finish(false)?;
-    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    // Answered after everything was read, both pass.
+    for after_emit in [None, Some(2)] {
+        let root = tempfile::tempdir()?;
+        let binary = install(
+            root.path(),
+            &fixture(&json!([]), 10_000, &steps(after_emit)),
+        )?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        assert_eq!(run.next_line()?, line("request"));
+        assert_eq!(run.next_line()?, line("notice"));
+        run.send(&json!({"type": "reply"}))?;
+        assert_eq!(run.next_line()?, line("done"));
+        assert_eq!(run.finish(true)?.code, Some(0));
+    }
     Ok(())
 }
 
 #[test]
-fn replay_await_signal_completes_at_the_signal_arrival() -> TestResult {
-    // via-jm4.33: the adapter signals and closes stdin at once while the
-    // fake is still in an earlier step. The signal arrived before the EOF,
-    // so the ordered EOF holds, however late the step handles it.
+fn replay_after_emit_must_name_an_earlier_emit() -> TestResult {
+    for after_emit in [0, 1, 3, 9] {
+        let end = run_closed(
+            &json!([
+                {"expect": {"line": {"type": "x"}}},
+                {"emit": {"line": "request"}},
+                {"expect": {"line": {"type": "reply"}, "after_emit": after_emit}}
+            ]),
+            10_000,
+        )?;
+        assert_eq!(end.code, Some(FAILED), "after_emit {after_emit}");
+        assert!(
+            end.stderr.contains(&format!(
+                "step 3: after_emit {after_emit} is not an earlier emit step"
+            )),
+            "{}",
+            end.stderr
+        );
+    }
+    Ok(())
+}
+
+/// Waits until the progress log beside `root/vendor` holds `line`.
+fn wait_for_progress(root: &Path, line: &str) -> TestResult {
+    let deadline = Instant::now() + OUTER;
+    loop {
+        let log = fs::read_to_string(root.join("vendor.progress")).unwrap_or_default();
+        if log.lines().any(|seen| seen == line) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("progress never showed {line:?}: {log:?}").into());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn replay_await_signal_orders_input_through_the_progress_log() -> TestResult {
+    // via-jm4.33: a driver that signals, waits for `signalled`, then closes
+    // stdin passes the ordered EOF, with the progress log showing both events.
     let steps = json!([
         {"emit": {"line": "ready"}},
-        {"delay": {"ms": 500}},
+        {"delay": {"ms": 200}},
+        {"await_signal": {"signal": "SIGINT"}},
+        {"await_eof": {}},
+        {"emit": {"line": "done"}}
+    ]);
+    for _ in 0..5 {
+        let root = tempfile::tempdir()?;
+        let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        assert_eq!(run.next_line()?, line("ready"));
+        wait_for_progress(root.path(), "at 3")?;
+        let kill = Command::new("kill")
+            .args(["-INT", &run.child.id().to_string()])
+            .status()?;
+        assert!(kill.success());
+        wait_for_progress(root.path(), "signalled 3")?;
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(0), "{}", end.stderr);
+        assert_eq!(end.stdout, vec![line("ready"), line("done")]);
+        assert_eq!(
+            fs::read_to_string(root.path().join("vendor.progress"))?,
+            "at 3\nsignalled 3\n"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn replay_eof_before_the_signal_fails() -> TestResult {
+    // Review r2 #3: stdin closed 20 ms before the signal precedes the
+    // `await_signal` step, however close the two were.
+    let steps = json!([
+        {"emit": {"line": "ready"}},
         {"await_signal": {"signal": "SIGINT"}},
         {"await_eof": {}},
         {"emit": {"line": "done"}}
     ]);
     let root = tempfile::tempdir()?;
     let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
-    for _ in 0..5 {
-        let mut run = spawn::<&str>(&binary, &[])?;
-        assert_eq!(run.next_line()?, line("ready"));
-        let kill = Command::new("kill")
-            .args(["-INT", &run.child.id().to_string()])
-            .status()?;
-        assert!(kill.success());
-        let end = run.finish(true)?;
-        assert_eq!(end.code, Some(0), "{}", end.stderr);
-        assert_eq!(end.stdout, vec![line("ready"), line("done")]);
-    }
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    thread::sleep(Duration::from_millis(100));
+    drop(run.stdin.take());
+    thread::sleep(Duration::from_millis(20));
+    let kill = Command::new("kill")
+        .args(["-INT", &run.child.id().to_string()])
+        .status()?;
+    assert!(kill.success());
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
+    assert!(
+        end.stderr
+            .contains("step 3: stdin closed before step 2 completed"),
+        "{}",
+        end.stderr
+    );
     Ok(())
 }
 
