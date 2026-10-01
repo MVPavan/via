@@ -37,7 +37,7 @@ use std::{
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    Admitted, CancellationToken, CloseMode, DriverFailure, DriverHealth, Inherit,
+    Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
     OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
     SessionSpec, UsageSample, VendorOptions, VendorTerminal, observation_channel_in,
 };
@@ -105,14 +105,17 @@ where
 }
 
 /// A lane's lifecycle, its actor's (Sol r2 #1, #2; Sol r3 N4): `Open`
-/// while it serves; `Ending` once its retirement or close was asked for,
-/// which the actor carries out once no turn holds a claim; `Ended` once
-/// the driver is closed and what the channel had is disposed of: the
-/// lane's end, the completion every caller awaits ([`Lane::retired`]).
+/// while it serves; `Ending` once its retirement, eviction or close was
+/// asked for, which the actor carries out once no turn holds a claim;
+/// `Closing` once the actor started the driver close, its mode and
+/// deadline final (critical r2 F6); `Ended` once the driver is closed and
+/// what the channel had is disposed of: the lane's end, the completion
+/// every caller awaits ([`Lane::retired`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Life {
     Open,
     Ending,
+    Closing,
     Ended,
 }
 
@@ -123,9 +126,12 @@ enum Ending {
     /// within [`REPLACE_CLOSE`]. It stays the session's lane, so the
     /// session's next turn opens its successor from it.
     Retire,
-    /// The session's close (C2 §2 Close), or an idle lane's driver close
-    /// (C2 §3 idle lanes), by its mode and deadline.
+    /// The session's close (C2 §2 Close), by its mode and deadline.
     Close(CloseMode, Deadline),
+    /// The idle lanes' bound (C2 §3 idle lanes, runtime §8): closed
+    /// `Graceful` by the deadline. A C1 close asked for before the driver
+    /// close started replaces it ([`Lane::begin_close`]).
+    Evict(Deadline),
 }
 
 /// The lifecycle, a turn's claim and a turn handed over, under one lock.
@@ -258,6 +264,9 @@ pub(super) struct Lane {
     /// The daemon's Engine, whose idle lanes' bound the lane checks when
     /// it becomes idle ([`Lane::bound_idle`]).
     engine: Weak<Engine>,
+    /// The driver close's report, once its actor closed it: a C1 close
+    /// that asked for it or joined it takes it ([`Engine::close_lane`]).
+    report: StdMutex<Option<CloseReport>>,
 }
 
 /// What the lane learned from the session's observations.
@@ -533,6 +542,7 @@ impl Lane {
             journal_reported: Arc::new(StdMutex::new(false)),
             used: AtomicU64::new(use_tick()),
             engine,
+            report: StdMutex::new(None),
         }
     }
 
@@ -595,11 +605,16 @@ impl Lane {
 
     /// Asks for the session's close (C2 §2 Close) by `mode` and
     /// `deadline`, unless the lane is already ending; either way the lane
-    /// leaves the session's registration once it ended.
+    /// leaves the session's registration once it ended. A close joins an
+    /// eviction (C2 §3 idle lanes, critical r2 F6): before the actor
+    /// started the driver close, decided under the lifecycle lock, the
+    /// close's mode and deadline replace the eviction's; after, the close
+    /// waits for it, as for any other ending.
     fn begin_close(&self, mode: CloseMode, deadline: Deadline) {
         {
             let mut core = lock(&self.core);
-            if core.life == Life::Open {
+            let evicting = matches!(core.ending, Some(Ending::Evict(_)));
+            if core.life == Life::Open || core.life == Life::Ending && evicting {
                 core.life = Life::Ending;
                 core.ending = Some(Ending::Close(mode, deadline));
             }
@@ -639,7 +654,7 @@ impl Lane {
     /// driver from its stored identity. Only an open lane no turn holds
     /// or was handed is taken, under the lifecycle lock: a claim or an end
     /// asked for first keeps it.
-    fn begin_evict(&self) -> bool {
+    pub(super) fn begin_evict(&self) -> bool {
         {
             let mut core = lock(&self.core);
             if core.life != Life::Open || core.claimed || core.job.is_some() {
@@ -647,11 +662,22 @@ impl Lane {
             }
             let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
             core.life = Life::Ending;
-            core.ending = Some(Ending::Close(CloseMode::Graceful, deadline));
+            core.ending = Some(Ending::Evict(deadline));
             core.removed = true;
         }
         self.changed.send_replace(());
         true
+    }
+
+    /// Test builds: the driver close the lane's end asked for, by mode and
+    /// deadline, if any.
+    #[cfg(all(test, feature = "test-failpoints"))]
+    pub(super) fn close_order(&self) -> Option<(CloseMode, tokio::time::Instant)> {
+        match lock(&self.core).ending? {
+            Ending::Retire => None,
+            Ending::Close(mode, deadline) => Some((mode, deadline.instant())),
+            Ending::Evict(deadline) => Some((CloseMode::Graceful, deadline.instant())),
+        }
     }
 
     /// Waits for the lane's end, whoever asked for it: the completion
@@ -788,17 +814,21 @@ impl Lane {
     /// waiter: close, retirement, replacement and final shutdown. Nothing
     /// cancels the actor but the runtime's own end.
     async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
-        match self.serve(&mut inbox).await {
-            Some(Ending::Retire) => {
-                let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
-                let _report = self.driver.close(CloseMode::Force, deadline).await;
-            }
-            Some(Ending::Close(mode, deadline)) => {
-                let _report = self.driver.close(mode, deadline).await;
-            }
+        let close = match self.serve(&mut inbox).await {
+            Some(Ending::Retire) => Some((
+                CloseMode::Force,
+                Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE),
+            )),
+            Some(Ending::Close(mode, deadline)) => Some((mode, deadline)),
+            Some(Ending::Evict(deadline)) => Some((CloseMode::Graceful, deadline)),
             // The drivers' cancellation ends their work; Host
             // reconciliation owns their groups (final shutdown).
-            None => {}
+            None => None,
+        };
+        if let Some((mode, deadline)) = close {
+            // Kept for a C1 close that owns or joined it (critical r2 F6).
+            let report = self.driver.close(mode, deadline).await;
+            *lock(&self.report) = Some(report);
         }
         // Test builds: the actor holds before the channel's admission closes.
         #[cfg(feature = "test-failpoints")]
@@ -895,6 +925,9 @@ impl Lane {
                         core.ending = Some(Ending::Retire);
                     }
                     if let Some(ending) = core.ending {
+                        // The driver close starts with this ending: a C1
+                        // close from now on waits for it (critical r2 F6).
+                        core.life = Life::Closing;
                         return Some(ending);
                     }
                 }
@@ -1299,17 +1332,18 @@ impl Engine {
     /// by `deadline`, releasing any connection it holds, unless the lane
     /// is already ending, disposes of what the channel still has and
     /// removes the lane, all before `session.closed` (Sol r2 #3); this
-    /// waits for that end. Dropping this future, as the close pass does
-    /// at the daemon's force, cancels none of it (Sol r3 N4).
+    /// waits for that end. A close joins an eviction ([`Lane::begin_close`])
+    /// and returns the report of the driver close it asked for or joined
+    /// (C2 §3 idle lanes, critical r2 F6); `None` with no lane, as after an
+    /// eviction that already ended. Dropping this future, as the close
+    /// pass does at the daemon's force, cancels none of it (Sol r3 N4).
     pub(super) async fn close_lane(
         &self,
         session: &SessionId,
         mode: CloseMode,
         deadline: Deadline,
-    ) {
-        let Some(lane) = lock(&self.lanes).get(session).cloned() else {
-            return;
-        };
+    ) -> Option<CloseReport> {
+        let lane = lock(&self.lanes).get(session).cloned()?;
         lane.begin_close(mode, deadline);
         // Test builds: the close is the lane actor's request.
         #[cfg(feature = "test-failpoints")]
@@ -1322,6 +1356,7 @@ impl Engine {
         {
             lanes.remove(session);
         }
+        lock(&lane.report).take()
     }
 
     /// Keeps the idle lanes within [`IDLE_LANES`] (runtime §8, C2 §3 idle

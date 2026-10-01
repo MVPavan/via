@@ -273,10 +273,15 @@ impl Engine {
             CloseMode::Graceful => via_adapters::CloseMode::Graceful,
             CloseMode::Force => via_adapters::CloseMode::Force,
         };
+        // The close receives the report of the driver close it asked for
+        // or joined, an eviction's included (C2 §3 idle lanes). Its result
+        // is still derived from durable rows only (T3 design §4 [r1.8]):
+        // folding the report's cleanup and leftovers into it awaits a
+        // ruling (critical r2 F6).
         tokio::select! {
             biased;
             _ = force.wait_for(Option::is_some) => return Some(Step::Next),
-            () = self.close_lane(session, mode, Deadline::at(bound)) => {}
+            _report = self.close_lane(session, mode, Deadline::at(bound)) => {}
         }
         tokio::select! {
             biased;

@@ -5660,3 +5660,70 @@ fn lanes_idle_only_by_draining_come_back_to_the_bound() {
         drop(senders);
     });
 }
+
+/// Critical r2 F6 (C2 §3 idle lanes, C1 §3.6): a C1 close that arrives
+/// after an eviction was chosen, before the lane's actor started its
+/// driver close, replaces the eviction's mode and deadline with its own.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_close_joining_a_chosen_eviction_takes_its_mode_and_deadline() {
+    let Some(root) = child("a_close_joining_a_chosen_eviction_takes_its_mode_and_deadline") else {
+        return;
+    };
+    run(async {
+        use via_adapters::CloseMode;
+        let engine = open(&root);
+        let (session, lane, _sender) = idle_session_with_lane(&engine, &root).await;
+        let by = tokio::time::Instant::now() + Duration::from_millis(700);
+        // Chosen, and the C1 close requested, before the actor runs.
+        assert!(lane.begin_evict());
+        let closing = engine.close_lane(&session, CloseMode::Force, Deadline::at(by));
+        tokio::pin!(closing);
+        tokio::select! {
+            biased;
+            _ = &mut closing => panic!("the close waits for the lane's end"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(lane.close_order(), Some((CloseMode::Force, by)));
+        let _report = tokio::time::timeout(Duration::from_secs(10), closing)
+            .await
+            .expect("the lane ends");
+    });
+}
+
+/// Critical r2 F6 (C2 §3 idle lanes): a C1 close that joins an eviction
+/// whose driver close already started waits for it, as a second close
+/// waits for the first (C1 §3.6), and receives that driver close's report.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_close_joining_a_started_eviction_receives_its_report() {
+    let Some(root) = child("a_close_joining_a_started_eviction_receives_its_report") else {
+        return;
+    };
+    let point = "core.lane.admission_close";
+    let points = count_points(&root, &[point]);
+    run(async {
+        use via_adapters::CloseMode;
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        // The dispatch's lane, retired at its failed launch, has ended.
+        until(|| engine.lane_drained(&session)).await;
+        let (lane, _sender) = adopt_test_lane(&engine, &root, &session).await;
+        let held = arm_next_with(&points, point, &json!({"action":"pause"}));
+        assert!(lane.begin_evict());
+        // The eviction's driver close is done; its drain is held.
+        until(|| acked(&points, point, held)).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (report, ()) = tokio::join!(
+            engine.close_lane(&session, CloseMode::Force, Deadline::at(by)),
+            async { release_point(&points, point, held) }
+        );
+        assert!(report.is_some(), "the joined close gets no report");
+        assert!(
+            matches!(lane.close_order(), Some((CloseMode::Graceful, _))),
+            "the started close keeps its mode: {:?}",
+            lane.close_order()
+        );
+    });
+}
