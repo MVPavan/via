@@ -5,8 +5,8 @@ These are implementation decisions proposed within the approved S1 scope,
 not measured runtime results. Dependent code waits for the review gate.
 Amended 2026-09-30 by the adapter design's AR1 and AR3–AR6 and its AD20
 report delivery ([adapter design](../workstreams/rust-foundation/adapters/design.md)
-§3.5, revision 9); leftover detection (AR2) is pending an owner decision
-(adapter design, conflict 4).
+§3.5, revision 9); leftover detection (AR2) follows the owner's choice of
+option A on 2026-10-01 (adapter design, conflict 4).
 Authority: [S1 plan](../workstreams/rust-foundation/s1-plan.md) §4,
 [C1](via-api-v1.md), [C2](adapter-contract.md),
 [invariants](../../.repo-context/invariants.md), and
@@ -408,8 +408,55 @@ owns vendor pipes. Host control bypasses data and SQLite queues.
 `leftovers: Option<LeftoverReport>`, produced after Host's close of the
 connection completes, within its existing bound (unchanged), and ready
 before its destination commits. VIA never signals or manages leftovers.
-Detection is pending an owner decision (adapter design, conflict 4); until
-it is decided, `leftovers` is `null`.
+Host owns detection: a report-only scan for its process marker (owner
+decision A, 2026-10-01; adapter design AD20 and AR2).
+
+- **Marker.** Host sets a random `VIA_PROCESS_MARKER` in every vendor
+  environment; the vendor's children inherit it. Host keeps it in memory only.
+- **Start bound.** The anchor reads the vendor's start ticks from
+  `/proc/<vendor>/stat` right after spawn, while it still holds the unreaped
+  child and before it sends `Spawned`, and carries them in
+  `Spawned {pid, start_ticks}` (§5.1 step 3). Host keeps them in memory only.
+  If the bound is unavailable, the report is `incomplete` and no candidate
+  environment is opened.
+- **Scan bound.** Absolute deadline `min(close_by, scan_started + 1 s)`; with
+  no budget left the report is `incomplete` and nothing is read. One scanner
+  task per report, cancelled at the deadline (§8).
+- **Per `/proc` entry.** Open the `/proc/<pid>` directory, then `openat`
+  `stat`, `status`, `environ` and `comm` through that descriptor, so every
+  read is bound to one process instance. Keep an entry only if its real uid
+  (`status`) equals the daemon's real uid, its start ticks are at or after the
+  bound, the environment holds the exact marker entry and fits the cap, and a
+  final re-read through the same descriptor shows the same start ticks and a
+  state other than zombie or dead (`stat`) and the same real uid (`status`).
+  Tick granularity only widens which environments are read; attribution is
+  still the exact marker match. Entries mean "observed during the scan", not
+  "alive".
+- **Environment cap.** The environment is read as a stream of at most
+  256 KiB plus one lookahead byte: reaching the lookahead byte means over the
+  cap, and a match counts only once end of file is reached within the cap.
+  It is compared in memory and dropped.
+- **`incomplete`.** Set when `/proc` enumeration fails, the start bound is
+  unavailable, a `stat` or `status` read fails before eligibility is settled,
+  any required read of an eligible entry (`environ`, `comm`, or the final
+  `stat` or `status` re-read) is denied or fails, `/proc` is mounted with
+  `hidepid=4` or its spelling `hidepid=ptraceable` (which hides same-uid
+  processes the daemon cannot trace), an environment is over the cap (counted
+  as no match), or the deadline passes. A process that disappears between
+  reads (`ENOENT`, `ESRCH` or an empty read) is dropped, not a failure.
+- **Limits.** Best effort: missed are processes whose procfs-visible
+  environment lacks the marker, processes that changed uid, processes outside
+  the daemon's pid namespace, and work handed to outside services (tmux
+  server, systemd, docker, ssh, cron, WSL `.exe`). Each harness's `x.3.4`
+  qualification checks that its tool processes carry the marker.
+- **Privacy and authority.** A report-only leftover scan (C2 AD20) may read
+  the environment of a same-uid process started at or after the vendor,
+  through one `/proc/<pid>` descriptor, solely to match the exact
+  `VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and
+  the marker never authorizes a signal or proves ownership or liveness. No
+  environment byte, marker value or command line enters the report, errors
+  (pid and errno only), logs or `Debug` output (coding-style §8). Where no
+  destination exists, nothing is scanned or logged.
 
 **Non-turn owners (AR6).** `ProcessOwner {session_id, turn}` and the Store
 `anchors` table (which references `turns`) fit per-turn processes only. A
@@ -480,13 +527,17 @@ Startup protocol, on a 0600 Host-only Unix socket in the validated directory:
    exactly one `Arm {generation}` send on the original connection. This is
    the **durable ARM intent**, not a claim that the anchor received ARM.
    The anchor starts at most one vendor after receiving that command, then
-   acknowledges with vendor child facts only after descriptor detachment.
+   acknowledges with vendor child facts only after descriptor detachment;
+   they include the vendor's start ticks for the leftover scan (§5,
+   `Spawned {pid, start_ticks}`), read from non-environment procfs metadata.
    It rejects duplicate/wrong-generation ARM and never spawns again.
    Before receiving ARM, controller EOF or a 5 s bootstrap deadline makes the anchor
    exit; no vendor was started. After ARM, EOF starts own-group cleanup.
 4. Commit vendor child facts before handing pipes to Wire. If that write
    fails or the daemon dies, the already-durable anchor can clean its group;
-   no missing vendor-identity row authorizes a numeric signal.
+   no missing vendor-identity row authorizes a numeric signal. The leftover
+   scan's start bound stays in Host memory and is not part of this commit
+   (AR2); the Store `anchors` table is unchanged.
 
 Uncertain ArmIntent commit means do not send ARM. A failed/partial ARM write,
 lost acknowledgement or daemon restart means do not resend ARM or Configure;
@@ -510,9 +561,11 @@ request and bounded integer fields. Restart cannot configure or start a
 vendor; it connects to the stored private socket and sends a
 fresh random challenge; the anchor returns the challenge plus its own private
 marker and identity, never an expected marker echoed from the request.
-Validate peer uid/pid and all durable anchor identity fields. Read Linux
-identity from non-environment process metadata; never open `/proc/*/environ`
-or inspect vendor credential values. The connection itself targets the same
+Validate peer uid/pid and all durable anchor identity fields. Anchor
+verification reads Linux identity from non-environment process metadata; it
+never opens `/proc/*/environ` or inspects vendor credential values. The only
+environment read is §5's report-only leftover scan, which never feeds
+verification, cleanup or signalling. The connection itself targets the same
 live anchor after verification; if it disappears, the socket fails rather
 than selecting a new process with the same pid. Unknown or malformed control
 commands close the control connection and trigger cleanup when armed.
@@ -1091,6 +1144,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Envelope | 1 MiB by construction (C1 §5): final text over 256 KiB goes to a file of at most 64 MiB; the denied and declined lists keep 1,000 entries each | Never fails the turn |
 | Work deadlines | wall 1 h, idle 10 min | C1 deadline disposition; idle resets on normalized meaningful progress, not stderr/noise |
 | Cleanup / daemon idle | §5 (3 s OS cleanup); daemon 60 s idle | No idle exit with a live client, running/queued work or pending cleanup |
+| Leftover scan (§5, C2 §4.2) | Absolute deadline `min(close_by, scan_started + 1 s)`; one scanner task per report; 256 KiB per environment (plus one lookahead byte); at most 16 listed processes | No budget left: `incomplete`, nothing read; at the deadline the task is cancelled and the report is `incomplete`; an over-cap environment counts as no match and sets `incomplete` |
 
 Large C1 prompts are persisted from the bounded request buffer. Store command
 payloads over 1 MiB use bounded chunks in a temporary Store-owned blob file
@@ -1183,21 +1237,22 @@ macOS linkage gate. No design text here claims those live gates have passed.
 | C1 summary, §3.8–3.9, §8.1 | Qualify “every later problem resolves the turn, never a request error”: after a receipt, a write known not committed is scoped to its turn and resolved by §7's per-site rules: usually `failed(store)` through one resolution write, but a natural terminal whose one retry commits keeps its result, and a dispatcher-owned queued cancellation whose retry commits stays `cancelled`; when the Store failure is latched (an uncertain write, a failed turn resolution write or terminal retry, or SQLite corruption), failure to persist a terminal result returns named `store_error` with `terminal_persisted:false`; this is not a terminal envelope. Define F12 error metadata in §7 above. Add `health` and `store_failure` to `daemon/status`. |
 | C1 §3.11 | Make `event_end` delivery best-effort subject to the 2 s writer deadline; add `store_error` reason; define byte/count outbox limits, scan vs delivery cursors and unsubscribe ordering. Replace literal registration “in the same Store read transaction” with the equivalent serialized cursor registration plus durable rescan protocol in §9 (no durable subscription rows). Superseded by T4-A25: follow removed. |
 | C1 §1, §3.11–3.12 | State bounded JSON depth/node limits; pages are limited by bytes as well as requested item count; named overload on oversized aggregate result. Envelope accumulation overflow is explicit; no silently truncated successful result. |
-| C1 §7.5 | Replace direct vendor marker discovery/group kill with verified live anchor identity/challenge authorizing only anchor-issued own-group cleanup. Vendor identity is distinct evidence; no environment marker scan or daemon-side numeric TERM/KILL. Absent/unverified anchor means no signalling; cleanup is uncertain unless §5.2 independently proves group absence by a same-boot/namespace, non-signalling `ESRCH` probe. Submission recovery stays unknown/no resend, regardless of proven cleanup. |
+| C1 §7.5 | Replace direct vendor marker discovery/group kill with verified live anchor identity/challenge authorizing only anchor-issued own-group cleanup. Vendor identity is distinct evidence; no environment marker scan for identity, recovery or cleanup, and no daemon-side numeric TERM/KILL. The only environment read is §5's report-only leftover scan (AR2), and the marker never authorizes a signal or proves ownership or liveness. Absent/unverified anchor means no signalling; cleanup is uncertain unless §5.2 independently proves group absence by a same-boot/namespace, non-signalling `ESRCH` probe. Submission recovery stays unknown/no resend, regardless of proven cleanup. |
 | C2 §2 SessionCx/SessionDriver | Opaque resource wiring instead of Adapter-accessible raw handle; separate control/health lanes; acceptance correlation token; health failures and Host cleanup travel upward/downward through C2/C3/C4 rather than Core calling Host directly. |
 | C2 §2 Recover wording | “Core asks Host” means Adapter/Route/Wire forwards cleanup; `Dead` is process evidence only, never proof of non-submission or no action. |
 | C2 A1 and §4 | Keep 1024 items/10 s unchanged; add byte budgets, splitting rules, independent sticky health failure delivery and acceptance deduplication. |
 | C1 §3.14, runtime §§2, 5, 6.2, 7 | Stop receipt is acceptance only; drain keeps work deadlines, force and idle enter final shutdown at once; one absolute 10 s final deadline; clean exit 0 only with positive cleanup, joins and durability, otherwise truthful incomplete exit 4 chosen by daemon main. Live-daemon deadlines and cancelled shutdown futures never abandon owners; Host's shutdown report keeps pending/failed joins and the named failure on every path. |
-| Coding standard §§5–6 | Permit signal setup in the same binary's internal Host-anchor entrypoint in addition to daemon main. Document anchor group creation and vendor inherited membership; distinguish durable anchor identity from vendor child facts. Force group KILL kills the anchor/reaper, so remaining child reaping is by the OS, never falsely reported as Host-reaped. Marker remains explicit vendor environment data but is never recovered by reading vendor environments. |
+| Coding standard §§5–6 | Permit signal setup in the same binary's internal Host-anchor entrypoint in addition to daemon main. Document anchor group creation and vendor inherited membership; distinguish durable anchor identity from vendor child facts. Force group KILL kills the anchor/reaper, so remaining child reaping is by the OS, never falsely reported as Host-reaped. Marker remains explicit vendor environment data but is never recovered by reading vendor environments for identity, recovery or signalling; the single exception is §5's report-only leftover scan (AR2), which only matches the exact marker entry for the report. |
 | Platform packet §5/§5.1 and P-I2–P-I4 | Match anchor-based authority, all-three-fd detachment, persisted generation/ArmIntent and §5.2 positive absence predicate. Keep native positive cleanup and negative identity-refusal requirements, with no uncertainty-only substitute. |
 
 The anchored process lifetime (§5), evidence folder (§4), numerical limits
 and F12 policy are material decisions for this packet's independent review.
 The adapter design's runtime amendments (AR1, AR3–AR6 and AD20's report
-delivery) are applied in place in §§2–8 and §11.1. AR2 and its rows in this
-table wait for the owner's leftover-detection decision (conflict 4).
+delivery) are applied in place in §§2–8 and §11.1. AR2 (owner decision A,
+2026-10-01, conflict 4) is applied in §5, §5.1, §8, this table and §11.
 No P7/P11/P13 or A2–A8 vendor decision is made here. No change to the approved
-dependency graph, one-route invariant or credential boundary is requested.
+dependency graph or one-route invariant is requested; the credential boundary
+changes only by AR2's owner-approved narrowing (invariant 1).
 
 ## 11. Failure-first seams and exact validation
 
@@ -1368,7 +1423,7 @@ No prompt, handle or vendor secret is included in acknowledgements.
 | `core.observations.pause`, fake flood and stderr flood | F24: 1024/byte bounds and 10 s overflow; independent control service; RSS assertion |
 | `core.progress.publish`, crash after a step commit | F25/F26 (superseded): status answers from memory during a flood; step rows survive a crash up to the last committed step |
 | byte splitter proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact messages or explicit failure, no panic/unbounded allocation |
-| Linux identity/control seam and real process tests | F22: uid/start/boot/group/marker mismatch never commands cleanup; forged challenge refused; spawn/anchor-death race yields no unrelated signal; marker checks never read vendor environment; leader exit alone never quiescent |
+| Linux identity/control seam and real process tests | F22: uid/start/boot/group/marker mismatch never commands cleanup; forged challenge refused; spawn/anchor-death race yields no unrelated signal; marker checks never authorize a signal; leader exit alone never quiescent |
 
 Implement scenario test names `s1_f01_...` through `s1_f30_...`, plus
 `s1_bounds_...`, `s1_store_...` for packet-specific assertions.

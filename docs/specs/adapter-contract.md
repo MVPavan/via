@@ -4,8 +4,9 @@ Status: draft 3, 2026-09-30; the owner approved A1 on 2026-09-26, and
 A2–A8 are decided in the vendor slice that needs them. Draft 3 applies the
 adapter design's amendments AD1–AD20
 ([adapter design](../workstreams/rust-foundation/adapters/design.md),
-revision 9, from the live re-probes of 2026-09-30); leftover detection is
-pending an owner decision (adapter design, conflict 4). Internal contract between L2
+revision 9, from the live re-probes of 2026-09-30); leftover detection
+follows the owner's choice of option A on 2026-10-01 (adapter design,
+conflict 4). Internal contract between L2
 Core (`via-core`) and L3 Adapters (`via-adapters`). Inputs:
 `docs/brainstorms/README.md` §15 (authoritative), review
 `docs/brainstorms/reviews/contract-specs-astra-r1.md`, probes P1–P5 and P2b
@@ -58,7 +59,8 @@ A5 (S6) remains for its vendor slice.
 **Owner, 2026-09-30** (adapter design §1.3): OD1 replaces A2's version gate
 (§5); OD5c amends rule 2 (AD12); OD3 makes processes a coding agent starts
 the agent's responsibility: VIA stops only the agent and reports leftovers
-(AD19, AD20). Leftover detection (conflict 4) remains pending.
+(AD19, AD20). Leftover detection (conflict 4): the owner chose option A on
+2026-10-01, the report-only marker scan (§4.2).
 
 | # | Decision | Recommendation / alternative |
 |---|---|---|
@@ -492,8 +494,9 @@ a terminal revises `unknown` under C1 §7.6. Non-durable ones are dropped.
 
 Processes the agent started that are observed after its own process exited
 are reported to the caller as left over by the coding agent (owner OD3). VIA
-never signals or manages them. Detection is pending an owner decision
-(adapter design, conflict 4); until it is decided, `leftovers` is `null`.
+never signals or manages them. Host detects them with a report-only scan
+for VIA's process marker (owner decision A, 2026-10-01); runtime §5 holds
+the full scan rules.
 
 | Aspect | Rule |
 |---|---|
@@ -501,8 +504,11 @@ never signals or manages them. Detection is pending an owner decision
 | Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle policy); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
 | Carried by | Host `CloseReport.leftovers` → Wire `WireCloseReport` → Route result (the shared runtime and each server route's close and loss paths) → Adapter `TurnEnd.leftovers` or driver `CloseReport.leftovers` (§2) → Core envelope, close result and `session.closed` (Store `commit_closed`). Recovery carries none. |
 | Trigger | After Host's close of the connection completes, within its existing bound (unchanged); the report is ready before its destination commits. |
-| Shape | C1 §5 `leftovers`: `{scope: "turn" \| "server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true} \| null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found; exact when not `incomplete`, a lower bound otherwise; `total > processes.len()` is the only truncation signal, distinct from `incomplete`. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's name (at most 15 bytes), lossy UTF-8. `null` when no report was produced. |
-| Privacy | Nothing from detection is persisted except the report. No environment byte, marker value or command line enters the report, errors (pid and errno only), logs or `Debug` output (coding-style §8). `comm` is process-controlled (a process can name itself anything). |
+| Detection | Host sets a random `VIA_PROCESS_MARKER` in every vendor environment; children inherit it. The scan lists same-uid processes started at or after the vendor (start bound from the anchor's `Spawned {pid, start_ticks}`) whose environment holds the exact marker entry, reading each through one `/proc/<pid>` descriptor with start-tick, uid and state rechecks and a 256 KiB environment cap. Bound: `min(close_by, scan_started + 1 s)`, one scanner task per report (runtime §5, §8). |
+| `incomplete` | Set when the scan cannot settle the full set: `/proc` enumeration or a required read fails or is denied, the start bound is unavailable (no candidate environment is opened), `/proc` hides same-uid processes (`hidepid=4`/`ptraceable`), an environment is over the cap, or the deadline passes (with no budget, nothing is read). A process that disappears between reads is dropped, not a failure (runtime §5). |
+| Shape | C1 §5 `leftovers`: `{scope: "turn" \| "server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true} \| null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found; exact when not `incomplete`, a lower bound otherwise; `total > processes.len()` is the only truncation signal, distinct from `incomplete`. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's name (at most 15 bytes), lossy UTF-8. `null` when no scan ran. |
+| Privacy | A report-only leftover scan may read the environment of a same-uid process started at or after the vendor, through one `/proc/<pid>` descriptor, solely to match the exact `VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and the marker never authorizes a signal or proves ownership or liveness. No environment byte, marker value or command line enters the report, errors (pid and errno only), logs or `Debug` output (coding-style §8). `comm` is process-controlled (a process can name itself anything). |
+| Limits | Best effort: missed are processes whose procfs-visible environment lacks the marker, processes that changed uid, processes outside the daemon's pid namespace, and work handed to outside services (tmux server, systemd, docker, ssh, cron, WSL `.exe`). Entries mean "observed during the scan", not "alive". Each harness's `x.3.4` qualification checks that its tool processes carry the marker. |
 | Future (not built) | A kill-or-keep option; Codex `thread/backgroundTerminals/clean` (experimental) is its Codex mechanism. |
 
 ## 5. Capability declaration and version rule
