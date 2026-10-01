@@ -93,6 +93,9 @@ pub struct Identity {
     pub connection_id: String,
     /// The vendor transcript, when known.
     pub transcript: Option<PathBuf>,
+    /// The vendor version the confirming handshake carried, if it carried
+    /// one (C2 §4): `session.opened`/`session.reopened`'s `vendor_version`.
+    pub vendor_version: Option<String>,
 }
 
 /// An action class the vendor's own bound denied (C1 §5).
@@ -492,6 +495,9 @@ fn item_cost(item: &ObservationItem) -> usize {
             if let Some(transcript) = &identity.transcript {
                 lengths.push(transcript.as_os_str().len());
             }
+            if let Some(version) = &identity.vendor_version {
+                lengths.push(version.len());
+            }
         }
         Observation::Progress(marks) => {
             for (id, name) in &marks.tools_started {
@@ -641,6 +647,7 @@ mod tests {
                 vendor_session_id: "v".to_owned(),
                 connection_id: "c".to_owned(),
                 transcript: transcript.map(Into::into),
+                vendor_version: None,
             })
         };
         let path = "p".repeat(4096);

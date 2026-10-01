@@ -1052,6 +1052,8 @@ impl Normalizer {
             vendor_session_id,
             connection_id: format!("fake-{}", self.generation),
             transcript: transcript.map(PathBuf::from),
+            // The fake's handshake carries none at confirmation.
+            vendor_version: None,
         })
     }
 }
