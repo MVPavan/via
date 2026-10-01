@@ -3,7 +3,8 @@
 //! Started as `<dir>/<name>` with `<dir>/<name>.replay.json` beside it, the
 //! fake checks its argv, answers `--version`, then runs the fixture's steps:
 //! - `expect` reads one stdin line and matches a JSON subset, capturing
-//!   values by JSON pointer;
+//!   values by JSON pointer; its `absent` pointers must not resolve in the
+//!   line;
 //! - `emit` writes one verbatim line;
 //! - `delay` sleeps; `await_signal` waits for a signal;
 //! - `await_eof` waits for stdin to end; any input instead fails.
@@ -93,6 +94,9 @@ enum Step {
         /// Capture name to a JSON pointer into the received line.
         #[serde(default)]
         capture: BTreeMap<String, String>,
+        /// JSON pointers that must not resolve in the received line.
+        #[serde(default)]
+        absent: Vec<String>,
     },
     Emit {
         line: String,
@@ -349,13 +353,23 @@ fn run_step<R: BufRead>(
     signals: &mut BTreeMap<SignalName, Signal>,
 ) -> Result<(), String> {
     match step {
-        Step::Expect { line, capture } => {
+        Step::Expect {
+            line,
+            capture,
+            absent,
+        } => {
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
             let actual = read_line(input)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
+            }
+            if let Some(pointer) = absent
+                .iter()
+                .find(|pointer| actual.pointer(pointer).is_some())
+            {
+                return Err(format!("{pointer} must be absent in {actual}"));
             }
             for (name, pointer) in capture {
                 let value = actual

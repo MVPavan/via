@@ -683,3 +683,40 @@ fn replay_await_eof_passes_at_eof_and_fails_on_input() -> TestResult {
     assert!(end.stdout.is_empty());
     Ok(())
 }
+
+#[test]
+fn replay_absent_pointer_fails_when_it_resolves() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {"type": "user"}, "absent": ["/session_id", "/message/model"]}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user", "message": {"content": "hi"}}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+
+    for sent in [
+        json!({"type": "user", "session_id": null}),
+        json!({"type": "user", "message": {"model": "m"}}),
+    ] {
+        let mut run = spawn::<&str>(&binary, &[])?;
+        run.send(&sent)?;
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(FAILED), "{sent}");
+        assert!(end.stdout.is_empty());
+        assert!(
+            end.stderr.contains("step 1") && end.stderr.contains("must be absent"),
+            "{}",
+            end.stderr
+        );
+    }
+    Ok(())
+}
