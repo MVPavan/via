@@ -1139,3 +1139,29 @@ fn conformance_intake_cwd_over_4_kib_encoded_is_refused() {
         daemon.stop().await;
     });
 }
+
+/// Sol r1 #15 (C1 §5): an omitted `cwd` is the daemon's startup
+/// directory, held to the same 4 KiB encoded cap: a startup directory over
+/// it is `invalid_params` naming `cwd`. (Nextest runs each test in its own
+/// process, so the working directory is this test's alone.)
+#[test]
+fn conformance_intake_startup_cwd_over_4_kib_encoded_is_refused() {
+    let root = Root::new();
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(&json!({}), &[script("p", &[accepted(1), terminal(1)])]),
+    );
+    let cwd = escaped_directory(root.path());
+    assert!(json!(cwd).to_string().len() > 4096);
+    env::set_current_dir(&cwd).unwrap();
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, "invalid_params", "{error:?}");
+        assert_eq!(error.data()["field"], "cwd", "{error:?}");
+        daemon.stop().await;
+    });
+}

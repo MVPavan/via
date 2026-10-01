@@ -149,11 +149,18 @@ impl Engine {
         let invalid =
             |message| ApiError::naming(ApiError::INVALID_PARAMS, Named::field("cwd"), message);
         let Some(cwd) = cwd else {
-            return self
+            // Sol r1 #15: the startup directory is held to the same cap.
+            let cwd = self
                 .cwd
                 .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"));
+                .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"))?;
+            return if intake::cwd_fits(cwd) {
+                Ok(cwd.to_owned())
+            } else {
+                Err(invalid(
+                    "the daemon's working directory is over 4 KiB encoded; give cwd",
+                ))
+            };
         };
         if !intake::cwd_fits(&cwd) {
             return Err(invalid(
