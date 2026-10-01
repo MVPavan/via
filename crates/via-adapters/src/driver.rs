@@ -336,14 +336,20 @@ impl SessionDriver {
     /// with the turn's [`Reservation`] until its handshake succeeded;
     /// otherwise it goes to Host with the process, and is returned. A new
     /// connection first waits for an older generation's idle close in
-    /// flight (C2 §4 generation barrier).
+    /// flight (C2 §4 generation barrier) unless `ordered`, the turn's stop
+    /// or force, resolves first: a turn so ordered launches nothing, as
+    /// before any launch (Route's entry check), so it offers no observation
+    /// for the barrier to order.
     pub(crate) async fn connect(
         &self,
-        prepared: Prepared,
-        capacity: Option<CapacityToken>,
+        (prepared, capacity): (Prepared, Option<CapacityToken>),
+        ordered: impl Future<Output = ()>,
     ) -> Result<(u64, Option<CapacityToken>, Reservation), AdapterError> {
         let _barrier = match prepared {
-            Prepared::NeedsConnection => Some(self.barrier.lock().await),
+            Prepared::NeedsConnection => tokio::select! {
+                barrier = self.barrier.lock() => Some(barrier),
+                () = ordered => None,
+            },
             Prepared::Pinned(_) => None,
         };
         let persistent = self.persistent();

@@ -112,7 +112,9 @@ pub(crate) async fn run_turn(
         force,
     } = cx;
     let first = matches!(prepared, Prepared::NeedsConnection);
-    let (generation, capacity, reservation) = match driver.connect(prepared, capacity).await {
+    let ordered = ordered(stop.clone(), force.clone(), driver.cancel.clone());
+    let connected = driver.connect((prepared, capacity), ordered).await;
+    let (generation, capacity, reservation) = match connected {
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
@@ -191,15 +193,13 @@ pub(crate) async fn run_turn(
     drop(reservation);
     report_mismatch(driver, &result, cutoff).await;
     let end = turn_end(adapter, turn, result, &rest, persistent);
-    if persistent {
-        after_persistent_turn(
-            driver,
-            adapter,
-            (turn, generation),
-            &end,
-            normalizer.vendor_closed,
-        );
-    }
+    after_persistent_turn(
+        driver,
+        adapter,
+        (turn, generation),
+        &end,
+        normalizer.vendor_closed,
+    );
     end
 }
 
@@ -323,6 +323,7 @@ async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Dead
 
 /// The persistent profile after a turn returned: a vendor close in the
 /// turn ends its connection, and the scenario's idle close starts now.
+/// Nothing on the per-turn profile.
 fn after_persistent_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
@@ -330,6 +331,9 @@ fn after_persistent_turn(
     end: &TurnEnd,
     vendor_closed: bool,
 ) {
+    if !adapter.profile().persistent {
+        return;
+    }
     if vendor_closed {
         driver.state().vendor_closed = true;
         driver.disconnect(generation);
@@ -348,6 +352,27 @@ fn after_persistent_turn(
             ),
             driver.cancel.clone(),
         ));
+    }
+}
+
+/// Resolves once the turn is ordered to end: Core's stop order, the
+/// daemon force, or the session's cancellation, which a driver close
+/// includes.
+async fn ordered(mut stop: StopWatch, mut force: ForceWatch, cancel: CancellationToken) {
+    let stopped = async {
+        if stop.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let forced = async {
+        if force.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = stopped => {}
+        () = forced => {}
+        () = cancel.cancelled() => {}
     }
 }
 

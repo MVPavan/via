@@ -2418,13 +2418,10 @@ fn an_idle_close_the_stalled_channel_cannot_take_latches_overflow() {
     assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
 }
 
-/// C2 §4 generation barrier (persistent profile): a driver admits a new
-/// generation's first observation only after the previous generation's
-/// last. The old generation's idle `VendorClosed` is in flight, blocked on
-/// the full channel, when the next turn opens a new connection; draining
-/// then reads every old item before the new generation's first.
-#[test]
-fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
+/// A persistent session whose turn 1 filled the channel and whose idle
+/// close then ran: its `VendorClosed` waits on the full channel, and the
+/// next turn needs a new connection. Turn 2 runs `second`.
+fn idle_close_in_flight(second: &[Value]) -> (Rig, SessionDriver, mpsc::Receiver<Admitted>) {
     let mut profile = persistent();
     profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
     // The accepted mark, 1022 model marks and the final text: a full channel.
@@ -2434,14 +2431,8 @@ fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
         vec![terminal(1, "completed", "end_turn")],
     ]
     .concat();
-    let rig = Rig::new(
-        &profile,
-        &[
-            script(1, &steps),
-            script(2, &[accepted(2), terminal(2, "completed", "end_turn")]),
-        ],
-    );
-    let (driver, mut receiver) = rig.session();
+    let rig = Rig::new(&profile, &[script(1, &steps), script(2, second)]);
+    let (driver, receiver) = rig.session();
     let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
     let sync = rig.sync();
     let end = checked(rig.runtime.block_on(async {
@@ -2462,6 +2453,19 @@ fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     });
+    assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
+    (rig, driver, receiver)
+}
+
+/// C2 §4 generation barrier (persistent profile): a driver admits a new
+/// generation's first observation only after the previous generation's
+/// last. The old generation's idle `VendorClosed` is in flight, blocked on
+/// the full channel, when the next turn opens a new connection; draining
+/// then reads every old item before the new generation's first.
+#[test]
+fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
+    let (rig, driver, mut receiver) =
+        idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
     let prepared = driver.prepare();
     assert!(matches!(prepared, Prepared::NeedsConnection));
     let (mut cx, _controls) = turn_cx(2, prepared, WALL);
@@ -2522,6 +2526,78 @@ fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
     assert!(
         items[first_new..].iter().all(new),
         "no old item after the new generation's first"
+    );
+}
+
+/// C2 §4 generation barrier: a turn waiting on it has not launched, so a
+/// stop or the daemon force ends it there as before any launch, promptly
+/// and well within the stall bound that holds the old close. The old
+/// close is still read, and nothing of the stopped turn.
+fn a_turn_waiting_on_the_barrier_ends_on(order: fn(&Controls), cause: fn(&RouteError) -> bool) {
+    let (rig, driver, mut receiver) =
+        idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
+    let (cx, controls) = turn_cx(2, driver.prepare(), WALL);
+    let (end, waited) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        // Polled first: the turn reaches the barrier and waits there.
+        tokio::select! {
+            biased;
+            end = &mut run => panic!("turn 2 did not wait on the barrier: {end:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        let sent = tokio::time::Instant::now();
+        order(&controls);
+        let end = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
+        assert!(end.is_ok(), "the order did not end the waiting turn");
+        let end = end.unwrap();
+        (checked(end), sent.elapsed())
+    });
+    let failure = failure(&end);
+    assert!(cause(&failure.cause), "{end:?}");
+    assert!(!failure.launched && !failure.forced, "{end:?}");
+    assert_eq!(failure.cleanup, None, "{end:?}");
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    let items = rig.runtime.block_on(async {
+        let mut items = Vec::new();
+        while items.len() <= OBSERVATION_ITEMS {
+            let admitted = tokio::time::timeout(FIXTURE_WAIT, receiver.recv()).await;
+            items.push(admitted.unwrap().unwrap().item);
+        }
+        items
+    });
+    assert!(
+        matches!(
+            items[OBSERVATION_ITEMS].observation,
+            Observation::VendorClosed(_)
+        ),
+        "{:?}",
+        items[OBSERVATION_ITEMS]
+    );
+    assert!(receiver.try_recv().is_err(), "nothing of the stopped turn");
+}
+
+#[test]
+fn a_stop_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on(
+        |controls| {
+            controls
+                .stop
+                .send_replace(Some(order(Duration::from_secs(10))));
+        },
+        |cause| matches!(cause, RouteError::Stopped { .. }),
+    );
+}
+
+#[test]
+fn the_daemon_force_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on(
+        |controls| {
+            controls
+                .force
+                .send_replace(Some(tokio::time::Instant::now()));
+        },
+        |cause| matches!(cause, RouteError::ForceStopped { .. }),
     );
 }
 
