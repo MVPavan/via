@@ -5,15 +5,19 @@ use tokio::sync::{mpsc, watch};
 
 use super::{FakeMessage, RouteMessage, TerminalStatus, TurnStart};
 use crate::{
-    Deadline, OutboundMessage, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure,
-    RuntimeConfig, RuntimeResources, SendOutcome, StopWatch, StoreFailure, TurnNumber,
-    WireRecovery, WireShutdown,
+    Deadline, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure, RuntimeConfig,
+    RuntimeResources, SendOutcome, StopWatch, StoreFailure, TurnNumber, WireRecovery, WireShutdown,
 };
+use lane::{Facts, LaneState, steer_request, turn_result};
 use via_wire::{
     CloseMode, CloseRequest, ExitReport, FailureCause, HostError, LatchState, PendingWrite,
     WireCloseReport, WireError, WireFailure, WireMessages, WireParts, WireRuntime, WireSender,
     WireSignals,
 };
+
+mod lane;
+
+pub use lane::{FakeTerminal, FakeTurn, Lane, SteerRefused, SteerRequest, TurnCause, TurnFailure};
 
 /// Final fake protocol evidence, including independently confirmed process exit.
 pub struct FakeRouteResult {
@@ -78,6 +82,47 @@ impl FakeRoute {
         force: watch::Receiver<Option<tokio::time::Instant>>,
         stop: StopWatch,
     ) -> Result<FakeRouteResult, RouteFailure> {
+        self.run(process, start, hop, (deadline, force, stop), Lane::legacy())
+            .await
+            .0
+    }
+
+    /// The C2 driver lane's turn (adapter design §3.2): [`Self::execute`]
+    /// with the `lane`'s handshake, steer control, interrupt
+    /// acknowledgement and persistent profile, returning the terminal and
+    /// handshake retained on every outcome (AD4, AD7).
+    pub async fn turn(
+        &self,
+        process: PrivateProcessSpec,
+        start: TurnStart,
+        hop: mpsc::Sender<RouteMessage>,
+        (deadline, force, stop): (
+            Deadline,
+            watch::Receiver<Option<tokio::time::Instant>>,
+            StopWatch,
+        ),
+        lane: Lane,
+    ) -> FakeTurn {
+        let persistent = lane.persistent;
+        let (result, facts) = self
+            .run(process, start, hop, (deadline, force, stop), lane)
+            .await;
+        turn_result(result, facts, persistent)
+    }
+
+    /// The entry checks of both lanes, then the turn while the waker runs.
+    async fn run(
+        &self,
+        process: PrivateProcessSpec,
+        start: TurnStart,
+        hop: mpsc::Sender<RouteMessage>,
+        (deadline, force, stop): (
+            Deadline,
+            watch::Receiver<Option<tokio::time::Instant>>,
+            StopWatch,
+        ),
+        lane: Lane,
+    ) -> (Result<FakeRouteResult, RouteFailure>, Facts) {
         let turn = start.turn();
         let not_launched = |cause| RouteFailure {
             cause,
@@ -89,12 +134,18 @@ impl FakeRoute {
             journal_uncertain: false,
         };
         if force.borrow().is_some() {
-            return Err(not_launched(RouteError::ForceStopped { turn }));
+            return (
+                Err(not_launched(RouteError::ForceStopped { turn })),
+                Facts::default(),
+            );
         }
         // An order set before submission reached Route: nothing starts, and
         // no anchor intent exists.
         if stop.borrow().is_some() {
-            return Err(not_launched(RouteError::Stopped { turn }));
+            return (
+                Err(not_launched(RouteError::Stopped { turn })),
+                Facts::default(),
+            );
         }
         let (wake, woken) = watch::channel(0_u64);
         let gate = {
@@ -118,6 +169,7 @@ impl FakeRoute {
                 stop: stop.clone(),
                 wake: woken,
             },
+            lane,
         );
         tokio::select! {
             result = turn_run => result,
@@ -129,6 +181,10 @@ impl FakeRoute {
     /// exit after the connection opened finishes it once, under the graceful
     /// close's `close_by`, the force close's cleanup deadline or the stop
     /// order's `close_by` (design §8.6).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct input of the one turn"
+    )]
     async fn run_turn(
         &self,
         process: PrivateProcessSpec,
@@ -137,19 +193,37 @@ impl FakeRoute {
         deadline: Deadline,
         wire_signals: WireSignals,
         signals: Signals,
-    ) -> Result<FakeRouteResult, RouteFailure> {
+        lane: Lane,
+    ) -> (Result<FakeRouteResult, RouteFailure>, Facts) {
         let turn = start.turn();
-        let WireParts {
-            sender,
-            mut messages,
-        } = self
+        let connection = match self
             .wire
             .open_connection(process, deadline, wire_signals)
             .await
-            .map_err(|error| acquire_failure(turn, &error, &signals.force))?
-            .into_parts();
-        let mut serving = Serving::new(turn, &sender, hop, deadline, signals);
-        let drive = Self::drive(&mut serving, &mut messages, start);
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                return (
+                    Err(acquire_failure(turn, &error, &signals.force)),
+                    Facts::default(),
+                );
+            }
+        };
+        let WireParts { sender, messages } = connection.into_parts();
+        let mut serving = Serving::new(turn, &sender, hop, deadline, signals, lane);
+        let result = Self::serve_turn(&mut serving, &sender, messages, start).await;
+        (result, serving.lane.into_facts())
+    }
+
+    /// [`Self::run_turn`] once the connection is open: every exit finishes
+    /// the connection.
+    async fn serve_turn(
+        serving: &mut Serving<'_>,
+        sender: &WireSender,
+        mut messages: WireMessages,
+        start: TurnStart,
+    ) -> Result<FakeRouteResult, RouteFailure> {
+        let drive = Self::drive(serving, &mut messages, start);
         let failed = match Box::pin(drive).await {
             Ok(Finished::Result(result, close_by)) => {
                 messages.finish(close_by).await;
@@ -158,10 +232,37 @@ impl FakeRoute {
                 return serving.unless_forced(result, sender.take_undecoded());
             }
             Ok(Finished::Late(terminal)) => {
-                return Self::late(&mut serving, &sender, messages, terminal).await;
+                return Self::late(serving, sender, messages, terminal).await;
+            }
+            Ok(Finished::Grace(terminal)) => {
+                // C1 P7 (persistent profile): a reported tool outlived the
+                // window. The emulated server's turn process is closed;
+                // cleanup is the tools' (AD9).
+                let by = cleanup_deadline();
+                let report = sender
+                    .close(CloseRequest {
+                        mode: CloseMode::Force,
+                        deadline: by,
+                    })
+                    .await;
+                messages.finish(by).await;
+                let exit = report.vendor_exit.unwrap_or(ExitReport {
+                    code: None,
+                    signal: None,
+                });
+                let result = terminal.result(exit, &report);
+                return serving.unless_forced(result, sender.take_undecoded());
             }
             Err(failed) => failed,
         };
+        // AD4 (persistent profile): at the wall, the cleanup step is the
+        // vendor's soft stop; its turn process is closed after it.
+        if serving.lane.persistent
+            && matches!(failed.cause, RouteError::Deadline { .. })
+            && serving.lane.facts.terminal.is_none()
+        {
+            serving.soft_stop(&mut messages).await;
+        }
         // The turn deadline may already have elapsed; cleanup gets its own
         // bound, or the stop order's `close_by`.
         let cleanup = failed.close_by.unwrap_or_else(cleanup_deadline);
@@ -200,7 +301,7 @@ impl FakeRoute {
         serving: &mut Serving<'_>,
         sender: &WireSender,
         messages: WireMessages,
-        terminal: TerminalEvidence,
+        terminal: FakeTerminal,
     ) -> Result<FakeRouteResult, RouteFailure> {
         // Test builds: the terminal is decoded and held, the late path
         // entered; nothing is closed or delivered yet.
@@ -321,6 +422,7 @@ impl FakeRoute {
         if let Some(order) = serving.signals.stop.borrow().as_ref() {
             return Err(Failed::stopped(turn, order.close_by));
         }
+        serving.handshake(messages).await?;
         let start = start.into_message().map_err(Failed::from)?;
         // While the start is pending no message is read: nothing the vendor
         // answers is taken before its whole input is written.
@@ -344,16 +446,7 @@ impl FakeRoute {
                 // Under the daemon force the exit is the force's own stop
                 // (Host's early stop, design §6.8): the force row, never
                 // `ProcessExited`.
-                end @ (Next::Eof | Next::Unterminated) => {
-                    let unterminated = matches!(end, Next::Unterminated);
-                    let exit = serving.exit_before_terminal(unterminated).await?;
-                    serving.after_terminal()?;
-                    return Err(Failed {
-                        cause: RouteError::ProcessExited { turn },
-                        exit: Some(exit),
-                        close_by: None,
-                    });
-                }
+                end @ (Next::Eof | Next::Unterminated) => return Err(serving.ended(end).await),
             };
             phase
                 .advance(&message.payload, turn, serving.interrupted)
@@ -361,6 +454,7 @@ impl FakeRoute {
             let terminal = terminal_evidence(&message);
             serving.held = Some(message);
             if let Some(terminal) = terminal {
+                serving.retain(&terminal);
                 break terminal;
             }
         };
@@ -382,6 +476,7 @@ impl FakeRoute {
                     .await;
                 Ok(Finished::Result(terminal.result(exit, &close), close_by))
             }
+            Err(_) if serving.lane.grace_expired => Ok(Finished::Grace(terminal)),
             Err(failed) if matches!(failed.cause, RouteError::Deadline { .. }) => {
                 Ok(Finished::Late(terminal))
             }
@@ -441,7 +536,10 @@ enum Finished {
     /// bound for `finish`.
     Result(FakeRouteResult, Deadline),
     /// A decoded terminal whose finalization outlived the wall deadline.
-    Late(TerminalEvidence),
+    Late(FakeTerminal),
+    /// An interrupted terminal whose reported tools outlived C1 P7's
+    /// window (persistent profile).
+    Grace(FakeTerminal),
 }
 
 /// The turn's control signals.
@@ -472,6 +570,8 @@ struct Serving<'a> {
     pending: Option<PendingWrite>,
     /// A decoded message waiting for room on the hop.
     held: Option<RouteMessage>,
+    /// The C2 lane's state.
+    lane: LaneState,
 }
 
 /// What [`Serving::next`] read.
@@ -491,6 +591,7 @@ impl<'a> Serving<'a> {
         hop: &'a mpsc::Sender<RouteMessage>,
         deadline: Deadline,
         signals: Signals,
+        lane: Lane,
     ) -> Self {
         Self {
             turn,
@@ -503,6 +604,7 @@ impl<'a> Serving<'a> {
             terminated: false,
             pending: None,
             held: None,
+            lane: LaneState::new(lane),
         }
     }
 
@@ -615,6 +717,22 @@ impl<'a> Serving<'a> {
                 self.pending = None;
                 Ok(None)
             }
+            // C1 P7: a reported tool outlived the window (persistent profile).
+            () = sleep_until_set(self.lane.grace), if self.lane.grace.is_some() && !self.lane.tools_settled() => {
+                self.lane.grace_expired = true;
+                Err(RouteError::Deadline { turn }.into())
+            }
+            written = pending(self.lane.steer_write.as_mut()), if self.lane.steer_write.is_some() => {
+                self.steer_written(&written);
+                Ok(None)
+            }
+            request = steer_request(self.lane.steer.as_mut()), if self.lane.steer.is_some() && self.lane.steer_reply.is_none() && self.lane.steer_write.is_none() => {
+                match request {
+                    Some(request) => self.on_steer(request),
+                    None => self.lane.steer = None,
+                }
+                Ok(None)
+            }
             permit = hop.reserve(), if self.held.is_some() => match (permit, self.held.take()) {
                 (Ok(permit), Some(message)) => {
                     permit.send(message);
@@ -645,7 +763,10 @@ impl<'a> Serving<'a> {
                 Err(error) => return Err(Failed::from(wire_cause(turn, &error))),
             };
             return match FakeMessage::decode(message.bytes(), turn) {
-                Ok(payload) => Ok(Next::Message(RouteMessage { payload })),
+                Ok(payload) => {
+                    self.note(&payload)?;
+                    Ok(Next::Message(RouteMessage { payload }))
+                }
                 Err(cause) => {
                     let what = format!(
                         "undecodable vendor message: {} bytes",
@@ -690,17 +811,7 @@ impl<'a> Serving<'a> {
         if tokio::time::Instant::now() >= force_at.instant() {
             return Err(Failed::stopped(self.turn, close_by));
         }
-        if !self.interrupted {
-            self.interrupted = true;
-            let interrupt = format!(
-                "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
-                self.turn.get()
-            );
-            self.pending = Some(self.sender.write(
-                OutboundMessage::Interrupt(interrupt.into_bytes()),
-                self.deadline,
-            ));
-        }
+        self.send_interrupt();
         Ok(())
     }
 
@@ -839,37 +950,43 @@ impl Phase {
             (FakeMessage::InterruptAck { .. }, _) => {
                 return Err(protocol(turn, "unsolicited fake interrupt acknowledgement"));
             }
-            (
+            // The handshake is read before the start, never here (AD7).
+            (FakeMessage::Hello(_), _) => {
+                return Err(protocol(turn, "unexpected fake handshake"));
+            }
+            // Session-level messages may come at any time (C2 §4).
+            (FakeMessage::Identity { .. } | FakeMessage::VendorClosed { .. }, _)
+            | (
                 FakeMessage::Text { .. }
                 | FakeMessage::ToolStarted { .. }
                 | FakeMessage::ToolEnded { .. }
                 | FakeMessage::Usage { .. }
-                | FakeMessage::Unknown { .. },
-                Self::Submitted,
-            ) => return Err(protocol(turn, "fake observation before acceptance")),
-            (
-                FakeMessage::Text { .. }
-                | FakeMessage::ToolStarted { .. }
-                | FakeMessage::ToolEnded { .. }
-                | FakeMessage::Usage { .. }
+                | FakeMessage::Denial { .. }
+                | FakeMessage::Decline { .. }
+                | FakeMessage::SteerDelivered { .. }
                 | FakeMessage::Unknown { .. },
                 Self::Accepted | Self::Terminated,
             ) => {}
+            (
+                FakeMessage::Text { .. }
+                | FakeMessage::ToolStarted { .. }
+                | FakeMessage::ToolEnded { .. }
+                | FakeMessage::Usage { .. }
+                | FakeMessage::Denial { .. }
+                | FakeMessage::Decline { .. }
+                | FakeMessage::SteerDelivered { .. }
+                | FakeMessage::Unknown { .. },
+                Self::Submitted,
+            ) => return Err(protocol(turn, "fake observation before acceptance")),
         }
         Ok(())
     }
 }
 
-/// Terminal fields retained for the route result. The final text is not
+/// The terminal fields go into the route result. The final text is not
 /// among them: the Adapter sends it as `final_text` observations from the
 /// terminal message itself (Task 4 design §2.3).
-struct TerminalEvidence {
-    status: TerminalStatus,
-    stop_reason: String,
-    vendor_code: Option<String>,
-}
-
-impl TerminalEvidence {
+impl FakeTerminal {
     fn result(self, exit: ExitReport, close: &WireCloseReport) -> FakeRouteResult {
         FakeRouteResult {
             status: self.status,
@@ -883,17 +1000,20 @@ impl TerminalEvidence {
     }
 }
 
-fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
+fn terminal_evidence(message: &RouteMessage) -> Option<FakeTerminal> {
     match &message.payload {
         FakeMessage::Terminal {
             status,
             stop_reason,
             vendor_code,
+            details,
             ..
-        } => Some(TerminalEvidence {
+        } => Some(FakeTerminal {
+            at: tokio::time::Instant::now(),
             status: *status,
             stop_reason: stop_reason.clone(),
             vendor_code: vendor_code.clone(),
+            details: details.clone(),
         }),
         FakeMessage::Accepted { .. }
         | FakeMessage::Text { .. }
@@ -901,7 +1021,21 @@ fn terminal_evidence(message: &RouteMessage) -> Option<TerminalEvidence> {
         | FakeMessage::ToolEnded { .. }
         | FakeMessage::Usage { .. }
         | FakeMessage::InterruptAck { .. }
+        | FakeMessage::Hello(_)
+        | FakeMessage::Identity { .. }
+        | FakeMessage::Denial { .. }
+        | FakeMessage::Decline { .. }
+        | FakeMessage::SteerDelivered { .. }
+        | FakeMessage::VendorClosed { .. }
         | FakeMessage::Unknown { .. } => None,
+    }
+}
+
+/// Resolves at `at`; never when it is unset.
+async fn sleep_until_set(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 

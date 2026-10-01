@@ -552,9 +552,16 @@ fn normalize(
         }),
         // Route rejects interrupt acknowledgements; the terminal's final
         // text is sent by `deliver`, its status is the route result; an
-        // unknown message is activity only.
+        // unknown message is activity only. The C2 lane's messages have no
+        // legacy observation.
         FakeMessage::Terminal { .. }
         | FakeMessage::InterruptAck { .. }
+        | FakeMessage::Hello(_)
+        | FakeMessage::Identity { .. }
+        | FakeMessage::Denial { .. }
+        | FakeMessage::Decline { .. }
+        | FakeMessage::SteerDelivered { .. }
+        | FakeMessage::VendorClosed { .. }
         | FakeMessage::Unknown { .. } => None,
     })
 }

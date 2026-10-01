@@ -2,12 +2,16 @@
 //! messages and the route that drives one turn over Wire.
 
 use serde::{Deserialize, Deserializer, de::IgnoredAny};
+use serde_json::value::RawValue;
 
 use crate::{OutboundMessage, RouteError, SHORT_FIELD_MAX, TurnNumber, UNKNOWN_TAG_MAX};
 
 mod runtime;
 
-pub use runtime::{FakeRoute, FakeRouteResult};
+pub use runtime::{
+    FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane, SteerRefused, SteerRequest,
+    TurnCause, TurnFailure,
+};
 
 /// The one prompt submission of a private fake connection. Wire streams it
 /// without a second whole copy of the prompt (Task 4 design §8.3).
@@ -85,9 +89,109 @@ pub enum TerminalStatus {
     Failed,
 }
 
+/// C2 §2 `ClassHint`, as the fake names it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeClassHint {
+    /// Authentication failed.
+    Auth,
+    /// Rate limited.
+    RateLimit,
+    /// The context window was exceeded.
+    ContextExceeded,
+    /// A budget was exceeded.
+    BudgetExceeded,
+    /// Another vendor error.
+    VendorError,
+    /// A protocol contradiction.
+    Protocol,
+    /// The vendor returned a different session.
+    ResumeMismatch,
+}
+
+/// A denied action's class, as the fake names it (C1 §5).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeDenialKind {
+    /// A file write.
+    FileWrite,
+    /// A command.
+    Command,
+    /// Network access.
+    Network,
+    /// Anything else.
+    Other,
+}
+
+/// A usage sample's components (adapter design AD6).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FakeUsage {
+    /// The sample key, if any: a keyed sample supersedes an earlier one.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Input tokens.
+    #[serde(default)]
+    pub input: Option<u64>,
+    /// Cached input tokens.
+    #[serde(default)]
+    pub cached_input: Option<u64>,
+    /// Output tokens.
+    #[serde(default)]
+    pub output: Option<u64>,
+    /// Reasoning output tokens.
+    #[serde(default)]
+    pub reasoning_output: Option<u64>,
+    /// Total tokens.
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+/// A vendor-reported cost.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FakeCost {
+    /// US dollars.
+    pub usd: f64,
+    /// The declared cost scope.
+    pub scope: String,
+}
+
+/// The C2 terminal fields beyond S1's (adapter design §3.2
+/// `VendorTerminal`), each optional.
+#[derive(Clone, Debug, Default)]
+pub struct TerminalDetails {
+    /// The suggested failure class.
+    pub class_hint: Option<FakeClassHint>,
+    /// A bounded failure detail.
+    pub detail: Option<String>,
+    /// Structured output, passed through unparsed.
+    pub structured_output: Option<Box<RawValue>>,
+    /// Steps the vendor counted.
+    pub steps: Option<u64>,
+    /// The turn aggregate usage.
+    pub usage: Option<FakeUsage>,
+    /// The vendor's cost.
+    pub cost: Option<FakeCost>,
+    /// Bounded vendor data, at most [`VENDOR_DATA_MAX`] bytes.
+    pub vendor: Option<Box<RawValue>>,
+}
+
+/// The version handshake a fake instance writes before it reads the start
+/// (adapter design AD7), on profiles that declare one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Handshake {
+    /// The instance's version.
+    pub vendor_version: Option<String>,
+    /// The features it reports.
+    pub features: Vec<String>,
+}
+
+/// C2 §2: the terminal's bounded vendor data is at most 16 KiB.
+pub const VENDOR_DATA_MAX: usize = 16 * 1024;
+
 /// A decoded fake message (Task 4 design §2.2): only what progress, the
 /// acceptance and the terminal need; everything else is skipped unread.
-#[derive(Eq, PartialEq)]
 pub enum FakeMessage {
     /// Response to the only start request, paired by ID and vendor turn.
     Accepted {
@@ -112,6 +216,8 @@ pub enum FakeMessage {
         stop_reason: String,
         /// Optional vendor error code.
         vendor_code: Option<String>,
+        /// The C2 terminal fields.
+        details: Box<TerminalDetails>,
     },
     /// A tool started inside the turn.
     ToolStarted {
@@ -129,12 +235,59 @@ pub enum FakeMessage {
         /// Vendor tool identifier.
         tool_id: String,
     },
-    /// A keyless usage sample: the tokens of one model call.
+    /// A usage sample: the tokens of one model call, keyless unless
+    /// `sample.key` is set.
     Usage {
         /// Fake-scoped vendor turn identifier.
         vendor_turn_id: String,
         /// The call's total tokens.
         total_tokens: u64,
+        /// The sample's key and components; `sample.total` is `total_tokens`.
+        sample: FakeUsage,
+    },
+    /// The version handshake (AD7); admitted only before the start.
+    Hello(Handshake),
+    /// The vendor session identity of this connection (C2 §4
+    /// `session.vendor_identity_confirmed`): session-level.
+    Identity {
+        /// The vendor's session ID.
+        vendor_session_id: String,
+        /// The vendor transcript path, when known.
+        transcript: Option<String>,
+    },
+    /// An action the vendor's own bound denied.
+    Denial {
+        /// Fake-scoped vendor turn identifier.
+        vendor_turn_id: String,
+        /// The action class.
+        kind: FakeDenialKind,
+        /// What was denied.
+        target: String,
+        /// Why.
+        reason: String,
+    },
+    /// A vendor request VIA declined.
+    Decline {
+        /// Fake-scoped vendor turn identifier.
+        vendor_turn_id: String,
+        /// The vendor method.
+        vendor_method: String,
+        /// A bounded summary.
+        summary: String,
+        /// Whether the vendor was blocked on it.
+        blocking: bool,
+    },
+    /// The vendor injected Route's steer input into the turn: the reply to
+    /// the steer request, paired by ID and vendor turn.
+    SteerDelivered {
+        /// Fake-scoped vendor turn identifier.
+        vendor_turn_id: String,
+    },
+    /// The vendor closed its session (C2 §4 `session.vendor_closed`):
+    /// session-level.
+    VendorClosed {
+        /// The vendor's reason.
+        reason: String,
     },
     /// Acknowledgement of receiving interrupt, not cancellation settlement.
     InterruptAck {
@@ -179,6 +332,20 @@ struct TerminalFields {
     final_text: String,
     stop_reason: String,
     vendor_code: Option<String>,
+    #[serde(default)]
+    class_hint: Option<FakeClassHint>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    structured_output: Option<Box<RawValue>>,
+    #[serde(default)]
+    steps: Option<u64>,
+    #[serde(default)]
+    usage: Option<FakeUsage>,
+    #[serde(default)]
+    cost: Option<FakeCost>,
+    #[serde(default)]
+    vendor: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -198,6 +365,52 @@ struct ToolEndedFields {
 struct UsageFields {
     vendor_turn_id: String,
     total_tokens: u64,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
+    cached_input: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+    #[serde(default)]
+    reasoning_output: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct HelloFields {
+    #[serde(default)]
+    vendor_version: Option<String>,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct IdentityFields {
+    vendor_session_id: String,
+    #[serde(default)]
+    transcript: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DenialFields {
+    vendor_turn_id: String,
+    kind: FakeDenialKind,
+    target: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct DeclineFields {
+    vendor_turn_id: String,
+    vendor_method: String,
+    summary: String,
+    blocking: bool,
+}
+
+#[derive(Deserialize)]
+struct VendorClosedFields {
+    reason: String,
 }
 
 fn known<T: for<'de> Deserialize<'de>>(input: &[u8], turn: TurnNumber) -> Result<T, RouteError> {
@@ -298,6 +511,19 @@ impl FakeMessage {
                     vendor_turn_id: fields.vendor_turn_id,
                 }
             }
+            "steer_delivered" => {
+                let fields: AcceptedFields = known(input, turn)?;
+                short(&[&fields.vendor_turn_id], turn)?;
+                if fields.id != STEER_ID || !paired_vendor_turn(&fields.vendor_turn_id, turn) {
+                    return Err(protocol(turn, "steer ID does not match control"));
+                }
+                Self::SteerDelivered {
+                    vendor_turn_id: fields.vendor_turn_id,
+                }
+            }
+            "hello" | "identity" | "denial" | "decline" | "vendor_closed" => {
+                Self::decode_session(&tag.kind, input, turn)?
+            }
             _ => Self::decode_unknown(tag, turn)?,
         };
         Ok(message)
@@ -343,9 +569,96 @@ impl FakeMessage {
             turn,
             "usage belongs to another turn",
         )?;
+        short(&[fields.key.as_deref().unwrap_or_default()], turn)?;
         Ok(Self::Usage {
             vendor_turn_id: fields.vendor_turn_id,
             total_tokens: fields.total_tokens,
+            sample: FakeUsage {
+                key: fields.key,
+                input: fields.input,
+                cached_input: fields.cached_input,
+                output: fields.output,
+                reasoning_output: fields.reasoning_output,
+                total: Some(fields.total_tokens),
+            },
+        })
+    }
+
+    /// The C2 messages beyond S1's: the handshake, identity, denial,
+    /// decline and vendor close (adapter design §3.2, AD7, AD8).
+    fn decode_session(kind: &str, input: &[u8], turn: TurnNumber) -> Result<Self, RouteError> {
+        Ok(match kind {
+            "hello" => {
+                let fields: HelloFields = known(input, turn)?;
+                let mut kept: Vec<&str> = fields.features.iter().map(String::as_str).collect();
+                kept.push(fields.vendor_version.as_deref().unwrap_or_default());
+                short(&kept, turn)?;
+                Self::Hello(Handshake {
+                    vendor_version: fields.vendor_version,
+                    features: fields.features,
+                })
+            }
+            "identity" => {
+                let fields: IdentityFields = known(input, turn)?;
+                short(
+                    &[
+                        &fields.vendor_session_id,
+                        fields.transcript.as_deref().unwrap_or_default(),
+                    ],
+                    turn,
+                )?;
+                Self::Identity {
+                    vendor_session_id: fields.vendor_session_id,
+                    transcript: fields.transcript,
+                }
+            }
+            "denial" => {
+                let fields: DenialFields = known(input, turn)?;
+                short(
+                    &[&fields.vendor_turn_id, &fields.target, &fields.reason],
+                    turn,
+                )?;
+                require_vendor_turn(
+                    &fields.vendor_turn_id,
+                    turn,
+                    "denial belongs to another turn",
+                )?;
+                Self::Denial {
+                    vendor_turn_id: fields.vendor_turn_id,
+                    kind: fields.kind,
+                    target: fields.target,
+                    reason: fields.reason,
+                }
+            }
+            "decline" => {
+                let fields: DeclineFields = known(input, turn)?;
+                short(
+                    &[
+                        &fields.vendor_turn_id,
+                        &fields.vendor_method,
+                        &fields.summary,
+                    ],
+                    turn,
+                )?;
+                require_vendor_turn(
+                    &fields.vendor_turn_id,
+                    turn,
+                    "decline belongs to another turn",
+                )?;
+                Self::Decline {
+                    vendor_turn_id: fields.vendor_turn_id,
+                    vendor_method: fields.vendor_method,
+                    summary: fields.summary,
+                    blocking: fields.blocking,
+                }
+            }
+            _ => {
+                let fields: VendorClosedFields = known(input, turn)?;
+                short(&[&fields.reason], turn)?;
+                Self::VendorClosed {
+                    reason: fields.reason,
+                }
+            }
         })
     }
 
@@ -384,19 +697,54 @@ impl FakeMessage {
             turn,
             "terminal belongs to another turn",
         )?;
+        let usage_key = fields.usage.as_ref().and_then(|usage| usage.key.as_deref());
+        short(
+            &[
+                fields.detail.as_deref().unwrap_or_default(),
+                usage_key.unwrap_or_default(),
+                fields.cost.as_ref().map_or("", |cost| cost.scope.as_str()),
+            ],
+            turn,
+        )?;
+        if fields
+            .vendor
+            .as_ref()
+            .is_some_and(|vendor| vendor.get().len() > VENDOR_DATA_MAX)
+        {
+            return Err(protocol(turn, "fake vendor data exceeds 16 KiB"));
+        }
         Ok(Self::Terminal {
             vendor_turn_id: fields.vendor_turn_id,
             status: fields.status,
             final_text: fields.final_text,
             stop_reason: fields.stop_reason,
             vendor_code: fields.vendor_code,
+            details: Box::new(TerminalDetails {
+                class_hint: fields.class_hint,
+                detail: fields.detail,
+                structured_output: fields.structured_output,
+                steps: fields.steps,
+                usage: fields.usage,
+                cost: fields.cost,
+                vendor: fields.vendor,
+            }),
         })
     }
 }
 
+fn protocol(turn: TurnNumber, detail: &'static str) -> RouteError {
+    RouteError::Protocol { turn, detail }
+}
+
+/// The steer request's connection-local ID; the start is 1 and the
+/// interrupt 2.
+pub(crate) const STEER_ID: u64 = 3;
+
 /// One decoded vendor message.
-#[derive(Eq, PartialEq)]
 pub struct RouteMessage {
     /// Typed fake payload.
     pub payload: FakeMessage,
 }
+
+#[cfg(test)]
+mod tests;

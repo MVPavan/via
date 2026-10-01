@@ -167,7 +167,11 @@ fn undecoded_note(note: Option<&str>) -> String {
 
 mod fake;
 
-pub use fake::{FakeMessage, FakeRoute, FakeRouteResult, RouteMessage, TerminalStatus, TurnStart};
+pub use fake::{
+    FakeClassHint, FakeCost, FakeDenialKind, FakeMessage, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, FakeUsage, Handshake, Lane, RouteMessage, SteerRefused, SteerRequest,
+    TerminalDetails, TerminalStatus, TurnCause, TurnFailure, TurnStart, VENDOR_DATA_MAX,
+};
 pub use via_wire::StoreError;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
