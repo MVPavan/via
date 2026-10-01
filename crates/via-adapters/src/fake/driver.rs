@@ -34,8 +34,8 @@ use crate::{
     VendorTurnId, final_text_pieces,
 };
 use via_routes::{
-    FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
-    Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
+    FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage,
+    Handshake, Lane, Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -162,12 +162,7 @@ pub(crate) async fn run_turn(
         reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
         done,
     }));
-    let mut normalizer = Normalizer {
-        generation,
-        state: Arc::clone(&driver.state),
-        steer: steer_delivery(profile),
-        vendor_closed: false,
-    };
+    let mut normalizer = Normalizer::new(generation, Arc::clone(&driver.state), profile);
     let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
     let mut abandonment = Abandonment(Some(&driver.health));
     let (result, rest) = deliver_beside(
@@ -859,22 +854,8 @@ fn turn_end(
         outcome,
         ..
     } = turn;
-    let instance = handshake.map(|handshake| {
-        let checked = adapter.profile().handshake.as_ref().is_some_and(|decl| {
-            handshake
-                .vendor_version
-                .as_ref()
-                .is_some_and(|version| decl.checked.contains(version))
-        });
-        InstanceReport {
-            vendor_version: handshake.vendor_version,
-            version_status: if checked {
-                VersionStatus::Tested
-            } else {
-                VersionStatus::Untested
-            },
-        }
-    });
+    let instance =
+        handshake.map(|handshake| instance_report(&checked(adapter.profile()), handshake));
     let outcome = match outcome {
         Err(
             ref failure @ RouteFailure {
@@ -927,6 +908,33 @@ fn turn_end(
         instance,
         leftovers: None,
         outcome,
+    }
+}
+
+/// The profile's `checked` handshake versions (AD7); none without a
+/// handshake.
+fn checked(profile: &FakeProfile) -> Vec<String> {
+    profile
+        .handshake
+        .as_ref()
+        .map(|decl| decl.checked.clone())
+        .unwrap_or_default()
+}
+
+/// The version a handshake reported (AD7): `tested` when the profile's
+/// `checked` versions hold it, else `untested`.
+fn instance_report(checked: &[String], handshake: Handshake) -> InstanceReport {
+    let checked = handshake
+        .vendor_version
+        .as_ref()
+        .is_some_and(|version| checked.contains(version));
+    InstanceReport {
+        vendor_version: handshake.vendor_version,
+        version_status: if checked {
+            VersionStatus::Tested
+        } else {
+            VersionStatus::Untested
+        },
     }
 }
 
@@ -1017,12 +1025,30 @@ struct Normalizer {
     steer: SteerDelivery,
     /// The vendor closed its session in this turn.
     vendor_closed: bool,
+    /// The profile's `checked` versions (AD7).
+    checked: Vec<String>,
+    /// The instance's handshake, once Route forwarded it (AD7): its
+    /// acceptance carries it (C2 §4 `turn.accepted`).
+    instance: Option<InstanceReport>,
 }
 
 impl Normalizer {
+    /// The normalizer of one turn on connection `generation`.
+    fn new(generation: u64, state: Arc<Mutex<DriverState>>, profile: &FakeProfile) -> Self {
+        Self {
+            generation,
+            state,
+            steer: steer_delivery(profile),
+            vendor_closed: false,
+            checked: checked(profile),
+            instance: None,
+        }
+    }
+
     /// One message's observations: at most one, or the terminal's final
-    /// text pieces. Unknown messages, the handshake and the interrupt
-    /// acknowledgement move only the activity clock.
+    /// text pieces. Unknown messages, the handshake (kept for the
+    /// acceptance) and the interrupt acknowledgement move only the activity
+    /// clock.
     fn items(&mut self, message: RouteMessage, at: tokio::time::Instant) -> Vec<ObservationItem> {
         // Route pairs every vendor turn ID with `fake-turn-N`, never empty:
         // the conversion cannot fail.
@@ -1064,6 +1090,7 @@ impl Normalizer {
                     correlation: AcceptanceToken::FIRST,
                     // Paired with `fake-turn-N`: never empty.
                     vendor_turn_id: VendorTurnId::try_from(vendor_turn_id.clone()).ok(),
+                    instance: self.instance.clone(),
                 };
                 Some((Some(vendor_turn_id), Observation::Accepted(accepted)))
             }
@@ -1144,8 +1171,11 @@ impl Normalizer {
                 self.vendor_closed = true;
                 Some((None, Observation::VendorClosed(reason)))
             }
+            FakeMessage::Hello(handshake) => {
+                self.instance = Some(instance_report(&self.checked, handshake));
+                None
+            }
             FakeMessage::Terminal { .. }
-            | FakeMessage::Hello(_)
             | FakeMessage::InterruptAck { .. }
             | FakeMessage::Unknown { .. } => None,
         }

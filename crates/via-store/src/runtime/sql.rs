@@ -155,9 +155,10 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Schema v7 (runtime §6; Task 4 design §6.6 plus the session's persisted
-/// `adapter_version`), frozen by `s1_store_v7_schema_is_frozen`.
-const SCHEMA_V7: &str = "CREATE TABLE sessions (
+/// Schema v8 (runtime §6; Task 4 design §6.6 plus the session's persisted
+/// `adapter_version` and the instance each turn's `turn.started` recorded),
+/// frozen by `s1_store_v8_schema_is_frozen`.
+const SCHEMA_V8: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
     next_seq INTEGER NOT NULL CHECK(next_seq>=2),
@@ -173,7 +174,8 @@ const SCHEMA_V7: &str = "CREATE TABLE sessions (
     queued_at TEXT, queued_seq INTEGER NOT NULL, submitted_at TEXT,
     accepted_at TEXT, correlation TEXT, envelope TEXT,
     cancel_cause TEXT CHECK(cancel_cause IN ('cancel','close')), ended_seq INTEGER,
-    evidence_dir TEXT,
+    evidence_dir TEXT, vendor_version TEXT,
+    version_status TEXT CHECK(version_status IN ('tested','untested')),
     CHECK((state IN ('completed','failed','cancelled','unknown')) = (ended_seq IS NOT NULL)),
     CHECK((prompt IS NULL) <> (prompt_blob IS NULL)),
     PRIMARY KEY(session_id,number));
@@ -215,7 +217,7 @@ const SCHEMA_V7: &str = "CREATE TABLE sessions (
     absence_time TEXT,
     FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
  CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
- PRAGMA user_version=7;";
+ PRAGMA user_version=8;";
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
@@ -263,7 +265,7 @@ pub(super) fn configure(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(SCHEMA_V7)
+        tx.execute_batch(SCHEMA_V8)
             .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
@@ -1321,10 +1323,30 @@ fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result
         ));
     }
     // The vendor correlation and accepted_at stay as internal C2 evidence; the
-    // public event is Core's canonical one.
+    // public event is Core's canonical one. The instance running the turn
+    // is recorded with it (C2 §4 `turn.accepted`, C1 §3.7).
+    let (vendor_version, version_status) =
+        record.instance.as_ref().map_or((None, None), |instance| {
+            (
+                instance.vendor_version.as_deref(),
+                Some(if instance.tested {
+                    "tested"
+                } else {
+                    "untested"
+                }),
+            )
+        });
     tx.execute(
-        "UPDATE turns SET correlation=?3,accepted_at=?4 WHERE session_id=?1 AND number=?2",
-        params![session.as_str(), turn.get(), correlation, at],
+        "UPDATE turns SET correlation=?3,accepted_at=?4,vendor_version=?5,version_status=?6
+         WHERE session_id=?1 AND number=?2",
+        params![
+            session.as_str(),
+            turn.get(),
+            correlation,
+            at,
+            vendor_version,
+            version_status
+        ],
     )
     .map_err(sql_error)?;
     // C1 §3.3: the turn.started commit advances the session's recorded
@@ -2408,8 +2430,11 @@ fn read_session_status(
     let active = read_active_turn(conn, session)?;
     let selected: Option<Selected> = conn
         .query_row(
-            "SELECT number,state,json_extract(envelope,'$.vendor_version'),
-                json_extract(envelope,'$.version_status')
+            "SELECT number,state,
+                CASE WHEN envelope IS NULL THEN vendor_version
+                     ELSE json_extract(envelope,'$.vendor_version') END,
+                CASE WHEN envelope IS NULL THEN version_status
+                     ELSE json_extract(envelope,'$.version_status') END
              FROM turns WHERE session_id=?1 AND number=coalesce(?2,
                 (SELECT number FROM turns WHERE session_id=?1 AND state='running'),
                 (SELECT max(number) FROM turns WHERE session_id=?1))",

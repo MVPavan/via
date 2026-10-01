@@ -82,6 +82,9 @@ pub struct Acceptance {
     pub correlation: AcceptanceToken,
     /// The vendor's turn ID, when the route has one.
     pub vendor_turn_id: Option<VendorTurnId>,
+    /// The handshake of the instance running the turn (AD7), read before
+    /// its acceptance; `None` when the route read none.
+    pub instance: Option<InstanceReport>,
 }
 
 /// A confirmed vendor identity for the current connection generation.
@@ -570,6 +573,13 @@ fn item_cost(item: &ObservationItem) -> usize {
             if let Some(vendor_turn_id) = &acceptance.vendor_turn_id {
                 lengths.push(vendor_turn_id.as_str().len());
             }
+            if let Some(version) = acceptance
+                .instance
+                .as_ref()
+                .and_then(|instance| instance.vendor_version.as_ref())
+            {
+                lengths.push(version.len());
+            }
         }
         Observation::SteerDelivered(delivery) => match delivery {
             SteerDelivery::Injected => {}
@@ -774,6 +784,7 @@ mod tests {
             Observation::Accepted(super::Acceptance {
                 correlation: crate::AcceptanceToken::FIRST,
                 vendor_turn_id: id.map(|id| crate::VendorTurnId::try_from(id.to_owned()).unwrap()),
+                instance: None,
             })
         };
         let id = "i".repeat(4096);

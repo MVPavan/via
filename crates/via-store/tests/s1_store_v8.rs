@@ -1,5 +1,6 @@
-//! Task 4 design §6.6, runtime §6: the schema, v7 since the session's
-//! persisted adapter version, is frozen by a golden DDL.
+//! Task 4 design §6.6, runtime §6: the schema, v8 since each turn's
+//! recorded instance (v7: the session's persisted adapter version), is
+//! frozen by a golden DDL.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -10,7 +11,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 use via_store::Store;
 
-/// The v7 schema: every `sqlite_master` entry as `type name tbl_name sql`,
+/// The v8 schema: every `sqlite_master` entry as `type name tbl_name sql`,
 /// with the SQL's whitespace collapsed. Changing it is a schema change.
 const GOLDEN: &[(&str, &str, &str, &str)] = &[
     (
@@ -115,7 +116,8 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
          state TEXT NOT NULL, queued_at TEXT, queued_seq INTEGER NOT NULL, submitted_at TEXT, \
          accepted_at TEXT, correlation TEXT, envelope TEXT, \
          cancel_cause TEXT CHECK(cancel_cause IN ('cancel','close')), ended_seq INTEGER, \
-         evidence_dir TEXT, \
+         evidence_dir TEXT, vendor_version TEXT, \
+         version_status TEXT CHECK(version_status IN ('tested','untested')), \
          CHECK((state IN ('completed','failed','cancelled','unknown')) = (ended_seq IS NOT NULL)), \
          CHECK((prompt IS NULL) <> (prompt_blob IS NULL)), PRIMARY KEY(session_id,number))",
     ),
@@ -131,17 +133,17 @@ fn collapse(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Design §6.6, runtime §6: a fresh Store is v7 exactly as frozen here, with the
+/// Design §6.6, runtime §6: a fresh Store is v8 exactly as frozen here, with the
 /// `session_ord` counter at `(1, 0)` and the evidence root beside it.
 #[test]
-fn s1_store_v7_schema_is_frozen() {
+fn s1_store_v8_schema_is_frozen() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let conn = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let mut query = conn
         .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
         .unwrap();

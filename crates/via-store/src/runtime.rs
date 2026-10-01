@@ -23,7 +23,7 @@ use crate::{
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -374,6 +374,18 @@ pub struct AcceptanceRecord {
     /// adapter version in the same transaction (C1 §3.3, decision H3);
     /// `None` leaves the recorded value.
     pub adapter_version: Option<String>,
+    /// The handshake of the instance running the turn (C2 §4
+    /// `turn.accepted`), recorded with it; `None` when none was read.
+    pub instance: Option<InstanceRecord>,
+}
+
+/// The version an instance reported at its handshake (C2 §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceRecord {
+    /// The handshake version.
+    pub vendor_version: Option<String>,
+    /// Whether the adapter's `checked` set holds it.
+    pub tested: bool,
 }
 
 /// One canonical event inside a running turn, such as an adapter observation.
@@ -520,9 +532,10 @@ pub struct SessionStatus {
     /// The session's route identity and frozen parameters, as
     /// [`SessionSnapshot`] reads them (adapter design §5.1 #38, #39).
     pub frozen: SessionRoute,
-    /// The selected turn's envelope `vendor_version`, once terminal.
+    /// The selected turn's `vendor_version`: its envelope's once terminal,
+    /// else the instance its `turn.started` recorded.
     pub vendor_version: Option<String>,
-    /// The selected turn's envelope `version_status`, once terminal.
+    /// The selected turn's `version_status`, from the same source.
     pub version_status: Option<String>,
     /// A group of the session's turns lacks a durable absence proof.
     pub cleanup_uncertain: bool,

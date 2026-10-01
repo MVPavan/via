@@ -1961,11 +1961,12 @@ impl Engine {
                     .as_ref()
                     .map(|id| id.as_str().to_owned());
                 let running = lane.and_then(|lane| lane.driver.adapter_version());
+                let instance = acceptance.instance.map(instance_record);
                 self.observe_acceptance(
                     record,
                     slot,
                     effective,
-                    (correlation, vendor_turn_id, running),
+                    (correlation, vendor_turn_id, running, instance),
                 )
                 .await;
             }
@@ -2150,7 +2151,7 @@ impl Engine {
         record: &mut TurnRecord,
         slot: &Slot,
         effective: &Effective,
-        evidence: (String, Option<String>, Option<String>),
+        evidence: AcceptanceEvidence,
     ) {
         if let Some(delta) = record.steps.accept() {
             slot.publish_progress(record.turn, &delta);
@@ -2544,12 +2545,13 @@ impl Engine {
     /// `correlation` is the acceptance's tagged Store correlation: the
     /// vendor turn ID, else the acceptance token. `adapter_version`, the running
     /// adapter's, becomes the session's recorded one in the same commit
-    /// (C1 §3.3, decision H3).
+    /// (C1 §3.3, decision H3), and the turn records `instance`, the
+    /// handshake of the instance running it (C2 §4 `turn.accepted`).
     async fn accept(
         &self,
         (session, turn, seq): (&SessionId, TurnNumber, u64),
         effective: &Effective,
-        (correlation, vendor_turn_id, adapter_version): (String, Option<String>, Option<String>),
+        (correlation, vendor_turn_id, adapter_version, instance): AcceptanceEvidence,
     ) -> Result<Accepted, AcceptFailure> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
@@ -2580,6 +2582,7 @@ impl Engine {
                 correlation,
                 event: event.clone(),
                 adapter_version,
+                instance,
             })
             .await;
         let accepted = Accepted { at, vendor_turn_id };
@@ -2596,6 +2599,23 @@ impl Engine {
 /// A failed acceptance commit: its classified outcome and, when the head is
 /// unknown, the acceptance and the event sent.
 type AcceptFailure = (WriteOutcome, Option<(Accepted, serde_json::Value)>);
+
+/// An acceptance's tagged correlation, vendor turn ID, the running
+/// adapter's version and the instance's handshake.
+type AcceptanceEvidence = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<via_store::InstanceRecord>,
+);
+
+/// The Store record of an instance's handshake report (C2 §5).
+fn instance_record(instance: via_adapters::InstanceReport) -> via_store::InstanceRecord {
+    via_store::InstanceRecord {
+        vendor_version: instance.vendor_version,
+        tested: instance.version_status == VersionStatus::Tested,
+    }
+}
 
 /// `turn.ended` at `seq` with the terminal envelope; `record` is already
 /// reconciled (design §7.4's batch builds it the same way).

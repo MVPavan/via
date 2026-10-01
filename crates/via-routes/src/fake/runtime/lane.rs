@@ -428,6 +428,7 @@ impl Serving<'_> {
     /// AD7: on a profile with a handshake, reads it before the start. A
     /// missing relied-on feature refuses the instance, and a catalog that
     /// lacks the turn's effort rejects the turn (AD18); nothing was sent.
+    /// An accepted handshake is forwarded on the hop.
     pub(super) async fn handshake(&mut self, messages: &mut WireMessages) -> Result<(), Failed> {
         let Some(required) = self.lane.handshake.take() else {
             return Ok(());
@@ -437,7 +438,7 @@ impl Serving<'_> {
             Next::Message(message) => message,
             end @ (Next::Eof | Next::Unterminated) => return Err(self.ended(end).await),
         };
-        let FakeMessage::Hello(handshake) = message.payload else {
+        let FakeMessage::Hello(handshake) = &message.payload else {
             return Err(protocol(turn, "fake handshake expected").into());
         };
         let missing = required
@@ -447,7 +448,7 @@ impl Serving<'_> {
             (Some(effort), Some(efforts)) => !efforts.contains(effort),
             _ => false,
         };
-        self.lane.facts.handshake = Some(handshake);
+        self.lane.facts.handshake = Some(handshake.clone());
         if missing {
             self.lane.facts.cause = Some(RouteError::HandshakeRefused { turn });
             return Err(protocol(turn, "fake handshake refused").into());
@@ -459,6 +460,10 @@ impl Serving<'_> {
             });
             return Err(protocol(turn, "fake effort outside the instance catalog").into());
         }
+        // C2 §4 `turn.accepted` (Sol r1 #13): an accepted handshake goes on
+        // the hop too, ahead of everything the turn reports, so the Adapter
+        // knows the instance before its acceptance.
+        self.held = Some(message);
         Ok(())
     }
 

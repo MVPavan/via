@@ -2606,6 +2606,7 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
                     vendor_turn_id: Some(vendor_turn),
+                    instance: None,
                 },
             ),
         };
@@ -2942,6 +2943,7 @@ fn an_unfamiliar_vendor_turn_becomes_current_only_through_the_acceptance() {
             vendor_turn_id: Some(
                 via_adapters::VendorTurnId::try_from("fake-turn-2".to_owned()).unwrap(),
             ),
+            instance: None,
         });
         let queued = vec![
             item(Some("fake-turn-2"), denied("before")),
@@ -2995,6 +2997,7 @@ fn an_acceptance_naming_another_turns_vendor_turn_fails_protocol() {
                     vendor_turn_id: Some(
                         via_adapters::VendorTurnId::try_from("fake-turn-1".to_owned()).unwrap(),
                     ),
+                    instance: None,
                 },
             ),
         };
@@ -5227,6 +5230,7 @@ fn only_the_running_turns_progress_resets_its_idle_deadline() {
         let accepted = Observation::Accepted(via_adapters::observation::Acceptance {
             correlation: via_adapters::AcceptanceToken::FIRST,
             vendor_turn_id: None,
+            instance: None,
         });
         assert!(super::drive::current_progress(
             &lane,
@@ -5291,6 +5295,7 @@ fn a_new_connection_generation_starts_with_no_old_ownership() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::FIRST,
                     vendor_turn_id: None,
+                    instance: None,
                 },
             ),
         };
@@ -5335,6 +5340,7 @@ fn tombstone_exhaustion_stops_the_running_turn_at_once() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::FIRST,
                     vendor_turn_id: None,
+                    instance: None,
                 },
             ),
         };
@@ -5377,6 +5383,7 @@ fn a_token_like_vendor_turn_id_survives_a_restart() {
                     via_adapters::observation::Acceptance {
                         correlation: via_adapters::AcceptanceToken::FIRST,
                         vendor_turn_id: Some(vendor_turn()),
+                        instance: None,
                     },
                 ),
             };

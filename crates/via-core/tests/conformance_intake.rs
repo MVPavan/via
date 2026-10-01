@@ -1677,3 +1677,64 @@ fn conformance_intake_steer_error_mapping() {
         });
     }
 }
+
+/// Sol r1 #13 (C1 §3.7, C2 §4 `turn.accepted`): a running turn's `status`
+/// reports its instance's handshake version once the turn is accepted,
+/// `null` before; a tested version carries no `vendor_version_untested`
+/// warning while the turn runs.
+#[test]
+fn conformance_intake_running_status_reports_the_accepted_instance() {
+    let root = Root::new();
+    let profile = json!({"handshake": {"checked": ["1.0"], "requires": []}});
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &profile,
+            &[script(
+                "p",
+                &[
+                    json!({"action":"hello","message":{"type":"hello",
+                           "vendor_version":"1.0","features":[]}}),
+                    gate("submitting"),
+                    accepted(1),
+                    gate("running"),
+                    terminal(1),
+                ],
+            )],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await;
+        daemon.entered("submitting").await;
+        let before = daemon.status(&session).await;
+        assert_eq!(before["active_turn"]["phase"], "submitting", "{before}");
+        assert_eq!(before["vendor_version"], Value::Null, "{before}");
+        daemon.release("submitting");
+        daemon.entered("running").await;
+        // The acceptance is committed once `status` shows it.
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let running = loop {
+            let status = daemon.status(&session).await;
+            if status["active_turn"]["phase"] == "accepted" {
+                break status;
+            }
+            assert!(tokio::time::Instant::now() < by, "never accepted: {status}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(running["vendor_version"], "1.0", "{running}");
+        assert_eq!(running["version_status"], "tested", "{running}");
+        assert!(
+            with_code(&running, "vendor_version_untested").is_empty(),
+            "{running}"
+        );
+        daemon.release("running");
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["vendor_version"], "1.0", "{envelope}");
+        let ended = daemon.status(&session).await;
+        assert_eq!(ended["version_status"], "tested", "{ended}");
+        daemon.stop().await;
+    });
+}
