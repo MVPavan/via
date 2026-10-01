@@ -26,7 +26,10 @@ use std::{
     ops::Deref,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -223,6 +226,9 @@ pub(super) struct Lane {
     writer: SessionWriter,
     /// The drivers' cancellation: final shutdown ends the actor's serving.
     cancel: CancellationToken,
+    /// The driver's uncertain journal write latched Store failure
+    /// ([`Lane::journal_read`]).
+    journal_latched: AtomicBool,
 }
 
 /// What the lane learned from the session's observations.
@@ -473,6 +479,7 @@ impl Lane {
             state: StdMutex::new(state),
             writer,
             cancel,
+            journal_latched: AtomicBool::new(false),
         }
     }
 
@@ -707,6 +714,9 @@ impl Lane {
             ready_item(&mut handled).await;
         }
         drop(inbox);
+        // The driver's close may have retired its connection.
+        self.journal_read(&mut self.driver.journal_uncertain())
+            .await;
         // A turn handed over meanwhile (only at the drivers' cancellation:
         // an ending lane is never claimed) runs to its end before the
         // lane's end is published (Sol r4 R2); a later handover finds the
@@ -751,8 +761,9 @@ impl Lane {
     /// being handled is finished first: it is never cut off.
     async fn serve(&self, inbox: &mut Inbox) -> Option<Ending> {
         let mut health = self.driver.health();
+        let mut journal = self.driver.journal_uncertain();
         let mut changes = self.changed.subscribe();
-        let (mut open, mut watched) = (true, true);
+        let (mut open, mut watched, mut journaled) = (true, true, true);
         // Each item is taken only after the job, the cancellation, the
         // health and the lane's end were checked again (runtime §8).
         let mut handled = 0;
@@ -766,6 +777,7 @@ impl Lane {
             if self.cancel.is_cancelled() {
                 return None;
             }
+            self.journal_read(&mut journal).await;
             let failed = self.health_read(&mut health);
             // Test builds: the actor holds between its health read and the
             // lane's end (Sol r2 #1), until a dispatch asks for that end or
@@ -794,6 +806,7 @@ impl Lane {
                 biased;
                 () = self.cancel.cancelled() => return None,
                 moved = health.changed(), if watched => watched = moved.is_ok(),
+                moved = journal.changed(), if journaled => journaled = moved.is_ok(),
                 _bumped = changes.changed() => {}
                 admitted = inbox.recv(), if open => match admitted {
                     Some(admitted) => {
@@ -803,6 +816,18 @@ impl Lane {
                     None => open = false,
                 },
             }
+        }
+    }
+
+    /// Reads the driver's journal report (C2 §2): an uncertain Host journal
+    /// write no turn reports latches Store failure, once (critical r1 #4,
+    /// runtime §7).
+    async fn journal_read(&self, journal: &mut watch::Receiver<bool>) {
+        if !*journal.borrow_and_update() {
+            return;
+        }
+        if !self.journal_latched.swap(true, Ordering::AcqRel) {
+            self.writer.journal_uncertain().await;
         }
     }
 

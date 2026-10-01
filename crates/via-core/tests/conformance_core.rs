@@ -1441,6 +1441,68 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
     });
 }
 
+/// Critical r1 #4 (runtime §7: every uncertain write latches Store
+/// failure): a persistent connection's retirement whose Host journal
+/// write is uncertain (its absence proof, after the logical turn already
+/// ended) latches the daemon's Store failure, separately from the
+/// retirement's unproven cleanup, which retires the lane.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_uncertain_retirement_journal_latches_store_failure() {
+    let scripts = [script(
+        "retires",
+        &[
+            accepted(1),
+            terminal(1, "completed", "end_turn"),
+            json!({"action":"exit","code":0}),
+        ],
+    )];
+    let Some(root) = child(
+        "core_uncertain_retirement_journal_latches_store_failure",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // The absence proof's write fails and its rollback too: its outcome
+    // is uncertain (design §7.1).
+    arm(&root, "store.journal.absence", "fail_io");
+    arm(&root, "store.rollback.fail", "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("retires", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        // The retirement's health failure retires the lane: its slot goes.
+        let released = tokio::time::Instant::now() + Duration::from_secs(5);
+        while daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < released,
+                "the failed driver keeps its slot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.join("points")
+                .join("store.journal.absence.1.ack")
+                .exists(),
+            "the absence proof write was refused"
+        );
+        assert!(
+            daemon.engine.store_failed(),
+            "the uncertain journal write latched Store failure"
+        );
+        let _report = daemon
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+    });
+}
+
 /// Sol r1 F3, Sol r2 #1, #2 (C2 §2 health, AD16): four persistent
 /// sessions hold every connection slot, and one's driver fails between
 /// turns while its lane's actor is held between its health read and the

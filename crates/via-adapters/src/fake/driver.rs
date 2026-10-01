@@ -157,7 +157,7 @@ pub(crate) async fn run_turn(
         logical,
         reservation: Arc::clone(&reservation),
         state: Arc::clone(&driver.state),
-        health: Arc::clone(&driver.health),
+        reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
         done,
     }));
     let mut normalizer = Normalizer {
@@ -511,7 +511,8 @@ struct TurnTask {
     logical: oneshot::Sender<FakeTurn>,
     reservation: Shared,
     state: Arc<Mutex<DriverState>>,
-    health: Arc<watch::Sender<DriverHealth>>,
+    /// The driver's health lane and its journal report.
+    reports: (Arc<watch::Sender<DriverHealth>>, Arc<watch::Sender<bool>>),
     done: watch::Sender<bool>,
 }
 
@@ -534,7 +535,7 @@ async fn turn_task(task: TurnTask) {
         logical,
         reservation,
         state,
-        health,
+        reports: (health, journal),
         done,
     } = task;
     let turn = start.turn();
@@ -570,6 +571,12 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
+    // A persistent connection's retirement journal is no turn's: its
+    // uncertainty is reported apart from the cleanup's, before the health
+    // failure that retires the lane (critical r1 #4).
+    if persistent && retirement.launched && retirement.journal_uncertain {
+        journal.send_replace(true);
+    }
     if persistent
         && retirement_uncertain(
             &retirement,

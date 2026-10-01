@@ -243,6 +243,9 @@ pub struct SessionDriver {
     /// The session's cancellation, also cancelled by this driver's close.
     pub(crate) cancel: CancellationToken,
     pub(crate) health: Arc<watch::Sender<DriverHealth>>,
+    /// Sticky: a Host journal write no turn reports had an uncertain
+    /// outcome ([`Self::journal_uncertain`]).
+    pub(crate) journal: Arc<watch::Sender<bool>>,
     pub(crate) state: Arc<Mutex<DriverState>>,
 }
 
@@ -269,6 +272,7 @@ impl SessionDriver {
             tracker: cx.tracker,
             cancel: cx.cancel.child_token(),
             health: Arc::new(watch::Sender::new(DriverHealth::Open)),
+            journal: Arc::new(watch::Sender::new(false)),
             state: Arc::new(Mutex::new(state)),
         }
     }
@@ -509,6 +513,16 @@ impl SessionDriver {
     /// The sticky health lane.
     pub fn health(&self) -> watch::Receiver<DriverHealth> {
         self.health.subscribe()
+    }
+
+    /// Sticky: true once a Host journal write the driver made outside any
+    /// turn's report had an uncertain outcome, as a persistent connection's
+    /// retirement after its logical turn ended (critical r1 #4). It is kept
+    /// apart from the retirement's cleanup in `RetirementUncertain`, and
+    /// from the health lane's first cause, which an earlier failure may
+    /// hold: Core latches Store failure on it (runtime §7).
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.journal.subscribe()
     }
 }
 

@@ -620,6 +620,21 @@ impl SessionWriter {
         written
     }
 
+    /// A Host journal write of the session's driver that no turn reports
+    /// had an uncertain outcome (critical r1 #4): like every uncertain
+    /// write, it latches Store failure (runtime §7), under `admission`.
+    async fn journal_uncertain(&self) {
+        let _admission = self.admission.lock().await;
+        if self.signal.report(
+            FailureSite::Journal,
+            WriteOutcome::Uncertain,
+            latch::FailureScope::Session(&self.session),
+        ) {
+            // Phase two, under the `admission` held (design §7.4).
+            self.store_failed.store(true, Ordering::Release);
+        }
+    }
+
     /// A failed write is the session's Store failure; the caller holds
     /// `admission`.
     fn report(&self, written: &journal::SessionWrite) {
