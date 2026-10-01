@@ -13,11 +13,12 @@
 //! - `exit`, only as the last step, writes its `stderr` text (at most 1 KiB)
 //!   verbatim and exits with its `code`, which may not be [`FAILED`].
 //!
-//! Stdin is read by one thread, which stamps each line, EOF or input error
-//! with its arrival. A line is on time if and only if it arrived at or before
-//! its limit: `within_ms` after the previous step's completion, capped by the
-//! run deadline. An emit completes just before its write, since the adapter
-//! may react as soon as the line is visible.
+//! Stdin is read by one thread (see [`input`]), which stamps each line, EOF
+//! or input error with its arrival: the instant it publishes the event. A
+//! line is on time if and only if it arrived at or before its limit:
+//! `within_ms` after the previous step's completion, capped by the run
+//! deadline. An emit completes just before its write, since the adapter may
+//! react as soon as the line is visible.
 //!
 //! Put `await_eof` right after the step the adapter must wait for (for
 //! example the terminal emit), and vendor output that follows the close
@@ -48,12 +49,12 @@ use std::collections::btree_map::Entry;
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,11 +63,12 @@ use serde_json::Value;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::contains_expected;
+use input::Input;
+
+mod input;
 
 /// Longest line, read or written, in bytes (newline excluded).
 const MAX_LINE: usize = 1024 * 1024;
-/// Most bytes one read takes: a longest line and its newline.
-const MAX_READ: u64 = 1024 * 1024 + 1;
 const MAX_STEPS: usize = 10_000;
 /// Largest fixture file, checked before it is read.
 const MAX_FIXTURE: u64 = 16 * 1024 * 1024;
@@ -465,111 +467,6 @@ fn expire(step: usize) -> ! {
     process::exit(FAILED)
 }
 
-/// What the stdin reader saw.
-enum Event {
-    /// A complete line, newline included.
-    Line(Vec<u8>),
-    Eof,
-    /// An over-long line, a partial line at EOF, or a read error.
-    Error(String),
-}
-
-/// Stdin, as events from the reader thread that owns it. Each event carries
-/// its arrival: the instant the reader finished reading it.
-struct Input {
-    events: Receiver<(Instant, Event)>,
-    /// When EOF arrived, once it has been received.
-    eof: Option<Instant>,
-    /// The run deadline, which caps every wait.
-    deadline: Instant,
-}
-
-impl Input {
-    fn start(deadline: Instant) -> Result<Self, String> {
-        // Capacity 1: the reader holds at most the line in the channel and
-        // the one in its hands.
-        let (sender, events) = mpsc::sync_channel(1);
-        // Detached on purpose: it may block reading stdin until the process exits.
-        thread::Builder::new()
-            .spawn(move || read_stdin(&sender))
-            .map_err(|error| format!("cannot start the stdin reader: {error}"))?;
-        Ok(Self {
-            events,
-            eof: None,
-            deadline,
-        })
-    }
-
-    /// The next event, waiting until `limit` or the run deadline, whichever
-    /// is first; `None` if nothing came by then.
-    fn next(&mut self, limit: Instant) -> Option<(Instant, Event)> {
-        if let Some(at) = self.eof {
-            return Some((at, Event::Eof));
-        }
-        let wait = limit
-            .min(self.deadline)
-            .saturating_duration_since(Instant::now());
-        let (at, event) = match self.events.recv_timeout(wait) {
-            Ok(received) => received,
-            Err(RecvTimeoutError::Timeout) => return None,
-            // The reader stops after its last event, already received.
-            Err(RecvTimeoutError::Disconnected) => {
-                return Some((
-                    Instant::now(),
-                    Event::Error("the stdin reader stopped".to_owned()),
-                ));
-            }
-        };
-        if matches!(event, Event::Eof) {
-            self.eof = Some(at);
-        }
-        Some((at, event))
-    }
-
-    /// Fails if a line or an input error has already been read. Best effort:
-    /// input that comes later, even after the process ends, is not seen.
-    fn check_trailing(&mut self) -> Result<(), String> {
-        if self.eof.is_some() {
-            return Ok(());
-        }
-        match self.events.try_recv() {
-            Ok((at, Event::Eof)) => {
-                self.eof = Some(at);
-                Ok(())
-            }
-            Ok((_, Event::Line(_) | Event::Error(_))) => {
-                Err("unexpected input after the last expect".to_owned())
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(()),
-        }
-    }
-}
-
-/// Reads stdin line by line until EOF or an error, sending each event with
-/// its arrival.
-fn read_stdin(sender: &SyncSender<(Instant, Event)>) {
-    let mut input = io::stdin().lock();
-    loop {
-        let mut bytes = Vec::new();
-        let read = Read::take(&mut input, MAX_READ).read_until(b'\n', &mut bytes);
-        let at = Instant::now();
-        let event = match read {
-            Err(error) => Event::Error(format!("cannot read stdin: {error}")),
-            Ok(0) => Event::Eof,
-            Ok(_) if bytes.last() == Some(&b'\n') => Event::Line(bytes),
-            Ok(_) if bytes.len() > MAX_LINE => {
-                Event::Error(format!("input line exceeds {MAX_LINE} bytes"))
-            }
-            Ok(_) => Event::Error("stdin ended within a partial line".to_owned()),
-        };
-        let last = !matches!(event, Event::Line(_));
-        // A failed send means the main thread is gone; nothing to do.
-        if sender.send((at, event)).is_err() || last {
-            return;
-        }
-    }
-}
-
 /// Runs one step and returns the instant it completed, from which later
 /// steps measure `within_ms` and order EOF. An emit completes just before
 /// its write: a reader may react as soon as the line is visible.
@@ -592,7 +489,7 @@ fn run_step(
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
-            let actual = expect_line(input, previous, within_ms)?;
+            let actual = input.expect_line(previous, within_ms)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
             }
@@ -623,20 +520,7 @@ fn run_step(
                 .block_on(stream.recv())
                 .ok_or("signal stream closed")?;
         }
-        Step::AwaitEof {} => match input.next(input.deadline) {
-            Some((at, Event::Eof)) if at > input.deadline => {
-                return Err("deadline passed while awaiting EOF".to_owned());
-            }
-            Some((at, Event::Eof)) if at < previous => {
-                return Err(format!("stdin closed before step {} completed", number - 1));
-            }
-            Some((_, Event::Eof)) => {}
-            Some((_, Event::Line(_))) => {
-                return Err("unexpected input while awaiting EOF".to_owned());
-            }
-            Some((_, Event::Error(error))) => return Err(error),
-            None => return Err("deadline passed while awaiting EOF".to_owned()),
-        },
+        Step::AwaitEof {} => input.await_eof(previous, number)?,
         Step::Exit { code: _, stderr } => {
             let mut out = io::stderr().lock();
             out.write_all(stderr.as_bytes())
@@ -645,32 +529,6 @@ fn run_step(
         }
     }
     Ok(Instant::now())
-}
-
-/// Receives the expected line. Its limit is `within_ms` after `previous`,
-/// when given, and never later than the run deadline. A line is on time if
-/// and only if it arrived at or before the limit.
-fn expect_line(
-    input: &mut Input,
-    previous: Instant,
-    within_ms: Option<u64>,
-) -> Result<Value, String> {
-    let (limit, name) = match within_ms
-        .and_then(|ms| previous.checked_add(Duration::from_millis(ms)))
-        .filter(|limit| *limit < input.deadline)
-    {
-        Some(limit) => (limit, "within_ms"),
-        None => (input.deadline, "deadline"),
-    };
-    match input.next(limit) {
-        Some((at, Event::Line(bytes))) if at <= limit => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("input line is not JSON: {error}")),
-        Some((at, Event::Eof)) if at <= limit => {
-            Err("stdin ended before the expected line".to_owned())
-        }
-        Some((at, Event::Error(error))) if at <= limit => Err(error),
-        Some(_) | None => Err(format!("{name} passed before the line arrived")),
-    }
 }
 
 /// Replaces each `${name}` with its captured text and each `$${` with a
