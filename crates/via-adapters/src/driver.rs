@@ -114,6 +114,9 @@ pub struct TurnCx {
 /// Steer input for the active turn (C2 §2 `SteerInput`).
 #[derive(Debug)]
 pub struct SteerInput {
+    /// The canonical turn the caller selected; the driver refuses the
+    /// input unless it is running that turn (C2 §2).
+    pub turn: TurnNumber,
     /// The text.
     pub text: String,
     /// The vendor turn the caller means; another running turn refuses it.
@@ -129,9 +132,13 @@ pub enum SteerError {
     NoActiveTurn,
     /// The input names another vendor turn than the running one.
     TurnMismatch,
-    /// The control lane's eight commands or 64 KiB are taken (C2 §2).
+    /// The control lane's eight commands or 64 KiB are taken (C2 §2):
+    /// nothing was written.
     OverCapacity,
-    /// The input was not written whole.
+    /// The vendor refused steer in the active turn's current phase
+    /// (Codex `activeTurnNotSteerable`): nothing was applied.
+    NotSteerable,
+    /// The input was not written whole: its delivery is uncertain.
     NotDelivered,
 }
 
@@ -454,6 +461,9 @@ impl SessionDriver {
 
     /// Delivers steer input into the running turn (C2 §2): admitted at
     /// once or refused; delivered once written and reported by the vendor.
+    /// Admission checks `input.turn` against the turn the driver runs under
+    /// the state lock it enqueues under: another turn is `TurnMismatch`,
+    /// none `NoActiveTurn`, so the input never reaches a successor.
     pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
         let delivery = match self
             .adapter
@@ -466,18 +476,30 @@ impl SessionDriver {
             }
             Some(crate::Support::Unsupported { .. }) | None => return Err(SteerError::Unsupported),
         };
-        let lane = self
-            .state()
-            .active
-            .as_ref()
-            .map(|active| active.steer.clone());
-        let Some(lane) = lane else {
-            return Err(SteerError::NoActiveTurn);
-        };
         let expected = input
             .expected_vendor_turn
             .map(|turn| turn.as_str().to_owned());
-        let answer = lane.send(input.text, expected).map_err(steer_error)?;
+        let answer = {
+            let state = self.state();
+            let Some(active) = state.active.as_ref() else {
+                return Err(SteerError::NoActiveTurn);
+            };
+            if active.turn != input.turn {
+                return Err(SteerError::TurnMismatch);
+            }
+            // The fake profile's declared vendor refusal (C2 §2 `NotSteerable`).
+            if let Some(refusal) = self
+                .adapter
+                .as_ref()
+                .and_then(|adapter| adapter.profile().steer_refusal)
+            {
+                return Err(refusal.error());
+            }
+            active
+                .steer
+                .send(input.text, expected)
+                .map_err(steer_error)?
+        };
         match answer.await {
             Ok(Ok(())) => Ok(delivery),
             Ok(Err(refused)) => Err(steer_error(refused)),

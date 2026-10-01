@@ -839,6 +839,8 @@ pub struct Named {
     pub route: Option<Cow<'static, str>>,
     /// The refused verb.
     pub verb: Option<Cow<'static, str>>,
+    /// A failed steer's delivery (`data.delivery`, C1 §3.4).
+    pub delivery: Option<Cow<'static, str>>,
 }
 
 impl Named {
@@ -849,6 +851,7 @@ impl Named {
             harness: None,
             route: None,
             verb: None,
+            delivery: None,
         }
     }
 
@@ -858,6 +861,7 @@ impl Named {
             && self.harness.is_none()
             && self.route.is_none()
             && self.verb.is_none()
+            && self.delivery.is_none()
     }
 
     /// `self`, or `None` when it names nothing.
@@ -955,6 +959,7 @@ impl ApiError {
                 ("verb", &named.verb),
                 ("harness", &named.harness),
                 ("route", &named.route),
+                ("delivery", &named.delivery),
             ] {
                 if let Some(value) = value {
                     data[member] = json!(value);
@@ -1202,19 +1207,38 @@ impl ApiError {
         reason: None,
         floor: None,
     };
-    /// `steer` input the driver could not deliver: its control lane was
-    /// full, or the input was not written whole (C2 §2).
-    pub const STEER_NOT_DELIVERED: Self = Self {
+    /// `steer` input the session's control lane had no room for (C1 §3.4,
+    /// C2 §2 `OverCapacity`): nothing was written; a later retry may fit.
+    pub const CONTROL_LANE_FULL: Self = Self {
         code: -32012,
         kind: "admission_refused",
-        message: "the steer input was not delivered",
+        message: "the session's control lane is full",
         unpersisted: None,
         kind2: None,
         commit_outcome: None,
         named: None,
-        reason: None,
+        reason: Some("control_lane_full"),
         floor: None,
     };
+    /// C1 -32021 `steer_failed`: the steer input was not applied, for
+    /// `reason`, with what is known of its `delivery` (C1 §3.4, §8.1).
+    pub(crate) fn steer_failed(reason: &'static str, delivery: &'static str) -> Self {
+        Self {
+            code: -32021,
+            kind: "steer_failed",
+            message: "the steer input was not applied",
+            unpersisted: None,
+            kind2: None,
+            commit_outcome: None,
+            named: Named {
+                delivery: Some(Cow::Borrowed(delivery)),
+                ..Named::default()
+            }
+            .boxed(),
+            reason: Some(reason),
+            floor: None,
+        }
+    }
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
         code: -32015,

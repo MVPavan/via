@@ -329,6 +329,7 @@ pub(crate) fn refused(refusal: &Refusal) -> ApiError {
             harness: refusal.route.and_then(harness_of).map(Cow::Borrowed),
             route: refusal.route.map(Cow::Borrowed),
             verb: refusal.verb.map(|verb| Cow::Borrowed(verb.as_str())),
+            delivery: None,
         }
         .boxed(),
         reason: refusal.reason,

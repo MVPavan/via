@@ -1606,3 +1606,75 @@ fn conformance_intake_instructions_path() {
     );
     assert!(params.contains("be brief"), "{params}");
 }
+
+/// Sol r1 #11 (C1 §3.4, §8.1; C2 §2 `SteerError`): the driver's refusals of
+/// an admitted steer map to C1 errors: a full control lane is
+/// `admission_refused` with `data.reason: "control_lane_full"`; a vendor
+/// that refuses steer in the turn's phase is `steer_failed` with
+/// `data.reason: "not_steerable"` and `data.delivery: "none"`; input not
+/// written whole is `steer_failed` with `data.reason: "not_delivered"` and
+/// `data.delivery: "uncertain"`. None commits `steer.delivered`.
+#[test]
+fn conformance_intake_steer_error_mapping() {
+    for (refusal, code, kind, reason, delivery) in [
+        (
+            "over_capacity",
+            -32012,
+            "admission_refused",
+            "control_lane_full",
+            Value::Null,
+        ),
+        (
+            "not_steerable",
+            -32021,
+            "steer_failed",
+            "not_steerable",
+            json!("none"),
+        ),
+        (
+            "not_delivered",
+            -32021,
+            "steer_failed",
+            "not_delivered",
+            json!("uncertain"),
+        ),
+    ] {
+        let root = Root::new();
+        let path = root.scenario(
+            "scenario.json",
+            &scenario(
+                &json!({"capabilities": capabilities(&[("/verbs/steer", native())]),
+                        "steer_refusal": refusal}),
+                &[script("p", &[accepted(1), gate("running"), terminal(1)])],
+            ),
+        );
+        run(async {
+            let daemon = Daemon::open(&root, &path);
+            let session = daemon
+                .spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+                .await;
+            daemon.entered("running").await;
+            let error = daemon
+                .try_steer(&session, &json!({"text":"x"}))
+                .await
+                .unwrap_err();
+            let data = error.data();
+            assert_eq!(
+                (error.code, error.kind, &data["reason"], &data["delivery"]),
+                (code, kind, &json!(reason), &delivery),
+                "{refusal}: {data}"
+            );
+            daemon.release("running");
+            assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+            assert!(
+                daemon
+                    .events(&session)
+                    .await
+                    .iter()
+                    .all(|event| event["type"] != "steer.delivered"),
+                "{refusal}"
+            );
+            daemon.stop().await;
+        });
+    }
+}

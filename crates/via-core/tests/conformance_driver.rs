@@ -747,6 +747,7 @@ fn conformance_steer_native_delivered_unsupported_refused() {
     );
     let (driver, mut receiver) = rig.session();
     let idle = rig.runtime.block_on(driver.steer(SteerInput {
+        turn: TurnNumber::try_from(1).unwrap(),
         text: "early".to_owned(),
         expected_vendor_turn: None,
     }));
@@ -763,7 +764,7 @@ fn conformance_steer_native_delivered_unsupported_refused() {
             tokio::select! {
                 Some(admitted) = receiver.recv() => {
                     if matches!(admitted.item.observation, Observation::Accepted(_)) {
-                        steer = Some(Box::pin(driver.steer(SteerInput { text: "also \"this\"".to_owned(), expected_vendor_turn: Some(VendorTurnId::try_from(vendor_turn(1)).unwrap()) })));
+                        steer = Some(Box::pin(driver.steer(SteerInput { turn: TurnNumber::try_from(1).unwrap(), text: "also \"this\"".to_owned(), expected_vendor_turn: Some(VendorTurnId::try_from(vendor_turn(1)).unwrap()) })));
                     }
                     items.push(admitted.item);
                 }
@@ -790,6 +791,7 @@ fn conformance_steer_native_delivered_unsupported_refused() {
     let rig = Rig::new(&json!({}), &[]);
     let (driver, _receiver) = rig.session();
     let refused = rig.runtime.block_on(driver.steer(SteerInput {
+        turn: TurnNumber::try_from(1).unwrap(),
         text: "no".to_owned(),
         expected_vendor_turn: None,
     }));
@@ -2037,6 +2039,7 @@ fn steer_once(
 fn a_steer_naming_another_vendor_turn_is_refused() {
     let (answer, _) = steer_once(&json!({"capabilities": native_capabilities()}), || {
         SteerInput {
+            turn: TurnNumber::try_from(1).unwrap(),
             text: "more".to_owned(),
             expected_vendor_turn: Some(VendorTurnId::try_from("fake-turn-9".to_owned()).unwrap()),
         }
@@ -2050,6 +2053,7 @@ fn a_steer_naming_another_vendor_turn_is_refused() {
 fn an_over_budget_steer_is_refused_before_enqueue() {
     let (answer, _) = steer_once(&json!({"capabilities": native_capabilities()}), || {
         SteerInput {
+            turn: TurnNumber::try_from(1).unwrap(),
             text: "s".repeat(65 * 1024),
             expected_vendor_turn: None,
         }
@@ -2086,6 +2090,7 @@ fn a_partial_steer_profile_reports_its_semantics() {
             until_seen(&mut seen, |seen| seen.accepted).await;
             driver_ref
                 .steer(SteerInput {
+                    turn: TurnNumber::try_from(1).unwrap(),
                     text: "more".to_owned(),
                     expected_vendor_turn: None,
                 })
@@ -2368,6 +2373,7 @@ fn a_ninth_outstanding_steer_is_refused() {
     let driver_ref = &driver;
     let steer = move || -> Steer<'_> {
         Box::pin(driver_ref.steer(SteerInput {
+            turn: TurnNumber::try_from(1).unwrap(),
             text: "more".to_owned(),
             expected_vendor_turn: None,
         }))
@@ -2819,4 +2825,56 @@ fn a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement() {
     });
     assert!(controls.released(), "released once the helper retired");
     assert!(!helper.exists(), "the helper is gone");
+}
+
+/// Sol r1 #8 (C2 §2 `SteerInput.turn`): a steer selected for turn 1 that
+/// reaches the driver only once turn 1 ended and turn 2 runs, accepted,
+/// is refused `TurnMismatch` at the driver's control-lane admission, even
+/// naming no vendor turn: turn 2's agent never receives it. With no turn
+/// running it is `NoActiveTurn`.
+#[test]
+fn a_steer_for_an_ended_turn_never_reaches_its_successor() {
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[
+            script(1, &[accepted(1), terminal(1, "completed", "end_turn")]),
+            script(
+                2,
+                &[accepted(2), gate("g"), terminal(2, "completed", "end_turn")],
+            ),
+        ],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let selected = || SteerInput {
+        turn: TurnNumber::try_from(1).unwrap(),
+        text: "for turn 1".to_owned(),
+        expected_vendor_turn: None,
+    };
+    let idle = rig.runtime.block_on(driver.steer(selected()));
+    assert_eq!(idle.unwrap_err(), SteerError::NoActiveTurn);
+    let (cx, _controls) = turn_cx(2, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let driver_ref = &driver;
+    let (end, items, answer) = rig.run_beside(
+        &driver,
+        &mut receiver,
+        (prompt(), cx),
+        |mut seen| async move {
+            until_seen(&mut seen, |seen| seen.accepted).await;
+            let answer = driver_ref.steer(selected()).await;
+            release(&sync, "g");
+            answer
+        },
+    );
+    assert_eq!(answer, Err(SteerError::TurnMismatch), "{end:?}");
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert!(
+        !observations(&items)
+            .iter()
+            .any(|observation| matches!(observation, Observation::SteerDelivered(_))),
+        "the successor took no steer"
+    );
 }

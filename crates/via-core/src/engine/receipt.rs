@@ -723,6 +723,8 @@ impl Engine {
             .kept_lane(&params.session)
             .ok_or(ApiError::NO_ACTIVE_TURN)?;
         let input = SteerInput {
+            // Sol r1 #8: the driver admits it only into the selected turn.
+            turn,
             text: params.text,
             expected_vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
         };
@@ -731,12 +733,13 @@ impl Engine {
             .steer(input)
             .await
             .map_err(|error| match error {
-                SteerError::Unsupported => ApiError::UNSUPPORTED_VERB,
+                // Sol r1 #11 (C1 §3.4, C2 §2).
+                SteerError::Unsupported => intake::unsupported_on(Verb::Steer, &frozen),
                 SteerError::NoActiveTurn => ApiError::NO_ACTIVE_TURN,
                 SteerError::TurnMismatch => ApiError::TURN_MISMATCH,
-                SteerError::OverCapacity | SteerError::NotDelivered => {
-                    ApiError::STEER_NOT_DELIVERED
-                }
+                SteerError::OverCapacity => ApiError::CONTROL_LANE_FULL,
+                SteerError::NotSteerable => ApiError::steer_failed("not_steerable", "none"),
+                SteerError::NotDelivered => ApiError::steer_failed("not_delivered", "uncertain"),
             })?;
         Ok(json!({
             "turn": format!("{}/{}", params.session.as_str(), turn.get()),
