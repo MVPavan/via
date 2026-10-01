@@ -494,10 +494,15 @@ pub(super) fn classify(
             )),
         }
     } else {
+        // A definite failure before acceptance keeps the vendor's code and
+        // detail (AD5).
         Some(failure(
             FailureClass::SubmitFailed,
-            "the vendor did not accept the submission".to_owned(),
-            None,
+            vendor
+                .detail
+                .clone()
+                .unwrap_or_else(|| "the vendor did not accept the submission".to_owned()),
+            vendor.vendor_code.clone(),
         ))
     };
     let stop_reason = match (&failure, accepted, vendor.status) {
@@ -577,7 +582,8 @@ fn blank(state: &'static str, stop_reason: &'static str, exit: Option<Exit>) -> 
 /// exit of a failed drive; a retained vendor terminal gives its stop
 /// reason (AD4).
 fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Terminal {
-    let message = error.to_string();
+    let mut message = error.to_string();
+    let mut vendor_code = None;
     let exit = exit_of(&error.evidence());
     let (state, class, stop_reason, data) = match error {
         AdapterError::Route(route) => {
@@ -591,8 +597,13 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
                 StartRejected::InvalidParam { field } => {
                     Some(json!({"reason": "invalid_param", "field": field}))
                 }
+                // The vendor's own code and bounded detail (AD5, C1 §5).
+                StartRejected::VendorError(code, detail) => {
+                    vendor_code = Some(code.clone());
+                    message.clone_from(detail);
+                    None
+                }
                 StartRejected::BoundUnsupported(_)
-                | StartRejected::VendorError(..)
                 | StartRejected::SessionGone
                 | StartRejected::Protocol(_) => None,
             };
@@ -611,7 +622,7 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
     };
     let mut terminal = blank(state, stop_reason, exit);
     terminal.failure = class.map(|class| {
-        let mut failure = failure(class, message, None);
+        let mut failure = failure(class, message, vendor_code);
         failure.data = data;
         failure
     });
@@ -803,5 +814,52 @@ mod tests {
         let lost = failed_terminal(route(RouteError::TransportLost { turn }, None));
         assert_eq!(lost.state, "unknown");
         assert!(lost.failure.is_none());
+    }
+
+    fn vendor_terminal(status: via_adapters::VendorTerminalStatus) -> via_adapters::VendorTerminal {
+        via_adapters::VendorTerminal {
+            at: tokio::time::Instant::now(),
+            status,
+            stop_reason: via_adapters::StopReason::Error,
+            vendor_stop_reason: "error".to_owned(),
+            vendor_code: Some("E429".to_owned()),
+            class_hint: None,
+            detail: Some("quota exhausted".to_owned()),
+            structured_output: None,
+            steps: None,
+            usage: None,
+            cost: None,
+            vendor: None,
+        }
+    }
+
+    /// Sol r1 F9: a definite vendor rejection keeps the vendor's code and
+    /// its bounded detail in the failure, as does a vendor terminal that
+    /// failed before acceptance; only the class is `submit_failed`.
+    #[test]
+    fn a_vendor_rejection_keeps_its_code_and_detail() {
+        let evidence = via_adapters::TurnEvidence {
+            exit: None,
+            cleanup: via_adapters::Cleanup::Quiescent,
+            journal_uncertain: false,
+        };
+        let rejected = failed_terminal(AdapterError::Rejected {
+            reason: via_adapters::StartRejected::VendorError(
+                "E429".to_owned(),
+                "quota exhausted".to_owned(),
+            ),
+            evidence: evidence.clone(),
+        });
+        let failure = rejected.failure.expect("a rejection fails");
+        assert_eq!(failure.class, FailureClass::SubmitFailed);
+        assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
+        assert_eq!(failure.message, "quota exhausted");
+
+        let vendor = vendor_terminal(via_adapters::VendorTerminalStatus::Failed);
+        let before = super::classify(false, Some(&vendor), Ok(evidence));
+        let failure = before.failure.expect("a failure before acceptance");
+        assert_eq!(failure.class, FailureClass::SubmitFailed);
+        assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
+        assert_eq!(failure.message, "quota exhausted");
     }
 }
