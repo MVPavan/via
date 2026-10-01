@@ -285,8 +285,8 @@ pub struct TurnFailure {
     /// Cleanup certainty, when Route established one.
     pub cleanup: Option<WireCleanup>,
     /// Host stopped the group while its vendor was live. On the persistent
-    /// profile only the server's death says so: a shared server is never
-    /// killed for a turn (C2 §4.1).
+    /// profile only the server's death or the daemon force says so: a
+    /// shared server is never killed for a turn (C2 §4.1).
     pub forced: bool,
     /// A Host journal write had an uncertain outcome: the daemon latches.
     pub journal_uncertain: bool,
@@ -831,7 +831,8 @@ impl Serving<'_> {
 
 /// Builds the C2-lane result from Route's S1 result and the lane's facts.
 /// On the persistent profile a failure reports the logical connection
-/// (decision H1): only the server's death carries the helper's Host facts.
+/// (decision H1): only the server's death and the daemon force, which stop
+/// the server, carry the helper's Host facts.
 /// Any other launched failure has no exit and no force, and its cleanup is
 /// the reported tool items' (AD9 server-route row); the helper's facts are
 /// its retirement's.
@@ -864,8 +865,15 @@ pub(super) fn turn_result(
                 | RouteError::Deadline { .. }
                 | RouteError::ForceStopped { .. }) => TurnCause::Route(cause),
             };
-            let logical =
-                persistent && failure.launched && !matches!(cause, TurnCause::ServerLost { .. });
+            // The server's loss and the daemon force end the server itself
+            // (Host's own lifecycle): their Host facts are the connection's.
+            let logical = persistent
+                && failure.launched
+                && !matches!(
+                    cause,
+                    TurnCause::ServerLost { .. }
+                        | TurnCause::Route(RouteError::ForceStopped { .. })
+                );
             let (exit, cleanup, forced) = if logical {
                 let cleanup = if tools_settled {
                     WireCleanup::Quiescent

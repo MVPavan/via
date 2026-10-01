@@ -2361,3 +2361,33 @@ fn a_dropped_unpolled_close_leaves_the_driver_open() {
     assert_eq!(report.cleanup, Cleanup::Quiescent, "{report:?}");
     assert!(report.process_exit.is_some(), "{report:?}");
 }
+
+/// C2 §2 Close(Force), §4.1 (persistent profile): the daemon force stops the
+/// shared server through Host's own lifecycle, so its Host facts are the
+/// logical connection's, as for the server's loss: forced, with its exit.
+#[test]
+fn a_persistent_daemon_force_reports_host_facts() {
+    let rig = Rig::new(&persistent(), &[script(1, &[accepted(1), gate("forced")])]);
+    let (driver, mut receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let force = &controls.force;
+    let (end, _, ()) = rig.run_beside(
+        &driver,
+        &mut receiver,
+        (prompt(), cx),
+        |mut seen| async move {
+            until_seen(&mut seen, |seen| seen.accepted).await;
+            force.send_replace(Some(tokio::time::Instant::now()));
+        },
+    );
+    let failure = failure(&end);
+    assert!(
+        matches!(
+            failure.cause,
+            TurnCause::Route(RouteError::ForceStopped { .. })
+        ),
+        "{end:?}"
+    );
+    assert!(failure.forced, "{end:?}");
+    assert!(failure.exit.is_some(), "{end:?}");
+}
