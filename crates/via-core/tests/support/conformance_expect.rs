@@ -442,7 +442,18 @@ fn rules(expect: &Value) -> Result<(), String> {
         }
         let order = strings(&e["observations_order"]);
         let first = |kind| order.iter().position(|&seen| seen == kind);
-        if let Some(confirmed) = first(CONFIRMED)
+        // C2 §2 identity: on every route, identity is persisted before any
+        // same-message acceptance, so an accepted turn that asserts the
+        // confirmation anywhere must also order it.
+        let confirmation_asserted = strings(&e["observations_include"]).contains(&CONFIRMED)
+            || e["observation_counts"][CONFIRMED]
+                .as_u64()
+                .is_some_and(|count| count > 0);
+        if e["accepted"] == json!(true) && confirmation_asserted && first(CONFIRMED).is_none() {
+            wrong.push(format!(
+                "turns[{index}].expect.observations_order: {CONFIRMED} must precede {ACCEPTED}"
+            ));
+        } else if let Some(confirmed) = first(CONFIRMED)
             && first(ACCEPTED).is_none_or(|accepted| accepted < confirmed)
         {
             wrong.push(format!(

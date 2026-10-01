@@ -211,3 +211,21 @@ fn conformance_claude_error_kinds_follow_c2() {
         );
     }
 }
+
+/// Green: an accepted turn that asserts identity confirmation must order it
+/// before acceptance (C2 §2 identity), so an expectation cannot drop the
+/// order and still validate.
+#[test]
+fn conformance_claude_identity_order_is_required() {
+    let base = conformance_expect::load(&fixtures(), "c1a").unwrap();
+    conformance_expect::validate(&base).unwrap();
+    for order in [json!([]), json!(["turn.accepted"])] {
+        let mut expect = base.clone();
+        expect["turns"][0]["expect"]["observations_order"] = order.clone();
+        let refused = conformance_expect::validate(&expect);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("must precede")),
+            "order {order}: {refused:?}"
+        );
+    }
+}
