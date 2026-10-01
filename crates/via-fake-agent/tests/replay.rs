@@ -820,3 +820,31 @@ fn replay_exit_step_is_checked_at_load() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn replay_appends_each_start_to_the_launch_log() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &json!({"argv": [], "version": "1.0", "deadline_ms": 10_000, "steps": []}),
+    )?;
+    let mut pids = Vec::new();
+    for args in [&[][..], &["--version"][..], &[][..]] {
+        let run = spawn(&binary, args)?;
+        pids.push(format!("{}\n", run.child.id()));
+        assert_eq!(run.finish(true)?.code, Some(0));
+    }
+    assert_eq!(
+        fs::read_to_string(root.path().join("vendor.launches"))?,
+        pids.concat()
+    );
+
+    // A launch log that cannot be written fails the run.
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &json!([])))?;
+    fs::create_dir(root.path().join("vendor.launches"))?;
+    let end = spawn::<&str>(&binary, &[])?.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stderr.contains("launch log"), "{}", end.stderr);
+    Ok(())
+}

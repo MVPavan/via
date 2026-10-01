@@ -19,6 +19,9 @@
 //!
 //! `$${` writes a literal `${`.
 //!
+//! Each start appends its pid as one line to `<dir>/<name>.launches`, so a
+//! test can count launches.
+//!
 //! Lines, the fixture, the captures and the whole run are bounded. Any
 //! failure exits [`FAILED`], naming the 1-based step where one was running.
 
@@ -176,30 +179,51 @@ pub(crate) fn run_if_selected() {
         process::exit(FAILED)
     };
     let watchdog = arm(load_deadline, Arc::clone(&step));
-    let Some(fixture) = fixture_path() else {
+    let Some((fixture, launches)) = fixture_paths() else {
         // If the watchdog is gone it can no longer act; nothing to disarm.
         let _ = watchdog.send(Arm::Disarm);
         return;
     };
-    let code = match replay(&fixture, started, &step, &watchdog) {
-        Ok(code) => code,
-        Err(error) => {
-            diagnostic(&error);
-            FAILED
-        }
-    };
+    let code =
+        match log_launch(&launches).and_then(|()| replay(&fixture, started, &step, &watchdog)) {
+            Ok(code) => code,
+            Err(error) => {
+                diagnostic(&error);
+                FAILED
+            }
+        };
     process::exit(code)
 }
 
-/// The sibling fixture of `argv[0]`, when the fake runs in replay mode.
-fn fixture_path() -> Option<PathBuf> {
+/// The sibling fixture and launch log of `argv[0]`, when the fake runs in
+/// replay mode.
+fn fixture_paths() -> Option<(PathBuf, PathBuf)> {
     let argv0 = PathBuf::from(env::args_os().next()?);
     // A bare name was found through PATH; it has no directory to look beside.
     argv0.parent().filter(|dir| !dir.as_os_str().is_empty())?;
-    let mut name = OsString::from(argv0.as_os_str());
-    name.push(".replay.json");
-    let fixture = PathBuf::from(name);
-    fixture.is_file().then_some(fixture)
+    let sibling = |suffix: &str| {
+        let mut name = OsString::from(argv0.as_os_str());
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let fixture = sibling(".replay.json");
+    fixture.is_file().then(|| (fixture, sibling(".launches")))
+}
+
+/// Appends this process's pid as one line, in a single `O_APPEND` write so
+/// that concurrent starts never interleave.
+fn log_launch(path: &Path) -> Result<(), String> {
+    let line = format!("{}\n", process::id());
+    let written = File::options()
+        .append(true)
+        .create(true)
+        .open(path)
+        .and_then(|mut file| file.write(line.as_bytes()))
+        .map_err(|error| format!("cannot write the launch log: {error}"))?;
+    if written != line.len() {
+        return Err("short write to the launch log".to_owned());
+    }
+    Ok(())
 }
 
 fn replay(
