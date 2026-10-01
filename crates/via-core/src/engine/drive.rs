@@ -1531,7 +1531,7 @@ impl Engine {
                 Some(admitted) = inbox.recv() => {
                     let Admitted { item, permit } = admitted;
                     if let Some(idle_at) = control.idle_at.as_mut()
-                        && progress(&item.observation)
+                        && current_progress(lane, control.turn, &item)
                     {
                         *idle_at = tokio::time::Instant::now() + control.idle;
                     }
@@ -2606,6 +2606,21 @@ fn progress(observation: &Observation) -> bool {
         | Observation::ResumeMismatch { .. }
         | Observation::LateTerminal(_) => false,
     }
+}
+
+/// Whether `item` is meaningful progress of the running `turn` on `lane`,
+/// which resets the turn's idle deadline (critical r1 #7): its acceptance,
+/// the turn's by its correlation, or progress `lane` attributes to the
+/// turn. Late, expired and session-level progress never does.
+pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &ObservationItem) -> bool {
+    progress(&item.observation)
+        && (matches!(item.observation, Observation::Accepted(_))
+            || lane.attribute(
+                item.vendor_turn
+                    .as_ref()
+                    .map(via_adapters::VendorTurnId::as_str),
+                Some(turn),
+            ) == Attribution::Current)
 }
 
 /// The vendor turn an acceptance names: its own vendor turn ID, else the

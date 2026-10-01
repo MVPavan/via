@@ -4802,3 +4802,49 @@ fn a_never_empty_channel_holds_neither_the_turn_nor_its_end() {
         producer.await.unwrap();
     });
 }
+
+/// Critical r1 #7 (Task 4 design §2.6, C2 §2): only the running turn's own
+/// meaningful progress resets its idle deadline. Progress of an earlier
+/// turn (late), of an expired vendor turn, or of a genuinely unseen one
+/// (session-level) does not; the turn's own, and its acceptance, do.
+#[test]
+fn only_the_running_turns_progress_resets_its_idle_deadline() {
+    let Some(root) = child("only_the_running_turns_progress_resets_its_idle_deadline") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{Observation, ProgressMarks};
+        let engine = open(&root);
+        let (_session, _slot, lane, _record, _effective, _orders) =
+            running_turn_2(&engine, &root).await;
+        let item = |vendor_turn: Option<&str>, observation| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: vendor_turn
+                .map(|turn| via_adapters::VendorTurnId::try_from(turn.to_owned()).unwrap()),
+            observation,
+        };
+        let tool = || {
+            Observation::Progress(ProgressMarks {
+                tools_started: vec![("t".to_owned(), "bash".to_owned())],
+                ..ProgressMarks::default()
+            })
+        };
+        let resets = |vendor_turn| {
+            super::drive::current_progress(&lane, turn(2), &item(vendor_turn, tool()))
+        };
+        assert!(!resets(Some("fake-turn-1")), "late");
+        assert!(!resets(Some("gone")), "expired");
+        assert!(!resets(Some("unseen")), "session-level");
+        assert!(resets(Some("fake-turn-2")), "the running turn's");
+        assert!(resets(None), "the running turn's, naming none");
+        let accepted = Observation::Accepted(via_adapters::observation::Acceptance {
+            correlation: via_adapters::AcceptanceToken::FIRST,
+            vendor_turn_id: None,
+        });
+        assert!(super::drive::current_progress(
+            &lane,
+            turn(2),
+            &item(Some("next"), accepted)
+        ));
+    });
+}
