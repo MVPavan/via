@@ -1,0 +1,46 @@
+{
+  "source": "CC c5_read_only, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Read input.txt, then try to write output.txt containing its text using a file-edit tool. Report what happened.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "read_only",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "error": null,
+        "cleanup": null,
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "steer": null,
+        "launched": false,
+        "stdin_sequence": [],
+        "notes": "read_only is refused bound_unsupported before any vendor I/O while CLAUDE-BOUND-1 is open (C2 §6.2 Bound, §7 item 13; packet §8). Restricted file tools are not all-tool containment. The fixture records the candidate recipe and is never started."
+      }
+    }
+  ]
+}

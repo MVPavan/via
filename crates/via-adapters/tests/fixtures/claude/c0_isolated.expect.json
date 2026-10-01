@@ -1,0 +1,51 @@
+{
+  "source": "CC c0_isolated, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "failed",
+          "stop_reason": "error",
+          "class_hint": "auth",
+          "vendor_code": "authentication_failed"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "observations_exclude": [
+          "progress",
+          "final_text"
+        ],
+        "steer": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "Not logged in. The matching init confirms identity but is not acceptance (C2 §2 delayed identity; packet §2). The synthetic assistant message (is_api_error_message, model <synthetic>) is never acceptance, progress or final text (C2 §2 submission boundary, §7 item 5); the post-init result is acceptance evidence, so the vendor failure is a Failed terminal with vendor code and class hint, never submit_failed (C2 §2; packet §5). Classified from the synthetic error code authentication_failed, not from subtype:success (C2 §6.2 class hints). The result text repeats the synthetic text and is not final text because is_error is true."
+      }
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Gaps over 1 s became 100 ms (longest recorded gap 1054 ms). The interrupt is answered with the captured request_id. The process exited 1, which replay cannot reproduce.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash"
+  ],
+  "version": "2.1.285 (Claude Code)",
+  "deadline_ms": 15000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Use Bash to run exactly sleep 12. Then say DONE."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 581
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/project\",\"session_id\":\"${sid}\",\"tools\":[\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\"],\"mcp_servers\":[],\"model\":\"claude-haiku-4-5-20251001\",\"permissionMode\":\"dontAsk\",\"slash_commands\":[\"clear\",\"compact\",\"config\",\"context\",\"init\",\"model\",\"review\"],\"terminal_slash_commands\":[\"doctor\",\"color\",\"focus\",\"reload-plugins\"],\"apiKeySource\":\"none\",\"claude_code_version\":\"2.1.285\",\"output_style\":\"default\",\"agents\":[\"claude\",\"Explore\",\"general-purpose\",\"Plan\",\"statusline-setup\"],\"skills\":[\"example-skill\"],\"plugins\":[{\"name\":\"cc-plugin-agents-md\",\"path\":\"builtin\",\"source\":\"cc-plugin-agents-md@builtin\"},{\"name\":\"cc-plugin-telemetry\",\"path\":\"builtin\",\"source\":\"cc-plugin-telemetry@builtin\"}],\"capabilities\":[\"interrupt_receipt_v1\",\"interrupt_cancel_queued_v1\",\"msg_01SYNTH000001_v1\",\"mcp_read_resource_v1\",\"mcp_tool_ui_meta_v1\"],\"analytics_disabled\":false,\"product_feedback_disabled\":false,\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"messaging_socket_path\":\"/tmp/cc-socks/4242.sock\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"per_turn_effort_active\":false,\"view_mode\":\"default\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":50,\"estimated_tokens_delta\":50,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000002\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 239
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":130,\"estimated_tokens_delta\":80,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000003\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 5
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000002\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SIGNATURE\"}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1305,\"cache_read_input_tokens\":6538,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1305},\"output_tokens\":4,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000004\",\"timestamp\":\"2026-09-30T16:48:00.464Z\",\"request_id\":\"req_01SYNTH000001\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 350
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01SYNTH000002\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_01SYNTH000001\",\"name\":\"Bash\",\"input\":{\"command\":\"sleep 12\",\"description\":\"Sleep for 12 seconds\"},\"caller\":{\"type\":\"direct\"}}],\"container\":null,\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1305,\"cache_read_input_tokens\":6538,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1305},\"output_tokens\":4,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"},\"input_transformations\":[],\"diagnostics\":null,\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000005\",\"timestamp\":\"2026-09-30T16:48:00.817Z\",\"request_id\":\"req_01SYNTH000001\",\"wire_tool_inputs\":{\"toolu_01SYNTH000001\":{\"command\":\"sleep 12\",\"description\":\"Sleep for 12 seconds\"}}}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 10
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":1790000000,\"rateLimitType\":\"five_hour\",\"utilization\":0.1,\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.1,\"resetsAt\":1790000000},\"seven_day\":{\"utilization\":0.1,\"resetsAt\":1790500000}}},\"uuid\":\"00000000-0000-4000-8000-000000000006\",\"session_id\":\"${sid}\"}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "type": "control_request",
+          "request": {
+            "subtype": "interrupt"
+          }
+        },
+        "capture": {
+          "rid": "/request_id"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\",\"is_error\":true,\"tool_use_id\":\"toolu_01SYNTH000001\"}]},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000007\",\"timestamp\":\"2026-09-30T16:48:01.047Z\",\"tool_use_result\":\"User rejected tool use\",\"tool_result_meta\":[{\"id\":\"toolu_01SYNTH000001\",\"non_execution_kind\":\"user-rejected\"}]}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user for tool use]\"}]},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000008\",\"timestamp\":\"2026-09-30T16:48:01.048Z\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"duration_api_ms\":1646,\"stop_reason\":\"tool_use\",\"session_id\":\"${sid}\",\"total_cost_usd\":0.0039688,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":1305,\"cache_read_input_tokens\":6538,\"output_tokens\":139,\"output_tokens_details\":{\"thinking_tokens\":61},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":1305,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":10,\"output_tokens\":139,\"cache_read_input_tokens\":6538,\"cache_creation_input_tokens\":1305,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1305},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":10,\"outputTokens\":139,\"cacheReadInputTokens\":6538,\"cacheCreationInputTokens\":1305,\"webSearchRequests\":0,\"costUSD\":0.0039688,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"thinkingTokens\":61,\"canonicalModel\":\"claude-haiku-4-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[],\"terminal_reason\":\"aborted_tools\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":true,\"num_turns\":3,\"subtype\":\"error_during_execution\",\"errors\":[\"[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use\"],\"type\":\"result\",\"duration_ms\":1893,\"uuid\":\"00000000-0000-4000-8000-000000000009\",\"queued_turn_count\":0,\"result_index\":0}"
+      }
+    }
+  ]
+}

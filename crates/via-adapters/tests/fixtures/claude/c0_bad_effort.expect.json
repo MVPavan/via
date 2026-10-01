@@ -1,0 +1,42 @@
+{
+  "source": "CC c0_bad_effort, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": "bogus",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": "invalid_param:effort",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "error": null,
+        "cleanup": null,
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "action.denied",
+          "vendor.request_declined"
+        ],
+        "steer": null,
+        "launched": false,
+        "stdin_sequence": [],
+        "notes": "Claude ignores an unknown --effort with only a stderr warning (recorded: exit 0), so plan validates effort against {low, medium, high, xhigh, max} and refuses invalid_params (field effort) before any receipt or launch (C2 §5 effort validation, AD18; packet §4 effort). The fixture is never started."
+      }
+    }
+  ]
+}

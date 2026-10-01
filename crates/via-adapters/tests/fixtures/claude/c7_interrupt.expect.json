@@ -1,0 +1,75 @@
+{
+  "source": "CC c7_interrupt, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "plan_checks": [
+    {
+      "require": [
+        "cancel"
+      ],
+      "refusal": "missing_capability:cancel"
+    },
+    {
+      "require": [
+        "cancel:partial"
+      ],
+      "refusal": null
+    }
+  ],
+  "turns": [
+    {
+      "params": {
+        "prompt": "Use Bash to run exactly sleep 12. Then say DONE.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "class_hint": null,
+          "vendor_stop_reason": "tool_use",
+          "usage": {
+            "output": 139
+          }
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "steer": null,
+        "cancel": {
+          "outcome": "acknowledged"
+        },
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "control_request:interrupt",
+          "eof"
+        ],
+        "notes": "AD19 cancel order: the interrupt control_request goes first on the control lane, then stdin EOF, then S1's close (C2 §6.2 Interrupt; packet §7). The nested success receipt with the same request_id plus the result error_during_execution / aborted_tools acknowledge the cancel; the receipt alone would not (C2 §7 item 10). Cleanup is quiescent only on Host GroupAbsent for Claude's own group (C2 §2 Interrupt table); live, Bash and sleep left the group and are leftovers (C2 §4.2), which this slice does not assert."
+      }
+    }
+  ]
+}

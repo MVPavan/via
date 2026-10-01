@@ -1,0 +1,68 @@
+{
+  "source": "CC c1b (derived), 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": "11111111-1111-4111-8111-111111111111",
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "effort": null,
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "beta"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "resume.mismatch"
+        ],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "final_text"
+        ],
+        "steer": null,
+        "resume_mismatch": {
+          "requested": "11111111-1111-4111-8111-111111111111",
+          "returned": "99999999-9999-4999-8999-999999999999"
+        },
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "unsettled": [
+          "accepted",
+          "terminal",
+          "error"
+        ],
+        "notes": "Derived fixture: the init and result carry a different session UUID from the one VIA resumed. Every init/result ID is checked; mismatch emits resume.mismatch {requested, returned} (Core commits failed(resume_mismatch)), never confirms or replaces the session and never resends (C2 §2 reopen, §4, §7 item 4; packet §2). C2 does not settle the TurnEnd after a mismatch (acceptance, retained terminal, AdapterError), so those are unsettled."
+      }
+    }
+  ]
+}

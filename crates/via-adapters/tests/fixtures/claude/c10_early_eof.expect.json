@@ -1,0 +1,57 @@
+{
+  "source": "CC c10_early_eof, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": {
+        "kind": "close",
+        "after": "handshake"
+      },
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "vendor_stop_reason": "end_turn"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": "READY.",
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "unsettled": [
+          "cancel"
+        ],
+        "notes": "Stdin EOF does not cancel: with no tool open the turn completed (exit 0) after an EOF sent right after the prompt. A close order with no open tool item therefore only closes stdin and the natural terminal wins (C2 §6.2 Close; packet §7; C1 §7.6). Recorded EOF preceded init; the replay cannot observe EOF timing. Whether the cancel report is requested or absent is not settled by C2."
+      }
+    }
+  ]
+}

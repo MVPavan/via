@@ -1,0 +1,57 @@
+{
+  "source": "CC c11b_stdio_prompt, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Use Edit to create probe.txt containing READY in the current directory. If permission is denied, say DENIED.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "vendor_stop_reason": "end_turn"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text",
+          "vendor.request_declined"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": "DENIED",
+        "observation_counts": {
+          "vendor.request_declined": 1,
+          "action.denied": 0
+        },
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "control_response:error",
+          "eof"
+        ],
+        "notes": "An incoming can_use_tool control_request is declined within 5 s on the control path with the pinned error reply (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9)."
+      }
+    }
+  ]
+}

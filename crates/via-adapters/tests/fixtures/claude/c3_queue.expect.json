@@ -1,0 +1,65 @@
+{
+  "source": "CC c3_queue, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "plan_checks": [
+    {
+      "require": [
+        "steer"
+      ],
+      "refusal": "missing_capability:steer"
+    }
+  ],
+  "turns": [
+    {
+      "params": {
+        "prompt": "Use Bash to run exactly sleep 3, then reply FIRST_DONE.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "vendor_stop_reason": "end_turn"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [
+          "steer.delivered"
+        ],
+        "steer": {
+          "text": "After that, reply SECOND_DONE without tools.",
+          "after": "tool_started",
+          "refusal": "unsupported_verb"
+        },
+        "final_text": "FIRST_DONE",
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "Live, a second user line written during the tool merged into one result, so steer is unsupported and VIA never writes busy input (C2 A3, §6.2 Steer; packet §6). A steer while the tool runs is refused unsupported_verb and writes nothing; the turn completes as if no steer was asked; require steer is refused missing_capability (C1 -32007)."
+      }
+    }
+  ]
+}

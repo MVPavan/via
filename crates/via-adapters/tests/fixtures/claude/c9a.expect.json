@@ -1,0 +1,58 @@
+{
+  "source": "CC c9a, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": "Always end every reply with the exact word MANGO."
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Use Bash to run exactly: echo RECIPE > made.txt . Then reply with one short sentence.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "vendor_stop_reason": "end_turn",
+          "usage": {
+            "output": 177
+          },
+          "cost": {
+            "usd": 0.007483900000000001,
+            "scope": "session_cumulative"
+          }
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": "Created `made.txt` with the content \"RECIPE\".\n\nMANGO",
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "The packet §4 full recipe with frozen instructions via --append-system-prompt. result.usage is the turn aggregate: output 177, while each assistant snapshot says 3; snapshots are never reported as usage (C2 §6.2 usage; packet §5)."
+      }
+    }
+  ]
+}

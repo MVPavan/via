@@ -1,0 +1,51 @@
+{
+  "source": "CC c0_bad_model, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "claude-nonexistent-model-9",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "failed",
+          "stop_reason": "error",
+          "class_hint": "vendor_error",
+          "vendor_code": "model_not_found"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "observations_exclude": [
+          "progress",
+          "final_text"
+        ],
+        "steer": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "An explicit model id outside the bundled catalog passes to the vendor (packet §2 models, §4 model). Init echoes the unresolved name and confirms identity. The synthetic model_not_found message is no progress and no acceptance; the post-init result (subtype success, is_error true, terminal_reason api_error, api_error_status 404) accepts the turn and is a Failed terminal, class vendor_error with vendor_code model_not_found (C2 §2, §6.2 class hints; packet §5)."
+      }
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "source": "CC c1a, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": null,
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Remember token NONCE0001. Return JSON with kind alpha and token equal to it.",
+        "effort": null,
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "alpha"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "other",
+          "class_hint": null,
+          "vendor_stop_reason": "tool_use",
+          "structured_output": {
+            "kind": "alpha",
+            "token": "NONCE0001"
+          },
+          "usage": {
+            "output": 156
+          },
+          "cost": {
+            "usd": 0.010124000000000001,
+            "scope": "session_cumulative"
+          }
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": "{\"kind\":\"alpha\",\"token\":\"NONCE0001\"}",
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "First launch: --session-id with the VIA-generated expected UUID (captured); the matching init confirms identity (session.opened) before acceptance (C2 §2). A schema result ends with vendor stop_reason tool_use, which is stop reason other, not interrupted or failed (packet §5). Tokens are the result.usage turn aggregate; total_cost_usd is session-cumulative (C2 §6.2 usage; packet §5)."
+      }
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": "11111111-1111-4111-8111-111111111111",
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "effort": null,
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "beta"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "other",
+          "class_hint": null,
+          "vendor_stop_reason": "tool_use",
+          "structured_output": {
+            "kind": "beta",
+            "token": "NONCE0001"
+          },
+          "usage": {
+            "output": 167
+          },
+          "cost": {
+            "usd": 0.020783000000000003,
+            "scope": "session_cumulative"
+          }
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": "{\"kind\":\"beta\",\"token\":\"NONCE0001\"}",
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "notes": "A new private process resumes the exact confirmed UUID with --resume and a replaced schema (C2 §2 reopen; packet §4). The matching init confirms this generation (session.reopened). Cost rose from c1a's 0.0101 while output tokens are this turn's own: cost is session_cumulative, tokens the turn aggregate (packet §5)."
+      }
+    }
+  ]
+}

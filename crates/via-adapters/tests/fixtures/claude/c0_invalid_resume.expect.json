@@ -1,0 +1,48 @@
+{
+  "source": "CC c0_invalid_resume, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "harness": "claude",
+  "session": {
+    "model": "haiku",
+    "resume": "33333333-3333-4333-8333-333333333333",
+    "instructions": null
+  },
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with just READY.",
+        "effort": null,
+        "output_schema": null,
+        "max_steps": null,
+        "bound": null
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": "session_gone",
+        "accepted": false,
+        "terminal": null,
+        "error": null,
+        "cleanup": null,
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "steer": null,
+        "instance": {
+          "vendor_version": null
+        },
+        "stdin_sequence": [
+          "user",
+          "eof"
+        ],
+        "unsettled": [
+          "cleanup"
+        ],
+        "notes": "--resume of a missing session gives a pre-init result (error_during_execution, num_turns 0, errors 'No conversation found ...') that echoes the requested UUID. A pre-init rejection never confirms identity or opens (C2 §2 delayed identity); a definite missing-session rejection is StartRejected::SessionGone, i.e. submit_failed, and the same VIA session is kept (packet §2). No init was read, so the instance reports vendor_version null (C2 §5). C2 does not say whether a Rejected outcome carries cleanup evidence, so cleanup is unsettled."
+      }
+    }
+  ]
+}
