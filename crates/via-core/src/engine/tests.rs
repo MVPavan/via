@@ -5170,3 +5170,58 @@ fn a_resumed_session_has_one_sequence_owner_during_recovery() {
         until(|| budget.available_permits() == 1_000).await;
     });
 }
+
+/// Critical r1 #3 (design §6.8 step 3: the lane drain barrier): the
+/// restart handoff closes a durably `closing` session's lane and waits for
+/// its end, by the close allowance, before `Closed`. A lane whose drain
+/// has not finished by then leaves the session `closing`, so the durable
+/// observation it still holds commits afterwards.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_undrained_lane_keeps_a_restart_closing_session_open() {
+    let Some(root) = child("an_undrained_lane_keeps_a_restart_closing_session_open") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            earlier
+                .store
+                .commit_closing(via_store::ClosingRecord {
+                    session_id: session.clone(),
+                    operation: None,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        // The session's resumed lane holds a durable observation.
+        let (_lane, sender) = adopt_test_lane(&engine, &root, &session).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, denied("held")).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        let handoff = engine.hand_off_queued().await.unwrap();
+        assert_eq!(handoff.closed, 0, "{handoff:?}");
+        let snapshot = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            snapshot.closing && !snapshot.closed,
+            "the session stays closing"
+        );
+        release_point(&points, "core.lane.dispose", 1);
+        until_denials(
+            &engine,
+            &session,
+            &[(json!("held"), Value::Null, json!(false))],
+        )
+        .await;
+    });
+}

@@ -44,7 +44,9 @@ pub struct Handoff {
     /// Committed `queued → cancelled` behind an `unknown` predecessor, or
     /// for a durably `closing` session.
     pub cancelled: usize,
-    /// Durably `closing` sessions the restart closed (design §4).
+    /// Durably `closing` sessions the restart closed (design §4); one
+    /// whose lane did not end within the close allowance stays `closing`
+    /// (critical r1 #3).
     pub closed: usize,
     /// Failed `failed(store)` without agent I/O because a frozen value in
     /// the queued row is unparseable (design §7.3, O1.D8).
@@ -128,7 +130,8 @@ impl Engine {
     ///
     /// A durably `closing` session is finished before admission (design §4
     /// "Restart"): its queued turns are cancelled with cause `close`, then
-    /// `Closed` commits after one bounded absence check.
+    /// `Closed` commits after its lane ended and one bounded absence check
+    /// ([`Engine::finish_restart_close`]).
     ///
     /// Design §7.3 (O1.D8): a turn the handoff would enqueue, at its
     /// session's head, whose frozen row is present but unparseable fails
@@ -223,8 +226,9 @@ impl Engine {
         }
         let bound = tokio::time::Instant::now() + CLOSE_ALLOWANCE;
         for session in closing {
-            self.finish_restart_close(&session, bound).await?;
-            handoff.closed += 1;
+            if self.finish_restart_close(&session, bound).await? {
+                handoff.closed += 1;
+            }
         }
         Ok(handoff)
     }

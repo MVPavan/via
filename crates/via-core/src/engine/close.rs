@@ -449,14 +449,22 @@ impl Engine {
     }
 
     /// The restart close completion (design §4): after the queued pass
-    /// cancelled the session's queued turns with cause `close`, one bounded
-    /// absence check, then `Closed`, derived as for a live close. Any
-    /// failure fails startup [O1.D9].
+    /// cancelled the session's queued turns with cause `close`, the
+    /// session's lane, a resumed one's, is closed and its end awaited as
+    /// for a live close (critical r1 #3), then one bounded absence check,
+    /// then `Closed`, derived as for a live close. A lane that has not
+    /// ended by `bound` still owns admitted observations: the session stays
+    /// `closing` (false). Any failure fails startup [O1.D9].
     pub(super) async fn finish_restart_close(
         &self,
         session: &SessionId,
         bound: tokio::time::Instant,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        let mode = via_adapters::CloseMode::Graceful;
+        let closed = self.close_lane(session, mode, Deadline::at(bound));
+        if tokio::time::timeout_at(bound, closed).await.is_err() || !self.lane_drained(session) {
+            return Ok(false);
+        }
         // A failed proof write fails startup before `Closed` [O1.D9].
         if let Err(outcome) = self.absence_check(session, bound).await {
             return Err(format!(
@@ -469,7 +477,7 @@ impl Engine {
         drop(slot);
         self.retire(session);
         match closed {
-            Ok(ClosedOutcome::Closed(_)) => Ok(()),
+            Ok(ClosedOutcome::Closed(_)) => Ok(true),
             Ok(ClosedOutcome::Unfinished) => Err(format!(
                 "store_error: closing session {session} still has unfinished turns"
             )),
