@@ -12,7 +12,7 @@ implementation develops.
    exception (2026-10-01): a report-only leftover scan may transiently read
    the environment of same-uid processes started at or after a vendor launch,
    solely to match VIA's exact process marker; nothing else is parsed, kept,
-   logged or sent (C2 AD20). The user logs in through the vendor's tool.
+   logged or sent (C2 §4.2; adapter design AD20). The user logs in through the vendor's tool.
    Terms uncertainty does not block development: build the
    adapter properly, disable it if the vendor does not permit the route, and
    record terms status per adapter (not a gate).

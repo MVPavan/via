@@ -449,7 +449,7 @@ decision A, 2026-10-01; adapter design AD20 and AR2).
   the daemon's pid namespace, and work handed to outside services (tmux
   server, systemd, docker, ssh, cron, WSL `.exe`). Each harness's `x.3.4`
   qualification checks that its tool processes carry the marker.
-- **Privacy and authority.** A report-only leftover scan (C2 AD20) may read
+- **Privacy and authority.** A report-only leftover scan (C2 §4.2) may read
   the environment of a same-uid process started at or after the vendor,
   through one `/proc/<pid>` descriptor, solely to match the exact
   `VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and
