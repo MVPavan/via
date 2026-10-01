@@ -14,6 +14,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 cargo deny check
 python3 scripts/check-layers.py
+python3 scripts/check-harness-literals.py
 ```
 
 Root or CI runs (a foreign-uid listener needs CAP_SETUID) also run the
@@ -40,6 +41,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 cargo deny check
 python3 scripts/check-layers.py
+python3 scripts/check-harness-literals.py
 cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings
 cargo nextest run --locked --workspace --features via-cli/test-failpoints
 cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08|09|10|12)_/)'
