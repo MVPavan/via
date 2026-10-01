@@ -110,8 +110,6 @@ dependencies = [
 [[package]]
 name = "boon"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa187da765010b70370368c49f08244b1ae5cae1d5d33072f76c8cb7112fe3e"
 dependencies = [
  "ahash",
  "appendlist",
