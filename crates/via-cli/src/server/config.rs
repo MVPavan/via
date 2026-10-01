@@ -16,7 +16,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
-use via_core::{AdapterConfig, Limits, PAGE_BYTES};
+use via_core::{AdapterConfig, ConfigError, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -30,7 +30,8 @@ const MIN_WAL: u64 = 4 * 1024 * 1024;
 /// The file's name, also the key of a file-level failure.
 const FILE: &str = "daemon.json";
 
-/// Why `daemon.json` is invalid: the key and the rule it broke.
+/// Why `daemon.json` is invalid: the key, as [`ConfigError::shown_key`]
+/// shows it, and the rule it broke.
 #[derive(Debug)]
 pub(super) struct Invalid {
     key: String,
@@ -38,9 +39,9 @@ pub(super) struct Invalid {
 }
 
 impl Invalid {
-    fn new(key: impl Into<String>, rule: impl Into<String>) -> Self {
+    fn new(key: impl AsRef<str>, rule: impl Into<String>) -> Self {
         Self {
-            key: key.into(),
+            key: ConfigError::shown_key(key.as_ref()),
             rule: rule.into(),
         }
     }
@@ -291,6 +292,29 @@ mod tests {
             invalid(r#"{"disk":null}"#),
             "daemon config invalid: disk: must be an object"
         );
+    }
+
+    /// Every echoed key is escaped and bounded like `harnesses`' keys: an
+    /// unknown top-level, `disk` or `wal` key cannot garble the one-line
+    /// diagnostic, and its rule always survives.
+    #[test]
+    fn echoed_keys_are_escaped_and_bounded() {
+        assert_eq!(
+            invalid(r#"{"me\nmo\u001bry":1}"#),
+            r"daemon config invalid: me\nmo\u{1b}ry: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"disk":{"fl\u0007oor":1}}"#),
+            r"daemon config invalid: disk.fl\u{7}oor: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"wal":{"m\tax":1}}"#),
+            r"daemon config invalid: wal.m\tax: unknown key"
+        );
+        let long = "k".repeat(6000);
+        let shown = invalid(&format!(r#"{{"{long}":1}}"#));
+        assert!(shown.len() <= 512, "{} bytes", shown.len());
+        assert!(shown.ends_with("...: unknown key"), "{shown}");
     }
 
     /// Runtime §8, S-LAUNCH: `harnesses` is validated at read, like every

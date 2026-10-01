@@ -330,23 +330,33 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
 /// fits the auto-start client's 4 KiB stderr capture.
 const KEY_SHOWN: usize = 256;
 
-/// The key as shown: control characters escaped, cut at [`KEY_SHOWN`]
-/// bytes with `...`, so the diagnostic stays one bounded line.
-fn invalid(key: &str, rule: HarnessesRule) -> HarnessesError {
-    let mut shown = String::new();
-    for character in key.chars() {
-        let piece: String = if character.is_control() {
-            character.escape_default().collect()
-        } else {
-            character.to_string()
-        };
-        if shown.len() + piece.len() > KEY_SHOWN {
-            shown.push_str("...");
-            break;
+impl ConfigError {
+    /// A configuration key as a diagnostic shows it: control characters
+    /// escaped, cut at [`KEY_SHOWN`] bytes with `...`, so the diagnostic
+    /// stays one bounded line and the rule after it always survives.
+    pub fn shown_key(key: &str) -> String {
+        let mut shown = String::new();
+        for character in key.chars() {
+            let piece: String = if character.is_control() {
+                character.escape_default().collect()
+            } else {
+                character.to_string()
+            };
+            if shown.len() + piece.len() > KEY_SHOWN {
+                shown.push_str("...");
+                break;
+            }
+            shown.push_str(&piece);
         }
-        shown.push_str(&piece);
+        shown
     }
-    HarnessesError { key: shown, rule }
+}
+
+fn invalid(key: &str, rule: HarnessesRule) -> HarnessesError {
+    HarnessesError {
+        key: ConfigError::shown_key(key),
+        rule,
+    }
 }
 
 /// A JSON object's members in order, duplicates kept, so that a repeated
