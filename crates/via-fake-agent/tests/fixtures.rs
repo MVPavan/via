@@ -597,7 +597,8 @@ fn file_finding(text: &str) -> Option<String> {
 
 /// A credential field assigned a value in free text, such as stderr: the
 /// name, an optional quote, `=` or `:`, then a value that is not exactly a
-/// placeholder (or `null`).
+/// placeholder (or a bare `null`). A quoted value is taken whole, through
+/// its closing quote, so whitespace inside it hides nothing.
 fn secret_assignment(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let quote = |c: char| c == '"' || c == '\'';
@@ -609,12 +610,25 @@ fn secret_assignment(text: &str) -> Option<String> {
             let Some(rest) = rest.strip_prefix(['=', ':']) else {
                 continue;
             };
-            let rest = rest.trim_start().trim_start_matches(quote);
-            let end = rest
-                .find(|c: char| c.is_whitespace() || quote(c) || ",;&}".contains(c))
-                .unwrap_or(rest.len());
-            let value = &rest[..end];
-            if !value.is_empty() && value != "null" && !PLACEHOLDERS.contains(&value) {
+            let rest = rest.trim_start();
+            // A quoted value runs through its closing quote (or to the end),
+            // whitespace included; a bare one stops at a delimiter.
+            let (value, quoted) = match rest.chars().next() {
+                Some(open) if quote(open) => {
+                    let inner = &rest[1..];
+                    (&inner[..inner.find(open).unwrap_or(inner.len())], true)
+                }
+                _ => {
+                    let end = rest
+                        .find(|c: char| c.is_whitespace() || quote(c) || ",;&}".contains(c))
+                        .unwrap_or(rest.len());
+                    (&rest[..end], false)
+                }
+            };
+            // `PLACEHOLDERS` includes the empty value; a bare `null` is JSON's.
+            let placeholder =
+                PLACEHOLDERS.contains(&value) || (!quoted && (value.is_empty() || value == "null"));
+            if !placeholder {
                 return Some(format!("{key} is assigned a non-placeholder value"));
             }
         }
@@ -712,6 +726,11 @@ fn fixtures_hygiene_scan_covers_the_new_step_fields() {
         r#"{"steps":[{"exit":{"code":1,"stderr":"refresh_token: \"abc\"\n"}}]}"#,
         r#"{"steps":[{"exit":{"code":1,"stderr":"[auth] {\"access_token\":\"abc\"}\n"}}]}"#,
         r#"{"steps":[{"exit":{"code":1,"stderr":"Authorization: Bearer abc\n"}}]}"#,
+        // A quoted value is checked whole: a space inside the quotes, or
+        // leading whitespace, does not hide the rest of it.
+        r#"{"steps":[{"exit":{"code":1,"stderr":"Error: api_key=\"<redacted> abc123\"\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"Error: api_key=' abc123'\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"Error: access_token: \" abc123\"\n"}}]}"#,
         // An absent pointer is a string too.
         r#"{"steps":[{"expect":{"line":{},"absent":["/home/someone"]}}]}"#,
     ];
@@ -721,6 +740,7 @@ fn fixtures_hygiene_scan_covers_the_new_step_fields() {
     let clean = [
         r#"{"steps":[{"exit":{"code":1,"stderr":"[claude-code:unrecognized_model] {\"model\":\"m\",\"query_source\":\"sdk\"}\n"}}]}"#,
         r#"{"steps":[{"exit":{"code":1,"stderr":"api_key=<redacted>\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"api_key=\"<redacted>\", api_key=''\n"}}]}"#,
         r#"{"steps":[{"exit":{"code":1,"stderr":"set the API key first\n"}}]}"#,
         r#"{"steps":[{"expect":{"line":{},"absent":["/response/response"],"within_ms":5000}},{"await_eof":{}}]}"#,
     ];
