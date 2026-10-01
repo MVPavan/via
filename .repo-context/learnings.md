@@ -109,3 +109,10 @@ in the design record (`docs/`), not here.
   with `#L<line>`, turn scratchpad targets into plain text (they resolve only on the machine
   that has `scratchpad/`, so the link check misses them), and run the link
   check from `verification.md` before committing.
+- Claude Code's `isolation: worktree` creates the worktree from
+  `origin/HEAD` (`origin/main`), not from the working branch. On
+  `rust-foundation` that is hundreds of commits behind. Workers used to
+  fast-forward themselves, but auto mode can deny `merge --ff-only` as
+  destructive. Create the worktree yourself at the intended base
+  (`git worktree add -b wt/<name> .claude/worktrees/<name> <commit>`) and
+  give the worker its path, rather than relying on isolation.
