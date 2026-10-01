@@ -140,9 +140,11 @@ fn known(value: &Value, keys: &[&str], at: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks the expectation's shape: known fields only, required parts present,
-/// session labels and `start_after` turns resolvable, and a reason for each
-/// `unasserted` entry.
+/// Checks the expectation's well-formedness for every harness: known fields
+/// only, required parts present, session labels and `start_after` turns
+/// resolvable, a non-empty reason for each `unasserted` entry, C2 names for
+/// enumerated values, `turn.accepted` counted exactly once on every accepted
+/// turn, and identity confirmation ordered before acceptance.
 pub(crate) fn validate(expect: &Value) -> Result<(), String> {
     known(expect, TOP, "case")?;
     let sessions = object(&expect["sessions"], "sessions")?;
@@ -187,7 +189,129 @@ pub(crate) fn validate(expect: &Value) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    rules(expect)
+}
+
+/// C2 terminal statuses.
+const STATUS: &[&str] = &["completed", "interrupted", "failed"];
+/// C2 `StopReason`.
+const STOP_REASON: &[&str] = &[
+    "end_turn",
+    "max_steps",
+    "budget",
+    "refusal",
+    "interrupted",
+    "error",
+    "other",
+];
+/// C2 `ClassHint`.
+const CLASS_HINT: &[&str] = &[
+    "auth",
+    "rate_limit",
+    "context_exceeded",
+    "budget_exceeded",
+    "vendor_error",
+    "protocol",
+    "resume_mismatch",
+];
+/// C2 `AdapterError` kinds other than `Rejected`, which is stated as `rejected`.
+const ERROR: &[&str] = &[
+    "deadline",
+    "force_stop",
+    "overflow",
+    "protocol",
+    "process_exit",
+    "unknown_submission",
+    "server_lost",
+    "transport_lost",
+];
+/// C2 `StartRejected`; a name ending in `:` takes a non-empty suffix.
+const REJECTED: &[&str] = &[
+    "bound_unsupported",
+    "invalid_param:",
+    "vendor_error",
+    "session_gone",
+    "protocol",
+];
+/// C2 `Refusal` kinds; a name ending in `:` takes a non-empty suffix.
+const REFUSAL: &[&str] = &[
+    "unsupported_verb",
+    "bound_unsupported",
+    "harness_unavailable",
+    "unknown_model",
+    "version_refused",
+    "vendor_option_conflict",
+    "invalid_param:",
+    "missing_capability:",
+];
+const CLEANUP: &[&str] = &["quiescent", "uncertain"];
+const SETTLES: &[&str] = &["at_terminal", "at_p7_bound", "when_tools_end"];
+const CONFIRMED: &str = "session.vendor_identity_confirmed";
+const ACCEPTED: &str = "turn.accepted";
+
+/// Whether `value` is null or one of `names`; a name ending in `:` admits
+/// that prefix followed by any non-empty suffix.
+fn named(value: &Value, names: &[&str]) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => names.iter().any(|name| match name.strip_suffix(':') {
+            Some(prefix) => text
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|rest| !rest.is_empty()),
+            None => text == name,
+        }),
+        Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
+/// The value rules of [`validate`], over every turn, reporting all breaks.
+fn rules(expect: &Value) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    for (index, turn) in expect["turns"].as_array().into_iter().flatten().enumerate() {
+        let e = &turn["expect"];
+        let terminal = &e["terminal"];
+        let enumerated: [(&str, &Value, &[&str]); 8] = [
+            ("cleanup", &e["cleanup"], CLEANUP),
+            ("cleanup_settles", &e["cleanup_settles"], SETTLES),
+            ("error", &e["error"], ERROR),
+            ("rejected", &e["rejected"], REJECTED),
+            ("plan_refusal", &e["plan_refusal"], REFUSAL),
+            ("terminal.status", &terminal["status"], STATUS),
+            (
+                "terminal.stop_reason",
+                &terminal["stop_reason"],
+                STOP_REASON,
+            ),
+            ("terminal.class_hint", &terminal["class_hint"], CLASS_HINT),
+        ];
+        for (field, value, names) in enumerated {
+            if !named(value, names) {
+                wrong.push(format!(
+                    "turns[{index}].expect.{field}: {value} is not a C2 name"
+                ));
+            }
+        }
+        if e["accepted"] == json!(true) && e["observation_counts"][ACCEPTED] != json!(1) {
+            wrong.push(format!(
+                "turns[{index}]: an accepted turn states observation_counts {ACCEPTED} = 1"
+            ));
+        }
+        let order = strings(&e["observations_order"]);
+        let first = |kind| order.iter().position(|&seen| seen == kind);
+        if let Some(confirmed) = first(CONFIRMED)
+            && first(ACCEPTED).is_none_or(|accepted| accepted < confirmed)
+        {
+            wrong.push(format!(
+                "turns[{index}].expect.observations_order: {CONFIRMED} must precede {ACCEPTED}"
+            ));
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("\n"))
+    }
 }
 
 /// Whether `actual` holds every stated part of `expected`: objects by their

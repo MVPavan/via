@@ -94,6 +94,64 @@ fn conformance_codex_cases_match_fixture_files() {
     }
 }
 
+/// A named change that makes an expectation malformed.
+type Defect = (&'static str, fn(&mut Value));
+
+/// Green: `validate` refuses each kind of malformed expectation, one
+/// mutation of a well-formed case per rule.
+#[test]
+fn conformance_codex_validate_refuses_each_defect() {
+    let base = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
+    conformance_expect::validate(&base).unwrap();
+    let defects: [Defect; 11] = [
+        ("accepted turn counts turn.accepted twice", |e| {
+            e["turns"][0]["expect"]["observation_counts"] = json!({"turn.accepted": 2});
+        }),
+        ("accepted turn omits the turn.accepted count", |e| {
+            e["turns"][0]["expect"]["observation_counts"] = json!({});
+        }),
+        ("identity confirmation after acceptance", |e| {
+            e["turns"][0]["expect"]["observations_order"] =
+                json!(["turn.accepted", "session.vendor_identity_confirmed"]);
+        }),
+        ("cleanup", |e| {
+            e["turns"][0]["expect"]["cleanup"] = json!("pending");
+        }),
+        ("cleanup_settles", |e| {
+            e["turns"][0]["expect"]["cleanup_settles"] = json!("later");
+        }),
+        ("error", |e| {
+            e["turns"][0]["expect"]["error"] = json!("timeout");
+        }),
+        ("rejected", |e| {
+            e["turns"][0]["expect"]["rejected"] = json!("invalid_param");
+        }),
+        ("plan_refusal", |e| {
+            e["turns"][0]["expect"]["plan_refusal"] = json!("invalid_params:effort");
+        }),
+        ("terminal.status", |e| {
+            e["turns"][0]["expect"]["terminal"]["status"] = json!("done");
+        }),
+        ("terminal.stop_reason", |e| {
+            e["turns"][0]["expect"]["terminal"]["stop_reason"] = json!("stop");
+        }),
+        ("terminal.class_hint", |e| {
+            e["turns"][0]["expect"]["terminal"]["class_hint"] = json!("unauthorized");
+        }),
+    ];
+    let accepted: Vec<&str> = defects
+        .into_iter()
+        .filter_map(|(what, defect)| {
+            let mut expect = base.clone();
+            defect(&mut expect);
+            conformance_expect::validate(&expect)
+                .is_ok()
+                .then_some(what)
+        })
+        .collect();
+    assert!(accepted.is_empty(), "validate accepted: {accepted:?}");
+}
+
 /// A named change to an ideal outcome.
 type Mutation = (&'static str, fn(&mut Outcome));
 
