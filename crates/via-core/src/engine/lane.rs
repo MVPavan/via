@@ -760,9 +760,10 @@ impl Lane {
     /// narrowed): an item received while no turn runs. A durable one is
     /// committed at once with its own attribution: an identity as the
     /// session's open event with its columns, a denial, decline or warning
-    /// session-level, or late with its turn when it names an earlier turn.
-    /// An expired one and every non-durable one (acceptance, progress,
-    /// final text, steer report, vendor close, mismatch, late terminal) is
+    /// session-level, or late with its turn when it names an earlier turn;
+    /// so is a steer report (Sol r1 #9). An expired one and every
+    /// non-durable one (acceptance, progress, final text, vendor close,
+    /// mismatch, late terminal) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
     /// connection, and the next turn reopens it. Its budget returns once
     /// it is handled.
@@ -796,7 +797,8 @@ impl Lane {
             }
             Observation::ActionDenied(_)
             | Observation::RequestDeclined(_)
-            | Observation::Warning(_) => {
+            | Observation::Warning(_)
+            | Observation::SteerDelivered(_) => {
                 let vendor_turn = item
                     .vendor_turn
                     .as_ref()
@@ -814,7 +816,6 @@ impl Lane {
             | Observation::Accepted(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
-            | Observation::SteerDelivered(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
             // Discarded until via-jm4.35: a late terminal's revision

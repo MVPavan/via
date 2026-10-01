@@ -2203,9 +2203,9 @@ impl Engine {
     /// An observation that is not the running turn's (AD4, C1 §6.1, C2
     /// §2), attributed to `(turn, late)`: of an earlier, ended turn with
     /// `late: true`, or session-level with `turn: null`. A durable one, a
-    /// denial, a decline or a warning, is committed under the running
-    /// turn, the one the Store admits events for; it never changes an
-    /// envelope.
+    /// denial, a decline, a warning or a steer report, is committed under
+    /// the running turn, the one the Store admits events for; it never
+    /// changes an envelope.
     /// Non-durable ones are dropped, and so is a late terminal, until
     /// via-jm4.35.
     async fn observe_other(
@@ -2224,11 +2224,20 @@ impl Engine {
             Observation::Warning(warning) => {
                 self.commit_warning(record, attributed, warning).await;
             }
+            // Sol r1 #9: a steer report is durable whoever's it is.
+            Observation::SteerDelivered(delivery) => {
+                let body = EventBody::SteerDelivered {
+                    delivery: steer_delivery(&delivery).to_owned(),
+                };
+                let at = rfc3339(SystemTime::now());
+                let failed = record.first_failure.is_some();
+                journal::commit_event_as(&self.store, record, body, &at, attributed).await;
+                self.report_first_failure(record, failed).await;
+            }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
-            | Observation::SteerDelivered(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
             // Discarded until via-jm4.35: a late terminal's revision
@@ -2855,8 +2864,8 @@ fn decline_body(decline: &Decline) -> EventBody {
 }
 
 /// The event a durable session observation other than an identity
-/// commits (C1 §6.1): a denial, a decline or an adapter warning; else
-/// none.
+/// commits (C1 §6.1): a denial, a decline, an adapter warning or a steer
+/// report; else none.
 pub(super) fn held_body(observation: &Observation) -> Option<EventBody> {
     match observation {
         Observation::ActionDenied(denial) => Some(denial_body(denial)),
@@ -2866,11 +2875,14 @@ pub(super) fn held_body(observation: &Observation) -> Option<EventBody> {
             &warning.message,
             warning.data.clone(),
         )),
+        // Sol r1 #9: a steer report is durable whoever's it is.
+        Observation::SteerDelivered(delivery) => Some(EventBody::SteerDelivered {
+            delivery: steer_delivery(delivery).to_owned(),
+        }),
         Observation::Accepted(_)
         | Observation::IdentityConfirmed(_)
         | Observation::Progress(_)
         | Observation::FinalText(_)
-        | Observation::SteerDelivered(_)
         | Observation::VendorClosed(_)
         | Observation::ResumeMismatch { .. }
         | Observation::LateTerminal(_) => None,

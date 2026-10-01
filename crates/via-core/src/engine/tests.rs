@@ -3510,6 +3510,90 @@ async fn until_denials(engine: &Engine, session: &SessionId, expected: &[(Value,
     .expect("the denials are committed");
 }
 
+/// A steer report (C2 §4 `steer.delivered`).
+fn steered() -> via_adapters::Observation {
+    via_adapters::Observation::SteerDelivered(via_adapters::observation::SteerDelivery::Injected)
+}
+
+/// The session's `steer.delivered` events as `(turn, late)`.
+async fn steers(engine: &Engine, session: &SessionId) -> Vec<(Value, Value)> {
+    events_page(engine, session).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "steer.delivered")
+        .map(|event| (event["turn"].clone(), event["late"].clone()))
+        .collect()
+}
+
+/// Sol r1 #9 (C1 §6, C2 §2): a steer report that is not the running
+/// turn's own is still durable. While turn 2 runs, one naming turn 1's
+/// vendor turn commits `steer.delivered` with `turn: 1, late: true`, one
+/// naming an unseen vendor turn `turn: null`, and turn 2's own `turn: 2`.
+#[test]
+fn a_steer_report_of_another_turn_is_committed_during_a_turn() {
+    let Some(root) = child("a_steer_report_of_another_turn_is_committed_during_a_turn") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let item = |vendor_turn: &str| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(
+                via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+            ),
+            observation: steered(),
+        };
+        let queued = vec![item("fake-turn-1"), item("stranger"), item("fake-turn-2")];
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        assert_eq!(
+            steers(&engine, &session).await,
+            [
+                (json!(1), json!(true)),
+                (Value::Null, json!(false)),
+                (json!(2), json!(false)),
+            ]
+        );
+    });
+}
+
+/// Sol r1 #9 (C1 §6, C2 §2 session drain): a steer report received
+/// between turns is committed as it arrives, with its own attribution:
+/// `turn: null` with no vendor turn, and `turn: 1, late: true` naming turn
+/// 1's.
+#[test]
+fn a_between_turn_steer_report_is_committed() {
+    let Some(root) = child("a_between_turn_steer_report_is_committed") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, steered()).await;
+        send_held(&sender, &budget, Some("vt-1"), steered()).await;
+        let expected = [(Value::Null, json!(false)), (json!(1), json!(true))];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while steers(&engine, &session).await != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the steer reports are committed");
+    });
+}
+
 /// S-CORE c4 r2 item 1b (C2 §2 session drain, decision H3 as narrowed):
 /// a durable observation received between turns is committed as it
 /// arrives, with its own attribution and no next turn: a session-level
