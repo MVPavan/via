@@ -1048,14 +1048,15 @@ fn read_keyed_operation(
 }
 
 /// The selected columns of a session's [`SessionRoute`], for a query whose
-/// `?1` is the session and whose row is `sessions` (decision H3): with the
-/// confirmed identity its `session.opened`/`session.reopened` wrote. A
-/// turn's unparseable frozen row records no version; it is that turn's own
-/// failure (design §7.3), not the session's.
+/// `?1` is the session and whose row is `sessions` (decision H3): the
+/// adapter version the latest started turn recorded, else the receipt's,
+/// with the confirmed identity its `session.opened`/`session.reopened`
+/// wrote. A turn's unparseable frozen row records no version; it is that
+/// turn's own failure (design §7.3), not the session's.
 const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
     coalesce((SELECT CASE WHEN json_valid(effective)
                           THEN json_extract(effective,'$.adapter_version') END
-              FROM turns WHERE session_id=?1 AND state<>'queued'
+              FROM turns WHERE session_id=?1 AND accepted_at IS NOT NULL
               ORDER BY number DESC LIMIT 1),
              json_extract(receipt,'$.adapter_version')),
     vendor_session_id,transcript_hint";
@@ -1322,10 +1323,18 @@ fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result
         ));
     }
     // The vendor correlation and accepted_at stay as internal C2 evidence; the
-    // public event is Core's canonical one.
+    // public event is Core's canonical one. Its `effective` values, which
+    // record the adapter version that started the turn (decision H3),
+    // become the turn's.
+    let started = record
+        .event
+        .get("effective")
+        .filter(|values| values.is_object());
+    let effective = started.map(Value::to_string);
     tx.execute(
-        "UPDATE turns SET correlation=?3,accepted_at=?4 WHERE session_id=?1 AND number=?2",
-        params![session.as_str(), turn.get(), correlation, at],
+        "UPDATE turns SET correlation=?3,accepted_at=?4,effective=coalesce(?5,effective)
+         WHERE session_id=?1 AND number=?2",
+        params![session.as_str(), turn.get(), correlation, at, effective],
     )
     .map_err(sql_error)?;
     insert_event(&tx, session, &record.event)?;

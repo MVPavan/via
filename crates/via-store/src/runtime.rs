@@ -286,9 +286,10 @@ pub struct SessionSnapshot {
 }
 
 /// A session's frozen route identity (C2 §2 `SessionRef`): its harness, its
-/// receipt's route, and its recorded adapter version: the latest submitted
-/// turn's frozen `adapter_version` where one was recorded (decision H3),
-/// else the receipt's; with the vendor identity it last confirmed.
+/// receipt's route, and its recorded adapter version: the latest started
+/// turn's `adapter_version`, recorded in its `turn.started` effective values
+/// (decision H3), else the receipt's; with the vendor identity it last
+/// confirmed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionRoute {
     /// `sessions.harness`.
