@@ -430,13 +430,42 @@ fn replay_whole_run_deadline_fails_naming_the_step() -> TestResult {
     assert_eq!(end.stdout, vec![line("ready")]);
     // The message is best-effort by design; check its content only if it came.
     if end.stderr.contains("deadline") {
-        // "ready" is written in step 1; step 2 is normally running by then.
+        // The watchdog may sample the step before or after "ready" is written.
         assert!(
-            end.stderr.contains("step 1") || end.stderr.contains("step 2"),
+            ["step 0", "step 1", "step 2"]
+                .iter()
+                .any(|step| end.stderr.contains(step)),
             "{}",
             end.stderr
         );
     }
+    Ok(())
+}
+
+#[test]
+fn replay_bounds_expected_value_including_plain_strings() -> TestResult {
+    // A plain 600 KiB string and a 600 KiB substitution exceed 1 MiB together.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {}, "capture": {"pad": "/pad"}}},
+                {"expect": {"line": {"plain": "b".repeat(600 * 1024), "sub": "${pad}"}}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"pad": "a".repeat(600 * 1024)}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(
+        end.stderr.contains("step 2") && end.stderr.contains("substitution exceeds"),
+        "{}",
+        end.stderr
+    );
     Ok(())
 }
 

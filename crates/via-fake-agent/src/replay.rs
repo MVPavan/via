@@ -445,6 +445,13 @@ fn substitute_value(
         Value::String(text) if text.contains("${") => {
             Value::String(substitute(&text, captures, budget)?)
         }
+        // A plain string is kept as is, but still counts toward the bound.
+        Value::String(text) => {
+            *budget = budget
+                .checked_sub(text.len())
+                .ok_or_else(|| format!("substitution exceeds {MAX_LINE} bytes"))?;
+            Value::String(text)
+        }
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
@@ -456,7 +463,7 @@ fn substitute_value(
                 .map(|(key, item)| Ok((key, substitute_value(item, captures, budget)?)))
                 .collect::<Result<_, String>>()?,
         ),
-        other @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)) => other,
+        other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
     })
 }
 
