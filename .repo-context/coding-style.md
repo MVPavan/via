@@ -162,7 +162,9 @@ the set.
   peer uid/pid, start, boot, namespace, group and private marker before asking
   it to signal its own group. Vendor child identity is distinct process
   evidence, never signalling authority. Never perform a vendor-environment
-  scan or daemon-side numeric TERM/KILL. Without a verified anchor, do not
+  scan for identity, recovery or cleanup, or a daemon-side numeric
+  TERM/KILL; the report-only leftover scan (Environment, below) is the single
+  exception and never authorizes a signal. Without a verified anchor, do not
   signal; cleanup is uncertain unless a same-boot/namespace, non-signalling
   group query returns `ESRCH` for the persisted Host-created group with full
   identity, generation and pgid > 1. Process exit alone does not prove
@@ -170,10 +172,16 @@ the set.
   positive absence on each platform before claiming it.
 - **Environment.** Build each vendor's environment from an explicit,
   reviewed per-adapter allow-list plus the VIA marker; never pass the
-  caller's full environment. The marker is launch data only and is never
-  recovered by reading vendor environments. The anchor's private marker and
-  control token are never inherited by the vendor. Invariant 1: never read,
-  copy or log vendor credentials.
+  caller's full environment. The marker is launch data, matched otherwise only by
+  the report-only leftover scan, and is never recovered by reading vendor
+  environments for identity, recovery or signalling. The anchor's private marker and control token are never
+  inherited by the vendor. Invariant 1: never read, copy or log vendor
+  credentials. The single exception is the report-only leftover scan
+  (C2 §4.2, runtime §5): it may transiently read the environment of a
+  same-uid process started at or after the vendor, through one `/proc/<pid>`
+  descriptor, solely to match the exact `VIA_PROCESS_MARKER` entry; compare
+  it in memory and drop it, keep nothing but the report, and never let the
+  marker authorize a signal or prove ownership or liveness.
 - **Socket and state directory.** Validate the state/runtime directory's
   owner, mode (`0700`) and file type, and reject symlinks. Create the socket
   with restrictive permissions (`0600`) from the start. Take the

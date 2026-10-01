@@ -199,13 +199,19 @@ verified **live anchor** can authorize an anchor-issued own-group cleanup.
 Check its live control marker against its persisted marker and match uid,
 start identity, boot identity, process group and generation as specified below.
 Vendor child identity is separate observational evidence; the vendor
-environment marker is launch data, never a recovery lookup or signal authority.
+environment marker is launch data, never a recovery lookup or signal authority
+(the report-only leftover scan below matches it only for the report).
 Neither a pid, executable name nor persisted marker proves current ownership.
 Failed identity/peer checks, partial records or a disappearing anchor refuse
 cleanup requests. An absent/unverified anchor supplies no signalling authority;
 report orphan/uncertain cleanup unless the independent no-signal absence test
 below proves the recorded group absent. Never inspect process environments or
-vendor credentials to recover a marker.
+vendor credentials to recover a marker. The only process-environment read
+is on Linux, outside recovery and cleanup: a report-only leftover scan
+(C2 §4.2) may read the environment of a same-uid process started at or after
+the vendor, through one `/proc/<pid>` descriptor, solely to match the exact
+`VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and
+the marker never authorizes a signal or proves ownership or liveness.
 [Linux procfs](https://www.kernel.org/doc/html/latest/filesystems/proc.html),
 [Apple process-info definitions](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h).
 
@@ -323,8 +329,12 @@ This explicitly changes the Host supervision shape: anchor identity/marker
 proof and vendor child identity are distinct records. The existing vendor
 environment marker remains set as required, but is **not** read back as live
 proof. Linux `/proc/<pid>/environ` and macOS `KERN_PROCARGS2` are forbidden
-marker-discovery routes, even with filtering after reading: their result can
-contain credential values. Apple process-info fields do not prove a marker.
+marker-discovery routes for identity, recovery and cleanup, even with
+filtering after reading: their result can contain credential values. The
+only exception is C2 §4.2's report-only leftover scan on Linux, which reads
+`environ` solely to match the exact marker entry for the report, compares it
+in memory and drops it; it is never identity, recovery or cleanup evidence.
+Apple process-info fields do not prove a marker.
 No persisted marker is promoted into evidence that a process is currently live.
 
 Required contract amendments for independent review, not applied by this
@@ -368,7 +378,7 @@ deferred macOS marker/cleanup requirements.
 | P-S3 | Concurrent auto-start, daemon crash and stale socket; overlong UTF-8 path | One daemon/Store writer; stale cleanup only while holding stable lock; lock file not unlinked; long path named refusal |
 | P-I1 | Owned child and in-group descendant; timed TERM/KILL escalation | Only owned processes signalled, children reaped, terminal result and cleanup match actual group observation |
 | P-I2 | Ordinary daemon crash after committed arm intent and ARM; test both autonomous anchor EOF cleanup and verified reconnect cleanup | No turn/ARM resend; live anchor performs own-group cleanup; same-boot/namespace persisted group yields `ESRCH` in the no-signal absence query, including after anchor self-KILL. Lost ACK alone stays uncertain; fresh absence evidence settles only group cleanup |
-| P-I3 | Wrong anchor uid/start/group/live marker/generation separately; stale boot/namespace; partial/missing identity; absent anchor; permission denial | Refuse anchor cleanup request and every numeric signal; unrelated sentinel remains alive. Existence-query success/`EPERM`/errors never become absence; vendor environment is never read |
+| P-I3 | Wrong anchor uid/start/group/live marker/generation separately; stale boot/namespace; partial/missing identity; absent anchor; permission denial | Refuse anchor cleanup request and every numeric signal; unrelated sentinel remains alive. Existence-query success/`EPERM`/errors never become absence; anchor verification and cleanup never read a vendor environment (C2 §4.2's report-only leftover scan is separate and never authorizes a signal) |
 | P-I4 | Crash before/after arm-intent commit and ARM send; duplicate/stale generation; anchor dies after challenge; descriptor-detach failure; vendor exits while anchor lives; reused pgid | Exactly one vendor at most, none before durable arm intent; failed detachment cleans up; both output EOFs/input closure observable before anchor exit. Lost ACK without `ESRCH` stays uncertain; no leader-death shortcut or signal to reused group; native stress complements deterministic seams |
 | P-I5 | Descendant escapes group; shared server hosts two sessions | No false containment/quiescence claim; cancelling one session does not kill shared server or sibling work |
 | P-A1 | Install archive on baseline and current OS; CLI/socket/stdio, daemon restart, fake spawn/resume/result and background/wait | Same extracted hash runs each surface; version handshake and state permissions correct; no missing loader/library/helper |
