@@ -1,15 +1,21 @@
 //! C2 §4 observation and turn-end types (adapter design §3.2, AD4, AD6,
-//! AD7, AD20). Types only: the driver that produces them comes with the
-//! fake driver lane. Kept in this module, not re-exported at the crate
-//! root, because the legacy `Observation` still lives there.
+//! AD7, AD20) and the per-session observation channel the driver lane
+//! sends them on. Kept in this module, not re-exported at the crate root,
+//! because the legacy `Observation` and channel still live there.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::value::RawValue;
-use tokio::time::Instant;
+use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
+use tokio::time::{Instant, timeout_at};
 
 use crate::plan::{VersionStatus, Warning};
-use crate::{AcceptanceToken, AdapterError, Cleanup, VendorTerminalStatus, VendorTurnId};
+use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
+use crate::{AcceptanceToken, Cleanup, StartRejected, VendorTerminalStatus, VendorTurnId};
 
 /// A vendor message's progress marks (C2 §4 `progress`); the arrival time
 /// is the item's `at`. Replaces the legacy root `ProgressMarks` once Core
@@ -125,12 +131,12 @@ pub struct Decline {
 }
 
 /// How steer input reached the vendor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SteerDelivery {
     /// Injected into the active turn.
     Injected,
-    /// Delivered with the named partial semantics.
-    Partial(&'static str),
+    /// Delivered with the profile's declared partial semantics.
+    Partial(Cow<'static, str>),
 }
 
 /// A normalized stop reason (AD5).
@@ -291,5 +297,251 @@ pub struct TurnEnd {
     /// Per-turn routes on every outcome, and server loss (AD20).
     pub leftovers: Option<LeftoverReport>,
     /// Process and cleanup facts, or a typed failure.
-    pub outcome: Result<TurnEvidence, AdapterError>,
+    pub outcome: Result<TurnEvidence, TurnError>,
+}
+
+/// A failed driver-lane turn (C2 §2 `AdapterError` for the lane; the legacy
+/// `AdapterError` stays for the legacy path until Core moves).
+#[derive(Debug, Error)]
+pub enum TurnError {
+    /// A route cause with Route's evidence: S1's causes, `ServerLost` and
+    /// transport loss on the persistent profile, and `HandshakeRefused`.
+    #[error("fake route failed: {0:?}")]
+    Route(via_routes::TurnFailure),
+    /// A definite rejection before submission; nothing was sent.
+    #[error("the turn was rejected before submission: {0:?}")]
+    Rejected(StartRejected),
+    /// No adapter serves the session's harness in this daemon.
+    #[error("the harness is not available in this daemon")]
+    Unavailable,
+    /// The driver's task for the turn ended without its result.
+    #[error("the driver's turn task failed")]
+    TaskFailed,
+}
+
+/// One observation in the session channel with its share of the session's
+/// 4 MiB budget: Core holds `permit` until it has handled the item.
+pub struct Admitted {
+    /// The observation.
+    pub item: ObservationItem,
+    /// The item's bytes of the budget.
+    pub permit: OwnedSemaphorePermit,
+}
+
+/// The sending side of one session's observation channel (C2 A1: 1,024
+/// items and 4 MiB per session); Core keeps the receiver.
+#[derive(Clone)]
+pub struct ObservationSink {
+    sender: mpsc::Sender<Admitted>,
+    budget: Arc<Semaphore>,
+}
+
+/// One session's observation channel (C2 §2 `SessionCx`).
+pub fn observation_channel() -> (ObservationSink, mpsc::Receiver<Admitted>) {
+    // Full: the driver waits, up to the stall bound, then fails the turn
+    // `overflow` (C2 §7 item 12).
+    let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
+    let budget = Arc::new(Semaphore::new(OBSERVATION_BYTES));
+    (ObservationSink { sender, budget }, receiver)
+}
+
+/// An item the channel did not take within the stall bound, or whose
+/// receiver is gone.
+#[derive(Debug)]
+pub(crate) struct Undelivered;
+
+impl ObservationSink {
+    /// Sends `item`: acquires its byte cost, then a slot. The item owns one
+    /// stall deadline, set at its first block; at it the send gives up.
+    pub(crate) async fn send(
+        &self,
+        item: ObservationItem,
+        stall: Duration,
+    ) -> Result<(), Undelivered> {
+        let mut stall_at = None;
+        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered)?;
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
+                    .await
+                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered)?
+            }
+            Err(TryAcquireError::Closed) => return Err(Undelivered),
+        };
+        let admitted = Admitted { item, permit };
+        match self.sender.try_send(admitted) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(admitted)) => {
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, self.sender.send(admitted))
+                    .await
+                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered),
+        }
+    }
+}
+
+/// An item's cost against the byte budget: `512 + Σ(64 + len)` over every
+/// variable-size field it keeps (Task 4 design §2.3), saturating.
+fn item_cost(item: &ObservationItem) -> usize {
+    let mut lengths: Vec<usize> = Vec::new();
+    if let Some(vendor_turn) = &item.vendor_turn {
+        lengths.push(vendor_turn.as_str().len());
+    }
+    match &item.observation {
+        Observation::Accepted(_) => {}
+        Observation::SteerDelivered(delivery) => match delivery {
+            SteerDelivery::Injected => {}
+            SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
+        },
+        Observation::IdentityConfirmed(identity) => {
+            lengths.push(identity.vendor_session_id.len());
+            lengths.push(identity.connection_id.len());
+            if let Some(transcript) = &identity.transcript {
+                lengths.push(transcript.as_os_str().len());
+            }
+        }
+        Observation::Progress(marks) => {
+            for (id, name) in &marks.tools_started {
+                lengths.push(id.len());
+                lengths.push(name.len());
+            }
+            lengths.extend(marks.tools_ended.iter().map(String::len));
+            if let Some(key) = marks.usage.as_ref().and_then(|usage| usage.key.as_deref()) {
+                lengths.push(key.len());
+            }
+        }
+        Observation::FinalText(string) | Observation::VendorClosed(string) => {
+            lengths.push(string.len());
+        }
+        Observation::ActionDenied(denial) => {
+            lengths.push(denial.target.len());
+            lengths.push(denial.reason.len());
+        }
+        Observation::RequestDeclined(decline) => {
+            lengths.push(decline.vendor_method.len());
+            lengths.push(decline.summary.len());
+        }
+        Observation::Warning(warning) => {
+            lengths.push(warning.code.len());
+            lengths.push(warning.message.len());
+            if let Some(data) = &warning.data {
+                lengths.push(encoded_len(data));
+            }
+        }
+        Observation::ResumeMismatch {
+            requested,
+            returned,
+        } => {
+            lengths.push(requested.len());
+            lengths.push(returned.len());
+        }
+        Observation::LateTerminal(terminal) => terminal_lengths(terminal, &mut lengths),
+    }
+    lengths.iter().fold(512_usize, |cost, length| {
+        cost.saturating_add(length.saturating_add(64))
+    })
+}
+
+/// A late terminal's variable-size fields.
+fn terminal_lengths(terminal: &VendorTerminal, lengths: &mut Vec<usize>) {
+    let strings = [
+        Some(terminal.vendor_stop_reason.as_str()),
+        terminal.vendor_code.as_deref(),
+        terminal.detail.as_deref(),
+        terminal.structured_output.as_deref().map(RawValue::get),
+        terminal
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.key.as_deref()),
+        terminal.cost.as_ref().map(|cost| cost.scope.as_str()),
+        terminal.vendor.as_deref().map(RawValue::get),
+    ];
+    lengths.extend(strings.into_iter().flatten().map(str::len));
+}
+
+/// `value`'s encoded bytes, counted without keeping them.
+fn encoded_len(value: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // A `Value` always encodes; were it not to, what was counted stands.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Identity, Instant, Observation, ObservationItem, StopReason, VendorTerminal, item_cost,
+    };
+    use crate::VendorTerminalStatus;
+    use crate::plan::Warning;
+
+    fn cost(observation: Observation) -> usize {
+        item_cost(&ObservationItem {
+            at: Instant::now(),
+            vendor_turn: None,
+            observation,
+        })
+    }
+
+    /// The byte budget counts every retained variable-size field: the
+    /// identity's transcript path, warning data and the late terminal's
+    /// contents.
+    #[test]
+    fn item_cost_counts_every_retained_field() {
+        let identity = |transcript: Option<&str>| {
+            Observation::IdentityConfirmed(Identity {
+                vendor_session_id: "v".to_owned(),
+                connection_id: "c".to_owned(),
+                transcript: transcript.map(Into::into),
+            })
+        };
+        let path = "p".repeat(4096);
+        assert!(cost(identity(Some(&path))) >= cost(identity(None)) + 4096);
+
+        let warning = |data: Option<serde_json::Value>| {
+            Observation::Warning(Warning {
+                code: "w",
+                message: String::new(),
+                data,
+            })
+        };
+        let data = serde_json::json!({"categories": ["x".repeat(4096)]});
+        assert!(cost(warning(Some(data))) >= cost(warning(None)) + 4096);
+
+        let late = |big: &str| {
+            Observation::LateTerminal(VendorTerminal {
+                at: Instant::now(),
+                status: VendorTerminalStatus::Failed,
+                stop_reason: StopReason::Error,
+                vendor_stop_reason: "error".to_owned(),
+                vendor_code: Some(big.to_owned()),
+                class_hint: None,
+                detail: Some(big.to_owned()),
+                structured_output: Some(
+                    serde_json::value::to_raw_value(&serde_json::json!({ "x": big })).unwrap(),
+                ),
+                steps: None,
+                usage: None,
+                cost: None,
+                vendor: Some(serde_json::value::to_raw_value(&big).unwrap()),
+            })
+        };
+        assert!(cost(late(&"b".repeat(1024))) >= cost(late("")) + 4 * 1024);
+    }
 }

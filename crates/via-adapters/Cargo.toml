@@ -12,7 +12,8 @@ test-failpoints = ["via-routes/test-failpoints"]
 
 [dependencies]
 via-routes = { path = "../via-routes" }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "rt", "fs"] }
+tokio-util = { workspace = true, features = ["rt"] }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
