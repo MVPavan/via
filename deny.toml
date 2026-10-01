@@ -5,6 +5,11 @@
 # review any new license before admitting it.
 unused-allowed-license = "allow"
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+exceptions = [
+  # MIT No Attribution: MIT without the attribution clause; a dependency of
+  # the K14 JSON Schema validator (boon -> fluent-uri). Reviewed 2026-10-01.
+  { allow = ["MIT-0"], crate = "borrow-or-share" },
+]
 
 [bans]
 multiple-versions = "warn"
