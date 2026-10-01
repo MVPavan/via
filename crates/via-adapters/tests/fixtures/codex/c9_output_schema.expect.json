@@ -1,0 +1,150 @@
+{
+  "source": "Codex re-probe c9 (outputSchema set, then cleared), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "harness": "codex",
+  "launches": 1,
+  "sessions": {
+    "main": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": {
+        "mode": "graceful",
+        "vendor_closed": false,
+        "cleanup": "quiescent"
+      }
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Give the answer VIA_SCHEMA_159.",
+        "effort": "low",
+        "bound": "full",
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "structured_output": {
+            "answer": "VIA_SCHEMA_159"
+          }
+        },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 20410,
+          "cached_input_tokens": 0,
+          "output_tokens": 19,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 20429,
+          "scope": "turn"
+        },
+        "final_text": [
+          "{\"answer\":\"VIA_SCHEMA_159\"}"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "unasserted": [],
+        "notes": "outputSchema is sent on turn/start; with a schema requested, the nonempty final agent text is the structured output, which Core validates (vendors/codex.md §3)."
+      }
+    },
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply with the plain words VIA PLAIN, no JSON.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null,
+          "structured_output": null
+        },
+        "usage": {
+          "from": "samples",
+          "input_tokens": 24437,
+          "cached_input_tokens": 18176,
+          "output_tokens": 8,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 24445,
+          "scope": "turn"
+        },
+        "final_text": [
+          "VIA PLAIN"
+        ],
+        "error": null,
+        "cleanup": "quiescent",
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "observations_include": [
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "turn.accepted",
+          "final_text"
+        ],
+        "unasserted": [],
+        "notes": "output_schema null clears the inherited schema (C1 §4 output_schema); turn/start carries outputSchema:null explicitly, because turn overrides persist as thread defaults (vendors/codex.md §3)."
+      }
+    }
+  ]
+}

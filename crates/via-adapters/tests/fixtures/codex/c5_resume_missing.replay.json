@@ -1,0 +1,91 @@
+{
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; the run ends at VIA's stdin close (await_eof) right after the refusal, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "argv": [
+    "app-server",
+    "--disable",
+    "hooks"
+  ],
+  "version": "codex-cli 0.159.2",
+  "deadline_ms": 20000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "method": "initialize",
+          "params": {
+            "clientInfo": {
+              "name": "via"
+            }
+          }
+        },
+        "capture": {
+          "init": "/id"
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${init},\"result\":{\"userAgent\":\"via/0.159.2 (Linux 6.0.0; x86_64) unknown (via; 0.0.0)\",\"codexHome\":\"/state/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "initialized"
+        }
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "model/list"
+        },
+        "capture": {
+          "models": "/id"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\",\"serverName\":\"host\",\"installationId\":\"00000000-0000-4000-8000-000000000000\",\"environmentId\":null},\"emittedAtMs\":1790000000005}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${models},\"result\":{\"data\":[{\"id\":\"gpt-6.1-sol\",\"model\":\"gpt-6.1-sol\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6.1-Sol\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"},{\"reasoningEffort\":\"ultra\",\"description\":\"Maximum reasoning with automatic task delegation\"}],\"defaultReasoningEffort\":\"low\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":true},{\"id\":\"gpt-6-sol\",\"model\":\"gpt-6-sol\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6-Sol\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"},{\"reasoningEffort\":\"ultra\",\"description\":\"Maximum reasoning with automatic task delegation\"}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":false},{\"id\":\"gpt-6-luna\",\"model\":\"gpt-6-luna\",\"upgrade\":null,\"upgradeInfo\":null,\"displayName\":\"GPT-6-Luna\",\"description\":\"A model in the recorded catalog.\",\"modelSpecialty\":null,\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Fast responses with lighter reasoning\"},{\"reasoningEffort\":\"medium\",\"description\":\"Balances speed and reasoning depth for everyday tasks\"},{\"reasoningEffort\":\"high\",\"description\":\"Greater reasoning depth for complex problems\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"Extra high reasoning depth for complex problems\"},{\"reasoningEffort\":\"max\",\"description\":\"Maximum reasoning depth for the hardest problems\"}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\",\"image\"],\"supportsPersonality\":false,\"isDefault\":false}],\"nextCursor\":null}}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "method": "thread/resume",
+          "params": {
+            "threadId": "019a0000-0000-7000-8000-000000100007",
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandbox": "danger-full-access",
+            "excludeTurns": true
+          }
+        },
+        "capture": {
+          "resume": "/id"
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"id\":${resume},\"error\":{\"code\":-32600,\"message\":\"no rollout found for thread id 019a0000-0000-7000-8000-000000100007\"}}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

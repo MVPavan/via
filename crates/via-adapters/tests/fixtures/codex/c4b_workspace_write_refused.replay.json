@@ -1,0 +1,11 @@
+{
+  "source": "Codex re-probe c4b (workspace-write then read-only on one thread), 0.159.2, 2026-09-30",
+  "argv": [
+    "app-server",
+    "--disable",
+    "hooks"
+  ],
+  "version": "codex-cli 0.159.2",
+  "deadline_ms": 20000,
+  "steps": []
+}
