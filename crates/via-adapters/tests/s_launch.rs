@@ -429,9 +429,8 @@ fn s_launch_refusal_cache_expires_after_ten_minutes() {
     );
 }
 
-/// Retention is bounded: each refusal write sweeps the expired ones, and
-/// one last-version entry is kept per resolved path, a new identity
-/// replacing the old.
+/// Refusal retention is bounded: each refusal write sweeps the expired
+/// ones.
 #[test]
 fn s_launch_cache_retention_is_bounded() {
     let dir = tempfile::tempdir().unwrap();

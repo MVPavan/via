@@ -402,7 +402,9 @@ fn pinned_exited(pidfd: &OwnedFd, pid: u32) -> Result<bool, String> {
 /// The kill fallback over the `candidates` a scan named, reading `/proc`
 /// through `read` (the test seam): each is pinned ([`pin_member`]), killed
 /// through its pidfd and waited for until `kill_by`, the fallback's share
-/// of the one teardown deadline. Returns one record per candidate.
+/// of the one teardown deadline. Once `kill_by` has passed, no candidate
+/// is pinned or signalled: each left is recorded `deadline_passed`.
+/// Returns one record per candidate.
 fn kill_candidates(
     candidates: &[u32],
     runtime: &Path,
@@ -413,6 +415,10 @@ fn kill_candidates(
     candidates
         .iter()
         .map(|&pid| {
+            let expired = || json!({"pid":pid,"status":"deadline_passed"});
+            if Instant::now() >= kill_by {
+                return expired();
+            }
             let pidfd = match pin_member(pid, runtime, state, read) {
                 Ok(Pinned::Member(pidfd)) => pidfd,
                 Ok(Pinned::Gone) => return json!({"pid":pid,"status":"gone"}),
@@ -421,6 +427,9 @@ fn kill_candidates(
                 }
                 Err(reason) => return json!({"pid":pid,"status":"unknown","reason":reason}),
             };
+            if Instant::now() >= kill_by {
+                return expired();
+            }
             match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
                 Ok(()) | Err(rustix::io::Errno::SRCH) => {}
                 Err(error) => {
@@ -757,11 +766,22 @@ fn s_launch_teardown_kills_an_unresponsive_daemon() -> TestResult {
 struct Children(Vec<std::process::Child>);
 
 impl Drop for Children {
+    /// Kills and reaps each child within a bound, never waiting without
+    /// end; one not reaped by then fails the test (unless it already
+    /// panicked).
     fn drop(&mut self) {
-        for child in &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let unreaped: Vec<u32> = self
+            .0
+            .iter_mut()
+            .filter_map(|child| {
+                let by = Instant::now() + outer_cleanup::REAP;
+                (!outer_cleanup::kill_and_reap(child, by)).then(|| child.id())
+            })
+            .collect();
+        assert!(
+            unreaped.is_empty() || std::thread::panicking(),
+            "helpers {unreaped:?} were not reaped within their bound"
+        );
     }
 }
 
@@ -783,7 +803,9 @@ fn s_launch_kill_fallback_never_signals_a_non_member() -> TestResult {
         }
         command.spawn()
     };
-    let mut children = Children(vec![sleeper(false)?, sleeper(true)?]);
+    let mut children = Children(Vec::new());
+    children.0.push(sleeper(false)?);
+    children.0.push(sleeper(true)?);
     let (outsider, member) = (children.0[0].id(), children.0[1].id());
     let kill_by = Instant::now() + Duration::from_secs(5);
 
@@ -813,10 +835,13 @@ fn s_launch_kill_fallback_never_signals_a_non_member() -> TestResult {
     })?;
 
     let killed = kill_candidates(&[member], &runtime, &state, &|path| fs::read(path), kill_by);
-    let status = children.0[1].wait()?;
+    check(killed[0]["status"] == "gone", || {
+        format!("(c) the member was not killed: {killed}")
+    })?;
+    let status = outer_cleanup::wait_by(&mut children.0[1], Instant::now() + outer_cleanup::REAP);
     check(
-        status.signal() == Some(9) && killed[0]["status"] == "gone",
-        || format!("(c) the member was not killed: {status} {killed}"),
+        status.is_some_and(|status| status.signal() == Some(9)),
+        || format!("(c) the member did not end by SIGKILL: {status:?} {killed}"),
     )
 }
 
@@ -855,7 +880,8 @@ fn s_launch_kill_fallback_reports_observation_errors() -> TestResult {
         .arg("60")
         .env_clear()
         .env("VIA_RUNTIME_DIR", &runtime);
-    let mut children = Children(vec![member.spawn()?]);
+    let mut children = Children(Vec::new());
+    children.0.push(member.spawn()?);
     let pid = children.0[0].id();
     let kill_by = Instant::now() + Duration::from_secs(5);
     let denied = |_: &Path| -> std::io::Result<Vec<u8>> {
@@ -879,4 +905,32 @@ fn s_launch_kill_fallback_reports_observation_errors() -> TestResult {
         })?;
     }
     Ok(())
+}
+
+/// Sol r3 (N2 residual): once the fallback's cutoff has passed, it starts
+/// no further work. A member candidate with an expired cutoff is neither
+/// pinned nor signalled, and its record names the deadline.
+#[test]
+fn s_launch_kill_fallback_stops_at_its_cutoff() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let runtime = dir.path().join("runtime");
+    let state = dir.path().join("state");
+    let mut children = Children(Vec::new());
+    let mut member = Command::new("sleep");
+    member
+        .arg("60")
+        .env_clear()
+        .env("VIA_RUNTIME_DIR", &runtime);
+    children.0.push(member.spawn()?);
+    let pid = children.0[0].id();
+    let expired = Instant::now();
+    let record = kill_candidates(&[pid], &runtime, &state, &|path| fs::read(path), expired);
+    check(record[0]["status"] == "deadline_passed", || {
+        format!("the expired cutoff is not recorded: {record}")
+    })?;
+    // A SIGKILL would end the helper well within this bound.
+    let exit = outer_cleanup::wait_by(&mut children.0[0], Instant::now() + Duration::from_secs(1));
+    check(exit.is_none(), || {
+        format!("a candidate was signalled after the cutoff: {exit:?} {record}")
+    })
 }
