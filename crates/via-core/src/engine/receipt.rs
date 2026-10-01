@@ -21,6 +21,7 @@ use super::journal::{self, Head};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot, Steering};
 use super::{Admission, Engine, Receipted, lock};
+use crate::api::retry_identity_of;
 use crate::api::{
     Event, EventBody, Named, PATH_MAX, PlanFields, PromptSource, Receipt, TurnReceipt, Warning,
     retry_key, rfc3339,
@@ -114,6 +115,44 @@ impl Engine {
         })
     }
 
+    /// Sol r1 #4 (C1 §4 `instructions`): the text of an `instructions
+    /// {path}`, read once when the request is received with the prompt
+    /// file's copy pass: an absolute path to a regular UTF-8 file of at
+    /// most 1 MiB that does not change during the copy, else
+    /// `invalid_params` naming `instructions` with the copy's `reason`.
+    /// The copy is then loaded and discarded; its content token is the
+    /// retry identity's. The path itself is never kept.
+    async fn read_instructions(&self, path: String) -> Result<(String, String), ApiError> {
+        if path.len() > PATH_MAX {
+            return Err(intake::instructions_refused(
+                "instructions path is too long",
+                Some("unreadable"),
+            ));
+        }
+        if !Path::new(&path).is_absolute() {
+            return Err(intake::instructions_refused(
+                "instructions path must be absolute",
+                Some("not_absolute"),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + PROMPT_FILE_PASS;
+        let blob = self
+            .store
+            .copy_text_file(PathBuf::from(path), deadline, INSTRUCTIONS_MAX)
+            .await
+            .map_err(|error| match error {
+                PromptFileError::Refused(reason) => {
+                    intake::instructions_refused("instructions file refused", Some(reason))
+                }
+                PromptFileError::Store(_) => WriteOutcome::NotCommitted.api_error(),
+            })?;
+        let text = self.store.load_prompt(&blob).await;
+        let content = content_token(&blob);
+        self.store.discard_blob(blob).await;
+        let text = text.map_err(|_| WriteOutcome::NotCommitted.api_error())?;
+        Ok((text, content))
+    }
+
     /// Design §6.5: a staged blob that no commit adopted (a replay, a
     /// conflict, a refusal, a commit known not to have happened) is
     /// discarded after `admission` is released.
@@ -201,7 +240,16 @@ impl Engine {
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
         let source = params.take_prompt()?;
-        let members = params.session_members()?;
+        let mut members = params.session_members()?;
+        // Sol r1 #4: an `instructions {path}` is read when the request is received.
+        let instructions = match members.instructions_path.take() {
+            Some(path) => {
+                let (text, content) = self.read_instructions(path).await?;
+                members.instructions = Some(text);
+                Some(content)
+            }
+            None => None,
+        };
         // Fix round 1 #1: the schema compiles off the executor, no lock held.
         self.check_schema(params.per_turn().overrides()?.schema())
             .await?;
@@ -219,8 +267,13 @@ impl Engine {
         let free = self.free_space().await;
         let receipted = match key
             .map(|key| {
-                retry_identity(raw_params, &hash, content.as_deref())
-                    .map(|identity| SpawnKey { key, identity })
+                retry_identity_of(
+                    raw_params,
+                    &hash,
+                    content.as_deref(),
+                    instructions.as_deref(),
+                )
+                .map(|identity| SpawnKey { key, identity })
             })
             .transpose()
         {
@@ -728,6 +781,9 @@ fn is_empty(prompt: &Prompt) -> bool {
 /// A receipt's free-space read (Task 4 design §5.3); `None` with the
 /// floor off.
 type FreeSpace = Result<u64, StoreError>;
+
+/// Longest `instructions {path}` file (C1 §4).
+const INSTRUCTIONS_MAX: u64 = 1024 * 1024;
 
 /// Design §10.4: the whole prompt-file pass ends within this bound.
 const PROMPT_FILE_PASS: std::time::Duration = std::time::Duration::from_secs(10);

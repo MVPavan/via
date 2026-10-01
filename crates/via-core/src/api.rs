@@ -1399,6 +1399,18 @@ pub fn retry_identity(
     handle_hash: &[u8; 32],
     prompt_file: Option<&str>,
 ) -> Result<via_store::Identity, ApiError> {
+    retry_identity_of(raw_params, handle_hash, prompt_file, None)
+}
+
+/// [`retry_identity`] with, for a spawn's `instructions {path}`, the
+/// top-level `instructions` value replaced by its file's content token
+/// (Sol r1 #4): the copy's SHA-256 and length, not the path.
+pub(crate) fn retry_identity_of(
+    raw_params: &str,
+    handle_hash: &[u8; 32],
+    prompt_file: Option<&str>,
+    instructions: Option<&str>,
+) -> Result<via_store::Identity, ApiError> {
     use std::collections::HashSet;
 
     use serde::de::{Deserializer, MapAccess, Visitor};
@@ -1409,6 +1421,7 @@ pub fn retry_identity(
     struct Spans {
         handle: Option<(usize, usize)>,
         prompt_file: Option<(usize, usize)>,
+        instructions: Option<(usize, usize)>,
     }
 
     struct Members<'a>(&'a str);
@@ -1431,6 +1444,7 @@ pub fn retry_identity(
                 match key.as_str() {
                     "handle" => spans.handle = span,
                     "prompt_file" => spans.prompt_file = span,
+                    "instructions" => spans.instructions = span,
                     _ => {}
                 }
                 if !seen.insert(key) {
@@ -1461,6 +1475,12 @@ pub fn retry_identity(
         (Some(span), Some(content)) => replaced.push((span, content.as_bytes())),
         (None, None) => {}
         _ => return Err(ApiError::INVALID_PARAMS),
+    }
+    let instructions = instructions.map(|content| format!("\"{content}\""));
+    match (spans.instructions, &instructions) {
+        (Some(span), Some(content)) => replaced.push((span, content.as_bytes())),
+        (_, None) => {}
+        (None, Some(_)) => return Err(ApiError::INVALID_PARAMS),
     }
     replaced.sort_by_key(|((start, _), _)| *start);
     let bytes = raw_params.as_bytes();

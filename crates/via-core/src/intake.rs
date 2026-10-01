@@ -257,16 +257,16 @@ struct Instructions {
     path: Option<String>,
 }
 
-/// The session's `instructions` text, if given: `{text}` only. `{path}` is
-/// not read yet, and is refused by name like any other unusable value.
-pub(crate) fn instructions(raw: Option<&RawValue>) -> Result<Option<String>, ApiError> {
-    let refuse = |message| {
-        ApiError::naming(
-            ApiError::INVALID_PARAMS,
-            Named::field("instructions"),
-            message,
-        )
-    };
+/// A spawn's `instructions` as given (C1 §4): its text, or the path of
+/// the file Core reads it from at the receipt.
+pub(crate) enum InstructionsSource {
+    Text(String),
+    Path(String),
+}
+
+/// The session's `instructions`, if given: `{text}` or `{path}`; any
+/// other shape is refused by name.
+pub(crate) fn instructions(raw: Option<&RawValue>) -> Result<Option<InstructionsSource>, ApiError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -274,14 +274,30 @@ pub(crate) fn instructions(raw: Option<&RawValue>) -> Result<Option<String>, Api
         Ok(Instructions {
             text: Some(text),
             path: None,
-        }) => Ok(Some(text)),
+        }) => Ok(Some(InstructionsSource::Text(text))),
         Ok(Instructions {
             text: None,
-            path: Some(_),
-        }) => Err(refuse(
-            "instructions {path} is not supported yet; give {text}",
+            path: Some(path),
+        }) => Ok(Some(InstructionsSource::Path(path))),
+        Ok(_) | Err(_) => Err(instructions_refused(
+            "instructions is {text} or {path}",
+            None,
         )),
-        Ok(_) | Err(_) => Err(refuse("instructions is {text} or {path}")),
+    }
+}
+
+/// `invalid_params` naming `instructions`, with a file's `reason`.
+pub(crate) fn instructions_refused(
+    message: &'static str,
+    reason: Option<&'static str>,
+) -> ApiError {
+    ApiError {
+        reason,
+        ..ApiError::naming(
+            ApiError::INVALID_PARAMS,
+            Named::field("instructions"),
+            message,
+        )
     }
 }
 
@@ -387,19 +403,28 @@ fn refusal_message(refusal: &Refusal) -> &'static str {
     }
 }
 
-/// The C1 §3.2 spawn's session members, checked without I/O.
+/// The C1 §3.2 spawn's session members, checked without I/O. An
+/// `instructions {path}` is in `instructions_path` until the receipt reads
+/// it into `instructions`.
 pub(crate) struct SessionMembers {
     pub(crate) require: Vec<VerbReq>,
     pub(crate) instructions: Option<String>,
+    pub(crate) instructions_path: Option<String>,
 }
 
 impl SpawnParams {
     /// Design §11.1: the session members' shapes, before any route rule.
     pub(crate) fn session_members(&self) -> Result<SessionMembers, ApiError> {
         self.check_session_members()?;
+        let (instructions, instructions_path) = match instructions(self.instructions.as_deref())? {
+            Some(InstructionsSource::Text(text)) => (Some(text), None),
+            Some(InstructionsSource::Path(path)) => (None, Some(path)),
+            None => (None, None),
+        };
         Ok(SessionMembers {
             require: require(self.require.as_deref())?,
-            instructions: instructions(self.instructions.as_deref())?,
+            instructions,
+            instructions_path,
         })
     }
 }

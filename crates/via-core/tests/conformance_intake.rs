@@ -1517,3 +1517,92 @@ fn conformance_intake_effective_bound_from_the_plan() {
         daemon.stop().await;
     });
 }
+
+/// Sol r1 #4 (C1 §4 `instructions`): `{path}` names an absolute regular
+/// UTF-8 file of at most 1 MiB, read once at the spawn receipt and frozen
+/// as its text, which the route then receives as it would `{text}`. A
+/// relative path, a directory, a missing, non-UTF-8 or larger file is
+/// `invalid_params` naming `instructions`. The path is not stored, and a
+/// keyed retry's identity is the copy's content: the same content replays,
+/// other content under the key is `idempotency_conflict`.
+#[test]
+fn conformance_intake_instructions_path() {
+    let root = Root::new();
+    let profile = json!({"capabilities": capabilities(&[("/params/instructions", native())])});
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &profile,
+            &[script_expecting(
+                &json!({"prompt":"p","instructions":"be brief"}),
+                &[accepted(1), terminal(1)],
+            )],
+        ),
+    );
+    let file = root.path().join("instructions.txt");
+    fs::write(&file, "be brief").unwrap();
+    let file = file.to_str().unwrap().to_owned();
+    let not_utf8 = root.path().join("binary.txt");
+    fs::write(&not_utf8, [0xff, 0xfe]).unwrap();
+    let large = root.path().join("large.txt");
+    fs::write(&large, "a".repeat(1024 * 1024 + 1)).unwrap();
+    let spawn = |instructions: Value, key: &str| {
+        json!({"harness":"fake","model":"fake","prompt":"p",
+               "instructions":instructions,"idempotency_key":key})
+    };
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        for (name, refused_path) in [
+            ("relative", "instructions.txt".to_owned()),
+            ("directory", root.path().to_str().unwrap().to_owned()),
+            (
+                "missing",
+                root.path().join("absent").to_str().unwrap().to_owned(),
+            ),
+            ("not_utf8", not_utf8.to_str().unwrap().to_owned()),
+            ("large", large.to_str().unwrap().to_owned()),
+        ] {
+            let error = daemon
+                .try_spawn(&spawn(json!({"path":refused_path}), name))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, "invalid_params", "{name}: {error:?}");
+            assert_eq!(error.data()["field"], "instructions", "{name}: {error:?}");
+        }
+        let receipt = daemon
+            .try_spawn(&spawn(json!({"path":file}), "k"))
+            .await
+            .unwrap();
+        let session = session_of(&receipt);
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(
+            daemon.first_input().unwrap()["instructions"],
+            "be brief",
+            "the route received the file's text"
+        );
+        // The same content under the key replays, rewritten or not.
+        fs::write(&file, "be brief").unwrap();
+        let replayed = daemon
+            .try_spawn(&spawn(json!({"path":file}), "k"))
+            .await
+            .unwrap();
+        assert_eq!(replayed, receipt);
+        fs::write(&file, "be verbose").unwrap();
+        let error = daemon
+            .try_spawn(&spawn(json!({"path":file}), "k"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.data()["kind2"], "idempotency_conflict", "{error:?}");
+        daemon.stop().await;
+    });
+    let db = rusqlite::Connection::open(root.path().join("state").join("store.sqlite3")).unwrap();
+    let params: String = db
+        .query_row("SELECT params FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        !params.contains("instructions.txt"),
+        "the path was stored: {params}"
+    );
+    assert!(params.contains("be brief"), "{params}");
+}

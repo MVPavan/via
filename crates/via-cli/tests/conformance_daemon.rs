@@ -269,3 +269,109 @@ fn conformance_daemon_model_only_spawn_and_steer() -> TestResult {
     );
     report.require_pass()
 }
+
+/// The default fake capabilities as JSON, with `params.instructions` native.
+fn instructions_capabilities() -> Value {
+    json!({
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no steer input"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"native"},
+                   "output_schema":{"support":"unsupported","reason":"no schema input"},
+                   "effort":{"support":"unsupported","reason":"no effort setting"},
+                   "max_steps":{"support":"unsupported","reason":"no step limit"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no recovery"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    })
+}
+
+/// Sol r1 #4 through the CLI and the daemon: `via spawn --instructions
+/// FILE` sends the file's absolute `{path}`, which the daemon reads at the
+/// receipt and the route receives as the session's instructions text; a
+/// raw `{path}` does the same, and a relative one is `invalid_params`
+/// naming `instructions`.
+#[test]
+fn conformance_daemon_instructions_path() -> TestResult {
+    let turn = |n: u32| format!("fake-turn-{n}");
+    let script = |prompt: &str, n: u32| {
+        json!({"expected_request":{"type":"start","prompt":prompt,"instructions":"be brief"},
+               "steps":[emit(&json!({"type":"accepted","id":1,"vendor_turn_id":turn(n)})),
+                        emit(&json!({"type":"terminal","vendor_turn_id":turn(n),
+                                     "status":"completed","final_text":"done",
+                                     "stop_reason":"end_turn"}))]})
+    };
+    let sandbox = Sandbox::new(&json!({
+        "profile": {"capabilities": instructions_capabilities()},
+        "scripts": [script("cli", 1), script("raw", 1)],
+    }))?;
+    let file = sandbox.sync.join("instructions.txt");
+    std::fs::write(&file, "be brief")?;
+    let file = file.to_str().ok_or("non-UTF-8 sandbox")?.to_owned();
+    let evidence = Evidence::new(
+        "conformance_daemon_instructions_path",
+        &sandbox.fake,
+        &sandbox.fixture,
+    )?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let receipt = daemon::cli(
+                &sandbox,
+                evidence,
+                "cli_spawn",
+                &[
+                    "spawn",
+                    "--harness",
+                    "fake",
+                    "--model",
+                    "fake",
+                    "--prompt",
+                    "cli",
+                    "--instructions",
+                    &file,
+                    "--handle",
+                    HANDLE,
+                    "--background",
+                    "--json",
+                ],
+            )?;
+            let mut raw = Raw::open(&sandbox)?;
+            let address = receipt["turn"].as_str().unwrap_or_default().to_owned();
+            let envelope = wait(&mut raw, 1, &address)?;
+            check(envelope["state"] == "completed", || {
+                format!("CLI instructions: {envelope}")
+            })?;
+            let receipt = call(
+                &mut raw,
+                2,
+                "spawn",
+                &json!({"harness":"fake","model":"fake","prompt":"raw","handle":HANDLE,
+                        "instructions":{"path":file}}),
+            )?;
+            let session = receipt["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let envelope = wait(&mut raw, 3, &format!("{session}/1"))?;
+            check(envelope["state"] == "completed", || {
+                format!("raw instructions: {envelope}")
+            })?;
+            record(evidence, &mut raw, &session, &[&envelope])?;
+            let relative = raw.exchange(&request(
+                4,
+                "spawn",
+                &json!({"harness":"fake","model":"fake","prompt":"x","handle":HANDLE,
+                        "instructions":{"path":"instructions.txt"}}),
+            ))?;
+            check(
+                relative["error"]["data"]["kind"] == "invalid_params"
+                    && relative["error"]["data"]["field"] == "instructions",
+                || format!("relative instructions path: {relative}"),
+            )
+        },
+        |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
+    );
+    report.require_pass()
+}

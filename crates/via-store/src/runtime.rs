@@ -1803,7 +1803,22 @@ impl StoreClient {
         path: std::path::PathBuf,
         deadline: tokio::time::Instant,
     ) -> Result<BlobRef, PromptFileError> {
-        self.blobs.copy_file(path, deadline).await
+        self.blobs
+            .copy_file(path, deadline, crate::blob::PROMPT_MAX)
+            .await
+    }
+
+    /// [`Self::copy_prompt_file`] for another caller's text file of at
+    /// most `max` bytes, such as a spawn's `instructions {path}` (C1 §4).
+    pub async fn copy_text_file(
+        &self,
+        path: std::path::PathBuf,
+        deadline: tokio::time::Instant,
+        max: u64,
+    ) -> Result<BlobRef, PromptFileError> {
+        self.blobs
+            .copy_file(path, deadline, max.min(crate::blob::PROMPT_MAX))
+            .await
     }
 
     /// Unlinks a finished blob after a commit known not to have happened;
