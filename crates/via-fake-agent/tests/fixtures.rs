@@ -4,8 +4,12 @@
 //!
 //! - Every `*.replay.json` loads in replay mode and names its source run.
 //! - A generic driver that answers each expect step with that step's own
-//!   line (a subset matches itself), reads back each emitted line, and
-//!   delivers each `await_signal`, completes the fixture with exit 0.
+//!   line (a subset matches itself), reads back each emitted line, delivers
+//!   each `await_signal` and closes stdin at each `await_eof`, completes the
+//!   fixture with the exit code and stderr of its `exit` step (0 and none
+//!   without one), with one launch logged per start. Ordered EOF and strict
+//!   trailing input hold: a resent line or an EOF right after the first
+//!   line fails replay.
 //! - No fixture file contains a home path, an email address, a token-like
 //!   value or a credential field with a real value. Every key and string is
 //!   scanned, the new step fields (`exit.stderr`, `absent` pointers)
@@ -17,7 +21,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +32,9 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Outer bound for one fixture run; each fixture's own deadline is shorter.
 const OUTER: Duration = Duration::from_secs(30);
+/// How long the driver waits after answering an expect before it closes
+/// stdin for the `await_eof` that follows (see [`drive`]).
+const EXPECT_SETTLE: Duration = Duration::from_millis(200);
 /// The value the driver passes for every argv capture.
 const CAPTURED_ARG: &str = "0f1de11e-0000-4000-8000-000000000001";
 /// Credential fields that may hold only a placeholder.
@@ -208,8 +215,23 @@ fn answer(expect: &Value, captures: &mut BTreeMap<String, String>) -> Result<Val
     Ok(line)
 }
 
+/// How the generic driver departs from the fixture, to show that replay
+/// catches what a fixture pins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Deviation {
+    /// Answers every step as the fixture says.
+    None,
+    /// Resends the last answered line just before closing stdin.
+    ExtraInput,
+    /// Closes stdin right after the first answered line.
+    EarlyEof,
+}
+
+/// What the fake must end with: its exit code and stderr.
+type End = (i64, String);
+
 /// Runs one fixture with the generic driver.
-fn drive(fixture_path: &Path) -> TestResult {
+fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     let fixture: Value = serde_json::from_slice(&fs::read(fixture_path)?)?;
     let source = fixture.get("source").and_then(Value::as_str).unwrap_or("");
     if source.trim().is_empty() {
@@ -234,61 +256,30 @@ fn drive(fixture_path: &Path) -> TestResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let mut stdin = Some(child.stdin.take().ok_or("no stdin")?);
     let stdout = lines_of(child.stdout.take().ok_or("no stdout")?);
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
     let stderr = thread::spawn(move || {
         let mut text = String::new();
-        // Only for the failure message; a read error leaves it short.
+        // A read error leaves it short, which the comparison reports.
         let _ = stderr.read_to_string(&mut text);
         text
     });
     let mut guard = Guard(child);
     let deadline = Instant::now() + OUTER;
 
-    for (index, step) in fixture["steps"]
-        .as_array()
-        .ok_or("steps is not an array")?
-        .iter()
-        .enumerate()
-    {
-        let number = index + 1;
-        let fail = |message: String| format!("step {number}: {message}");
-        if let Some(emit) = step.get("emit") {
-            let expected =
-                substitute(emit["line"].as_str().ok_or("emit line")?, &captures).map_err(fail)?;
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = stdout
-                .recv_timeout(left)
-                .map_err(|error| fail(format!("no emitted line: {error}")))?
-                .map_err(fail)?;
-            if line != expected {
-                return Err(fail(format!("emitted {line}, fixture says {expected}")).into());
-            }
-        } else if let Some(expect) = step.get("expect") {
-            let line = answer(expect, &mut captures).map_err(fail)?;
-            writeln!(stdin, "{line}")?;
-            stdin.flush()?;
-        } else if let Some(wait) = step.get("await_signal") {
-            let signal = match wait["signal"].as_str() {
-                Some("SIGINT") => "-INT",
-                Some("SIGTERM") => "-TERM",
-                other => return Err(fail(format!("unknown signal {other:?}")).into()),
-            };
-            // Handlers are installed before the first step, and any earlier
-            // emit was already read, so the fake is past its setup.
-            let status = Command::new("kill")
-                .args([signal, &guard.0.id().to_string()])
-                .status()?;
-            if !status.success() {
-                return Err(fail("kill failed".to_owned()).into());
-            }
-        } else if step.get("delay").is_none() {
-            return Err(fail(format!("unknown step {step}")).into());
-        }
-    }
+    let steps = run_steps(
+        &fixture,
+        &mut Run {
+            stdin: &mut stdin,
+            stdout: &stdout,
+            pid: guard.0.id(),
+            deadline,
+            captures,
+            deviation,
+        },
+    );
     drop(stdin);
-
     let status = loop {
         if let Some(status) = guard.0.try_wait()? {
             break status;
@@ -299,13 +290,131 @@ fn drive(fixture_path: &Path) -> TestResult {
         thread::sleep(Duration::from_millis(5));
     };
     let stderr = stderr.join().map_err(|_| "stderr reader panicked")?;
-    if status.code() != Some(0) {
-        return Err(format!("exit {status}: {stderr}").into());
+    let (code, text) =
+        steps.map_err(|error| format!("{error}; the fake ended {status}: {stderr}"))?;
+    if status.code().map(i64::from) != Some(code) || stderr != text {
+        return Err(
+            format!("{status} with stderr {stderr:?}; fixture says {code} {text:?}").into(),
+        );
     }
     if let Ok(Ok(extra)) = stdout.recv_timeout(Duration::from_millis(100)) {
         return Err(format!("unexpected extra output {extra}").into());
     }
+    // One start for `--version`, if the fixture has one, and one for the run.
+    let starts = 1 + usize::from(fixture.get("version").is_some_and(Value::is_string));
+    let launches = fs::read_to_string(root.path().join("vendor.launches"))?;
+    if launches.lines().count() != starts {
+        return Err(format!("launch log has {launches:?}, expected {starts} starts").into());
+    }
     Ok(())
+}
+
+/// The driver's side of one run.
+struct Run<'a> {
+    stdin: &'a mut Option<ChildStdin>,
+    stdout: &'a Receiver<Result<String, String>>,
+    pid: u32,
+    deadline: Instant,
+    captures: BTreeMap<String, String>,
+    deviation: Deviation,
+}
+
+/// Answers the fixture's steps in order and returns how the fake must end:
+/// exit 0 with no stderr, unless an exit step says otherwise.
+fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
+    let mut end = (0, String::new());
+    let mut previous_is_expect = false;
+    let mut last_answer = None;
+    for (index, step) in fixture["steps"]
+        .as_array()
+        .ok_or("steps is not an array")?
+        .iter()
+        .enumerate()
+    {
+        let number = index + 1;
+        let fail = |message: String| format!("step {number}: {message}");
+        if let Some(emit) = step.get("emit") {
+            let expected = substitute(emit["line"].as_str().ok_or("emit line")?, &run.captures)
+                .map_err(fail)?;
+            let left = run.deadline.saturating_duration_since(Instant::now());
+            let line = run
+                .stdout
+                .recv_timeout(left)
+                .map_err(|error| fail(format!("no emitted line: {error}")))?
+                .map_err(fail)?;
+            if line != expected {
+                return Err(fail(format!("emitted {line}, fixture says {expected}")).into());
+            }
+        } else if let Some(expect) = step.get("expect") {
+            let line = answer(expect, &mut run.captures).map_err(fail)?;
+            // The answer is the fixture's own subset, so an absent pointer
+            // it resolves is a fixture that no adapter could pass.
+            for pointer in expect
+                .get("absent")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let pointer = pointer
+                    .as_str()
+                    .ok_or_else(|| fail("absent pointer".to_owned()))?;
+                if line.pointer(pointer).is_some() {
+                    return Err(fail(format!("the subset sets absent {pointer}")).into());
+                }
+            }
+            let input = run
+                .stdin
+                .as_mut()
+                .ok_or_else(|| fail("stdin already closed".to_owned()))?;
+            // Answered at once, so any `within_ms` is met.
+            writeln!(input, "{line}")?;
+            input.flush()?;
+            last_answer = Some(line);
+            if run.deviation == Deviation::EarlyEof {
+                drop(run.stdin.take());
+            }
+        } else if let Some(wait) = step.get("await_signal") {
+            let signal = match wait["signal"].as_str() {
+                Some("SIGINT") => "-INT",
+                Some("SIGTERM") => "-TERM",
+                other => return Err(fail(format!("unknown signal {other:?}")).into()),
+            };
+            // Handlers are installed before the first step, and any earlier
+            // emit was already read, so the fake is past its setup.
+            let status = Command::new("kill")
+                .args([signal, &run.pid.to_string()])
+                .status()?;
+            if !status.success() {
+                return Err(fail("kill failed".to_owned()).into());
+            }
+        } else if step.get("await_eof").is_some() {
+            if run.deviation == Deviation::ExtraInput
+                && let (Some(input), Some(line)) = (run.stdin.as_mut(), &last_answer)
+            {
+                writeln!(input, "{line}")?;
+                input.flush()?;
+            }
+            if previous_is_expect {
+                // An expect completes when the fake has matched the line,
+                // which the driver cannot observe; an EOF before that is a
+                // replay failure, so let the fake take the line first.
+                thread::sleep(EXPECT_SETTLE);
+            }
+            drop(run.stdin.take());
+        } else if let Some(exit) = step.get("exit") {
+            let code = exit["code"]
+                .as_i64()
+                .ok_or_else(|| fail("exit code".to_owned()))?;
+            let text = exit["stderr"]
+                .as_str()
+                .ok_or_else(|| fail("exit stderr".to_owned()))?;
+            end = (code, text.to_owned());
+        } else if step.get("delay").is_none() {
+            return Err(fail(format!("unknown step {step}")).into());
+        }
+        previous_is_expect = step.get("expect").is_some();
+    }
+    Ok(end)
 }
 
 #[test]
@@ -317,7 +426,9 @@ fn fixtures_replay_with_a_generic_driver_to_exit_zero() -> TestResult {
         .into_iter()
         .map(|path| {
             let name = path.display().to_string();
-            let run = thread::spawn(move || drive(&path).map_err(|error| error.to_string()));
+            let run = thread::spawn(move || {
+                drive(&path, Deviation::None).map_err(|error| error.to_string())
+            });
             (name, run)
         })
         .collect();
@@ -627,4 +738,64 @@ fn fixtures_hygiene_scan_covers_the_new_step_fields() {
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
     }
+}
+
+/// Runs every fixture concurrently with `deviation` and returns, per
+/// fixture, the driver's result.
+fn drive_all(deviation: Deviation) -> TestResult<Vec<(PathBuf, Result<(), String>)>> {
+    let fixtures = replay_fixtures()?;
+    assert!(!fixtures.is_empty(), "no replay fixtures found");
+    let runs: Vec<_> = fixtures
+        .into_iter()
+        .map(|path| {
+            let worker = path.clone();
+            let run =
+                thread::spawn(move || drive(&worker, deviation).map_err(|error| error.to_string()));
+            (path, run)
+        })
+        .collect();
+    runs.into_iter()
+        .map(|(path, run)| {
+            let result = run.join().map_err(|_| "driver panicked")?;
+            Ok((path, result))
+        })
+        .collect()
+}
+
+/// Whether the fixture's first `await_eof` directly follows its first
+/// expect: there an EOF right after the first line is the recorded order.
+fn eof_follows_first_expect(path: &Path) -> TestResult<bool> {
+    let fixture: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let steps = fixture["steps"].as_array().ok_or("steps")?;
+    let first = steps.iter().position(|step| step.get("expect").is_some());
+    Ok(first.is_some_and(|at| {
+        steps
+            .get(at + 1)
+            .is_some_and(|step| step.get("await_eof").is_some())
+    }))
+}
+
+#[test]
+fn fixtures_fail_replay_on_trailing_input_or_early_eof() -> TestResult {
+    let mut misses = Vec::new();
+    for (path, result) in drive_all(Deviation::ExtraInput)? {
+        // Every fixture ends its input with await_eof, so a resent line is
+        // strict trailing input.
+        match result {
+            Err(error) if error.contains("fake replay: ") && error.contains("unexpected input") => {
+            }
+            other => misses.push(format!("{}: extra input gave {other:?}", path.display())),
+        }
+    }
+    for (path, result) in drive_all(Deviation::EarlyEof)? {
+        if eof_follows_first_expect(&path)? {
+            continue;
+        }
+        match result {
+            Err(error) if error.contains("fake replay: ") && error.contains("exit status: 3") => {}
+            other => misses.push(format!("{}: early EOF gave {other:?}", path.display())),
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+    Ok(())
 }

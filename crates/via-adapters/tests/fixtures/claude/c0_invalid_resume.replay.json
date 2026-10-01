@@ -1,5 +1,5 @@
 {
-  "source": "CC c0_invalid_resume, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 566 ms). Pre-init rejection: no init. The process exited 1, which replay cannot reproduce.",
+  "source": "CC c0_invalid_resume, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 566 ms). The probe closed stdin after the result, so await_eof follows it. The recorded exit code (1) and sanitized stderr are replayed by the exit step. Pre-init rejection: no init. The stderr names the session as 33333333-3333-4333-8333-333333333333 (the expectation's sessions.main.resume), since exit stderr is not templated.",
   "argv": [
     "-p",
     "--input-format",
@@ -51,6 +51,15 @@
     {
       "emit": {
         "line": "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"duration_ms\":0,\"duration_api_ms\":0,\"is_error\":true,\"num_turns\":0,\"stop_reason\":null,\"session_id\":\"${resume}\",\"total_cost_usd\":0,\"usage\":{\"output_tokens_details\":{\"thinking_tokens\":0},\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"\",\"iterations\":[],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{},\"permission_denials\":[],\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"errors\":[\"No conversation found with session ID: ${resume}\"],\"result_index\":0}"
+      }
+    },
+    {
+      "await_eof": {}
+    },
+    {
+      "exit": {
+        "code": 1,
+        "stderr": "No conversation found with session ID: 33333333-3333-4333-8333-333333333333\n"
       }
     }
   ]

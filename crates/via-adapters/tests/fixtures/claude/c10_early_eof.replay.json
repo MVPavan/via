@@ -1,5 +1,5 @@
 {
-  "source": "CC c10_early_eof, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 2110 ms). The probe closed stdin right after the prompt, before init; the turn still completed with exit 0.",
+  "source": "CC c10_early_eof, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 2110 ms).  The probe closed stdin right after the prompt, before init, so await_eof follows the prompt and the vendor's later output follows it; the turn still completed with exit 0.",
   "argv": [
     "-p",
     "--input-format",
@@ -42,6 +42,9 @@
           }
         }
       }
+    },
+    {
+      "await_eof": {}
     },
     {
       "delay": {
