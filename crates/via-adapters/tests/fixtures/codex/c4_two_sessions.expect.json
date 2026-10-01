@@ -2,6 +2,18 @@
   "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits) (A recorded read-only, B workspace-write); requests in VIA's per-session order (the probe sent both thread/start before both turn/start); A's tool start kept after B's as recorded; B's marker command simplified; B's changed-bound second turn dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "harness": "codex",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0,
+      "b": 0
+    },
+    "after_turn": [
+      1,
+      1
+    ]
+  },
+  "pure_writes": [],
   "sessions": {
     "main": {
       "model": "gpt-6-sol",
@@ -33,7 +45,11 @@
       "params": {
         "prompt": "Run the shell command sleep 12. Then say A_DONE.",
         "effort": "low",
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -50,7 +66,11 @@
         "terminal": {
           "status": "interrupted",
           "stop_reason": "interrupted",
-          "class_hint": null
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
         },
         "usage": {
           "from": "samples",
@@ -67,12 +87,32 @@
         "cleanup_settles": "at_p7_bound",
         "stop_facts": null,
         "instance": {
-          "vendor_version": "0.159.2"
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
         },
+        "exit": null,
+        "group_absent": false,
+        "journal_uncertain": false,
         "observations_include": [
-          "session.vendor_identity_confirmed",
-          "turn.accepted",
-          "progress"
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100001",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200001"
+          },
+          "progress",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400007",
+                "commandExecution"
+              ]
+            ]
+          }
         ],
         "observations_exclude": [
           "final_text"
@@ -97,7 +137,11 @@
       "params": {
         "prompt": "Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.",
         "effort": "low",
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -111,7 +155,11 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
-          "class_hint": null
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
         },
         "usage": {
           "from": "samples",
@@ -129,13 +177,54 @@
         "cleanup": "quiescent",
         "stop_facts": null,
         "instance": {
-          "vendor_version": "0.159.2"
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
         },
+        "exit": null,
+        "group_absent": false,
+        "journal_uncertain": false,
         "observations_include": [
-          "session.vendor_identity_confirmed",
-          "turn.accepted",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100002",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200002"
+          },
           "progress",
-          "final_text"
+          "final_text",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400006",
+                "commandExecution"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "exec-019a0000-0000-7000-8000-000000400008",
+                "commandExecution"
+              ]
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "exec-019a0000-0000-7000-8000-000000400006"
+            ]
+          },
+          {
+            "kind": "progress",
+            "tools_ended": [
+              "exec-019a0000-0000-7000-8000-000000400008"
+            ]
+          }
         ],
         "observations_exclude": [],
         "observation_counts": {

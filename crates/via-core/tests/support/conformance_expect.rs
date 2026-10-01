@@ -2,54 +2,200 @@
 //!
 //! An expectation file (`<case>.expect.json` beside a replay fixture) states
 //! what a C2 driver must produce, in the unified schema of the adapter
-//! fixture slices: top-level `launches` and `plan_checks`, `sessions` (with
-//! their close results) and `turns` (with their `expect` blocks). A harness's
-//! `drive()` collects an [`Outcome`] from the real driver; [`check`] compares
-//! every stated field. A field the case does not state is not compared;
-//! `expect.unasserted` lists fields deliberately skipped, each with a reason.
+//! fixture slices. A harness's `drive()` collects an [`Outcome`] from the
+//! real driver; [`check`] compares every stated field. [`validate`] refuses
+//! a malformed or vacuous case before any comparison.
 //!
-//! `drive()` obligations the checker relies on:
-//! - `launches` counts vendor process starts over the whole case, read from
-//!   the fixture's launch log `<name>.launches` beside the replay (one line
-//!   per start of the replaying fake, `--version` probes included), never
-//!   from the driver's own count; each case starts with no log;
-//! - the replay's own verdict is part of the case: a fake that exits 3
+//! # Case schema
+//!
+//! Top level: `source`, `harness`, `launches` (required), and optionally
+//! `launch_checkpoints`, `pure_writes`, `plan_checks`, `describe`,
+//! `sessions` (required), `turns` (required, non-empty) and `unasserted`.
+//!
+//! - `launch_checkpoints` `{after_pure, after_open: {label: n}, after_turn:
+//!   [n, …]}`: the launch-log count after the pure operations, after each
+//!   session's logical open and after each turn. Each part is stated, or
+//!   named in the top-level `unasserted` with its reason.
+//! - `pure_writes`: the files the pure operations changed (normally `[]`),
+//!   compared as a set.
+//! - `plan_checks` `[{require, refusal}]`: one `plan` per entry with that
+//!   `require`; `refusal` is a C2 `Refusal` kind or null.
+//! - `describe` `{params, capabilities?, vendor_version?, version_status?,
+//!   launches: 0}`: one `describe` with C1 §3.1 `params`; `capabilities` is
+//!   the C1 §4.1 DTO (subset), the version fields exact, and `launches`
+//!   (always 0: describe starts nothing) the launch-log delta over the call.
+//! - `sessions.<label>`: `model`, `instructions`, `cwd`, `resume` (the
+//!   confirmed vendor session ID to continue, or null), `vendor_options`
+//!   (C1 `vendor`, `{"<harness>": {k: v}}`), `close` (`{mode, vendor_closed,
+//!   cleanup}` or null: not closed) and `health` (`{state, first_cause}`:
+//!   C2 `DriverHealth` after the case, `state` `open`, `failed` or `closed`,
+//!   `first_cause` a [`DRIVER_FAILURE`] name or null).
+//! - `turns[i]`: `session` (a label; `main` when absent), `start_after`
+//!   (`{turn, event}`: an earlier turn's index and the event of it this turn
+//!   waits for), `params` (`prompt`, `effort`, `bound` in C1's shape `{mode,
+//!   extra_write_dirs, network}` or null to inherit, `output_schema`,
+//!   `max_steps`), `deadlines` (C1 `{wall_ms, idle_ms}`; C1's defaults when
+//!   absent), `tool_grace_ms`, `stop` (`{kind, after}`), `steer`
+//!   (`[{after, text, expected_vendor_turn?, result}]`), `gates` (below) and
+//!   `expect`.
+//!
+//! Recovery vocabulary is left to the adapter slices: their named recovery
+//! tests (`claude_recovery_no_submit`, `codex_server_recovery`) need crash
+//! simulation, which the driver owns.
+//!
+//! # Turn expectations
+//!
+//! `expect` states a baseline: `accepted`, `terminal`, `error` and
+//! `cleanup` are each stated (null allowed), or named in `unasserted` with
+//! a reason. `unasserted` is documentary: a field it names may not also be
+//! stated, and nothing stated is ever skipped. The other fields:
+//! `plan_refusal`, `rejected`, `usage`, `final_text`, `cleanup_settles`,
+//! `stop_facts`, `instance`, `exit`, `journal_uncertain`, `group_absent`,
+//! `warnings`, the observation fields and `notes`.
+//!
+//! How each field compares:
+//! - **Exact:** the opaque vendor JSON C2 passes through unparsed
+//!   (`terminal.structured_output`, `terminal.vendor`), `warnings` (a set of
+//!   C1 warning codes from the turn's `warning` observations), the version
+//!   fields, `pure_writes`, launch counts and checkpoints, `health`, and every
+//!   scalar.
+//! - **Assembled:** `final_text`, a list of pieces compared by their
+//!   concatenation in order, since C2 §4 may cut completed text anywhere.
+//! - **Subset:** DTO-shaped objects (`terminal` apart from its opaque
+//!   members, `usage`, `stop_facts`, `instance`, `exit`, `close`,
+//!   `capabilities`, observation objects): every stated key must hold, an
+//!   absent actual key counts as null, and arrays compare element by
+//!   element with equal length.
+//!
+//! Observation entries (`observations_include`, `observations_exclude`,
+//! `observations_order`) are a kind string, or an object that subset-matches
+//! one observation; `observation_counts` counts by kind. An observation is
+//! `{kind, …}` with the C2 §4 correlation fields of its kind
+//! ([`OBSERVATION_FIELDS`]):
+//! - `session.vendor_identity_confirmed`: `vendor_session_id`, and
+//!   `generation`, the 1-based ordinal of its `connection_id` among the
+//!   distinct connection IDs of the case, in first-seen order;
+//! - `turn.accepted`: `vendor_turn_id`, and `correlation`, the 1-based
+//!   ordinal of its acceptance token among the case's distinct tokens;
+//! - `progress`: `model`, `tools_started` (`[[id, name], …]`),
+//!   `tools_ended` (`[id, …]`), `usage`;
+//! - `final_text`: `text`;
+//! - `action.denied`: `denial_kind` (C1 `file_write`, `command`, `network`,
+//!   `other`), `target`, `reason`;
+//! - `vendor.request_declined`: `vendor_method`, `summary`, `blocking`;
+//! - `steer.delivered`: `delivery` (`injected`, or the partial semantics);
+//! - `warning`: `code`;
+//! - `session.vendor_closed`: `reason`;
+//! - `resume.mismatch`: `requested`, `returned`;
+//! - `turn.late_terminal`: none.
+//!
+//! Turn evidence follows C2 `TurnEvidence`, from the `Ok` outcome or the
+//! failure's evidence: `exit` (`{code, signal}`, or null when nothing was
+//! launched or no exit was reported), `cleanup`, `journal_uncertain`, and
+//! `group_absent`: whether Host `GroupAbsent` evidence for the connection's
+//! own group backs the cleanup. `terminal.cost` is C1's cost member: a
+//! vendor cost gives `{usd, scope, provenance: "reported"}`; none gives
+//! `{usd: null, provenance: "unavailable"}`. `instance` is
+//! `TurnEnd.instance`: `{vendor_version, version_status}` or null.
+//!
+//! # Gates
+//!
+//! A turn's `gates` `[{step, lifetime?, advance_ms?, expect}]` each name the
+//! replay `await_signal` step they release (1-based; `lifetime` 1-based,
+//! default 1). For each gate, in order, the driver:
+//! 1. waits until the turn's outcome so far satisfies the gate's `expect`
+//!    (a partial outcome: any turn `expect` field but `unasserted`, such as
+//!    observations so far or `terminal: null`), bounded by the case;
+//! 2. advances its controlled clock by `advance_ms`;
+//! 3. records a snapshot of the outcome so far (`TurnOutcome::gates`), which
+//!    [`check`] compares with the gate's `expect`;
+//! 4. sends the step's signal to the fake, once the fake catches it: a
+//!    gate before any emit can come before the fake installed its
+//!    handlers, and the default action kills it (the fake's pid is its
+//!    line in the launch log; on Linux, wait for the signal's bit in
+//!    `SigCgt` of `/proc/<pid>/status`, as `via-fake-agent`'s
+//!    `fixtures.rs` does).
+//!
+//! tokio's paused clock auto-advances whenever the runtime has no work, so
+//! a driver that pauses time must keep the runtime busy (or hold the turn's
+//! futures unpolled) while it waits in step 1, or the adapter's timers fire
+//! before the gate: advance explicitly, never by idling.
+//!
+//! # `drive()` obligations
+//!
+//! - Order: the pure operations (`describe`, then each `plan_checks` entry),
+//!   then every session's logical open in label order, then the turns in
+//!   order (a turn with `start_after` starts at that event of the earlier
+//!   turn, concurrently with it), then each stated `close`.
+//! - `launches` and the checkpoints are read from the fixture's launch log
+//!   `<name>.launches` beside the replay (one line per start of the
+//!   replaying fake, `--version` probes included), never from the driver's
+//!   own count; each case starts with no log. `pure_writes` lists the files
+//!   that the pure operations created, changed or removed in the case's
+//!   fixture and scratch directories, the launch log excepted.
+//! - The replay's own verdict is part of the case: a fake that exits 3
 //!   (unmatched or unexpected input, an absent field that was sent, a line
-//!   that came late, stdin closed early) fails the case whatever the
-//!   outcome. A replay that ends with `await_eof` requires the case to end
-//!   the way the route ends its vendor input (Codex: idle retirement closes
-//!   the server's stdin after the last session closed; a per-turn process:
-//!   EOF after the result), and no line after the step before it;
+//!   that came late or before the emit it answers, stdin closed early) fails
+//!   the case whatever the outcome. A replay that ends with `await_eof`
+//!   requires the case to end the way the route ends its vendor input
+//!   (Codex: idle retirement closes the server's stdin after the last session
+//!   closed; a per-turn process: EOF after the result), and no line after
+//!   the step before it.
 //! - `cleanup_settles` is measured with controlled time: `at_terminal` when
 //!   the turn settled with its terminal, `at_p7_bound` when it was still
 //!   pending just before `min(ack + tool_grace, wall)` and settled at it,
-//!   `when_tools_end` when the last reported tool ended first;
-//! - `observations` lists the kinds the driver emitted for the turn, in
-//!   order (`turn.accepted`, `final_text`, …).
+//!   `when_tools_end` when the last reported tool ended first.
+//! - `observations` lists the turn's observations, in order, as objects in
+//!   the shape above.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
 /// What a driver produced for a whole case.
+#[derive(Default)]
 pub(crate) struct Outcome {
     /// Vendor process launches over the case: the lines of the fixture's
     /// `<name>.launches` log.
     pub(crate) launches: u64,
+    /// The launch-log count at each checkpoint.
+    pub(crate) checkpoints: Checkpoints,
+    /// Files the pure operations changed, launch log excepted.
+    pub(crate) pure_writes: Vec<String>,
     /// The refusal kind of each `plan_checks` entry, in order; `None` when
     /// the check passed.
     pub(crate) plan_checks: Vec<Option<String>>,
+    /// `{capabilities, vendor_version, version_status, launches}` of the
+    /// case's `describe`, when it has one.
+    pub(crate) describe: Option<Value>,
     /// Each session's close report (`vendor_closed`, `cleanup`), or `None`
     /// when the case did not close it.
     pub(crate) closes: BTreeMap<String, Option<Value>>,
+    /// Each session's health after the case: `{state, first_cause}`.
+    pub(crate) health: BTreeMap<String, Value>,
     /// One entry per expected turn, in the expectation's order.
     pub(crate) turns: Vec<TurnOutcome>,
 }
 
-/// What a driver produced for one turn, in the schema's vocabulary.
+/// Launch-log counts at the case's checkpoints.
 #[derive(Default)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields mirror the schema's launch_checkpoints keys"
+)]
+pub(crate) struct Checkpoints {
+    /// After the pure operations.
+    pub(crate) after_pure: u64,
+    /// After each session's logical open, by label.
+    pub(crate) after_open: BTreeMap<String, u64>,
+    /// After each turn, in the expectation's order.
+    pub(crate) after_turn: Vec<u64>,
+}
+
+/// What a driver produced for one turn, in the schema's vocabulary.
+#[derive(Clone, Default)]
 pub(crate) struct TurnOutcome {
     pub(crate) plan_refusal: Option<String>,
     pub(crate) rejected: Option<String>,
@@ -64,32 +210,74 @@ pub(crate) struct TurnOutcome {
     pub(crate) cleanup_settles: Option<String>,
     pub(crate) stop_facts: Option<Value>,
     pub(crate) instance: Option<Value>,
+    /// `TurnEvidence.exit`: `{code, signal}`.
+    pub(crate) exit: Option<Value>,
+    pub(crate) journal_uncertain: bool,
+    /// Host `GroupAbsent` evidence backs the cleanup.
+    pub(crate) group_absent: bool,
+    /// Codes of the turn's `warning` observations.
+    pub(crate) warnings: Vec<String>,
     /// The result kind of each steer attempt, in the turn's `steer` order.
     pub(crate) steer: Vec<String>,
-    /// Observation kinds emitted for the turn, in order.
-    pub(crate) observations: Vec<String>,
+    /// The turn's observations, in order, as `{kind, …}` objects.
+    pub(crate) observations: Vec<Value>,
+    /// The outcome so far at each gate, in the turn's `gates` order.
+    pub(crate) gates: Vec<TurnOutcome>,
 }
 
 const TOP: &[&str] = &[
     "source",
     "harness",
     "launches",
+    "launch_checkpoints",
+    "pure_writes",
     "plan_checks",
+    "describe",
     "sessions",
     "turns",
+    "unasserted",
 ];
-const SESSION: &[&str] = &["model", "instructions", "cwd", "resume", "close"];
+const CHECKPOINTS: &[&str] = &["after_pure", "after_open", "after_turn"];
+const DESCRIBE: &[&str] = &[
+    "params",
+    "capabilities",
+    "vendor_version",
+    "version_status",
+    "launches",
+];
+/// C1 §3.1 `describe` params.
+const DESCRIBE_PARAMS: &[&str] = &[
+    "harness",
+    "model",
+    "bound",
+    "require",
+    "vendor",
+    "cwd",
+    "allow_untested",
+];
+const SESSION: &[&str] = &[
+    "model",
+    "instructions",
+    "cwd",
+    "resume",
+    "vendor_options",
+    "close",
+    "health",
+];
 const CLOSE: &[&str] = &["mode", "vendor_closed", "cleanup"];
+const HEALTH: &[&str] = &["state", "first_cause"];
 const TURN: &[&str] = &[
     "session",
     "start_after",
     "params",
+    "deadlines",
     "tool_grace_ms",
     "stop",
     "steer",
+    "gates",
     "expect",
 ];
-/// Turn `expect` fields compared by (subset) value.
+/// Turn `expect` fields compared by value.
 const VALUED: &[&str] = &[
     "plan_refusal",
     "rejected",
@@ -102,20 +290,33 @@ const VALUED: &[&str] = &[
     "cleanup_settles",
     "stop_facts",
     "instance",
+    "exit",
+    "journal_uncertain",
+    "group_absent",
+    "warnings",
 ];
-const EXPECT_OTHER: &[&str] = &[
+const OBSERVED: &[&str] = &[
     "observations_include",
     "observations_exclude",
     "observation_counts",
     "observations_order",
-    "unasserted",
-    "notes",
 ];
+/// The fields every turn states, or names in `unasserted`.
+const BASELINE: &[&str] = &["accepted", "terminal", "error", "cleanup"];
 const PLAN_CHECK: &[&str] = &["require", "refusal"];
 const START_AFTER: &[&str] = &["turn", "event"];
 const PARAMS: &[&str] = &["prompt", "effort", "bound", "output_schema", "max_steps"];
+/// C1 §4 `bound`.
+const BOUND: &[&str] = &["mode", "extra_write_dirs", "network"];
+const BOUND_MODE: &[&str] = &["read_only", "workspace_write", "full"];
+/// C1 §4 `deadlines`.
+const DEADLINES: &[&str] = &["wall_ms", "idle_ms"];
 const STOP: &[&str] = &["kind", "after"];
+const STOP_KIND: &[&str] = &["interrupt", "wall", "close"];
+/// The turn events a stop, steer or later turn can wait for.
+const EVENTS: &[&str] = &["accepted", "tool_started", "handshake"];
 const STEER: &[&str] = &["after", "text", "expected_vendor_turn", "result"];
+const GATE: &[&str] = &["step", "lifetime", "advance_ms", "expect"];
 const UNASSERTED: &[&str] = &["field", "why"];
 const TERMINAL: &[&str] = &[
     "status",
@@ -127,8 +328,13 @@ const TERMINAL: &[&str] = &[
     "structured_output",
     "steps",
     "cost",
+    "vendor",
 ];
+/// Terminal members C2 passes through unparsed: compared exactly.
+const OPAQUE: &[&str] = &["structured_output", "vendor"];
 const COST: &[&str] = &["usd", "scope", "provenance"];
+/// C1 §5 cost provenance.
+const PROVENANCE: &[&str] = &["reported", "estimated", "unavailable"];
 /// `from`, the C1 scope and provenance, and the C1 token names.
 const USAGE: &[&str] = &[
     "from",
@@ -142,11 +348,60 @@ const USAGE: &[&str] = &[
 ];
 const STOP_FACTS: &[&str] = &["acknowledged", "forced", "shared"];
 const INSTANCE: &[&str] = &["vendor_version", "version_status"];
-/// Observation fields that are lists of kinds.
-const KIND_LISTS: &[&str] = &[
-    "observations_include",
-    "observations_exclude",
-    "observations_order",
+/// C2 `InstanceReport.version_status`: never `refused`.
+const INSTANCE_STATUS: &[&str] = &["tested", "untested"];
+/// C1 §3.1 `version_status`.
+const VERSION_STATUS: &[&str] = &["tested", "untested", "refused"];
+const EXIT: &[&str] = &["code", "signal"];
+/// C1 §5 warning codes.
+const WARNING: &[&str] = &[
+    "instructions_partial",
+    "vendor_version_untested",
+    "usage_interval_unverified",
+    "structured_output_missing",
+    "cancel_cleanup_uncertain",
+    "predecessor_cleanup_uncertain",
+    "config_switch_unverified",
+    "deprecated",
+];
+/// C2 `DriverHealth` states.
+const HEALTH_STATE: &[&str] = &["open", "failed", "closed"];
+/// C2 `DriverFailure` causes.
+const DRIVER_FAILURE: &[&str] = &[
+    "protocol",
+    "transport_lost",
+    "process_exit",
+    "overflow",
+    "store",
+    "owned_task",
+    "turn_abandoned",
+    "server_lost",
+    "resume_mismatch",
+    "retirement_uncertain",
+];
+const CLOSE_MODE: &[&str] = &["graceful", "force"];
+/// C2 §4 observation kinds and the fields an entry may state for each.
+const OBSERVATION_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "session.vendor_identity_confirmed",
+        &["vendor_session_id", "generation"],
+    ),
+    ("turn.accepted", &["correlation", "vendor_turn_id"]),
+    ("turn.late_terminal", &[]),
+    ("session.vendor_closed", &["reason"]),
+    ("resume.mismatch", &["requested", "returned"]),
+    (
+        "progress",
+        &["model", "tools_started", "tools_ended", "usage"],
+    ),
+    ("final_text", &["text"]),
+    ("action.denied", &["denial_kind", "target", "reason"]),
+    (
+        "vendor.request_declined",
+        &["vendor_method", "summary", "blocking"],
+    ),
+    ("steer.delivered", &["delivery"]),
+    ("warning", &["code"]),
 ];
 
 /// Reads `<dir>/<name>.expect.json`.
@@ -196,31 +451,416 @@ fn known_if(value: Option<&Value>, keys: &[&str], at: &str) -> Result<(), String
     }
 }
 
-/// [`known`] for each object of an optional array: absent passes.
-fn known_entries(value: Option<&Value>, keys: &[&str], at: &str) -> Result<(), String> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let entries = value
-        .as_array()
-        .ok_or_else(|| format!("{at}: not an array"))?;
-    for (index, entry) in entries.iter().enumerate() {
-        known(entry, keys, &format!("{at}[{index}]"))?;
+/// The entries of an optional array: absent is empty, another type fails.
+fn entries<'a>(value: Option<&'a Value>, at: &str) -> Result<&'a [Value], String> {
+    match value {
+        None => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items),
+        Some(_) => Err(format!("{at}: not an array")),
+    }
+}
+
+/// The value's JSON type, in words, for messages.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// A type an input or expected field must have.
+#[derive(Clone, Copy)]
+enum Ty {
+    Bool,
+    Str,
+    /// A non-negative integer.
+    Count,
+    /// A positive integer.
+    Positive,
+    Object,
+    /// An array of strings.
+    Strings,
+    /// One of these names.
+    Name(&'static [&'static str]),
+}
+
+impl Ty {
+    fn holds(self, value: &Value) -> bool {
+        match self {
+            Self::Bool => value.is_boolean(),
+            Self::Str => value.is_string(),
+            Self::Count => value.as_u64().is_some(),
+            Self::Positive => value.as_u64().is_some_and(|n| n > 0),
+            Self::Object => value.is_object(),
+            Self::Strings => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            Self::Name(names) => value.as_str().is_some_and(|text| names.contains(&text)),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Bool => "a boolean".to_owned(),
+            Self::Str => "a string".to_owned(),
+            Self::Count => "a non-negative integer".to_owned(),
+            Self::Positive => "a positive integer".to_owned(),
+            Self::Object => "an object".to_owned(),
+            Self::Strings => "an array of strings".to_owned(),
+            Self::Name(names) => format!("one of {names:?}"),
+        }
+    }
+}
+
+/// Checks the type of `map[key]` when present: `ty`, or null when
+/// `nullable`.
+fn typed(
+    map: &Map<String, Value>,
+    key: &str,
+    ty: Ty,
+    nullable: bool,
+    at: &str,
+) -> Result<(), String> {
+    match map.get(key) {
+        None => Ok(()),
+        Some(Value::Null) if nullable => Ok(()),
+        Some(value) if ty.holds(value) => Ok(()),
+        Some(value) => Err(format!(
+            "{at}.{key}: {} is not {}{}",
+            kind_of(value),
+            ty.describe(),
+            if nullable { " or null" } else { "" }
+        )),
+    }
+}
+
+/// [`typed`] for a field that must be present.
+fn required(
+    map: &Map<String, Value>,
+    key: &str,
+    ty: Ty,
+    nullable: bool,
+    at: &str,
+) -> Result<(), String> {
+    if !map.contains_key(key) {
+        return Err(format!("{at}: {key} is required"));
+    }
+    typed(map, key, ty, nullable, at)
+}
+
+/// The fields an `unasserted` list names, after checking its entries.
+fn unasserted_fields<'a>(value: Option<&'a Value>, at: &str) -> Result<Vec<&'a str>, String> {
+    let mut fields = Vec::new();
+    for (index, entry) in entries(value, at)?.iter().enumerate() {
+        let at = format!("{at}[{index}]");
+        known(entry, UNASSERTED, &at)?;
+        match (entry["field"].as_str(), entry["why"].as_str()) {
+            (Some(field), Some(why)) if !field.is_empty() && !why.trim().is_empty() => {
+                fields.push(field);
+            }
+            _ => return Err(format!("{at}: needs field and why")),
+        }
+    }
+    Ok(fields)
+}
+
+/// Whether the dotted `path` is stated in `value` (an object member at
+/// every step, null included).
+fn states(value: &Value, path: &str) -> bool {
+    let mut node = value;
+    for key in path.split('.') {
+        match node.get(key) {
+            Some(next) => node = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Refuses an `unasserted` entry that names a stated field: the list is
+/// documentary and never overrides an assertion.
+fn documentary(fields: &[&str], stated: &Value, at: &str) -> Result<(), String> {
+    match fields.iter().find(|field| states(stated, field)) {
+        Some(field) => Err(format!(
+            "{at}.unasserted: {field} is also stated; unasserted is documentary"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Checks a C1 `bound` object.
+fn bound(value: &Value, at: &str) -> Result<(), String> {
+    known(value, BOUND, at)?;
+    let map = object(value, at)?;
+    required(map, "mode", Ty::Name(BOUND_MODE), false, at)?;
+    required(map, "extra_write_dirs", Ty::Strings, false, at)?;
+    required(map, "network", Ty::Bool, false, at)
+}
+
+/// Checks `launch_checkpoints`: each part stated or unasserted, one count
+/// per session and per turn.
+fn validate_checkpoints(
+    points: &Value,
+    skipped: &[&str],
+    sessions: &Map<String, Value>,
+    turns: usize,
+) -> Result<(), String> {
+    let at = "launch_checkpoints";
+    known(points, CHECKPOINTS, at)?;
+    let map = object(points, at)?;
+    for part in CHECKPOINTS {
+        let named = format!("{at}.{part}");
+        if !map.contains_key(*part) && !skipped.contains(&named.as_str()) {
+            return Err(format!("{at}: {part} is stated or unasserted"));
+        }
+    }
+    typed(map, "after_pure", Ty::Count, false, at)?;
+    if let Some(opened) = map.get("after_open") {
+        let opened = object(opened, &format!("{at}.after_open"))?;
+        let labels: BTreeSet<&String> = opened.keys().collect();
+        if labels != sessions.keys().collect() {
+            return Err(format!("{at}.after_open: one count per session"));
+        }
+        for label in opened.keys() {
+            typed(opened, label, Ty::Count, false, &format!("{at}.after_open"))?;
+        }
+    }
+    if let Some(after) = map.get("after_turn") {
+        let counts = after
+            .as_array()
+            .filter(|counts| counts.iter().all(|count| count.as_u64().is_some()))
+            .ok_or_else(|| format!("{at}.after_turn: not an array of counts"))?;
+        if counts.len() != turns {
+            return Err(format!("{at}.after_turn: one count per turn"));
+        }
     }
     Ok(())
 }
 
-/// Refuses an observation field of the wrong type instead of reading it
-/// as empty: kind lists are arrays of strings, counts an object of
-/// non-negative integers. Absent fields pass.
-fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
-    for key in KIND_LISTS {
-        if let Some(value) = fields.get(*key)
-            && !value
-                .as_array()
-                .is_some_and(|kinds| kinds.iter().all(Value::is_string))
+/// Checks one session's input and assertion fields.
+fn validate_session(label: &str, session: &Value) -> Result<(), String> {
+    let at = format!("sessions.{label}");
+    known(session, SESSION, &at)?;
+    let map = object(session, &at)?;
+    required(map, "model", Ty::Str, false, &at)?;
+    typed(map, "instructions", Ty::Str, true, &at)?;
+    typed(map, "cwd", Ty::Str, false, &at)?;
+    typed(map, "resume", Ty::Str, true, &at)?;
+    if let Some(options) = map.get("vendor_options") {
+        let options = object(options, &format!("{at}.vendor_options"))?;
+        if !options.values().all(Value::is_object) {
+            return Err(format!(
+                "{at}.vendor_options: one object of keys per harness"
+            ));
+        }
+    }
+    if let Some(close) = map.get("close").filter(|close| !close.is_null()) {
+        let at = format!("{at}.close");
+        known(close, CLOSE, &at)?;
+        let close = object(close, &at)?;
+        required(close, "mode", Ty::Name(CLOSE_MODE), false, &at)?;
+        typed(close, "vendor_closed", Ty::Bool, false, &at)?;
+        typed(close, "cleanup", Ty::Name(CLEANUP), false, &at)?;
+    }
+    if let Some(health) = map.get("health") {
+        let at = format!("{at}.health");
+        known(health, HEALTH, &at)?;
+        let health = object(health, &at)?;
+        required(health, "state", Ty::Name(HEALTH_STATE), false, &at)?;
+        required(health, "first_cause", Ty::Name(DRIVER_FAILURE), true, &at)?;
+        if (health["state"] == "failed") == health["first_cause"].is_null() {
+            return Err(format!("{at}: a first_cause exactly when failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Checks the case's top-level input and assertion fields.
+fn validate_case(
+    expect: &Value,
+    sessions: &Map<String, Value>,
+    turns: usize,
+) -> Result<(), String> {
+    let top = object(expect, "case")?;
+    known(expect, TOP, "case")?;
+    typed(top, "source", Ty::Str, false, "case")?;
+    typed(top, "harness", Ty::Str, false, "case")?;
+    required(top, "launches", Ty::Count, false, "case")?;
+    let skipped = unasserted_fields(top.get("unasserted"), "unasserted")?;
+    documentary(&skipped, expect, "case")?;
+    if let Some(points) = top.get("launch_checkpoints") {
+        validate_checkpoints(points, &skipped, sessions, turns)?;
+    }
+    typed(top, "pure_writes", Ty::Strings, false, "case")?;
+    for (index, check) in entries(top.get("plan_checks"), "plan_checks")?
+        .iter()
+        .enumerate()
+    {
+        let at = format!("plan_checks[{index}]");
+        known(check, PLAN_CHECK, &at)?;
+        let map = object(check, &at)?;
+        required(map, "require", Ty::Str, false, &at)?;
+        if !map.contains_key("refusal") {
+            return Err(format!("{at}: refusal is required"));
+        }
+    }
+    if let Some(describe) = top.get("describe") {
+        let at = "describe";
+        known(describe, DESCRIBE, at)?;
+        let map = object(describe, at)?;
+        required(map, "params", Ty::Object, false, at)?;
+        known(&map["params"], DESCRIBE_PARAMS, "describe.params")?;
+        if let Some(bound_value) = map["params"].get("bound") {
+            bound(bound_value, "describe.params.bound")?;
+        }
+        typed(map, "capabilities", Ty::Object, false, at)?;
+        typed(map, "vendor_version", Ty::Str, true, at)?;
+        typed(map, "version_status", Ty::Name(VERSION_STATUS), false, at)?;
+        if map.get("launches") != Some(&json!(0)) {
+            return Err("describe: launches is 0, since describe starts nothing".to_owned());
+        }
+    }
+    for (label, session) in sessions {
+        validate_session(label, session)?;
+    }
+    Ok(())
+}
+
+/// Checks a turn's input fields.
+fn validate_inputs(
+    turn: &Value,
+    index: usize,
+    sessions: &Map<String, Value>,
+) -> Result<(), String> {
+    let at = format!("turns[{index}]");
+    known(turn, TURN, &at)?;
+    let map = object(turn, &at)?;
+    typed(map, "session", Ty::Str, false, &at)?;
+    let label = turn["session"].as_str().unwrap_or("main");
+    if !sessions.contains_key(label) {
+        return Err(format!("{at}: unknown session {label}"));
+    }
+    if let Some(after) = map.get("start_after").filter(|after| !after.is_null()) {
+        let at = format!("{at}.start_after");
+        known(after, START_AFTER, &at)?;
+        let after = object(after, &at)?;
+        required(after, "turn", Ty::Count, false, &at)?;
+        required(after, "event", Ty::Name(EVENTS), false, &at)?;
+        if after["turn"]
+            .as_u64()
+            .and_then(|turn| usize::try_from(turn).ok())
+            .is_none_or(|turn| turn >= index)
         {
-            return Err(format!("{at}.{key}: not an array of strings"));
+            return Err(format!("{at}.turn: names no earlier turn"));
+        }
+    }
+    let params = map
+        .get("params")
+        .ok_or_else(|| format!("{at}: params is required"))?;
+    let at_params = format!("{at}.params");
+    known(params, PARAMS, &at_params)?;
+    let params = object(params, &at_params)?;
+    required(params, "prompt", Ty::Str, false, &at_params)?;
+    typed(params, "effort", Ty::Str, true, &at_params)?;
+    typed(params, "output_schema", Ty::Object, true, &at_params)?;
+    typed(params, "max_steps", Ty::Positive, true, &at_params)?;
+    if let Some(bound_value) = params.get("bound").filter(|bound| !bound.is_null()) {
+        bound(bound_value, &format!("{at_params}.bound"))?;
+    }
+    if let Some(deadlines) = map.get("deadlines") {
+        let at = format!("{at}.deadlines");
+        known(deadlines, DEADLINES, &at)?;
+        let deadlines = object(deadlines, &at)?;
+        typed(deadlines, "wall_ms", Ty::Positive, false, &at)?;
+        typed(deadlines, "idle_ms", Ty::Positive, false, &at)?;
+    }
+    typed(map, "tool_grace_ms", Ty::Count, true, &at)?;
+    if let Some(stop) = map.get("stop").filter(|stop| !stop.is_null()) {
+        let at = format!("{at}.stop");
+        known(stop, STOP, &at)?;
+        let stop = object(stop, &at)?;
+        required(stop, "kind", Ty::Name(STOP_KIND), false, &at)?;
+        required(stop, "after", Ty::Name(EVENTS), false, &at)?;
+    }
+    for (number, attempt) in entries(map.get("steer"), &format!("{at}.steer"))?
+        .iter()
+        .enumerate()
+    {
+        let at = format!("{at}.steer[{number}]");
+        known(attempt, STEER, &at)?;
+        let attempt = object(attempt, &at)?;
+        required(attempt, "after", Ty::Name(EVENTS), false, &at)?;
+        required(attempt, "text", Ty::Str, false, &at)?;
+        typed(attempt, "expected_vendor_turn", Ty::Str, true, &at)?;
+        required(attempt, "result", Ty::Str, false, &at)?;
+    }
+    for (number, gate) in entries(map.get("gates"), &format!("{at}.gates"))?
+        .iter()
+        .enumerate()
+    {
+        let at = format!("{at}.gates[{number}]");
+        known(gate, GATE, &at)?;
+        let gate = object(gate, &at)?;
+        required(gate, "step", Ty::Positive, false, &at)?;
+        typed(gate, "lifetime", Ty::Positive, false, &at)?;
+        typed(gate, "advance_ms", Ty::Count, false, &at)?;
+        required(gate, "expect", Ty::Object, false, &at)?;
+        let at = format!("{at}.expect");
+        let fields = object(&gate["expect"], &at)?;
+        for key in fields.keys() {
+            if !VALUED.contains(&key.as_str()) && !OBSERVED.contains(&key.as_str()) {
+                return Err(format!("{at}: unknown field {key}"));
+            }
+        }
+        expected_types(fields, &at)?;
+    }
+    Ok(())
+}
+
+/// The kind an observation entry names: the string, or the object's `kind`.
+fn entry_kind(entry: &Value) -> Option<&str> {
+    entry.as_str().or_else(|| entry["kind"].as_str())
+}
+
+/// The fields an object entry of `kind` may state.
+fn observation_fields(kind: &str) -> Option<&'static [&'static str]> {
+    OBSERVATION_FIELDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, fields)| *fields)
+}
+
+/// Checks the observation fields: entries are known kinds or objects of a
+/// known kind with that kind's fields; counts are by known kind.
+fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
+    for key in [
+        "observations_include",
+        "observations_exclude",
+        "observations_order",
+    ] {
+        let Some(value) = fields.get(key) else {
+            continue;
+        };
+        let list = value
+            .as_array()
+            .ok_or_else(|| format!("{at}.{key}: not an array of kinds or observation objects"))?;
+        for entry in list {
+            let kind = entry_kind(entry).ok_or_else(|| {
+                format!("{at}.{key}: not an array of kinds or observation objects")
+            })?;
+            let allowed = observation_fields(kind)
+                .ok_or_else(|| format!("{at}.{key}: {kind} is not a C2 observation"))?;
+            if let Some(map) = entry.as_object() {
+                for field in map.keys() {
+                    if field != "kind" && !allowed.contains(&field.as_str()) {
+                        return Err(format!("{at}.{key}: {kind} has no field {field}"));
+                    }
+                }
+            }
         }
     }
     if let Some(counts) = fields.get("observation_counts") {
@@ -233,101 +873,129 @@ fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String
                     "{at}.observation_counts.{kind}: not a non-negative integer"
                 ));
             }
+            if observation_fields(kind).is_none() {
+                return Err(format!(
+                    "{at}.observation_counts: {kind} is not a C2 observation"
+                ));
+            }
         }
     }
     Ok(())
 }
 
+/// Checks the types and nested fields of the stated expectation fields.
+fn expected_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
+    observation_types(fields, at)?;
+    typed(fields, "accepted", Ty::Bool, false, at)?;
+    typed(fields, "journal_uncertain", Ty::Bool, false, at)?;
+    typed(fields, "group_absent", Ty::Bool, false, at)?;
+    typed(fields, "final_text", Ty::Strings, true, at)?;
+    typed(fields, "warnings", Ty::Strings, false, at)?;
+    let codes = strings(fields.get("warnings").unwrap_or(&Value::Null));
+    if let Some(code) = codes.iter().find(|code| !WARNING.contains(code)) {
+        return Err(format!("{at}.warnings: {code} is not a C1 warning code"));
+    }
+    if codes.iter().collect::<BTreeSet<_>>().len() != codes.len() {
+        return Err(format!("{at}.warnings: a code is listed twice"));
+    }
+    for key in ["terminal", "usage", "stop_facts", "instance", "exit"] {
+        typed(fields, key, Ty::Object, true, at)?;
+    }
+    if fields
+        .get("terminal")
+        .and_then(Value::as_object)
+        .is_some_and(|terminal| terminal.contains_key("usage"))
+    {
+        return Err(format!(
+            "{at}.terminal.usage: usage lives under expect.usage"
+        ));
+    }
+    known_if(fields.get("terminal"), TERMINAL, &format!("{at}.terminal"))?;
+    let cost = fields
+        .get("terminal")
+        .and_then(|terminal| terminal.get("cost"));
+    known_if(cost, COST, &format!("{at}.terminal.cost"))?;
+    if let Some(cost) = cost.and_then(Value::as_object) {
+        typed(
+            cost,
+            "provenance",
+            Ty::Name(PROVENANCE),
+            false,
+            &format!("{at}.terminal.cost"),
+        )?;
+    }
+    known_if(fields.get("usage"), USAGE, &format!("{at}.usage"))?;
+    known_if(
+        fields.get("stop_facts"),
+        STOP_FACTS,
+        &format!("{at}.stop_facts"),
+    )?;
+    known_if(fields.get("instance"), INSTANCE, &format!("{at}.instance"))?;
+    if let Some(instance) = fields.get("instance").and_then(Value::as_object) {
+        typed(
+            instance,
+            "vendor_version",
+            Ty::Str,
+            true,
+            &format!("{at}.instance"),
+        )?;
+        typed(
+            instance,
+            "version_status",
+            Ty::Name(INSTANCE_STATUS),
+            false,
+            &format!("{at}.instance"),
+        )?;
+    }
+    known_if(fields.get("exit"), EXIT, &format!("{at}.exit"))?;
+    Ok(())
+}
+
 /// Checks the expectation's well-formedness for every harness: known fields
 /// at every level (usage only under `expect.usage`, never the retired
-/// `terminal.usage`), required parts present, observation fields of their
-/// types, session labels and `start_after` turns resolvable, a non-empty
-/// reason for each `unasserted` entry, C2 names for enumerated values,
+/// `terminal.usage`), required parts present, inputs and expected values of
+/// their types, session labels and `start_after` turns resolvable, each
+/// turn's baseline stated or reasoned, `unasserted` entries reasoned and
+/// never overlapping a stated field, C2 names for enumerated values,
 /// `turn.accepted` counted exactly once on every accepted turn, and identity
 /// confirmation ordered before acceptance.
 pub(crate) fn validate(expect: &Value) -> Result<(), String> {
     known(expect, TOP, "case")?;
-    known_entries(expect.get("plan_checks"), PLAN_CHECK, "plan_checks")?;
     let sessions = object(&expect["sessions"], "sessions")?;
-    for (label, session) in sessions {
-        known(session, SESSION, &format!("sessions.{label}"))?;
-        if !session["close"].is_null() {
-            known(&session["close"], CLOSE, &format!("sessions.{label}.close"))?;
-        }
+    if sessions.is_empty() {
+        return Err("sessions: none".to_owned());
     }
     let turns = expect["turns"]
         .as_array()
         .filter(|turns| !turns.is_empty())
         .ok_or("turns: missing or empty")?;
+    validate_case(expect, sessions, turns.len())?;
     for (index, turn) in turns.iter().enumerate() {
-        let at = format!("turns[{index}]");
-        known(turn, TURN, &at)?;
-        let label = turn["session"].as_str().unwrap_or("main");
-        if !sessions.contains_key(label) {
-            return Err(format!("{at}: unknown session {label}"));
-        }
-        known_if(
-            turn.get("start_after"),
-            START_AFTER,
-            &format!("{at}.start_after"),
-        )?;
-        if let Some(before) = turn["start_after"]["turn"].as_u64()
-            && usize::try_from(before).map_or(true, |before| before >= index)
-        {
-            return Err(format!("{at}: start_after names a later turn"));
-        }
-        known_if(turn.get("params"), PARAMS, &format!("{at}.params"))?;
-        known_if(turn.get("stop"), STOP, &format!("{at}.stop"))?;
-        known_entries(turn.get("steer"), STEER, &format!("{at}.steer"))?;
+        validate_inputs(turn, index, sessions)?;
+        let at = format!("turns[{index}].expect");
         let fields = turn["expect"]
             .as_object()
-            .ok_or_else(|| format!("{at}: no expect"))?;
+            .ok_or_else(|| format!("turns[{index}]: no expect"))?;
         for key in fields.keys() {
-            if !VALUED.contains(&key.as_str()) && !EXPECT_OTHER.contains(&key.as_str()) {
-                return Err(format!("{at}.expect: unknown field {key}"));
-            }
-        }
-        let at = format!("{at}.expect");
-        known_entries(
-            fields.get("unasserted"),
-            UNASSERTED,
-            &format!("{at}.unasserted"),
-        )?;
-        observation_types(fields, &at)?;
-        if fields
-            .get("terminal")
-            .and_then(Value::as_object)
-            .is_some_and(|terminal| terminal.contains_key("usage"))
-        {
-            return Err(format!(
-                "{at}.terminal.usage: usage lives under expect.usage"
-            ));
-        }
-        known_if(fields.get("terminal"), TERMINAL, &format!("{at}.terminal"))?;
-        known_if(
-            fields
-                .get("terminal")
-                .and_then(|terminal| terminal.get("cost")),
-            COST,
-            &format!("{at}.terminal.cost"),
-        )?;
-        known_if(fields.get("usage"), USAGE, &format!("{at}.usage"))?;
-        known_if(
-            fields.get("stop_facts"),
-            STOP_FACTS,
-            &format!("{at}.stop_facts"),
-        )?;
-        known_if(fields.get("instance"), INSTANCE, &format!("{at}.instance"))?;
-        for entry in turn["expect"]["unasserted"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if entry["field"].as_str().is_none() || entry["why"].as_str().is_none_or(str::is_empty)
+            if !VALUED.contains(&key.as_str())
+                && !OBSERVED.contains(&key.as_str())
+                && key != "unasserted"
+                && key != "notes"
             {
-                return Err(format!("{at}.unasserted: needs field and why"));
+                return Err(format!("{at}: unknown field {key}"));
             }
         }
+        typed(fields, "notes", Ty::Str, false, &at)?;
+        let skipped = unasserted_fields(fields.get("unasserted"), &format!("{at}.unasserted"))?;
+        documentary(&skipped, &turn["expect"], &at)?;
+        for field in BASELINE {
+            if !fields.contains_key(*field) && !skipped.contains(field) {
+                return Err(format!(
+                    "{at}: {field} is stated (null allowed) or unasserted with a reason"
+                ));
+            }
+        }
+        expected_types(fields, &at)?;
     }
     rules(expect)
 }
@@ -387,6 +1055,7 @@ const REFUSAL: &[&str] = &[
     "invalid_param:",
     "missing_capability:",
 ];
+/// A settled C2 `Cleanup`: never `pending` (C1 §3.5).
 const CLEANUP: &[&str] = &["quiescent", "uncertain"];
 const SETTLES: &[&str] = &["at_terminal", "at_p7_bound", "when_tools_end"];
 const CONFIRMED: &str = "session.vendor_identity_confirmed";
@@ -408,9 +1077,32 @@ fn named(value: &Value, names: &[&str]) -> bool {
     }
 }
 
+/// The kinds of an observation list, in order.
+fn kinds(value: &Value) -> Vec<&str> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(entry_kind)
+        .collect()
+}
+
 /// The value rules of [`validate`], over every turn, reporting all breaks.
 fn rules(expect: &Value) -> Result<(), String> {
     let mut wrong = Vec::new();
+    for (index, check) in expect["plan_checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if !named(&check["refusal"], REFUSAL) {
+            wrong.push(format!(
+                "plan_checks[{index}].refusal: {} is not a C2 name",
+                check["refusal"]
+            ));
+        }
+    }
     for (index, turn) in expect["turns"].as_array().into_iter().flatten().enumerate() {
         let e = &turn["expect"];
         let terminal = &e["terminal"];
@@ -440,12 +1132,12 @@ fn rules(expect: &Value) -> Result<(), String> {
                 "turns[{index}]: an accepted turn states observation_counts {ACCEPTED} = 1"
             ));
         }
-        let order = strings(&e["observations_order"]);
+        let order = kinds(&e["observations_order"]);
         let first = |kind| order.iter().position(|&seen| seen == kind);
         // C2 §2 identity: on every route, identity is persisted before any
         // same-message acceptance, so an accepted turn that asserts the
         // confirmation anywhere must also order it.
-        let confirmation_asserted = strings(&e["observations_include"]).contains(&CONFIRMED)
+        let confirmation_asserted = kinds(&e["observations_include"]).contains(&CONFIRMED)
             || e["observation_counts"][CONFIRMED]
                 .as_u64()
                 .is_some_and(|count| count > 0);
@@ -468,6 +1160,36 @@ fn rules(expect: &Value) -> Result<(), String> {
     }
 }
 
+/// Checks that every gate of `expect` names an `await_signal` step of
+/// `replay` (a fixture, or `{lifetimes}`), in its lifetime.
+pub(crate) fn gates_resolve(expect: &Value, replay: &Value) -> Result<(), String> {
+    for (index, turn) in expect["turns"].as_array().into_iter().flatten().enumerate() {
+        for (number, gate) in turn["gates"].as_array().into_iter().flatten().enumerate() {
+            let lifetime = gate["lifetime"].as_u64().unwrap_or(1);
+            let fixture = match replay.get("lifetimes") {
+                Some(lifetimes) => lifetime
+                    .checked_sub(1)
+                    .and_then(|at| usize::try_from(at).ok())
+                    .and_then(|at| lifetimes.get(at))
+                    .unwrap_or(&Value::Null),
+                None if lifetime == 1 => replay,
+                None => &Value::Null,
+            };
+            let step = gate["step"]
+                .as_u64()
+                .and_then(|step| usize::try_from(step).ok())
+                .and_then(|step| fixture["steps"].get(step.checked_sub(1)?));
+            if step.is_none_or(|step| step.get("await_signal").is_none()) {
+                return Err(format!(
+                    "turns[{index}].gates[{number}]: step {} of lifetime {lifetime} is not an await_signal",
+                    gate["step"]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether `actual` holds every stated part of `expected`: objects by their
 /// stated keys (an absent actual key counts as null), arrays element by
 /// element with equal length, scalars by equality.
@@ -480,6 +1202,42 @@ fn holds(expected: &Value, actual: &Value) -> bool {
             expected.len() == actual.len() && expected.iter().zip(actual).all(|(e, a)| holds(e, a))
         }
         _ => expected == actual,
+    }
+}
+
+/// [`holds`] for a terminal: its opaque members compare exactly.
+fn terminal_holds(expected: &Value, actual: &Value) -> bool {
+    let (Value::Object(expected), Value::Object(actual)) = (expected, actual) else {
+        return holds(expected, actual);
+    };
+    expected.iter().all(|(key, value)| {
+        let got = actual.get(key).unwrap_or(&Value::Null);
+        if OPAQUE.contains(&key.as_str()) {
+            value == got
+        } else {
+            holds(value, got)
+        }
+    })
+}
+
+/// The assembled final text: the pieces' concatenation, or null.
+fn assembled(value: &Value) -> Value {
+    match value.as_array() {
+        Some(pieces) => Value::String(pieces.iter().filter_map(Value::as_str).collect()),
+        None => value.clone(),
+    }
+}
+
+/// Whether a stated expectation field holds for its actual value.
+fn field_holds(field: &str, stated: &Value, actual: &Value) -> bool {
+    match field {
+        "terminal" => terminal_holds(stated, actual),
+        "final_text" => assembled(stated) == assembled(actual),
+        "warnings" => {
+            strings(stated).into_iter().collect::<BTreeSet<_>>()
+                == strings(actual).into_iter().collect::<BTreeSet<_>>()
+        }
+        _ => holds(stated, actual),
     }
 }
 
@@ -497,6 +1255,10 @@ impl TurnOutcome {
             "cleanup_settles": self.cleanup_settles,
             "stop_facts": self.stop_facts,
             "instance": self.instance,
+            "exit": self.exit,
+            "journal_uncertain": self.journal_uncertain,
+            "group_absent": self.group_absent,
+            "warnings": self.warnings,
         })
     }
 }
@@ -510,18 +1272,35 @@ fn strings(value: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// Whether an observation entry (a kind, or an object) matches one
+/// observation.
+fn matches(entry: &Value, observation: &Value) -> bool {
+    match entry {
+        Value::String(kind) => observation["kind"] == kind.as_str(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            holds(entry, observation)
+        }
+    }
+}
+
 /// Compares `outcome` with every stated field of `expect`, returning all
 /// mismatches at once.
 pub(crate) fn check(expect: &Value, outcome: &Outcome) -> Result<(), String> {
     validate(expect)?;
     let mut wrong = Vec::new();
-    if let Some(launches) = expect.get("launches")
-        && *launches != json!(outcome.launches)
-    {
+    if expect["launches"] != json!(outcome.launches) {
         wrong.push(format!(
-            "launches: expected {launches}, got {}",
-            outcome.launches
+            "launches: expected {}, got {}",
+            expect["launches"], outcome.launches
         ));
+    }
+    check_points(expect, outcome, &mut wrong);
+    if let Some(stated) = expect.get("pure_writes") {
+        let stated: BTreeSet<&str> = strings(stated).into_iter().collect();
+        let actual: BTreeSet<&str> = outcome.pure_writes.iter().map(String::as_str).collect();
+        if stated != actual {
+            wrong.push(format!("pure_writes: expected {stated:?}, got {actual:?}"));
+        }
     }
     let checks: Vec<&Value> = expect["plan_checks"]
         .as_array()
@@ -543,29 +1322,18 @@ pub(crate) fn check(expect: &Value, outcome: &Outcome) -> Result<(), String> {
             ));
         }
     }
-    for (label, session) in expect["sessions"].as_object().into_iter().flatten() {
-        let Some(close) = session.get("close") else {
-            continue;
-        };
-        let actual = outcome.closes.get(label).cloned().flatten();
-        let ok = match (close, &actual) {
-            (Value::Null, None) => true,
-            (Value::Null, Some(_)) | (_, None) => false,
-            (stated, Some(actual)) => {
-                let mut stated = stated.clone();
-                // The mode is an input to the driver, not a result.
-                if let Some(map) = stated.as_object_mut() {
-                    map.remove("mode");
-                }
-                holds(&stated, actual)
-            }
-        };
-        if !ok {
-            wrong.push(format!(
-                "sessions.{label}.close: expected {close}, got {actual:?}"
-            ));
+    if let Some(describe) = expect.get("describe") {
+        let mut stated = describe.clone();
+        // The params are the driver's input, not a result.
+        if let Some(map) = stated.as_object_mut() {
+            map.remove("params");
+        }
+        let actual = outcome.describe.clone().unwrap_or(Value::Null);
+        if !holds(&stated, &actual) {
+            wrong.push(format!("describe: expected {stated}, got {actual}"));
         }
     }
+    check_sessions(expect, outcome, &mut wrong);
     let turns = expect["turns"]
         .as_array()
         .into_iter()
@@ -588,29 +1356,136 @@ pub(crate) fn check(expect: &Value, outcome: &Outcome) -> Result<(), String> {
     }
 }
 
-fn check_turn(index: usize, turn: &Value, actual: &TurnOutcome, wrong: &mut Vec<String>) {
-    let expect = &turn["expect"];
-    let skipped: Vec<&str> = expect["unasserted"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry["field"].as_str())
-        .collect();
+fn check_points(expect: &Value, outcome: &Outcome, wrong: &mut Vec<String>) {
+    let Some(points) = expect.get("launch_checkpoints") else {
+        return;
+    };
+    let actual = &outcome.checkpoints;
+    if let Some(after) = points.get("after_pure")
+        && *after != json!(actual.after_pure)
+    {
+        wrong.push(format!(
+            "launch_checkpoints.after_pure: expected {after}, got {}",
+            actual.after_pure
+        ));
+    }
+    if let Some(after) = points.get("after_open")
+        && *after != json!(actual.after_open)
+    {
+        wrong.push(format!(
+            "launch_checkpoints.after_open: expected {after}, got {}",
+            json!(actual.after_open)
+        ));
+    }
+    if let Some(after) = points.get("after_turn")
+        && *after != json!(actual.after_turn)
+    {
+        wrong.push(format!(
+            "launch_checkpoints.after_turn: expected {after}, got {:?}",
+            actual.after_turn
+        ));
+    }
+}
+
+fn check_sessions(expect: &Value, outcome: &Outcome, wrong: &mut Vec<String>) {
+    for (label, session) in expect["sessions"].as_object().into_iter().flatten() {
+        if let Some(close) = session.get("close") {
+            let actual = outcome.closes.get(label).cloned().flatten();
+            let ok = match (close, &actual) {
+                (Value::Null, None) => true,
+                (Value::Null, Some(_)) | (_, None) => false,
+                (stated, Some(actual)) => {
+                    let mut stated = stated.clone();
+                    // The mode is an input to the driver, not a result.
+                    if let Some(map) = stated.as_object_mut() {
+                        map.remove("mode");
+                    }
+                    holds(&stated, actual)
+                }
+            };
+            if !ok {
+                wrong.push(format!(
+                    "sessions.{label}.close: expected {close}, got {actual:?}"
+                ));
+            }
+        }
+        if let Some(health) = session.get("health") {
+            let actual = outcome.health.get(label);
+            if actual != Some(health) {
+                wrong.push(format!(
+                    "sessions.{label}.health: expected {health}, got {actual:?}"
+                ));
+            }
+        }
+    }
+}
+
+/// Compares the stated value and observation fields of `expect` (a turn's
+/// expectation or a gate's) with `actual`.
+fn check_fields(at: &str, expect: &Value, actual: &TurnOutcome, wrong: &mut Vec<String>) {
     let valued = actual.valued();
     for field in VALUED {
         let Some(stated) = expect.get(*field) else {
             continue;
         };
-        if skipped.contains(field) {
-            continue;
-        }
-        if !holds(stated, &valued[*field]) {
+        if !field_holds(field, stated, &valued[*field]) {
             wrong.push(format!(
-                "turn {index} {field}: expected {stated}, got {}",
+                "{at} {field}: expected {stated}, got {}",
                 valued[*field]
             ));
         }
     }
+    let seen = &actual.observations;
+    for entry in expect["observations_include"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if !seen.iter().any(|observation| matches(entry, observation)) {
+            wrong.push(format!("{at}: missing observation {entry}"));
+        }
+    }
+    for entry in expect["observations_exclude"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if seen.iter().any(|observation| matches(entry, observation)) {
+            wrong.push(format!("{at}: unexpected observation {entry}"));
+        }
+    }
+    for (kind, count) in expect["observation_counts"]
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let got = seen
+            .iter()
+            .filter(|observation| observation["kind"] == kind.as_str())
+            .count();
+        if *count != json!(got) {
+            wrong.push(format!("{at}: {kind} count expected {count}, got {got}"));
+        }
+    }
+    let order: &[Value] = expect["observations_order"]
+        .as_array()
+        .map_or(&[], Vec::as_slice);
+    let mut rest = seen.iter();
+    if !order
+        .iter()
+        .all(|entry| rest.any(|observation| matches(entry, observation)))
+    {
+        wrong.push(format!(
+            "{at}: observations {} lack the order {}",
+            Value::Array(seen.clone()),
+            Value::Array(order.to_vec())
+        ));
+    }
+}
+
+fn check_turn(index: usize, turn: &Value, actual: &TurnOutcome, wrong: &mut Vec<String>) {
+    let at = format!("turn {index}");
+    check_fields(&at, &turn["expect"], actual, wrong);
     let steer: Vec<&str> = turn["steer"]
         .as_array()
         .into_iter()
@@ -619,115 +1494,176 @@ fn check_turn(index: usize, turn: &Value, actual: &TurnOutcome, wrong: &mut Vec<
         .collect();
     if steer != actual.steer {
         wrong.push(format!(
-            "turn {index} steer: expected {steer:?}, got {:?}",
+            "{at} steer: expected {steer:?}, got {:?}",
             actual.steer
         ));
     }
-    let seen: Vec<&str> = actual.observations.iter().map(String::as_str).collect();
-    for kind in strings(&expect["observations_include"]) {
-        if !seen.contains(&kind) {
-            wrong.push(format!("turn {index}: missing observation {kind}"));
-        }
+    let gates: &[Value] = turn["gates"].as_array().map_or(&[], Vec::as_slice);
+    if gates.len() != actual.gates.len() {
+        wrong.push(format!(
+            "{at} gates: expected {} snapshots, got {}",
+            gates.len(),
+            actual.gates.len()
+        ));
     }
-    for kind in strings(&expect["observations_exclude"]) {
-        if seen.contains(&kind) {
-            wrong.push(format!("turn {index}: unexpected observation {kind}"));
-        }
+    for (number, (gate, snapshot)) in gates.iter().zip(&actual.gates).enumerate() {
+        check_fields(
+            &format!("{at} gate {number}"),
+            &gate["expect"],
+            snapshot,
+            wrong,
+        );
     }
-    for (kind, count) in expect["observation_counts"]
-        .as_object()
+}
+
+/// The observations a conforming driver would report for an expectation:
+/// every ordered and included entry once, in that order (a kind as a bare
+/// `{kind}` object, which a later object entry of that kind fills in), then
+/// each counted kind repeated or removed to its count.
+fn ideal_observations(e: &Value) -> Vec<Value> {
+    let mut observations: Vec<Value> = Vec::new();
+    let listed = e["observations_order"]
+        .as_array()
         .into_iter()
         .flatten()
-    {
-        let got = seen.iter().filter(|&&s| s == kind).count();
-        if *count != json!(got) {
-            wrong.push(format!(
-                "turn {index}: {kind} count expected {count}, got {got}"
-            ));
+        .chain(e["observations_include"].as_array().into_iter().flatten());
+    for entry in listed {
+        if observations.iter().any(|seen| matches(entry, seen)) {
+            continue;
+        }
+        let Some(kind) = entry_kind(entry) else {
+            continue;
+        };
+        let bare = json!({"kind": kind});
+        match observations.iter_mut().find(|seen| **seen == bare) {
+            Some(seen) if entry.is_object() => *seen = entry.clone(),
+            Some(_) | None => observations.push(if entry.is_object() {
+                entry.clone()
+            } else {
+                bare
+            }),
         }
     }
-    let order = strings(&expect["observations_order"]);
-    let mut rest = seen.iter();
-    if !order.iter().all(|kind| rest.any(|s| s == kind)) {
-        wrong.push(format!(
-            "turn {index}: observations {seen:?} lack the order {order:?}"
-        ));
+    for (kind, count) in e["observation_counts"].as_object().into_iter().flatten() {
+        // Extra copies follow the first one, so the stated order holds.
+        let want = usize::try_from(count.as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
+        let of_kind = |seen: &Value| seen["kind"] == kind.as_str();
+        match observations.iter().position(of_kind) {
+            Some(_) if want == 0 => observations.retain(|seen| !of_kind(seen)),
+            Some(first) => {
+                let have = observations.iter().filter(|seen| of_kind(seen)).count();
+                for _ in have..want {
+                    observations.insert(first + 1, json!({"kind": kind}));
+                }
+            }
+            None => observations.extend((0..want).map(|_| json!({"kind": kind}))),
+        }
+    }
+    observations
+}
+
+/// The outcome a conforming driver would report for one turn expectation.
+fn ideal_turn(e: &Value) -> TurnOutcome {
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    let object = |value: &Value| (!value.is_null()).then(|| value.clone());
+    TurnOutcome {
+        plan_refusal: text(&e["plan_refusal"]),
+        rejected: text(&e["rejected"]),
+        accepted: e["accepted"].as_bool().unwrap_or(false),
+        terminal: object(&e["terminal"]),
+        usage: object(&e["usage"]),
+        final_text: e["final_text"]
+            .as_array()
+            .map(|pieces| pieces.iter().filter_map(text).collect()),
+        error: text(&e["error"]),
+        cleanup: text(&e["cleanup"]),
+        cleanup_settles: text(&e["cleanup_settles"]),
+        stop_facts: object(&e["stop_facts"]),
+        instance: object(&e["instance"]),
+        exit: object(&e["exit"]),
+        journal_uncertain: e["journal_uncertain"].as_bool().unwrap_or(false),
+        group_absent: e["group_absent"].as_bool().unwrap_or(false),
+        warnings: strings(&e["warnings"])
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        steer: Vec::new(),
+        observations: ideal_observations(e),
+        gates: Vec::new(),
     }
 }
 
 /// The outcome a conforming driver would report for `expect`: every stated
-/// value, every included and ordered observation with its stated count.
-/// Used to test the checker and the expectation files against each other.
+/// value, every included and ordered observation with its stated count,
+/// and one snapshot per gate. Used to test the checker and the expectation
+/// files against each other.
 pub(crate) fn ideal(expect: &Value) -> Outcome {
     let text = |value: &Value| value.as_str().map(str::to_owned);
     let object = |value: &Value| (!value.is_null()).then(|| value.clone());
+    let count = |value: &Value| value.as_u64().unwrap_or(0);
     let turns = expect["turns"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|turn| {
-            let e = &turn["expect"];
-            let mut observations: Vec<String> = strings(&e["observations_order"])
+            let mut outcome = ideal_turn(&turn["expect"]);
+            outcome.steer = turn["steer"]
+                .as_array()
                 .into_iter()
-                .chain(strings(&e["observations_include"]))
-                .map(str::to_owned)
+                .flatten()
+                .filter_map(|attempt| text(&attempt["result"]))
                 .collect();
-            let mut seen = Vec::new();
-            observations.retain(|kind| {
-                let first = !seen.contains(kind);
-                seen.push(kind.clone());
-                first
-            });
-            for (kind, count) in e["observation_counts"].as_object().into_iter().flatten() {
-                // Extra copies follow the first one, so the stated order holds.
-                let want = usize::try_from(count.as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
-                match observations.iter().position(|seen| seen == kind) {
-                    Some(_) if want == 0 => observations.retain(|seen| seen != kind),
-                    Some(first) => {
-                        for _ in 1..want {
-                            observations.insert(first + 1, kind.clone());
-                        }
-                    }
-                    None => observations.extend((0..want).map(|_| kind.clone())),
-                }
-            }
-            TurnOutcome {
-                plan_refusal: text(&e["plan_refusal"]),
-                rejected: text(&e["rejected"]),
-                accepted: e["accepted"].as_bool().unwrap_or(false),
-                terminal: object(&e["terminal"]),
-                usage: object(&e["usage"]),
-                final_text: e["final_text"]
-                    .as_array()
-                    .map(|pieces| pieces.iter().filter_map(text).collect()),
-                error: text(&e["error"]),
-                cleanup: text(&e["cleanup"]),
-                cleanup_settles: text(&e["cleanup_settles"]),
-                stop_facts: object(&e["stop_facts"]),
-                instance: object(&e["instance"]),
-                steer: strings(&turn["steer"].as_array().map_or(Value::Null, |attempts| {
-                    attempts.iter().map(|a| a["result"].clone()).collect()
-                }))
+            outcome.gates = turn["gates"]
+                .as_array()
                 .into_iter()
-                .map(str::to_owned)
-                .collect(),
-                observations,
-            }
+                .flatten()
+                .map(|gate| ideal_turn(&gate["expect"]))
+                .collect();
+            outcome
         })
         .collect();
+    let points = &expect["launch_checkpoints"];
+    let sessions = expect["sessions"].as_object().into_iter().flatten();
     Outcome {
-        launches: expect["launches"].as_u64().unwrap_or(0),
+        launches: count(&expect["launches"]),
+        checkpoints: Checkpoints {
+            after_pure: count(&points["after_pure"]),
+            after_open: points["after_open"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(label, value)| (label.clone(), count(value)))
+                .collect(),
+            after_turn: points["after_turn"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(count)
+                .collect(),
+        },
+        pure_writes: strings(&expect["pure_writes"])
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         plan_checks: expect["plan_checks"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|check| text(&check["refusal"]))
             .collect(),
-        closes: expect["sessions"]
-            .as_object()
-            .into_iter()
-            .flatten()
+        describe: expect.get("describe").map(|describe| {
+            let mut describe = describe.clone();
+            if let Some(map) = describe.as_object_mut() {
+                map.remove("params");
+            }
+            describe
+        }),
+        closes: sessions
+            .clone()
             .map(|(label, session)| (label.clone(), object(&session["close"])))
+            .collect(),
+        health: sessions
+            .filter_map(|(label, session)| Some((label.clone(), session.get("health")?.clone())))
             .collect(),
         turns,
     }

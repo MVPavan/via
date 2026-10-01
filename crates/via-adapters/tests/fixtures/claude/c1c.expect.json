@@ -2,6 +2,16 @@
   "source": "CC c1c, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
   "plan_checks": [],
   "sessions": {
     "main": {
@@ -19,7 +29,11 @@
       "params": {
         "prompt": "Reply with the single plain word PLAIN and no JSON.",
         "effort": null,
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -36,8 +50,11 @@
           "vendor_stop_reason": "end_turn",
           "class_hint": null,
           "cost": {
-            "scope": "session_cumulative"
-          }
+            "usd": 0.029871,
+            "scope": "session_cumulative",
+            "provenance": "reported"
+          },
+          "structured_output": null
         },
         "usage": {
           "from": "terminal",
@@ -54,10 +71,21 @@
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": {
-          "vendor_version": "2.1.285"
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
         },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
         "observations_include": [
-          "session.vendor_identity_confirmed",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1,
+            "vendor_session_id": "11111111-1111-4111-8111-111111111111"
+          },
           "turn.accepted",
           "progress",
           "final_text"
@@ -71,7 +99,7 @@
           "turn.accepted"
         ],
         "unasserted": [],
-        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Third process on the same UUID; output_schema null clears the schema by omitting --json-schema (packet §4 output_schema)."
+        "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. Third process on the same UUID; output_schema null clears the schema by omitting --json-schema (packet §4 output_schema)."
       }
     }
   ]

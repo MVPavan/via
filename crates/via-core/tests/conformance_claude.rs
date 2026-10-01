@@ -18,12 +18,21 @@
 //!
 //! The argv is the adapter's own recipe (vendor packet §4) in this order:
 //! `-p --input-format stream-json --output-format stream-json --verbose
-//! --model M (--session-id {capture sid} | --resume {capture resume})
+//! --model M (--session-id {capture sid} | --resume <ID>)
 //! --restricted --strict-mcp-config --permission-mode dontAsk
 //! --permission-prompts none --tools T --allowedTools T`, then
 //! `--append-system-prompt`, `--effort` and `--json-schema` (compact, sorted
-//! keys) when set. For a resume, the driver passes `sessions.main.resume`
-//! and asserts the fake's captured `--resume` value equals it.
+//! keys) when set. A resume pins the literal `--resume` value, the case's
+//! `sessions.main.resume`, so a driver that passes another ID fails the
+//! replay's argv check. A new session's `--session-id` stays a capture:
+//! the adapter allocates that UUID.
+//!
+//! # Versions
+//!
+//! Every launched case pins `instance` `{vendor_version: "2.1.285",
+//! version_status: "tested"}`: `via-p98.3.2`'s initial `checked` set holds
+//! the fixture version (the live re-probes of 2026-09-30). The synthetic
+//! untested case is `via-p98.3.2`'s `claude_preflight_pure_version`.
 
 #[path = "support/conformance_expect.rs"]
 mod conformance_expect;
@@ -112,7 +121,8 @@ fn listed() -> Vec<&'static str> {
 
 /// Green now: every expectation file is a case test or a vendor record (not
 /// both, each record with its reason), has a replay fixture, names this
-/// harness and validates against the unified schema.
+/// harness, validates against the unified schema and gates only
+/// `await_signal` steps of its replay.
 #[test]
 fn conformance_claude_cases_match_fixture_files() {
     for (name, why) in VENDOR_RECORDS {
@@ -128,10 +138,11 @@ fn conformance_claude_cases_match_fixture_files() {
         let expect = conformance_expect::load(&dir, name).unwrap();
         assert_eq!(expect["harness"], "claude", "{name}: harness");
         conformance_expect::validate(&expect).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(
-            dir.join(format!("{name}.replay.json")).is_file(),
-            "{name}: replay fixture missing"
-        );
+        let replay = std::fs::read(dir.join(format!("{name}.replay.json")))
+            .unwrap_or_else(|e| panic!("{name}: replay fixture: {e}"));
+        let replay: Value = serde_json::from_slice(&replay).unwrap();
+        conformance_expect::gates_resolve(&expect, &replay)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }
 
@@ -147,7 +158,7 @@ fn conformance_claude_checker_detects_each_difference() {
         let expect = conformance_expect::load(&dir, name).unwrap();
         conformance_expect::check(&expect, &conformance_expect::ideal(&expect))
             .unwrap_or_else(|e| panic!("{name}: ideal outcome refused:\n{e}"));
-        let mutations: [Mutation; 9] = [
+        let mutations: [Mutation; 17] = [
             ("usage", |o| {
                 o.turns[0].usage = Some(json!({"input_tokens": 1}));
             }),
@@ -164,8 +175,42 @@ fn conformance_claude_checker_detects_each_difference() {
                 o.turns[0].stop_facts = Some(json!({"acknowledged": false}));
             }),
             ("observations", |o| {
-                o.turns[0].observations.push("turn.accepted".to_owned());
-                o.turns[0].observations.push("action.denied".to_owned());
+                o.turns[0]
+                    .observations
+                    .push(json!({"kind": "turn.accepted"}));
+                o.turns[0]
+                    .observations
+                    .push(json!({"kind": "action.denied"}));
+            }),
+            ("observation_payload", |o| {
+                for observation in &mut o.turns[0].observations {
+                    for (key, value) in observation.as_object_mut().into_iter().flatten() {
+                        if key != "kind" {
+                            *value = json!("changed");
+                        }
+                    }
+                }
+            }),
+            ("exit", |o| {
+                o.turns[0].exit = Some(json!({"code": 99, "signal": null}));
+            }),
+            ("journal_uncertain", |o| {
+                o.turns[0].journal_uncertain = !o.turns[0].journal_uncertain;
+            }),
+            ("group_absent", |o| {
+                o.turns[0].group_absent = !o.turns[0].group_absent;
+            }),
+            ("launch_checkpoints", |o| o.checkpoints.after_pure += 1),
+            ("pure_writes", |o| o.pure_writes.push("changed".to_owned())),
+            ("health", |o| {
+                for health in o.health.values_mut() {
+                    *health = json!({"state": "open", "first_cause": null});
+                }
+            }),
+            ("gates", |o| {
+                for gate in &mut o.turns[0].gates {
+                    gate.accepted = !gate.accepted;
+                }
             }),
             ("turns", |o| {
                 o.turns.pop();
@@ -180,6 +225,22 @@ fn conformance_claude_checker_detects_each_difference() {
                 "observations" => {
                     first.get("observation_counts").is_some()
                         || first.get("observations_exclude").is_some()
+                }
+                "launch_checkpoints" | "pure_writes" => expect.get(what).is_some(),
+                "health" => expect["sessions"]
+                    .as_object()
+                    .is_some_and(|s| s.values().any(|s| s.get("health").is_some())),
+                "gates" => expect["turns"][0]["gates"].as_array().is_some_and(|gates| {
+                    gates.iter().any(|g| g["expect"].get("accepted").is_some())
+                }),
+                "observation_payload" => {
+                    first["observations_include"]
+                        .as_array()
+                        .is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|e| e.as_object().is_some_and(|e| e.len() > 1))
+                        })
                 }
                 "turns" | "steer" => true,
                 field => first.get(field).is_some(),
@@ -228,4 +289,22 @@ fn conformance_claude_identity_order_is_required() {
             "order {order}: {refused:?}"
         );
     }
+}
+
+/// Green: `final_text` compares the assembled text, not piece boundaries
+/// (C2 §4; review F4): c1a's text split in two pieces passes, other text
+/// fails.
+#[test]
+fn conformance_claude_final_text_compares_assembled_text() {
+    let expect = conformance_expect::load(&fixtures(), "c1a").unwrap();
+    let whole = expect["turns"][0]["expect"]["final_text"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (head, tail) = whole.split_at(whole.len() / 2);
+    let mut outcome = conformance_expect::ideal(&expect);
+    outcome.turns[0].final_text = Some(vec![head.to_owned(), tail.to_owned()]);
+    conformance_expect::check(&expect, &outcome).unwrap();
+    outcome.turns[0].final_text = Some(vec![tail.to_owned(), head.to_owned()]);
+    assert!(conformance_expect::check(&expect, &outcome).is_err());
 }

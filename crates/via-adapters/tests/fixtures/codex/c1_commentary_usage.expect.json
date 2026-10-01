@@ -2,6 +2,17 @@
   "source": "Codex re-probe c1 (two turns on one thread), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); model text neutralized; rate-limit notifications dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "harness": "codex",
   "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1,
+      1
+    ]
+  },
+  "pure_writes": [],
   "sessions": {
     "main": {
       "model": "gpt-6-sol",
@@ -22,7 +33,11 @@
       "params": {
         "prompt": "Create a file note.txt in this directory with the text OK. Report the result.",
         "effort": "low",
-        "bound": "full",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
         "output_schema": null,
         "max_steps": null
       },
@@ -36,7 +51,11 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
-          "class_hint": null
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
         },
         "usage": {
           "from": "samples",
@@ -54,11 +73,22 @@
         "cleanup": "quiescent",
         "stop_facts": null,
         "instance": {
-          "vendor_version": "0.159.2"
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
         },
+        "exit": null,
+        "group_absent": false,
+        "journal_uncertain": false,
         "observations_include": [
-          "session.vendor_identity_confirmed",
-          "turn.accepted",
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "019a0000-0000-7000-8000-000000100001",
+            "generation": 1
+          },
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200001"
+          },
           "progress",
           "final_text"
         ],
@@ -94,7 +124,11 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
-          "class_hint": null
+          "class_hint": null,
+          "cost": {
+            "usd": null,
+            "provenance": "unavailable"
+          }
         },
         "usage": {
           "from": "samples",
@@ -113,10 +147,17 @@
         "cleanup": "quiescent",
         "stop_facts": null,
         "instance": {
-          "vendor_version": "0.159.2"
+          "vendor_version": "0.159.2",
+          "version_status": "tested"
         },
+        "exit": null,
+        "group_absent": false,
+        "journal_uncertain": false,
         "observations_include": [
-          "turn.accepted",
+          {
+            "kind": "turn.accepted",
+            "vendor_turn_id": "019a0000-0000-7000-8000-000000200002"
+          },
           "progress",
           "final_text"
         ],
