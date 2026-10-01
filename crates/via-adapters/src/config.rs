@@ -8,8 +8,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+use serde_json::Value;
 use serde_json::value::RawValue;
-use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::fake::FakeProfile;
@@ -110,39 +111,43 @@ pub enum ConfigError {
     /// The scenario's `profile` does not parse.
     #[error("fake scenario profile is invalid: {0}")]
     Profile(serde_json::Error),
-    /// A `harnesses` member that must be an object is not; names its path.
-    #[error("{0}: must be an object")]
-    NotAnObject(String),
-    /// `harnesses` names a harness the table does not.
-    #[error("harnesses.{0}: unknown harness")]
-    UnknownHarness(String),
-    /// A harness entry has a key other than `binary` and `inherit`.
-    #[error("harnesses.{harness}.{key}: unknown key")]
-    UnknownHarnessKey {
-        /// The harness.
-        harness: &'static str,
-        /// The unknown key.
-        key: String,
-    },
+    /// `harnesses` is invalid (runtime §8).
+    #[error(transparent)]
+    Harnesses(#[from] HarnessesError),
+}
+
+/// Why `harnesses` is invalid: the member's full path, such as
+/// `harnesses.claude.binary`, and the rule it broke (runtime §8).
+#[derive(Debug, Error, Eq, PartialEq)]
+#[error("{key}: {rule}")]
+pub struct HarnessesError {
+    /// The member's path from `harnesses`.
+    pub key: String,
+    /// The rule it broke.
+    pub rule: HarnessesRule,
+}
+
+/// A rule of the `harnesses` section.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum HarnessesRule {
+    /// The member must be a JSON object.
+    #[error("must be an object")]
+    NotAnObject,
+    /// The key names no [`HARNESSES`] row.
+    #[error("unknown harness")]
+    UnknownHarness,
+    /// The key is not one this level allows.
+    #[error("unknown key")]
+    UnknownKey,
+    /// The key appears twice in its object.
+    #[error("duplicate key")]
+    DuplicateKey,
     /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
-    #[error("harnesses.{0}.binary: must be an absolute path without `..`")]
-    HarnessBinary(&'static str),
-    /// `inherit` names a key that is not a category.
-    #[error("harnesses.{harness}.inherit.{key}: unknown key")]
-    UnknownInheritKey {
-        /// The harness.
-        harness: &'static str,
-        /// The unknown key.
-        key: String,
-    },
-    /// An `inherit` category is not a boolean.
-    #[error("harnesses.{harness}.inherit.{key}: must be a boolean")]
-    InheritNotBoolean {
-        /// The harness.
-        harness: &'static str,
-        /// The category.
-        key: String,
-    },
+    #[error("must be an absolute path without `..`")]
+    Binary,
+    /// An `inherit` switch is not a boolean.
+    #[error("must be a boolean")]
+    NotBoolean,
 }
 
 /// The fake's validated fixture (runtime §11.1): its launch paths and the
@@ -212,10 +217,10 @@ impl AdapterConfig {
     /// the fake's profile from the scenario once (H2) and parses
     /// `harnesses` (runtime §8): any invalid member is refused.
     pub fn load(env: BootstrapEnv, harnesses: Option<&RawValue>) -> Result<Self, ConfigError> {
-        let harnesses = harnesses.map_or_else(
-            || Ok(vec![DEFAULT_HARNESS.clone(); HARNESSES.len()]),
-            parse_harnesses,
-        )?;
+        let harnesses = match harnesses {
+            Some(raw) => parse_harnesses(raw)?,
+            None => vec![DEFAULT_HARNESS.clone(); HARNESSES.len()],
+        };
         let paths = [
             env.get("VIA_FAKE_AGENT_BINARY"),
             env.get("VIA_FAKE_SCENARIO"),
@@ -273,6 +278,13 @@ impl AdapterConfig {
         }
     }
 
+    /// Validates a `harnesses` section with [`Self::load`]'s rules, purely:
+    /// daemon start refuses an invalid `daemon.json` before touching
+    /// anything (runtime §8).
+    pub fn check_harnesses(raw: &RawValue) -> Result<(), HarnessesError> {
+        parse_harnesses(raw).map(drop)
+    }
+
     /// Takes the fake's fixture, when configured.
     pub(crate) fn take_fake(&mut self) -> Option<FakeFixture> {
         self.fake.take()
@@ -282,65 +294,97 @@ impl AdapterConfig {
 /// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
 /// names; per harness only `binary` (an absolute path without `..`, never
 /// expanded) and `inherit` (the six category booleans, the OD2 default for
-/// each missing one).
-fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, ConfigError> {
-    let not_object = || ConfigError::NotAnObject("harnesses".to_owned());
-    let Value::Object(section) = serde_json::from_str(raw.get()).map_err(|_| not_object())? else {
-        return Err(not_object());
-    };
+/// each missing one). No key may repeat within its object. Pure: no I/O.
+fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
     let mut harnesses = vec![DEFAULT_HARNESS.clone(); HARNESSES.len()];
-    for (name, entry) in section {
+    for (name, entry) in members(raw, "harnesses")? {
+        let key = format!("harnesses.{name}");
         let Some(index) = HARNESSES.iter().position(|row| row.name == name) else {
-            return Err(ConfigError::UnknownHarness(name));
+            return Err(invalid(key, HarnessesRule::UnknownHarness));
         };
-        let harness = HARNESSES[index].name;
-        let entry = object(entry, || format!("harnesses.{harness}"))?;
         let config = &mut harnesses[index];
-        for (key, value) in entry {
-            match key.as_str() {
-                "binary" => config.binary = Some(binary(harness, &value)?),
-                "inherit" => {
-                    let inherit = object(value, || format!("harnesses.{harness}.inherit"))?;
-                    config.inherit = parse_inherit(harness, inherit)?;
-                }
-                _ => return Err(ConfigError::UnknownHarnessKey { harness, key }),
+        for (member, value) in members(&entry, &key)? {
+            let key = format!("{key}.{member}");
+            match member.as_str() {
+                "binary" => config.binary = Some(binary(&value, key)?),
+                "inherit" => config.inherit = parse_inherit(&value, &key)?,
+                _ => return Err(invalid(key, HarnessesRule::UnknownKey)),
             }
         }
     }
     Ok(harnesses)
 }
 
-fn object(value: Value, path: impl FnOnce() -> String) -> Result<Map<String, Value>, ConfigError> {
-    if let Value::Object(map) = value {
-        Ok(map)
-    } else {
-        Err(ConfigError::NotAnObject(path()))
+fn invalid(key: String, rule: HarnessesRule) -> HarnessesError {
+    HarnessesError { key, rule }
+}
+
+/// A JSON object's members in order, duplicates kept, so that a repeated
+/// key is refused rather than silently replaced.
+struct Members(Vec<(String, Box<RawValue>)>);
+
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> Visitor<'de> for Visit {
+            type Value = Members;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(Members(members))
+            }
+        }
+        deserializer.deserialize_map(Visit)
     }
 }
 
-/// Runtime §6.1's path rule: absolute, no `..`, no expansion.
-fn binary(harness: &'static str, value: &Value) -> Result<PathBuf, ConfigError> {
-    let path = value
-        .as_str()
-        .map(Path::new)
-        .filter(|path| {
-            path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
-        })
-        .ok_or(ConfigError::HarnessBinary(harness))?;
-    Ok(path.to_path_buf())
+/// The members of the object at `key`; a non-object or a repeated key is
+/// refused.
+fn members(raw: &RawValue, key: &str) -> Result<Vec<(String, Box<RawValue>)>, HarnessesError> {
+    let Members(members) = serde_json::from_str(raw.get())
+        .map_err(|_| invalid(key.to_owned(), HarnessesRule::NotAnObject))?;
+    for (at, (name, _)) in members.iter().enumerate() {
+        if members[..at].iter().any(|(earlier, _)| earlier == name) {
+            return Err(invalid(
+                format!("{key}.{name}"),
+                HarnessesRule::DuplicateKey,
+            ));
+        }
+    }
+    Ok(members)
 }
 
-fn parse_inherit(
-    harness: &'static str,
-    inherit: Map<String, Value>,
-) -> Result<Inherit, ConfigError> {
+/// Runtime §6.1's path rule: absolute, no `..`, no expansion.
+fn binary(value: &RawValue, key: String) -> Result<PathBuf, HarnessesError> {
+    match serde_json::from_str::<String>(value.get()) {
+        Ok(path)
+            if Path::new(&path).is_absolute()
+                && !Path::new(&path)
+                    .components()
+                    .any(|part| part == Component::ParentDir) =>
+        {
+            Ok(PathBuf::from(path))
+        }
+        _ => Err(invalid(key, HarnessesRule::Binary)),
+    }
+}
+
+fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError> {
     let mut states = Inherit::OD2_DEFAULT;
-    for (key, value) in inherit {
-        let Ok(category) = serde_json::from_value::<Category>(Value::String(key.clone())) else {
-            return Err(ConfigError::UnknownInheritKey { harness, key });
+    for (name, value) in members(value, key)? {
+        let key = format!("{key}.{name}");
+        let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
+            return Err(invalid(key, HarnessesRule::UnknownKey));
         };
-        let Value::Bool(on) = value else {
-            return Err(ConfigError::InheritNotBoolean { harness, key });
+        let Ok(on) = serde_json::from_str::<bool>(value.get()) else {
+            return Err(invalid(key, HarnessesRule::NotBoolean));
         };
         states.set(
             category,

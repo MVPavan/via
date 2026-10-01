@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use serde_json::value::RawValue;
 use via_adapters::{
     AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
-    Harness, Incompatibility, Inherit, InheritState, InstanceCache, resolve_binary,
+    Harness, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState, InstanceCache,
+    resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -29,9 +30,6 @@ fn none() -> BootstrapEnv {
 fn load(text: &str) -> Result<AdapterConfig, ConfigError> {
     AdapterConfig::load(none(), Some(&raw(text)))
 }
-
-/// Whether a refusal is the expected named error.
-type Expected = fn(&ConfigError) -> bool;
 
 fn row(name: &str) -> Harness {
     Harness::parse(name).unwrap()
@@ -73,70 +71,114 @@ fn s_launch_bootstrap_env_names_and_debug() {
     assert!(!format!("{config:?}").contains("secret"));
 }
 
-/// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
-/// named error.
-#[test]
-fn s_launch_harnesses_refusals() {
-    let cases: &[(&str, Expected)] = &[
-        (r#"{"claude":{"binary":"bin/claude"}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("claude"))
-        }),
-        (r#"{"claude":{"binary":""}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("claude"))
-        }),
-        (r#"{"codex":{"binary":"/opt/../codex"}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("codex"))
-        }),
-        (r#"{"codex":{"binary":"~/codex"}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("codex"))
-        }),
-        (r#"{"codex":{"binary":"$HOME/codex"}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("codex"))
-        }),
-        (r#"{"codex":{"binary":7}}"#, |e| {
-            matches!(e, ConfigError::HarnessBinary("codex"))
-        }),
+/// Each invalid section, the member it names and the rule it breaks.
+fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
+    use HarnessesRule::{
+        Binary, DuplicateKey, NotAnObject, NotBoolean, UnknownHarness, UnknownKey,
+    };
+    vec![
         (
-            r#"{"gemini":{}}"#,
-            |e| matches!(e, ConfigError::UnknownHarness(name) if name == "gemini"),
+            r#"{"claude":{"binary":"bin/claude"}}"#,
+            "harnesses.claude.binary",
+            Binary,
         ),
         (
-            r#"{"fake":{}}"#,
-            |e| matches!(e, ConfigError::UnknownHarness(name) if name == "fake"),
+            r#"{"claude":{"binary":""}}"#,
+            "harnesses.claude.binary",
+            Binary,
         ),
+        (
+            r#"{"codex":{"binary":"/opt/../codex"}}"#,
+            "harnesses.codex.binary",
+            Binary,
+        ),
+        (
+            r#"{"codex":{"binary":"~/codex"}}"#,
+            "harnesses.codex.binary",
+            Binary,
+        ),
+        (
+            r#"{"codex":{"binary":"$HOME/codex"}}"#,
+            "harnesses.codex.binary",
+            Binary,
+        ),
+        (
+            r#"{"codex":{"binary":7}}"#,
+            "harnesses.codex.binary",
+            Binary,
+        ),
+        (r#"{"gemini":{}}"#, "harnesses.gemini", UnknownHarness),
+        (r#"{"fake":{}}"#, "harnesses.fake", UnknownHarness),
         (
             r#"{"opencode":{"bin":"/x"}}"#,
-            |e| matches!(e, ConfigError::UnknownHarnessKey { harness: "opencode", key } if key == "bin"),
+            "harnesses.opencode.bin",
+            UnknownKey,
         ),
         (
             r#"{"claude":{"inherit":{"memory":true}}}"#,
-            |e| matches!(e, ConfigError::UnknownInheritKey { harness: "claude", key } if key == "memory"),
+            "harnesses.claude.inherit.memory",
+            UnknownKey,
         ),
         (
             r#"{"claude":{"inherit":{"hooks":"yes"}}}"#,
-            |e| matches!(e, ConfigError::InheritNotBoolean { harness: "claude", key } if key == "hooks"),
+            "harnesses.claude.inherit.hooks",
+            NotBoolean,
         ),
         (
             r#"{"claude":{"inherit":{"skills":null}}}"#,
-            |e| matches!(e, ConfigError::InheritNotBoolean { harness: "claude", key } if key == "skills"),
+            "harnesses.claude.inherit.skills",
+            NotBoolean,
         ),
-        (
-            r#"{"claude":[]}"#,
-            |e| matches!(e, ConfigError::NotAnObject(path) if path == "harnesses.claude"),
-        ),
+        (r#"{"claude":[]}"#, "harnesses.claude", NotAnObject),
         (
             r#"{"claude":{"inherit":true}}"#,
-            |e| matches!(e, ConfigError::NotAnObject(path) if path == "harnesses.claude.inherit"),
+            "harnesses.claude.inherit",
+            NotAnObject,
+        ),
+        ("[]", "harnesses", NotAnObject),
+        ("null", "harnesses", NotAnObject),
+        (
+            r#"{"claude":{},"claude":{}}"#,
+            "harnesses.claude",
+            DuplicateKey,
         ),
         (
-            "[]",
-            |e| matches!(e, ConfigError::NotAnObject(path) if path == "harnesses"),
+            r#"{"claude":{"binary":"/a","binary":"/b"}}"#,
+            "harnesses.claude.binary",
+            DuplicateKey,
         ),
-    ];
-    for (text, expected) in cases {
+        (
+            r#"{"claude":{"inherit":{},"inherit":{}}}"#,
+            "harnesses.claude.inherit",
+            DuplicateKey,
+        ),
+        (
+            r#"{"claude":{"inherit":{"hooks":true,"hooks":true}}}"#,
+            "harnesses.claude.inherit.hooks",
+            DuplicateKey,
+        ),
+    ]
+}
+
+/// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
+/// named error, from `load` and from the pure `check_harnesses` alike; a
+/// key repeated at any level is refused.
+#[test]
+fn s_launch_harnesses_refusals() {
+    for (text, key, rule) in refusal_cases() {
+        let expected = HarnessesError {
+            key: key.to_owned(),
+            rule,
+        };
+        assert_eq!(
+            AdapterConfig::check_harnesses(&raw(text)).as_ref(),
+            Err(&expected),
+            "{text}"
+        );
         match load(text) {
             Ok(config) => panic!("{text} was accepted: {config:?}"),
-            Err(error) => assert!(expected(&error), "{text}: {error:?} ({error})"),
+            Err(ConfigError::Harnesses(error)) => assert_eq!(error, expected, "{text}"),
+            Err(error) => panic!("{text}: {error:?}"),
         }
     }
 }
