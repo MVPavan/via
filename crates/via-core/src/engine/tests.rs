@@ -2798,6 +2798,22 @@ async fn running_turn_2(
     crate::api::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
+    running_turn_2_with(engine, root, true).await
+}
+
+/// [`running_turn_2`], with `fake-turn-2` mapped only when `accepted`.
+async fn running_turn_2_with(
+    engine: &Engine,
+    root: &Path,
+    accepted: bool,
+) -> (
+    SessionId,
+    std::sync::Arc<super::Slot>,
+    super::lane::LaneClaim,
+    super::TurnRecord,
+    crate::api::Effective,
+    tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
+) {
     let session = new_session(engine).await;
     // Turn 1 ends: the absent anchor fails its launch.
     dispatch(engine, &session).await;
@@ -2848,7 +2864,9 @@ async fn running_turn_2(
         lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
     }
     lane.map_vendor_turn("fake-turn-1", turn(1));
-    lane.map_vendor_turn("fake-turn-2", turn(2));
+    if accepted {
+        lane.map_vendor_turn("fake-turn-2", turn(2));
+    }
     let record = super::TurnRecord {
         session: session.clone(),
         turn: turn(2),
@@ -2865,6 +2883,61 @@ async fn running_turn_2(
     }))
     .unwrap();
     (session, slot, lane, record, effective, orders)
+}
+
+/// Sol r2 #5, r1 F6 (C2 §2, §4.1): before the running turn's acceptance an
+/// unfamiliar explicit vendor turn is the session's (`turn: null`), not
+/// the running turn's; the acceptance, the turn's by its correlation, maps
+/// the ID it names, which is current from then on. An item naming none is
+/// the running turn's throughout.
+#[test]
+fn an_unfamiliar_vendor_turn_becomes_current_only_through_the_acceptance() {
+    let Some(root) = child("an_unfamiliar_vendor_turn_becomes_current_only_through_the_acceptance")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2_with(&engine, &root, false).await;
+        let item = |vendor_turn: Option<&str>, observation| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: vendor_turn
+                .map(|id| via_adapters::VendorTurnId::try_from(id.to_owned()).unwrap()),
+            observation,
+        };
+        let accepted = via_adapters::Observation::Accepted(via_adapters::observation::Acceptance {
+            correlation: via_adapters::AcceptanceToken::FIRST,
+            vendor_turn_id: Some(
+                via_adapters::VendorTurnId::try_from("fake-turn-2".to_owned()).unwrap(),
+            ),
+        });
+        let queued = vec![
+            item(Some("fake-turn-2"), denied("before")),
+            item(None, denied("unnamed")),
+            item(Some("fake-turn-2"), accepted),
+            item(Some("fake-turn-2"), denied("after")),
+        ];
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        assert!(record.accepted.is_some(), "the acceptance is the turn's");
+        assert_eq!(
+            denials(&engine, &session).await,
+            [
+                (json!("before"), Value::Null, json!(false)),
+                (json!("unnamed"), json!(2), json!(false)),
+                (json!("after"), json!(2), json!(false)),
+            ]
+        );
+    });
 }
 
 /// (14) AD4, C1 §6.1: a denial naming an earlier, ended turn's vendor turn
@@ -3400,6 +3473,61 @@ async fn identity_columns(
         .unwrap()
         .route;
     (route.vendor_session_id, route.transcript)
+}
+
+/// Sol r2 #5 (C2 §4.1: retained tombstones cannot be reassigned;
+/// exhaustion escalates to connection failure): a lane whose vendor turns
+/// overflow its tombstones fails. The running turn keeps its claim; once
+/// it ends, the monitor retires the lane (`ObservationOverflow`), and the
+/// session's next turn opens a successor with no inherited vendor turns.
+#[test]
+fn tombstone_exhaustion_fails_and_retires_the_lane() {
+    let Some(root) = child("tombstone_exhaustion_fails_and_retires_the_lane") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        let (lane, _sender) = adopt_test_lane(&engine, &root, &session).await;
+        let claim = lane.claim().expect("an idle lane is claimed");
+        let bound = u32::try_from(super::lane::VENDOR_TURNS + 1024).unwrap();
+        for number in 1..=bound + 1 {
+            lane.map_vendor_turn(&format!("v{number}"), turn(number));
+        }
+        assert!(lane.failed(), "the overflow fails the lane");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *lane.driver.health().borrow(),
+            via_adapters::DriverHealth::Open,
+            "a claimed lane is not retired"
+        );
+        drop(claim);
+        tokio::time::timeout(Duration::from_secs(5), lane.retired())
+            .await
+            .expect("the monitor retires the overflowed lane");
+        assert_eq!(
+            lane.first_cause(),
+            Some(via_adapters::DriverFailure::ObservationOverflow)
+        );
+        assert!(lane.claim().is_none());
+        assert!(engine.claim_lane(&session).await.is_none());
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        let successor = engine
+            .open_lane(&session, &route, "fake", root.clone())
+            .await;
+        assert!(!successor.failed());
+        assert_eq!(
+            successor.attribute(Some("v1"), None),
+            super::lane::Attribution::Session
+        );
+    });
 }
 
 /// Sol r2 #4 (C2 §2 delayed identity, C1 §3.7): an identity confirmation

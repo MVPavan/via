@@ -1632,9 +1632,13 @@ impl Engine {
             self.confirm_identity(record, lane, identity).await;
             return;
         }
-        let attribution = lane.map_or(Attribution::Current, |lane| {
-            lane.attribute(vendor_turn.as_deref(), Some(record.turn))
-        });
+        // The acceptance is the running turn's by its correlation with the
+        // turn's start (C2 §4.1): it maps the vendor turn it names, which
+        // only then is current (Sol r2 #5).
+        let attribution = match (&item.observation, lane) {
+            (Observation::Accepted(_), _) | (_, None) => Attribution::Current,
+            (_, Some(lane)) => lane.attribute(vendor_turn.as_deref(), Some(record.turn)),
+        };
         match attribution {
             Attribution::Current => {}
             Attribution::Late(turn) => {
