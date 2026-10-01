@@ -1,0 +1,66 @@
+{
+  "source": "Codex re-probe cat (first initialize took 38.1 s with a fresh CODEX_SQLITE_HOME) and c6 (tool-free turn), 0.159.2, 2026-09-30; the 38.1 s wait is replayed as 1.5 s",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply with exactly VIA_ENV_159. Do not use any tools.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": [
+          "VIA_ENV_159"
+        ],
+        "usage": {
+          "input_tokens": 21998,
+          "cached_input_tokens": 7168,
+          "output_tokens": 9,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 22007,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "The initialize reply is delayed (38.1 s live, 1.5 s here): the handshake deadline is the turn's remaining wall time, never a shorter fixed bound (vendors/codex.md §2 Shared ownership; adapters design §2 cold start). The instance version is parsed from initialize.userAgent `via/0.159.2 (...)`: the token after the client name and `/` (C2 §5; vendors/codex.md §1). argv pins `--disable hooks` (vendors/codex.md §4). One keyless usage sample gives scope turn (C2 §5 AD6)."
+      }
+    }
+  ]
+}

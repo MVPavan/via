@@ -1,0 +1,48 @@
+{
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": "019a0000-0000-7000-8000-000000100007",
+    "cwd": "/work/project",
+    "close": null
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Continue.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": "session_gone",
+        "accepted": false,
+        "terminal": null,
+        "error": null,
+        "cleanup": null,
+        "observations_include": [],
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600."
+      }
+    }
+  ]
+}

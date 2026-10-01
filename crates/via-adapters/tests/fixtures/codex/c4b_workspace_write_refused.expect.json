@@ -1,0 +1,44 @@
+{
+  "source": "Codex re-probe c4b (workspace-write then read-only on one thread), 0.159.2, 2026-09-30",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": null
+  },
+  "launches": 0,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Sandbox conformance check.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "workspace_write",
+          "extra_write_dirs": [],
+          "network": false
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "error": null,
+        "cleanup": null,
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": null,
+        "instance": null,
+        "notes": "workspace_write is refused as bound_unsupported before any launch until via-5lr.3.4 proves enforcement; no fallback to full (C1 §4.2; vendors/codex.md §3)."
+      }
+    }
+  ]
+}

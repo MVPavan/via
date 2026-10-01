@@ -1,0 +1,57 @@
+{
+  "source": "Codex re-probe c8 (no login: 10 retried 401s over about 15 s, then httpConnectionFailed 401), 0.159.2, 2026-09-30; reduced to two retries and the final error, URLs and request ids removed",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply OK.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "failed",
+          "stop_reason": "error",
+          "class_hint": "auth"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "Without a login thread/start and turn/start are accepted; error notifications with willRetry:true are progress diagnostics, not terminals; turn/completed failed with codexErrorInfo httpConnectionFailed{401} gives class hint auth (C2 §6.2 Class hints; vendors/codex.md §5). The `warning` is activity only."
+      }
+    }
+  ]
+}

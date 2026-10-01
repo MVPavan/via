@@ -1,0 +1,11 @@
+{
+  "source": "Codex re-probe c10 (read-only bound: a slow denied write gave a failed item), 0.159.2, 2026-09-30",
+  "argv": [
+    "app-server",
+    "--disable",
+    "hooks"
+  ],
+  "version": "codex-cli 0.159.2",
+  "deadline_ms": 20000,
+  "steps": []
+}

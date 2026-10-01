@@ -1,0 +1,137 @@
+{
+  "source": "Codex re-probe c4 (threads A and B on one server; A interrupted and unsubscribed while B runs), 0.159.2, 2026-09-30; reordered to VIA's per-session order and B's changed-bound turn dropped",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project-a",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "sessions": {
+    "b": {
+      "model": "gpt-6-sol",
+      "resume": null,
+      "cwd": "/work/project-b",
+      "close": {
+        "mode": "graceful",
+        "after": "turns",
+        "vendor_closed": false
+      }
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Run the shell command sleep 12. Then say A_DONE.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started",
+        "of_turn": 1
+      },
+      "tool_grace_ms": 300,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "uncertain",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": {
+          "input_tokens": 20388,
+          "cached_input_tokens": 18176,
+          "output_tokens": 64,
+          "reasoning_output_tokens": 10,
+          "total_tokens": 20452,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "Session A's interrupt is ordered after B's tool started (stop.of_turn 1). A's interrupted sleep item never completed in the recording, so A settles uncertain at the P7 window (C2 §4.1); then A closes with thread/unsubscribe only, never stdin (C2 §2 Close(Graceful)); vendor_closed false (vendors/codex.md §2)."
+      }
+    },
+    {
+      "via_session": "b",
+      "start_after": {
+        "turn": 0,
+        "event": "tool_started"
+      },
+      "params": {
+        "prompt": "Run the shell command sleep 14. Then create b_marker.txt here containing B_OK and say B_DONE.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": [
+          "B_DONE"
+        ],
+        "usage": {
+          "input_tokens": 62553,
+          "cached_input_tokens": 40192,
+          "output_tokens": 180,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 62733,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "Session B opens on the server A's lease already holds: prepare() pins the live connection, no second launch or initialize (C2 §3 Connection admission, AD16; top-level launches 1). B's events are attributed only to B; A's interrupt and unsubscribe leave B running to completion (vendors/codex.md §5; re-probe c4)."
+      }
+    }
+  ],
+  "notes": "Two VIA sessions on one owned server. `session` is session A; `sessions.b` is session B; turns name their session with via_session (absent means A). The replay is one script, so cross-session order is pinned by start_after and stop.of_turn."
+}

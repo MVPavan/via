@@ -1,0 +1,69 @@
+{
+  "source": "Codex re-probe c3 (interrupt during sleep 75), 0.159.2, 2026-09-30; interrupt reply and interrupted terminal arrived in one 2 ms read; the tool was alive at 65 s with no item/completed",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Run the shell command sleep 75. Then say done.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "tool_grace_ms": 300,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "uncertain",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": {
+          "input_tokens": 20390,
+          "cached_input_tokens": 7168,
+          "output_tokens": 65,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 20455,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "Interrupt sends only turn/interrupt; {} confirms handling only, the matching turn/completed interrupted is the acknowledgement (C2 §6.2 Interrupt). The reported commandExecution item never completes, so run_turn returns at min(ack + tool_grace, wall) with cleanup uncertain (C2 §2 Interrupt table, §4.1; C1 P7). tool_grace_ms scales C1 P7's 60 s for the test. The commentary message is not final text. The shared server is never killed."
+      }
+    }
+  ]
+}

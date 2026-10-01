@@ -1,0 +1,80 @@
+{
+  "source": "Codex re-probe c2 (steer during a running tool), 0.159.2, 2026-09-30; tool wait not replayed",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Run the shell command sleep 12. After it finishes, say the word BASE.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "steer.delivered",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": [
+          {
+            "after": "tool_started",
+            "text": "Also include token VIA_STEER_159 in your final answer.",
+            "expected_vendor_turn": null,
+            "result": "injected"
+          },
+          {
+            "after": "tool_started",
+            "text": "Ignore this stale input.",
+            "expected_vendor_turn": "019a0000-0000-7000-8000-000000200009",
+            "result": "turn_mismatch"
+          }
+        ],
+        "final_text": [
+          "BASE VIA_STEER_159"
+        ],
+        "usage": {
+          "input_tokens": 40935,
+          "cached_input_tokens": 20224,
+          "output_tokens": 83,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 41018,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "turn/steer with the active turn's id returns {turnId} equal to it: Injected, one steer.delivered, and no second turn/start (vendors/codex.md §3 Steer). A steer whose expected vendor turn is stale gets -32600 `expected active turn id ... but found ...`, mapped from that text to turn_mismatch (C1 §3.4; vendors/codex.md §3: every refusal is -32600, so the mapping uses the operation, the expected id and the message). expected_vendor_turn null means the driver's own active turn id. The steer text appears as a userMessage item and is not final text."
+      }
+    }
+  ]
+}

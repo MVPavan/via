@@ -1,0 +1,66 @@
+{
+  "source": "Codex re-probe c5 (thread/resume with excludeTurns after unsubscribe), 0.159.2, 2026-09-30; modelled as the next server lifetime of a confirmed session",
+  "harness": "codex",
+  "session": {
+    "model": "gpt-6-sol",
+    "resume": "019a0000-0000-7000-8000-000000100001",
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "What token did I ask you to remember? Reply with just the token.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "class_hint": null
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "progress",
+          "final_text"
+        ],
+        "observations_exclude": [],
+        "steer": null,
+        "final_text": [
+          "VIA_RESUME_159"
+        ],
+        "usage": {
+          "input_tokens": 24438,
+          "cached_input_tokens": 20224,
+          "output_tokens": 10,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 24448,
+          "scope": "turn"
+        },
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "A session with a confirmed vendor thread id reopens on a new connection with thread/resume {threadId exact, excludeTurns:true, current sandbox mode}; the returned thread.id equals it, so identity is confirmed for this generation and no thread/start is sent (C2 §2 Reopen; vendors/codex.md §3 Reopen idle session). Turn overrides persist as thread defaults, so turn/start still carries every frozen value."
+      }
+    }
+  ]
+}

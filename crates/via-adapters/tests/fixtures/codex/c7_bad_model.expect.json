@@ -1,0 +1,57 @@
+{
+  "source": "Codex re-probe c7 (thread/start and turn/start with an unknown model), 0.159.2, 2026-09-30",
+  "harness": "codex",
+  "session": {
+    "model": "via-nonexistent-model",
+    "resume": null,
+    "cwd": "/work/project",
+    "close": {
+      "mode": "graceful",
+      "after": "turns",
+      "vendor_closed": false
+    }
+  },
+  "launches": 1,
+  "turns": [
+    {
+      "params": {
+        "prompt": "Reply OK.",
+        "effort": "low",
+        "output_schema": null,
+        "max_steps": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        }
+      },
+      "stop": null,
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "failed",
+          "stop_reason": "error",
+          "class_hint": "vendor_error"
+        },
+        "error": null,
+        "cleanup": "quiescent",
+        "observations_include": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "steer": null,
+        "final_text": [],
+        "usage": null,
+        "instance": {
+          "vendor_version": "0.159.2"
+        },
+        "notes": "An explicit model passes to the vendor even though model/list lacks it; thread/start and turn/start are accepted, then turn/completed failed with codexErrorInfo `other` and HTTP 400: a Failed terminal after acceptance, class hint vendor_error, not submit_failed (C2 §2 Submission boundary, §6.2 Class hints; adapters design §5.3). The vendor `warning` notification is activity only (vendors/codex.md §5)."
+      }
+    }
+  ]
+}
