@@ -530,18 +530,20 @@ impl Engine {
             .clone()
             .and_then(|latest| serde_json::from_value(latest).ok())
             .ok_or(ApiError::STORE)?;
-        let given = overrides.bound().cloned();
         let effective = latest.inherit(overrides);
         // C2 §2 `check_turn` (decision F12): the turn's values against the
-        // session's frozen route, AD12's adapter version included; a given
-        // bound's effective one is the route's (Sol r2 #4).
+        // session's frozen route, AD12's adapter version included. The
+        // requested bound, given or inherited, takes the effective one the
+        // route reports now (Sol r2 #4, r3 #2); an inherited one stays
+        // marked so.
+        let params = effective.turn_params();
         let checked = self
             .adapter
-            .check_turn(&frozen.session_ref(), &effective.turn_params())
+            .check_turn(&frozen.session_ref(), &params)
             .map_err(|refusal| intake::refused(&refusal))?;
-        let effective = match given {
-            Some(bound) => effective.with_bound(intake::EffectiveBound::of(
-                Some(&bound),
+        let effective = match params.bound {
+            Some(requested) => effective.with_bound(intake::EffectiveBound::of(
+                Some(&requested),
                 checked.effective_bound,
                 intake::route_name(&frozen.route).ok_or(ApiError::STORE)?,
             )?),

@@ -223,11 +223,6 @@ impl Overrides {
     pub(crate) fn schema(&self) -> Option<&Value> {
         self.output_schema.given()
     }
-
-    /// The `bound` this turn gives, if any.
-    pub(crate) fn bound(&self) -> Option<&Bound> {
-        self.bound.given()
-    }
 }
 
 /// C1 §4.1 `require` (design §11.1): a list of verb names, each optionally
@@ -668,7 +663,8 @@ impl Effective {
     /// latest accepted turn's frozen `self`; `null` clears `output_schema`
     /// and `max_steps`. An omitted bound inherits both the requested and
     /// the effective one and is marked so (C1 §5 `bound`); a given one
-    /// stands for both until [`Self::with_bound`] sets its plan's.
+    /// stands for both. [`Self::with_bound`] then sets the effective one
+    /// the route reports for the requested one.
     pub(crate) fn inherit(&self, overrides: Overrides) -> Self {
         let bound_inherited = matches!(overrides.bound, Member::Omitted) && self.bound.is_some();
         let (bound, bound_requested) = match overrides.bound {
@@ -699,7 +695,8 @@ impl Effective {
         &self.model
     }
 
-    /// `self` with `bound`, a given bound as its plan enforces it.
+    /// `self` with `bound`, its requested bound as the route enforces it;
+    /// whether it was inherited stays.
     pub(crate) fn with_bound(self, bound: EffectiveBound) -> Self {
         Self {
             bound: bound.effective,

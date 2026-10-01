@@ -1792,3 +1792,58 @@ fn conformance_intake_resume_bound_from_check_turn() {
         daemon.stop().await;
     });
 }
+
+/// Sol r3 #2 (C2 `TurnCheck`, C1 §5 `bound`): a resume that omits the
+/// bound inherits the requested one, and its effective bound is the one
+/// `check_turn` reports for it now, not the earlier turn's. The session
+/// spawned on a daemon whose route normalized `full` to one bound; the
+/// daemon that resumes it normalizes it to another. The receipt reports,
+/// the start carries and the envelope freezes the new one, with the
+/// requested bound kept and `inherited: true`.
+#[test]
+fn conformance_intake_inherited_bound_from_check_turn() {
+    let root = Root::new();
+    let earlier = json!({"mode":"full","extra_write_dirs":["/earlier"],"network":true});
+    let now = json!({"mode":"full","extra_write_dirs":["/now"],"network":true});
+    let profile = |normalized: &Value| {
+        json!({"capabilities": capabilities(&[("/bounds", json!(["full"]))]),
+               "normalized_bound": normalized})
+    };
+    let scripts = [
+        script_expecting(
+            &json!({"prompt":"one","bound":earlier}),
+            &[accepted(1), terminal(1)],
+        ),
+        script_expecting(
+            &json!({"prompt":"two","bound":now}),
+            &[accepted(2), terminal(2)],
+        ),
+    ];
+    let v1 = root.scenario("v1.json", &scenario(&profile(&earlier), &scripts));
+    let v2 = root.scenario("v2.json", &scenario(&profile(&now), &scripts));
+    run(async {
+        let daemon = Daemon::open(&root, &v1);
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"one","bound":full_bound()}))
+            .await;
+        let first = daemon.wait(&session, 1).await;
+        assert_eq!(first["state"], "completed", "{first}");
+        assert_eq!(first["bound"]["effective"], earlier, "{first}");
+        daemon.stop().await;
+
+        let daemon = Daemon::open(&root, &v2);
+        let two = daemon
+            .try_resume(&session, &json!({"prompt":"two"}))
+            .await
+            .unwrap();
+        assert_eq!(two["effective"]["bound"], now, "{two}");
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        assert_eq!(
+            second["bound"],
+            json!({"requested":full_bound(),"effective":now,"inherited":true}),
+            "{second}"
+        );
+        daemon.stop().await;
+    });
+}
