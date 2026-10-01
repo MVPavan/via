@@ -4488,6 +4488,51 @@ fn an_item_admitted_as_the_lane_ends_is_committed_before_its_end() {
     });
 }
 
+/// Sol r4 R4 (design §6.8 step 3): under force, a session whose lane is
+/// still disposing of durable items past its drain's bound is never
+/// closed: neither the force's last queued cancellation nor the closure
+/// pass commits `session.closed`. Shutdown is incomplete, and every item
+/// is committed once the lane goes on, none refused by a closed session.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn force_never_closes_a_session_whose_lane_drain_is_unfinished() {
+    let Some(root) = child("force_never_closes_a_session_whose_lane_drain_is_unfinished") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        send_denials(&sender, &budget, &["two", "three"]).await;
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        dispatch(&engine, &session).await;
+        let report = shutdown(&engine).await;
+        assert!(!report.is_clean(), "{report:?}");
+        let snapshot = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.closed, "the session stays open for restart");
+        release_point(&points, "core.lane.dispose", 1);
+        until_denials(
+            &engine,
+            &session,
+            &[
+                (json!("one"), Value::Null, json!(false)),
+                (json!("two"), Value::Null, json!(false)),
+                (json!("three"), Value::Null, json!(false)),
+            ],
+        )
+        .await;
+    });
+}
+
 /// A backlog of `count` denials, `d0` onwards, naming no vendor turn.
 fn denial_backlog(count: usize) -> Vec<via_adapters::ObservationItem> {
     (0..count)

@@ -301,8 +301,11 @@ impl Engine {
             // transaction while any other turn is queued or running, which
             // covers a turn an uncertain receipt committed unregistered.
             let admission = self.admission.lock().await;
-            let close =
-                !self.store_failed() && !self.unresolved.others(&started.session, started.turn);
+            // Design §6.8 step 3 (Sol r4 R4): never before the session's
+            // lane drain completes.
+            let close = !self.store_failed()
+                && !self.unresolved.others(&started.session, started.turn)
+                && self.lane_drained(&started.session);
             self.finish(&started, record, terminal, close, Some(&admission))
                 .await
         };
@@ -573,13 +576,16 @@ impl Engine {
     /// already closed in-path is read as closed and never closed twice. A
     /// session in `unjoined`, whose dispatcher still owns it, is not closed:
     /// it is counted by the same read, with or without a Store failure
-    /// (round 3, decision 14; round 4, decision 16).
+    /// (round 3, decision 14; round 4, decision 16), as is a session whose
+    /// lane drain has not completed (design §6.8 step 3, Sol r4 R4).
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
         let mut unclosed = 0;
         let mut unvisited = Vec::new();
         for (index, session) in sessions.iter().enumerate() {
-            if unjoined.contains(session) {
+            // Design §6.8 step 3 (Sol r4 R4): a session whose lane drain
+            // has not completed is not closed either.
+            if unjoined.contains(session) || !self.lane_drained(session) {
                 unvisited.push(session);
                 continue;
             }

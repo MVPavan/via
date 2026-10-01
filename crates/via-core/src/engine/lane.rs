@@ -488,6 +488,11 @@ impl Lane {
         }
     }
 
+    /// Whether the lane's actor ended: its channel is drained to its end.
+    fn ended(&self) -> bool {
+        self.life() == Life::Ended
+    }
+
     /// Retires the lane once no turn holds it, and waits for its end.
     async fn retire_now(&self) {
         let mut changes = self.changed.subscribe();
@@ -1097,22 +1102,37 @@ impl Engine {
         }
     }
 
+    /// Whether `session`'s lane drain is complete (design §6.8 step 3, Sol
+    /// r4 R4): no lane of it is live, and none was left unfinished at
+    /// final shutdown. A session is never closed before then: its lane may
+    /// still commit what its channel had.
+    pub(super) fn lane_drained(&self, session: &SessionId) -> bool {
+        !lock(&self.undrained).contains(session)
+            && lock(&self.lanes)
+                .get(session)
+                .is_none_or(|lane| lane.ended())
+    }
+
     /// Final shutdown: every driver's owned work is cancelled and every
     /// lane let go, before Host reconciliation. Each lane's actor finishes
     /// what it is doing and disposes of what its channel still has (C2 §2
     /// session drain; Sol r2 #3); this waits for them by `by` and within
-    /// [`SHUTDOWN_DRAIN`]. Returns how many actors have not ended by then
-    /// (Sol r3 N5): each still owns its work, which final shutdown reports
-    /// as pending and leaves to it.
+    /// [`SHUTDOWN_DRAIN`], after letting each see the cancellation once.
+    /// Returns how many actors have not ended by then (Sol r3 N5): each
+    /// still owns its work, which final shutdown reports as pending and
+    /// leaves to it, and its session stays open (Sol r4 R4).
     pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) -> usize {
         self.cancel.cancel();
         self.tracker.close();
-        let lanes: Vec<Arc<Lane>> = lock(&self.lanes).drain().map(|(_, lane)| lane).collect();
+        let lanes: Vec<(SessionId, Arc<Lane>)> = lock(&self.lanes).drain().collect();
         let by = by.min(tokio::time::Instant::now() + SHUTDOWN_DRAIN);
+        // An actor with nothing left ends at its next poll.
+        tokio::task::yield_now().await;
         let mut undrained = 0;
-        for lane in lanes {
+        for (session, lane) in lanes {
             // A lane that ended is ready at its first poll, even past `by`.
             if tokio::time::timeout_at(by, lane.retired()).await.is_err() {
+                lock(&self.undrained).insert(session);
                 undrained += 1;
             }
         }

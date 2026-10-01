@@ -1031,7 +1031,9 @@ impl Engine {
             self.unresolved.fail(session, turn, TurnState::Queued);
             return Cancelled::Latched;
         }
-        let close = closing && !self.unresolved.others(session, turn);
+        // Design §6.8 step 3 (Sol r4 R4): never before the session's lane
+        // drain completes; the closure pass closes it after.
+        let close = closing && !self.unresolved.others(session, turn) && self.lane_drained(session);
         #[cfg(test)]
         if closing {
             self.hold(&self.faults.hold_after_close_check).await;
