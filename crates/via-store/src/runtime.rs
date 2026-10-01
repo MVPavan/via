@@ -1308,6 +1308,7 @@ impl Command {
                 record.session_id.as_str().len()
                     + record.correlation.len()
                     + encoded(&record.event)
+                    + record.adapter_version.as_ref().map_or(0, String::len)
                     + record.instance.as_ref().map_or(0, |instance| {
                         instance.vendor_version.as_ref().map_or(0, String::len)
                     }),
@@ -2634,11 +2635,12 @@ mod tests {
             .expect("runtime")
     }
 
-    /// Sol r2 #10 (design §6.4): an acceptance binds the instance's
-    /// handshake version it records, so the command's size counts it.
+    /// Sol r2 #10, r3 #3 (design §6.4): an acceptance binds the instance's
+    /// handshake version and the adapter version it records, so the
+    /// command's size counts both.
     #[test]
     fn an_acceptance_counts_its_instance_version() {
-        let size = |vendor_version: Option<String>| {
+        let size = |vendor_version: Option<String>, adapter_version: Option<String>| {
             let (reply, _receive) = tokio::sync::oneshot::channel();
             super::Command::Acceptance(
                 super::AcceptanceRecord {
@@ -2646,7 +2648,7 @@ mod tests {
                     turn: super::TurnNumber::try_from(1).expect("turn"),
                     correlation: "t:vt-1".to_owned(),
                     event: serde_json::json!({}),
-                    adapter_version: None,
+                    adapter_version,
                     instance: Some(super::InstanceRecord {
                         vendor_version,
                         tested: true,
@@ -2657,7 +2659,8 @@ mod tests {
             .size()
             .bytes
         };
-        assert_eq!(size(Some("v".repeat(1000))), size(None) + 1000);
+        assert_eq!(size(Some("v".repeat(1000)), None), size(None, None) + 1000);
+        assert_eq!(size(None, Some("a".repeat(1000))), size(None, None) + 1000);
     }
 
     /// Design §6.1, §6.3, §7.1 [r3.9, r4.5]: a full lane or the fence
