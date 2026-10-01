@@ -654,3 +654,32 @@ fn replay_bounds_expected_value_substitution_in_aggregate() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn replay_await_eof_passes_at_eof_and_fails_on_input() -> TestResult {
+    let steps = json!([{"await_eof": {}}, {"emit": {"line": "done"}}]);
+    let end = run_closed(&steps, 10_000)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    assert_eq!(end.stdout, vec![line("done")]);
+
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    assert!(
+        end.stderr.contains("step 1") && end.stderr.contains("unexpected input while awaiting EOF"),
+        "{}",
+        end.stderr
+    );
+
+    // With stdin left open, only the run deadline ends the wait.
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 300, &steps))?;
+    let end = spawn::<&str>(&binary, &[])?.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    Ok(())
+}

@@ -5,7 +5,8 @@
 //! - `expect` reads one stdin line and matches a JSON subset, capturing
 //!   values by JSON pointer;
 //! - `emit` writes one verbatim line;
-//! - `delay` sleeps; `await_signal` waits for a signal.
+//! - `delay` sleeps; `await_signal` waits for a signal;
+//! - `await_eof` waits for stdin to end; any input instead fails.
 //!
 //! An `argv` entry is an exact string or `{"capture": "<name>"}`, which
 //! captures that argument. In emit lines and in expected string values,
@@ -102,6 +103,7 @@ enum Step {
     AwaitSignal {
         signal: SignalName,
     },
+    AwaitEof {},
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -209,7 +211,7 @@ fn replay(
     let mut signals = BTreeMap::new();
     for name in fixture.steps.iter().filter_map(|step| match step {
         Step::AwaitSignal { signal } => Some(*signal),
-        Step::Expect { .. } | Step::Emit { .. } | Step::Delay { .. } => None,
+        Step::Expect { .. } | Step::Emit { .. } | Step::Delay { .. } | Step::AwaitEof {} => None,
     }) {
         if let Entry::Vacant(entry) = signals.entry(name) {
             let kind = match name {
@@ -376,6 +378,15 @@ fn run_step<R: BufRead>(
             runtime
                 .block_on(stream.recv())
                 .ok_or_else(|| "signal stream closed".to_owned())
+        }
+        Step::AwaitEof {} => {
+            // Any byte, even an unfinished line, is input arriving instead of EOF.
+            let pending = input.fill_buf().map_err(|error| error.to_string())?;
+            if pending.is_empty() {
+                Ok(())
+            } else {
+                Err("unexpected input while awaiting EOF".to_owned())
+            }
         }
     }
 }
