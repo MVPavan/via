@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use via_adapters::{
     AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
     Harness, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState, InstanceCache,
-    resolve_binary,
+    REFUSAL_TTL, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -364,13 +364,16 @@ fn s_launch_refusal_cache_key_and_version() {
     assert_eq!(cache.refusal(&identity, "recipe-a", now), Some(cause));
     assert_eq!(cache.refusal(&identity, "recipe-b", now), None);
 
-    assert_eq!(cache.last_version(&identity), None);
-    cache.record_version(identity, "2.1.0".to_owned());
-    cache.record_version(identity, "2.1.1".to_owned());
-    assert_eq!(cache.last_version(&identity).as_deref(), Some("2.1.1"));
+    assert_eq!(cache.last_version(&binary, &identity), None);
+    cache.record_version(&binary, identity, "2.1.0".to_owned());
+    cache.record_version(&binary, identity, "2.1.1".to_owned());
+    assert_eq!(
+        cache.last_version(&binary, &identity).as_deref(),
+        Some("2.1.1")
+    );
     let other = dir.path().join("other");
     executable(&other);
-    assert_eq!(cache.last_version(&identity_of(&other)), None);
+    assert_eq!(cache.last_version(&other, &identity_of(&other)), None);
 }
 
 /// Touching the binary (size or mtime) gives a new identity, which misses.
@@ -384,14 +387,14 @@ fn s_launch_refusal_cache_identity_change_misses() {
     let now = Instant::now();
     let cause = Incompatibility::ReadbackDiffers("permission_mode");
     cache.record_refusal(before, "recipe".to_owned(), cause, now);
-    cache.record_version(before, "1.0.0".to_owned());
+    cache.record_version(&binary, before, "1.0.0".to_owned());
 
     // Size change.
     fs::write(&binary, "#!/bin/sh\nexit 0\n# grown\n").unwrap();
     let grown = identity_of(&binary);
     assert_ne!(grown, before);
     assert_eq!(cache.refusal(&grown, "recipe", now), None);
-    assert_eq!(cache.last_version(&grown), None);
+    assert_eq!(cache.last_version(&binary, &grown), None);
 
     // Mtime change only, same size.
     let file = fs::File::options().write(true).open(&binary).unwrap();
@@ -426,5 +429,39 @@ fn s_launch_refusal_cache_expires_after_ten_minutes() {
     assert_eq!(
         cache.refusal(&identity, "recipe", expired + Duration::from_secs(599)),
         Some(cause)
+    );
+}
+
+/// Retention is bounded: each refusal write sweeps the expired ones, and
+/// one last-version entry is kept per resolved path, a new identity
+/// replacing the old.
+#[test]
+fn s_launch_cache_retention_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("vendor");
+    executable(&binary);
+    let identity = identity_of(&binary);
+    let cache = InstanceCache::default();
+    let written = Instant::now();
+    let cause = Incompatibility::FeatureAbsent("tool_list");
+    for recipe in 0..1000 {
+        cache.record_refusal(identity, format!("recipe-{recipe}"), cause, written);
+    }
+    assert_eq!(cache.retained(), 1000);
+    let later = written + REFUSAL_TTL;
+    cache.record_refusal(identity, "fresh".to_owned(), cause, later);
+    assert_eq!(cache.retained(), 1, "expired refusals survived a write");
+    assert_eq!(cache.refusal(&identity, "fresh", later), Some(cause));
+
+    let cache = InstanceCache::default();
+    cache.record_version(&binary, identity, "1.0.0".to_owned());
+    fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
+    let upgraded = identity_of(&binary);
+    cache.record_version(&binary, upgraded, "1.1.0".to_owned());
+    assert_eq!(cache.retained(), 1, "one version entry per path");
+    assert_eq!(cache.last_version(&binary, &identity), None);
+    assert_eq!(
+        cache.last_version(&binary, &upgraded).as_deref(),
+        Some("1.1.0")
     );
 }

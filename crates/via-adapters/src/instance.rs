@@ -145,7 +145,9 @@ pub enum Incompatibility {
 
 /// The instance cache (C2 §5 AD7): the last version seen per binary
 /// identity, and refusal entries keyed by identity plus the route's
-/// recipe key (the adapter's canonical recipe string).
+/// recipe key (the adapter's canonical recipe string). Retention is
+/// bounded: one version entry per resolved binary path, and every refusal
+/// write sweeps the expired refusals.
 #[derive(Debug, Default)]
 pub struct InstanceCache {
     inner: Mutex<Entries>,
@@ -153,8 +155,14 @@ pub struct InstanceCache {
 
 #[derive(Debug, Default)]
 struct Entries {
-    versions: HashMap<BinaryIdentity, String>,
+    /// Per resolved path: the identity it had and the version it reported.
+    versions: HashMap<PathBuf, (BinaryIdentity, String)>,
     refusals: HashMap<BinaryIdentity, HashMap<String, (Instant, Incompatibility)>>,
+}
+
+/// Whether an entry written at `written` is live at `now`.
+fn live(written: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(written) < REFUSAL_TTL
 }
 
 impl InstanceCache {
@@ -163,17 +171,26 @@ impl InstanceCache {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records the version an instance of `identity` reported at its handshake.
-    pub fn record_version(&self, identity: BinaryIdentity, version: String) {
-        self.entries().versions.insert(identity, version);
+    /// Records the version an instance of the binary at `path`, with
+    /// `identity`, reported at its handshake; it replaces the path's entry.
+    pub fn record_version(&self, path: &Path, identity: BinaryIdentity, version: String) {
+        self.entries()
+            .versions
+            .insert(path.to_path_buf(), (identity, version));
     }
 
-    /// The last version seen for `identity`.
-    pub fn last_version(&self, identity: &BinaryIdentity) -> Option<String> {
-        self.entries().versions.get(identity).cloned()
+    /// The last version seen for the binary at `path`, while it still has
+    /// `identity`.
+    pub fn last_version(&self, path: &Path, identity: &BinaryIdentity) -> Option<String> {
+        self.entries()
+            .versions
+            .get(path)
+            .filter(|(seen, _)| seen == identity)
+            .map(|(_, version)| version.clone())
     }
 
     /// Records a refusal written at `now`; it expires [`REFUSAL_TTL`] later.
+    /// Every refusal expired at `now` is dropped first.
     pub fn record_refusal(
         &self,
         identity: BinaryIdentity,
@@ -181,7 +198,12 @@ impl InstanceCache {
         cause: Incompatibility,
         now: Instant,
     ) {
-        self.entries()
+        let mut entries = self.entries();
+        entries.refusals.retain(|_, recipes| {
+            recipes.retain(|_, (written, _)| live(*written, now));
+            !recipes.is_empty()
+        });
+        entries
             .refusals
             .entry(identity)
             .or_default()
@@ -199,7 +221,7 @@ impl InstanceCache {
         let mut entries = self.entries();
         let recipes = entries.refusals.get_mut(identity)?;
         let (written, cause) = *recipes.get(recipe)?;
-        if now.saturating_duration_since(written) < REFUSAL_TTL {
+        if live(written, now) {
             return Some(cause);
         }
         recipes.remove(recipe);
@@ -207,5 +229,11 @@ impl InstanceCache {
             entries.refusals.remove(identity);
         }
         None
+    }
+
+    /// The entries held, versions and refusals together.
+    pub fn retained(&self) -> usize {
+        let entries = self.entries();
+        entries.versions.len() + entries.refusals.values().map(HashMap::len).sum::<usize>()
     }
 }
