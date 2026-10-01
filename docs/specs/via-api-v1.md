@@ -578,11 +578,14 @@ for the size of its result. `final_text` is inline up to 256 KiB encoded.
 A longer final text is written to `final_text.txt` in the turn's evidence
 folder (§3.12): `final_text` is then `null` and `final_text_file` gives
 `{path, bytes, truncated}`. The file holds at most 64 MiB; a longer text is
-cut there at a character boundary with `truncated: true`, as is a text
-whose file write failed. `structured_output` is inline up to 32 KiB
-encoded. A larger value is written to `structured_output.json` in the same
-folder: `structured_output` is then `null` and `structured_output_file`
-gives `{path, bytes}`. VIA writes the whole file and syncs it and its folder
+cut there at a character boundary with `truncated: true`. VIA syncs the
+file and its folder before committing the envelope that names it. A failed
+file step fails the turn `store`. After a failed write, the file is cut to
+its last whole character and named with `truncated: true` only if that cut
+and both syncs succeed; otherwise the envelope names no file.
+`structured_output` is inline up to 32 KiB encoded. A larger value is
+written to `structured_output.json` in the same folder: `structured_output`
+is then `null` and `structured_output_file` gives `{path, bytes}`. VIA writes the whole file and syncs it and its folder
 before committing the envelope or revision that names it, and never changes
 a written file. The write is part of the commit that names the file: if it
 fails, that commit fails and resolves under §7.6's Store rule, and a partial
