@@ -336,8 +336,8 @@ impl SessionDriver {
     /// with the turn's [`Reservation`] until its handshake succeeded;
     /// otherwise it goes to Host with the process, and is returned. A new
     /// connection first waits for an older generation's idle close in
-    /// flight (C2 §4 generation barrier) unless `ordered`, the turn's stop
-    /// or force, resolves first: a turn so ordered launches nothing, as
+    /// flight (C2 §4 generation barrier) unless `ordered`, the turn's stop,
+    /// force or wall, resolves first: a turn so ordered launches nothing, as
     /// before any launch (Route's entry check), so it offers no observation
     /// for the barrier to order.
     pub(crate) async fn connect(

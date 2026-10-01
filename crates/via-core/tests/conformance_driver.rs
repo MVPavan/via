@@ -2530,13 +2530,16 @@ fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
 }
 
 /// C2 §4 generation barrier: a turn waiting on it has not launched, so a
-/// stop or the daemon force ends it there as before any launch, promptly
-/// and well within the stall bound that holds the old close. The old
-/// close is still read, and nothing of the stopped turn.
-fn a_turn_waiting_on_the_barrier_ends_on(order: fn(&Controls), cause: fn(&RouteError) -> bool) {
+/// stop, the daemon force or its wall (turn `wall`) ends it there as before
+/// any launch, promptly and well within the stall bound that holds the old
+/// close. The old close is still read, and nothing of the ended turn.
+fn a_turn_waiting_on_the_barrier_ends_on(
+    (wall, order): (Duration, fn(&Controls)),
+    cause: fn(&RouteError) -> bool,
+) {
     let (rig, driver, mut receiver) =
         idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
-    let (cx, controls) = turn_cx(2, driver.prepare(), WALL);
+    let (cx, controls) = turn_cx(2, driver.prepare(), wall);
     let (end, waited) = rig.runtime.block_on(async {
         let run = driver.run_turn(prompt(), cx);
         tokio::pin!(run);
@@ -2580,11 +2583,11 @@ fn a_turn_waiting_on_the_barrier_ends_on(order: fn(&Controls), cause: fn(&RouteE
 #[test]
 fn a_stop_ends_a_turn_waiting_on_the_generation_barrier() {
     a_turn_waiting_on_the_barrier_ends_on(
-        |controls| {
+        (WALL, |controls| {
             controls
                 .stop
                 .send_replace(Some(order(Duration::from_secs(10))));
-        },
+        }),
         |cause| matches!(cause, RouteError::Stopped { .. }),
     );
 }
@@ -2592,13 +2595,22 @@ fn a_stop_ends_a_turn_waiting_on_the_generation_barrier() {
 #[test]
 fn the_daemon_force_ends_a_turn_waiting_on_the_generation_barrier() {
     a_turn_waiting_on_the_barrier_ends_on(
-        |controls| {
+        (WALL, |controls| {
             controls
                 .force
                 .send_replace(Some(tokio::time::Instant::now()));
-        },
+        }),
         |cause| matches!(cause, RouteError::ForceStopped { .. }),
     );
+}
+
+/// C2 §4.1 wall path: a wall passing while the turn waits on the barrier
+/// ends it unlaunched with the deadline, long before the old close's stall.
+#[test]
+fn the_wall_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on((Duration::from_millis(300), |_| {}), |cause| {
+        matches!(cause, RouteError::Deadline { .. })
+    });
 }
 
 /// C2 §2 Close: a `close()` dropped before it was polled leaves the driver

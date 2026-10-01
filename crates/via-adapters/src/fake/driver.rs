@@ -112,7 +112,7 @@ pub(crate) async fn run_turn(
         force,
     } = cx;
     let first = matches!(prepared, Prepared::NeedsConnection);
-    let ordered = ordered(stop.clone(), force.clone(), driver.cancel.clone());
+    let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let connected = driver.connect((prepared, capacity), ordered).await;
     let (generation, capacity, reservation) = match connected {
         Ok(connection) => connection,
@@ -356,9 +356,12 @@ fn after_persistent_turn(
 }
 
 /// Resolves once the turn is ordered to end: Core's stop order, the
-/// daemon force, or the session's cancellation, which a driver close
-/// includes.
-async fn ordered(mut stop: StopWatch, mut force: ForceWatch, cancel: CancellationToken) {
+/// daemon force, its wall, or the session's cancellation, which a driver
+/// close includes.
+async fn ordered(
+    (mut stop, mut force, wall): (StopWatch, ForceWatch, Deadline),
+    cancel: CancellationToken,
+) {
     let stopped = async {
         if stop.wait_for(Option::is_some).await.is_err() {
             std::future::pending::<()>().await;
@@ -372,6 +375,7 @@ async fn ordered(mut stop: StopWatch, mut force: ForceWatch, cancel: Cancellatio
     tokio::select! {
         () = stopped => {}
         () = forced => {}
+        () = tokio::time::sleep_until(wall.instant()) => {}
         () = cancel.cancelled() => {}
     }
 }
