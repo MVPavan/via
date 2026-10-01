@@ -156,7 +156,7 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
 }
 
 /// Schema v7 (runtime §6; Task 4 design §6.6 plus the session's persisted
-/// `adapter_version`), frozen by `s1_store_v6_schema_is_frozen`.
+/// `adapter_version`), frozen by `s1_store_v7_schema_is_frozen`.
 const SCHEMA_V7: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,

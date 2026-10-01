@@ -1,6 +1,5 @@
 //! Task 4 design §6.6, runtime §6: the schema, v7 since the session's
-//! persisted adapter version, is frozen by a golden DDL. The test keeps its
-//! v6 name, which the plan tracks.
+//! persisted adapter version, is frozen by a golden DDL.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -135,7 +134,7 @@ fn collapse(sql: &str) -> String {
 /// Design §6.6, runtime §6: a fresh Store is v7 exactly as frozen here, with the
 /// `session_ord` counter at `(1, 0)` and the evidence root beside it.
 #[test]
-fn s1_store_v6_schema_is_frozen() {
+fn s1_store_v7_schema_is_frozen() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let conn = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
