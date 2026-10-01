@@ -75,12 +75,7 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
-          }
-        ],
+        "unasserted": [],
         "notes": "On the never-ask recipe the vendor denies the Edit itself: a live system/permission_denied and the same tool_use_id in the result's permission_denials are one denial, exactly one action.denied (C2 §6.2 auto-decline, §7 item 9; packet §5). No control request arrives, so nothing is declined."
       }
     }

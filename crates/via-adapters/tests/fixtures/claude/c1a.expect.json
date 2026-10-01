@@ -88,12 +88,7 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
-          }
-        ],
+        "unasserted": [],
         "notes": "First launch: --session-id with the VIA-generated expected UUID (captured); the matching init confirms identity (session.opened) before acceptance (C2 §2). A schema result ends with vendor stop_reason tool_use, which is stop reason other (packet §5). Usage is the result.usage turn aggregate with input = input + cache creation + cache read and cached = cache read (vendor-spec ruling); total_cost_usd is session_cumulative (C2 §6.2; packet §5)."
       }
     }

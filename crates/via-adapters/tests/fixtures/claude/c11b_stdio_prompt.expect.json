@@ -73,17 +73,8 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "decline_deadline",
-            "why": "replay-format addition pending (replay-additions.md): within_ms; the decline must be written within 5 s"
-          },
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, control_response:error, eof"
-          }
-        ],
-        "notes": "An incoming can_use_tool control_request is declined on the control path with the pinned error reply, response.error included (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9)."
+        "unasserted": [],
+        "notes": "An incoming can_use_tool control_request is declined on the control path with the pinned error reply, response.error included (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9). Replay pins the decline within 5 s of the request (within_ms), no allow payload (absent /response/response; vendor spec: never an invented allow), and stdin EOF after the result."
       }
     }
   ]

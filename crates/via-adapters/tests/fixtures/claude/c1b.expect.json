@@ -88,12 +88,7 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
-          }
-        ],
+        "unasserted": [],
         "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. A new private process resumes the exact confirmed UUID with a replaced schema (C2 §2 reopen; packet §4); the matching init confirms this generation (session.reopened). Tokens are this turn's aggregate; cost is session_cumulative (packet §5)."
       }
     }

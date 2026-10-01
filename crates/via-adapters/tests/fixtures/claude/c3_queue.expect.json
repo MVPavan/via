@@ -83,13 +83,8 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): absent; exactly one user line, then eof"
-          }
-        ],
-        "notes": "Live, a second user line written during the tool merged into one result, so steer is unsupported and VIA never writes busy input (C2 A3, §6.2 Steer; packet §6). A steer while the tool runs is refused unsupported_verb and writes nothing; require steer is refused missing_capability. Usage still counts the probe's merged second prompt."
+        "unasserted": [],
+        "notes": "Live, a second user line written during the tool merged into one result, so steer is unsupported and VIA never writes busy input (C2 A3, §6.2 Steer; packet §6). A steer while the tool runs is refused unsupported_verb and writes nothing; require steer is refused missing_capability. Usage still counts the probe's merged second prompt. Replay pins exactly one user line, then stdin EOF after the result: a busy-input line fails strict trailing input."
       }
     }
   ]

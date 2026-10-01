@@ -70,12 +70,7 @@
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
-          }
-        ],
+        "unasserted": [],
         "notes": "The packet §4 full recipe with frozen instructions via --append-system-prompt. result.usage is the turn aggregate (output 177) while each assistant snapshot says 3; snapshots are never reported as usage (C2 §6.2 usage; packet §5)."
       }
     }

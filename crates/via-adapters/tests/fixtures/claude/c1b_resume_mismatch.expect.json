@@ -75,13 +75,9 @@
           {
             "field": "resume.mismatch.fields",
             "why": "requested = the captured --resume (sessions.main.resume), returned = 99999999-9999-4999-8999-999999999999; observation payloads are not in the schema"
-          },
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
           }
         ],
-        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Derived fixture: init and result carry a different, fixed session UUID. Init cannot accept, and wrong-session traffic cannot accept the requested turn, so acceptance and progress are absent. Every init/result ID is checked; mismatch emits resume.mismatch, never confirms or replaces the session and never resends (C2 §2 reopen, §4, §7 item 4; packet §2). The TurnEnd carries no terminal (coordinator ruling)."
+        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Derived fixture: init and result carry a different, fixed session UUID. Init cannot accept, and wrong-session traffic cannot accept the requested turn, so acceptance and progress are absent. Every init/result ID is checked; mismatch emits resume.mismatch, never confirms or replaces the session and never resends (C2 §2 reopen, §4, §7 item 4; packet §2). The TurnEnd carries no terminal (coordinator ruling). Replay pins no resend (strict trailing input) and stdin EOF after the result; C2 does not say whether the adapter stops a mismatched process earlier, and the fixture assumes the normal close after the result."
       }
     }
   ]

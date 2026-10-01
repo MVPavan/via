@@ -72,11 +72,11 @@
         ],
         "unasserted": [
           {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof; the vendor saw EOF right after the prompt, before init"
+            "field": "early_eof_trigger",
+            "why": "the fixture requires stdin EOF right after the prompt (await_eof before init), but no C2 verb makes an adapter close stdin early without interrupting first (C2 §6.2 Close); how via-p98.3.2's drive induces it is open"
           }
         ],
-        "notes": "Vendor-behaviour case only (coordinator ruling): stdin EOF right after the prompt, before init, with no stop order, still completed the turn naturally (exit 0); EOF does not cancel (C2 §6.2 Close; packet §7). A close order on a running turn always interrupts first; c7 pins that sequence."
+        "notes": "Vendor-behaviour case only (coordinator ruling): stdin EOF right after the prompt, before init, with no stop order, still completed the turn naturally (exit 0); EOF does not cancel (C2 §6.2 Close; packet §7). A close order on a running turn always interrupts first; c7 pins that sequence. Replay pins the EOF right after the prompt, with all vendor output after it."
       }
     }
   ]

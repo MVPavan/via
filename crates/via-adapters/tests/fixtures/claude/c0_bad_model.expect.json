@@ -74,11 +74,11 @@
             "why": "acceptance on the result, not the synthetic message: pinned by via-p98.3.2's normalizer unit test, not by replay"
           },
           {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
+            "field": "exit",
+            "why": "the fixture replays exit 1 with the sanitized unrecognized_model stderr line; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
           }
         ],
-        "notes": "An explicit model id outside the bundled catalog passes to the vendor (packet §2 models, §4 model). Init echoes the unresolved name and confirms identity. The synthetic model_not_found message is no progress and no acceptance; the post-init result (subtype success, is_error true, terminal_reason api_error, api_error_status 404) accepts the turn and is a Failed terminal, class vendor_error, vendor_code model_not_found, its text in detail (C2 §2, §6.2 class hints; packet §5; coordinator ruling on is_error text)."
+        "notes": "An explicit model id outside the bundled catalog passes to the vendor (packet §2 models, §4 model). Init echoes the unresolved name and confirms identity. The synthetic model_not_found message is no progress and no acceptance; the post-init result (subtype success, is_error true, terminal_reason api_error, api_error_status 404) accepts the turn and is a Failed terminal, class vendor_error, vendor_code model_not_found, its text in detail (C2 §2, §6.2 class hints; packet §5; coordinator ruling on is_error text). Replay pins stdin EOF after the result and replays the recorded exit 1 and stderr line."
       }
     }
   ]

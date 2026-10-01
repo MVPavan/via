@@ -55,8 +55,8 @@
             "why": "C2 §4.1 requires cleanup facts on failure, but Err(Rejected) carries no TurnEvidence in the §2 sketch; the carrier is unsettled"
           },
           {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
+            "field": "exit",
+            "why": "the fixture replays exit 1 with the 'No conversation found' stderr line; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
           }
         ],
         "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. --resume of a missing session gives a pre-init result (error_during_execution, num_turns 0, errors 'No conversation found ...') that echoes the requested UUID. A pre-init rejection never confirms identity or opens (C2 §2 delayed identity); the definite, fixture-backed missing-session rejection is StartRejected::SessionGone and the same VIA session is kept (packet §2). No init was read, so vendor_version is null (C2 §5)."

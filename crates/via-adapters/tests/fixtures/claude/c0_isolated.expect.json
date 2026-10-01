@@ -74,11 +74,11 @@
             "why": "acceptance on the result, not the synthetic message: pinned by via-p98.3.2's normalizer unit test, not by replay"
           },
           {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
+            "field": "exit",
+            "why": "the fixture replays exit 1 with empty stderr; the schema has no field for TurnEvidence.exit (C2 §2), so the ExitReport is not compared. stderr is never read (vendor spec, stderr row), so it cannot change any asserted field"
           }
         ],
-        "notes": "Not logged in. The matching init confirms identity but is not acceptance (C2 §2 delayed identity; packet §2). The synthetic assistant message (is_api_error_message, model <synthetic>) is never acceptance, progress or final text (C2 §2 submission boundary, §7 item 5); the post-init result is acceptance evidence, so the vendor failure is a Failed terminal with vendor code, class hint and detail, never submit_failed (C2 §2; packet §5). Class from the synthetic error code authentication_failed, not from subtype:success (C2 §6.2 class hints). Coordinator ruling: the is_error result text is terminal.detail, never final_text."
+        "notes": "Not logged in. The matching init confirms identity but is not acceptance (C2 §2 delayed identity; packet §2). The synthetic assistant message (is_api_error_message, model <synthetic>) is never acceptance, progress or final text (C2 §2 submission boundary, §7 item 5); the post-init result is acceptance evidence, so the vendor failure is a Failed terminal with vendor code, class hint and detail, never submit_failed (C2 §2; packet §5). Class from the synthetic error code authentication_failed, not from subtype:success (C2 §6.2 class hints). Coordinator ruling: the is_error result text is terminal.detail, never final_text. Replay pins stdin EOF after the result (vendor spec Close) and replays the recorded exit 1."
       }
     }
   ]
