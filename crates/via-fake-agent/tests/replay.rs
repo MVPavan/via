@@ -1023,3 +1023,30 @@ fn replay_concurrent_starts_each_log_one_launch() -> TestResult {
     assert_eq!(logged, pids);
     Ok(())
 }
+
+#[test]
+fn replay_expect_then_close_at_once_passes_await_eof() -> TestResult {
+    // A correct adapter may write its last line and close stdin at once:
+    // the expect completes when its line arrived, so the EOF is not early.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {"type": "user"}}},
+                {"await_eof": {}},
+                {"emit": {"line": "done"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    let mut stdin = run.stdin.take().ok_or("stdin closed")?;
+    stdin.write_all(b"{\"type\":\"user\"}\n")?;
+    drop(stdin);
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    assert_eq!(end.stdout, vec![line("done")]);
+    Ok(())
+}
