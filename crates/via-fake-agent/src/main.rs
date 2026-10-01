@@ -119,6 +119,27 @@ struct StartRequest {
     session_id: String,
     turn: u64,
     prompt: String,
+    /// The C2 lane's effective values (adapter design §3.2), present only
+    /// when the driver sends them: validated as typed values; scripts match
+    /// them in `expected_request`.
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    effort: Option<String>,
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    bound: Option<Value>,
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    max_steps: Option<u64>,
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    model: Option<String>,
+    #[serde(default)]
+    #[expect(dead_code, reason = "validated as a typed value only")]
+    instructions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -190,13 +211,18 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
         gate(&sync_dir, name)?;
     }
     let hello = leading_hello(&scripts)?;
-    let (start, script) = read_start(&mut input, scripts)?;
+    let (start, script) = read_start(&mut input, scripts, &sync_dir)?;
     let (input_tx, input_rx) = mpsc::sync_channel(8);
     thread::spawn(move || read_remaining(input, &input_tx));
     let mut terminal_emitted = false;
     let mut interrupt_seen = false;
     let mut steps = script.steps.into_iter().peekable();
-    // The leading handshake was written before the start.
+    // The leading hold and handshake ran before the start.
+    if let Some(name) = &held {
+        steps.next_if(
+            |step| matches!(step, Step::HoldStdin { name: step_name } if step_name == name),
+        );
+    }
     if hello.is_some() {
         steps.next_if(|step| matches!(step, Step::Hello { .. }));
     }
@@ -270,12 +296,14 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The first script's leading handshake, written before the start request
-/// is read; `None` when no script leads with one.
+/// is read; `None` when no script leads with one. A leading `hold_stdin`
+/// runs first, so a test can hold the instance before its handshake.
 fn leading_hello(scripts: &[Script]) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     let hello = scripts
         .iter()
-        .find_map(|script| match script.steps.first() {
-            Some(Step::Hello { message }) => Some(message.clone()),
+        .find_map(|script| match script.steps.as_slice() {
+            [Step::Hello { message }, ..]
+            | [Step::HoldStdin { .. }, Step::Hello { message }, ..] => Some(message.clone()),
             _ => None,
         });
     if let Some(message) = &hello {
@@ -325,8 +353,12 @@ fn read_message<R: BufRead>(input: &mut R) -> Result<Option<Value>, Box<dyn std:
 fn read_start<R: BufRead>(
     input: &mut R,
     scripts: Vec<Script>,
+    sync_dir: &Path,
 ) -> Result<(StartRequest, Script), Box<dyn std::error::Error>> {
     let actual = read_message(input)?.ok_or("request ended before expected message")?;
+    // The record of what VIA wrote first, whatever it is: a test proves
+    // that nothing was written when this file is absent.
+    fs::write(sync_dir.join("first-input"), actual.to_string())?;
     let script = scripts
         .into_iter()
         .find(|script| contains_expected(&actual, &script.expected_request))
