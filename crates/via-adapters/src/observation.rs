@@ -495,8 +495,9 @@ impl ObservationSink {
     /// Sends `item`: acquires its byte cost, then a slot. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
     /// Test builds: `adapter.observation.admitted` acknowledges each item
-    /// the channel took, and `adapter.observation.stalled` a send that gave
-    /// up at its stall deadline.
+    /// the channel took, `adapter.observation.stalled` a send that gave
+    /// up at its stall deadline, and `adapter.observation.blocked` each
+    /// block, before its wait.
     pub(crate) async fn send(
         &self,
         item: ObservationItem,
@@ -523,6 +524,8 @@ impl ObservationSink {
         let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
                     .await
@@ -535,6 +538,8 @@ impl ObservationSink {
         match self.sender.try_send(admitted) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(admitted)) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, self.sender.send(admitted))
                     .await
@@ -544,6 +549,12 @@ impl ObservationSink {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
         }
     }
+}
+
+/// A send blocked on the budget or the channel, before its wait.
+#[cfg(feature = "test-failpoints")]
+async fn blocked() {
+    let _ = via_routes::failpoint::hit_async("adapter.observation.blocked").await;
 }
 
 /// An item's cost against the byte budget: `512 + Σ(64 + len)` over every

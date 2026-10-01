@@ -346,10 +346,19 @@ impl SessionDriver {
         ordered: impl Future<Output = ()>,
     ) -> Result<(u64, Option<CapacityToken>, Reservation), AdapterError> {
         let _barrier = match prepared {
-            Prepared::NeedsConnection => tokio::select! {
-                barrier = self.barrier.lock() => Some(barrier),
-                () = ordered => None,
-            },
+            Prepared::NeedsConnection => {
+                // Test builds: `adapter.connection.barrier_wait` acknowledges
+                // a new connection that finds the barrier held.
+                #[cfg(feature = "test-failpoints")]
+                if self.barrier.try_lock().is_err() {
+                    let _ =
+                        via_routes::failpoint::hit_async("adapter.connection.barrier_wait").await;
+                }
+                tokio::select! {
+                    barrier = self.barrier.lock() => Some(barrier),
+                    () = ordered => None,
+                }
+            }
             Prepared::Pinned(_) => None,
         };
         let persistent = self.persistent();

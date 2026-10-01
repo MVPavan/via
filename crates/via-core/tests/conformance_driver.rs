@@ -70,6 +70,19 @@ impl Seen {
     }
 }
 
+/// The failpoint token of [`Rig::points`].
+#[cfg(feature = "test-failpoints")]
+const POINTS_TOKEN: &str = "conformance-driver";
+
+/// Arms `point`'s first hit to be acknowledged only. A `value` command at
+/// a point that reads none continues at once, without yielding: by the
+/// time its task is next idle, it waits past the point.
+#[cfg(feature = "test-failpoints")]
+fn acknowledge(points: &std::path::Path, point: &str) {
+    let command = json!({"token":POINTS_TOKEN,"occurrence":1,"action":"value","value":0});
+    fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
+}
+
 /// Waits until `path` exists, within [`FIXTURE_WAIT`].
 async fn until_file(path: PathBuf) {
     let by = tokio::time::Instant::now() + FIXTURE_WAIT;
@@ -382,6 +395,16 @@ impl Rig {
     /// The fake agent's synchronization directory.
     fn sync(&self) -> PathBuf {
         self.dir.path().join("sync")
+    }
+
+    /// This process's failpoint directory, the controller activated on it
+    /// (once per process: each test runs in its own).
+    #[cfg(feature = "test-failpoints")]
+    fn points(&self) -> PathBuf {
+        let points = self.dir.path().join("points");
+        fs::DirBuilder::new().mode(0o700).create(&points).unwrap();
+        via_store::failpoint::activate(&points, POINTS_TOKEN).unwrap();
+        points
     }
 
     /// A logical session with its observation channel (AD3: no vendor I/O).
@@ -2460,32 +2483,40 @@ fn idle_close_in_flight(second: &[Value]) -> (Rig, SessionDriver, mpsc::Receiver
 /// C2 §4 generation barrier (persistent profile): a driver admits a new
 /// generation's first observation only after the previous generation's
 /// last. The old generation's idle `VendorClosed` is in flight, blocked on
-/// the full channel, when the next turn opens a new connection; draining
-/// then reads every old item before the new generation's first.
+/// the full channel, when the next turn opens a new connection. Nothing is
+/// drained until that turn is acknowledged either waiting on the barrier
+/// (`adapter.connection.barrier_wait`) or offering its first observation
+/// to the full channel (`adapter.observation.blocked`); draining then
+/// reads every old item before the new generation's first. A driver
+/// without the barrier always reaches the second, and fails.
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
     let (rig, driver, mut receiver) =
         idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
+    // Activated once the old close is parked: occurrences count from here.
+    let points = rig.points();
+    for point in [
+        "adapter.connection.barrier_wait",
+        "adapter.observation.blocked",
+    ] {
+        acknowledge(&points, point);
+    }
     let prepared = driver.prepare();
     assert!(matches!(prepared, Prepared::NeedsConnection));
-    let (mut cx, _controls) = turn_cx(2, prepared, WALL);
-    // A base in the past: the first arrival reads as a nonzero clock.
-    cx.activity = TurnActivity::new(
-        tokio::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap(),
-    );
-    let activity = cx.activity.clone();
+    let (cx, _controls) = turn_cx(2, prepared, WALL);
     let (end, items) = rig.runtime.block_on(async {
         let run = driver.run_turn(prompt(), cx);
         tokio::pin!(run);
-        // Nothing is drained until the new generation's acceptance is in
-        // flight, or for a second: a driver that holds the barrier offers
-        // nothing before the old close was taken. The window only gives a
-        // driver without it the chance to; the order holds whatever its
-        // length.
-        let window = tokio::time::Instant::now() + Duration::from_secs(1);
-        while activity.last_ms() == 0 && tokio::time::Instant::now() < window {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while ![
+            "adapter.connection.barrier_wait",
+            "adapter.observation.blocked",
+        ]
+        .iter()
+        .any(|point| points.join(format!("{point}.1.ack")).exists())
+        {
+            assert!(tokio::time::Instant::now() < by, "turn 2 never waited");
             tokio::select! {
                 end = &mut run => panic!("turn 2 ended undelivered: {end:?}"),
                 () = tokio::time::sleep(Duration::from_millis(5)) => {}
