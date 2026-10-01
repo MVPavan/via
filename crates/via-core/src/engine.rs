@@ -200,6 +200,10 @@ struct Faults {
     release: tokio::sync::Notify,
     /// Re-probe passes begun.
     reprobe_passes: AtomicUsize,
+    /// Each restart recovery the adapter set was asked for (C2 §2
+    /// Recover): the session, how many Host facts it was given, and its
+    /// answer (`resumed`, `unknown` or `dead`).
+    recoveries: std::sync::Mutex<Vec<(SessionId, usize, &'static str)>>,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.

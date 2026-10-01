@@ -8,9 +8,9 @@ use super::{
     KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord, OperationVerb,
     OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors, Prompt,
     QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT,
-    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow, StepsRecord, StoreError,
-    StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
+    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionId, SessionRoute, SessionSnapshot,
+    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow, StepsRecord,
+    StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
     TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn,
     Value, check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
     commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs, oneshot, params,
@@ -1042,20 +1042,51 @@ fn read_keyed_operation(
     .transpose()
 }
 
+/// The selected columns of a session's [`SessionRoute`], for a query whose
+/// `?1` is the session and whose row is `sessions` (decision H3). A turn's
+/// unparseable frozen row records no version; it is that turn's own
+/// failure (design §7.3), not the session's.
+const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
+    coalesce((SELECT CASE WHEN json_valid(effective)
+                          THEN json_extract(effective,'$.adapter_version') END
+              FROM turns WHERE session_id=?1 AND state<>'queued'
+              ORDER BY number DESC LIMIT 1),
+             json_extract(receipt,'$.adapter_version'))";
+
+/// The route identity read at `first` and the two columns after it.
+fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRoute> {
+    Ok(SessionRoute {
+        harness: row.get(first)?,
+        route: row.get(first + 1)?,
+        adapter_version: row.get(first + 2)?,
+    })
+}
+
 fn read_snapshot(
     conn: &Connection,
     session: &SessionId,
 ) -> Result<Option<SessionSnapshot>, StoreError> {
-    /// State, admission, turns, queued turns, latest effective, `cwd`.
-    type Row = (String, String, u32, u32, Option<String>, Option<String>);
+    /// State, admission, turns, queued turns, latest effective, `cwd`,
+    /// route identity.
+    type Row = (
+        String,
+        String,
+        u32,
+        u32,
+        Option<String>,
+        Option<String>,
+        SessionRoute,
+    );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT state,admission,
-                (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
-                (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
-                (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
-                json_extract(params,'$.cwd')
-             FROM sessions WHERE id=?1",
+            &format!(
+                "SELECT state,admission,
+                    (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
+                    (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
+                    (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
+                    json_extract(params,'$.cwd'),{ROUTE_COLUMNS}
+                 FROM sessions WHERE id=?1"
+            ),
             [session.as_str()],
             |row| {
                 Ok((
@@ -1065,18 +1096,20 @@ fn read_snapshot(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    route_at(row, 6)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(state, admission, turns, queued, latest, cwd)| {
+    row.map(|(state, admission, turns, queued, latest, cwd, route)| {
         Ok(SessionSnapshot {
             closed: state == "closed",
             closing: admission == "closing",
             turns,
             queued,
             cwd,
+            route,
             latest_effective: latest
                 .map(|value| serde_json::from_str(&value))
                 .transpose()
@@ -1124,7 +1157,7 @@ fn read_queued_turn(
     turn: TurnNumber,
 ) -> Result<Option<QueuedTurn>, StoreError> {
     /// Prompt, prompt blob, effective values, `queued_at`, `queued_seq`,
-    /// the session's frozen `cwd`.
+    /// the session's frozen `cwd` and route identity.
     type Row = (
         Option<String>,
         Option<String>,
@@ -1132,13 +1165,16 @@ fn read_queued_turn(
         Option<String>,
         i64,
         Option<String>,
+        SessionRoute,
     );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT t.prompt,t.prompt_blob,t.effective,t.queued_at,t.queued_seq,
-                    json_extract(s.params,'$.cwd')
-             FROM turns t JOIN sessions s ON s.id=t.session_id
-             WHERE t.session_id=?1 AND t.number=?2 AND t.state='queued'",
+            &format!(
+                "SELECT t.prompt,t.prompt_blob,t.effective,t.queued_at,t.queued_seq,
+                        json_extract(s.params,'$.cwd'),{ROUTE_COLUMNS}
+                 FROM turns t JOIN sessions s ON s.id=t.session_id
+                 WHERE t.session_id=?1 AND t.number=?2 AND t.state='queued'"
+            ),
             params![session.as_str(), turn.get()],
             |row| {
                 Ok((
@@ -1148,25 +1184,30 @@ fn read_queued_turn(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    route_at(row, 6)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(prompt, blob, effective, queued_at, queued_seq, cwd)| {
-        let prompt = match (prompt, blob) {
-            (Some(text), None) => Prompt::Inline(text),
-            (None, Some(blob)) => Prompt::Blob(BlobRef::decode(&blob)?),
-            _ => return Err(StoreError::CorruptEvidence),
-        };
-        Ok(QueuedTurn {
-            prompt,
-            cwd,
-            effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
-            queued_at: queued_at.ok_or(StoreError::CorruptEvidence)?,
-            queued_seq: u64::try_from(queued_seq).map_err(|_| StoreError::CorruptEvidence)?,
-        })
-    })
+    row.map(
+        |(prompt, blob, effective, queued_at, queued_seq, cwd, route)| {
+            let prompt = match (prompt, blob) {
+                (Some(text), None) => Prompt::Inline(text),
+                (None, Some(blob)) => Prompt::Blob(BlobRef::decode(&blob)?),
+                _ => return Err(StoreError::CorruptEvidence),
+            };
+            Ok(QueuedTurn {
+                prompt,
+                cwd,
+                effective: serde_json::from_str(&effective)
+                    .map_err(|_| StoreError::CorruptEvidence)?,
+                queued_at: queued_at.ok_or(StoreError::CorruptEvidence)?,
+                queued_seq: u64::try_from(queued_seq).map_err(|_| StoreError::CorruptEvidence)?,
+                route,
+            })
+        },
+    )
     .transpose()
 }
 

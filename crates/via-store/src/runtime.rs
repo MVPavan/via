@@ -281,6 +281,22 @@ pub struct SessionSnapshot {
     pub latest_effective: Option<Value>,
     /// The session's frozen `cwd` (Task 4 design §11.1), if it has one.
     pub cwd: Option<String>,
+    /// The session's frozen route identity.
+    pub route: SessionRoute,
+}
+
+/// A session's frozen route identity (C2 §2 `SessionRef`): its harness, its
+/// receipt's route, and its recorded adapter version: the latest submitted
+/// turn's frozen `adapter_version` where one was recorded (decision H3),
+/// else the receipt's.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionRoute {
+    /// `sessions.harness`.
+    pub harness: String,
+    /// `receipt.route`.
+    pub route: Option<String>,
+    /// The recorded adapter version.
+    pub adapter_version: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -305,6 +321,8 @@ pub struct QueuedTurn {
     pub queued_at: String,
     /// Sequence of `turn.queued`.
     pub queued_seq: u64,
+    /// The session's frozen route identity, which its driver opens from.
+    pub route: SessionRoute,
 }
 
 /// Core's submission intent and its canonical event, committed before agent I/O.

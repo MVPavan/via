@@ -445,7 +445,10 @@ impl Engine {
             .cwd
             .as_ref()
             .map_or_else(|| self.cwd.clone(), PathBuf::from);
-        let lane = self.lane(session, submission.effective.model(), cwd).await;
+        let route = submission.queued.route.clone();
+        let lane = self
+            .lane(session, &route, submission.effective.model(), cwd)
+            .await;
         self.queued.fetch_sub(1, Ordering::AcqRel);
         self.run(slot, submission, (&lane, prepared, connection))
             .await;

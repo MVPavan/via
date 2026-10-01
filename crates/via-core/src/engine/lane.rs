@@ -20,9 +20,10 @@ use std::{
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use via_adapters::{
-    Admitted, CloseMode, DriverHealth, FAKE, Harness, Inherit, SessionCx, SessionDriver,
-    SessionRef, SessionSpec, UsageSample, VendorOptions, VendorTerminal, observation_channel,
+    Admitted, CloseMode, DriverHealth, Inherit, SessionCx, SessionDriver, SessionRef, SessionSpec,
+    UsageSample, VendorOptions, VendorTerminal, observation_channel,
 };
+use via_store::SessionRoute;
 
 use super::progress::UsageLedger;
 use super::{Engine, lock};
@@ -43,6 +44,9 @@ const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 /// One session's driver and observation channel.
 pub(super) struct Lane {
     pub(super) driver: SessionDriver,
+    /// Test builds: the route identity the driver was opened with.
+    #[cfg(test)]
+    pub(super) reference: SessionRef,
     /// The session channel's receiver; the session's dispatcher holds it
     /// for the whole of a turn.
     pub(super) observations: tokio::sync::Mutex<mpsc::Receiver<Admitted>>,
@@ -153,6 +157,17 @@ impl LaneState {
     /// Whether `turn` has its vendor turn mapped.
     fn mapped(&self, turn: TurnNumber) -> bool {
         self.turns.iter().any(|(_, mapped)| *mapped == turn)
+    }
+}
+
+/// The C2 §2 `SessionRef` of a session's stored route identity (decision
+/// H3). What the Store does not hold is left empty, never invented: no
+/// adapter serves an empty route.
+pub(super) fn session_ref(route: &SessionRoute) -> SessionRef {
+    SessionRef {
+        harness: route.harness.clone(),
+        route: route.route.clone().unwrap_or_default(),
+        adapter_version: route.adapter_version.clone().unwrap_or_default(),
     }
 }
 
@@ -291,14 +306,16 @@ impl Engine {
     /// its driver's health failed, which is closed and replaced with the
     /// identity it confirmed (C2 §2 health); else a lane opened for the
     /// turn's `model` in `cwd` (C2 §2 `open_session`, logical: no vendor
-    /// I/O).
-    ///
-    /// The route identity is the fake's: intake admits only harnesses the
-    /// adapter set serves, the fake alone in this build (api.rs stays
-    /// fake-shaped at intake until chunk 5). The Store's one read of a
-    /// session's frozen harness is `status`'s, which a corrupt queued row
-    /// fails (design §7.3), so dispatch does not read it.
-    pub(super) async fn lane(&self, session: &SessionId, model: &str, cwd: PathBuf) -> Arc<Lane> {
+    /// I/O), from the session's stored route identity `route` (Sol r1 F12,
+    /// decision H3). A route identity the Store does not hold is not
+    /// invented: the driver then has no adapter and refuses the turn.
+    pub(super) async fn lane(
+        &self,
+        session: &SessionId,
+        route: &SessionRoute,
+        model: &str,
+        cwd: PathBuf,
+    ) -> Arc<Lane> {
         let kept = lock(&self.lanes).get(session).cloned();
         let mut state = LaneState::default();
         if let Some(lane) = kept {
@@ -310,13 +327,7 @@ impl Engine {
             state = lock(&lane.state).successor();
             lane.retire().await;
         }
-        let reference = SessionRef {
-            harness: FAKE.to_owned(),
-            route: Harness::parse(FAKE).map_or("", Harness::route).to_owned(),
-            // `open_session` reads only the harness and route; the
-            // version check is `check_turn`'s (chunk 5).
-            adapter_version: String::new(),
-        };
+        let reference = session_ref(route);
         let spec = SessionSpec {
             session_id: session.clone(),
             model: model.to_owned(),
@@ -339,12 +350,37 @@ impl Engine {
         };
         let lane = Arc::new(Lane {
             driver: self.adapter.open_session(&reference, spec, cx),
+            #[cfg(test)]
+            reference,
             observations: tokio::sync::Mutex::new(receiver),
             state: StdMutex::new(state),
             retired: std::sync::atomic::AtomicBool::new(false),
         });
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         lane
+    }
+
+    /// Restart recovery's resumed driver (C2 §2 Recover) becomes the
+    /// session's lane, with the channel its recovery was given.
+    pub(super) fn adopt_lane(
+        &self,
+        session: &SessionId,
+        (driver, receiver): (SessionDriver, mpsc::Receiver<Admitted>),
+        #[cfg_attr(
+            not(test),
+            expect(unused_variables, reason = "kept by test builds only")
+        )]
+        reference: &SessionRef,
+    ) {
+        let lane = Arc::new(Lane {
+            driver,
+            #[cfg(test)]
+            reference: reference.clone(),
+            observations: tokio::sync::Mutex::new(receiver),
+            state: StdMutex::new(LaneState::default()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        lock(&self.lanes).insert(session.clone(), lane);
     }
 
     /// A session's close (C2 §2 Close): its driver is closed by

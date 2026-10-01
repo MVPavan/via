@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
-use via_adapters::AnchorRecovery;
+use via_adapters::{AnchorRecovery, Recovery, SessionCx, observation_channel};
 use via_store::{
     ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, StoreError, TerminalRecord, UnfinishedTurn,
 };
@@ -72,6 +72,7 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
+        let mut asked = std::collections::HashSet::new();
         loop {
             let turns = self
                 .store
@@ -84,6 +85,11 @@ impl Engine {
             // Each resolution commits or fails recovery, so the next read
             // never returns the same turn again.
             for turn in turns {
+                if asked.insert(turn.session_id.clone()) {
+                    self.recover_session(&turn.session_id, &reconciled)
+                        .await
+                        .map_err(|error| format!("store_error: {}", error.kind))?;
+                }
                 on_turn(&turn.session_id, turn.turn);
                 self.recover_turn(turn, &reconciled)
                     .await
@@ -404,6 +410,46 @@ impl Engine {
                 .await
                 .map_err(|error| format!("store_error: {error}"))?;
         }
+    }
+
+    /// C2 §2 Recover (AD9, Sol r1 F12): asks the adapter set about
+    /// `session` from its stored route identity, with Host's reconciled
+    /// facts for it; nothing is submitted. A resumed driver becomes the
+    /// session's lane. The session's unfinished turns still end `unknown`
+    /// (C1 §7.5), with the cleanup Host's facts prove.
+    async fn recover_session(
+        &self,
+        session: &SessionId,
+        reconciled: &Reconciled,
+    ) -> Result<(), ApiError> {
+        let snapshot = self
+            .store
+            .session_snapshot(session)
+            .await
+            .map_err(|_| ApiError::STORE)?
+            .ok_or(ApiError::STORE)?;
+        let facts = reconciled.facts.get(session).map_or(&[][..], Vec::as_slice);
+        let (sink, receiver) = observation_channel();
+        let cx = SessionCx {
+            observations: sink,
+            tracker: self.tracker.clone(),
+            cancel: self.cancel.child_token(),
+        };
+        let reference = super::lane::session_ref(&snapshot.route);
+        let recovery = self.adapter.recover(&reference, facts, cx).await;
+        #[cfg(test)]
+        {
+            let answer = match &recovery {
+                Recovery::Resumed(_) => "resumed",
+                Recovery::Unknown { .. } => "unknown",
+                Recovery::Dead { .. } => "dead",
+            };
+            super::lock(&self.faults.recoveries).push((session.clone(), facts.len(), answer));
+        }
+        if let Recovery::Resumed(driver) = recovery {
+            self.adopt_lane(session, (*driver, receiver), &reference);
+        }
+        Ok(())
     }
 
     /// Design §11: a group an earlier daemon left, whose absence recovery did
@@ -736,6 +782,9 @@ impl DurableSettlement {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
+    /// Host's reports for the anchors of each session's running turns: the
+    /// facts its adapter recovery is given (C2 §2 Recover).
+    facts: HashMap<SessionId, Vec<AnchorRecovery>>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
     /// The deadline stopped paging before the whole inventory was read.
@@ -764,6 +813,17 @@ impl Reconciled {
             if let Some(report) = report {
                 entry.0 &= report.cleanup == Cleanup::Quiescent;
                 entry.1 |= report.forced;
+                self.facts
+                    .entry(owner.session_id.clone())
+                    .or_default()
+                    .push(AnchorRecovery {
+                        session_id: report.session_id.clone(),
+                        anchor_id: report.anchor_id.clone(),
+                        generation: report.generation.clone(),
+                        turn: report.turn,
+                        cleanup: report.cleanup,
+                        forced: report.forced,
+                    });
             } else {
                 // An unreported anchor is never proved absent.
                 entry.0 = false;

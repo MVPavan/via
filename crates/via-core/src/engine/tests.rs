@@ -2838,7 +2838,14 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
         let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
         let (_route, orders) =
             slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
-        let lane = engine.lane(&session, "fake", root.clone()).await;
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        let lane = engine.lane(&session, &route, "fake", root.clone()).await;
         // `gone` is evicted by the bound's worth of later vendor turns.
         lane.map_vendor_turn("gone", turn(1));
         for filler in 1..super::lane::VENDOR_TURNS {
@@ -2915,5 +2922,77 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
         let kept = serde_json::to_value(&kept).unwrap();
         assert_eq!(total, 1, "only turn 2's own denial: {kept}");
         assert_eq!(kept[0]["target"], "own", "{kept}");
+    });
+}
+
+/// Sol r1 F12 (C2 §2, H3): a session's lane opens its driver from the
+/// session's stored route identity: its harness, its receipt's route and
+/// its recorded adapter version, never a constant.
+#[test]
+fn a_lane_opens_from_the_sessions_stored_route_identity() {
+    let Some(root) = child("a_lane_opens_from_the_sessions_stored_route_identity") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        let lane = super::lock(&engine.lanes).get(&session).cloned().unwrap();
+        let reference = &lane.reference;
+        assert_eq!(
+            (
+                reference.harness.as_str(),
+                reference.route.as_str(),
+                reference.adapter_version.as_str()
+            ),
+            ("fake", "fake", env!("CARGO_PKG_VERSION"))
+        );
+    });
+}
+
+/// Sol r1 F12 (C2 §2 Recover, AD9): restart recovery asks the adapter set
+/// once per session with unfinished turns, from the session's stored
+/// route identity and with Host's reconciled facts for it; the fake never
+/// resumes, so without Host evidence its answer is `unknown`, and the turn
+/// is recovered `unknown` as before.
+#[test]
+fn recovery_asks_the_adapter_per_session_with_the_reconciled_facts() {
+    let Some(root) = child("recovery_asks_the_adapter_per_session_with_the_reconciled_facts")
+    else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            // Turn 1 is submitted, then the daemon is gone.
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &rfc3339(std::time::SystemTime::now()),
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let recoveries = super::lock(&engine.faults.recoveries).clone();
+        assert_eq!(recoveries, [(session.clone(), 0, "unknown")]);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
     });
 }
