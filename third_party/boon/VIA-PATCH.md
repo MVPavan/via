@@ -33,7 +33,11 @@ commit that vendored the unchanged copy shows the whole patch.
    - one unit per 64 bytes of each name the dependency keywords look up and
      of each `required`, `dependencies` or `dependentRequired` name scanned;
    - one unit per 64 bytes counted by `minLength`/`maxLength`;
-   - one unit per scope a `$dynamicRef` or `$recursiveRef` walks;
+   - one unit per scope a `$recursiveRef` walks, and for a `$dynamicRef`
+     one unit per 64 bytes of its anchor name for the comparison with its
+     target's `$dynamicAnchor` and again for each scope it walks (each
+     scope's lookup hashes and compares the name), charged before either
+     runs;
    - for `pattern` and `patternProperties`, the subject length times the
      pattern's weight (an estimate, from its syntax tree, of how many
      automaton states can be live at once), per 16 bytes.
@@ -48,7 +52,17 @@ commit that vendored the unchanged copy shows the whole patch.
    before it: the member scan, `Uneval` collection and merging (at most the
    members of the value the evaluation already paid for), the items and
    applicator loops (one evaluation each), `unevaluated*` (lookups of names
-   paid for at entry). `format` and the `content*` keywords run no code for
+   paid for at entry). Fix round 3 re-checked every per-byte operation on
+   a schema-controlled string: dependency names and `required` names are
+   charged by length as above, and `$dynamicRef` anchor names now are too;
+   `properties` and the `unevaluated*` sets hash value member names, paid
+   for by each evaluation's member charge; `$ref`, `$dynamicRef` and
+   `$recursiveRef` targets and their fragments are resolved when compiling,
+   so validating does no string work on them beyond the `$dynamicRef`
+   anchor name; `pattern` and `patternProperties` are charged per subject
+   byte as above; `enum` and
+   `const` values are charged per node and per 64 bytes of each string and
+   member name. `format` and the `content*` keywords run no code for
    a draft 2020-12 schema under `require_draft` without `assert_format` or
    `assert_content`, which VIA does not set.
 2. **Bounded regular expressions** (`util.rs`, `compiler.rs`). Patterns

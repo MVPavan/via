@@ -781,10 +781,18 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
         if let Some(dref) = &s.dynamic_ref {
             let mut sch = dref.sch; // initial target
             if let Some(anchor) = &dref.anchor {
+                // VIA patch: comparing the anchor name is charged by its
+                // length, before it runs.
+                if !self.budget.charge(pattern_units(anchor)) {
+                    return;
+                }
                 // $dynamicRef includes anchor
                 if self.schemas.get(sch).dynamic_anchor == dref.anchor {
                     // initial target has matching $dynamicAnchor
                     sch = self.resolve_dynamic_anchor(anchor, sch);
+                    if self.budget.spent() {
+                        return;
+                    }
                 }
             }
             add_err!(self.validate_ref(sch, "$dynamicRef"));
@@ -833,8 +841,11 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
     }
 
     fn resolve_dynamic_anchor(&self, name: &String, fallback: SchemaIndex) -> SchemaIndex {
-        // VIA patch: the walk over the scope chain is charged.
-        if !self.budget.charge(self.scope.depth as u64 + 1) {
+        // VIA patch: the walk over the scope chain is charged, each scope's
+        // lookup by the length of the name it hashes and compares, before
+        // the walk runs.
+        let scopes = self.scope.depth as u64 + 1;
+        if !self.budget.charge(scopes.saturating_mul(pattern_units(name))) {
             return fallback;
         }
         let mut sch = fallback;

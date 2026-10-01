@@ -329,6 +329,23 @@ mod tests {
         );
     }
 
+    /// Fix round 3 #1: a `$dynamicRef` charges its anchor name's bytes,
+    /// for its comparison with the target's `$dynamicAnchor` and for each
+    /// scope its resolution looks the name up in. A 100,000-byte anchor
+    /// reached from 2,000 items is about 1,563 units per comparison and
+    /// per lookup: past the budget, where one unit each was not.
+    #[test]
+    fn dynamic_anchor_names_are_charged_by_length() {
+        let name = "a".repeat(100_000);
+        let schema = json!({
+            "$dynamicAnchor": name,
+            "items": {"$dynamicRef": format!("#{name}")},
+        });
+        assert!(compiles(&schema), "the schema compiles");
+        let value = Value::Array((0..2000).map(|i| json!(i)).collect());
+        assert_eq!(validate(&schema, &value), Checked::Limit);
+    }
+
     /// A schema that walks `objects` levels of `{"a":…}`, one `$defs`
     /// schema per level, and at the last level checks the property name
     /// through a chain of `chain` `allOf` references: the name's
