@@ -649,9 +649,11 @@ impl Lane {
     /// Asks for an idle lane's end (C2 §3 idle lanes, runtime §8): its
     /// actor closes the driver gracefully, disposes of what the channel
     /// still has and ends the lane, which then leaves the session's
-    /// registration. That is not the session's close: nothing is
-    /// committed for it, and the session's next dispatch opens a new
-    /// driver from its stored identity. Only an open lane no turn holds
+    /// registration. That is not the session's close: it commits no
+    /// session-close or eviction event (durable observations admitted
+    /// meanwhile still commit as the lane drains; critical r2 F9), and the
+    /// session's next dispatch opens a new driver from its stored
+    /// identity. Only an open lane no turn holds
     /// or was handed is taken, under the lifecycle lock: a claim or an end
     /// asked for first keeps it.
     pub(super) fn begin_evict(&self) -> bool {
