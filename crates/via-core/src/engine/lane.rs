@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -168,6 +168,8 @@ impl Drop for LaneClaim {
         self.0.used.store(use_tick(), Ordering::Relaxed);
         lock(&self.0.core).claimed = false;
         self.0.changed.send_replace(());
+        // The lane may be idle now (runtime §8).
+        self.0.bound_idle();
     }
 }
 
@@ -253,6 +255,9 @@ pub(super) struct Lane {
     /// The lane's last use, a tick of [`USES`]: its making, then each
     /// turn's claim released.
     used: AtomicU64,
+    /// The daemon's Engine, whose idle lanes' bound the lane checks when
+    /// it becomes idle ([`Lane::bound_idle`]).
+    engine: Weak<Engine>,
 }
 
 /// What the lane learned from the session's observations.
@@ -508,7 +513,7 @@ impl Lane {
         (driver, reference): (SessionDriver, SessionRef),
         budget: ObservationBudget,
         (state, claimed): (LaneState, bool),
-        (writer, cancel): (SessionWriter, CancellationToken),
+        (writer, cancel, engine): (SessionWriter, CancellationToken, Weak<Engine>),
     ) -> Self {
         Self {
             driver,
@@ -527,6 +532,7 @@ impl Lane {
             cancel,
             journal_reported: Arc::new(StdMutex::new(false)),
             used: AtomicU64::new(use_tick()),
+            engine,
         }
     }
 
@@ -614,6 +620,15 @@ impl Lane {
             && !self.health_failed()
             && !self.overflowed()
             && self.budget.available() == OBSERVATION_BYTES
+    }
+
+    /// The lane may have become idle (critical r2 F5): a turn released its
+    /// claim, or the actor drained its channel between turns. The idle
+    /// lanes' bound is enforced at once ([`Engine::evict_idle`]).
+    fn bound_idle(&self) {
+        if let Some(engine) = self.engine.upgrade() {
+            engine.evict_idle();
+        }
     }
 
     /// Asks for an idle lane's end (C2 §3 idle lanes, runtime §8): its
@@ -892,6 +907,10 @@ impl Lane {
                 admitted = inbox.recv(), if open => match admitted {
                     Some(admitted) => {
                         self.dispose(admitted).await;
+                        // Drained: the lane may be idle now (runtime §8).
+                        if self.idle() {
+                            self.bound_idle();
+                        }
                         ready_item(&mut handled).await;
                     }
                     None => open = false,
@@ -1257,7 +1276,11 @@ impl Engine {
             opened,
             budget,
             initial,
-            (self.session_writer(session), self.cancel.child_token()),
+            (
+                self.session_writer(session),
+                self.cancel.child_token(),
+                Weak::clone(&self.me),
+            ),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         self.tracker.spawn(journal_watch(
@@ -1302,35 +1325,32 @@ impl Engine {
     }
 
     /// Keeps the idle lanes within [`IDLE_LANES`] (runtime §8, C2 §3 idle
-    /// lanes), after a turn released its lane and when a lane is adopted.
+    /// lanes), whenever a lane may have become idle: a turn released its
+    /// claim, a lane was adopted, or an actor drained its channel between
+    /// turns. Afterwards exactly the bound's worth of idle lanes, or fewer
+    /// when fewer are idle, remain; an evicting lane is no longer idle.
     /// Lanes that ended, such as retired ones, leave the registry: their
     /// channel was drained to its end, and the session's next dispatch
     /// opens a fresh lane from its stored identity. Past the bound, the
     /// least recently used idle lanes are taken through the live-close
-    /// barrier ([`Lane::begin_evict`]), which their actors carry out; this
-    /// waits for none of it. A lane whose session has a turn queued or
+    /// barrier ([`Lane::begin_evict`]), as many as exceed the bound, which
+    /// their actors carry out; this waits for none of it. A lane whose session has a turn queued or
     /// running, or a close order, is not idle; one claimed, handed a turn
     /// or ending is never taken. A dispatch that finds its lane taken
     /// waits for its end, then opens the successor ([`Self::claim_lane`],
     /// [`Self::open_lane`]): one driver at a time, and no turn lost.
     pub(super) fn evict_idle(&self) {
-        let candidates: Vec<(SessionId, Arc<Lane>)> = {
-            let mut lanes = lock(&self.lanes);
-            lanes.retain(|_, lane| !lane.ended());
+        // Selection and every eviction under one registry lock (critical
+        // r2 F5): concurrent checks neither over- nor under-evict.
+        let mut lanes = lock(&self.lanes);
+        lanes.retain(|_, lane| !lane.ended());
+        let mut idle: Vec<&Arc<Lane>> = {
+            let sessions = lock(&self.sessions);
             lanes
                 .iter()
-                .filter(|(_, lane)| lane.idle())
-                .map(|(session, lane)| (session.clone(), Arc::clone(lane)))
-                .collect()
-        };
-        if candidates.len() <= IDLE_LANES {
-            return;
-        }
-        let mut idle: Vec<Arc<Lane>> = {
-            let sessions = lock(&self.sessions);
-            candidates
-                .into_iter()
-                .filter(|(session, _)| sessions.get(session).is_none_or(|slot| slot.unoccupied()))
+                .filter(|(session, lane)| {
+                    lane.idle() && sessions.get(*session).is_none_or(|slot| slot.unoccupied())
+                })
                 .map(|(_, lane)| lane)
                 .collect()
         };

@@ -5608,3 +5608,55 @@ fn an_uncertain_journal_in_a_restart_close_fails_startup() {
         assert!(!snapshot.closed, "Closed was committed");
     });
 }
+
+/// Critical r2 F5 (runtime §8 idle session lanes): the bound is enforced
+/// whenever a lane becomes idle, its channel drained included. Lanes past
+/// the bound are adopted each holding an admitted item, so none is idle at
+/// its adoption's check; once their actors drain them, with no dispatch
+/// or adoption after, exactly `IDLE_LANES` idle lanes remain.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn lanes_idle_only_by_draining_come_back_to_the_bound() {
+    use super::lane::IDLE_LANES;
+    let Some(root) = child("lanes_idle_only_by_draining_come_back_to_the_bound") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut opened = Vec::new();
+        for _ in 0..IDLE_LANES + 2 {
+            let session = new_session(&engine).await;
+            dispatch(&engine, &session).await;
+            let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
+            opened.push((session, driver, reference, route));
+        }
+        let mut senders = Vec::new();
+        // Adopted with no await between them: no actor drains meanwhile.
+        for (session, driver, reference, route) in opened {
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            let budget = via_adapters::ObservationBudget::new();
+            let item = via_adapters::Admitted {
+                item: via_adapters::ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: denied("held"),
+                },
+                permit: budget.charge(10).unwrap(),
+            };
+            assert!(sender.try_send(item).is_ok());
+            engine.adopt_lane(&session, (driver, receiver, budget), (reference, &route));
+            senders.push(sender);
+        }
+        assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 2);
+        let bounded = tokio::time::timeout(Duration::from_secs(10), async {
+            while super::lock(&engine.lanes).len() > IDLE_LANES {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let lanes = super::lock(&engine.lanes).len();
+        assert!(bounded.is_ok(), "{lanes} lanes stay registered");
+        assert_eq!(lanes, IDLE_LANES, "exactly the bound remains");
+        drop(senders);
+    });
+}

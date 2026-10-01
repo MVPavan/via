@@ -455,6 +455,14 @@ impl ObservationBudget {
     pub fn shares(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Test builds only: `bytes` of the budget, as an admitted item holds
+    /// them; `None` when they are not free.
+    #[cfg(feature = "test-failpoints")]
+    #[must_use]
+    pub fn charge(&self, bytes: u32) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0).try_acquire_many_owned(bytes).ok()
+    }
 }
 
 impl Default for ObservationBudget {
