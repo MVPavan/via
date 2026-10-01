@@ -8,42 +8,24 @@
 //! ignored; `via-p98.3.2` replaces it with a driver over the real adapter and
 //! removes the `ignore`s.
 //!
-//! # Expectation schema
-//!
-//! The shared x.3.1 schema (`source`, `harness`, `session {model, resume}`,
-//! `turns[] {params, stop, expect}`) plus these additive fields:
-//! - `session.instructions`: frozen session instructions, or null;
-//! - `plan_checks[] {require, refusal}`: pure `plan` calls with that `require`
-//!   list; `refusal` is the expected `Refusal` kind, or null when it passes;
-//! - `params.bound`: the C1 bound, or null for the route default
-//!   (`full`, `network: true`);
-//! - `expect.terminal.{vendor_stop_reason, vendor_code, structured_output,
-//!   usage, cost}`: retained-terminal fields; `usage` uses `UsageSample`
-//!   names and is matched as a subset;
-//! - `expect.cancel {outcome}`: the stop's `CancelOutcome`;
-//! - `expect.final_text`: the concatenated `final_text` pieces;
-//! - `expect.instance {vendor_version}`: `TurnEnd.instance` (null version when
-//!   no handshake was read);
-//! - `expect.observation_counts`: exact counts of observation kinds;
-//! - `expect.launched`: false when no vendor process may start;
-//! - `expect.stdin_sequence`: what VIA writes to the vendor, in order:
-//!   `user`, `control_request:<subtype>`, `control_response:<subtype>`, `eof`;
-//! - `expect.resume_mismatch {requested, returned}`: the observation's fields;
-//! - `expect.unsettled`: `expect` fields C2 does not settle for this case;
-//!   they are not compared.
-//!
-//! A null core field (`plan_refusal`, `rejected`, `terminal`, `error`,
-//! `cleanup`, `steer`) means the outcome has none. An absent additive field
-//! is not compared. `notes` is never compared.
+//! The expectations use the unified adapter-level schema shared with the
+//! other harnesses (`launches`, `plan_checks`, `sessions`, `turns[] {session,
+//! start_after, params, tool_grace_ms, stop, steer, expect}`). This local
+//! checker follows it until the shared `support/conformance_expect.rs`
+//! lands, then the cases switch to that module. A field a case does not
+//! state is not compared; `expect.unasserted` names deliberately skipped
+//! fields, each with its reason; `notes` is never compared.
 //!
 //! # Fixture argv
 //!
 //! The argv is the adapter's own recipe (vendor packet §4) in this order:
 //! `-p --input-format stream-json --output-format stream-json --verbose
-//! --model M (--session-id {capture} | --resume ID) --restricted
-//! --strict-mcp-config --permission-mode dontAsk --permission-prompts none
-//! --tools T --allowedTools T`, then `--append-system-prompt`, `--effort` and
-//! `--json-schema` (compact, sorted keys) when set.
+//! --model M (--session-id {capture sid} | --resume {capture resume})
+//! --restricted --strict-mcp-config --permission-mode dontAsk
+//! --permission-prompts none --tools T --allowedTools T`, then
+//! `--append-system-prompt`, `--effort` and `--json-schema` (compact, sorted
+//! keys) when set. For a resume, the driver passes `sessions.main.resume`
+//! and asserts the fake's captured `--resume` value equals it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -67,51 +49,59 @@ const OBSERVATIONS: [&str; 10] = [
     "vendor.request_declined",
     "steer.delivered",
 ];
-/// Fields every `expect` carries (the shared schema).
-const CORE_FIELDS: [&str; 10] = [
+/// The `expect` fields of the unified schema.
+const EXPECT_FIELDS: [&str; 17] = [
     "plan_refusal",
     "rejected",
     "accepted",
     "terminal",
+    "usage",
+    "final_text",
     "error",
     "cleanup",
+    "cleanup_settles",
+    "stop_facts",
+    "instance",
     "observations_include",
     "observations_exclude",
-    "steer",
-    "notes",
-];
-/// Additive `expect` fields (module docs).
-const ADDITIVE_FIELDS: [&str; 9] = [
-    "cancel",
-    "final_text",
-    "instance",
     "observation_counts",
-    "launched",
-    "stdin_sequence",
-    "resume_mismatch",
-    "unsettled",
+    "observations_order",
+    "unasserted",
     "notes",
 ];
 /// Fields compared by their own rules rather than by value.
-const SPECIAL_FIELDS: [&str; 5] = [
+const SPECIAL_FIELDS: [&str; 6] = [
     "observations_include",
     "observations_exclude",
     "observation_counts",
-    "unsettled",
+    "observations_order",
+    "unasserted",
     "notes",
 ];
+const TERMINAL_FIELDS: [&str; 10] = [
+    "status",
+    "stop_reason",
+    "vendor_stop_reason",
+    "vendor_code",
+    "class_hint",
+    "detail",
+    "structured_output",
+    "steps",
+    "cost",
+    "usage",
+];
 
-fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures/claude")
-}
-
-/// Returns an error naming the case unless `$cond` holds.
+/// Returns an error unless `$cond` holds.
 macro_rules! ensure {
     ($cond:expr, $($message:tt)+) => {
         if !$cond {
             return Err(format!($($message)+));
         }
     };
+}
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures/claude")
 }
 
 /// One case: its expectation and the path of its replay fixture.
@@ -131,10 +121,15 @@ fn load(name: &str) -> Result<Case, String> {
     })
 }
 
-/// What the driver produced, in the expectation schema's shape.
+/// What the driver observed, in the expectation schema's shape.
 struct Outcome {
+    /// Vendor process launches over the whole case.
+    launches: u64,
     /// One refusal kind (or none) per `plan_checks` entry.
     plan_checks: Vec<Option<String>>,
+    /// Per session label, its close report (`{mode, vendor_closed,
+    /// cleanup}`) or null.
+    closes: serde_json::Map<String, Value>,
     /// One object per turn with the `expect` fields, plus `observations`:
     /// the observation kinds in the order the driver decoded them.
     turns: Vec<Value>,
@@ -165,10 +160,25 @@ fn strings(value: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+fn unasserted(expect: &Value) -> Vec<&str> {
+    expect["unasserted"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["field"].as_str())
+        .collect()
+}
+
+/// Whether `wanted` occurs in `seen` in order (not necessarily adjacent).
+fn subsequence(wanted: &[&str], seen: &[&str]) -> bool {
+    let mut seen = seen.iter();
+    wanted.iter().all(|kind| seen.any(|item| item == kind))
+}
+
 fn compare_turn(expect: &Value, actual: &Value) -> Result<(), String> {
-    let unsettled = strings(&expect["unsettled"]);
+    let skipped = unasserted(expect);
     for (field, expected) in expect.as_object().ok_or("expect is not an object")? {
-        if SPECIAL_FIELDS.contains(&field.as_str()) || unsettled.contains(&field.as_str()) {
+        if SPECIAL_FIELDS.contains(&field.as_str()) || skipped.contains(&field.as_str()) {
             continue;
         }
         let actual = actual.get(field).unwrap_or(&Value::Null);
@@ -198,16 +208,26 @@ fn compare_turn(expect: &Value, actual: &Value) -> Result<(), String> {
             "{kind}: expected {count}, got {got}"
         );
     }
+    let order = strings(&expect["observations_order"]);
+    ensure!(
+        subsequence(&order, &seen),
+        "observations {seen:?} lack the order {order:?}"
+    );
     Ok(())
 }
 
 fn run_case(name: &str) -> Result<(), String> {
     let case = load(name)?;
+    let doc = &case.expect;
     let outcome = drive(&case).map_err(|error| format!("{name}: {error}"))?;
-    let checks = case.expect["plan_checks"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    if let Some(launches) = doc["launches"].as_u64() {
+        ensure!(
+            launches == outcome.launches,
+            "{name}: {launches} launches, got {}",
+            outcome.launches
+        );
+    }
+    let checks = doc["plan_checks"].as_array().cloned().unwrap_or_default();
     ensure!(
         checks.len() == outcome.plan_checks.len(),
         "{name}: {} plan checks, got {}",
@@ -221,7 +241,14 @@ fn run_case(name: &str) -> Result<(), String> {
             "{name}: plan check {check} gave {got:?}"
         );
     }
-    let turns = case.expect["turns"].as_array().cloned().unwrap_or_default();
+    for (label, session) in doc["sessions"].as_object().into_iter().flatten() {
+        let close = &session["close"];
+        if !close.is_null() {
+            let got = outcome.closes.get(label).unwrap_or(&Value::Null);
+            ensure!(matches(close, got), "{name}: close of {label}: {got}");
+        }
+    }
+    let turns = doc["turns"].as_array().cloned().unwrap_or_default();
     ensure!(
         turns.len() == outcome.turns.len(),
         "{name}: {} turns, got {}",
@@ -329,38 +356,61 @@ fn kind_ok(value: &Value, allowed: &[&str]) -> bool {
     }
 }
 
-fn check_turn(name: &str, turn: &Value) -> Result<(), String> {
-    ensure!(turn["params"]["prompt"].is_string(), "{name}: no prompt");
-    let stop = &turn["stop"];
-    if !stop.is_null() {
+fn check_observations(name: &str, expect: &Value) -> Result<(), String> {
+    let counts = expect["observation_counts"].as_object();
+    let mut kinds = strings(&expect["observations_include"]);
+    kinds.extend(strings(&expect["observations_exclude"]));
+    kinds.extend(strings(&expect["observations_order"]));
+    kinds.extend(counts.into_iter().flatten().map(|(kind, _)| kind.as_str()));
+    for kind in kinds {
         ensure!(
-            kind_ok(&stop["kind"], &["interrupt", "wall", "close"]),
-            "{name}: {stop}"
-        );
-        ensure!(
-            kind_ok(&stop["after"], &["accepted", "tool_started", "handshake"]),
-            "{name}: {stop}"
-        );
-    }
-    let expect = &turn["expect"];
-    let known = |field: &str| CORE_FIELDS.contains(&field) || ADDITIVE_FIELDS.contains(&field);
-    for field in CORE_FIELDS {
-        ensure!(
-            expect.get(field).is_some(),
-            "{name}: expect.{field} missing"
+            OBSERVATIONS.contains(&kind),
+            "{name}: unknown observation {kind}"
         );
     }
+    if expect["accepted"] == true {
+        let accepted = counts.and_then(|counts| counts.get("turn.accepted"));
+        ensure!(
+            accepted.and_then(Value::as_u64) == Some(1),
+            "{name}: an accepted turn must count turn.accepted == 1"
+        );
+        let confirms =
+            strings(&expect["observations_include"]).contains(&"session.vendor_identity_confirmed");
+        let order = strings(&expect["observations_order"]);
+        ensure!(
+            !confirms
+                || subsequence(
+                    &["session.vendor_identity_confirmed", "turn.accepted"],
+                    &order
+                ),
+            "{name}: identity confirmation must precede acceptance in observations_order"
+        );
+    }
+    for entry in expect["unasserted"].as_array().into_iter().flatten() {
+        ensure!(
+            entry["field"].is_string() && entry["why"].as_str().is_some_and(|why| !why.is_empty()),
+            "{name}: unasserted entry {entry} needs a field and a why"
+        );
+    }
+    Ok(())
+}
+
+fn check_expect(name: &str, expect: &Value) -> Result<(), String> {
     for field in expect.as_object().ok_or("expect")?.keys() {
-        ensure!(known(field), "{name}: unknown expect field {field}");
-    }
-    for field in strings(&expect["unsettled"]) {
-        ensure!(known(field), "{name}: unknown unsettled field {field}");
+        ensure!(
+            EXPECT_FIELDS.contains(&field.as_str()),
+            "{name}: unknown expect field {field}"
+        );
     }
     for (field, allowed) in [
         ("plan_refusal", &REFUSALS[..]),
         ("rejected", &REJECTIONS[..]),
         ("error", &ERRORS[..]),
-        ("cleanup", &["quiescent", "uncertain", "pending"][..]),
+        ("cleanup", &["quiescent", "uncertain"][..]),
+        (
+            "cleanup_settles",
+            &["at_terminal", "at_p7_bound", "when_tools_end"][..],
+        ),
     ] {
         ensure!(
             kind_ok(&expect[field], allowed),
@@ -369,6 +419,17 @@ fn check_turn(name: &str, turn: &Value) -> Result<(), String> {
         );
     }
     let terminal = &expect["terminal"];
+    for field in terminal
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key)
+    {
+        ensure!(
+            TERMINAL_FIELDS.contains(&field.as_str()),
+            "{name}: unknown terminal field {field}"
+        );
+    }
     if !terminal.is_null() {
         for (field, allowed) in [
             ("status", &STATUSES[..]),
@@ -381,21 +442,18 @@ fn check_turn(name: &str, turn: &Value) -> Result<(), String> {
             );
         }
     }
-    let mut kinds = strings(&expect["observations_include"]);
-    kinds.extend(strings(&expect["observations_exclude"]));
-    kinds.extend(
-        expect["observation_counts"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(kind, _)| kind.as_str()),
-    );
-    for kind in kinds {
+    let usage = &expect["usage"];
+    if !usage.is_null() {
         ensure!(
-            OBSERVATIONS.contains(&kind),
-            "{name}: unknown observation {kind}"
+            kind_ok(&usage["from"], &["terminal", "samples"]) && usage["from"].is_string(),
+            "{name}: usage.from"
         );
     }
+    ensure!(
+        expect["final_text"].is_null() || expect["final_text"].is_array(),
+        "{name}: final_text is ordered pieces or null"
+    );
+    check_observations(name, expect)?;
     ensure!(
         expect["notes"]
             .as_str()
@@ -403,6 +461,28 @@ fn check_turn(name: &str, turn: &Value) -> Result<(), String> {
         "{name}: no notes"
     );
     Ok(())
+}
+
+fn check_turn(name: &str, sessions: &Value, turn: &Value) -> Result<(), String> {
+    let label = turn["session"].as_str().ok_or("turn session")?;
+    ensure!(
+        !sessions[label].is_null(),
+        "{name}: unknown session {label}"
+    );
+    ensure!(turn["params"]["prompt"].is_string(), "{name}: no prompt");
+    ensure!(turn["steer"].is_array(), "{name}: steer is a list");
+    let stop = &turn["stop"];
+    if !stop.is_null() {
+        ensure!(
+            kind_ok(&stop["kind"], &["interrupt", "wall", "close"]),
+            "{name}: {stop}"
+        );
+        ensure!(
+            kind_ok(&stop["after"], &["accepted", "tool_started", "handshake"]),
+            "{name}: {stop}"
+        );
+    }
+    check_expect(name, &turn["expect"])
 }
 
 fn check_case(name: &str) -> Result<(), String> {
@@ -416,18 +496,24 @@ fn check_case(name: &str) -> Result<(), String> {
             .is_some_and(|source| !source.is_empty()),
         "{name}: no source"
     );
-    ensure!(doc["session"]["model"].is_string(), "{name}: no model");
+    ensure!(doc["launches"].is_u64(), "{name}: launches");
     for check in doc["plan_checks"].as_array().into_iter().flatten() {
-        ensure!(check["require"].is_array(), "{name}: {check}");
+        ensure!(check["require"].is_string(), "{name}: {check}");
         ensure!(kind_ok(&check["refusal"], &REFUSALS), "{name}: {check}");
+    }
+    let sessions = &doc["sessions"];
+    for (label, session) in sessions.as_object().ok_or("sessions")? {
+        ensure!(session["model"].is_string(), "{name}: {label} has no model");
     }
     let turns = doc["turns"].as_array().ok_or("turns")?;
     ensure!(!turns.is_empty(), "{name}: no turns");
-    turns.iter().try_for_each(|turn| check_turn(name, turn))
+    turns
+        .iter()
+        .try_for_each(|turn| check_turn(name, sessions, turn))
 }
 
 /// Green now: every expectation has a test and a fixture, and uses only the
-/// schema's fields and C2's names.
+/// unified schema's fields and C2's names.
 #[test]
 fn conformance_claude_expectations_are_well_formed() -> Result<(), String> {
     let mut files = BTreeSet::new();
