@@ -826,25 +826,43 @@ pub struct FreeFloor {
     pub floor_bytes: u64,
 }
 
-/// A refused request member (`data.field`) and, when a route's capabilities
-/// refused it, that route (`data.route`).
-#[derive(Clone, Copy, Debug)]
+/// A refusal's context in `data` (C1 §8.1, §9): the refused request member
+/// (`data.field`), and the harness, route and verb whenever known,
+/// independently of a field. Owned or static text, never request input.
+#[derive(Clone, Debug, Default)]
 pub struct Named {
     /// Request member, dotted for a nested one.
-    pub field: &'static str,
-    /// Route whose capabilities refuse the member.
-    pub route: Option<&'static str>,
+    pub field: Option<Cow<'static, str>>,
+    /// The harness the refusal concerns.
+    pub harness: Option<Cow<'static, str>>,
+    /// The route whose capabilities refuse.
+    pub route: Option<Cow<'static, str>>,
+    /// The refused verb.
+    pub verb: Option<Cow<'static, str>>,
 }
 
 impl Named {
     /// A member refused regardless of route.
     pub(crate) const fn field(field: &'static str) -> Self {
-        Self { field, route: None }
+        Self {
+            field: Some(Cow::Borrowed(field)),
+            harness: None,
+            route: None,
+            verb: None,
+        }
     }
 
-    /// A member `route`'s capabilities refuse, when a route was chosen.
-    pub(crate) const fn route(field: &'static str, route: Option<&'static str>) -> Self {
-        Self { field, route }
+    /// Whether nothing is named.
+    fn is_empty(&self) -> bool {
+        self.field.is_none()
+            && self.harness.is_none()
+            && self.route.is_none()
+            && self.verb.is_none()
+    }
+
+    /// `self`, or `None` when it names nothing.
+    pub(crate) fn boxed(self) -> Option<Box<Self>> {
+        (!self.is_empty()).then(|| Box::new(self))
     }
 }
 
@@ -932,9 +950,15 @@ impl ApiError {
             data["terminal_persisted"] = json!(false);
         }
         if let Some(named) = &self.named {
-            data["field"] = json!(named.field);
-            if let Some(route) = named.route {
-                data["route"] = json!(route);
+            for (member, value) in [
+                ("field", &named.field),
+                ("verb", &named.verb),
+                ("harness", &named.harness),
+                ("route", &named.route),
+            ] {
+                if let Some(value) = value {
+                    data[member] = json!(value);
+                }
             }
         }
         if let Some(reason) = self.reason {

@@ -1165,3 +1165,160 @@ fn conformance_intake_startup_cwd_over_4_kib_encoded_is_refused() {
         daemon.stop().await;
     });
 }
+
+/// Sol r1 #5 (C1 §4.1): a route whose `capabilities.verbs.spawn` is
+/// unsupported refuses `spawn` `unsupported_verb` before any receipt; a
+/// session whose frozen `verbs.resume` is unsupported refuses `resume`
+/// the same way, before a receipt and before any driver call.
+#[test]
+fn conformance_intake_unsupported_spawn_and_resume_verbs() {
+    let root = Root::new();
+    let unsupported = json!({"support":"unsupported","reason":"no such verb"});
+    let no_spawn = root.scenario(
+        "no-spawn.json",
+        &scenario(
+            &json!({"capabilities": capabilities(&[("/verbs/spawn", unsupported.clone())])}),
+            &[script("p", &[accepted(1), terminal(1)])],
+        ),
+    );
+    let no_resume = root.scenario(
+        "no-resume.json",
+        &scenario(
+            &json!({"capabilities": capabilities(&[("/verbs/resume", unsupported)])}),
+            &[
+                script("p", &[accepted(1), terminal(1)]),
+                script("again", &[accepted(2), terminal(2)]),
+            ],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &no_spawn);
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, "unsupported_verb", "{error:?}");
+        assert!(daemon.first_input().is_none(), "no agent was started");
+        daemon.stop().await;
+
+        let daemon = Daemon::open(&root, &no_resume);
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await;
+        assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+        let error = daemon
+            .try_resume(&session, &json!({"prompt":"again"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, "unsupported_verb", "{error:?}");
+        let queued: Vec<_> = daemon
+            .events(&session)
+            .await
+            .into_iter()
+            .filter(|event| event["type"] == "turn.queued")
+            .collect();
+        assert_eq!(queued.len(), 1, "no second turn was received: {queued:?}");
+        daemon.stop().await;
+    });
+}
+
+/// Sol r1 #10 (C1 §8.1, §9): a refusal's `harness`, `route` and `verb` are
+/// in `data` whenever known, with or without a `data.field`: steer's
+/// `unsupported_verb` carries `verb: "steer"` and the session's harness
+/// and route; spawn's and resume's carry their verb; a member the route
+/// refuses carries its field, harness and route.
+#[test]
+fn conformance_intake_refusal_metadata() {
+    let root = Root::new();
+    let unsupported = json!({"support":"unsupported","reason":"no such verb"});
+    let no_spawn = root.scenario(
+        "no-spawn.json",
+        &scenario(
+            &json!({"capabilities": capabilities(&[("/verbs/spawn", unsupported.clone())])}),
+            &[],
+        ),
+    );
+    let no_resume = root.scenario(
+        "no-resume.json",
+        &scenario(
+            &json!({"capabilities": capabilities(&[("/verbs/resume", unsupported)])}),
+            &[script("p", &[gate("running"), accepted(1), terminal(1)])],
+        ),
+    );
+    let metadata = |error: &ApiError| {
+        let data = error.data();
+        (
+            error.kind.to_owned(),
+            data["verb"].clone(),
+            data["harness"].clone(),
+            data["route"].clone(),
+        )
+    };
+    let fake = || json!("fake");
+    run(async {
+        let daemon = Daemon::open(&root, &no_spawn);
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            metadata(&error),
+            (
+                "unsupported_verb".to_owned(),
+                json!("spawn"),
+                fake(),
+                fake()
+            ),
+            "{error:?}"
+        );
+        daemon.stop().await;
+
+        let daemon = Daemon::open(&root, &no_resume);
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"p",
+                               "instructions":{"text":"be brief"}}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.data()["field"], "instructions", "{error:?}");
+        assert_eq!(
+            metadata(&error),
+            ("invalid_params".to_owned(), Value::Null, fake(), fake()),
+            "{error:?}"
+        );
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await;
+        daemon.entered("running").await;
+        let error = daemon
+            .try_steer(&session, &json!({"text":"x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            metadata(&error),
+            (
+                "unsupported_verb".to_owned(),
+                json!("steer"),
+                fake(),
+                fake()
+            ),
+            "{error:?}"
+        );
+        daemon.release("running");
+        assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+        let error = daemon
+            .try_resume(&session, &json!({"prompt":"again"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            metadata(&error),
+            (
+                "unsupported_verb".to_owned(),
+                json!("resume"),
+                fake(),
+                fake()
+            ),
+            "{error:?}"
+        );
+        daemon.stop().await;
+    });
+}

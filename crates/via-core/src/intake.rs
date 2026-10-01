@@ -3,6 +3,7 @@
 //! `describe` and `models` through the adapter set, and a session's frozen
 //! facts as its Store row holds them.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
@@ -10,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
-    AdapterSet, Bound, Capabilities, DescribeRequest, Refusal, RefusalKind, RoutePlan, SessionRef,
-    Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq,
+    AdapterSet, Bound, Capabilities, DescribeRequest, Harness, Refusal, RefusalKind, RoutePlan,
+    SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
 };
 use via_store::SessionRoute;
 use via_store::json_limits::{self, Shape};
@@ -299,12 +300,51 @@ pub(crate) fn refused(refusal: &Refusal) -> ApiError {
     };
     ApiError {
         message: refusal_message(refusal),
-        named: refusal
-            .field()
-            .map(|field| Box::new(Named::route(field, refusal.route))),
+        named: Named {
+            field: refusal.field().map(Cow::Borrowed),
+            harness: refusal.route.and_then(harness_of).map(Cow::Borrowed),
+            route: refusal.route.map(Cow::Borrowed),
+            verb: refusal.verb.map(|verb| Cow::Borrowed(verb.as_str())),
+        }
+        .boxed(),
         reason: refusal.reason,
         ..base
     }
+}
+
+/// The harness `route` serves, when this build knows it.
+fn harness_of(route: &str) -> Option<&'static str> {
+    harness_names()
+        .filter_map(Harness::parse)
+        .find(|harness| harness.route() == route)
+        .map(Harness::name)
+}
+
+/// `unsupported_verb` of `verb` on a session's frozen route (C1 §4.1,
+/// §8.1), naming the verb, harness and route.
+pub(crate) fn unsupported_on(verb: Verb, frozen: &Frozen) -> ApiError {
+    ApiError {
+        message: "verb is unsupported on this route",
+        named: Named {
+            verb: Some(Cow::Borrowed(verb.as_str())),
+            harness: Some(Cow::Owned(frozen.harness.clone())),
+            route: Some(Cow::Owned(frozen.route.clone())),
+            ..Named::default()
+        }
+        .boxed(),
+        ..ApiError::UNSUPPORTED_VERB
+    }
+}
+
+/// `unsupported_verb` of `verb` on `route` (C1 §4.1, §8.1).
+pub(crate) fn unsupported_verb(verb: Verb, route: &'static str) -> ApiError {
+    refused(&Refusal {
+        kind: RefusalKind::UnsupportedVerb,
+        message: String::new(),
+        verb: Some(verb),
+        route: Some(route),
+        reason: None,
+    })
 }
 
 /// VIA's own bounded message for a refusal, naming its member.
@@ -388,6 +428,10 @@ pub(crate) fn plan_spawn(
     let plan = adapter
         .plan(&request)
         .map_err(|refusal| refused(&refusal))?;
+    // Sol r1 #5 (C1 §4.1): a route that cannot spawn refuses before any receipt.
+    if matches!(plan.capabilities.verbs.spawn, Support::Unsupported { .. }) {
+        return Err(unsupported_verb(Verb::Spawn, plan.route));
+    }
     if let Some(refusal) = plan.refusals.first() {
         return Err(refused(refusal));
     }
@@ -735,6 +779,14 @@ impl Frozen {
             .map_or("turn", |capabilities| capabilities.usage.tokens.as_str())
     }
 
+    /// Whether the route's declared support of `verb` is unsupported; a
+    /// route whose capabilities are unread refuses nothing here.
+    pub(crate) fn lacks(&self, verb: Verb) -> bool {
+        self.capabilities.as_ref().is_some_and(|capabilities| {
+            matches!(capabilities.verbs.get(verb), Support::Unsupported { .. })
+        })
+    }
+
     /// The route's declared `steer` support; none when unread.
     pub(crate) fn steer(&self) -> Option<&Support> {
         self.capabilities
@@ -827,6 +879,8 @@ impl TurnPlan {
 mod tests {
     use serde_json::json;
 
+    use std::borrow::Cow;
+
     use super::{Effective, Member};
     use crate::SpawnParams;
 
@@ -847,14 +901,17 @@ mod tests {
                 .per_turn()
                 .overrides()
                 .map(|overrides| overrides.wall_ms)
-                .map_err(|error| (error.kind, error.named.map(|named| named.field)))
+                .map_err(|error| {
+                    let field = error.named.and_then(|named| named.field);
+                    (error.kind, field.map(Cow::into_owned))
+                })
         };
         assert_eq!(check(json!({"vendor":{"a":{},"b":{}}})), Ok(None));
         assert_eq!(check(json!({"deadlines":{"wall_ms":7}})), Ok(Some(7)));
         for field in ["bound", "effort", "vendor", "deadlines"] {
             assert_eq!(
                 check(json!({ field: null })),
-                Err(("invalid_params", Some(field))),
+                Err(("invalid_params", Some(field.to_owned()))),
                 "{field}"
             );
         }
@@ -871,13 +928,13 @@ mod tests {
         ] {
             assert_eq!(
                 check(json!({ field: value })),
-                Err(("invalid_params", Some(field))),
+                Err(("invalid_params", Some(field.to_owned()))),
                 "{field}"
             );
         }
         assert_eq!(
             check(json!({"deadlines":{"wall_ms":0}})),
-            Err(("invalid_params", Some("deadlines.wall_ms")))
+            Err(("invalid_params", Some("deadlines.wall_ms".to_owned())))
         );
     }
 

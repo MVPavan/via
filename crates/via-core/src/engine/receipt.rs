@@ -12,7 +12,9 @@ use via_store::{
     SessionSnapshot, SpawnKey, SpawnRecord, StoreError,
 };
 
-use via_adapters::{DescribeRequest, RoutePlan, SteerError, SteerInput, Support, VendorTurnId};
+use via_adapters::{
+    DescribeRequest, RoutePlan, SteerError, SteerInput, Support, VendorTurnId, Verb,
+};
 
 use super::drive::steer_delivery;
 use super::journal::{self, Head};
@@ -428,6 +430,12 @@ impl Engine {
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
+        // Sol r1 #5 (C1 §4.1): the session's frozen route cannot resume;
+        // refused before any receipt or driver call.
+        let frozen = Frozen::of(&snapshot.route);
+        if frozen.lacks(Verb::Resume) {
+            return Err(intake::unsupported_on(Verb::Resume, &frozen));
+        }
         if let Some((key, identity)) = &operation
             && let Some(stored) = self
                 .store
@@ -472,7 +480,6 @@ impl Engine {
         let effective = latest.inherit(overrides);
         // C2 §2 `check_turn` (decision F12): the turn's values against the
         // session's frozen route, AD12's adapter version included.
-        let frozen = Frozen::of(&snapshot.route);
         self.adapter
             .check_turn(&frozen.session_ref(), &effective.turn_params())
             .map_err(|refusal| intake::refused(&refusal))?;
@@ -623,10 +630,7 @@ impl Engine {
             frozen.steer(),
             Some(Support::Native | Support::Partial { .. })
         ) {
-            return Err(ApiError {
-                message: "steer is unsupported on this route",
-                ..ApiError::UNSUPPORTED_VERB
-            });
+            return Err(intake::unsupported_on(Verb::Steer, &frozen));
         }
         let Some((turn, mut steering)) =
             self.slot(&params.session).and_then(|slot| slot.steering())
