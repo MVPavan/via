@@ -4966,3 +4966,50 @@ fn tombstone_exhaustion_stops_the_running_turn_at_once() {
         assert!(record.vendor.overflowed, "its terminal reads overflow");
     });
 }
+
+/// Critical r1 #10 (C2 reserves no vendor turn ID prefix): the Store keeps
+/// an acceptance's correlation tagged, so a vendor turn ID that reads like
+/// the synthetic token form, `token:1`, is still the vendor's after a
+/// restart: the recovered envelope names it.
+#[test]
+fn a_token_like_vendor_turn_id_survives_a_restart() {
+    let Some(root) = child("a_token_like_vendor_turn_id_survives_a_restart") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let (session, slot, lane, mut record, effective, orders) =
+                running_turn_2_with(&earlier, &root, false).await;
+            let vendor_turn =
+                || via_adapters::VendorTurnId::try_from("token:1".to_owned()).unwrap();
+            let accepted = via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: Some(vendor_turn()),
+                observation: via_adapters::Observation::Accepted(
+                    via_adapters::observation::Acceptance {
+                        correlation: via_adapters::AcceptanceToken::FIRST,
+                        vendor_turn_id: Some(vendor_turn()),
+                    },
+                ),
+            };
+            earlier
+                .drain_queued(
+                    (&slot, Some(&*lane)),
+                    &mut record,
+                    &effective,
+                    orders,
+                    vec![accepted],
+                )
+                .await;
+            assert!(record.accepted.is_some(), "turn 2 accepted");
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        let envelope = engine.result(&format!("{session}/2")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(envelope["vendor"]["turn_id"], "token:1", "{envelope}");
+    });
+}

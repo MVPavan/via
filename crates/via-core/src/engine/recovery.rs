@@ -726,13 +726,16 @@ fn recovered_terminal(cancel: Cancel) -> Terminal {
     }
 }
 
-/// Acceptance is reported only when both its evidence and its event committed.
+/// Acceptance is reported only when both its evidence and its event
+/// committed. Its vendor turn ID is the tagged correlation's (critical r1
+/// #10); a token names none.
 fn recovered_acceptance(correlation: Option<String>, started: Option<String>) -> Option<Accepted> {
     match (correlation, started) {
         (Some(correlation), Some(at)) => Some(Accepted {
             at,
-            vendor_turn_id: (!correlation.starts_with(super::drive::TOKEN_CORRELATION))
-                .then_some(correlation),
+            vendor_turn_id: correlation
+                .strip_prefix(super::drive::VENDOR_CORRELATION)
+                .map(str::to_owned),
         }),
         _ => None,
     }

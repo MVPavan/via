@@ -39,10 +39,15 @@ use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
 
-/// The Store correlation prefix of an acceptance with no vendor turn ID:
-/// the acceptance token follows it. Recovery reports no vendor turn ID for
+/// The Store correlation tag of an acceptance with no vendor turn ID: the
+/// acceptance token follows it. Recovery reports no vendor turn ID for
 /// such an acceptance.
-pub(super) const TOKEN_CORRELATION: &str = "token:";
+pub(super) const TOKEN_CORRELATION: &str = "t:";
+
+/// The Store correlation tag of an acceptance's vendor turn ID, which
+/// follows it verbatim. Every correlation is tagged, so no vendor ID reads
+/// as a token (critical r1 #10: C2 reserves no prefix of its own).
+pub(super) const VENDOR_CORRELATION: &str = "v:";
 
 /// C1 P7's tool-grace window.
 const TOOL_GRACE: Duration = Duration::from_secs(60);
@@ -1841,10 +1846,10 @@ impl Engine {
                     // establishes nothing.
                     return;
                 }
-                let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref())
-                    .unwrap_or_else(|| {
-                        format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get())
-                    });
+                let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref()).map_or_else(
+                    || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
+                    |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
+                );
                 let vendor_turn_id = acceptance
                     .vendor_turn_id
                     .as_ref()
@@ -2405,8 +2410,8 @@ impl Engine {
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
     /// A failure carries its classified outcome ([`WriteOutcome::of`]) and,
     /// when the head is unknown, the acceptance and the event sent.
-    /// `correlation` is the acceptance's Store correlation: the vendor turn
-    /// ID, else the acceptance token. `adapter_version`, the running
+    /// `correlation` is the acceptance's tagged Store correlation: the
+    /// vendor turn ID, else the acceptance token. `adapter_version`, the running
     /// adapter's, becomes the session's recorded one in the same commit
     /// (C1 §3.3, decision H3).
     async fn accept(
