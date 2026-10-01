@@ -157,7 +157,7 @@ pub use capabilities::{
 };
 pub use config::{
     AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture, HarnessConfig,
-    HarnessesError, HarnessesRule,
+    HarnessSettings, HarnessesError, HarnessesRule,
 };
 pub use driver::{
     CloseMode, CloseReport, ConnectionPin, ForceWatch, Prepared, Recovery, SessionCx,

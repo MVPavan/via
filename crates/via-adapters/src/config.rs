@@ -213,25 +213,54 @@ impl HarnessConfig {
     }
 }
 
+/// The validated `harnesses` section of `daemon.json` (runtime §8, design
+/// §5.4): one [`HarnessConfig`] per [`HARNESSES`] row, in table order. The
+/// default is every harness's defaults, an absent section's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessSettings(Vec<HarnessConfig>);
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        Self(vec![DEFAULT_HARNESS.clone(); HARNESSES.len()])
+    }
+}
+
+impl HarnessSettings {
+    /// Parses a `harnesses` section, purely: no I/O, so daemon start
+    /// refuses an invalid `daemon.json` before touching anything, and keeps
+    /// the result for [`AdapterConfig::with_harnesses`].
+    pub fn parse(raw: &RawValue) -> Result<Self, HarnessesError> {
+        parse_harnesses(raw).map(Self)
+    }
+}
+
 /// Per-harness settings, the bootstrap environment and the fake fixture,
 /// validated once at daemon start.
 #[derive(Debug)]
 pub struct AdapterConfig {
     env: BootstrapEnv,
     fake: Option<FakeFixture>,
-    /// One entry per [`HARNESSES`] row, in table order.
-    harnesses: Vec<HarnessConfig>,
+    harnesses: HarnessSettings,
 }
 
 impl AdapterConfig {
-    /// Validates the fixture environment (all three paths or none), reads
-    /// the fake's profile from the scenario once (H2) and parses
-    /// `harnesses` (runtime §8): any invalid member is refused.
+    /// [`HarnessSettings::parse`] of `harnesses`, when present, then
+    /// [`Self::with_harnesses`]: any invalid member is refused.
     pub fn load(env: BootstrapEnv, harnesses: Option<&RawValue>) -> Result<Self, ConfigError> {
         let harnesses = match harnesses {
-            Some(raw) => parse_harnesses(raw)?,
-            None => vec![DEFAULT_HARNESS.clone(); HARNESSES.len()],
+            Some(raw) => HarnessSettings::parse(raw)?,
+            None => HarnessSettings::default(),
         };
+        Self::with_harnesses(env, harnesses)
+    }
+
+    /// Validates the fixture environment (all three paths or none) and
+    /// reads the fake's profile from the scenario once (H2), keeping the
+    /// already validated `harnesses`.
+    pub fn with_harnesses(
+        env: BootstrapEnv,
+        harnesses: HarnessSettings,
+    ) -> Result<Self, ConfigError> {
         let paths = [
             env.get("VIA_FAKE_AGENT_BINARY"),
             env.get("VIA_FAKE_SCENARIO"),
@@ -276,7 +305,7 @@ impl AdapterConfig {
         HARNESSES
             .iter()
             .position(|known| known == row)
-            .and_then(|index| self.harnesses.get(index))
+            .and_then(|index| self.harnesses.0.get(index))
             .unwrap_or(&DEFAULT_HARNESS)
     }
 
@@ -287,13 +316,6 @@ impl AdapterConfig {
             Harness::Vendor(row) => self.harness(row).inherit(),
             Harness::Fake => Inherit::OD2_DEFAULT,
         }
-    }
-
-    /// Validates a `harnesses` section with [`Self::load`]'s rules, purely:
-    /// daemon start refuses an invalid `daemon.json` before touching
-    /// anything (runtime §8).
-    pub fn check_harnesses(raw: &RawValue) -> Result<(), HarnessesError> {
-        parse_harnesses(raw).map(drop)
     }
 
     /// Takes the fake's fixture, when configured.

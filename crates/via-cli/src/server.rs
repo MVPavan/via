@@ -15,8 +15,9 @@ use tokio::{
     task::JoinSet,
 };
 
-use serde_json::value::RawValue;
-use via_core::{AdapterConfig, ApiError, BootstrapEnv, Engine, Limits, SessionId, StoreLock};
+use via_core::{
+    AdapterConfig, ApiError, BootstrapEnv, Engine, HarnessSettings, Limits, SessionId, StoreLock,
+};
 
 mod config;
 mod dispatch;
@@ -181,7 +182,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         &socket,
         &paths,
         (store_lock, limits),
-        harnesses.as_deref(),
+        harnesses,
     ))
     .await;
     if served.is_err() {
@@ -200,7 +201,7 @@ async fn serve_bound(
     socket: &Path,
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
-    harnesses: Option<&RawValue>,
+    harnesses: HarnessSettings,
 ) -> anyhow::Result<i32> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
@@ -296,12 +297,12 @@ async fn serve_bound(
 async fn open_engine(
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
-    harnesses: Option<&RawValue>,
+    harnesses: HarnessSettings,
 ) -> anyhow::Result<Arc<Engine>> {
     // Design §5.1 #42: the bootstrap names the client forwarded, and the
     // config's `harnesses`.
-    let adapters =
-        AdapterConfig::load(BootstrapEnv::capture(), harnesses).map_err(anyhow::Error::msg)?;
+    let adapters = AdapterConfig::with_harnesses(BootstrapEnv::capture(), harnesses)
+        .map_err(anyhow::Error::msg)?;
     let state = paths.state.clone();
     let runtime = paths.runtime.clone();
     let binary = std::env::current_exe()?;

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use serde_json::value::RawValue;
 use via_adapters::{
     AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
-    Harness, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState, InstanceCache,
-    VERSIONS_KEPT, resolve_binary,
+    Harness, HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit,
+    InheritState, InstanceCache, VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -106,7 +106,7 @@ fn s_launch_harnesses_error_text_is_bounded() {
         format!(r#"{{"{long}":{{}}}}"#),
         format!(r#"{{"claude":{{"inherit":{{"{long}":true}}}}}}"#),
     ] {
-        let error = AdapterConfig::check_harnesses(&raw(&text)).unwrap_err();
+        let error = HarnessSettings::parse(&raw(&text)).unwrap_err();
         let shown = error.to_string();
         assert!(
             !shown.chars().any(char::is_control),
@@ -217,7 +217,7 @@ fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
 }
 
 /// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
-/// named error, from `load` and from the pure `check_harnesses` alike; a
+/// named error, from `load` and from the pure `HarnessSettings::parse` alike; a
 /// key repeated at any level is refused.
 #[test]
 fn s_launch_harnesses_refusals() {
@@ -227,7 +227,7 @@ fn s_launch_harnesses_refusals() {
             rule,
         };
         assert_eq!(
-            AdapterConfig::check_harnesses(&raw(text)).as_ref(),
+            HarnessSettings::parse(&raw(text)).as_ref(),
             Err(&expected),
             "{text}"
         );
@@ -244,12 +244,13 @@ fn s_launch_harnesses_refusals() {
 #[test]
 fn s_launch_harnesses_valid() {
     use InheritState::{Off, On};
-    let config = load(
-        r#"{"claude":{"binary":"/opt/vendor/claude","inherit":{"hooks":true,"skills":false}},
+    let text = r#"{"claude":{"binary":"/opt/vendor/claude","inherit":{"hooks":true,"skills":false}},
             "codex":{"inherit":{}},
-            "opencode":{}}"#,
-    )
-    .unwrap();
+            "opencode":{}}"#;
+    // Parsed once (critical r1 #6): the typed settings build the config.
+    let settings = HarnessSettings::parse(&raw(text)).unwrap();
+    let config = AdapterConfig::with_harnesses(none(), settings).unwrap();
+    assert_eq!(format!("{config:?}"), format!("{:?}", load(text).unwrap()));
     let claude = config.harness(HARNESSES.iter().find(|r| r.name == "claude").unwrap());
     assert_eq!(claude.binary(), Some(Path::new("/opt/vendor/claude")));
     let inherit = config.inherit(row("claude"));

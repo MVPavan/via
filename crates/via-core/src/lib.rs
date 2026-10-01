@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use via_adapters::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Cleanup, ConfigError};
+pub use via_adapters::{
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Cleanup, ConfigError, HarnessSettings,
+};
 pub use via_store::{
     CommitOutcome, Deadline, PAGE_BYTES, SessionId, StoreLock, TurnNumber, WalLimits,
 };

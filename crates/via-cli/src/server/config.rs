@@ -2,9 +2,9 @@
 //! once at start, before any Store or socket change; absent means every
 //! default. An invalid file names its key and the rule it broke.
 //!
-//! `harnesses` is validated here by the adapter layer's own pure parser
+//! `harnesses` is parsed here, once, by the adapter layer's own pure parser
 //! (runtime §8), so an invalid section is an invalid file like any other
-//! key; the validated text is then passed to `AdapterConfig::load`.
+//! key; the typed settings are then passed to `AdapterConfig::with_harnesses`.
 
 use std::{
     fmt,
@@ -16,7 +16,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
-use via_core::{AdapterConfig, ConfigError, Limits, PAGE_BYTES};
+use via_core::{ConfigError, HarnessSettings, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -98,12 +98,12 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// What `daemon.json` configures: the validated limits and the validated
-/// `harnesses` object, if present.
+/// What `daemon.json` configures: the validated limits and `harnesses`
+/// settings.
 #[derive(Debug, Default)]
 pub(super) struct Config {
     pub(super) limits: Limits,
-    pub(super) harnesses: Option<Box<RawValue>>,
+    pub(super) harnesses: HarnessSettings,
 }
 
 /// Reads `<state>/daemon.json`: defaults when it is absent, else the
@@ -156,10 +156,11 @@ pub(super) fn read(state: &Path) -> Result<Config, Invalid> {
 /// Parses and validates the file's text (§5.5).
 fn parse(text: &[u8]) -> Result<Config, Invalid> {
     let file: File = serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
-    if let Some(raw) = &file.harnesses {
-        AdapterConfig::check_harnesses(raw)
-            .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?;
-    }
+    let harnesses = match &file.harnesses {
+        Some(raw) => HarnessSettings::parse(raw)
+            .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?,
+        None => HarnessSettings::default(),
+    };
     let mut limits = Limits::default();
     if let Some(raw) = file.disk {
         let disk: Disk =
@@ -214,10 +215,7 @@ fn parse(text: &[u8]) -> Result<Config, Invalid> {
             "must be above wal.checkpoint_bytes",
         ));
     }
-    Ok(Config {
-        limits,
-        harnesses: file.harnesses,
-    })
+    Ok(Config { limits, harnesses })
 }
 
 /// A value in bytes: a non-negative integer at most 2^62.
@@ -319,15 +317,22 @@ mod tests {
 
     /// Runtime §8, S-LAUNCH: `harnesses` is validated at read, like every
     /// other key, by the adapter layer's rules; each refusal names its
-    /// member, and a duplicate key at any level is refused.
+    /// member, and a duplicate key at any level is refused. The section is
+    /// parsed once: the read keeps the typed settings for the adapters.
     #[test]
     fn harnesses_are_validated_like_other_keys() {
         let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("valid");
+        let section =
+            RawValue::from_string(r#"{"claude":{"binary":"/x"}}"#.to_owned()).expect("section");
         assert_eq!(
-            config.harnesses.expect("kept").get(),
-            r#"{"claude":{"binary":"/x"}}"#
+            config.harnesses,
+            HarnessSettings::parse(&section).expect("settings")
         );
-        assert!(parse(b"{}").expect("empty").harnesses.is_none());
+        assert_ne!(config.harnesses, HarnessSettings::default());
+        assert_eq!(
+            parse(b"{}").expect("empty").harnesses,
+            HarnessSettings::default()
+        );
         let cases = [
             (r#"{"harnesses":[]}"#, "harnesses: must be an object"),
             (r#"{"harnesses":null}"#, "harnesses: must be an object"),
