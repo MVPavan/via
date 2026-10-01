@@ -1,15 +1,20 @@
 //! C2 §4 observation and turn-end types (adapter design §3.2, AD4, AD6,
-//! AD7, AD20). Types only: the driver that produces them comes with the
-//! fake driver lane. Kept in this module, not re-exported at the crate
-//! root, because the legacy `Observation` still lives there.
+//! AD7, AD20) and the per-session observation channel the driver lane
+//! sends them on. Kept in this module, not re-exported at the crate root,
+//! because the legacy `Observation` and channel still live there.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::value::RawValue;
-use tokio::time::Instant;
+use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
+use tokio::time::{Instant, timeout_at};
 
 use crate::plan::{VersionStatus, Warning};
-use crate::{AcceptanceToken, AdapterError, Cleanup, VendorTerminalStatus, VendorTurnId};
+use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
+use crate::{AcceptanceToken, Cleanup, StartRejected, VendorTerminalStatus, VendorTurnId};
 
 /// A vendor message's progress marks (C2 §4 `progress`); the arrival time
 /// is the item's `at`. Replaces the legacy root `ProgressMarks` once Core
@@ -291,5 +296,138 @@ pub struct TurnEnd {
     /// Per-turn routes on every outcome, and server loss (AD20).
     pub leftovers: Option<LeftoverReport>,
     /// Process and cleanup facts, or a typed failure.
-    pub outcome: Result<TurnEvidence, AdapterError>,
+    pub outcome: Result<TurnEvidence, TurnError>,
+}
+
+/// A failed driver-lane turn (C2 §2 `AdapterError` for the lane; the legacy
+/// `AdapterError` stays for the legacy path until Core moves).
+#[derive(Debug, Error)]
+pub enum TurnError {
+    /// A route cause with Route's evidence: S1's causes, `ServerLost` and
+    /// transport loss on the persistent profile, and `HandshakeRefused`.
+    #[error("fake route failed: {0:?}")]
+    Route(via_routes::TurnFailure),
+    /// A definite rejection before submission; nothing was sent.
+    #[error("the turn was rejected before submission: {0:?}")]
+    Rejected(StartRejected),
+    /// No adapter serves the session's harness in this daemon.
+    #[error("the harness is not available in this daemon")]
+    Unavailable,
+}
+
+/// One observation in the session channel with its share of the session's
+/// 4 MiB budget: Core holds `permit` until it has handled the item.
+pub struct Admitted {
+    /// The observation.
+    pub item: ObservationItem,
+    /// The item's bytes of the budget.
+    pub permit: OwnedSemaphorePermit,
+}
+
+/// The sending side of one session's observation channel (C2 A1: 1,024
+/// items and 4 MiB per session); Core keeps the receiver.
+#[derive(Clone)]
+pub struct ObservationSink {
+    sender: mpsc::Sender<Admitted>,
+    budget: Arc<Semaphore>,
+}
+
+/// One session's observation channel (C2 §2 `SessionCx`).
+pub fn observation_channel() -> (ObservationSink, mpsc::Receiver<Admitted>) {
+    // Full: the driver waits, up to the stall bound, then fails the turn
+    // `overflow` (C2 §7 item 12).
+    let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
+    let budget = Arc::new(Semaphore::new(OBSERVATION_BYTES));
+    (ObservationSink { sender, budget }, receiver)
+}
+
+/// An item the channel did not take within the stall bound, or whose
+/// receiver is gone.
+#[derive(Debug)]
+pub(crate) struct Undelivered;
+
+impl ObservationSink {
+    /// Sends `item`: acquires its byte cost, then a slot. The item owns one
+    /// stall deadline, set at its first block; at it the send gives up.
+    pub(crate) async fn send(
+        &self,
+        item: ObservationItem,
+        stall: Duration,
+    ) -> Result<(), Undelivered> {
+        let mut stall_at = None;
+        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered)?;
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
+                    .await
+                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered)?
+            }
+            Err(TryAcquireError::Closed) => return Err(Undelivered),
+        };
+        let admitted = Admitted { item, permit };
+        match self.sender.try_send(admitted) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(admitted)) => {
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, self.sender.send(admitted))
+                    .await
+                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered),
+        }
+    }
+}
+
+/// An item's cost against the byte budget: `512 + Σ(64 + len)` over its
+/// strings (Task 4 design §2.3).
+fn item_cost(item: &ObservationItem) -> usize {
+    let mut strings: Vec<&str> = Vec::new();
+    if let Some(vendor_turn) = &item.vendor_turn {
+        strings.push(vendor_turn.as_str());
+    }
+    match &item.observation {
+        Observation::Accepted(_) | Observation::SteerDelivered(_) => {}
+        Observation::IdentityConfirmed(identity) => {
+            strings.push(&identity.vendor_session_id);
+            strings.push(&identity.connection_id);
+        }
+        Observation::Progress(marks) => {
+            for (id, name) in &marks.tools_started {
+                strings.push(id);
+                strings.push(name);
+            }
+            strings.extend(marks.tools_ended.iter().map(String::as_str));
+            if let Some(key) = marks.usage.as_ref().and_then(|usage| usage.key.as_deref()) {
+                strings.push(key);
+            }
+        }
+        Observation::FinalText(text) | Observation::VendorClosed(text) => strings.push(text),
+        Observation::ActionDenied(denial) => {
+            strings.push(&denial.target);
+            strings.push(&denial.reason);
+        }
+        Observation::RequestDeclined(decline) => {
+            strings.push(&decline.vendor_method);
+            strings.push(&decline.summary);
+        }
+        Observation::Warning(warning) => strings.push(&warning.message),
+        Observation::ResumeMismatch {
+            requested,
+            returned,
+        } => {
+            strings.push(requested);
+            strings.push(returned);
+        }
+        Observation::LateTerminal(terminal) => {
+            strings.push(&terminal.vendor_stop_reason);
+        }
+    }
+    512 + strings
+        .iter()
+        .map(|string| 64 + string.len())
+        .sum::<usize>()
 }

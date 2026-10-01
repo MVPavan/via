@@ -2,8 +2,10 @@
 //! with its fixture configured. Its plan comes from its scenario profile;
 //! it has no handshake and never refuses a version.
 
+mod driver;
 mod profile;
 
+pub(crate) use driver::run_turn;
 pub(crate) use profile::FakeProfile;
 
 use crate::config::FakeFixture;
@@ -30,6 +32,37 @@ struct PerTurn<'a> {
 impl FakeAdapter {
     pub(crate) fn new(fixture: FakeFixture) -> Self {
         Self { fixture }
+    }
+
+    /// The scenario's profile.
+    pub(crate) fn profile(&self) -> &FakeProfile {
+        &self.fixture.profile
+    }
+
+    /// The fake agent's launch for one turn, in the session's frozen `cwd`
+    /// (runtime §11.1): only the scenario and sync paths are passed on.
+    pub(crate) fn process_spec(
+        &self,
+        owner: crate::ProcessOwner,
+        cwd: &std::path::Path,
+    ) -> Result<crate::PrivateProcessSpec, &'static str> {
+        let env = [
+            ("VIA_FAKE_SCENARIO", self.fixture.scenario()),
+            ("VIA_FAKE_SYNC_DIR", self.fixture.sync_dir()),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name.into(), path.as_os_str().to_os_string()))
+        .collect();
+        Ok(crate::PrivateProcessSpec {
+            program: self.fixture.binary().to_path_buf(),
+            args: Vec::new(),
+            cwd: cwd.to_path_buf(),
+            env: crate::EnvAllowList::try_from_entries(env)?,
+            owner,
+            // Wire creates the turn's evidence folder and names the file in it.
+            stderr_path: std::path::PathBuf::new(),
+            capacity: None,
+        })
     }
 
     /// The bundled catalog.

@@ -29,7 +29,7 @@ const EVENT_STALL: Duration = Duration::from_secs(10);
 
 /// The stall bound: 10 s. Test builds only: `VIA_TEST_EVENT_STALL_MS`
 /// lowers it (Task 4 design §13.1).
-fn event_stall() -> Duration {
+pub(crate) fn event_stall() -> Duration {
     #[cfg(feature = "test-failpoints")]
     if let Some(lowered) = std::env::var("VIA_TEST_EVENT_STALL_MS")
         .ok()
@@ -116,7 +116,7 @@ impl AdapterError {
 }
 
 /// Passive recovery facts for Core's later crash reconciliation.
-pub struct FakeRecovery {
+pub struct AnchorRecovery {
     /// Owning VIA session.
     pub session_id: SessionId,
     /// Opaque committed anchor identifier.
@@ -295,28 +295,8 @@ impl AdapterRuntime {
         &self,
         deadline: Deadline,
         turns: &[(SessionId, TurnNumber)],
-    ) -> FakeShutdown {
-        let report = self.route.shutdown(deadline, turns).await;
-        FakeShutdown {
-            recovery: report
-                .recovery
-                .into_iter()
-                .map(|turn| FakeTurnRecovery {
-                    session_id: turn.owner_session,
-                    turn: turn.owner_turn,
-                    cleanup: match turn.cleanup {
-                        via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,
-                        via_routes::WireCleanup::Uncertain => Cleanup::Uncertain,
-                    },
-                    forced: turn.forced,
-                })
-                .collect(),
-            anchors: report.anchors,
-            uncertain_anchors: report.uncertain_anchors,
-            pending_tasks: report.pending_tasks,
-            failed_tasks: report.failed_tasks,
-            failure: report.failure,
-        }
+    ) -> AdapterShutdown {
+        shutdown_report(self.route.shutdown(deadline, turns).await)
     }
 
     /// Hands Host capacity for a group it did not launch, such as one an
@@ -382,7 +362,7 @@ impl AdapterRuntime {
         after: Option<String>,
         limit: u32,
         deadline: Deadline,
-    ) -> Result<Vec<FakeRecovery>, AdapterError> {
+    ) -> Result<Vec<AnchorRecovery>, AdapterError> {
         self.route
             .recover_page(after, limit, deadline)
             .await
@@ -398,7 +378,7 @@ impl AdapterRuntime {
         limit: u32,
         cohort: via_routes::AnchorCohort,
         deadline: Deadline,
-    ) -> Result<Vec<FakeRecovery>, AdapterError> {
+    ) -> Result<Vec<AnchorRecovery>, AdapterError> {
         self.route
             .recover_cohort_page(after, limit, cohort, deadline)
             .await
@@ -609,8 +589,37 @@ fn normalize_terminal(result: FakeRouteResult) -> FakeTerminalEvidence {
     }
 }
 
-fn normalize_recovery(report: WireRecovery) -> FakeRecovery {
-    FakeRecovery {
+/// Route's passive shutdown report as the Adapter's.
+pub(crate) fn shutdown_report(report: via_routes::WireShutdown) -> AdapterShutdown {
+    AdapterShutdown {
+        recovery: report
+            .recovery
+            .into_iter()
+            .map(|turn| AnchorTurnRecovery {
+                session_id: turn.owner_session,
+                turn: turn.owner_turn,
+                cleanup: cleanup(turn.cleanup),
+                forced: turn.forced,
+            })
+            .collect(),
+        anchors: report.anchors,
+        uncertain_anchors: report.uncertain_anchors,
+        pending_tasks: report.pending_tasks,
+        failed_tasks: report.failed_tasks,
+        failure: report.failure,
+    }
+}
+
+/// Route's cleanup certainty as the Adapter's.
+pub(crate) fn cleanup(cleanup: via_routes::WireCleanup) -> Cleanup {
+    match cleanup {
+        via_routes::WireCleanup::Quiescent => Cleanup::Quiescent,
+        via_routes::WireCleanup::Uncertain => Cleanup::Uncertain,
+    }
+}
+
+pub(crate) fn normalize_recovery(report: WireRecovery) -> AnchorRecovery {
+    AnchorRecovery {
         session_id: report.owner_session,
         anchor_id: report.anchor_id,
         generation: report.generation,
@@ -623,8 +632,15 @@ fn normalize_recovery(report: WireRecovery) -> FakeRecovery {
     }
 }
 
+/// The legacy name of [`AnchorRecovery`].
+pub type FakeRecovery = AnchorRecovery;
+/// The legacy name of [`AnchorTurnRecovery`].
+pub type FakeTurnRecovery = AnchorTurnRecovery;
+/// The legacy name of [`AdapterShutdown`].
+pub type FakeShutdown = AdapterShutdown;
+
 /// Passive per-turn shutdown recovery facts.
-pub struct FakeTurnRecovery {
+pub struct AnchorTurnRecovery {
     /// Owning VIA session.
     pub session_id: SessionId,
     /// Owning turn.
@@ -636,9 +652,9 @@ pub struct FakeTurnRecovery {
 }
 
 /// Passive shutdown status; no Host operation or signal handle escapes Adapter.
-pub struct FakeShutdown {
+pub struct AdapterShutdown {
     /// Per-turn recovery facts for the requested turns.
-    pub recovery: Vec<FakeTurnRecovery>,
+    pub recovery: Vec<AnchorTurnRecovery>,
     /// Committed anchors reconciled.
     pub anchors: usize,
     /// Reconciled anchors without positive absence proof.

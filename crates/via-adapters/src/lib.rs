@@ -25,6 +25,9 @@ impl TryFrom<u64> for AcceptanceToken {
 }
 
 impl AcceptanceToken {
+    /// The token of a connection's one start request.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
     /// Returns the request correlation number.
     pub fn get(self) -> u64 {
         self.0.get()
@@ -58,6 +61,11 @@ impl VendorTurnId {
 pub enum StartRejected {
     /// The route cannot enforce the requested bound.
     BoundUnsupported(String),
+    /// A per-turn parameter the route refuses (AD18).
+    InvalidParam {
+        /// The C1 parameter.
+        field: &'static str,
+    },
     /// Vendor returned a definite error code and description.
     VendorError(String, String),
     /// The vendor session no longer exists.
@@ -145,17 +153,23 @@ pub enum DriverHealth {
 
 mod capabilities;
 mod config;
+mod driver;
 mod fake;
 mod fake_config;
 mod harness;
 pub mod observation;
 mod plan;
 mod runtime;
+mod set;
 
 pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
 pub use config::{AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture};
+pub use driver::{
+    CloseMode, CloseReport, ConnectionPin, ForceWatch, Prepared, Recovery, SessionCx,
+    SessionDriver, SessionSpec, SteerError, SteerInput, TurnCx, TurnSpec,
+};
 pub use fake_config::FakeConfig;
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use plan::{
@@ -164,13 +178,13 @@ pub use plan::{
     SessionRef, Switch, TurnParams, VendorOptions, VersionStatus, Warning, resolve_model,
 };
 pub use runtime::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdmittedObservation, FakeRecovery,
-    FakeShutdown, FakeTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink,
-    observation_channel,
+    AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdapterShutdown, AdmittedObservation,
+    AnchorRecovery, AnchorTurnRecovery, FakeRecovery, FakeShutdown, FakeTurnRecovery,
+    OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink, observation_channel,
 };
 pub use via_routes::{
-    CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, RuntimeConfig, RuntimeResources,
-    SessionId, WireCleanup,
+    AnchorCohort, CapacityToken, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner,
+    RuntimeConfig, RuntimeResources, SessionId, TurnCause, TurnFailure, WireCleanup,
 };
 
 /// Fake terminal status as vendor evidence; Core chooses the C1 disposition.
