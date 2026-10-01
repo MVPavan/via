@@ -606,7 +606,7 @@ catalog cache of live instances; nothing is persisted.
 
 **Usage (AD6).** Usage is reported one of two ways, and each route declares
 which it uses:
-- per model call, as `progress.usage: UsageSample`, where a keyed sample
+- per model call, as `progress.usage: UsageSample` (`key: Option<String>` and the nullable counters `input`, `cached_input`, `output`, `reasoning_output`, `total`, which are C1's usage token fields), where a keyed sample
   supersedes an earlier sample with the same key and a keyless sample adds;
 - as a turn aggregate in `VendorTerminal.usage`, which supersedes every call
   sample of the turn for the envelope.
