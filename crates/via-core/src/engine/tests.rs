@@ -5013,3 +5013,85 @@ fn a_token_like_vendor_turn_id_survives_a_restart() {
         assert_eq!(envelope["vendor"]["turn_id"], "token:1", "{envelope}");
     });
 }
+
+/// Critical r1 #11 (C1 §5: the envelope's transcript matches `logs`): a
+/// turn recovered after its session's identity was committed carries the
+/// stored vendor session ID and transcript hint, as `logs` reports them;
+/// no measurement is invented.
+#[test]
+fn a_recovered_envelope_keeps_the_stored_identity() {
+    let Some(root) = child("a_recovered_envelope_keeps_the_stored_identity") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            earlier
+                .store
+                .commit_identity(via_store::SessionEventRecord {
+                    session_id: session.clone(),
+                    event: Some(
+                        Event {
+                            seq: 2,
+                            session_id: &session,
+                            turn: None,
+                            late: false,
+                            at: &rfc3339(std::time::SystemTime::now()),
+                            body: EventBody::SessionOpened {
+                                route: "fake".to_owned(),
+                                vendor_session_id: "vs-1".to_owned(),
+                                vendor_version: None,
+                            },
+                        }
+                        .to_value()
+                        .unwrap(),
+                    ),
+                    identity: Some(via_store::SessionIdentity {
+                        vendor_session_id: "vs-1".to_owned(),
+                        transcript: Some("/t/vs-1.jsonl".to_owned()),
+                    }),
+                })
+                .await
+                .unwrap();
+            let submitted = Event {
+                seq: 3,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &rfc3339(std::time::SystemTime::now()),
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        let params = serde_json::from_value(json!({"turn": format!("{session}/1")})).unwrap();
+        let logs = engine.logs(params).await.unwrap();
+        assert_eq!(logs["vendor_session_id"], "vs-1", "{logs}");
+        assert_eq!(
+            (
+                &envelope["vendor_session_id"],
+                &envelope["evidence"]["transcript"]
+            ),
+            (&logs["vendor_session_id"], &logs["transcript"]),
+            "{envelope}"
+        );
+        assert!(envelope["usage"]["total_tokens"].is_null(), "{envelope}");
+        assert!(envelope["duration_ms"].is_null(), "{envelope}");
+    });
+}

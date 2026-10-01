@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use super::drive::{Cancelled, Commit, queued_cancellation};
 use super::journal::Head;
+use super::lane::Identity;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
@@ -324,8 +325,8 @@ impl Engine {
             queued_seq,
             ..
         } = self.history(session, turn).await?;
-        let cwd = self
-            .frozen_cwd(session)
+        let (cwd, _) = self
+            .frozen(session)
             .await
             .map_err(|error| WriteOutcome::of_read(&error))?;
         Ok(Queueing {
@@ -343,14 +344,20 @@ impl Engine {
             .to_string()
     }
 
-    /// The session's frozen `cwd` (design §11.1), which a rebuilt envelope
-    /// reports as the live drive would.
-    async fn frozen_cwd(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
+    /// The session's frozen `cwd` (design §11.1) and its stored identity
+    /// (decision H3), which a rebuilt envelope reports as the live drive
+    /// and `logs` would (C1 §5, critical r1 #11).
+    async fn frozen(
+        &self,
+        session: &SessionId,
+    ) -> Result<(Option<String>, Option<Identity>), StoreError> {
         Ok(self
             .store
             .session_snapshot(session)
             .await?
-            .and_then(|snapshot| snapshot.cwd))
+            .map_or((None, None), |snapshot| {
+                (snapshot.cwd, Identity::stored(&snapshot.route))
+            }))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -509,10 +516,7 @@ impl Engine {
             .history(&session, turn)
             .await
             .map_err(|_| ApiError::STORE)?;
-        let cwd = self
-            .frozen_cwd(&session)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        let (cwd, identity) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -569,6 +573,7 @@ impl Engine {
             (queued_seq, seq),
             // The crashed daemon's samples are gone with it.
             Usage::UNAVAILABLE,
+            identity,
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(

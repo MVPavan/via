@@ -457,6 +457,7 @@ pub(super) async fn commit_submit_failed(
         None,
         (queueing.queued_seq, ended_seq),
         Usage::UNAVAILABLE,
+        None,
     );
     let envelope = serde_json::to_value(&envelope).map_err(|_| SubmitFailed::Encode)?;
     let committed = store

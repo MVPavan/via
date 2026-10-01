@@ -262,6 +262,18 @@ pub(super) struct Identity {
 }
 
 impl Identity {
+    /// The identity the session last committed, with its transcript hint,
+    /// as its columns hold it (decision H3).
+    pub(super) fn stored(route: &SessionRoute) -> Option<Self> {
+        route
+            .vendor_session_id
+            .clone()
+            .map(|vendor_session_id| Self {
+                vendor_session_id,
+                transcript: route.transcript.clone(),
+            })
+    }
+
     /// The session's identity columns this identity's open event writes
     /// (decision H3 as narrowed).
     pub(super) fn columns(&self) -> SessionIdentity {
@@ -305,13 +317,7 @@ impl LaneState {
     /// decision H3): the identity the session last committed, with its
     /// transcript.
     fn recovered(route: &SessionRoute) -> Self {
-        let identity = route
-            .vendor_session_id
-            .clone()
-            .map(|vendor_session_id| Identity {
-                vendor_session_id,
-                transcript: route.transcript.clone(),
-            });
+        let identity = Identity::stored(route);
         Self {
             opened: identity.is_some(),
             identity,

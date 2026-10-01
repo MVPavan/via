@@ -7,7 +7,7 @@ use via_adapters::{
 };
 use via_store::CancelCause;
 
-use super::lane::VendorRecord;
+use super::lane::{Identity, VendorRecord};
 use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
@@ -21,7 +21,8 @@ use crate::{SessionId, TurnNumber};
 /// its `turn.ended`, other turns' events of the session included. `cwd` is
 /// the session's frozen working directory (design §11.1), `None` where the
 /// caller did not read it; `folder` is the turn's absolute evidence folder,
-/// `None` for a turn never submitted.
+/// `None` for a turn never submitted. `identity` is the session's stored
+/// one where the caller read it (critical r1 #11).
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -36,6 +37,7 @@ pub(super) fn terminal_envelope(
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
     usage: Usage,
+    identity: Option<Identity>,
 ) -> Envelope {
     assemble(
         (session, turn),
@@ -45,7 +47,10 @@ pub(super) fn terminal_envelope(
         (timestamps, duration_ms),
         (first_seq, last_seq),
         (usage, false),
-        VendorRecord::default(),
+        VendorRecord {
+            identity,
+            ..VendorRecord::default()
+        },
     )
 }
 
@@ -671,7 +676,7 @@ pub fn envelope_at_maximum(
     declined: u64,
     entry_bytes: usize,
 ) -> Result<String, crate::ApiError> {
-    use super::lane::{Identity, Retained};
+    use super::lane::Retained;
     use crate::api::{
         Cancel, FINAL_TEXT_INLINE, FinalTextFile, Kept, STRUCTURED_OUTPUT_INLINE,
         StructuredOutputFile, Tokens, maxima,
