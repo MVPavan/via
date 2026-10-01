@@ -475,7 +475,7 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             session_id: session.clone(),
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
-            params: json!({"harness":"fake"}),
+            params: json!({"harness":"fake","model":"fake"}),
             label: None,
             prompt: "hello".into(),
             effective: frozen(),
