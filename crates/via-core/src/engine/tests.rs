@@ -4723,3 +4723,82 @@ fn a_cancellation_during_the_lane_drain_wait_never_closes_the_session() {
         .await;
     });
 }
+
+/// Critical r1 #1 (runtime §8): a producer that keeps the session channel
+/// non-empty holds neither the turn's start nor its end. The pre-turn
+/// drain takes only what the channel held when the turn was handed over,
+/// and the final drain only what it held when the driver returned; later
+/// items are the running turn's, or the lane's between turns.
+#[test]
+fn a_never_empty_channel_holds_neither_the_turn_nor_its_end() {
+    let Some(root) = child("a_never_empty_channel_holds_neither_the_turn_nor_its_end") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{Observation, Prepared, ProgressMarks, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1024);
+        // Each time it runs, the producer fills the channel to the brim.
+        let producer = tokio::spawn(async move {
+            let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+            let item = || {
+                let permit = std::sync::Arc::clone(&budget)
+                    .try_acquire_many_owned(10)
+                    .unwrap();
+                let item = via_adapters::ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::Progress(ProgressMarks {
+                        model: true,
+                        ..ProgressMarks::default()
+                    }),
+                };
+                via_adapters::Admitted { item, permit }
+            };
+            loop {
+                let Ok(slot) = sender.reserve().await else {
+                    break;
+                };
+                slot.send(item());
+                while let Ok(slot) = sender.try_reserve() {
+                    slot.send(item());
+                }
+            }
+        });
+        let mut inbox = super::lane::Inbox::of(receiver);
+        // The channel is full before the turn is handed over.
+        until(|| inbox.len() == 1024).await;
+        let now = tokio::time::Instant::now();
+        let (_stop, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(2),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.execute_turn(
+                (&slot, &claim),
+                (&mut record, &effective),
+                (orders, &mut inbox),
+                (spec, cx),
+            ),
+        )
+        .await
+        .expect("the turn started and its end was reached");
+        drop(inbox);
+        producer.await.unwrap();
+    });
+}

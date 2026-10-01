@@ -1505,8 +1505,13 @@ impl Engine {
         // budget; an item's permit is held until it is handled. What
         // arrived before the turn is the session drain's (C2 §2), which
         // keeps servicing the turn's order and idle deadline (runtime §8).
+        // It is finite (critical r1 #1): only what the channel held at the
+        // handover; what arrives later is the running turn's to attribute.
         let mut handled = 0;
-        while let Some(admitted) = inbox.try_recv() {
+        for _ in 0..inbox.len() {
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
             self.between_items(record, control, &mut handled, true)
                 .await;
             lane.dispose(admitted).await;
@@ -1519,7 +1524,7 @@ impl Engine {
         let mut early = None;
         let end = loop {
             if let Some(end) = early.take() {
-                break end;
+                break (end, inbox.len());
             }
             let idle_at = control.idle_at;
             tokio::select! {
@@ -1567,12 +1572,13 @@ impl Engine {
                     // Test builds: the driver's turn returned.
                     #[cfg(feature = "test-failpoints")]
                     let _ = via_store::failpoint::hit_async("core.run.returned").await;
-                    break end;
+                    break (end, inbox.len());
                 }
             }
         };
         // The driver delivered the turn's items before it returned.
-        self.final_drain(record, (Some(lane), effective), control, inbox)
+        let (end, delivered) = end;
+        self.final_drain(record, (Some(lane), effective), control, (inbox, delivered))
             .await;
         let TurnEnd {
             terminal,
@@ -1611,18 +1617,25 @@ impl Engine {
     }
 
     /// The turn's final drain (Sol r3 N2): what the driver delivered
-    /// before it returned, handled one item at a time in decode order,
-    /// each taken only once the one before it is done, while the turn's
-    /// order is still serviced (runtime §8, Sol r4 R5).
+    /// before it returned, the `delivered` items the channel held then,
+    /// handled one item at a time in decode order, each taken only once the
+    /// one before it is done, while the turn's order is still serviced
+    /// (runtime §8, Sol r4 R5). It is finite (critical r1 #1): the
+    /// terminal follows, and what arrives later is the lane actor's
+    /// between turns. (After a driver that returned during a commit, the
+    /// count is read once that commit is done.)
     async fn final_drain(
         &self,
         record: &mut TurnRecord,
         (lane, effective): (Option<&Lane>, &Effective),
         control: &mut Control<'_>,
-        inbox: &mut Inbox,
+        (inbox, delivered): (&mut Inbox, usize),
     ) {
         let mut handled = 0;
-        while let Some(admitted) = inbox.try_recv() {
+        for _ in 0..delivered {
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
             self.between_items(record, control, &mut handled, false)
                 .await;
             self.drain_one(record, lane, effective, control, admitted)
@@ -1747,8 +1760,14 @@ impl Engine {
         }
         drop(sender);
         let mut inbox = Inbox::of(receiver);
-        self.final_drain(record, (lane, effective), &mut control, &mut inbox)
-            .await;
+        let delivered = inbox.len();
+        self.final_drain(
+            record,
+            (lane, effective),
+            &mut control,
+            (&mut inbox, delivered),
+        )
+        .await;
     }
 
     /// Handles one observation in decode order (C2 §4): commits the

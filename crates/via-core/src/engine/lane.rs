@@ -172,6 +172,11 @@ impl Inbox {
         }
     }
 
+    /// How many items the channel holds now.
+    pub(super) fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, mpsc::Receiver::len)
+    }
+
     /// An item already queued, if any.
     pub(super) fn try_recv(&mut self) -> Option<Admitted> {
         self.0.as_mut()?.try_recv().ok()
