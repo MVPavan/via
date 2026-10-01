@@ -193,3 +193,21 @@ fn conformance_claude_checker_detects_each_difference() {
         }
     }
 }
+
+/// Green: `resume_mismatch` is an `AdapterError` kind (C2 §2 identity), and
+/// a start rejection is never stated as an error: it is `rejected`.
+#[test]
+fn conformance_claude_error_kinds_follow_c2() {
+    let base = conformance_expect::load(&fixtures(), "c1b_resume_mismatch").unwrap();
+    assert_eq!(base["turns"][0]["expect"]["error"], "resume_mismatch");
+    conformance_expect::validate(&base).unwrap();
+    for wrong in ["rejected", "session_gone", "resume.mismatch"] {
+        let mut expect = base.clone();
+        expect["turns"][0]["expect"]["error"] = json!(wrong);
+        let refused = conformance_expect::validate(&expect);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("expect.error:")),
+            "error {wrong}: {refused:?}"
+        );
+    }
+}

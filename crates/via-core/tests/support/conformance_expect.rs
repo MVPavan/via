@@ -364,6 +364,9 @@ const ERROR: &[&str] = &[
     "unknown_submission",
     "server_lost",
     "transport_lost",
+    // C2 §2 identity: `AdapterError::ResumeMismatch { evidence }`, for a
+    // mismatch before a terminal was retained; never `Rejected`.
+    "resume_mismatch",
 ];
 /// C2 `StartRejected`; a name ending in `:` takes a non-empty suffix.
 const REJECTED: &[&str] = &[
