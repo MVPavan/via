@@ -2784,6 +2784,89 @@ fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
     });
 }
 
+/// Turn 2 of a new session is running in `engine` (turn 1 ended at its
+/// failed launch), with its lane mapping `fake-turn-1` to turn 1,
+/// `fake-turn-2` to turn 2, and `gone` evicted past the mapping bound.
+async fn running_turn_2(
+    engine: &Engine,
+    root: &Path,
+) -> (
+    SessionId,
+    std::sync::Arc<super::Slot>,
+    std::sync::Arc<super::lane::Lane>,
+    super::TurnRecord,
+    crate::api::Effective,
+    tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
+) {
+    let session = new_session(engine).await;
+    // Turn 1 ends: the absent anchor fails its launch.
+    dispatch(engine, &session).await;
+    assert!(engine.result(&format!("{session}/1")).await.is_ok());
+    resume(engine, &session, None).await;
+    // Turn 2 is running.
+    let next = events_page(engine, &session).await["events"]
+        .as_array()
+        .unwrap()
+        .len() as u64
+        + 1;
+    let submitted = Event {
+        seq: next,
+        session_id: &session,
+        turn: Some(2),
+        late: false,
+        at: &rfc3339(std::time::SystemTime::now()),
+        body: EventBody::TurnSubmitted { attempt: 1 },
+    }
+    .to_value()
+    .unwrap();
+    engine
+        .store
+        .commit_submission(SubmissionRecord {
+            session_id: session.clone(),
+            turn: turn(2),
+            event: submitted,
+        })
+        .await
+        .unwrap();
+    let slot = engine.slot(&session).unwrap();
+    let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let (_route, orders) =
+        slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
+    let route = engine
+        .store
+        .session_snapshot(&session)
+        .await
+        .unwrap()
+        .unwrap()
+        .route;
+    let lane = engine
+        .lane(&session, &route, "fake", root.to_path_buf())
+        .await;
+    // `gone` is evicted by the bound's worth of later vendor turns.
+    lane.map_vendor_turn("gone", turn(1));
+    for filler in 1..super::lane::VENDOR_TURNS {
+        lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
+    }
+    lane.map_vendor_turn("fake-turn-1", turn(1));
+    lane.map_vendor_turn("fake-turn-2", turn(2));
+    let record = super::TurnRecord {
+        session: session.clone(),
+        turn: turn(2),
+        head: super::journal::Head::new(None),
+        accepted: None,
+        first_failure: None,
+        uncertain: None,
+        steps: super::progress::StepTracker::default(),
+        vendor: super::lane::VendorRecord::default(),
+    };
+    let effective: crate::api::Effective = serde_json::from_value(json!({
+        "model":"fake","effort":null,"bound":null,
+        "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+    }))
+    .unwrap();
+    (session, slot, lane, record, effective, orders)
+}
+
 /// (14) AD4, C1 §6.1: a denial naming an earlier, ended turn's vendor turn
 /// arrives while turn 2 runs. It is committed `action.denied` with that
 /// turn's number and `late: true`, under the running turn, and stays out
@@ -2793,10 +2876,6 @@ fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
 /// bound is dropped; neither reaches turn 2's list. The end-to-end case is
 /// `conformance_core`'s.
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one running turn receives each attribution class"
-)]
 fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     let Some(root) = child("a_late_denial_is_committed_late_and_kept_out_of_the_running_turn")
     else {
@@ -2804,70 +2883,8 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     };
     run(async {
         let engine = open(&root);
-        let session = new_session(&engine).await;
-        // Turn 1 ends: the absent anchor fails its launch.
-        dispatch(&engine, &session).await;
-        assert!(engine.result(&format!("{session}/1")).await.is_ok());
-        resume(&engine, &session, None).await;
-        // Turn 2 is running.
-        let next = events_page(&engine, &session).await["events"]
-            .as_array()
-            .unwrap()
-            .len() as u64
-            + 1;
-        let submitted = Event {
-            seq: next,
-            session_id: &session,
-            turn: Some(2),
-            late: false,
-            at: &rfc3339(std::time::SystemTime::now()),
-            body: EventBody::TurnSubmitted { attempt: 1 },
-        }
-        .to_value()
-        .unwrap();
-        engine
-            .store
-            .commit_submission(SubmissionRecord {
-                session_id: session.clone(),
-                turn: turn(2),
-                event: submitted,
-            })
-            .await
-            .unwrap();
-        let slot = engine.slot(&session).unwrap();
-        let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
-        let (_route, orders) =
-            slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
-        let route = engine
-            .store
-            .session_snapshot(&session)
-            .await
-            .unwrap()
-            .unwrap()
-            .route;
-        let lane = engine.lane(&session, &route, "fake", root.clone()).await;
-        // `gone` is evicted by the bound's worth of later vendor turns.
-        lane.map_vendor_turn("gone", turn(1));
-        for filler in 1..super::lane::VENDOR_TURNS {
-            lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
-        }
-        lane.map_vendor_turn("fake-turn-1", turn(1));
-        lane.map_vendor_turn("fake-turn-2", turn(2));
-        let mut record = super::TurnRecord {
-            session: session.clone(),
-            turn: turn(2),
-            head: super::journal::Head::new(None),
-            accepted: None,
-            first_failure: None,
-            uncertain: None,
-            steps: super::progress::StepTracker::default(),
-            vendor: super::lane::VendorRecord::default(),
-        };
-        let effective: crate::api::Effective = serde_json::from_value(json!({
-            "model":"fake","effort":null,"bound":null,
-            "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
-        }))
-        .unwrap();
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
         let denial = |vendor_turn: &str, target: &str| via_adapters::ObservationItem {
             at: tokio::time::Instant::now(),
             vendor_turn: Some(
@@ -2994,5 +3011,235 @@ fn recovery_asks_the_adapter_per_session_with_the_reconciled_facts() {
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "unknown", "{envelope}");
+    });
+}
+
+/// Sol r1 F2, F13 (C2 §2 health, `TurnAbandoned`): a `run_turn` dropped
+/// while pending fails the driver's health; the lane's monitor, with no
+/// observation and no dispatch, keeps that first cause and closes the
+/// failed driver.
+#[test]
+fn the_lane_monitor_closes_a_driver_whose_turn_was_abandoned() {
+    let Some(root) = child("the_lane_monitor_closes_a_driver_whose_turn_was_abandoned") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{DriverFailure, DriverHealth, Prepared, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        let lane = engine.lane(&session, &route, "fake", root.clone()).await;
+        let now = tokio::time::Instant::now();
+        let (_orders, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(1),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        {
+            let mut pending = Box::pin(lane.driver.run_turn(spec, cx));
+            // One poll starts the turn; dropping it then abandons it.
+            tokio::select! {
+                biased;
+                _ = &mut pending => panic!("the turn ended at its first poll"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        let mut health = lane.driver.health();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            health.wait_for(|health| matches!(health, DriverHealth::Closed)),
+        )
+        .await
+        .expect("the monitor closes the failed driver")
+        .unwrap();
+        assert_eq!(lane.first_cause(), Some(DriverFailure::TurnAbandoned));
+    });
+}
+
+/// Sol r1 F4 (C2 §2 observations before turns): between turns the lane's
+/// monitor owns the session channel: non-durable items (progress, a vendor
+/// close) are dropped at once, returning their budget, and a durable one
+/// is held session-level, never the next turn's, for that turn to commit.
+/// Without the drain, the channel fills and its sender blocks.
+#[test]
+fn between_turns_the_lane_monitor_drains_the_session_channel() {
+    let Some(root) = child("between_turns_the_lane_monitor_drains_the_session_channel") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{
+            Admitted, Denial, DenialKind, Inherit, Observation, ObservationItem, ProgressMarks,
+            SessionCx, SessionSpec, VendorOptions, observation_channel,
+        };
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        let reference = super::lane::session_ref(&route);
+        let (sink, _unused) = observation_channel();
+        let driver = engine.adapter.open_session(
+            &reference,
+            SessionSpec {
+                session_id: session.clone(),
+                model: "fake".to_owned(),
+                instructions: None,
+                initial_bound: None,
+                cwd: root.clone(),
+                vendor: VendorOptions::new(),
+                inherit: Inherit::OD2_DEFAULT,
+                confirmed_vendor_session_id: None,
+                allow_untested: false,
+            },
+            SessionCx {
+                observations: sink,
+                tracker: engine.tracker.clone(),
+                cancel: engine.cancel.child_token(),
+            },
+        );
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        engine.adopt_lane(&session, (driver, receiver), (reference, &route));
+        let lane = super::lock(&engine.lanes).get(&session).cloned().unwrap();
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let send = |observation| {
+            let permit = std::sync::Arc::clone(&budget)
+                .try_acquire_many_owned(10)
+                .unwrap();
+            let item = ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: None,
+                observation,
+            };
+            let sender = sender.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    sender.send(Admitted { item, permit }),
+                )
+                .await
+                .expect("the monitor drains the channel between turns")
+                .unwrap();
+            }
+        };
+        // 32 items through a 4-item channel.
+        for _ in 0..30 {
+            let marks = ProgressMarks {
+                model: true,
+                ..ProgressMarks::default()
+            };
+            send(Observation::Progress(marks)).await;
+        }
+        send(Observation::ActionDenied(Denial {
+            kind: DenialKind::Network,
+            target: "between".to_owned(),
+            reason: "r".to_owned(),
+        }))
+        .await;
+        send(Observation::VendorClosed("idle".to_owned())).await;
+        until(|| lane.held_len() == 1 && budget.available_permits() == 990).await;
+        let held = lane.take_held();
+        let (attributed, admitted) = held.front().unwrap();
+        assert_eq!(*attributed, (None, false), "session-level");
+        assert!(matches!(
+            &admitted.item.observation,
+            Observation::ActionDenied(denial) if denial.target == "between"
+        ));
+    });
+}
+
+/// Sol r1 F4 (C1 §6.1, §5): adapter warnings while a turn runs commit
+/// `warning` events with their own attribution, the running turn's or an
+/// earlier turn's `late: true`, within C1 §5's caps: `message` cut to
+/// 1 KiB encoded, `data` over 4 KiB encoded left out.
+#[test]
+fn adapter_warnings_commit_warning_events_within_the_caps() {
+    let Some(root) = child("adapter_warnings_commit_warning_events_within_the_caps") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let warning = |vendor_turn: &str, message: String, data: Option<Value>| {
+            via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: Some(
+                    via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+                ),
+                observation: via_adapters::Observation::Warning(via_adapters::Warning {
+                    code: "deprecated",
+                    message,
+                    data,
+                }),
+            }
+        };
+        let queued = vec![
+            warning("fake-turn-2", "own".to_owned(), Some(json!({"k":"v"}))),
+            warning("fake-turn-1", "late".to_owned(), None),
+            warning(
+                "fake-turn-2",
+                "w".repeat(2048),
+                Some(json!({"big":"d".repeat(5000)})),
+            ),
+        ];
+        engine
+            .drain_queued(
+                (&slot, Some(&lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        let page = events_page(&engine, &session).await;
+        let warnings: Vec<&Value> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "warning")
+            .collect();
+        assert_eq!(warnings.len(), 3, "{page}");
+        assert_eq!(
+            (
+                &warnings[0]["turn"],
+                &warnings[0]["late"],
+                &warnings[0]["message"]
+            ),
+            (&json!(2), &json!(false), &json!("own")),
+        );
+        assert_eq!(warnings[0]["code"], "deprecated");
+        assert_eq!(warnings[0]["data"], json!({"k":"v"}));
+        assert_eq!(
+            (
+                &warnings[1]["turn"],
+                &warnings[1]["late"],
+                &warnings[1]["message"]
+            ),
+            (&json!(1), &json!(true), &json!("late")),
+        );
+        assert_eq!(warnings[2]["message"], "w".repeat(1022));
+        assert!(warnings[2].get("data").is_none(), "{}", warnings[2]);
     });
 }

@@ -2525,6 +2525,14 @@ pub(crate) enum EventBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         transcript: Option<String>,
     },
+    /// C1 §6.1: an adapter-reported warning, within C1 §5's caps.
+    #[serde(rename = "warning")]
+    Warning {
+        code: &'static str,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
     /// C1 §6.1, C2 §2: a later confirmed connection generation.
     #[serde(rename = "session.reopened")]
     SessionReopened {
@@ -2535,6 +2543,18 @@ pub(crate) enum EventBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         transcript: Option<String>,
     },
+}
+
+impl EventBody {
+    /// A `warning` event within C1 §5's caps: `message` cut to 1 KiB
+    /// encoded at a character boundary, `data` over 4 KiB encoded left out.
+    pub(crate) fn warning(code: &'static str, message: &str, data: Option<Value>) -> Self {
+        Self::Warning {
+            code,
+            message: cut_encoded(message, WARNING_MESSAGE_MAX - 2).to_owned(),
+            data: data.filter(|data| encodes_within(data, WARNING_DATA_MAX)),
+        }
+    }
 }
 
 /// C1 §6.1 event with every common field.

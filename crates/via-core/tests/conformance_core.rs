@@ -1215,16 +1215,16 @@ fn core_structured_output_write_failure_fails_the_commit() {
     });
 }
 
-/// Sol r1 F3 (C2 §2 health, AD16): with all four connection slots held by
-/// persistent sessions, one whose driver's health failed between turns
-/// (its server's retirement unproven, `RetirementUncertain`, its
-/// committed slot still held) is retired before its next turn reserves
-/// capacity: its own slot is released, the next turn runs on a replacement
-/// driver that keeps the confirmed identity, and the slot count never
-/// passes four.
+/// Sol r1 F2, F3, F13 (C2 §2 health, AD16): a persistent session whose
+/// driver's health fails between turns (its server's retirement unproven,
+/// `RetirementUncertain`, its committed slot still held) is retired by the
+/// lane's own health monitor, with no observation and no dispatch: its
+/// slot is released at once. Its next turn runs on a replacement driver
+/// that keeps the confirmed identity. (Every launched retirement is
+/// unproven here, so each persistent lane is retired after its turn.)
 #[cfg(feature = "test-failpoints")]
 #[test]
-fn core_failed_lane_retires_before_reserving_replacement_capacity() {
+fn core_failed_lane_is_retired_by_its_health_monitor() {
     let scripts = [
         script(
             "retires",
@@ -1235,7 +1235,6 @@ fn core_failed_lane_retires_before_reserving_replacement_capacity() {
                 json!({"action":"exit","code":0}),
             ],
         ),
-        script("first", &completed(1)),
         script(
             "again",
             &[
@@ -1246,7 +1245,7 @@ fn core_failed_lane_retires_before_reserving_replacement_capacity() {
         ),
     ];
     let Some(root) = child(
-        "core_failed_lane_retires_before_reserving_replacement_capacity",
+        "core_failed_lane_is_retired_by_its_health_monitor",
         &scenario(&persistent(), &scripts),
         &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "1")],
     ) else {
@@ -1258,15 +1257,16 @@ fn core_failed_lane_retires_before_reserving_replacement_capacity() {
         let envelope = daemon.wait(&failed, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
-        for _ in 0..3 {
-            let session = daemon.spawn("first", &json!({})).await;
-            let envelope = daemon.wait(&session, 1).await;
-            assert_eq!(envelope["state"], "completed", "{envelope}");
+        // The monitor closes the failed driver: its slot is released
+        // without a dispatch.
+        let released = tokio::time::Instant::now() + Duration::from_secs(5);
+        while daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < released,
+                "the failed driver keeps its slot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
-        // The retired server's slot stays the failed driver's.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(daemon.engine.connections().in_use, 4);
         daemon.resume(&failed, "again").await;
         let params = WaitParams {
             address: format!("{failed}/2"),
@@ -1281,7 +1281,6 @@ fn core_failed_lane_retires_before_reserving_replacement_capacity() {
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
-        assert_eq!(daemon.engine.connections().in_use, 4);
         // Every retirement is unproven here, so the report is not clean.
         let _report = daemon
             .engine
@@ -1316,15 +1315,27 @@ fn core_confirmed_identity_is_durable_across_a_restart() {
     let scripts = [
         script(
             "first",
-            &[with_transcript, accepted(1), terminal(1, "completed", "end_turn")],
+            &[
+                with_transcript,
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+            ],
         ),
         script(
             "second",
-            &[identity("v1"), accepted(2), terminal(2, "completed", "end_turn")],
+            &[
+                identity("v1"),
+                accepted(2),
+                terminal(2, "completed", "end_turn"),
+            ],
         ),
         script(
             "other",
-            &[identity("v2"), accepted(3), terminal(3, "completed", "end_turn")],
+            &[
+                identity("v2"),
+                accepted(3),
+                terminal(3, "completed", "end_turn"),
+            ],
         ),
     ];
     let Some(root) = child(

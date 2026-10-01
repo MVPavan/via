@@ -1397,9 +1397,11 @@ impl Engine {
 
     /// Runs the turn on the session's driver under the turn deadline,
     /// handling each observation on the session channel in decode order
-    /// before its result is acted on. Items still queued from before the
-    /// turn are handled first: late durable ones of earlier turns are
-    /// committed `late: true` (AD4). A force stop reaches Route, which
+    /// before its result is acted on. The turn claims the channel from the
+    /// lane's monitor; what arrived before the turn is handled first, as
+    /// the session drain handles it (C2 §2): durable items commit with
+    /// their own attribution, late ones of earlier turns `late: true`
+    /// (AD4), session-level ones with no turn. A force stop reaches Route, which
     /// force-closes the group and drains its output first: messages it read
     /// are still handled.
     ///
@@ -1415,9 +1417,17 @@ impl Engine {
     ) -> Driven {
         // The session channel (C2 A1): 1,024 items and a 4 MiB byte
         // budget; an item's permit is held until it is handled.
+        let _claim = lane.claim();
         let mut observed = lane.observations.lock().await;
-        self.drain(record, Some(lane), effective, control, &mut observed)
-            .await;
+        while let Ok(admitted) = observed.try_recv() {
+            lane.between(admitted);
+        }
+        for (attributed, Admitted { item, permit }) in lane.take_held() {
+            self.observe_held(record, lane, attributed, item.observation)
+                .await;
+            drop(permit);
+            stop_for_store(record, control);
+        }
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
         // driver keeps servicing its controls; a result it returns early is
@@ -1674,18 +1684,56 @@ impl Engine {
                 let own = (Some(record.turn.get()), false);
                 self.commit_decline(record, own, decline).await;
             }
+            Observation::Warning(warning) => {
+                let own = (Some(record.turn.get()), false);
+                self.commit_warning(record, own, warning).await;
+            }
             // C2 §4: a mismatch commits nothing itself; the turn is
-            // disposed from its end (r3). A vendor close ends the driver's
-            // connection, which the driver tracks. Steer reports, warnings
-            // and late terminals are not committed here. An identity was
-            // handled before attribution.
+            // disposed from its end (r3). A vendor close has no C1 event:
+            // the driver ends the connection, and the turn's end carries
+            // what it did to the turn. Core routes no steer, so no steer
+            // report comes; a late terminal needs a revision write the
+            // Store does not have (decision H3). An identity was handled
+            // before attribution.
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
             | Observation::VendorClosed(_)
             | Observation::SteerDelivered(_)
-            | Observation::Warning(_)
             | Observation::LateTerminal(_) => {}
         }
+    }
+
+    /// A durable item the session drain held (C2 §2): an identity commits
+    /// as the session's; another commits with its own attribution.
+    async fn observe_held(
+        &self,
+        record: &mut TurnRecord,
+        lane: &Lane,
+        attributed: (Option<u32>, bool),
+        observation: Observation,
+    ) {
+        if let Observation::IdentityConfirmed(identity) = observation {
+            self.confirm_identity(record, Some(lane), identity).await;
+        } else {
+            self.observe_other(record, attributed, observation).await;
+        }
+    }
+
+    /// Commits an adapter-reported `warning` event attributed to `(turn,
+    /// late)` (C1 §6.1), within C1 §5's caps: `message` cut to 1 KiB
+    /// encoded, `data` over 4 KiB encoded left out. Envelope warnings stay
+    /// VIA's own (C1 §5).
+    async fn commit_warning(
+        &self,
+        record: &mut TurnRecord,
+        attributed: (Option<u32>, bool),
+        warning: via_adapters::Warning,
+    ) {
+        let at = rfc3339(SystemTime::now());
+        let body = EventBody::warning(warning.code, &warning.message, warning.data);
+        let failed = record.first_failure.is_some();
+        journal::commit_event_as(&self.store, record, body, &at, attributed).await;
+        self.report_first_failure(record, failed).await;
     }
 
     /// Commits a confirmed identity (C2 §2 delayed identity, C1 §6.1):
@@ -1815,8 +1863,9 @@ impl Engine {
     /// An observation that is not the running turn's (AD4, C1 §6.1, C2
     /// §2), attributed to `(turn, late)`: of an earlier, ended turn with
     /// `late: true`, or session-level with `turn: null`. A durable one, a
-    /// denial or a decline, is committed under the running turn, the one
-    /// the Store admits events for; it never changes an envelope.
+    /// denial, a decline or a warning, is committed under the running
+    /// turn, the one the Store admits events for; it never changes an
+    /// envelope.
     /// Non-durable ones are dropped, and so is a late terminal: the Store
     /// has no revision write yet.
     async fn observe_other(
@@ -1832,12 +1881,14 @@ impl Engine {
             Observation::RequestDeclined(decline) => {
                 self.commit_decline(record, attributed, decline).await;
             }
+            Observation::Warning(warning) => {
+                self.commit_warning(record, attributed, warning).await;
+            }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::SteerDelivered(_)
-            | Observation::Warning(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
             | Observation::LateTerminal(_) => {}
