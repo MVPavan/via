@@ -24,6 +24,7 @@ use super::queue::{Owner, Slot};
 use super::terminal::terminal_envelope;
 use super::{Engine, FailureNote, Terminal, TurnRecord, failure};
 use crate::api::{Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::intake::TurnPlan;
 use crate::{SessionId, TurnNumber};
 
 /// The failure message of a turn whose frozen row cannot be parsed.
@@ -112,6 +113,9 @@ pub(super) struct Queueing {
     /// The session's frozen `cwd` (design §11.1), from the queued row or,
     /// for a queueing rebuilt from the event history, the session row.
     pub(super) cwd: Option<String>,
+    /// The session's frozen plan and, from the queued row, the turn's
+    /// frozen values: what its envelope reports (design §5.1 #33).
+    pub(super) plan: Box<TurnPlan>,
 }
 
 impl From<&QueuedTurn> for Queueing {
@@ -120,6 +124,7 @@ impl From<&QueuedTurn> for Queueing {
             queued_at: queued.queued_at.clone(),
             queued_seq: queued.queued_seq,
             cwd: queued.cwd.clone(),
+            plan: Box::new(TurnPlan::of(&queued.route, Some(&queued.effective))),
         }
     }
 }
@@ -457,7 +462,7 @@ pub(super) async fn commit_submit_failed(
         None,
         (queueing.queued_seq, ended_seq),
         Usage::UNAVAILABLE,
-        None,
+        (None, &queueing.plan),
     );
     let envelope = serde_json::to_value(&envelope).map_err(|_| SubmitFailed::Encode)?;
     let committed = store

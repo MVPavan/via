@@ -28,7 +28,8 @@ use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::api::{Cancel, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::intake::{Effective, TurnPlan};
 use crate::{ApiError, Cleanup, Deadline, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
@@ -342,7 +343,7 @@ impl Engine {
             queued_seq,
             ..
         } = self.history(session, turn).await?;
-        let (cwd, _) = self
+        let (cwd, _, plan) = self
             .frozen(session)
             .await
             .map_err(|error| WriteOutcome::of_read(&error))?;
@@ -350,6 +351,7 @@ impl Engine {
             queued_at,
             queued_seq,
             cwd,
+            plan: Box::new(plan),
         })
     }
 
@@ -367,14 +369,15 @@ impl Engine {
     async fn frozen(
         &self,
         session: &SessionId,
-    ) -> Result<(Option<String>, Option<Identity>), StoreError> {
-        Ok(self
-            .store
-            .session_snapshot(session)
-            .await?
-            .map_or((None, None), |snapshot| {
-                (snapshot.cwd, Identity::stored(&snapshot.route))
-            }))
+    ) -> Result<(Option<String>, Option<Identity>, TurnPlan), StoreError> {
+        Ok(self.store.session_snapshot(session).await?.map_or(
+            (None, None, TurnPlan::default()),
+            |snapshot| {
+                // The turn's own frozen values are not read back here.
+                let plan = TurnPlan::of(&snapshot.route, None);
+                (snapshot.cwd, Identity::stored(&snapshot.route), plan)
+            },
+        ))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -554,7 +557,7 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_history).await;
-        let (cwd, identity) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
+        let (cwd, identity, plan) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -611,7 +614,7 @@ impl Engine {
             (queued_seq, seq),
             // The crashed daemon's samples are gone with it.
             Usage::UNAVAILABLE,
-            identity,
+            (identity, &plan),
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(

@@ -214,6 +214,7 @@ fn started() -> Started {
         submitted: Some((AT.to_owned(), Instant::now())),
         folder: Some(FOLDER.to_owned()),
         cwd: None,
+        plan: Box::default(),
     }
 }
 

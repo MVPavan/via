@@ -292,6 +292,21 @@ struct Running {
     wall: tokio::time::Instant,
     /// The published progress (Task 4 design §2.4).
     progress: Progress,
+    /// Where the turn's acceptance stands, for `steer` (C1 §3.4).
+    steering: watch::Sender<Steering>,
+}
+
+/// A running turn's acceptance as `steer` waits for it (C1 §3.4): a steer
+/// that arrives while the turn is submitting waits for its acceptance,
+/// and fails `no_active_turn` once the turn ends first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum Steering {
+    /// Submitted, not yet accepted.
+    Submitting,
+    /// Accepted, with the vendor turn ID the acceptance named.
+    Accepted(Option<String>),
+    /// The turn's execution returned: nothing more reaches it.
+    Ended,
 }
 
 /// Mutable dispatch state of one session.
@@ -510,6 +525,7 @@ impl Slot {
             stop,
             wall,
             progress,
+            steering: watch::Sender::new(Steering::Submitting),
         });
         receivers
     }
@@ -628,7 +644,30 @@ impl Slot {
             .as_mut()
             .filter(|running| running.turn == turn)?;
         running.settling = true;
+        running.steering.send_replace(Steering::Ended);
         running.stop.order.borrow().clone()
+    }
+
+    /// The running turn, not yet settling, and its acceptance watch: the
+    /// turn a `steer` addresses (C1 §3.4).
+    pub(super) fn steering(&self) -> Option<(TurnNumber, watch::Receiver<Steering>)> {
+        let state = lock(&self.state);
+        let running = state.running.as_ref().filter(|running| !running.settling)?;
+        Some((running.turn, running.steering.subscribe()))
+    }
+
+    /// The running turn's acceptance committed, naming `vendor_turn`.
+    pub(super) fn accepted(&self, turn: TurnNumber, vendor_turn: Option<String>) {
+        let state = lock(&self.state);
+        if let Some(running) = state
+            .running
+            .as_ref()
+            .filter(|running| running.turn == turn)
+        {
+            running
+                .steering
+                .send_replace(Steering::Accepted(vendor_turn));
+        }
     }
 
     /// The run loop is done with the turn: its stop channels drop, which

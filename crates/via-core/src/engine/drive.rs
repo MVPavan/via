@@ -9,8 +9,8 @@ use std::{
 use tokio::sync::watch;
 use via_adapters::{
     AdapterError, Admitted, Decline, Denial, DenialKind, Observation, ObservationItem, Prepared,
-    RouteError, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd, TurnEvidence, TurnSpec,
-    VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
+    RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd, TurnEvidence,
+    TurnSpec, VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
@@ -31,9 +31,11 @@ use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
 use crate::api::{
-    AutoDeclined, Cancel, DeniedAction, Effective, Event, EventBody, FailureClass, FinalTextFile,
+    AutoDeclined, Cancel, DeniedAction, Event, EventBody, FailureClass, FinalTextFile,
     STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, Warning, rfc3339,
 };
+use crate::intake::{Effective, Frozen, TurnPlan};
+use crate::schema::Validator;
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -476,12 +478,8 @@ impl Engine {
         let claim = match claim {
             Ok(claim) => claim,
             Err(resident) => {
-                self.open_lane(
-                    session,
-                    (&route, submission.effective.model(), cwd),
-                    resident,
-                )
-                .await
+                self.open_lane(session, (&route, &submission.effective, cwd), resident)
+                    .await
             }
         };
         self.queued.fetch_sub(1, Ordering::AcqRel);
@@ -773,11 +771,14 @@ impl Engine {
     /// without one (§5.1 #22).
     fn started(
         &self,
-        session: &SessionId,
-        turn: TurnNumber,
-        queued: QueuedTurn,
+        (session, turn): (&SessionId, TurnNumber),
+        (queued, effective): (QueuedTurn, &Effective),
         (submitted, clock): (SystemTime, Instant),
     ) -> Started {
+        let plan = Box::new(TurnPlan {
+            frozen: Frozen::of(&queued.route),
+            effective: Some(effective.clone()),
+        });
         let cwd = queued.cwd.map_or_else(|| self.cwd.clone(), PathBuf::from);
         Started {
             session: session.clone(),
@@ -787,6 +788,7 @@ impl Engine {
             cwd: cwd.to_str().map(str::to_owned),
             submitted: Some((rfc3339(submitted), clock)),
             folder: Some(self.evidence_folder(session, turn)),
+            plan,
         }
     }
 
@@ -806,12 +808,14 @@ impl Engine {
             submitted,
             clock,
         } = submission;
-        let started = self.started(&session, turn, queued, (submitted, clock));
+        let started = self.started((&session, turn), (queued, &effective), (submitted, clock));
         // Design §2 [r1.11]: both deadlines run from the submission clock.
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
         let (mut record, activity, (route_stop, orders)) =
             start_turn(slot, &session, turn, deadline.instant());
+        // AD12: the adapter that runs the turn, the envelope's version.
+        record.vendor.adapter_version = lane.driver.adapter_version();
         let mut control = Control {
             slot,
             turn,
@@ -823,11 +827,8 @@ impl Engine {
             idle: effective.idle(),
             final_text: FinalText::new(),
         };
-        // C2 §2 `TurnSpec`: the intake carries no other per-turn value yet.
-        let spec = TurnSpec {
-            prompt,
-            ..TurnSpec::default()
-        };
+        // C2 §2 `TurnSpec`: the prompt with the turn's frozen values.
+        let spec = effective.turn_spec(prompt);
         let cx = self.turn_cx(turn, (prepared, capacity), activity, (deadline, route_stop));
         let driven = self
             .execute(
@@ -869,6 +870,7 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
+        validate_output(&effective, &record, &mut terminal);
         if let Some((outcome, cleanup)) = disposed.stop {
             let requested_at = if let Some(order) = &order {
                 order.requested_at.clone()
@@ -2049,15 +2051,20 @@ impl Engine {
                 self.commit_decline(record, own, decline).await;
             }
             Observation::Warning(warning) => self.own_warning(record, warning).await,
+            // C1 §3.4, §6.1: steer input the running turn took.
+            Observation::SteerDelivered(delivery) => {
+                let delivery = steer_delivery(&delivery).to_owned();
+                self.commit_event(record, EventBody::SteerDelivered { delivery })
+                    .await;
+            }
             // C2 §4: a mismatch commits nothing itself; the turn is
             // disposed from its end (r3). A vendor close has no C1 event:
             // the driver ends the connection, and the turn's end carries
-            // what it did to the turn. Core routes no steer, so no steer
-            // report comes. An identity was handled before attribution.
+            // what it did to the turn. An identity was handled before
+            // attribution.
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
             | Observation::VendorClosed(_)
-            | Observation::SteerDelivered(_)
             // Discarded until via-jm4.35: a late terminal's revision
             // write is not in the Store yet.
             | Observation::LateTerminal(_) => {}
@@ -2203,6 +2210,7 @@ impl Engine {
             }
         };
         let seq = head.next();
+        let vendor_turn = evidence.1.clone();
         match self
             .accept((&record.session, record.turn, seq), effective, evidence)
             .await
@@ -2210,6 +2218,8 @@ impl Engine {
             Ok(accepted) => {
                 head.committed(1);
                 record.accepted = Some(accepted);
+                // C1 §3.4: a steer waiting for this acceptance may proceed.
+                slot.accepted(record.turn, vendor_turn);
             }
             Err((outcome, sent)) => {
                 if outcome.head_unknown() {
@@ -2571,7 +2581,7 @@ impl Engine {
             late: false,
             at: &at,
             body: EventBody::TurnStarted {
-                effective: effective.clone(),
+                effective: effective.c1(),
             },
         }
         .to_value()
@@ -2647,7 +2657,7 @@ pub(super) fn ended_record(
         .as_ref()
         .and_then(|(_, clock)| u64::try_from(clock.elapsed().as_millis()).ok());
     let envelope = turn_envelope(
-        (&started.session, started.turn),
+        (&started.session, started.turn, &started.plan),
         terminal,
         record.accepted,
         (started.cwd.clone(), started.folder.clone()),
@@ -2971,6 +2981,7 @@ pub(super) fn queued_cancellation(
         cwd: queued.cwd,
         submitted: None,
         folder: None,
+        plan: queued.plan,
     };
     let record = new_record(slot, session, turn);
     let terminal = Terminal {
@@ -2993,4 +3004,43 @@ pub(super) fn queued_cancellation(
         cancel_cause: cause.map(|(cause, _)| cause),
     };
     (started, record, terminal, extras)
+}
+
+/// C1 §3.4 `delivery`: `injected`, or the route's declared partial
+/// semantics.
+pub(super) fn steer_delivery(delivery: &SteerDelivery) -> &str {
+    match delivery {
+        SteerDelivery::Injected => "injected",
+        SteerDelivery::Partial(semantics) => semantics,
+    }
+}
+
+/// C1 Q2, §5 (adapter design §5.1 #37): a completed turn whose frozen
+/// `output_schema` its structured output does not satisfy fails
+/// `structured_output_invalid`, the output kept; one with no structured
+/// output keeps its state and warns `structured_output_missing`. The value
+/// is validated before it is stored, inline or spilled.
+fn validate_output(effective: &Effective, record: &TurnRecord, terminal: &mut Terminal) {
+    let Some(schema) = effective.output_schema() else {
+        return;
+    };
+    if terminal.state != "completed" {
+        return;
+    }
+    let output = record
+        .vendor
+        .retained
+        .as_ref()
+        .and_then(|retained| retained.structured_output.as_ref());
+    match output {
+        Some(output) => {
+            if !Validator::compile(schema).is_some_and(|validator| validator.accepts(output)) {
+                terminal.fail(
+                    FailureClass::StructuredOutputInvalid,
+                    "the structured output does not satisfy output_schema",
+                );
+            }
+        }
+        None => terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING),
+    }
 }

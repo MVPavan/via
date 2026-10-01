@@ -27,6 +27,8 @@ insta = "1.48"
 proptest = "1.11"
 tempfile = "3.27"
 sha2 = "0.10"
+# K14: JSON Schema draft 2020-12 validation of structured output (C1 Q2).
+boon = { version = "0.6", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

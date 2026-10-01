@@ -39,7 +39,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
     OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
-    SessionSpec, UsageSample, VendorOptions, VendorTerminal, observation_channel_in,
+    SessionSpec, UsageSample, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
@@ -49,6 +49,7 @@ use super::{Engine, SessionWriter, lock};
 use crate::api::{
     AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, Warning, rfc3339,
 };
+use crate::intake::{Effective, Frozen};
 use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
@@ -1185,6 +1186,8 @@ pub(super) struct VendorRecord {
     /// The handshake version of the instance that ran the turn, and
     /// whether the adapter checked it (AD7).
     pub(super) instance: Option<(Option<String>, bool)>,
+    /// The version of the adapter that ran the turn (AD12), when one did.
+    pub(super) adapter_version: Option<String>,
     /// The retained vendor terminal's envelope facts (AD4).
     pub(super) retained: Option<Retained>,
     /// The turn's acceptance found every tombstone taken (C2 §4.1,
@@ -1262,7 +1265,7 @@ impl Engine {
     }
 
     /// The session's lane for its submitted turn, which found none to
-    /// claim, opened for the turn's `model` in `cwd` (C2 §2
+    /// claim, opened for the turn's frozen values in `cwd` (C2 §2
     /// `open_session`, logical: no vendor I/O) from the session's stored
     /// route identity `route` (Sol r1 F12, decision H3), and claimed. A
     /// route identity the Store does not hold is not invented: the driver
@@ -1274,7 +1277,7 @@ impl Engine {
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
-        (route, model, cwd): (&SessionRoute, &str, PathBuf),
+        (route, effective, cwd): (&SessionRoute, &Effective, PathBuf),
         resident: OwnedSemaphorePermit,
     ) -> LaneClaim {
         let replaced = lock(&self.lanes).get(session).cloned();
@@ -1287,19 +1290,21 @@ impl Engine {
             None => (LaneState::recovered(route), ObservationBudget::new()),
         };
         let reference = session_ref(route);
+        // Decision F12: what the session's plan froze at spawn.
+        let frozen = Frozen::of(route);
         let spec = SessionSpec {
             session_id: session.clone(),
-            model: model.to_owned(),
-            instructions: None,
-            initial_bound: None,
+            model: effective.model().to_owned(),
+            instructions: frozen.instructions,
+            initial_bound: effective.bound().cloned(),
             cwd,
-            vendor: VendorOptions::new(),
+            vendor: frozen.vendor,
             inherit: Inherit::OD2_DEFAULT,
             confirmed_vendor_session_id: state
                 .identity
                 .as_ref()
                 .map(|identity: &Identity| identity.vendor_session_id.clone()),
-            allow_untested: false,
+            allow_untested: frozen.allow_untested,
         };
         let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {

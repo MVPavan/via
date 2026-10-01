@@ -3,7 +3,8 @@
 use serde_json::json;
 use via_adapters::{
     AdapterError, ClassHint, Cleanup, RouteError, RouteFailure, StartRejected, StopCause,
-    StopOrder, StopReason, TurnEvidence, VendorTerminal, VendorTerminalStatus, WireCleanup,
+    StopOrder, StopReason, TurnEvidence, VendorTerminal, VendorTerminalStatus, VersionStatus,
+    WireCleanup,
 };
 use via_store::CancelCause;
 
@@ -11,9 +12,10 @@ use super::lane::{Identity, VendorRecord};
 use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
-    Bound, Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, Requested, RoutePlan,
-    TRANSCRIPT_MAX, Timestamps, Usage, VendorFields, Warning, encodes_within,
+    Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, PlanFields, TRANSCRIPT_MAX,
+    Timestamps, Usage, VendorFields, Warning, encodes_within,
 };
+use crate::intake::TurnPlan;
 use crate::{SessionId, TurnNumber};
 
 /// Assembles the C1 §5 envelope of a turn that reported nothing to its
@@ -22,7 +24,8 @@ use crate::{SessionId, TurnNumber};
 /// the session's frozen working directory (design §11.1), `None` where the
 /// caller did not read it; `folder` is the turn's absolute evidence folder,
 /// `None` for a turn never submitted. `identity` is the session's stored
-/// one where the caller read it (critical r1 #11).
+/// one where the caller read it (critical r1 #11); `plan` is the session's
+/// frozen plan and the turn's frozen values (design §5.1 #33).
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct committed fact of the one turn"
@@ -37,10 +40,10 @@ pub(super) fn terminal_envelope(
     duration_ms: Option<u64>,
     (first_seq, last_seq): (u64, u64),
     usage: Usage,
-    identity: Option<Identity>,
+    (identity, plan): (Option<Identity>, &TurnPlan),
 ) -> Envelope {
     assemble(
-        (session, turn),
+        (session, turn, plan),
         terminal,
         accepted,
         (cwd, folder),
@@ -61,7 +64,7 @@ pub(super) fn terminal_envelope(
 /// and vendor data (AD4), and the usage ledger's figure, which a turn
 /// aggregate supersedes (AD6).
 pub(super) fn turn_envelope(
-    (session, turn): (&SessionId, TurnNumber),
+    (session, turn, plan): (&SessionId, TurnNumber, &TurnPlan),
     terminal: Terminal,
     accepted: Option<Accepted>,
     paths: (Option<String>, Option<String>),
@@ -75,9 +78,13 @@ pub(super) fn turn_envelope(
         .and_then(|retained| retained.usage.as_ref());
     let figure = vendor.ledger.figure(aggregate);
     let interval = figure.as_ref().is_some_and(|(_, interval)| *interval);
-    let usage = Usage::reported(figure.map(|(tokens, _)| tokens), interval);
+    let usage = Usage::reported(
+        figure.map(|(tokens, _)| tokens),
+        interval,
+        plan.frozen.token_scope(),
+    );
     assemble(
-        (session, turn),
+        (session, turn, plan),
         terminal,
         accepted,
         paths,
@@ -93,7 +100,7 @@ pub(super) fn turn_envelope(
     reason = "each argument is a distinct committed fact of the one turn"
 )]
 fn assemble(
-    (session, turn): (&SessionId, TurnNumber),
+    (session, turn, plan): (&SessionId, TurnNumber, &TurnPlan),
     terminal: Terminal,
     accepted: Option<Accepted>,
     (cwd, folder): (Option<String>, Option<String>),
@@ -102,12 +109,25 @@ fn assemble(
     (usage, interval): (Usage, bool),
     vendor: VendorRecord,
 ) -> Envelope {
-    let mut plan = RoutePlan::fake();
-    if let Some((version, tested)) = vendor.instance {
-        // AD7: the version the turn's own instance reported.
-        plan = plan.instance(version, tested);
-    }
-    let mut warnings = plan.warnings();
+    // AD7: the version the turn's own instance reported; AD12: the
+    // adapter that ran the turn, else the session's recorded one.
+    let (vendor_version, tested) = vendor.instance.unwrap_or((None, false));
+    let version = PlanFields {
+        route: plan.frozen.route.clone(),
+        adapter_version: vendor
+            .adapter_version
+            .clone()
+            .unwrap_or_else(|| plan.frozen.adapter_version.clone()),
+        vendor_version,
+        version_status: if tested {
+            VersionStatus::Tested
+        } else {
+            VersionStatus::Untested
+        },
+    };
+    let mut warnings: Vec<Warning> = version.warning().into_iter().collect();
+    // C1 §5, AD13: the session's unverified inheritance, on every envelope.
+    warnings.extend(plan.frozen.config_warning());
     warnings.extend(terminal.warnings);
     // C1 §5: the turn's own adapter warnings of the closed list.
     warnings.extend(vendor.warnings);
@@ -148,23 +168,17 @@ fn assemble(
         stop_reason: terminal.stop_reason,
         vendor_stop_reason: terminal.vendor_stop_reason,
         cancel: terminal.cancel,
-        harness: "fake",
-        model: Requested {
-            requested: "fake".to_owned(),
-            resolved: "fake".to_owned(),
-        },
-        effort: Requested {
-            requested: None,
-            resolved: None,
-        },
+        harness: plan.frozen.harness.clone(),
+        model: plan.model(),
+        effort: plan.effort(),
         warnings,
-        plan,
+        plan: version,
         vendor_session_id,
         cwd,
-        bound: Bound::NONE,
+        bound: plan.bound(),
         final_text: terminal.final_text,
         final_text_file: terminal.final_text_file,
-        // Passed through; validation against the frozen schema is #37's.
+        // Validated against the frozen schema before it was kept (#37).
         structured_output: retained.structured_output,
         structured_output_file: retained.structured_output_file,
         leftovers: None,
@@ -186,7 +200,7 @@ fn assemble(
             count: last_seq + 1 - first_seq,
         },
         evidence: EvidenceRef { folder, transcript },
-        vendor_options: json!({}),
+        vendor_options: plan.vendor_options(),
         vendor: VendorFields {
             turn_id: accepted.and_then(|accepted| accepted.vendor_turn_id),
             data,
@@ -678,7 +692,7 @@ pub fn envelope_at_maximum(
 ) -> Result<String, crate::ApiError> {
     use super::lane::Retained;
     use crate::api::{
-        Cancel, FINAL_TEXT_INLINE, FinalTextFile, Kept, STRUCTURED_OUTPUT_INLINE,
+        Cancel, FINAL_TEXT_INLINE, FinalTextFile, Kept, Requested, STRUCTURED_OUTPUT_INLINE,
         StructuredOutputFile, Tokens, maxima,
     };
     let bad = |_| crate::ApiError::STORE;
@@ -776,9 +790,10 @@ pub fn envelope_at_maximum(
             total: max,
         }),
         true,
+        "vendor_interval",
     );
     let mut envelope = assemble(
-        (&session, turn),
+        (&session, turn, &TurnPlan::default()),
         terminal,
         Some(accepted),
         (Some(maxima::escaped(4 * 1024)), Some(path)),
@@ -787,6 +802,10 @@ pub fn envelope_at_maximum(
         (usage, true),
         vendor,
     );
+    // C2 A1: the harness, route and versions at 1 KiB each.
+    envelope.harness = id();
+    envelope.plan.route = id();
+    envelope.plan.adapter_version = id();
     envelope.model = Requested {
         requested: maxima::escaped(1024),
         resolved: maxima::escaped(1024),
@@ -978,7 +997,11 @@ mod tests {
                 ..VendorRecord::default()
             };
             let envelope = super::turn_envelope(
-                (&session, TurnNumber::try_from(1).expect("a turn")),
+                (
+                    &session,
+                    TurnNumber::try_from(1).expect("a turn"),
+                    &crate::intake::TurnPlan::default(),
+                ),
                 terminal,
                 None,
                 (None, None),

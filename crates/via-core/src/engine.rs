@@ -16,10 +16,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::api::{Cancel, EventBody, Exit, Failure, FailureClass, Warning};
 use crate::{SessionId, TurnNumber};
-use via_adapters::{
-    AdapterConfig, AdapterSet, CancellationToken, DescribeRequest, RefusalKind, RuntimeConfig,
-    TaskTracker,
-};
+use via_adapters::{AdapterConfig, AdapterSet, CancellationToken, RuntimeConfig, TaskTracker};
 use via_store::{Store, StoreClient, StoreLock};
 
 mod batch;
@@ -269,6 +266,9 @@ struct Started {
     /// The turn's absolute evidence folder, once submitted (Task 4 design
     /// §7.1); the envelope's `evidence.folder`.
     folder: Option<String>,
+    /// The session's frozen plan and the turn's frozen values, as its
+    /// envelope reports them (adapter design §5.1 #33).
+    plan: Box<crate::intake::TurnPlan>,
 }
 
 /// A held `admission` guard: receipts, stop acceptance, the Store-failed
@@ -519,19 +519,6 @@ impl Engine {
     /// (design §6.4): Host's owned pending cleanup, which blocks idle exit.
     pub fn pending_cleanup(&self) -> usize {
         self.adapter.pending_cleanup()
-    }
-
-    /// Whether an adapter of this daemon serves `harness`: planning it is
-    /// not refused `harness_unavailable` (C2 §2 `plan`; pure).
-    fn harness_available(&self, harness: &str) -> bool {
-        let request = DescribeRequest {
-            harness: Some(harness.to_owned()),
-            ..DescribeRequest::default()
-        };
-        !matches!(
-            self.adapter.plan(&request),
-            Err(refusal) if refusal.kind == RefusalKind::HarnessUnavailable
-        )
     }
 
     /// The session's dispatch slot, created when it has none. Whether a new

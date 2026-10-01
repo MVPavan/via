@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync"] }
 sha2 = { workspace = true }
+boon = { workspace = true }
 
 [dev-dependencies]
 # Tests drive Store's test seams.

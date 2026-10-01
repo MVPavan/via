@@ -2099,7 +2099,7 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             steps: super::progress::StepTracker::default(),
             vendor: super::lane::VendorRecord::default(),
         };
-        let effective: crate::api::Effective = serde_json::from_value(json!({
+        let effective: crate::intake::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
@@ -2180,6 +2180,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             submitted: None,
             folder: None,
             cwd: None,
+            plan: Box::default(),
         };
         let record = super::TurnRecord {
             session: session.clone(),
@@ -2407,6 +2408,7 @@ fn started_one(session: &SessionId) -> super::Started {
         submitted: None,
         folder: None,
         cwd: None,
+        plan: Box::default(),
     }
 }
 
@@ -2591,7 +2593,7 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
             head: super::journal::Head::new(None),
             ..turn_one(&session, false)
         };
-        let effective: crate::api::Effective = serde_json::from_value(json!({
+        let effective: crate::intake::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
@@ -2804,7 +2806,7 @@ async fn running_turn_2(
     std::sync::Arc<super::Slot>,
     super::lane::LaneClaim,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     running_turn_2_with(engine, root, true).await
@@ -2820,7 +2822,7 @@ async fn running_turn_2_with(
     std::sync::Arc<super::Slot>,
     super::lane::LaneClaim,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     let session = new_session(engine).await;
@@ -2837,7 +2839,7 @@ async fn running_turn_2_with(
     let lane = engine
         .open_lane(
             &session,
-            (&route, "fake", root.to_path_buf()),
+            (&route, &plain_effective(), root.to_path_buf()),
             resident(engine),
         )
         .await;
@@ -2861,7 +2863,7 @@ async fn turn_2_running(
 ) -> (
     std::sync::Arc<super::Slot>,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     let session = session.clone();
@@ -2906,7 +2908,7 @@ async fn turn_2_running(
         steps: super::progress::StepTracker::default(),
         vendor: super::lane::VendorRecord::default(),
     };
-    let effective: crate::api::Effective = serde_json::from_value(json!({
+    let effective: crate::intake::Effective = serde_json::from_value(json!({
         "model":"fake","effort":null,"bound":null,
         "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
     }))
@@ -3612,7 +3614,11 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
+            .open_lane(
+                &session,
+                (&route, &plain_effective(), root.clone()),
+                resident(&engine),
+            )
             .await;
         assert!(!successor.failed());
         assert_eq!(
@@ -3830,7 +3836,11 @@ fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
+            .open_lane(
+                &session,
+                (&route, &plain_effective(), root.clone()),
+                resident(&engine),
+            )
             .await;
         // Committed before the successor was made.
         assert_eq!(
@@ -3936,7 +3946,7 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
         assert!(codes.contains(&&json!("vendor_specific")), "{page}");
         let at = "2026-01-01T00:00:00.000Z".to_owned();
         let envelope = super::terminal::turn_envelope(
-            (&session, record.turn),
+            (&session, record.turn, &crate::intake::TurnPlan::default()),
             super::terminal::blank("completed", "end_turn", None),
             None,
             (None, None),
@@ -4202,9 +4212,13 @@ fn a_dropped_replacement_leaves_the_old_lane_owning_its_work() {
             .unwrap()
             .unwrap()
             .route;
+        let effective = plain_effective();
         {
-            let replacing =
-                engine.open_lane(&session, (&route, "fake", root.clone()), resident(&engine));
+            let replacing = engine.open_lane(
+                &session,
+                (&route, &effective, root.clone()),
+                resident(&engine),
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), replacing)
                     .await
@@ -6178,4 +6192,13 @@ fn a_close_joining_a_started_eviction_waits_and_owns_no_report() {
             lane.close_order()
         );
     });
+}
+
+/// A turn's frozen values with C1's defaults and a 30 s wall budget.
+fn plain_effective() -> crate::intake::Effective {
+    serde_json::from_value(json!({
+        "model":"fake","effort":null,"bound":null,
+        "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+    }))
+    .unwrap()
 }
