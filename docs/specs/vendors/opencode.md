@@ -224,7 +224,12 @@ This is tested authentication/ownership/handling, **not** proof that vendor
 tools cannot obtain or emit their inherited instance secret. Arbitrary
 model-controlled output is not made secret-free by this exception. VIA must
 not initiate environment/credential dumps or copy provider authentication
-material; fixtures and reports must use nonsecret synthetic data. Keep the
+material (the report-only leftover scan of C2 §4.2 is not a dump: it may
+read the environment of a same-uid process started at or after the vendor,
+through one `/proc/<pid>` descriptor, solely to match the exact
+`VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and
+the marker never authorizes a signal or proves ownership or liveness);
+fixtures and reports must use nonsecret synthetic data. Keep the
 inherited-password limitation explicit in usage/release documentation. Do not
 claim an environment scrub or sanitization of arbitrary vendor payloads.
 
@@ -769,7 +774,7 @@ No credentials or generated server passwords may enter fixtures/reports.
 | OC09 overload/loss | Four-server memory/listener/SSE limits and fifth-owner admission; flood/oversize/slow consumer, full lane, SSE disconnect, compression expansion; other owners and control progress, loss explicit; idle namespaces consume no listener; nonempty bounded suites |
 | OC10 recovery | Server/daemon death during accepted work, unknown state no resend, verified anchor cleanup, namespace lock and password rollover; no attachment to unrelated survivor |
 | OC11 parameters/usage | Instructions clearing; `format` omitted on plain turns and `output_schema` refused; invalid variants → `failed(submit_failed)` with `failure.data.field:"effort"` and no `prompt_async`; pre-I/O unsupported max_steps refusal and null/omitted acceptance, multi-step usage scopes; nonempty full-bound extra_write_dirs deterministically invalid_params before allocation/I/O. ProviderAuthError and 401/403 → auth (t18); 429 → rate_limit (t19); no entitlement inference |
-| OC12 credential boundary | Selected temporary exception is explicit; test correct/wrong/missing and other-owner Basic Auth, exact server/namespace ownership, password rotation, and no generated secret in VIA argv/Store/keys/diagnostics/transport captures. Synthetic credentials only; tests emit Boolean leak checks, not secrets. Never read/copy/log actual user/provider credentials. Inherited instance-password presence is an accepted limitation, not a failed scrub test or proof of same-user isolation |
+| OC12 credential boundary | Selected temporary exception is explicit; test correct/wrong/missing and other-owner Basic Auth, exact server/namespace ownership, password rotation, and no generated secret in VIA argv/Store/keys/diagnostics/transport captures. Synthetic credentials only; tests emit Boolean leak checks, not secrets. Never read/copy/log actual user/provider credentials; the single narrow exception is that a report-only leftover scan (C2 §4.2) may read the environment of a same-uid process started at or after the vendor, through one `/proc/<pid>` descriptor, solely to match the exact `VIA_PROCESS_MARKER` entry; nothing from it is kept except the report, and the marker never authorizes a signal or proves ownership or liveness; the generated-password exception does not cover it. Inherited instance-password presence is an accepted limitation, not a failed scrub test or proof of same-user isolation |
 
 OC-SEC-1's material exception has owner authority; scoped Sol review and the
 selected-control proof remain required. Free-model vendor result/continuity and
@@ -838,6 +843,13 @@ These are proposed changes, not edits applied by this worker:
    exception does not authorize access to user/provider credentials. Revisit
    at the next vendor-pin/security review and before changing sharing,
    listener exposure, credential reuse or the advertised trust boundary.”
+   C1 §9 also carries, as a separate bullet that this password exception does
+   not cover, the owner-approved leftover-scan narrowing (2026-10-01): a
+   report-only leftover scan (C2 §4.2) may read the environment of a same-uid
+   process started at or after the vendor, through one `/proc/<pid>`
+   descriptor, solely to match the exact `VIA_PROCESS_MARKER` entry; nothing
+   from it is kept except the report, and the marker never authorizes a signal
+   or proves ownership or liveness.
    This is an accepted limitation, not a fixed inheritance mechanism. Retain
    OC01/OC02/OC12 control tests, four bounded server slots and durable namespace
    ownership. Pin §3's generated rules/readback/precedence and §7's structured

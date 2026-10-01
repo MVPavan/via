@@ -234,6 +234,9 @@ Start from an explicit environment allow-list: `HOME`, `PATH`, `USER`,
 `LOGNAME`, `LANG`, optional `XDG_RUNTIME_DIR`; VIA supplies a writable,
 user-private `CODEX_SQLITE_HOME` and its Host marker. The server itself uses
 the user's vendor login state; VIA never reads/copies credential contents.
+The one exception is C2 §4.2's report-only leftover scan: it matches only
+the exact `VIA_PROCESS_MARKER` entry of a same-uid process started at or
+after the vendor, and its transient buffer is compared in memory and dropped.
 No wholesale parent environment, tokens, proxy variables, loader injection
 or arbitrary `CODEX_*` forwarding. Changes require named evidence and enter
 the server key. This is a candidate integration policy, not a claim that
