@@ -48,9 +48,9 @@
 //!
 //! # Turn expectations
 //!
-//! `expect` states a baseline: `accepted`, `terminal`, `error` and
-//! `cleanup` are each stated (null allowed), or named in `unasserted` with
-//! a reason. `unasserted` is documentary: a field it names may not also be
+//! `expect` states a baseline: `accepted` is stated as a boolean, and
+//! `terminal`, `error` and `cleanup` are each stated (null allowed); any of
+//! the four may instead be named in `unasserted` with a reason. `unasserted` is documentary: a field it names may not also be
 //! stated, and nothing stated is ever skipped. The other fields:
 //! `plan_refusal`, `rejected`, `usage`, `final_text`, `cleanup_settles`,
 //! `stop_facts`, `instance`, `exit`, `journal_uncertain`, `group_absent`,
@@ -107,49 +107,69 @@
 //! are excluded: `vendor_version_untested` (from `InstanceReport`) and
 //! `structured_output_missing` (Core's schema check) are S-CORE's to test.
 //! On a server route (C2 §2 `AdapterError` row, server-route evidence) a
-//! turn's `exit` is always null, and cleanup is its reported tool items
-//! while the server lives (`group_absent` false), or Host `GroupAbsent` for
-//! the server's group after a crash (`group_absent` true).
+//! turn's `exit` is always null, and while the server lives cleanup is its
+//! reported tool items (`group_absent` false). After a server crash cleanup
+//! derives from Host's group evidence for the server's group: `quiescent`
+//! only with positive `GroupAbsent` proof (`group_absent` true), otherwise
+//! `uncertain`. A crash case pins what its fake leaves behind; `c0_server_lost`
+//! leaves no survivor, so it pins `quiescent` with `group_absent` true.
 //!
 //! # Gates
 //!
 //! A turn's `gates` `[{step, lifetime?, advance_ms?, expect}]` each name the
 //! replay `await_signal` step they release (1-based; `lifetime` 1-based,
-//! default 1). For each gate, in order, the driver:
-//! 1. waits until the turn's outcome so far satisfies the gate's `expect`
-//!    (a partial outcome: any turn `expect` field but `unasserted`, such as
-//!    observations so far or `terminal: null`), bounded by the case;
-//! 2. advances its controlled clock by `advance_ms`;
-//! 3. records a snapshot of the outcome so far (`TurnOutcome::gates`), which
+//! default 1). A gate's `expect` is a partial outcome: any turn `expect`
+//! field but `unasserted`, validated like a final expectation except that
+//! `cleanup` may also be `pending`.
+//!
+//! The fake reports its side on the progress log `<name>.progress` beside
+//! the replay, one line per event: `at <step>` when it starts waiting for
+//! the step's signal and `signalled <step>` once it has consumed it (with
+//! ` lifetime <n>` appended in a lifetimes fixture). For each gate, in
+//! order, the driver:
+//! 1. waits for `at <step>` before anything else for the gate;
+//! 2. polls the adapter until it is pending on what the gate guards (for
+//!    c6, the handshake: the adapter has written `initialize`, which the
+//!    fake consumed before reaching the step, and waits for its reply), and
+//!    the gate's `expect` holds;
+//! 3. advances its controlled clock by `advance_ms` and lets every timer
+//!    that expired run, so a timeout armed in step 2 fires now;
+//! 4. records a snapshot of the outcome so far (`TurnOutcome::gates`), which
 //!    [`check`] compares with the gate's `expect`;
-//! 4. sends the step's signal to the fake, once the fake catches it: a
-//!    gate before any emit can come before the fake installed its
-//!    handlers, and the default action kills it (the fake's pid is its
-//!    line in the launch log; on Linux, wait for the signal's bit in
-//!    `SigCgt` of `/proc/<pid>/status`, as `via-fake-agent`'s
-//!    `fixtures.rs` does).
+//! 5. sends the step's signal to the fake (the fake's pid is its line in
+//!    the launch log);
+//! 6. waits for `signalled <step>` before letting the adapter run again, so
+//!    everything the adapter does next (stdin EOF included) comes after the
+//!    step's completion, which the fake orders by true arrival times.
 //!
 //! tokio's paused clock auto-advances whenever the runtime has no work, so
 //! a driver that pauses time must keep the runtime busy (or hold the turn's
-//! futures unpolled) while it waits in step 1, or the adapter's timers fire
-//! before the gate: advance explicitly, never by idling.
+//! futures unpolled) while it waits in steps 1, 5 and 6, and must poll them
+//! in step 2: advance explicitly, never by idling.
 //!
 //! # `drive()` obligations
 //!
 //! - Order: the pure operations (`describe`, then each `plan_checks` entry),
 //!   then every session's logical open in label order, then the turns in
 //!   order (a turn with `start_after` starts at that event of the earlier
-//!   turn, concurrently with it), then each stated `close`.
+//!   turn, concurrently with it). Each session's stated `close` runs as soon
+//!   as that session's own last turn has settled, while other sessions'
+//!   turns may still be running (c4 closes A before B's turn completes);
+//!   never after all turns.
 //! - `launches` and the checkpoints are read from the fixture's launch log
 //!   `<name>.launches` beside the replay (one line per start of the
 //!   replaying fake, `--version` probes included), never from the driver's
 //!   own count; each case starts with no log. `pure_writes` lists the files
 //!   that the pure operations created, changed or removed in the case's
 //!   fixture and scratch directories, the launch log excepted.
-//! - The replay's own verdict is part of the case: a fake that exits 3
-//!   (unmatched or unexpected input, an absent field that was sent, a line
-//!   that came late or before the emit it answers, stdin closed early) fails
-//!   the case whatever the outcome. A replay that ends with `await_eof`
+//! - The replay's own verdict is part of the case. For every launch the
+//!   driver calls [`replay_exit`] with the fixture (or lifetime) it ran and
+//!   the fake's exit status and stderr: the fixture's `exit` step's code and
+//!   stderr, or 0 and none, is required. A fake that exits 3 (unmatched or
+//!   unexpected input, an absent field that was sent, a line that came late
+//!   or before its causal predecessor, stdin closed early), one ended by a
+//!   signal (a shared server killed before its last steps), or any other end
+//!   fails the case whatever the outcome. A replay that ends with `await_eof`
 //!   requires the case to end the way the route ends its vendor input
 //!   (Codex: idle retirement closes the server's stdin after the last session
 //!   closed; a per-turn process: EOF after the result), and no line after
@@ -166,6 +186,55 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
+
+#[path = "replay_exit.rs"]
+mod replay_exit;
+
+pub(crate) use replay_exit::replay_exit;
+
+/// Checks [`replay_exit`] against every `*.replay.json` in `dir`, one
+/// lifetime at a time: the fixture's own end is accepted, and a signal
+/// death, the replay's failure code, another code or other stderr are
+/// refused. Returns the number of lifetimes checked.
+pub(crate) fn replay_exit_self_check(dir: &Path) -> Result<usize, String> {
+    let mut checked = 0;
+    let mut paths: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.to_string_lossy().ends_with(".replay.json"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let at = path.display().to_string();
+        let text = fs::read_to_string(&path).map_err(|error| format!("{at}: {error}"))?;
+        let replay: Value =
+            serde_json::from_str(&text).map_err(|error| format!("{at}: {error}"))?;
+        let lifetimes = match replay.get("lifetimes").and_then(Value::as_array) {
+            Some(lifetimes) => lifetimes.iter().collect(),
+            None => vec![&replay],
+        };
+        for fixture in lifetimes {
+            let (code, stderr) =
+                replay_exit::expected_exit(fixture).map_err(|e| format!("{at}: {e}"))?;
+            replay_exit(fixture, Some(code), &stderr).map_err(|e| format!("{at}: {e}"))?;
+            let wrong = [
+                (None, stderr.clone()),
+                (Some(replay_exit::REPLAY_FAILED), stderr.clone()),
+                (Some(code + 1), stderr.clone()),
+                (Some(code), format!("{stderr}extra")),
+            ];
+            for (ended, text) in wrong {
+                if replay_exit(fixture, ended, &text).is_ok() {
+                    return Err(format!(
+                        "{at}: an end of {ended:?} with {text:?} was accepted"
+                    ));
+                }
+            }
+            checked += 1;
+        }
+    }
+    Ok(checked)
+}
 
 /// What a driver produced for a whole case.
 #[derive(Default)]
@@ -349,6 +418,12 @@ const OPAQUE: &[&str] = &["structured_output", "vendor"];
 const COST: &[&str] = &["usd", "scope", "provenance"];
 /// C1 §5 cost provenance.
 const PROVENANCE: &[&str] = &["reported", "estimated", "unavailable"];
+/// C1 §5 usage and cost scope.
+const SCOPE: &[&str] = &["turn", "session_cumulative", "vendor_interval"];
+/// Where a turn's usage came from.
+const USAGE_FROM: &[&str] = &["terminal", "samples"];
+/// C1 §5 denied action kinds.
+const DENIAL_KIND: &[&str] = &["file_write", "command", "network", "other"];
 /// `from`, the C1 scope and provenance, and the C1 token names.
 const USAGE: &[&str] = &[
     "from",
@@ -498,6 +573,14 @@ enum Ty {
     Object,
     /// An array of strings.
     Strings,
+    /// Any integer.
+    Integer,
+    /// Any number.
+    Number,
+    /// An array of `[id, name]` string pairs.
+    Pairs,
+    /// An object whose members are non-negative integers or null.
+    Counts,
     /// One of these names.
     Name(&'static [&'static str]),
 }
@@ -513,6 +596,19 @@ impl Ty {
             Self::Strings => value
                 .as_array()
                 .is_some_and(|items| items.iter().all(Value::is_string)),
+            Self::Integer => value.is_i64() || value.is_u64(),
+            Self::Number => value.is_number(),
+            Self::Pairs => value.as_array().is_some_and(|items| {
+                items.iter().all(|pair| {
+                    pair.as_array()
+                        .is_some_and(|pair| pair.len() == 2 && pair.iter().all(Value::is_string))
+                })
+            }),
+            Self::Counts => value.as_object().is_some_and(|counts| {
+                counts
+                    .values()
+                    .all(|count| count.is_null() || count.as_u64().is_some())
+            }),
             Self::Name(names) => value.as_str().is_some_and(|text| names.contains(&text)),
         }
     }
@@ -525,6 +621,10 @@ impl Ty {
             Self::Positive => "a positive integer".to_owned(),
             Self::Object => "an object".to_owned(),
             Self::Strings => "an array of strings".to_owned(),
+            Self::Integer => "an integer".to_owned(),
+            Self::Number => "a number".to_owned(),
+            Self::Pairs => "an array of [id, name] string pairs".to_owned(),
+            Self::Counts => "an object of non-negative integers".to_owned(),
             Self::Name(names) => format!("one of {names:?}"),
         }
     }
@@ -728,7 +828,26 @@ fn validate_case(
         let map = object(describe, at)?;
         required(map, "params", Ty::Object, false, at)?;
         known(&map["params"], DESCRIBE_PARAMS, "describe.params")?;
-        if let Some(bound_value) = map["params"].get("bound") {
+        let params = object(&map["params"], "describe.params")?;
+        let at_params = "describe.params";
+        // C1 §3.1: `harness?` and `model?`, one of them required.
+        typed(params, "harness", Ty::Str, true, at_params)?;
+        typed(params, "model", Ty::Str, true, at_params)?;
+        if !params.get("harness").is_some_and(Value::is_string)
+            && !params.get("model").is_some_and(Value::is_string)
+        {
+            return Err("describe.params: harness or model is required".to_owned());
+        }
+        typed(params, "require", Ty::Strings, false, at_params)?;
+        typed(params, "cwd", Ty::Str, true, at_params)?;
+        typed(params, "allow_untested", Ty::Bool, false, at_params)?;
+        if let Some(vendor) = params.get("vendor") {
+            let vendor = object(vendor, "describe.params.vendor")?;
+            if !vendor.values().all(Value::is_object) {
+                return Err("describe.params.vendor: one object of keys per harness".to_owned());
+            }
+        }
+        if let Some(bound_value) = params.get("bound").filter(|bound| !bound.is_null()) {
             bound(bound_value, "describe.params.bound")?;
         }
         typed(map, "capabilities", Ty::Object, false, at)?;
@@ -873,6 +992,8 @@ fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String
                     if field != "kind" && !allowed.contains(&field.as_str()) {
                         return Err(format!("{at}.{key}: {kind} has no field {field}"));
                     }
+                    let (ty, nullable) = observation_field_type(field);
+                    typed(map, field, ty, nullable, &format!("{at}.{key}.{kind}"))?;
                 }
             }
         }
@@ -893,6 +1014,57 @@ fn observation_types(fields: &Map<String, Value>, at: &str) -> Result<(), String
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// The type of an observation payload field, and whether it may be null.
+fn observation_field_type(field: &str) -> (Ty, bool) {
+    match field {
+        "generation" | "correlation" => (Ty::Positive, false),
+        "model" | "blocking" => (Ty::Bool, false),
+        "tools_started" => (Ty::Pairs, false),
+        "tools_ended" => (Ty::Strings, false),
+        "usage" => (Ty::Counts, true),
+        "denial_kind" => (Ty::Name(DENIAL_KIND), false),
+        "code" => (Ty::Name(WARNING), false),
+        "vendor_turn_id" => (Ty::Str, true),
+        // vendor_session_id, text, target, reason, vendor_method, summary,
+        // delivery, requested, returned.
+        _ => (Ty::Str, false),
+    }
+}
+
+/// Checks the members of the stated `terminal.cost`, `usage`,
+/// `stop_facts` and `exit`.
+fn member_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
+    let cost = fields
+        .get("terminal")
+        .and_then(|terminal| terminal.get("cost"))
+        .and_then(Value::as_object);
+    if let Some(cost) = cost {
+        let at = format!("{at}.terminal.cost");
+        typed(cost, "usd", Ty::Number, true, &at)?;
+        typed(cost, "scope", Ty::Name(SCOPE), true, &at)?;
+        typed(cost, "provenance", Ty::Name(PROVENANCE), false, &at)?;
+    }
+    if let Some(usage) = fields.get("usage").and_then(Value::as_object) {
+        let at = format!("{at}.usage");
+        typed(usage, "from", Ty::Name(USAGE_FROM), false, &at)?;
+        typed(usage, "scope", Ty::Name(SCOPE), false, &at)?;
+        typed(usage, "provenance", Ty::Name(PROVENANCE), false, &at)?;
+        for count in &USAGE[3..] {
+            typed(usage, count, Ty::Count, true, &at)?;
+        }
+    }
+    if let Some(facts) = fields.get("stop_facts").and_then(Value::as_object) {
+        for fact in STOP_FACTS {
+            typed(facts, fact, Ty::Bool, false, &format!("{at}.stop_facts"))?;
+        }
+    }
+    if let Some(exit) = fields.get("exit").and_then(Value::as_object) {
+        typed(exit, "code", Ty::Integer, true, &format!("{at}.exit"))?;
+        typed(exit, "signal", Ty::Integer, true, &format!("{at}.exit"))?;
     }
     Ok(())
 }
@@ -929,15 +1101,6 @@ fn expected_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
         .get("terminal")
         .and_then(|terminal| terminal.get("cost"));
     known_if(cost, COST, &format!("{at}.terminal.cost"))?;
-    if let Some(cost) = cost.and_then(Value::as_object) {
-        typed(
-            cost,
-            "provenance",
-            Ty::Name(PROVENANCE),
-            false,
-            &format!("{at}.terminal.cost"),
-        )?;
-    }
     known_if(fields.get("usage"), USAGE, &format!("{at}.usage"))?;
     known_if(
         fields.get("stop_facts"),
@@ -962,7 +1125,7 @@ fn expected_types(fields: &Map<String, Value>, at: &str) -> Result<(), String> {
         )?;
     }
     known_if(fields.get("exit"), EXIT, &format!("{at}.exit"))?;
-    Ok(())
+    member_types(fields, at)
 }
 
 /// Checks the expectation's well-formedness for every harness: known fields
@@ -1071,6 +1234,8 @@ const REFUSAL: &[&str] = &[
 ];
 /// A settled C2 `Cleanup`: never `pending` (C1 §3.5).
 const CLEANUP: &[&str] = &["quiescent", "uncertain"];
+/// A gate's snapshot may catch cleanup still pending.
+const GATE_CLEANUP: &[&str] = &["quiescent", "uncertain", "pending"];
 const SETTLES: &[&str] = &["at_terminal", "at_p7_bound", "when_tools_end"];
 const CONFIRMED: &str = "session.vendor_identity_confirmed";
 const ACCEPTED: &str = "turn.accepted";
@@ -1119,51 +1284,17 @@ fn rules(expect: &Value) -> Result<(), String> {
     }
     for (index, turn) in expect["turns"].as_array().into_iter().flatten().enumerate() {
         let e = &turn["expect"];
-        let terminal = &e["terminal"];
-        let enumerated: [(&str, &Value, &[&str]); 8] = [
-            ("cleanup", &e["cleanup"], CLEANUP),
-            ("cleanup_settles", &e["cleanup_settles"], SETTLES),
-            ("error", &e["error"], ERROR),
-            ("rejected", &e["rejected"], REJECTED),
-            ("plan_refusal", &e["plan_refusal"], REFUSAL),
-            ("terminal.status", &terminal["status"], STATUS),
-            (
-                "terminal.stop_reason",
-                &terminal["stop_reason"],
-                STOP_REASON,
-            ),
-            ("terminal.class_hint", &terminal["class_hint"], CLASS_HINT),
-        ];
-        for (field, value, names) in enumerated {
-            if !named(value, names) {
-                wrong.push(format!(
-                    "turns[{index}].expect.{field}: {value} is not a C2 name"
-                ));
-            }
-        }
+        wrong.extend(expect_rules(&format!("turns[{index}].expect"), e, CLEANUP));
         if e["accepted"] == json!(true) && e["observation_counts"][ACCEPTED] != json!(1) {
             wrong.push(format!(
                 "turns[{index}]: an accepted turn states observation_counts {ACCEPTED} = 1"
             ));
         }
-        let order = kinds(&e["observations_order"]);
-        let first = |kind| order.iter().position(|&seen| seen == kind);
-        // C2 §2 identity: on every route, identity is persisted before any
-        // same-message acceptance, so an accepted turn that asserts the
-        // confirmation anywhere must also order it.
-        let confirmation_asserted = kinds(&e["observations_include"]).contains(&CONFIRMED)
-            || e["observation_counts"][CONFIRMED]
-                .as_u64()
-                .is_some_and(|count| count > 0);
-        if e["accepted"] == json!(true) && confirmation_asserted && first(CONFIRMED).is_none() {
-            wrong.push(format!(
-                "turns[{index}].expect.observations_order: {CONFIRMED} must precede {ACCEPTED}"
-            ));
-        } else if let Some(confirmed) = first(CONFIRMED)
-            && first(ACCEPTED).is_none_or(|accepted| accepted < confirmed)
-        {
-            wrong.push(format!(
-                "turns[{index}].expect.observations_order: {CONFIRMED} must precede {ACCEPTED}"
+        for (number, gate) in turn["gates"].as_array().into_iter().flatten().enumerate() {
+            wrong.extend(expect_rules(
+                &format!("turns[{index}].gates[{number}].expect"),
+                &gate["expect"],
+                GATE_CLEANUP,
             ));
         }
     }
@@ -1172,6 +1303,54 @@ fn rules(expect: &Value) -> Result<(), String> {
     } else {
         Err(wrong.join("\n"))
     }
+}
+
+/// The value rules one expectation (a turn's or a gate's) breaks: C2 names
+/// for its enumerated values, `cleanup` among `cleanups`, and identity
+/// confirmation ordered before acceptance.
+fn expect_rules(at: &str, e: &Value, cleanups: &[&str]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let terminal = &e["terminal"];
+    let enumerated: [(&str, &Value, &[&str]); 8] = [
+        ("cleanup", &e["cleanup"], cleanups),
+        ("cleanup_settles", &e["cleanup_settles"], SETTLES),
+        ("error", &e["error"], ERROR),
+        ("rejected", &e["rejected"], REJECTED),
+        ("plan_refusal", &e["plan_refusal"], REFUSAL),
+        ("terminal.status", &terminal["status"], STATUS),
+        (
+            "terminal.stop_reason",
+            &terminal["stop_reason"],
+            STOP_REASON,
+        ),
+        ("terminal.class_hint", &terminal["class_hint"], CLASS_HINT),
+    ];
+    for (field, value, names) in enumerated {
+        if !named(value, names) {
+            wrong.push(format!("{at}.{field}: {value} is not a C2 name"));
+        }
+    }
+    let order = kinds(&e["observations_order"]);
+    let first = |kind| order.iter().position(|&seen| seen == kind);
+    // C2 §2 identity: on every route, identity is persisted before any
+    // same-message acceptance, so an accepted turn that asserts the
+    // confirmation anywhere must also order it.
+    let confirmation_asserted = kinds(&e["observations_include"]).contains(&CONFIRMED)
+        || e["observation_counts"][CONFIRMED]
+            .as_u64()
+            .is_some_and(|count| count > 0);
+    if e["accepted"] == json!(true) && confirmation_asserted && first(CONFIRMED).is_none() {
+        wrong.push(format!(
+            "{at}.observations_order: {CONFIRMED} must precede {ACCEPTED}"
+        ));
+    } else if let Some(confirmed) = first(CONFIRMED)
+        && first(ACCEPTED).is_none_or(|accepted| accepted < confirmed)
+    {
+        wrong.push(format!(
+            "{at}.observations_order: {CONFIRMED} must precede {ACCEPTED}"
+        ));
+    }
+    wrong
 }
 
 /// Checks that every gate of `expect` names an `await_signal` step of

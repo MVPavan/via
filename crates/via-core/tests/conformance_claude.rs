@@ -61,7 +61,8 @@ fn fixtures() -> PathBuf {
 /// Runs the case's sessions and turns through the Claude C2 driver against
 /// the fake agent replaying `<case>.replay.json`, and collects the outcome
 /// (see the checker's module docs for its obligations: `launches` from
-/// `<case>.launches`, the replay's exit status, and stdin EOF after the
+/// `<case>.launches`, the replay's end judged by
+/// [`conformance_expect::replay_exit`] for every launch, and stdin EOF after the
 /// result at an `await_eof` step). Replaced by `via-p98.3.2`.
 fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
     Err(format!(
@@ -307,4 +308,13 @@ fn conformance_claude_final_text_compares_assembled_text() {
     conformance_expect::check(&expect, &outcome).unwrap();
     outcome.turns[0].final_text = Some(vec![tail.to_owned(), head.to_owned()]);
     assert!(conformance_expect::check(&expect, &outcome).is_err());
+}
+
+/// Green: the shared replay-exit check accepts each fixture's own end and
+/// refuses a signal death, the replay's failure code and any other end
+/// (review r2 #8). [`drive`] calls it for every launch.
+#[test]
+fn conformance_claude_replay_exit_is_judged() {
+    let checked = conformance_expect::replay_exit_self_check(&fixtures()).unwrap();
+    assert!(checked > 0, "no replay lifetimes checked");
 }

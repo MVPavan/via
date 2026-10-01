@@ -36,7 +36,8 @@ fn fixtures() -> PathBuf {
 /// Runs the case's sessions and turns through the Codex C2 driver against
 /// the fake agent replaying `<case>.replay.json`, with controlled time, and
 /// collects the outcome (see the checker's module docs for its obligations:
-/// `launches` from `<case>.launches`, the replay's exit status, and the
+/// `launches` from `<case>.launches`, the replay's end judged by
+/// [`conformance_expect::replay_exit`] for every launch, and the
 /// server's stdin close at an `await_eof` step).
 /// Replaced by `via-5lr.3.2`.
 fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
@@ -123,7 +124,7 @@ type Defect = (&'static str, &'static str, fn(&mut Value));
 fn conformance_codex_validate_refuses_each_defect() {
     let base = conformance_expect::load(&fixtures(), "c2_steer").unwrap();
     conformance_expect::validate(&base).unwrap();
-    let defects: [Defect; 72] = [
+    let defects: [Defect; 92] = [
         (
             "accepted turn counts turn.accepted twice",
             "an accepted turn states",
@@ -569,6 +570,100 @@ fn conformance_codex_validate_refuses_each_defect() {
                 e["turns"][0]["expect"]["instance"]["build"] = json!("x");
             },
         ),
+        // Review r2 #5: nested members are typed.
+        ("describe model a boolean", "describe.params.model:", |e| {
+            e["describe"] = json!({"params": {"model": true}, "launches": 0});
+        }),
+        ("describe cwd a number", "describe.params.cwd:", |e| {
+            e["describe"] = json!({"params": {"harness": "codex", "cwd": 7}, "launches": 0});
+        }),
+        (
+            "describe require a string",
+            "describe.params.require:",
+            |e| {
+                e["describe"] =
+                    json!({"params": {"harness": "codex", "require": "steer"}, "launches": 0});
+            },
+        ),
+        (
+            "describe without harness or model",
+            "describe.params: harness or model is required",
+            |e| {
+                e["describe"] = json!({"params": {"cwd": "/w"}, "launches": 0});
+            },
+        ),
+        ("progress model a string", ".progress.model:", |e| {
+            e["turns"][0]["expect"]["observations_include"] =
+                json!([{"kind": "progress", "model": "yes"}]);
+        }),
+        (
+            "progress tools_started a number",
+            ".progress.tools_started:",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] =
+                    json!([{"kind": "progress", "tools_started": 123}]);
+            },
+        ),
+        (
+            "progress tools_started not pairs",
+            ".progress.tools_started:",
+            |e| {
+                e["turns"][0]["expect"]["observations_include"] =
+                    json!([{"kind": "progress", "tools_started": [["exec-1"]]}]);
+            },
+        ),
+        ("denial kind unknown", ".action.denied.denial_kind:", |e| {
+            e["turns"][0]["expect"]["observations_exclude"] =
+                json!([{"kind": "action.denied", "denial_kind": "disk"}]);
+        }),
+        ("warning observation code unknown", ".warning.code:", |e| {
+            e["turns"][0]["expect"]["observations_include"] =
+                json!([{"kind": "warning", "code": "slow"}]);
+        }),
+        ("cost usd a string", "terminal.cost.usd:", |e| {
+            e["turns"][0]["expect"]["terminal"]["cost"]["usd"] = json!("free");
+        }),
+        ("cost scope a boolean", "terminal.cost.scope:", |e| {
+            e["turns"][0]["expect"]["terminal"]["cost"]["scope"] = json!(true);
+        }),
+        ("exit code a string", "expect.exit.code:", |e| {
+            e["turns"][0]["expect"]["exit"] = json!({"code": "0", "signal": null});
+        }),
+        ("exit signal a boolean", "expect.exit.signal:", |e| {
+            e["turns"][0]["expect"]["exit"] = json!({"code": null, "signal": true});
+        }),
+        ("usage from unknown", "expect.usage.from:", |e| {
+            e["turns"][0]["expect"]["usage"]["from"] = json!("guess");
+        }),
+        ("usage scope unknown", "expect.usage.scope:", |e| {
+            e["turns"][0]["expect"]["usage"]["scope"] = json!("forever");
+        }),
+        (
+            "usage tokens a string",
+            "expect.usage.output_tokens:",
+            |e| {
+                e["turns"][0]["expect"]["usage"]["output_tokens"] = json!("83");
+            },
+        ),
+        ("stop fact a string", "expect.stop_facts.forced:", |e| {
+            e["turns"][0]["expect"]["stop_facts"] =
+                json!({"acknowledged": true, "forced": "no", "shared": false});
+        }),
+        // Review r2 #6: gates share the final expectations' enum rules.
+        ("gate error unknown", "gates[0].expect.error:", |e| {
+            e["turns"][0]["gates"] = json!([{"step": 1, "expect": {"error": "nonsense"}}]);
+        }),
+        (
+            "gate terminal status unknown",
+            "gates[0].expect.terminal.status:",
+            |e| {
+                e["turns"][0]["gates"] =
+                    json!([{"step": 1, "expect": {"terminal": {"status": "banana"}}}]);
+            },
+        ),
+        ("gate cleanup unknown", "gates[0].expect.cleanup:", |e| {
+            e["turns"][0]["gates"] = json!([{"step": 1, "expect": {"cleanup": "done"}}]);
+        }),
     ];
     let wrong: Vec<String> = defects
         .into_iter()
@@ -585,6 +680,23 @@ fn conformance_codex_validate_refuses_each_defect() {
         })
         .collect();
     assert!(wrong.is_empty(), "validate:\n{}", wrong.join("\n"));
+}
+
+/// Green: a gate snapshot may catch cleanup still `pending`; a final
+/// expectation may not (review r2 #6).
+#[test]
+fn conformance_codex_pending_cleanup_only_in_gates() {
+    let mut expect = conformance_expect::load(&fixtures(), "c6_cold_initialize").unwrap();
+    expect["turns"][0]["gates"][0]["expect"]["cleanup"] = json!("pending");
+    conformance_expect::validate(&expect).unwrap();
+    expect["turns"][0]["expect"]["cleanup"] = json!("pending");
+    let refused = conformance_expect::validate(&expect);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.contains("turns[0].expect.cleanup:")),
+        "{refused:?}"
+    );
 }
 
 /// Green: `unasserted` is documentary. A listed field the turn also states
@@ -890,4 +1002,13 @@ fn conformance_codex_checker_detects_each_difference() {
             }
         }
     }
+}
+
+/// Green: the shared replay-exit check accepts each fixture's own end and
+/// refuses a signal death, the replay's failure code and any other end
+/// (review r2 #8). [`drive`] calls it for every launch.
+#[test]
+fn conformance_codex_replay_exit_is_judged() {
+    let checked = conformance_expect::replay_exit_self_check(&fixtures()).unwrap();
+    assert!(checked > 0, "no replay lifetimes checked");
 }
