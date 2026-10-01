@@ -5837,19 +5837,24 @@ fn a_close_joining_a_chosen_eviction_takes_its_mode_and_deadline() {
             () = std::future::ready(()) => {}
         }
         assert_eq!(lane.close_order(), Some((CloseMode::Force, by)));
-        let _report = tokio::time::timeout(Duration::from_secs(10), closing)
+        let report = tokio::time::timeout(Duration::from_secs(10), closing)
             .await
             .expect("the lane ends");
+        assert!(
+            report.is_some(),
+            "the close that took it over owns its report"
+        );
     });
 }
 
-/// Critical r2 F6 (C2 §3 idle lanes): a C1 close that joins an eviction
-/// whose driver close already started waits for it, as a second close
-/// waits for the first (C1 §3.6), and receives that driver close's report.
+/// Critical r2 F6, r3 #7 (C2 §3 idle lanes, C1 §3.6): a C1 close that
+/// joins an eviction whose driver close already started waits for it, and
+/// that driver close stays an idle-lane close with no destination: the C1
+/// close gets no report (`leftovers` null).
 #[cfg(feature = "test-failpoints")]
 #[test]
-fn a_close_joining_a_started_eviction_receives_its_report() {
-    let Some(root) = child("a_close_joining_a_started_eviction_receives_its_report") else {
+fn a_close_joining_a_started_eviction_waits_and_owns_no_report() {
+    let Some(root) = child("a_close_joining_a_started_eviction_waits_and_owns_no_report") else {
         return;
     };
     let point = "core.lane.admission_close";
@@ -5871,7 +5876,10 @@ fn a_close_joining_a_started_eviction_receives_its_report() {
             engine.close_lane(&session, CloseMode::Force, Deadline::at(by)),
             async { release_point(&points, point, held) }
         );
-        assert!(report.is_some(), "the joined close gets no report");
+        assert!(
+            report.is_none(),
+            "the joined close got the idle close's report"
+        );
         assert!(
             matches!(lane.close_order(), Some((CloseMode::Graceful, _))),
             "the started close keeps its mode: {:?}",

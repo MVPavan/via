@@ -273,11 +273,14 @@ impl Engine {
             CloseMode::Graceful => via_adapters::CloseMode::Graceful,
             CloseMode::Force => via_adapters::CloseMode::Force,
         };
-        // The close receives the report of the driver close it asked for
-        // or joined, an eviction's included (C2 §3 idle lanes). Its result
-        // is still derived from durable rows only (T3 design §4 [r1.8]):
-        // folding the report's cleanup and leftovers into it awaits a
-        // ruling (critical r2 F6).
+        // Joining an idle-lane close (C1 §3.6; C2 §3 idle lanes): before
+        // the driver close starts, this close takes it over with its mode
+        // and deadline and owns its report; after, it waits for it, and
+        // that driver close stays an idle-lane close with no destination
+        // (`leftovers` null; `close_lane` returns no report). The result is
+        // still derived from durable rows only (T3 design §4 [r1.8]):
+        // folding an owned report's cleanup and leftovers into it belongs to
+        // S-LEFTOVER (via-jm4.28).
         tokio::select! {
             biased;
             _ = force.wait_for(Option::is_some) => return Some(Step::Next),

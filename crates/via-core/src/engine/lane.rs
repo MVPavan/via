@@ -264,8 +264,9 @@ pub(super) struct Lane {
     /// The daemon's Engine, whose idle lanes' bound the lane checks when
     /// it becomes idle ([`Lane::bound_idle`]).
     engine: Weak<Engine>,
-    /// The driver close's report, once its actor closed it: a C1 close
-    /// that asked for it or joined it takes it ([`Engine::close_lane`]).
+    /// The driver close's report, once its actor closed it, when a C1
+    /// close asked for that driver close or took it over before it started:
+    /// that close takes it ([`Engine::close_lane`]).
     report: StdMutex<Option<CloseReport>>,
 }
 
@@ -816,7 +817,13 @@ impl Lane {
     /// waiter: close, retirement, replacement and final shutdown. Nothing
     /// cancels the actor but the runtime's own end.
     async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
-        let close = match self.serve(&mut inbox).await {
+        let ending = self.serve(&mut inbox).await;
+        // A C1 close owns the report of the driver close it asked for or
+        // took over before it started (C1 §3.6; C2 §3 idle lanes, §4.2).
+        // A retirement's or an idle-lane close's has no destination, even
+        // when a C1 close joined it after it started: `leftovers` is null.
+        let owned = matches!(ending, Some(Ending::Close(..)));
+        let close = match ending {
             Some(Ending::Retire) => Some((
                 CloseMode::Force,
                 Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE),
@@ -828,9 +835,10 @@ impl Lane {
             None => None,
         };
         if let Some((mode, deadline)) = close {
-            // Kept for a C1 close that owns or joined it (critical r2 F6).
             let report = self.driver.close(mode, deadline).await;
-            *lock(&self.report) = Some(report);
+            if owned {
+                *lock(&self.report) = Some(report);
+            }
         }
         // Test builds: the actor holds before the channel's admission closes.
         #[cfg(feature = "test-failpoints")]
@@ -1337,10 +1345,12 @@ impl Engine {
     /// by `deadline`, releasing any connection it holds, unless the lane
     /// is already ending, disposes of what the channel still has and
     /// removes the lane, all before `session.closed` (Sol r2 #3); this
-    /// waits for that end. A close joins an eviction ([`Lane::begin_close`])
-    /// and returns the report of the driver close it asked for or joined
-    /// (C2 §3 idle lanes, critical r2 F6); `None` with no lane, as after an
-    /// eviction that already ended. Dropping this future, as the close
+    /// waits for that end. A close joins an eviction ([`Lane::begin_close`]):
+    /// it returns the report of the driver close it asked for or took over
+    /// before it started; `None` for one it joined after it started, which
+    /// stays an idle-lane close with no destination (C1 §3.6, C2 §3 idle
+    /// lanes, critical r3 #7), and with no lane, as after an eviction that
+    /// already ended. Dropping this future, as the close
     /// pass does at the daemon's force, cancels none of it (Sol r3 N4).
     pub(super) async fn close_lane(
         &self,
