@@ -262,7 +262,8 @@ pub(crate) const ENVIRON_CAP: u64 = 256 * 1024;
 /// through `read(path, cap)`, which returns at most `cap` bytes (a reader
 /// may return the whole file). Once `cutoff` has passed, nothing more is
 /// read and the scan is uncertainty, never absence: it is checked before
-/// the scan starts, between entries and before every read. An environment
+/// the scan starts, between entries, before and after every observation
+/// and before the scan reports its result. An environment
 /// is asked for up to [`ENVIRON_CAP`] bytes, a command line only as far as
 /// this build's `via` path and its terminator; an environment of exactly
 /// [`ENVIRON_CAP`] bytes without the mark may have been cut, so it is
@@ -272,6 +273,33 @@ pub(crate) fn scan_processes_by(
     state: &Path,
     cutoff: Option<Instant>,
     read: impl Fn(&Path, u64) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<u32>, String> {
+    let marks = Marks { runtime, state };
+    scan_entries_by(
+        Path::new("/proc"),
+        marks,
+        cutoff,
+        read,
+        crate::process::exited,
+    )
+}
+
+/// The sandbox directories whose `VIA_RUNTIME_DIR` or `VIA_STATE_DIR`
+/// marks a sandbox process.
+#[derive(Clone, Copy)]
+pub(crate) struct Marks<'a> {
+    pub(crate) runtime: &'a Path,
+    pub(crate) state: &'a Path,
+}
+
+/// [`scan_processes_by`] over the numeric entries of `proc`, observing a
+/// marked process's exit through `exited` (a test seam, like `read`).
+pub(crate) fn scan_entries_by(
+    proc: &Path,
+    Marks { runtime, state }: Marks<'_>,
+    cutoff: Option<Instant>,
+    read: impl Fn(&Path, u64) -> std::io::Result<Vec<u8>>,
+    exited: impl Fn(u32) -> Result<bool, String>,
 ) -> Result<Vec<u32>, String> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut scanned = 0_usize;
@@ -300,12 +328,13 @@ pub(crate) fn scan_processes_by(
     if let Some(expired) = expired(scanned) {
         return Err(expired);
     }
-    for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
+    let listed = |error: std::io::Error| format!("{}: {error}", proc.display());
+    for entry in fs::read_dir(proc).map_err(listed)? {
         if let Some(expired) = expired(scanned) {
             return Err(expired);
         }
         scanned += 1;
-        let entry = entry.map_err(|error| format!("/proc: {error}"))?;
+        let entry = entry.map_err(listed)?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -316,7 +345,11 @@ pub(crate) fn scan_processes_by(
         if pid == own {
             continue;
         }
-        let unreadable = match read(&entry.path().join("environ"), ENVIRON_CAP) {
+        let environ = read(&entry.path().join("environ"), ENVIRON_CAP);
+        if let Some(expired) = expired(scanned) {
+            return Err(expired);
+        }
+        let unreadable = match environ {
             Err(error) if vanished(&error) => continue,
             Err(error) => error.to_string(),
             Ok(environ) => {
@@ -328,7 +361,11 @@ pub(crate) fn scan_processes_by(
                         return Err(expired);
                     }
                     // Only a vanished process or a zombie has exited.
-                    if !crate::process::exited(pid)? {
+                    let ended = exited(pid)?;
+                    if let Some(expired) = expired(scanned) {
+                        return Err(expired);
+                    }
+                    if !ended {
                         alive.push(pid);
                     }
                     continue;
@@ -342,7 +379,11 @@ pub(crate) fn scan_processes_by(
         if let Some(expired) = expired(scanned) {
             return Err(expired);
         }
-        match read(&entry.path().join("cmdline"), via.len() as u64 + 1) {
+        let cmdline = read(&entry.path().join("cmdline"), via.len() as u64 + 1);
+        if let Some(expired) = expired(scanned) {
+            return Err(expired);
+        }
+        match cmdline {
             Err(cmdline) if vanished(&cmdline) => {}
             Ok(cmdline) if cmdline.split(|byte| *byte == 0).next() != Some(via) => {}
             _ => {
@@ -351,6 +392,10 @@ pub(crate) fn scan_processes_by(
                 ));
             }
         }
+    }
+    // A scan whose last observation ended past the cutoff proves nothing.
+    if let Some(expired) = expired(scanned) {
+        return Err(expired);
     }
     Ok(alive)
 }

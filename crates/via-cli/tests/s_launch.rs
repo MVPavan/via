@@ -115,21 +115,29 @@ impl Sandbox {
             .stderr(trace)
             .spawn()?;
         let pid = child.id();
-        let child = self.daemon.insert(child);
-        let by = Instant::now() + Duration::from_secs(20);
+        self.daemon = Some(child);
+        self.wait_serving(pid, Instant::now() + Duration::from_secs(20))
+    }
+
+    /// Waits until the directly owned daemon `pid` serves the sandbox's
+    /// socket, by `by`: the deadline is checked before each probe, and a
+    /// probe's exchange is bounded by it and accepted only by it
+    /// ([`daemon::serving_pid_by`]).
+    fn wait_serving(&mut self, pid: u32, by: Instant) -> TestResult<u32> {
+        let child = self.daemon.as_mut().ok_or("no directly owned daemon")?;
         loop {
-            if daemon::serving_pid(&self.runtime) == Some(pid) {
+            if Instant::now() >= by {
+                return Err(Box::new(ScenarioError::Timeout(format!(
+                    "daemon {pid} did not serve by its startup deadline"
+                ))));
+            }
+            if daemon::serving_pid_by(&self.runtime, by) == Some(pid) {
                 return Ok(pid);
             }
             if let Some(status) = child.try_wait()? {
                 return Err(format!("daemon {pid} exited before serving: {status}").into());
             }
-            if Instant::now() >= by {
-                return Err(Box::new(ScenarioError::Timeout(format!(
-                    "daemon {pid} did not serve within 20 s"
-                ))));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(by)));
         }
     }
 
@@ -264,11 +272,7 @@ impl Sandbox {
         if let Some(mut child) = self.daemon.take() {
             let pid = child.id();
             if let Err(error) = &proof {
-                let killed = child.kill().map_err(|error| error.to_string());
-                failures.push(format!(
-                    "the ordinary stop left the sandbox's daemon running ({error}); \
-                     killed its retained child {pid}: {killed:?}"
-                ));
+                failures.push(kill_owned(&mut child, error, kill_by));
             }
             if !outer_cleanup::reap_by(&mut child, kill_by) {
                 failures.push(format!(
@@ -321,6 +325,26 @@ impl Sandbox {
         rustix::process::kill_process(pid, rustix::process::Signal::STOP)?;
         Ok(())
     }
+}
+
+/// The owned-child fallback (runtime §11.2): kills the retained `child`,
+/// left running after the ordinary stop for `cause`, only while `kill_by`
+/// has not passed, checked immediately before the signal. Returns the
+/// cleanup failure to record; past `kill_by`, nothing is signalled and the
+/// child is left to the kept sandbox.
+fn kill_owned(child: &mut Child, cause: &str, kill_by: Instant) -> String {
+    let pid = child.id();
+    if Instant::now() >= kill_by {
+        return format!(
+            "the ordinary stop left the sandbox's daemon running ({cause}); the fallback's \
+             cutoff passed first: nothing signalled, daemon child {pid} left running"
+        );
+    }
+    let killed = child.kill().map_err(|error| error.to_string());
+    format!(
+        "the ordinary stop left the sandbox's daemon running ({cause}); \
+         killed its retained child {pid}: {killed:?}"
+    )
 }
 
 /// At most `cap` bytes of `path`: the teardown's `/proc` reads.
@@ -387,18 +411,27 @@ fn gone(pid: u32, start: u64) -> TestResult<bool> {
 
 /// Whether the process `pid` that started at `start` outlived its
 /// teardown, observed until that teardown's own `deadline` (critical r1
-/// #4): never signalled and given no new budget. A survivor at the
-/// deadline is reported uncertain.
+/// #4): never signalled and given no new budget. Expiry is checked before
+/// each observation and after it, so only an absence observed by the
+/// deadline proves exit (critical r2 N3); otherwise the survivor is
+/// reported uncertain.
 fn survived(pid: u32, start: u64, deadline: Instant) -> TestResult<Option<String>> {
+    let uncertain = || {
+        Ok(Some(format!(
+            "process {pid} survived its teardown: uncertain at the teardown deadline; \
+             nothing signalled"
+        )))
+    };
     loop {
-        if gone(pid, start)? {
-            return Ok(None);
-        }
         if Instant::now() >= deadline {
-            return Ok(Some(format!(
-                "process {pid} survived its teardown: uncertain at the teardown deadline; \
-                 nothing signalled"
-            )));
+            return uncertain();
+        }
+        let ended = gone(pid, start)?;
+        if Instant::now() > deadline {
+            return uncertain();
+        }
+        if ended {
+            return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(deadline)));
     }
@@ -878,4 +911,142 @@ fn s_launch_survivor_check_keeps_the_deadline() -> TestResult {
             && took < Duration::from_millis(500),
         || format!("the expired survivor check: {report:?} after {took:?}"),
     )
+}
+
+/// Critical r2 N1, runtime §11.2: an observation finished after the
+/// cutoff proves nothing. With one entry, so the delayed observation is
+/// the scan's last, each path (a vanished process, an unmarked
+/// environment, an unrelated command line, a marked process's exit)
+/// reports uncertainty once its observation ends past the cutoff; on time,
+/// the same entry is absence.
+#[test]
+fn s_launch_scan_rejects_a_late_final_observation() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let proc = dir.path().join("proc");
+    fs::create_dir_all(proc.join("4242"))?;
+    let (runtime, state) = (dir.path().join("runtime"), dir.path().join("state"));
+    let marks = evidenced::Marks {
+        runtime: &runtime,
+        state: &state,
+    };
+    let marked = [
+        b"VIA_RUNTIME_DIR=".as_slice(),
+        runtime.as_os_str().as_encoded_bytes(),
+    ]
+    .concat();
+    let late = Duration::from_millis(100);
+    let pause = |delayed: bool| {
+        if delayed {
+            std::thread::sleep(late);
+        }
+    };
+    // `delayed` makes the path's observation finish past the cutoff.
+    let mut wrong = Vec::new();
+    for path in ["vanished", "unmarked", "cmdline", "exited"] {
+        for delayed in [false, true] {
+            let read = |file: &Path, _: u64| -> std::io::Result<Vec<u8>> {
+                let environ = file.ends_with("environ");
+                match (path, environ) {
+                    ("vanished", true) => {
+                        pause(delayed);
+                        Err(std::io::ErrorKind::NotFound.into())
+                    }
+                    ("unmarked", true) => {
+                        pause(delayed);
+                        Ok(b"HOME=/x\0".to_vec())
+                    }
+                    ("cmdline", true) => Err(std::io::ErrorKind::PermissionDenied.into()),
+                    ("cmdline", false) => {
+                        pause(delayed);
+                        Ok(b"/bin/sleep\0".to_vec())
+                    }
+                    ("exited", true) => Ok([marked.as_slice(), b"\0"].concat()),
+                    _ => Err(std::io::ErrorKind::NotFound.into()),
+                }
+            };
+            let exited = |_: u32| -> Result<bool, String> {
+                pause(delayed && path == "exited");
+                Ok(true)
+            };
+            let cutoff = Instant::now() + Duration::from_millis(50);
+            let scan = evidenced::scan_entries_by(&proc, marks, Some(cutoff), read, exited);
+            if delayed != scan.is_err() || scan.as_ref().is_ok_and(|alive| !alive.is_empty()) {
+                wrong.push(format!("{path}, delayed {delayed}: {scan:?}"));
+            }
+        }
+    }
+    check(wrong.is_empty(), || wrong.join("; "))
+}
+
+/// Critical r2 N2, runtime §11.2: no destructive step starts after the
+/// fallback's cutoff. When observation consumed the fallback's allowance,
+/// the retained child is not signalled, and the incomplete cleanup is
+/// recorded.
+#[test]
+fn s_launch_owned_fallback_keeps_its_cutoff() -> TestResult {
+    let mut children = Children(Vec::new());
+    let mut helper = Command::new("sleep");
+    helper.arg("60").env_clear();
+    children.0.push(helper.spawn()?);
+    let failure = kill_owned(&mut children.0[0], "observation was slow", Instant::now());
+    let exit = outer_cleanup::wait_by(&mut children.0[0], Instant::now() + Duration::from_secs(1));
+    check(exit.is_none(), || {
+        format!("the retained child was signalled after the cutoff: {exit:?} {failure}")
+    })?;
+    check(failure.contains("nothing signalled"), || {
+        format!("the incomplete cleanup is not recorded: {failure}")
+    })
+}
+
+/// Critical r2 N3: an absence observed once the teardown's deadline has
+/// passed does not prove exit by it: the survivor check reports it
+/// uncertain.
+#[test]
+fn s_launch_survivor_check_rejects_a_late_absence() -> TestResult {
+    let mut ended = Command::new("true").env_clear().spawn()?;
+    let pid = ended.id();
+    let reaped = outer_cleanup::wait_by(&mut ended, Instant::now() + outer_cleanup::REAP);
+    check(reaped.is_some(), || format!("helper {pid} was not reaped"))?;
+    let report = survived(pid, 0, Instant::now())?;
+    check(
+        report
+            .as_deref()
+            .is_some_and(|report| report.contains("uncertain")),
+        || format!("a late absence was accepted: {report:?}"),
+    )
+}
+
+/// Critical r2 N4: readiness keeps the startup deadline. A readiness
+/// probe's exchange is bounded by the time left, so a socket that never
+/// answers costs no more than that.
+#[test]
+fn s_launch_readiness_probe_keeps_its_deadline() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let _silent = std::os::unix::net::UnixListener::bind(dir.path().join("via.sock"))?;
+    let began = Instant::now();
+    let pid = daemon::serving_pid_by(dir.path(), began + Duration::from_millis(200));
+    let took = began.elapsed();
+    check(pid.is_none() && took < Duration::from_secs(1), || {
+        format!("a silent socket's probe: {pid:?} after {took:?}")
+    })
+}
+
+/// Critical r2 N4: the startup wait does not accept readiness once its
+/// deadline has passed: the start is a typed timeout.
+#[test]
+fn s_launch_startup_wait_keeps_its_deadline() -> TestResult {
+    evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        let pid = sandbox.start_daemon()?;
+        let late = sandbox.wait_serving(pid, Instant::now());
+        check(
+            late.as_ref().is_err_and(|error| {
+                matches!(
+                    error.downcast_ref::<ScenarioError>(),
+                    Some(ScenarioError::Timeout(_))
+                )
+            }),
+            || format!("readiness accepted after the startup deadline: {late:?}"),
+        )
+    })
 }
