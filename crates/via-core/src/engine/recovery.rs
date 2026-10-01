@@ -382,7 +382,18 @@ impl Engine {
     /// stays uncertain; only a Store read or write failure is fatal
     /// (runtime-contracts §7).
     async fn reconcile(&self, deadline: Deadline) -> Result<Reconciled, String> {
-        let mut reconciled = Reconciled::default();
+        // Critical r1 #9: facts are kept only for the sessions recovery
+        // asks about. Store lists at most 1,000 unfinished turns at once
+        // (one running per session); past a full list a session it did not
+        // name has no kept facts, which are then incomplete.
+        let unfinished = self
+            .store
+            .unfinished_turns()
+            .await
+            .map_err(|error| format!("store_error: {error}"))?;
+        let every = unfinished.len() < UNFINISHED_LIST;
+        let relevant = unfinished.into_iter().map(|turn| turn.session_id).collect();
+        let mut reconciled = Reconciled::for_sessions(relevant, every);
         let mut after = None;
         loop {
             // At expiry paging stops: the unread rest of the inventory leaves
@@ -845,19 +856,45 @@ impl DurableSettlement {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
-    /// Host's reports for every committed anchor of each session, one an
-    /// earlier, ended turn owns included: the facts its adapter recovery
-    /// is given (C2 §2 Recover, Sol r2 #7).
+    /// Host's reports for every committed anchor of each session with an
+    /// unfinished turn, one an earlier, ended turn owns included: the facts
+    /// its adapter recovery is given (C2 §2 Recover, Sol r2 #7). At most
+    /// [`RECOVERY_FACTS`] in all (critical r1 #9).
     facts: HashMap<SessionId, Vec<AnchorRecovery>>,
-    /// Sessions with a committed anchor Host returned no report for.
+    /// Sessions with unfinished turns and a committed anchor Host returned
+    /// no report for, or one past the cap.
     unreported: HashSet<SessionId>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
     /// The deadline stopped paging before the whole inventory was read.
     incomplete: bool,
+    /// The sessions with unfinished turns, whose recovery asks for facts.
+    relevant: HashSet<SessionId>,
+    /// [`Self::relevant`] lists every session with an unfinished turn.
+    every: bool,
+    /// Facts kept, against [`RECOVERY_FACTS`].
+    kept: usize,
 }
 
+/// Host facts recovery keeps across sessions (critical r1 #9): past it a
+/// session's facts are incomplete, so its answer is never `Dead`.
+const RECOVERY_FACTS: usize = 1024;
+
+/// The most unfinished turns one Store list returns
+/// (`Store::unfinished_turns`, `LIMIT 1000`).
+const UNFINISHED_LIST: usize = 1000;
+
 impl Reconciled {
+    /// Facts for `relevant`'s sessions only, `every` one with an
+    /// unfinished turn when true.
+    fn for_sessions(relevant: HashSet<SessionId>, every: bool) -> Self {
+        Self {
+            relevant,
+            every,
+            ..Self::default()
+        }
+    }
+
     /// Folds one inventory page and Host's reports for the same id range.
     fn add(&mut self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
@@ -866,21 +903,31 @@ impl Reconciled {
                     && report.session_id == owner.session_id
                     && report.turn == owner.turn
             });
-            if let Some(report) = report {
-                self.facts
-                    .entry(owner.session_id.clone())
-                    .or_default()
-                    .push(AnchorRecovery {
-                        session_id: report.session_id.clone(),
-                        anchor_id: report.anchor_id.clone(),
-                        generation: report.generation.clone(),
-                        turn: report.turn,
-                        cleanup: report.cleanup,
-                        forced: report.forced,
-                    });
-            } else {
+            if report.is_none() {
                 self.missing += 1;
-                self.unreported.insert(owner.session_id.clone());
+            }
+            // Critical r1 #9: only a session recovery asks about keeps its
+            // facts, within the cap; past it the session's are incomplete.
+            if self.relevant.contains(&owner.session_id) {
+                match report {
+                    Some(report) if self.kept < RECOVERY_FACTS => {
+                        self.kept += 1;
+                        self.facts
+                            .entry(owner.session_id.clone())
+                            .or_default()
+                            .push(AnchorRecovery {
+                                session_id: report.session_id.clone(),
+                                anchor_id: report.anchor_id.clone(),
+                                generation: report.generation.clone(),
+                                turn: report.turn,
+                                cleanup: report.cleanup,
+                                forced: report.forced,
+                            });
+                    }
+                    Some(_) | None => {
+                        self.unreported.insert(owner.session_id.clone());
+                    }
+                }
             }
             if !owner.turn_running {
                 continue;
@@ -901,12 +948,14 @@ impl Reconciled {
 
     /// Host's reports for every committed anchor of `session` (C2 §2
     /// Recover), and whether they are complete: the whole inventory was
-    /// read and every anchor of the session has a report.
+    /// read, `session` was among those whose facts were kept, and every
+    /// anchor of the session has a kept report.
     fn session_facts(&self, session: &SessionId) -> (&[AnchorRecovery], bool) {
         let facts = self.facts.get(session).map_or(&[][..], Vec::as_slice);
+        let known = self.every || self.relevant.contains(session);
         (
             facts,
-            !self.incomplete && !self.unreported.contains(session),
+            known && !self.incomplete && !self.unreported.contains(session),
         )
     }
 
@@ -944,6 +993,15 @@ mod tests {
         TurnNumber, bounded,
     };
     use via_store::AnchorPhase;
+
+    /// Reconciliation for every session `sessions` names, the sessions
+    /// with unfinished turns.
+    fn relevant(sessions: &[&SessionId]) -> Reconciled {
+        Reconciled::for_sessions(
+            sessions.iter().map(|&session| session.clone()).collect(),
+            true,
+        )
+    }
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
         at_phase(
@@ -984,7 +1042,7 @@ mod tests {
     fn an_anchor_without_a_report_is_never_quiescent_and_is_counted_missing() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session]);
         reconciled.add(
             &[owner("a1", &session, true), owner("a2", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -997,7 +1055,7 @@ mod tests {
     fn a_page_without_reports_after_the_deadline_stays_uncertain() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session]);
         reconciled.add(
             &[owner("a1", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -1012,7 +1070,7 @@ mod tests {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let unseen = SessionId::try_from("s_000000000001").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session, &unseen]);
         reconciled.add(
             &[owner("a1", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -1028,7 +1086,7 @@ mod tests {
         let other = SessionId::try_from("s_000000000001").expect("session");
         let ended = SessionId::try_from("s_000000000002").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session, &other, &ended]);
         reconciled.add(
             &[
                 owner("a1", &session, true),
@@ -1056,7 +1114,7 @@ mod tests {
     fn recovery_facts_cover_every_session_anchor_and_incomplete_ones_never_give_dead() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let unreported = SessionId::try_from("s_000000000001").expect("session");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session, &unreported]);
         reconciled.add(
             &[
                 owner("a1", &session, true),
@@ -1107,5 +1165,55 @@ mod tests {
             DurableSettlement::read(&serde_json::json!({"outcome":"forced","cleanup":"quiescent"}))
                 .is_err()
         );
+    }
+
+    /// Critical r1 #9 (runtime §8: bounded holders): recovery keeps Host's
+    /// facts only for sessions with unfinished turns, a persistent anchor
+    /// of an earlier turn included (Sol r2 #7), and at most
+    /// [`RECOVERY_FACTS`] in all; past the cap a session's facts are
+    /// incomplete, so they never give `Dead`. A session the unfinished list
+    /// may have missed is never complete either.
+    #[test]
+    fn recovery_keeps_bounded_facts_of_sessions_with_unfinished_turns() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let historical = SessionId::try_from("s_000000000001").expect("session");
+        let mut reconciled = relevant(&[&session]);
+        let mut owners = vec![owner("a1", &session, true), owner("a0", &session, false)];
+        let mut reports = vec![
+            report("a1", &session, Cleanup::Quiescent),
+            report("a0", &session, Cleanup::Quiescent),
+        ];
+        for anchor in 0..10 {
+            let anchor = format!("h{anchor}");
+            owners.push(owner(&anchor, &historical, false));
+            reports.push(report(&anchor, &historical, Cleanup::Quiescent));
+        }
+        // A historical anchor without a report.
+        owners.push(owner("hx", &historical, false));
+        reconciled.add(&owners, &reports);
+        assert_eq!(reconciled.session_facts(&session).0.len(), 2);
+        assert!(reconciled.session_facts(&session).1);
+        assert!(
+            !reconciled.facts.contains_key(&historical) && reconciled.unreported.is_empty(),
+            "nothing is kept of a session with no unfinished turn"
+        );
+        // The cap.
+        let mut capped = relevant(&[&session]);
+        let (owners, reports): (Vec<_>, Vec<_>) = (0..=super::RECOVERY_FACTS)
+            .map(|anchor| {
+                let anchor = format!("c{anchor}");
+                (
+                    owner(&anchor, &session, false),
+                    report(&anchor, &session, Cleanup::Quiescent),
+                )
+            })
+            .unzip();
+        capped.add(&owners, &reports);
+        let (facts, complete) = capped.session_facts(&session);
+        assert!(facts.len() <= super::RECOVERY_FACTS);
+        assert!(!complete, "past the cap the facts are incomplete");
+        // A list that may have missed sessions proves nothing for them.
+        let partial = Reconciled::for_sessions(std::iter::once(session.clone()).collect(), false);
+        assert!(!partial.session_facts(&historical).1);
     }
 }
