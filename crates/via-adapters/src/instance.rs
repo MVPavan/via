@@ -1,30 +1,27 @@
 //! Vendor binary resolution and identity, and the in-memory instance cache
-//! (adapter design §5.4, C2 §5 AD7). Pure `stat` work: nothing here starts
-//! a process or writes a file. The cache lives in memory only, so a daemon
+//! (adapter design §5.4, C2 §5 AD7). Only `stat` and access checks: nothing
+//! here starts a process or writes a file. The cache lives in memory only, so a daemon
 //! restart clears it by construction.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 /// How long a refusal entry stays live after it was written (C2 §5).
 pub const REFUSAL_TTL: Duration = Duration::from_mins(10);
 
 /// The binary a harness runs: `configured` (`harnesses.<name>.binary`) when
 /// set, else the first regular file named `default_binary` in the captured
-/// `path` that this process may execute. Empty and relative `PATH` entries
-/// are skipped.
-///
-/// Execution is judged from the mode bits of the class that applies to the
-/// process's effective uid and gids (owner, else group, else other; root
-/// needs any execute bit). Limit: without a kernel access check, ACLs and
-/// `noexec` mounts are not seen, so such a file can still be chosen and
-/// fail at spawn. Revisit if a stat-only lookup proves wrong in practice.
+/// `path` that this process may execute, as the kernel judges it for the
+/// effective ids (`faccessat(X_OK, AT_EACCESS)`: mode classes, ACLs and
+/// `noexec` mounts included). Empty and relative `PATH` entries are skipped.
 pub fn resolve_binary(
     configured: Option<&Path>,
     default_binary: &str,
@@ -33,57 +30,13 @@ pub fn resolve_binary(
     if let Some(configured) = configured {
         return Some(configured.to_path_buf());
     }
-    let ids = EffectiveIds::of_process();
     std::env::split_paths(path?)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(default_binary))
         .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|meta| meta.is_file() && ids.may_execute(&meta))
+            fs::metadata(candidate).is_ok_and(|meta| meta.is_file())
+                && accessat(CWD, candidate, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
         })
-}
-
-/// This process's effective uid, effective gid and supplementary gids, as
-/// `/proc/self/status` reports them; `None` where it cannot be read.
-struct EffectiveIds(Option<(u32, Vec<u32>)>);
-
-impl EffectiveIds {
-    fn of_process() -> Self {
-        Self(
-            fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|status| Self::parse(&status)),
-        )
-    }
-
-    /// `Uid:` and `Gid:` list real, effective, saved and filesystem ids;
-    /// `Groups:` the supplementary ones.
-    fn parse(status: &str) -> Option<(u32, Vec<u32>)> {
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(|rest| rest.split_whitespace().map(str::parse::<u32>))
-        };
-        let uid = field("Uid:")?.nth(1)?.ok()?;
-        let mut gids = vec![field("Gid:")?.nth(1)?.ok()?];
-        for gid in field("Groups:")? {
-            gids.push(gid.ok()?);
-        }
-        Some((uid, gids))
-    }
-
-    /// Whether the mode's applicable class allows execution. Unknown ids
-    /// fall back to any execute bit.
-    fn may_execute(&self, meta: &fs::Metadata) -> bool {
-        let mode = meta.permissions().mode();
-        let class = match &self.0 {
-            None | Some((0, _)) => 0o111,
-            Some((uid, _)) if *uid == meta.uid() => 0o100,
-            Some((_, gids)) if gids.contains(&meta.gid()) => 0o010,
-            Some(_) => 0o001,
-        };
-        mode & class != 0
-    }
 }
 
 /// A resolved binary's identity (C2 §5): device, inode, size and
