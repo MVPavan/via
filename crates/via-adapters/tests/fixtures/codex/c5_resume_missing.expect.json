@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; a 500 ms keep-alive ends the script until the replay gains await_eof",
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; the run ends at VIA's stdin close (await_eof) right after the refusal, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "harness": "codex",
   "launches": 1,
   "sessions": {
@@ -46,13 +46,8 @@
         "observation_counts": {
           "turn.accepted": 0
         },
-        "unasserted": [
-          {
-            "field": "stdin_sequence",
-            "why": "replay-format addition pending: await_eof replaces the 500 ms keep-alive and absent pins that no thread/start or turn/start follows"
-          }
-        ],
-        "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600."
+        "unasserted": [],
+        "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600. The replay pins the stdin sequence: thread/resume without developerInstructions, then nothing but EOF after the refusal (await_eof), so no thread/start or turn/start follows."
       }
     }
   ]

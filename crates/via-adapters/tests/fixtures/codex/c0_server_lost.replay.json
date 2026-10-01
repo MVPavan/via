@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
+  "source": "Codex re-probe c0 (owned stdin closed during sleep 12: the server exited 0 and its tool, code-mode host and sandbox groups were gone within 5 s), 0.159.2, 2026-09-30; replayed as a server exit with the turn in flight; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the recorded exit 0 and its one stderr line (timestamp and pid neutralized) end the replay as an exit step",
   "argv": [
     "app-server",
     "--disable",
@@ -20,7 +20,11 @@
         },
         "capture": {
           "init": "/id"
-        }
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
       }
     },
     {
@@ -70,7 +74,10 @@
         },
         "capture": {
           "thread": "/id"
-        }
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
       }
     },
     {
@@ -169,6 +176,12 @@
     {
       "emit": {
         "line": "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400004\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'sleep 12'\",\"cwd\":\"/work/project\",\"processId\":\"1004\",\"source\":\"unifiedExecStartup\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"sleep 12\"}],\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"startedAtMs\":1790000007781},\"emittedAtMs\":1790000007781}"
+      }
+    },
+    {
+      "exit": {
+        "code": 0,
+        "stderr": "\u001b[2m2026-09-30T00:00:00.000000Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mcodex_core::tools::router\u001b[0m\u001b[2m:\u001b[0m \u001b[3merror\u001b[0m\u001b[2m=\u001b[0mexec_command failed: UnknownProcessId { process_id: 1000 }\n"
       }
     }
   ]

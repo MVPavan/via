@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3's exchange (thread/start, turn/start, final_answer `ACK.` and its usage sample 20391/18176/6) borrowed from c5 turn 1 with gpt-6-luna substituted; thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
+  "source": "Codex re-probe cat (model/list: gpt-6-luna lists no `ultra`) and c7 (an unlisted effort was accepted by turn/start and failed later with HTTP 400), 0.159.2, 2026-09-30; turn 3's exchange (thread/start, turn/start, final_answer `ACK.` and its usage sample 20391/18176/6) borrowed from c5 turn 1 with gpt-6-luna substituted; thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "argv": [
     "app-server",
     "--disable",
@@ -20,7 +20,11 @@
         },
         "capture": {
           "init": "/id"
-        }
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
       }
     },
     {
@@ -70,7 +74,10 @@
         },
         "capture": {
           "thread": "/id"
-        }
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
       }
     },
     {
@@ -188,6 +195,9 @@
       "emit": {
         "line": "{\"id\":${close},\"result\":{\"status\":\"unsubscribed\"}}"
       }
+    },
+    {
+      "await_eof": {}
     }
   ]
 }

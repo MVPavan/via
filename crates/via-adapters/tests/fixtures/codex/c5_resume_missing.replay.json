@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; a 500 ms keep-alive ends the script until the replay gains await_eof",
+  "source": "Codex re-probe c5 (thread/resume with an unknown thread id), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); VIA's resume adds approvalsReviewer and excludeTurns, which the probe's bogus resume omitted; the run ends at VIA's stdin close (await_eof) right after the refusal, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "argv": [
     "app-server",
     "--disable",
@@ -20,7 +20,11 @@
         },
         "capture": {
           "init": "/id"
-        }
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
       }
     },
     {
@@ -69,7 +73,10 @@
         },
         "capture": {
           "resume": "/id"
-        }
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
       }
     },
     {
@@ -78,9 +85,7 @@
       }
     },
     {
-      "delay": {
-        "ms": 500
-      }
+      "await_eof": {}
     }
   ]
 }

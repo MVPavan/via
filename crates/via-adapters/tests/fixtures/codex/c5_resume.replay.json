@@ -1,5 +1,5 @@
 {
-  "source": "Codex re-probe c5 second turn (thread/resume with excludeTurns, then recall of the token), 0.159.2, 2026-09-30; modelled as the next server lifetime of a confirmed session, so c5's first turn and unsubscribe are omitted; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits)",
+  "source": "Codex re-probe c5 second turn (thread/resume with excludeTurns, then recall of the token), 0.159.2, 2026-09-30; modelled as the next server lifetime of a confirmed session, so c5's first turn and unsubscribe are omitted; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
   "argv": [
     "app-server",
     "--disable",
@@ -20,7 +20,11 @@
         },
         "capture": {
           "init": "/id"
-        }
+        },
+        "absent": [
+          "/params/capabilities/experimentalApi",
+          "/params/capabilities/optOutNotificationMethods"
+        ]
       }
     },
     {
@@ -69,7 +73,10 @@
         },
         "capture": {
           "resume": "/id"
-        }
+        },
+        "absent": [
+          "/params/developerInstructions"
+        ]
       }
     },
     {
@@ -177,6 +184,9 @@
       "emit": {
         "line": "{\"id\":${close},\"result\":{\"status\":\"unsubscribed\"}}"
       }
+    },
+    {
+      "await_eof": {}
     }
   ]
 }
