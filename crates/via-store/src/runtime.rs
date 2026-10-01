@@ -1307,7 +1307,10 @@ impl Command {
             Self::Acceptance(record, _) => (
                 record.session_id.as_str().len()
                     + record.correlation.len()
-                    + encoded(&record.event),
+                    + encoded(&record.event)
+                    + record.instance.as_ref().map_or(0, |instance| {
+                        instance.vendor_version.as_ref().map_or(0, String::len)
+                    }),
                 0,
                 1,
             ),
@@ -2629,6 +2632,32 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime")
+    }
+
+    /// Sol r2 #10 (design §6.4): an acceptance binds the instance's
+    /// handshake version it records, so the command's size counts it.
+    #[test]
+    fn an_acceptance_counts_its_instance_version() {
+        let size = |vendor_version: Option<String>| {
+            let (reply, _receive) = tokio::sync::oneshot::channel();
+            super::Command::Acceptance(
+                super::AcceptanceRecord {
+                    session_id: session(),
+                    turn: super::TurnNumber::try_from(1).expect("turn"),
+                    correlation: "t:vt-1".to_owned(),
+                    event: serde_json::json!({}),
+                    adapter_version: None,
+                    instance: Some(super::InstanceRecord {
+                        vendor_version,
+                        tested: true,
+                    }),
+                },
+                reply,
+            )
+            .size()
+            .bytes
+        };
+        assert_eq!(size(Some("v".repeat(1000))), size(None) + 1000);
     }
 
     /// Design §6.1, §6.3, §7.1 [r3.9, r4.5]: a full lane or the fence
