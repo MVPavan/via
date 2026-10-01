@@ -723,13 +723,14 @@ fn replay_absent_pointer_fails_when_it_resolves() -> TestResult {
 
 #[test]
 fn replay_within_ms_bounds_the_wait_for_an_expected_line() -> TestResult {
-    // The run deadline outlasts the outer bound, so only within_ms can end the run.
+    // A missed 300 ms limit fails on its own name, long before the 3 s run
+    // deadline; a longer limit would fail naming the deadline instead.
     let root = tempfile::tempdir()?;
     let binary = install(
         root.path(),
         &fixture(
             &json!([]),
-            60_000,
+            3_000,
             &json!([
                 {"emit": {"line": "ready"}},
                 {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
@@ -742,14 +743,11 @@ fn replay_within_ms_bounds_the_wait_for_an_expected_line() -> TestResult {
     let end = run.finish(false)?;
     assert_eq!(end.code, Some(FAILED));
     assert_eq!(end.stdout, vec![line("ready")]);
-    // The message is best-effort, like the run deadline's.
-    if !end.stderr.is_empty() {
-        assert!(
-            end.stderr.contains("within_ms") && end.stderr.contains("step 2"),
-            "{}",
-            end.stderr
-        );
-    }
+    assert!(
+        end.stderr.contains("step 2: within_ms") && !end.stderr.contains("deadline"),
+        "{}",
+        end.stderr
+    );
 
     // It counts from the previous step's completion, not from the start.
     let root = tempfile::tempdir()?;
@@ -846,5 +844,141 @@ fn replay_appends_each_start_to_the_launch_log() -> TestResult {
     let end = spawn::<&str>(&binary, &[])?.finish(true)?;
     assert_eq!(end.code, Some(FAILED));
     assert!(end.stderr.contains("launch log"), "{}", end.stderr);
+    Ok(())
+}
+
+/// A fixture whose second step must see its line within 300 ms, run with a
+/// 5 s deadline; the line is sent `wait` after "ready" is read.
+fn within_ms_after(wait: Duration) -> TestResult<Finished> {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            5_000,
+            &json!([
+                {"emit": {"line": "ready"}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "got"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    thread::sleep(wait);
+    // The fake may already have exited; then the write fails.
+    let _ = run.send(&json!({"type": "decline"}));
+    run.finish(false)
+}
+
+#[test]
+fn replay_within_ms_late_line_fails_before_the_run_deadline() -> TestResult {
+    let end = within_ms_after(Duration::from_millis(800))?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("ready")]);
+    assert!(
+        end.stderr.contains("step 2: within_ms") && !end.stderr.contains("deadline"),
+        "{}",
+        end.stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_within_ms_limit_ends_with_its_step() -> TestResult {
+    // The second expect has no limit of its own; its line comes after the
+    // first one's 300 ms but well within the 5 s run deadline.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            5_000,
+            &json!([
+                {"expect": {"line": {"type": "first"}, "within_ms": 300}},
+                {"expect": {"line": {"type": "second"}}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "first"}))?;
+    thread::sleep(Duration::from_millis(800));
+    run.send(&json!({"type": "second"}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_await_eof_fails_when_stdin_closed_before_the_previous_step() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {"type": "user"}}},
+                {"delay": {"ms": 1_000}},
+                {"emit": {"line": "terminal"}},
+                {"await_eof": {}}
+            ]),
+        ),
+    )?;
+    // Closed at once, before the terminal is emitted.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("terminal")]);
+    assert!(
+        end.stderr
+            .contains("step 4: stdin closed before step 3 completed"),
+        "{}",
+        end.stderr
+    );
+
+    // Closed only after the terminal is read.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "user"}))?;
+    assert_eq!(run.next_line()?, line("terminal"));
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_trailing_input_after_the_last_expect_fails() -> TestResult {
+    // The delay gives the reader time to see the extra line; nothing is
+    // asserted about time.
+    for steps in [
+        json!([
+            {"expect": {"line": {"type": "user"}}},
+            {"delay": {"ms": 300}},
+            {"exit": {"code": 1, "stderr": "vendor failed\n"}}
+        ]),
+        json!([
+            {"expect": {"line": {"type": "user"}}},
+            {"delay": {"ms": 300}},
+            {"emit": {"line": "done"}}
+        ]),
+    ] {
+        let root = tempfile::tempdir()?;
+        let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+        let mut run = spawn::<&str>(&binary, &[])?;
+        run.send(&json!({"type": "user"}))?;
+        run.send(&json!({"type": "user", "resent": true}))?;
+        let end = run.finish(false)?;
+        assert_eq!(end.code, Some(FAILED), "{steps}");
+        assert!(
+            end.stderr
+                .contains("unexpected input after the last expect"),
+            "{}",
+            end.stderr
+        );
+        assert!(!end.stderr.contains("vendor failed"), "{}", end.stderr);
+    }
     Ok(())
 }
