@@ -169,8 +169,9 @@ pub use runtime::{
     GroupAbsenceRecord, KeyedOperation, ListPage, ListQuery, OperationRecord, OperationVerb,
     PAGE_BYTES, PAGE_MAX, Predecessors, ProcessJournal, Prompt, QueuedSummary, QueuedTurn,
     ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, STATUS_ANCHORS,
-    STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS, SessionRoute, SessionSnapshot, SessionStatus,
-    SessionSummary, SpawnKey, SpawnRecord, StepRow, StepsRecord, Store, StoreClient, StoreError,
-    StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
-    TerminalExtras, TerminalFacts, TerminalRecord, UnfinishedTurn, WalLimits, at_ms,
+    STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS, SessionEventRecord, SessionIdentity, SessionRoute,
+    SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StepRow, StepsRecord,
+    Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    UnfinishedTurn, WalLimits, at_ms,
 };

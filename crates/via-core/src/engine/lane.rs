@@ -15,7 +15,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use serde_json::{Map, Value};
@@ -25,11 +25,14 @@ use via_adapters::{
     SessionCx, SessionDriver, SessionRef, SessionSpec, UsageSample, VendorOptions, VendorTerminal,
     observation_channel,
 };
-use via_store::SessionRoute;
+use via_store::{SessionIdentity, SessionRoute};
 
+use super::journal::{self, SessionWrite};
+use super::latch::{FailureScope, FailureSite};
 use super::progress::UsageLedger;
-use super::{Engine, lock};
-use crate::api::{AutoDeclined, DeniedAction, Kept, StructuredOutputFile};
+use super::queue::Slot;
+use super::{Drain, Engine, lock};
+use crate::api::{AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, rfc3339};
 use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
@@ -42,6 +45,14 @@ const TOMBSTONES: usize = 1024;
 
 /// How long replacing a failed driver waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
+
+/// How long final shutdown's session drain may take before Host
+/// reconciliation: a few Store commits ([`Engine::drop_lanes`]).
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(1);
+
+/// How long final shutdown waits for a lane's channel: one a turn still
+/// holds is that turn's.
+const CHANNEL_RELEASE: Duration = Duration::from_millis(50);
 
 /// Durable session observations a lane holds between turns. Each keeps its
 /// share of the channel's 4 MiB budget; at the bound the monitor stops
@@ -76,9 +87,11 @@ pub(super) struct Lane {
     /// A turn owns the session channel: the monitor gives it up.
     active: watch::Sender<bool>,
     /// Durable session observations received between turns, in decode
-    /// order, for the next turn to commit (decision H3: the Store commits
-    /// an event only while a turn of the session runs).
+    /// order, for the session's dispatcher to commit, or a turn that
+    /// claims the channel first (decision H3 as narrowed).
     held: StdMutex<VecDeque<Held>>,
+    /// Wakes the session's dispatcher for what the monitor holds.
+    wake: Drain,
     /// Ends the lane's monitor.
     cancel: CancellationToken,
 }
@@ -105,6 +118,17 @@ struct LaneState {
 pub(super) struct Identity {
     pub(super) vendor_session_id: String,
     pub(super) transcript: Option<String>,
+}
+
+impl Identity {
+    /// The session's identity columns this identity's open event writes
+    /// (decision H3 as narrowed).
+    pub(super) fn columns(&self) -> SessionIdentity {
+        SessionIdentity {
+            vendor_session_id: self.vendor_session_id.clone(),
+            transcript: self.transcript.clone(),
+        }
+    }
 }
 
 /// Which turn an observation belongs to (C1 §6.1, AD4).
@@ -256,7 +280,7 @@ impl Lane {
         reference: SessionRef,
         receiver: mpsc::Receiver<Admitted>,
         (state, held): (LaneState, VecDeque<Held>),
-        cancel: CancellationToken,
+        (wake, cancel): (Drain, CancellationToken),
     ) -> Self {
         Self {
             driver,
@@ -266,6 +290,7 @@ impl Lane {
             retired: std::sync::atomic::AtomicBool::new(false),
             active: watch::Sender::new(false),
             held: StdMutex::new(held),
+            wake,
             cancel,
         }
     }
@@ -298,7 +323,7 @@ impl Lane {
     /// The session drain (C2 §2 observations before turns): an item
     /// received while no turn runs. A durable one (identity, denial,
     /// decline, warning) is held with its attribution, session-level
-    /// unless it names an earlier turn, for the next turn to commit; an
+    /// unless it names an earlier turn, for the dispatcher to commit; an
     /// expired one and every non-durable one (acceptance, progress, final
     /// text, steer report, vendor close, mismatch, late terminal) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
@@ -329,6 +354,15 @@ impl Lane {
             | Observation::LateTerminal(_) => return,
         };
         lock(&self.held).push_back((attributed, admitted));
+    }
+
+    /// Once the lane is cancelled, what its channel still has goes through
+    /// [`Self::between`]; the monitor gives the channel up when cancelled.
+    async fn drain_rest(&self) {
+        let mut observed = self.observations.lock().await;
+        while let Ok(admitted) = observed.try_recv() {
+            self.between(admitted);
+        }
     }
 
     /// The lane's monitor (C2 §2; Sol r1 F2, F4), on the daemon's tracker
@@ -395,7 +429,12 @@ impl Lane {
                 changed = health.changed() => return changed.is_ok(),
                 changed = active.changed() => return changed.is_ok(),
                 admitted = observed.recv(), if room => match admitted {
-                    Some(admitted) => self.between(admitted),
+                    Some(admitted) => {
+                        self.between(admitted);
+                        if !lock(&self.held).is_empty() {
+                            self.wake.wake().await;
+                        }
+                    }
                     None => open = false,
                 },
             }
@@ -449,6 +488,57 @@ impl Lane {
     /// connection (C1 §3.7 `vendor_identity_verified`, decision H3).
     pub(super) fn verified(&self) -> bool {
         lock(&self.state).committed.is_some()
+    }
+
+    /// A confirmed `identity` as the session's (C2 §2 delayed identity):
+    /// the same vendor session keeps the transcript hint `lane` knows when
+    /// the confirmation names none.
+    pub(super) fn confirmed(
+        lane: Option<&Self>,
+        identity: &via_adapters::observation::Identity,
+    ) -> Identity {
+        let mut confirmed = Identity {
+            vendor_session_id: identity.vendor_session_id.clone(),
+            transcript: identity
+                .transcript
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        };
+        if let (None, Some(known)) = (&confirmed.transcript, lane.and_then(Self::identity))
+            && known.vendor_session_id == confirmed.vendor_session_id
+        {
+            confirmed.transcript = known.transcript;
+        }
+        confirmed
+    }
+
+    /// The open event connection `generation`'s `confirmed` identity
+    /// commits (C1 §6.1, C2 §2), unless the generation committed one:
+    /// `session.opened` for the session's first, else `session.reopened`,
+    /// with the handshake's `vendor_version`.
+    pub(super) fn open_event(
+        &self,
+        generation: &str,
+        confirmed: &Identity,
+        vendor_version: Option<String>,
+    ) -> Option<EventBody> {
+        let first = self.opens(generation)?;
+        let route = self.reference.route.clone();
+        let vendor_session_id = confirmed.vendor_session_id.clone();
+        Some(if first {
+            EventBody::SessionOpened {
+                route,
+                vendor_session_id,
+                vendor_version,
+            }
+        } else {
+            EventBody::SessionReopened {
+                route,
+                vendor_session_id,
+                vendor_version,
+                reason: "resume",
+            }
+        })
     }
 }
 
@@ -588,7 +678,7 @@ impl Engine {
             reference,
             receiver,
             (state, held),
-            self.cancel.child_token(),
+            (self.session_drain(session), self.cancel.child_token()),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         self.tracker.spawn(Arc::clone(&lane).monitor());
@@ -608,7 +698,7 @@ impl Engine {
             reference,
             receiver,
             (LaneState::recovered(route), VecDeque::new()),
-            self.cancel.child_token(),
+            (self.session_drain(session), self.cancel.child_token()),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         self.tracker.spawn(lane.monitor());
@@ -616,25 +706,106 @@ impl Engine {
 
     /// A session's close (C2 §2 Close): its driver is closed by
     /// `deadline`, releasing any connection it holds, and the lane goes.
+    /// The lane is returned with what its channel still had drained
+    /// ([`Lane::between`]), for the close to commit before `session.closed`.
     pub(super) async fn close_lane(
         &self,
         session: &SessionId,
         mode: CloseMode,
         deadline: Deadline,
-    ) {
-        let lane = lock(&self.lanes).remove(session);
+    ) -> Option<Arc<Lane>> {
+        let lane = lock(&self.lanes).remove(session)?;
+        let _report = lane.driver.close(mode, deadline).await;
+        lane.cancel.cancel();
+        lane.drain_rest().await;
+        Some(lane)
+    }
+
+    /// Commits what the session's lane holds from between turns
+    /// ([`Self::commit_lane_held`]); the dispatcher's, once its lane's
+    /// [`Drain`] woke it.
+    pub(super) async fn commit_held(&self, slot: &Slot, session: &SessionId) {
+        let lane = lock(&self.lanes).get(session).cloned();
         if let Some(lane) = lane {
-            let _report = lane.driver.close(mode, deadline).await;
-            lane.cancel.cancel();
+            self.commit_lane_held(slot, session, &lane).await;
+        }
+    }
+
+    /// The durable session observations `lane` holds (C2 §2 session
+    /// drain; decision H3 as narrowed), committed in decode order, each at
+    /// the session's next sequence with its own attribution: a confirmed
+    /// identity's open event with the session's identity columns, and a
+    /// denial, decline or warning as itself. The Store refuses them once
+    /// the session is closed. A failed commit is the session's Store
+    /// failure (design §7.1); what it held after that is dropped.
+    pub(super) async fn commit_lane_held(&self, slot: &Slot, session: &SessionId, lane: &Lane) {
+        for (attributed, admitted) in lane.take_held() {
+            if self.store_failed() {
+                return;
+            }
+            let observation = &admitted.item.observation;
+            let (body, opened) = if let Observation::IdentityConfirmed(identity) = observation {
+                let confirmed = Lane::confirmed(Some(lane), identity);
+                let version = identity.vendor_version.clone();
+                let Some(body) = lane.open_event(&identity.connection_id, &confirmed, version)
+                else {
+                    lane.confirm(confirmed);
+                    continue;
+                };
+                (body, Some((identity.connection_id.clone(), confirmed)))
+            } else if let Some(body) = super::drive::held_body(observation) {
+                (body, None)
+            } else {
+                continue;
+            };
+            let at = rfc3339(SystemTime::now());
+            let columns = opened.as_ref().map(|(_, confirmed)| confirmed.columns());
+            let written = journal::commit_session_event(
+                &self.store,
+                (&slot.head, session),
+                (body, &at, attributed),
+                columns,
+            )
+            .await;
+            match written {
+                SessionWrite::Committed => {
+                    if let Some((generation, confirmed)) = opened {
+                        lane.opened(generation, confirmed);
+                    }
+                }
+                SessionWrite::Refused => return,
+                SessionWrite::Failed(outcome) => {
+                    self.store_failure(FailureSite::Event, outcome, FailureScope::Session(session))
+                        .finish()
+                        .await;
+                    return;
+                }
+            }
         }
     }
 
     /// Final shutdown: every driver's owned work is cancelled and every
-    /// lane dropped, before Host reconciliation.
-    pub(super) fn drop_lanes(&self) {
+    /// lane dropped, before Host reconciliation. What a lane still held or
+    /// its channel still had commits first, by `by` (C2 §2 session drain;
+    /// decision H3 as narrowed): a wake after the final-shutdown fence
+    /// started no dispatcher for it.
+    pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) {
         self.cancel.cancel();
         self.tracker.close();
-        lock(&self.lanes).clear();
+        let lanes: Vec<(SessionId, Arc<Lane>)> = lock(&self.lanes).drain().collect();
+        let by = by.min(tokio::time::Instant::now() + SHUTDOWN_DRAIN);
+        let _bounded = tokio::time::timeout_at(by, async {
+            for (session, lane) in &lanes {
+                if tokio::time::timeout(CHANNEL_RELEASE, lane.drain_rest())
+                    .await
+                    .is_ok()
+                {
+                    let slot = self.slot_for(session);
+                    self.commit_lane_held(&slot, session, lane).await;
+                }
+            }
+        })
+        .await;
     }
 }
 

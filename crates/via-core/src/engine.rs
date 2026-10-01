@@ -81,7 +81,7 @@ pub struct Engine {
     /// The drivers' cancellation; final shutdown cancels it.
     cancel: CancellationToken,
     active: AtomicUsize,
-    admission: tokio::sync::Mutex<()>,
+    admission: Arc<tokio::sync::Mutex<()>>,
     /// The stop mode, the force watch and the latch's phase one with the
     /// failure record, shared with Store's read-corruption observer.
     signal: Arc<latch::Signal>,
@@ -97,7 +97,8 @@ pub struct Engine {
     finalized: AtomicBool,
     /// Sessions with dispatch state: queue, dispatcher and event head. A slot
     /// is retired when its dispatcher exits with nothing left (design §2).
-    sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
+    /// Shared with each lane's [`Drain`].
+    sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
     /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
     /// Phase two of the latch, set under `admission` after `failure_pending`
@@ -114,7 +115,7 @@ pub struct Engine {
     /// Daemon main's end of `starts`, taken once.
     start_receiver: StdMutex<Option<mpsc::Receiver<SessionId>>>,
     /// Starts that found `starts` full; daemon main retries them.
-    pending_starts: StdMutex<HashSet<SessionId>>,
+    pending_starts: Arc<StdMutex<HashSet<SessionId>>>,
     /// Connection slots (design §11): a `Run` turn reserves one before its
     /// grant; at launch Host takes it for the group's life. FIFO waiters.
     slots: Arc<tokio::sync::Semaphore>,
@@ -360,20 +361,20 @@ impl Engine {
             tracker: TaskTracker::new(),
             cancel: CancellationToken::new(),
             active: AtomicUsize::new(0),
-            admission: tokio::sync::Mutex::new(()),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
             signal,
             forced: StdMutex::new(Vec::new()),
             affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
             finalized: AtomicBool::new(false),
-            sessions: StdMutex::new(HashMap::new()),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
             queued: AtomicUsize::new(0),
             store_failed: AtomicBool::new(false),
             force_sessions: StdMutex::new(None),
             read_retries_until: watch::Sender::new(None),
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
-            pending_starts: StdMutex::new(HashSet::new()),
+            pending_starts: Arc::new(StdMutex::new(HashSet::new())),
             slots,
             slot_limit,
             recovered: slots::RecoveredSlots::default(),
@@ -418,9 +419,18 @@ impl Engine {
     /// Asks daemon main to start the session's dispatcher; a full channel
     /// leaves the start pending for daemon main's retry (design §5).
     fn request_start(&self, session: SessionId) {
-        let mut pending = lock(&self.pending_starts);
-        if let Err(mpsc::error::TrySendError::Full(session)) = self.starts.try_send(session) {
-            pending.insert(session);
+        request_start((&self.starts, &self.pending_starts), session);
+    }
+
+    /// The session's [`Drain`], for its lane.
+    fn session_drain(&self, session: &SessionId) -> Drain {
+        Drain {
+            admission: Arc::clone(&self.admission),
+            fence: self.final_shutdown.subscribe(),
+            sessions: Arc::clone(&self.sessions),
+            starts: self.starts.clone(),
+            pending_starts: Arc::clone(&self.pending_starts),
+            session: session.clone(),
         }
     }
 
@@ -504,6 +514,53 @@ impl Engine {
                 .entry(session.clone())
                 .or_insert_with(|| Slot::new(Head::new(None))),
         )
+    }
+}
+
+/// Asks daemon main to start the session's dispatcher; a full channel
+/// leaves the start pending for daemon main's retry (design §5).
+fn request_start(
+    (starts, pending_starts): (&mpsc::Sender<SessionId>, &StdMutex<HashSet<SessionId>>),
+    session: SessionId,
+) {
+    let mut pending = lock(pending_starts);
+    if let Err(mpsc::error::TrySendError::Full(session)) = starts.try_send(session) {
+        pending.insert(session);
+    }
+}
+
+/// Wakes a session's dispatcher to commit the durable observations its
+/// lane received between turns (C2 §2 session drain; decision H3 as
+/// narrowed), so none waits for a next turn. The lane's monitor holds it.
+pub(super) struct Drain {
+    admission: Arc<tokio::sync::Mutex<()>>,
+    /// The `final_shutdown` fence's watch.
+    fence: watch::Receiver<bool>,
+    sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
+    starts: mpsc::Sender<SessionId>,
+    pending_starts: Arc<StdMutex<HashSet<SessionId>>>,
+    session: SessionId,
+}
+
+impl Drain {
+    /// Marks the session's slot, created if it has none, and starts its
+    /// dispatcher unless one runs. Under `admission`, as a receipt's start
+    /// request is, so final shutdown's start drain sees the start or the
+    /// fence refused it; final shutdown then commits what the lane holds
+    /// itself ([`Engine::shutdown`]). Under `sessions`, as a dispatcher's
+    /// exit is, so the slot it marks is never one being retired.
+    pub(super) async fn wake(&self) {
+        let _admission = self.admission.lock().await;
+        if *self.fence.borrow() {
+            return;
+        }
+        let start = lock(&self.sessions)
+            .entry(self.session.clone())
+            .or_insert_with(|| Slot::new(Head::new(None)))
+            .drain();
+        if start {
+            request_start((&self.starts, &self.pending_starts), self.session.clone());
+        }
     }
 }
 

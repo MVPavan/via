@@ -16,8 +16,8 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    BlobRef, EventRecord, QueuedTurn, StoreClient, StoreError, StoredEvent, SubmissionRecord,
-    TerminalExtras, TerminalFacts, TerminalRecord,
+    BlobRef, EventRecord, QueuedTurn, SessionEventRecord, SessionIdentity, StoreClient, StoreError,
+    StoredEvent, SubmissionRecord, TerminalExtras, TerminalFacts, TerminalRecord,
 };
 
 use super::latch::{FailureSite, Signal, WriteOutcome};
@@ -454,6 +454,70 @@ pub(super) async fn commit_event_as(
     }
     head.committed(1);
     Some(seq)
+}
+
+/// A session-level write's outcome ([`commit_session_event`]).
+pub(super) enum SessionWrite {
+    /// Committed.
+    Committed,
+    /// The session is closed: nothing was written, and nothing failed.
+    Refused,
+    /// The write failed; an uncertain one left the head unknown.
+    Failed(WriteOutcome),
+}
+
+/// Commits a session-level event at the session's next sequence on
+/// `head`, whether or not a turn runs (decision H3 as narrowed): a durable
+/// observation received between turns, with its own `(turn, late)`, or a
+/// confirmed identity's open event with `identity`, which the Store
+/// writes into the session's columns in the same transaction. The Store
+/// refuses it once the session is closed.
+pub(super) async fn commit_session_event(
+    store: &StoreClient,
+    (head, session): (&Head, &SessionId),
+    (body, at, (turn, late)): (EventBody, &str, (Option<u32>, bool)),
+    identity: Option<SessionIdentity>,
+) -> SessionWrite {
+    let head = match head.lock(store, session).await {
+        Ok(head) => head,
+        Err(error) => return SessionWrite::Failed(WriteOutcome::of_read(&error)),
+    };
+    let event = Event {
+        seq: head.next(),
+        session_id: session,
+        turn,
+        late,
+        at,
+        body,
+    }
+    .to_value();
+    let Ok(event) = event else {
+        return SessionWrite::Failed(WriteOutcome::NotCommitted);
+    };
+    let record = SessionEventRecord {
+        session_id: session.clone(),
+        event,
+        identity,
+    };
+    let committed = if record.identity.is_some() {
+        store.commit_identity(record).await
+    } else {
+        store.commit_session_event(record).await
+    };
+    match committed {
+        Ok(()) => {
+            head.committed(1);
+            SessionWrite::Committed
+        }
+        Err(StoreError::Refused(_)) => SessionWrite::Refused,
+        Err(error) => {
+            let outcome = WriteOutcome::of(&error);
+            if outcome.head_unknown() {
+                head.lost();
+            }
+            SessionWrite::Failed(outcome)
+        }
+    }
 }
 
 /// Settles an uncertain event against the durable stream: a durable event

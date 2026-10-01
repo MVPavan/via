@@ -20,7 +20,7 @@ use via_store::{
 use super::batch::AffectedTurn;
 use super::final_text::FinalText;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
-use super::lane::{Attribution, Identity, Lane, Retained};
+use super::lane::{Attribution, Lane, Retained};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::progress::Progress;
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
@@ -235,6 +235,12 @@ impl Engine {
             if force.borrow().is_some() {
                 self.force_exit(&slot, &session).await;
                 return Ok(());
+            }
+            // C2 §2 session drain: what the lane received between turns
+            // commits before any decision, so none waits for a next turn.
+            if slot.take_drain() {
+                self.commit_held(&slot, &session).await;
+                continue;
             }
             let step = match slot.front() {
                 Front::Closing => match self.close_pass(&slot, &session, &mut refused).await {
@@ -1749,54 +1755,42 @@ impl Engine {
         lane: Option<&Lane>,
         identity: via_adapters::observation::Identity,
     ) {
-        let mut confirmed = Identity {
-            vendor_session_id: identity.vendor_session_id,
-            transcript: identity
-                .transcript
-                .map(|path| path.to_string_lossy().into_owned()),
-        };
-        // The same vendor session keeps its transcript hint when a later
-        // confirmation names none.
-        if let (None, Some(known)) = (&confirmed.transcript, lane.and_then(Lane::identity))
-            && known.vendor_session_id == confirmed.vendor_session_id
-        {
-            confirmed.transcript = known.transcript;
-        }
+        let confirmed = Lane::confirmed(lane, &identity);
         let Some(lane) = lane else {
             record.vendor.identity = Some(confirmed);
             return;
         };
-        let Some(first) = lane.opens(&identity.connection_id) else {
+        let vendor_version = identity.vendor_version.clone();
+        let Some(body) = lane.open_event(&identity.connection_id, &confirmed, vendor_version)
+        else {
             lane.confirm(confirmed.clone());
             record.vendor.identity = Some(confirmed);
             return;
         };
-        let route = lane.reference.route.clone();
-        let vendor_session_id = confirmed.vendor_session_id.clone();
-        let transcript = confirmed.transcript.clone();
-        let body = if first {
-            EventBody::SessionOpened {
-                route,
-                vendor_session_id,
-                vendor_version: None,
-                transcript,
-            }
-        } else {
-            EventBody::SessionReopened {
-                route,
-                vendor_session_id,
-                vendor_version: None,
-                reason: "resume",
-                transcript,
-            }
-        };
+        if record.first_failure.is_some() {
+            return;
+        }
         let at = rfc3339(SystemTime::now());
-        let failed = record.first_failure.is_some();
-        let seq = journal::commit_event_as(&self.store, record, body, &at, (None, false)).await;
-        self.report_first_failure(record, failed).await;
-        if seq.is_some() {
-            lane.opened(identity.connection_id, confirmed.clone());
-            record.vendor.identity = Some(confirmed);
+        let written = journal::commit_session_event(
+            &self.store,
+            (&record.head, &record.session),
+            (body, &at, (None, false)),
+            Some(confirmed.columns()),
+        )
+        .await;
+        match written {
+            journal::SessionWrite::Committed => {
+                lane.opened(identity.connection_id, confirmed.clone());
+                record.vendor.identity = Some(confirmed);
+            }
+            journal::SessionWrite::Refused => {}
+            journal::SessionWrite::Failed(outcome) => {
+                record.first_failure = Some(FailureNote {
+                    site: FailureSite::Event,
+                    outcome,
+                });
+                self.report_first_failure(record, false).await;
+            }
         }
     }
 
@@ -1905,11 +1899,7 @@ impl Engine {
     ) {
         let kind = denial_kind(denial.kind);
         let at = rfc3339(SystemTime::now());
-        let body = EventBody::ActionDenied {
-            kind,
-            target: denial.target.clone(),
-            reason: denial.reason.clone(),
-        };
+        let body = denial_body(&denial);
         let failed = record.first_failure.is_some();
         let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
         self.report_first_failure(record, failed).await;
@@ -1930,11 +1920,7 @@ impl Engine {
         decline: Decline,
     ) {
         let at = rfc3339(SystemTime::now());
-        let body = EventBody::RequestDeclined {
-            vendor_method: decline.vendor_method.clone(),
-            summary: decline.summary.clone(),
-            blocking: decline.blocking,
-        };
+        let body = decline_body(&decline);
         let failed = record.first_failure.is_some();
         let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
         self.report_first_failure(record, failed).await;
@@ -2397,6 +2383,47 @@ fn acceptance_turn(acceptance: &Acceptance, item: Option<&str>) -> Option<String
         .as_ref()
         .map(|id| id.as_str().to_owned())
         .or_else(|| item.map(str::to_owned))
+}
+
+/// `action.denied`'s body for `denial` (C1 §6.1).
+fn denial_body(denial: &Denial) -> EventBody {
+    EventBody::ActionDenied {
+        kind: denial_kind(denial.kind),
+        target: denial.target.clone(),
+        reason: denial.reason.clone(),
+    }
+}
+
+/// `vendor.request_declined`'s body for `decline` (C1 §6.1).
+fn decline_body(decline: &Decline) -> EventBody {
+    EventBody::RequestDeclined {
+        vendor_method: decline.vendor_method.clone(),
+        summary: decline.summary.clone(),
+        blocking: decline.blocking,
+    }
+}
+
+/// The event a durable session observation other than an identity
+/// commits (C1 §6.1): a denial, a decline or an adapter warning; else
+/// none.
+pub(super) fn held_body(observation: &Observation) -> Option<EventBody> {
+    match observation {
+        Observation::ActionDenied(denial) => Some(denial_body(denial)),
+        Observation::RequestDeclined(decline) => Some(decline_body(decline)),
+        Observation::Warning(warning) => Some(EventBody::warning(
+            warning.code,
+            &warning.message,
+            warning.data.clone(),
+        )),
+        Observation::Accepted(_)
+        | Observation::IdentityConfirmed(_)
+        | Observation::Progress(_)
+        | Observation::FinalText(_)
+        | Observation::SteerDelivered(_)
+        | Observation::VendorClosed(_)
+        | Observation::ResumeMismatch { .. }
+        | Observation::LateTerminal(_) => None,
+    }
 }
 
 /// C1 §5's `action.denied` kind word.

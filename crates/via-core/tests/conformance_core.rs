@@ -1454,8 +1454,9 @@ async fn events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
 
 /// Sol r1 F1 (C2 §2 delayed identity, C1 §6.1, decision H3): a confirmed
 /// vendor identity is committed through the session journal, as one
-/// `session.opened` (`turn: null`, the route, the ID and its transcript)
-/// for the session's first connection generation and one
+/// `session.opened` (`turn: null`, the route, the ID and the handshake's
+/// version; the transcript hint into the session's columns) for the
+/// session's first connection generation and one
 /// `session.reopened` for each later one, before the same message's
 /// acceptance. After a daemon restart the lane recovers the committed
 /// identity, so a resume whose vendor returns another session is
@@ -1521,7 +1522,13 @@ fn core_confirmed_identity_is_durable_across_a_restart() {
                 assert_eq!(open["vendor_session_id"], "v1", "{open}");
                 assert_eq!(open["route"], "fake", "{open}");
             }
-            assert_eq!(opens[0]["transcript"], "/t/v1.jsonl", "{events:?}");
+            // C1 §6.1's members only: the fake's handshake carries no
+            // version; the transcript hint goes to the session's columns.
+            for open in &opens {
+                assert_eq!(open.get("vendor_version"), Some(&Value::Null), "{open}");
+                assert!(open.get("transcript").is_none(), "{open}");
+            }
+            assert_eq!(opens[1]["reason"], "resume", "{events:?}");
             // Committed before the same turn's acceptance.
             for (open, turn) in opens.iter().zip([1, 2]) {
                 let started = events

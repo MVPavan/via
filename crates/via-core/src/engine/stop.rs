@@ -494,7 +494,7 @@ impl Engine {
         let turns = self.unresolved.turns();
         // Every driver's owned work stops with the daemon (C2 §2
         // `SessionCx`); Host's reconciliation below owns their groups.
-        self.drop_lanes();
+        self.drop_lanes(host_by).await;
         let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
         // The drivers' tasks end once Host stopped their groups; one still
         // running then counts as pending work.

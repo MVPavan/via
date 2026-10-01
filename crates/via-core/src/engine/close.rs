@@ -273,10 +273,15 @@ impl Engine {
             CloseMode::Graceful => via_adapters::CloseMode::Graceful,
             CloseMode::Force => via_adapters::CloseMode::Force,
         };
-        tokio::select! {
+        let lane = tokio::select! {
             biased;
             _ = force.wait_for(Option::is_some) => return Some(Step::Next),
-            () = self.close_lane(session, mode, Deadline::at(bound)) => {}
+            lane = self.close_lane(session, mode, Deadline::at(bound)) => lane,
+        };
+        // C2 §2 session drain: what the closed lane still held commits
+        // before `session.closed`.
+        if let Some(lane) = lane {
+            self.commit_lane_held(slot, session, &lane).await;
         }
         tokio::select! {
             biased;

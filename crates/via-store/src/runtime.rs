@@ -362,6 +362,28 @@ pub struct EventRecord {
     pub event: Value,
 }
 
+/// A session-level event committed whether or not a turn of the session
+/// runs (C2 §2 session drain and delayed identity, decision H3 as narrowed):
+/// a durable observation between turns, or a confirmed identity's
+/// `session.opened`/`session.reopened`. Refused once the session is closed.
+pub struct SessionEventRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// Canonical event with the session's next sequence.
+    pub event: Value,
+    /// A confirmed identity, written into the session's `vendor_session_id`
+    /// and `transcript_hint` in the event's transaction (C1 §6.1).
+    pub identity: Option<SessionIdentity>,
+}
+
+/// A session's confirmed vendor identity, as its columns hold it.
+pub struct SessionIdentity {
+    /// The confirmed vendor session ID.
+    pub vendor_session_id: String,
+    /// The vendor's transcript hint, if any.
+    pub transcript: Option<String>,
+}
+
 /// Core's terminal state and final event, committed atomically.
 pub struct TerminalRecord {
     /// Owning session.
@@ -979,6 +1001,7 @@ pub(crate) enum Command {
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
+    SessionEvent(SessionEventRecord, oneshot::Sender<Result<(), StoreError>>),
     Steps(StepsRecord, oneshot::Sender<Result<(), StoreError>>),
     Status(
         StatusQuery,
@@ -1237,6 +1260,16 @@ impl Command {
             ),
             Self::Event(record, _) => (
                 record.session_id.as_str().len() + encoded(&record.event),
+                0,
+                1,
+            ),
+            Self::SessionEvent(record, _) => (
+                record.session_id.as_str().len()
+                    + encoded(&record.event)
+                    + record.identity.as_ref().map_or(0, |identity| {
+                        identity.vendor_session_id.len()
+                            + identity.transcript.as_ref().map_or(0, String::len)
+                    }),
                 0,
                 1,
             ),
@@ -1891,6 +1924,38 @@ impl StoreClient {
     pub async fn commit_event(&self, record: EventRecord) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Event(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits a durable session observation at the session's next sequence,
+    /// whether or not a turn runs: between turns, the session drain's (C2
+    /// §2). The event keeps its own `turn` and `late`. A closed session
+    /// refuses it.
+    pub async fn commit_session_event(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        if record.identity.is_some() {
+            return Err(StoreError::Constraint(
+                "a session event carries no identity",
+            ));
+        }
+        self.send_session_event(record).await
+    }
+
+    /// Commits a confirmed identity's `session.opened`/`session.reopened` at
+    /// the session's next sequence, and writes the identity into the
+    /// session's columns in the same transaction (C1 §6.1). A closed
+    /// session refuses it.
+    pub async fn commit_identity(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        if record.identity.is_none() {
+            return Err(StoreError::Constraint(
+                "an identity commit needs the identity",
+            ));
+        }
+        self.send_session_event(record).await
+    }
+
+    async fn send_session_event(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SessionEvent(record, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 

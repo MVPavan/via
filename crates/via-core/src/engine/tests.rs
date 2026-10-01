@@ -3076,7 +3076,8 @@ fn the_lane_monitor_closes_a_driver_whose_turn_was_abandoned() {
 /// Sol r1 F4 (C2 §2 observations before turns): between turns the lane's
 /// monitor owns the session channel: non-durable items (progress, a vendor
 /// close) are dropped at once, returning their budget, and a durable one
-/// is held session-level, never the next turn's, for that turn to commit.
+/// is held session-level, never the next turn's, for the dispatcher it
+/// wakes to commit.
 /// Without the drain, the channel fills and its sender blocks.
 #[test]
 fn between_turns_the_lane_monitor_drains_the_session_channel() {
@@ -3084,64 +3085,12 @@ fn between_turns_the_lane_monitor_drains_the_session_channel() {
         return;
     };
     run(async {
-        use via_adapters::{
-            Admitted, Denial, DenialKind, Inherit, Observation, ObservationItem, ProgressMarks,
-            SessionCx, SessionSpec, VendorOptions, observation_channel,
-        };
+        use via_adapters::{Observation, ProgressMarks};
         let engine = open(&root);
         let session = new_session(&engine).await;
-        let route = engine
-            .store
-            .session_snapshot(&session)
-            .await
-            .unwrap()
-            .unwrap()
-            .route;
-        let reference = super::lane::session_ref(&route);
-        let (sink, _unused) = observation_channel();
-        let driver = engine.adapter.open_session(
-            &reference,
-            SessionSpec {
-                session_id: session.clone(),
-                model: "fake".to_owned(),
-                instructions: None,
-                initial_bound: None,
-                cwd: root.clone(),
-                vendor: VendorOptions::new(),
-                inherit: Inherit::OD2_DEFAULT,
-                confirmed_vendor_session_id: None,
-                allow_untested: false,
-            },
-            SessionCx {
-                observations: sink,
-                tracker: engine.tracker.clone(),
-                cancel: engine.cancel.child_token(),
-            },
-        );
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
-        engine.adopt_lane(&session, (driver, receiver), (reference, &route));
-        let lane = super::lock(&engine.lanes).get(&session).cloned().unwrap();
+        let (lane, sender) = adopt_test_lane(&engine, &root, &session).await;
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
-        let send = |observation| {
-            let permit = std::sync::Arc::clone(&budget)
-                .try_acquire_many_owned(10)
-                .unwrap();
-            let item = ObservationItem {
-                at: tokio::time::Instant::now(),
-                vendor_turn: None,
-                observation,
-            };
-            let sender = sender.clone();
-            async move {
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    sender.send(Admitted { item, permit }),
-                )
-                .await
-                .expect("the monitor drains the channel between turns")
-                .unwrap();
-            }
-        };
+        let send = |observation| send_held(&sender, &budget, None, observation);
         // 32 items through a 4-item channel.
         for _ in 0..30 {
             let marks = ProgressMarks {
@@ -3150,12 +3099,7 @@ fn between_turns_the_lane_monitor_drains_the_session_channel() {
             };
             send(Observation::Progress(marks)).await;
         }
-        send(Observation::ActionDenied(Denial {
-            kind: DenialKind::Network,
-            target: "between".to_owned(),
-            reason: "r".to_owned(),
-        }))
-        .await;
+        send(denied("between")).await;
         send(Observation::VendorClosed("idle".to_owned())).await;
         until(|| lane.held_len() == 1 && budget.available_permits() == 990).await;
         let held = lane.take_held();
@@ -3165,6 +3109,310 @@ fn between_turns_the_lane_monitor_drains_the_session_channel() {
             &admitted.item.observation,
             Observation::ActionDenied(denial) if denial.target == "between"
         ));
+    });
+}
+
+/// A lane adopted for `session` on the fake adapter, with the sending end
+/// of its 4-item session channel.
+async fn adopt_test_lane(
+    engine: &Engine,
+    root: &Path,
+    session: &SessionId,
+) -> (
+    std::sync::Arc<super::lane::Lane>,
+    tokio::sync::mpsc::Sender<via_adapters::Admitted>,
+) {
+    use via_adapters::{Inherit, SessionCx, SessionSpec, VendorOptions, observation_channel};
+    let route = engine
+        .store
+        .session_snapshot(session)
+        .await
+        .unwrap()
+        .unwrap()
+        .route;
+    let reference = super::lane::session_ref(&route);
+    let (sink, _unused) = observation_channel();
+    let driver = engine.adapter.open_session(
+        &reference,
+        SessionSpec {
+            session_id: session.clone(),
+            model: "fake".to_owned(),
+            instructions: None,
+            initial_bound: None,
+            cwd: root.to_path_buf(),
+            vendor: VendorOptions::new(),
+            inherit: Inherit::OD2_DEFAULT,
+            confirmed_vendor_session_id: None,
+            allow_untested: false,
+        },
+        SessionCx {
+            observations: sink,
+            tracker: engine.tracker.clone(),
+            cancel: engine.cancel.child_token(),
+        },
+    );
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    engine.adopt_lane(session, (driver, receiver), (reference, &route));
+    let lane = super::lock(&engine.lanes).get(session).cloned().unwrap();
+    (lane, sender)
+}
+
+/// Sends `observation`, naming `vendor_turn`, into a test lane's channel
+/// with 10 permits of `budget`.
+async fn send_held(
+    sender: &tokio::sync::mpsc::Sender<via_adapters::Admitted>,
+    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+    vendor_turn: Option<&str>,
+    observation: via_adapters::Observation,
+) {
+    let permit = std::sync::Arc::clone(budget)
+        .try_acquire_many_owned(10)
+        .unwrap();
+    let item = via_adapters::ObservationItem {
+        at: tokio::time::Instant::now(),
+        vendor_turn: vendor_turn
+            .map(|turn| via_adapters::VendorTurnId::try_from(turn.to_owned()).unwrap()),
+        observation,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sender.send(via_adapters::Admitted { item, permit }),
+    )
+    .await
+    .expect("the monitor drains the channel between turns")
+    .unwrap();
+}
+
+/// A denial named `target`.
+fn denied(target: &str) -> via_adapters::Observation {
+    via_adapters::Observation::ActionDenied(via_adapters::Denial {
+        kind: via_adapters::DenialKind::Network,
+        target: target.to_owned(),
+        reason: "r".to_owned(),
+    })
+}
+
+/// The session's `action.denied` events as `(target, turn, late)`.
+async fn denials(engine: &Engine, session: &SessionId) -> Vec<(Value, Value, Value)> {
+    events_page(engine, session).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "action.denied")
+        .map(|event| {
+            (
+                event["target"].clone(),
+                event["turn"].clone(),
+                event["late"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// Turn 1 of a new session has ended (its launch failed) and its slot is
+/// retired; the session has an adopted lane, its earlier vendor turn
+/// `vt-1` mapped to turn 1, and no start is pending.
+async fn idle_session_with_lane(
+    engine: &Engine,
+    root: &Path,
+    starts: &mut tokio::sync::mpsc::Receiver<SessionId>,
+) -> (
+    SessionId,
+    std::sync::Arc<super::lane::Lane>,
+    tokio::sync::mpsc::Sender<via_adapters::Admitted>,
+) {
+    let session = new_session(engine).await;
+    dispatch(engine, &session).await;
+    while starts.try_recv().is_ok() {}
+    assert!(engine.slot(&session).is_none(), "retired");
+    let (lane, sender) = adopt_test_lane(engine, root, &session).await;
+    lane.map_vendor_turn("vt-1", TurnNumber::try_from(1).unwrap());
+    (session, lane, sender)
+}
+
+/// S-CORE c4 r2 item 1b (C2 §2 session drain, decision H3 as narrowed):
+/// a durable observation received between turns wakes the session's
+/// dispatcher, which commits it at once with its own attribution, with no
+/// next turn: a session-level denial `turn: null`, and a late one naming
+/// an earlier vendor turn with that turn and `late: true`.
+#[test]
+fn a_between_turn_denial_is_committed_before_any_next_turn() {
+    let Some(root) = child("a_between_turn_denial_is_committed_before_any_next_turn") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root, &mut starts).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, denied("session")).await;
+        send_held(&sender, &budget, Some("vt-1"), denied("late")).await;
+        let woken = tokio::time::timeout(Duration::from_secs(2), starts.recv()).await;
+        assert_eq!(
+            woken.ok().flatten(),
+            Some(session.clone()),
+            "the lane woke it"
+        );
+        // The woken dispatcher may find only the first item held: it
+        // commits what is held, and a later item wakes it again.
+        until(|| lane.held_len() == 2).await;
+        dispatch(&engine, &session).await;
+        assert_eq!(
+            denials(&engine, &session).await,
+            [
+                (json!("session"), Value::Null, json!(false)),
+                (json!("late"), json!(1), json!(true)),
+            ]
+        );
+        assert_eq!(lane.held_len(), 0);
+        assert_eq!(
+            budget.available_permits(),
+            1_000,
+            "their budget is returned"
+        );
+        // No next turn was queued or run.
+        let page = events_page(&engine, &session).await;
+        assert!(
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["turn"] != 2),
+            "{page}"
+        );
+    });
+}
+
+/// S-CORE c4 r2 items 1a and 5 (decision H3 as narrowed, C1 §6.1): an
+/// identity confirmed between turns commits `session.opened` with C1's
+/// members, the handshake's `vendor_version` included, and writes the
+/// session's identity columns in the same transaction, from which
+/// `status` and the lane's recovery read it.
+#[test]
+fn a_between_turn_identity_commits_its_open_event_and_the_columns() {
+    let Some(root) = child("a_between_turn_identity_commits_its_open_event_and_the_columns") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root, &mut starts).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let identity = via_adapters::observation::Identity {
+            vendor_session_id: "vs-1".to_owned(),
+            connection_id: "c-1".to_owned(),
+            transcript: Some(PathBuf::from("/t/vs-1.jsonl")),
+            vendor_version: Some("9.9.9".to_owned()),
+        };
+        let confirmed = via_adapters::Observation::IdentityConfirmed(identity);
+        send_held(&sender, &budget, None, confirmed).await;
+        until(|| lane.held_len() == 1).await;
+        dispatch(&engine, &session).await;
+        let page = events_page(&engine, &session).await;
+        let opened: Vec<&Value> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "session.opened")
+            .collect();
+        assert_eq!(opened.len(), 1, "{page}");
+        let mut members: Vec<&str> = opened[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "at",
+                "late",
+                "route",
+                "seq",
+                "session_id",
+                "turn",
+                "type",
+                "vendor_session_id",
+                "vendor_version"
+            ],
+            "{page}"
+        );
+        assert_eq!(opened[0]["vendor_version"], "9.9.9");
+        assert_eq!(opened[0]["vendor_session_id"], "vs-1");
+        assert!(opened[0]["turn"].is_null());
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        assert_eq!(route.vendor_session_id.as_deref(), Some("vs-1"));
+        assert_eq!(route.transcript.as_deref(), Some("/t/vs-1.jsonl"));
+        assert!(lane.verified());
+    });
+}
+
+/// S-CORE c4 r2 item 1b: after the final-shutdown fence a lane's wake
+/// starts no dispatcher, which the start drain would miss; final shutdown
+/// commits what the lane holds before its lanes go.
+#[test]
+fn a_between_turn_denial_at_final_shutdown_is_committed() {
+    let Some(root) = child("a_between_turn_denial_at_final_shutdown_is_committed") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root, &mut starts).await;
+        engine.enter_final_shutdown().await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, denied("at shutdown")).await;
+        until(|| lane.held_len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(starts.try_recv().is_err(), "no start after the fence");
+        drop(lane);
+        let report = shutdown(&engine).await;
+        assert_eq!(report.unstarted_dispatchers, 0);
+        assert_eq!(
+            denials(&engine, &session).await,
+            [(json!("at shutdown"), Value::Null, json!(false))]
+        );
+    });
+}
+
+/// S-CORE c4 r2 item 1b: a denial received between turns and followed by
+/// the session's close is committed before `session.closed`; nothing
+/// commits after it.
+#[test]
+fn a_between_turn_denial_followed_by_close_is_still_in_events() {
+    let Some(root) = child("a_between_turn_denial_followed_by_close_is_still_in_events") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut starts = engine.take_starts().unwrap();
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root, &mut starts).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, denied("before close")).await;
+        until(|| lane.held_len() == 1).await;
+        let (closed, ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session)
+        );
+        closed.unwrap();
+        let page = events_page(&engine, &session).await;
+        let types: Vec<&str> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        let denied_at = types.iter().position(|kind| *kind == "action.denied");
+        let closed_at = types.iter().position(|kind| *kind == "session.closed");
+        assert!(denied_at.is_some() && denied_at < closed_at, "{types:?}");
+        assert_eq!(*types.last().unwrap(), "session.closed", "{types:?}");
     });
 }
 

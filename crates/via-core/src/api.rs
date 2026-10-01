@@ -2516,14 +2516,12 @@ pub(crate) enum EventBody {
     #[serde(rename = "session.closed")]
     SessionClosed { reason: &'static str },
     /// C1 §6.1, C2 §2: the session's first confirmed connection
-    /// generation. `transcript` is C2's hint, committed with the ID.
+    /// generation. Its transcript hint goes to the session's columns.
     #[serde(rename = "session.opened")]
     SessionOpened {
         route: String,
         vendor_session_id: String,
         vendor_version: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        transcript: Option<String>,
     },
     /// C1 §6.1: an adapter-reported warning, within C1 §5's caps.
     #[serde(rename = "warning")]
@@ -2540,8 +2538,6 @@ pub(crate) enum EventBody {
         vendor_session_id: String,
         vendor_version: Option<String>,
         reason: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        transcript: Option<String>,
     },
 }
 

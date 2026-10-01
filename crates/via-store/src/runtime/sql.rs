@@ -8,13 +8,13 @@ use super::{
     KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord, OperationVerb,
     OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors, Prompt,
     QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT,
-    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionId, SessionRoute, SessionSnapshot,
-    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow, StepsRecord,
-    StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
-    TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn,
-    Value, check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
-    commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs, oneshot, params,
-    read_anchor_cohort, read_anchor_owners, read_anchor_records,
+    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId, SessionRoute,
+    SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow,
+    StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
+    TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber,
+    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
+    commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
+    oneshot, params, read_anchor_cohort, read_anchor_owners, read_anchor_records,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -396,6 +396,7 @@ impl Command {
             | Self::Submission(..)
             | Self::Acceptance(..)
             | Self::Event(..)
+            | Self::SessionEvent(..)
             | Self::Steps(..)
             | Self::Terminal(..)
             | Self::Closing(..)
@@ -527,6 +528,7 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::Submission(..)
         | Command::Acceptance(..)
         | Command::Event(..)
+        | Command::SessionEvent(..)
         | Command::Steps(..)
         | Command::Terminal(..)
         | Command::ClosingTerminal(..)
@@ -613,6 +615,9 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::Submission(record, reply) => reply!(reply, commit_submission(conn, &record)),
         Command::Acceptance(record, reply) => reply!(reply, commit_acceptance(conn, &record)),
         Command::Event(record, reply) => reply!(reply, commit_event(conn, &record)),
+        Command::SessionEvent(record, reply) => {
+            reply!(reply, commit_session_event(conn, &record));
+        }
         Command::Steps(record, reply) => reply!(reply, commit_steps(conn, &record)),
         Command::Terminal(record, extras, reply) => {
             reply!(
@@ -1043,27 +1048,17 @@ fn read_keyed_operation(
 }
 
 /// The selected columns of a session's [`SessionRoute`], for a query whose
-/// `?1` is the session and whose row is `sessions` (decision H3). A turn's
-/// unparseable frozen row records no version; it is that turn's own
+/// `?1` is the session and whose row is `sessions` (decision H3): with the
+/// confirmed identity its `session.opened`/`session.reopened` wrote. A
+/// turn's unparseable frozen row records no version; it is that turn's own
 /// failure (design §7.3), not the session's.
 const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
     coalesce((SELECT CASE WHEN json_valid(effective)
                           THEN json_extract(effective,'$.adapter_version') END
               FROM turns WHERE session_id=?1 AND state<>'queued'
               ORDER BY number DESC LIMIT 1),
-             json_extract(receipt,'$.adapter_version'))";
-
-/// `member` of the session's latest committed `session.opened` or
-/// `session.reopened` (decision H3: the confirmed vendor identity is the
-/// committed observation, never a Store update), for a query whose `?1` is
-/// the session.
-fn confirmed(member: &str) -> String {
-    format!(
-        "(SELECT CASE WHEN json_valid(event) THEN json_extract(event,'$.{member}') END FROM events
-          WHERE session_id=?1 AND type IN ('session.opened','session.reopened')
-          ORDER BY seq DESC LIMIT 1)"
-    )
-}
+             json_extract(receipt,'$.adapter_version')),
+    vendor_session_id,transcript_hint";
 
 /// The route identity read at `first` and the four columns after it.
 fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRoute> {
@@ -1074,15 +1069,6 @@ fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRo
         vendor_session_id: row.get(first + 3)?,
         transcript: row.get(first + 4)?,
     })
-}
-
-/// [`ROUTE_COLUMNS`] with the confirmed identity's two columns.
-fn route_columns() -> String {
-    format!(
-        "{ROUTE_COLUMNS},{},{}",
-        confirmed("vendor_session_id"),
-        confirmed("transcript")
-    )
 }
 
 fn read_snapshot(
@@ -1100,7 +1086,6 @@ fn read_snapshot(
         Option<String>,
         SessionRoute,
     );
-    let route = route_columns();
     let row: Option<Row> = conn
         .query_row(
             &format!(
@@ -1108,7 +1093,7 @@ fn read_snapshot(
                     (SELECT coalesce(max(number),0) FROM turns WHERE session_id=?1),
                     (SELECT count(*) FROM turns WHERE session_id=?1 AND state='queued'),
                     (SELECT effective FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT 1),
-                    json_extract(params,'$.cwd'),{route}
+                    json_extract(params,'$.cwd'),{ROUTE_COLUMNS}
                  FROM sessions WHERE id=?1"
             ),
             [session.as_str()],
@@ -1191,12 +1176,11 @@ fn read_queued_turn(
         Option<String>,
         SessionRoute,
     );
-    let route = route_columns();
     let row: Option<Row> = conn
         .query_row(
             &format!(
                 "SELECT t.prompt,t.prompt_blob,t.effective,t.queued_at,t.queued_seq,
-                        json_extract(s.params,'$.cwd'),{route}
+                        json_extract(s.params,'$.cwd'),{ROUTE_COLUMNS}
                  FROM turns t JOIN sessions s ON s.id=t.session_id
                  WHERE t.session_id=?1 AND t.number=?2 AND t.state='queued'"
             ),
@@ -1441,6 +1425,44 @@ fn commit_event(conn: &mut Connection, record: &EventRecord) -> Result<(), Store
     }
     insert_event(&tx, &record.session_id, &record.event)?;
     before_commit!("store.commit.event");
+    commit(tx)
+}
+
+/// Commits a session-level event at the session's next sequence, with a
+/// confirmed identity's columns when it carries one, unless the session is
+/// closed (C2 §2, decision H3 as narrowed).
+fn commit_session_event(
+    conn: &mut Connection,
+    record: &SessionEventRecord,
+) -> Result<(), StoreError> {
+    let session = &record.session_id;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error)?;
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM sessions WHERE id=?1",
+            [session.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or(StoreError::Constraint("session does not exist"))?;
+    if state == "closed" {
+        return Err(StoreError::Refused("session is closed"));
+    }
+    insert_event(&tx, session, &record.event)?;
+    if let Some(identity) = &record.identity {
+        tx.execute(
+            "UPDATE sessions SET vendor_session_id=?2,transcript_hint=?3 WHERE id=?1",
+            params![
+                session.as_str(),
+                identity.vendor_session_id,
+                identity.transcript
+            ],
+        )
+        .map_err(sql_error)?;
+    }
     commit(tx)
 }
 
@@ -2295,17 +2317,12 @@ fn read_evidence_refs(
     type Row = (Option<String>, Option<String>, Option<u32>, Option<String>);
     let row: Option<Row> = conn
         .query_row(
-            &format!(
-                "SELECT coalesce(s.vendor_session_id,{}),coalesce(s.transcript_hint,{}),
-                    t.number,t.evidence_dir
-                 FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
-                    (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
-                    (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
-                    (SELECT max(number) FROM turns WHERE session_id=s.id))
-                 WHERE s.id=?1",
-                confirmed("vendor_session_id"),
-                confirmed("transcript")
-            ),
+            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir
+             FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
+                (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
+                (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
+                (SELECT max(number) FROM turns WHERE session_id=s.id))
+             WHERE s.id=?1",
             params![session.as_str(), turn.map(TurnNumber::get)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -2349,13 +2366,10 @@ fn read_session_status(
     let session = query.session.as_str();
     let row: Option<Session> = conn
         .query_row(
-            &format!(
-                "SELECT state,admission,harness,label,created_ms,updated_ms,
-                    json_extract(params,'$.model'),json_extract(params,'$.cwd'),
-                    json_extract(receipt,'$.route'),coalesce(vendor_session_id,{})
-                 FROM sessions WHERE id=?1",
-                confirmed("vendor_session_id")
-            ),
+            "SELECT state,admission,harness,label,created_ms,updated_ms,
+                json_extract(params,'$.model'),json_extract(params,'$.cwd'),
+                json_extract(receipt,'$.route'),vendor_session_id
+             FROM sessions WHERE id=?1",
             [session],
             |row| {
                 Ok((
