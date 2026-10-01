@@ -583,17 +583,39 @@ impl SessionWriter {
                 sessions.remove(&self.session);
             }
         }
+        self.report(&written);
+        written
+    }
+
+    /// Writes `identity`, confirmed again by the connection generation
+    /// that committed the session's open event, into the session's
+    /// identity columns, with no event ([`journal::commit_identity_columns`]),
+    /// as [`Self::commit`] writes.
+    async fn commit_columns(&self, identity: via_store::SessionIdentity) -> journal::SessionWrite {
+        let _admission = self.admission.lock().await;
+        if self.signal.failure_pending.load(Ordering::Acquire)
+            || self.store_failed.load(Ordering::Acquire)
+        {
+            return journal::SessionWrite::Refused;
+        }
+        let written = journal::commit_identity_columns(&self.store, &self.session, identity).await;
+        self.report(&written);
+        written
+    }
+
+    /// A failed write is the session's Store failure; the caller holds
+    /// `admission`.
+    fn report(&self, written: &journal::SessionWrite) {
         if let journal::SessionWrite::Failed(outcome) = written
             && self.signal.report(
                 FailureSite::Event,
-                outcome,
+                *outcome,
                 latch::FailureScope::Session(&self.session),
             )
         {
             // Phase two, under the `admission` held (design §7.4).
             self.store_failed.store(true, Ordering::Release);
         }
-        written
     }
 }
 

@@ -514,18 +514,25 @@ impl Lane {
         let Admitted { item, permit } = admitted;
         let at = rfc3339(SystemTime::now());
         match &item.observation {
-            Observation::IdentityConfirmed(identity) => {
+            // A stale generation's confirmation counts nothing (C2 §2).
+            Observation::IdentityConfirmed(identity) if self.current(&identity.connection_id) => {
                 let confirmed = Self::confirmed(Some(self), identity);
                 let version = identity.vendor_version.clone();
-                let Some(body) = self.open_event(&identity.connection_id, &confirmed, version)
-                else {
-                    self.confirm(confirmed);
-                    return;
-                };
-                let columns = Some(confirmed.columns());
-                let written = self.writer.commit((body, &at, (None, false)), columns).await;
-                if let SessionWrite::Committed = written {
-                    self.opened(identity.connection_id.clone(), confirmed);
+                match self.open_event(&identity.connection_id, &confirmed, version) {
+                    Some(body) => {
+                        let columns = Some(confirmed.columns());
+                        let written = self.writer.commit((body, &at, (None, false)), columns).await;
+                        if let SessionWrite::Committed = written {
+                            self.opened(identity.connection_id.clone(), confirmed);
+                        }
+                    }
+                    None if self.changes(&confirmed) => {
+                        let written = self.writer.commit_columns(confirmed.columns()).await;
+                        if let SessionWrite::Committed = written {
+                            self.confirm(confirmed);
+                        }
+                    }
+                    None => {}
                 }
             }
             Observation::ActionDenied(_)
@@ -544,7 +551,8 @@ impl Lane {
                     self.writer.commit((body, &at, attributed), None).await;
                 }
             }
-            Observation::Accepted(_)
+            Observation::IdentityConfirmed(_)
+            | Observation::Accepted(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::SteerDelivered(_)
@@ -709,10 +717,31 @@ impl Lane {
         state.identity = Some(identity);
     }
 
-    /// Whether this daemon committed the confirmed identity of the lane's
-    /// connection (C1 §3.7 `vendor_identity_verified`, decision H3).
+    /// Whether this daemon committed the confirmed identity of the driver's
+    /// current connection generation (C1 §3.7 `vendor_identity_verified`,
+    /// decision H3, Sol r2 #4): false from the start of a reopen until that
+    /// generation's own confirmation commits, so a refusal before it
+    /// leaves it false.
     pub(super) fn verified(&self) -> bool {
-        lock(&self.state).committed.is_some()
+        let current = self.driver.connection_id();
+        current.is_some() && lock(&self.state).committed == current
+    }
+
+    /// Whether `connection_id` names the driver's current connection
+    /// generation (C2 §2 delayed identity: Core checks the current
+    /// generation).
+    pub(super) fn current(&self, connection_id: &str) -> bool {
+        self.driver.connection_id().as_deref() == Some(connection_id)
+    }
+
+    /// Whether `confirmed`, confirmed again by the generation that
+    /// committed the open event, differs from the identity the lane knows:
+    /// its columns are written again, with no event.
+    pub(super) fn changes(&self, confirmed: &Identity) -> bool {
+        lock(&self.state).identity.as_ref().is_none_or(|known| {
+            known.vendor_session_id != confirmed.vendor_session_id
+                || known.transcript != confirmed.transcript
+        })
     }
 
     /// A confirmed `identity` as the session's (C2 §2 delayed identity):

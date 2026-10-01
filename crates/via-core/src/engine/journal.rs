@@ -496,7 +496,7 @@ pub(super) async fn commit_session_event(
     };
     let record = SessionEventRecord {
         session_id: session.clone(),
-        event,
+        event: Some(event),
         identity,
     };
     let committed = if record.identity.is_some() {
@@ -517,6 +517,28 @@ pub(super) async fn commit_session_event(
             }
             SessionWrite::Failed(outcome)
         }
+    }
+}
+
+/// Writes `identity`, confirmed again by the connection generation that
+/// committed the session's open event, into the session's identity
+/// columns without another event (Sol r2 #4, decision H3 as narrowed): a
+/// newly named transcript hint survives a restart. The Store refuses it
+/// once the session is closed.
+pub(super) async fn commit_identity_columns(
+    store: &StoreClient,
+    session: &SessionId,
+    identity: SessionIdentity,
+) -> SessionWrite {
+    let record = SessionEventRecord {
+        session_id: session.clone(),
+        event: None,
+        identity: Some(identity),
+    };
+    match store.commit_identity(record).await {
+        Ok(()) => SessionWrite::Committed,
+        Err(StoreError::Refused(_)) => SessionWrite::Refused,
+        Err(error) => SessionWrite::Failed(WriteOutcome::of(&error)),
     }
 }
 

@@ -61,7 +61,7 @@ async fn spawn(client: &StoreClient) {
 fn observation(seq: u64, turn: Option<u32>, late: bool) -> SessionEventRecord {
     SessionEventRecord {
         session_id: session(),
-        event: event("action.denied", seq, turn, late),
+        event: Some(event("action.denied", seq, turn, late)),
         identity: None,
     }
 }
@@ -175,9 +175,11 @@ fn an_identity_commit_writes_the_session_columns_with_its_event() {
         spawn(&client).await;
         let opened = |seq, transcript: Option<&str>| SessionEventRecord {
             session_id: session(),
-            event: json!({"type":"session.opened","seq":seq,"turn":null,"late":false,
+            event: Some(
+                json!({"type":"session.opened","seq":seq,"turn":null,"late":false,
                           "at":"2026-01-01T00:00:00.000Z","route":"fake",
                           "vendor_session_id":"v1","vendor_version":null}),
+            ),
             identity: Some(SessionIdentity {
                 vendor_session_id: "v1".to_owned(),
                 transcript: transcript.map(str::to_owned),
@@ -208,5 +210,78 @@ fn an_identity_commit_writes_the_session_columns_with_its_event() {
         assert!(client.commit_identity(stale).await.is_err());
         let snapshot = client.session_snapshot(&session()).await.unwrap().unwrap();
         assert_eq!(snapshot.route.vendor_session_id.as_deref(), Some("v1"));
+    });
+}
+
+/// Sol r2 #4: a repeated confirmation of the same connection generation
+/// writes the session's identity columns without another open event; a
+/// session observation always has its event; a closed session refuses it.
+#[test]
+fn a_repeated_confirmation_writes_the_columns_without_an_event() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        spawn(&client).await;
+        let columns = |transcript: &str| SessionEventRecord {
+            session_id: session(),
+            event: None,
+            identity: Some(SessionIdentity {
+                vendor_session_id: "v1".to_owned(),
+                transcript: Some(transcript.to_owned()),
+            }),
+        };
+        client.commit_identity(columns("/t/a.jsonl")).await.unwrap();
+        client.commit_identity(columns("/t/b.jsonl")).await.unwrap();
+        let snapshot = client.session_snapshot(&session()).await.unwrap().unwrap();
+        assert_eq!(snapshot.route.vendor_session_id.as_deref(), Some("v1"));
+        assert_eq!(snapshot.route.transcript.as_deref(), Some("/t/b.jsonl"));
+        // No event was written: the next one is still sequence 2.
+        assert_eq!(client.events(&session(), 1, 10).await.unwrap().len(), 1);
+        let mut eventless = observation(2, None, false);
+        eventless.event = None;
+        assert!(client.commit_session_event(eventless).await.is_err());
+        client
+            .commit_session_event(observation(2, None, false))
+            .await
+            .unwrap();
+        client
+            .commit_closing(ClosingRecord {
+                session_id: session(),
+                operation: None,
+            })
+            .await
+            .unwrap();
+        client
+            .commit_terminal_with(
+                TerminalRecord {
+                    session_id: session(),
+                    turn: TurnNumber::try_from(1).unwrap(),
+                    envelope: json!({"state":"cancelled"}),
+                    event: event("turn.ended", 3, Some(1), false),
+                    steps: Vec::new(),
+                },
+                TerminalExtras {
+                    cancel_cause: Some(CancelCause::Close),
+                },
+            )
+            .await
+            .unwrap();
+        let closed = client
+            .commit_closed(ClosedRecord {
+                session_id: session(),
+                event: event("session.closed", 4, None, false),
+                operation: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(closed, ClosedOutcome::Closed(_)));
+        let refused = client.commit_identity(columns("/t/c.jsonl")).await;
+        assert!(
+            matches!(refused, Err(StoreError::Refused(_))),
+            "{refused:?}"
+        );
+        let snapshot = client.session_snapshot(&session()).await.unwrap().unwrap();
+        assert_eq!(snapshot.route.transcript.as_deref(), Some("/t/b.jsonl"));
     });
 }

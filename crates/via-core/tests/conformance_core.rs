@@ -1649,3 +1649,85 @@ fn core_confirmed_identity_is_durable_across_a_restart() {
         daemon.shutdown().await;
     });
 }
+
+/// The session's `vendor_identity_verified` in `status`.
+async fn verified(daemon: &Daemon, session: &SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session":session})).unwrap();
+    let status = daemon.engine.status(params).await.unwrap();
+    status["vendor_identity_verified"].clone()
+}
+
+/// Sol r2 #4 (C2 §2 delayed identity, C1 §3.7, decision H3): verification
+/// belongs to the driver's current connection generation. A generation
+/// confirming again with a new transcript hint writes the session's
+/// columns with no second open event. A reopen resets verification until
+/// its own generation confirms; a turn refused before its generation
+/// confirms leaves it false.
+#[test]
+fn core_identity_verification_follows_the_connection_generation() {
+    let named = |transcript: &str| {
+        emit(&json!({"type":"identity","vendor_session_id":"v1","transcript":transcript}))
+    };
+    let scripts = [
+        script(
+            "first",
+            &[
+                named("/t/a.jsonl"),
+                accepted(1),
+                named("/t/b.jsonl"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        script(
+            "reopen",
+            &[
+                gate("reopen"),
+                identity("v1"),
+                accepted(2),
+                terminal(2, "completed", "end_turn"),
+            ],
+        ),
+        script("refused", &[json!({"action":"exit","code":1})]),
+    ];
+    let Some(root) = child(
+        "core_identity_verification_follows_the_connection_generation",
+        &scenario(&json!({}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        let opens = |events: &[Value]| {
+            events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "session.opened" || event["type"] == "session.reopened"
+                })
+                .count()
+        };
+        assert_eq!(opens(&events(&daemon, &session).await), 1);
+        let params = serde_json::from_value(json!({"turn":format!("{session}/1")})).unwrap();
+        let logs = daemon.engine.logs(params).await.unwrap();
+        assert_eq!(logs["transcript"], "/t/b.jsonl", "{logs}");
+        assert_eq!(verified(&daemon, &session).await, true);
+        // A reopen: unverified until its generation confirms.
+        daemon.resume(&session, "reopen").await;
+        daemon.entered("reopen").await;
+        assert_eq!(verified(&daemon, &session).await, false);
+        daemon.release("reopen");
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(opens(&events(&daemon, &session).await), 2);
+        assert_eq!(verified(&daemon, &session).await, true);
+        // Refused before its generation confirms: unverified.
+        daemon.resume(&session, "refused").await;
+        let envelope = daemon.wait(&session, 3).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(verified(&daemon, &session).await, false);
+        daemon.shutdown().await;
+    });
+}

@@ -1451,7 +1451,9 @@ fn commit_session_event(
     if state == "closed" {
         return Err(StoreError::Refused("session is closed"));
     }
-    insert_event(&tx, session, &record.event)?;
+    if let Some(event) = &record.event {
+        insert_event(&tx, session, event)?;
+    }
     if let Some(identity) = &record.identity {
         tx.execute(
             "UPDATE sessions SET vendor_session_id=?2,transcript_hint=?3 WHERE id=?1",

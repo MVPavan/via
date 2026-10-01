@@ -1769,7 +1769,10 @@ impl Engine {
     /// carrying the ID and transcript hint, before any acceptance of the
     /// same message, which the driver sends after it. Only a committed
     /// identity becomes the session's (decision H3: the journal holds it);
-    /// a failed commit is the turn's first failure.
+    /// a failed commit is the turn's first failure. Only the driver's
+    /// current generation counts; that generation confirming again with a
+    /// new transcript hint writes the session's columns with no event (Sol
+    /// r2 #4).
     async fn confirm_identity(
         &self,
         record: &mut TurnRecord,
@@ -1781,27 +1784,45 @@ impl Engine {
             record.vendor.identity = Some(confirmed);
             return;
         };
+        // A stale generation's confirmation counts nothing (C2 §2).
+        if !lane.current(&identity.connection_id) {
+            return;
+        }
         let vendor_version = identity.vendor_version.clone();
-        let Some(body) = lane.open_event(&identity.connection_id, &confirmed, vendor_version)
-        else {
-            lane.confirm(confirmed.clone());
+        let opened = lane.open_event(&identity.connection_id, &confirmed, vendor_version);
+        let opened_event = opened.is_some();
+        if opened.is_none() && !lane.changes(&confirmed) {
             record.vendor.identity = Some(confirmed);
             return;
-        };
+        }
         if record.first_failure.is_some() {
             return;
         }
-        let at = rfc3339(SystemTime::now());
-        let written = journal::commit_session_event(
-            &self.store,
-            (&record.head, &record.session),
-            (body, &at, (None, false)),
-            Some(confirmed.columns()),
-        )
-        .await;
+        let written = match opened {
+            Some(body) => {
+                let at = rfc3339(SystemTime::now());
+                journal::commit_session_event(
+                    &self.store,
+                    (&record.head, &record.session),
+                    (body, &at, (None, false)),
+                    Some(confirmed.columns()),
+                )
+                .await
+            }
+            // The same generation again, naming more: its columns, with
+            // no event.
+            None => {
+                journal::commit_identity_columns(&self.store, &record.session, confirmed.columns())
+                    .await
+            }
+        };
         match written {
             journal::SessionWrite::Committed => {
-                lane.opened(identity.connection_id, confirmed.clone());
+                if opened_event {
+                    lane.opened(identity.connection_id, confirmed.clone());
+                } else {
+                    lane.confirm(confirmed.clone());
+                }
                 record.vendor.identity = Some(confirmed);
             }
             journal::SessionWrite::Refused => {}

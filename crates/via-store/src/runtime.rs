@@ -365,12 +365,14 @@ pub struct EventRecord {
 /// A session-level event committed whether or not a turn of the session
 /// runs (C2 §2 session drain and delayed identity, decision H3 as narrowed):
 /// a durable observation between turns, or a confirmed identity's
-/// `session.opened`/`session.reopened`. Refused once the session is closed.
+/// `session.opened`/`session.reopened`, or with no event a repeated
+/// confirmation's identity. Refused once the session is closed.
 pub struct SessionEventRecord {
     /// Owning session.
     pub session_id: SessionId,
-    /// Canonical event with the session's next sequence.
-    pub event: Value,
+    /// Canonical event with the session's next sequence; `None` only for an
+    /// identity confirmed again by the same connection generation.
+    pub event: Option<Value>,
     /// A confirmed identity, written into the session's `vendor_session_id`
     /// and `transcript_hint` in the event's transaction (C1 §6.1).
     pub identity: Option<SessionIdentity>,
@@ -1265,7 +1267,7 @@ impl Command {
             ),
             Self::SessionEvent(record, _) => (
                 record.session_id.as_str().len()
-                    + encoded(&record.event)
+                    + record.event.as_ref().map_or(0, encoded)
                     + record.identity.as_ref().map_or(0, |identity| {
                         identity.vendor_session_id.len()
                             + identity.transcript.as_ref().map_or(0, String::len)
@@ -1932,9 +1934,9 @@ impl StoreClient {
     /// §2). The event keeps its own `turn` and `late`. A closed session
     /// refuses it.
     pub async fn commit_session_event(&self, record: SessionEventRecord) -> Result<(), StoreError> {
-        if record.identity.is_some() {
+        if record.identity.is_some() || record.event.is_none() {
             return Err(StoreError::Constraint(
-                "a session event carries no identity",
+                "a session event has its event and no identity",
             ));
         }
         self.send_session_event(record).await
@@ -1942,8 +1944,9 @@ impl StoreClient {
 
     /// Commits a confirmed identity's `session.opened`/`session.reopened` at
     /// the session's next sequence, and writes the identity into the
-    /// session's columns in the same transaction (C1 §6.1). A closed
-    /// session refuses it.
+    /// session's columns in the same transaction (C1 §6.1); with no event,
+    /// a repeated confirmation of the same connection generation, only the
+    /// columns. A closed session refuses it.
     pub async fn commit_identity(&self, record: SessionEventRecord) -> Result<(), StoreError> {
         if record.identity.is_none() {
             return Err(StoreError::Constraint(

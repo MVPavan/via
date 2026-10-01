@@ -3311,17 +3311,28 @@ fn a_between_turn_identity_commits_its_open_event_and_the_columns() {
     };
     run(async {
         let engine = open(&root);
-        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        // The lane the session's dispatch opened, its driver on generation 1.
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        let lane = super::lock(&engine.lanes)
+            .get(&session)
+            .cloned()
+            .expect("the session's lane");
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
         let identity = via_adapters::observation::Identity {
             vendor_session_id: "vs-1".to_owned(),
-            connection_id: "c-1".to_owned(),
+            connection_id: lane.driver.connection_id().expect("a generation"),
             transcript: Some(PathBuf::from("/t/vs-1.jsonl")),
             vendor_version: Some("9.9.9".to_owned()),
         };
-        let confirmed = via_adapters::Observation::IdentityConfirmed(identity);
-        send_held(&sender, &budget, None, confirmed).await;
-        until(|| lane.verified()).await;
+        let item = via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
+            observation: via_adapters::Observation::IdentityConfirmed(identity),
+        };
+        let permit = std::sync::Arc::clone(&budget).try_acquire_owned().unwrap();
+        lane.dispose(via_adapters::Admitted { item, permit }).await;
+        assert!(lane.verified());
         let page = events_page(&engine, &session).await;
         let opened: Vec<&Value> = page["events"]
             .as_array()
@@ -3364,6 +3375,101 @@ fn a_between_turn_identity_commits_its_open_event_and_the_columns() {
             .route;
         assert_eq!(route.vendor_session_id.as_deref(), Some("vs-1"));
         assert_eq!(route.transcript.as_deref(), Some("/t/vs-1.jsonl"));
+    });
+}
+
+/// How many `session.opened`/`session.reopened` the session committed.
+async fn opens(engine: &Engine, session: &SessionId) -> usize {
+    event_types(engine, session)
+        .await
+        .into_iter()
+        .filter(|kind| kind == "session.opened" || kind == "session.reopened")
+        .count()
+}
+
+/// The session's identity columns.
+async fn identity_columns(
+    engine: &Engine,
+    session: &SessionId,
+) -> (Option<String>, Option<String>) {
+    let route = engine
+        .store
+        .session_snapshot(session)
+        .await
+        .unwrap()
+        .unwrap()
+        .route;
+    (route.vendor_session_id, route.transcript)
+}
+
+/// Sol r2 #4 (C2 §2 delayed identity, C1 §3.7): an identity confirmation
+/// counts only for the driver's current connection generation. A stale
+/// one commits nothing; the current one commits one `session.opened` and
+/// the columns, and verifies; the same generation confirming again with a
+/// new transcript hint writes the columns with no event. (A reopen's reset
+/// is `core_identity_verification_follows_the_connection_generation`.)
+#[test]
+fn identity_counts_only_for_the_current_connection_generation() {
+    let Some(root) = child("identity_counts_only_for_the_current_connection_generation") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        let lane = super::lock(&engine.lanes)
+            .get(&session)
+            .cloned()
+            .expect("the session's lane");
+        let current = lane
+            .driver
+            .connection_id()
+            .expect("a connection generation");
+        assert!(!lane.verified());
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let confirm = |connection: &str, transcript: Option<&str>| {
+            let permit = std::sync::Arc::clone(&budget).try_acquire_owned().unwrap();
+            via_adapters::Admitted {
+                item: via_adapters::ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: via_adapters::Observation::IdentityConfirmed(
+                        via_adapters::observation::Identity {
+                            vendor_session_id: "vs-1".to_owned(),
+                            connection_id: connection.to_owned(),
+                            transcript: transcript.map(PathBuf::from),
+                            vendor_version: None,
+                        },
+                    ),
+                },
+                permit,
+            }
+        };
+        // A stale generation's confirmation commits nothing.
+        lane.dispose(confirm("fake-999", Some("/t/stale.jsonl")))
+            .await;
+        assert_eq!(opens(&engine, &session).await, 0);
+        assert_eq!(identity_columns(&engine, &session).await, (None, None));
+        assert!(lane.identity().is_none());
+        assert!(!lane.verified());
+        // The current generation's: one open event and the columns.
+        lane.dispose(confirm(&current, Some("/t/a.jsonl"))).await;
+        assert_eq!(opens(&engine, &session).await, 1);
+        assert_eq!(
+            identity_columns(&engine, &session).await,
+            (Some("vs-1".to_owned()), Some("/t/a.jsonl".to_owned()))
+        );
+        assert!(lane.verified());
+        // The same generation again, with a new hint: the columns only.
+        lane.dispose(confirm(&current, Some("/t/b.jsonl"))).await;
+        lane.dispose(confirm(&current, None)).await;
+        assert_eq!(opens(&engine, &session).await, 1);
+        assert_eq!(
+            identity_columns(&engine, &session).await,
+            (Some("vs-1".to_owned()), Some("/t/b.jsonl".to_owned()))
+        );
+        assert!(lane.verified());
+        assert_eq!(budget.available_permits(), 1_000);
     });
 }
 
