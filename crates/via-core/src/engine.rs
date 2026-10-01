@@ -228,6 +228,11 @@ struct Faults {
     hold_after_submit: AtomicBool,
     /// Notified when a `steer` starts waiting for its turn's acceptance.
     steer_waiting: tokio::sync::Notify,
+    /// The next submission waits for `release` after its commit, before
+    /// a `steer` can address it.
+    hold_before_publish: AtomicBool,
+    /// Notified when a `steer` starts selecting the turn it addresses.
+    steer_selecting: tokio::sync::Notify,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.

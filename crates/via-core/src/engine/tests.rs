@@ -3576,6 +3576,77 @@ fn a_steer_in_the_submitting_window_waits_for_the_acceptance() {
     });
 }
 
+/// Sol r2 #5 (C1 §3.4): steer selection is serialized with the submission
+/// commit and its publication, so a steer issued once `turn.submitted` is
+/// durable, while the dispatcher holds between the commit and the
+/// publication, waits for the publication and then for the acceptance;
+/// it never answers `no_active_turn` from the gap. The launch then fails
+/// (no anchor), so the steer ends `no_active_turn` after its wait.
+#[test]
+fn a_steer_between_the_submission_commit_and_its_publication_waits() {
+    let Some(root) = child("a_steer_between_the_submission_commit_and_its_publication_waits")
+    else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":unsupported,"output_schema":unsupported,
+                   "effort":unsupported,"max_steps":unsupported},
+        "bounds": [], "network_control": false, "recover": unsupported,
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_publish
+            .store(true, Ordering::Release);
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), engine.faults.granted.notified())
+            .await
+            .expect("the submission committed and holds before its publication");
+        assert!(
+            event_types(&engine, &session)
+                .await
+                .contains(&"turn.submitted".to_owned())
+        );
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_selecting.notified(),
+        )
+        .await
+        .expect("the steer selects its turn");
+        engine.faults.release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer addresses the published turn and waits for its acceptance");
+        let error = steering.await.unwrap().unwrap_err();
+        assert_eq!(error.kind, "no_active_turn", "{error:?}");
+        dispatching.await.unwrap();
+    });
+}
+
 /// A workspace test build's sibling binary.
 fn sibling(name: &str) -> PathBuf {
     let path = env::current_exe()

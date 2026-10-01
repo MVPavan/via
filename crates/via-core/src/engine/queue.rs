@@ -376,6 +376,12 @@ pub(super) enum Sweep {
 /// while anyone else holds one.
 pub(super) struct Slot {
     pub(super) head: Arc<Head>,
+    /// Sol r2 #5 (C1 §3.4): a submission holds it from before its commit
+    /// through its publication ([`Self::submitted`]), and a `steer` while
+    /// it selects its turn ([`Self::steering`]), so no steer reads a
+    /// committed submission that is not yet published. The steer releases
+    /// it before it waits for the acceptance.
+    pub(super) selection: tokio::sync::Mutex<()>,
     state: StdMutex<State>,
     wake: Notify,
     /// The engine whose idle-lane bound the slot's emptying enforces
@@ -388,6 +394,7 @@ impl Slot {
         Arc::new(Self {
             engine,
             head,
+            selection: tokio::sync::Mutex::new(()),
             state: StdMutex::new(State {
                 queue: VecDeque::new(),
                 dispatcher: Dispatcher::None,

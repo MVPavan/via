@@ -2407,6 +2407,8 @@ impl Engine {
             // The queued-turn read failed: nothing was written.
             return Err(SubmitFailure::Unread);
         }
+        // Sol r2 #5: held through the publication below, on every path.
+        let _selection = slot.selection.lock().await;
         let submitted = Self::commit_submission(&self.store, session, turn, &slot.head).await;
         #[cfg(test)]
         if submitted.is_ok()
@@ -2438,6 +2440,10 @@ impl Engine {
             slot.finish_running(turn);
             self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(SubmitFailure::Failed(WriteOutcome::Uncertain));
+        }
+        #[cfg(test)]
+        if submitted.is_ok() {
+            self.hold(&self.faults.hold_before_publish).await;
         }
         if submitted.is_ok() {
             // Sol r1 #7: a steer addresses the turn from its durable submission.

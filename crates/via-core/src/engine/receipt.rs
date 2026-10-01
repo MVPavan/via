@@ -696,9 +696,19 @@ impl Engine {
         ) {
             return Err(intake::unsupported_on(Verb::Steer, &frozen));
         }
-        let Some((turn, mut steering)) =
-            self.slot(&params.session).and_then(|slot| slot.steering())
-        else {
+        #[cfg(test)]
+        self.faults.steer_selecting.notify_one();
+        // Sol r2 #5: selected under the slot's `selection`, so a submission
+        // committed before this steer is published to it; released here,
+        // before the acceptance wait.
+        let selected = match self.slot(&params.session) {
+            Some(slot) => {
+                let _selection = slot.selection.lock().await;
+                slot.steering()
+            }
+            None => None,
+        };
+        let Some((turn, mut steering)) = selected else {
             return Err(ApiError::NO_ACTIVE_TURN);
         };
         if params
