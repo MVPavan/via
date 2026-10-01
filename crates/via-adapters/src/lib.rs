@@ -137,6 +137,13 @@ pub enum DriverFailure {
     ObservationOverflow,
     /// A task the driver owns ended without its result.
     OwnedTask,
+    /// Host confirmed the persistent connection's server died.
+    ServerLost,
+    /// The vendor returned another session than the one VIA continues.
+    ResumeMismatch,
+    /// A persistent connection's helper process was retired without proof
+    /// that its group is gone, or with an uncertain Host journal write.
+    RetirementUncertain,
 }
 
 /// Driver health remains observable even when data observations are full.

@@ -2,6 +2,7 @@
 //! session driver whose `run_turn` is the one data lane per submitted turn,
 //! with `steer`, `close` and `health` serviceable meanwhile.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -215,6 +216,19 @@ pub(crate) fn lock(state: &Mutex<DriverState>) -> MutexGuard<'_, DriverState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Latches the first failure (C2 §2 sticky health); later failures and a
+/// closed driver keep what they find.
+pub(crate) fn latch(health: &watch::Sender<DriverHealth>, cause: DriverFailure) {
+    health.send_if_modified(|health| {
+        if matches!(health, DriverHealth::Open) {
+            *health = DriverHealth::Failed { first_cause: cause };
+            true
+        } else {
+            false
+        }
+    });
+}
+
 /// One session's driver (C2 §2).
 pub struct SessionDriver {
     pub(crate) route: Arc<FakeRoute>,
@@ -225,7 +239,7 @@ pub struct SessionDriver {
     pub(crate) tracker: TaskTracker,
     /// The session's cancellation, also cancelled by this driver's close.
     pub(crate) cancel: CancellationToken,
-    health: Arc<watch::Sender<DriverHealth>>,
+    pub(crate) health: Arc<watch::Sender<DriverHealth>>,
     pub(crate) state: Arc<Mutex<DriverState>>,
 }
 
@@ -345,17 +359,9 @@ impl SessionDriver {
         drop(released);
     }
 
-    /// Latches the first failure (C2 §2 sticky health); later failures and
-    /// a closed driver keep what they find.
+    /// Latches the first failure (C2 §2 sticky health).
     pub(crate) fn fail(&self, cause: DriverFailure) {
-        self.health.send_if_modified(|health| {
-            if matches!(health, DriverHealth::Open) {
-                *health = DriverHealth::Failed { first_cause: cause };
-                true
-            } else {
-                false
-            }
-        });
+        latch(&self.health, cause);
     }
 
     /// Delivers steer input into the running turn (C2 §2): admitted at
@@ -368,7 +374,7 @@ impl SessionDriver {
         {
             Some(crate::Support::Native) => SteerDelivery::Injected,
             Some(crate::Support::Partial { semantics }) => {
-                SteerDelivery::Partial(semantics.clone())
+                SteerDelivery::Partial(Cow::Owned(semantics.clone()))
             }
             Some(crate::Support::Unsupported { .. }) | None => return Err(SteerError::Unsupported),
         };
@@ -398,22 +404,25 @@ impl SessionDriver {
     /// waits, within `deadline`, for the last process's retirement and
     /// carries only what was established: the vendor's own close, the exit
     /// this close caused and the retirement's cleanup. The persistent
-    /// profile's slot is released after it.
+    /// profile's slot is released once that retirement ended: here when it
+    /// did by `deadline`, else by the retirement itself. Nothing happens
+    /// before the first poll: a close dropped unpolled changes nothing.
     pub fn close(
         &self,
         mode: CloseMode,
         deadline: Deadline,
     ) -> impl Future<Output = CloseReport> + Send + use<> {
-        let (stop, retiring) = {
-            let mut state = self.state();
-            state.closed = true;
-            let stop = state.active.take().map(|active| active.close);
-            (stop, state.retiring.clone())
-        };
         let state = Arc::clone(&self.state);
         let health = Arc::clone(&self.health);
         let cancel = self.cancel.clone();
         async move {
+            // The session closes and the stop order is posted together.
+            let (stop, retiring) = {
+                let mut state = lock(&state);
+                state.closed = true;
+                let stop = state.active.take().map(|active| active.close);
+                (stop, state.retiring.clone())
+            };
             let stopped = stop.is_some();
             if let Some(stop) = stop {
                 let now = tokio::time::Instant::now();
@@ -445,7 +454,10 @@ impl SessionDriver {
             let (released, retirement, vendor_closed) = {
                 let mut state = lock(&state);
                 state.live = false;
-                (state.capacity.take(), state.retirement, state.vendor_closed)
+                // A retirement still running keeps the slot until it ends
+                // (`Reservation::retired`).
+                let released = if settled { state.capacity.take() } else { None };
+                (released, state.retirement, state.vendor_closed)
             };
             drop(released);
             health.send_replace(DriverHealth::Closed);
@@ -487,11 +499,13 @@ fn steer_error(refused: SteerRefused) -> SteerError {
     }
 }
 
-/// One turn's hold on its connection (AD16), owned by the turn's task: the
-/// persistent profile's slot and pin are committed only once the logical
-/// turn kept its server. Dropped uncommitted, on any failure, a dropped
-/// task or an unwind, it invalidates the generation and releases the slot
-/// then, after the cleanup that ran before it.
+/// One turn's hold on its connection (AD16), shared by the turn's task and
+/// `run_turn`: the persistent profile's slot and pin are committed only
+/// once the logical turn kept its server and the Adapter delivered all of
+/// it. Its last owner drops it after the process's retirement and the end
+/// of `run_turn`, whichever is later; dropped uncommitted, on any failure,
+/// a dropped `run_turn` or an unwind, it invalidates the generation and
+/// releases the slot then.
 pub(crate) struct Reservation {
     state: Arc<Mutex<DriverState>>,
     generation: u64,
@@ -518,13 +532,14 @@ impl Reservation {
         self.committed = true;
     }
 
-    /// The logical turn ended its connection: the generation is invalid
-    /// and the slot released now, its cleanup already done.
-    pub(crate) fn release(&mut self) {
+    /// The logical turn ended its connection, or the Adapter could not
+    /// deliver it: the generation is invalid now; the uncommitted slot goes
+    /// with the reservation.
+    pub(crate) fn release(&self) {
         self.invalidate();
     }
 
-    fn invalidate(&mut self) {
+    fn invalidate(&self) {
         let released = {
             let mut state = lock(&self.state);
             if state.generation == self.generation {
@@ -535,16 +550,28 @@ impl Reservation {
             }
         };
         drop(released);
-        self.slot = None;
     }
 
-    /// Records the turn's process retirement for a later close.
+    /// Records the turn's process retirement for a later close. A session
+    /// closed meanwhile releases its committed slot now, the retirement
+    /// done (C2 §2 Close).
     pub(crate) fn retired(&self, retirement: Retirement) {
-        lock(&self.state).retirement = Some(retirement);
+        let released = {
+            let mut state = lock(&self.state);
+            state.retirement = Some(retirement);
+            if state.closed && state.generation == self.generation {
+                state.capacity.take()
+            } else {
+                None
+            }
+        };
+        drop(released);
     }
 }
 
 impl Drop for Reservation {
+    /// Uncommitted, the generation is invalidated; the slot is released
+    /// with the reservation's fields.
     fn drop(&mut self) {
         if !self.committed {
             self.invalidate();

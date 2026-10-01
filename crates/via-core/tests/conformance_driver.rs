@@ -576,25 +576,31 @@ fn conformance_stop_reason_other_and_failed_max_steps_kept() {
     assert_eq!(kept.steps, Some(7));
 }
 
+/// In the parent, runs test `name` again in a child with the stall bound
+/// lowered to 250 ms, which test-failpoint builds honour (others keep
+/// 10 s), and returns true once it passed; in the child, returns false.
+fn rerun_with_short_stall(name: &str) -> bool {
+    const CHILD: &str = "VIA_CONFORMANCE_STALL_CHILD";
+    if env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let status = std::process::Command::new(env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, "1")
+        .env("VIA_TEST_EVENT_STALL_MS", "250")
+        .status()
+        .unwrap();
+    assert!(status.success(), "child failed: {status}");
+    true
+}
+
 /// (7) AD4: Core never drains the channel; the decoded terminal is retained
 /// in the turn's end although the delivery before it stalled (`overflow`).
 /// It runs again in a child with the stall bound lowered to 250 ms, which
 /// test-failpoint builds honour (others keep 10 s).
 #[test]
 fn conformance_terminal_retained_under_stalled_observations() {
-    const CHILD: &str = "VIA_CONFORMANCE_STALL_CHILD";
-    if env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "conformance_terminal_retained_under_stalled_observations",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("VIA_TEST_EVENT_STALL_MS", "250")
-            .status()
-            .unwrap();
-        assert!(status.success(), "child failed: {status}");
+    if rerun_with_short_stall("conformance_terminal_retained_under_stalled_observations") {
         return;
     }
     let text = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
@@ -1050,7 +1056,7 @@ enum Moment {
 /// turn's own stop path, on the per-turn and the persistent profile. The
 /// slot stays held until cleanup settled, and the report carries only
 /// established facts. With `no_input`, nothing reached the vendor.
-fn close_during(steps: &[Value], moment: Moment, no_input: bool) {
+fn close_during(steps: &[Value], moment: Moment, no_input: bool, mode: CloseMode) {
     for persistent in [false, true] {
         let mut profile = handshake();
         profile["persistent"] = json!(persistent);
@@ -1071,7 +1077,7 @@ fn close_during(steps: &[Value], moment: Moment, no_input: bool) {
                 }
                 let held = !released.load(Ordering::SeqCst);
                 let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_WITHIN);
-                (held, driver_ref.close(CloseMode::Graceful, deadline).await)
+                (held, driver_ref.close(mode, deadline).await)
             },
         );
         let case = format!("persistent={persistent}");
@@ -1108,6 +1114,7 @@ fn close_while_awaiting_the_handshake_stops_the_turn_without_input() {
         ],
         Moment::Entered("h"),
         true,
+        CloseMode::Graceful,
     );
 }
 
@@ -1117,21 +1124,29 @@ fn close_while_awaiting_acceptance_stops_the_turn() {
         &[hello("1.0", &["turns"]), gate("wait")],
         Moment::Entered("wait"),
         false,
+        CloseMode::Graceful,
     );
+}
+
+/// A tool open in turn 1, on the C2 §2 Close cases.
+fn open_tool_steps() -> [Value; 4] {
+    [
+        hello("1.0", &["turns"]),
+        accepted(1),
+        tool_started(1),
+        gate("tool"),
+    ]
 }
 
 #[test]
 fn close_during_an_open_tool_stops_the_turn() {
-    close_during(
-        &[
-            hello("1.0", &["turns"]),
-            accepted(1),
-            tool_started(1),
-            gate("tool"),
-        ],
-        Moment::Tool,
-        false,
-    );
+    close_during(&open_tool_steps(), Moment::Tool, false, CloseMode::Graceful);
+}
+
+/// C2 §2 Close(Force): the same stop path, forced at once.
+#[test]
+fn force_close_during_an_open_tool_stops_the_turn() {
+    close_during(&open_tool_steps(), Moment::Tool, false, CloseMode::Force);
 }
 
 /// C2 §2 Close with no active turn: cleanup is the last helper's
@@ -1959,11 +1974,390 @@ fn a_partial_steer_profile_reports_its_semantics() {
         },
     );
     assert!(end.outcome.is_ok(), "{end:?}");
-    let partial = SteerDelivery::Partial("after_tool".to_owned());
+    let partial = SteerDelivery::Partial("after_tool".into());
     assert_eq!(answer, Ok(partial.clone()));
     assert!(
         observations(&items)
             .iter()
             .any(|observation| matches!(observation, Observation::SteerDelivered(delivery) if *delivery == partial))
     );
+}
+
+/// Polls `steer` once: its answer if it has one at once.
+async fn poll_once(steer: &mut Steer<'_>) -> Option<Result<SteerDelivery, SteerError>> {
+    tokio::select! {
+        biased;
+        answer = steer.as_mut() => Some(answer),
+        () = std::future::ready(()) => None,
+    }
+}
+
+/// Waits, within `within`, until `health` is `Failed`; returns what it is.
+async fn until_failed(
+    health: &mut watch::Receiver<DriverHealth>,
+    within: Duration,
+) -> DriverHealth {
+    // A timeout leaves the health as it was, which the caller asserts on.
+    drop(
+        tokio::time::timeout(
+            within,
+            health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })),
+        )
+        .await,
+    );
+    health.borrow().clone()
+}
+
+/// The text message a flood repeats: one `model` mark each.
+fn text_line() -> String {
+    json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n"
+}
+
+/// C2 §2 Close (persistent profile): a close whose deadline passes before
+/// the helper's retirement reports `Uncertain`, and the slot stays held
+/// until the retirement ended with the helper gone.
+#[test]
+fn a_close_past_its_deadline_holds_the_slot_until_the_helper_retired() {
+    let rig = Rig::new(
+        &persistent(),
+        &[script(
+            1,
+            &[
+                json!({"action":"report_pids"}),
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+                gate("after"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_millis(300));
+    let report = rig
+        .runtime
+        .block_on(driver.close(CloseMode::Graceful, deadline));
+    assert_eq!(report.cleanup, Cleanup::Uncertain, "{report:?}");
+    assert!(
+        !controls.released(),
+        "the slot outlives a close whose deadline passed"
+    );
+    let pid = fs::read_to_string(rig.sync().join("agent.pid")).unwrap();
+    rig.runtime.block_on(async {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !controls.released() && tokio::time::Instant::now() < by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    assert!(controls.released(), "released once the helper retired");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the helper is gone"
+    );
+}
+
+/// AD16 (persistent profile): the reservation commits only after the
+/// Adapter's final delivery. A logical success whose remaining delivery
+/// overflows leaves nothing pinnable, and the slot is released.
+#[test]
+fn a_persistent_success_whose_delivery_overflows_keeps_no_pin() {
+    let rig = Rig::new(
+        &persistent(),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS}),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    // Core never drains the channel.
+    let (driver, _receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), SHORT_WALL);
+    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    assert!(
+        matches!(
+            failure(&end).cause,
+            TurnCause::Route(RouteError::Overflow { .. })
+        ),
+        "{end:?}"
+    );
+    assert!(
+        matches!(driver.prepare(), Prepared::NeedsConnection),
+        "no live pin after a delivery overflow"
+    );
+    rig.runtime.block_on(async {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !controls.released() && tokio::time::Instant::now() < by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    assert!(controls.released(), "the slot is released");
+}
+
+/// C2 §4.1, AD9 (persistent profile): a protocol failure reports the
+/// logical connection's facts only. The helper's housekeeping kill is no
+/// exit and no force, and cleanup comes from the reported tool items: one
+/// still open is `Uncertain`.
+#[test]
+fn a_persistent_protocol_failure_reports_logical_facts_only() {
+    let rig = Rig::new(
+        &persistent(),
+        &[script(
+            1,
+            &[accepted(1), tool_started(1), raw("not json\n"), hang()],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    let failure = failure(&end);
+    assert!(
+        matches!(failure.cause, TurnCause::Route(RouteError::Protocol { .. })),
+        "{end:?}"
+    );
+    assert!(failure.exit.is_none(), "no helper exit: {end:?}");
+    assert!(!failure.forced, "no helper force: {end:?}");
+    assert_eq!(failure.cleanup, Some(WireCleanup::Uncertain), "{end:?}");
+}
+
+/// C2 §2 health: a failure is published when it is detected, not after the
+/// turn's delivery: with Core stalled, health is `Failed` long before the
+/// delivery's stall bound.
+#[test]
+fn health_fails_at_detection_with_a_stalled_consumer() {
+    let rig = Rig::new(
+        &json!({}),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS}),
+                raw("not json\n"),
+                hang(),
+            ],
+        )],
+    );
+    // Core never drains the channel.
+    let (driver, _receiver) = rig.session();
+    let mut health = driver.health();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let seen = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        tokio::select! {
+            end = &mut run => panic!("the turn ended first: {end:?}"),
+            seen = until_failed(&mut health, Duration::from_secs(5)) => seen,
+        }
+    });
+    assert!(
+        matches!(
+            seen,
+            DriverHealth::Failed {
+                first_cause: DriverFailure::Route(RouteError::Protocol { .. })
+            }
+        ),
+        "{seen:?}"
+    );
+}
+
+/// C2 §2 health: a failure after the `run_turn` future was dropped is still
+/// published by the turn's owned task.
+#[test]
+fn health_fails_after_the_turn_future_was_dropped() {
+    let rig = Rig::new(&json!({}), &[script(1, &[accepted(1), gate("held")])]);
+    let (driver, mut receiver) = rig.session();
+    let mut health = driver.health();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let seen = rig.runtime.block_on(async {
+        {
+            let run = driver.run_turn(prompt(), cx);
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    Some(admitted) = receiver.recv() => {
+                        if matches!(admitted.item.observation, Observation::Accepted(_)) {
+                            break;
+                        }
+                    }
+                    end = &mut run => panic!("the turn ended first: {end:?}"),
+                }
+            }
+        }
+        until_failed(&mut health, FIXTURE_WAIT).await
+    });
+    assert!(matches!(seen, DriverHealth::Failed { .. }), "{seen:?}");
+}
+
+/// C2 §2 health: the persistent server's loss and a resume mismatch each
+/// latch `Failed` with their cause.
+#[test]
+fn server_loss_and_resume_mismatch_latch_health() {
+    let rig = Rig::new(
+        &persistent(),
+        &[script(1, &[accepted(1), json!({"action":"exit","code":3})])],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(
+        matches!(failure(&end).cause, TurnCause::ServerLost { .. }),
+        "{end:?}"
+    );
+    assert_eq!(
+        format!("{:?}", *driver.health().borrow()),
+        "Failed { first_cause: ServerLost }"
+    );
+
+    let rig = Rig::new(
+        &json!({}),
+        &[script(
+            1,
+            &[
+                identity("v1"),
+                identity("v2"),
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_err(), "{end:?}");
+    assert_eq!(
+        format!("{:?}", *driver.health().borrow()),
+        "Failed { first_cause: ResumeMismatch }"
+    );
+}
+
+/// C2 §2 independent lanes: at most eight control commands are
+/// outstanding. With one steer written and awaiting the vendor's report and
+/// seven queued, a ninth is refused `OverCapacity`.
+#[test]
+fn a_ninth_outstanding_steer_is_refused() {
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+                gate("held"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let driver_ref = &driver;
+    let steer = move || -> Steer<'_> {
+        Box::pin(driver_ref.steer(SteerInput {
+            text: "more".to_owned(),
+            expected_vendor_turn: None,
+        }))
+    };
+    let (end, _, (queued, ninth)) = rig.run_beside(
+        &driver,
+        &mut receiver,
+        (prompt(), cx),
+        |mut seen| async move {
+            until_seen(&mut seen, |seen| seen.accepted).await;
+            let mut first = steer();
+            assert!(poll_once(&mut first).await.is_none(), "admitted");
+            until_file(sync.join("held.entered")).await;
+            let mut queued = Vec::new();
+            for _ in 0..7 {
+                let mut next = steer();
+                queued.push(poll_once(&mut next).await);
+            }
+            let mut ninth = steer();
+            let ninth = poll_once(&mut ninth).await;
+            release(&sync, "held");
+            (queued, ninth)
+        },
+    );
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert!(queued.iter().all(Option::is_none), "{queued:?}");
+    assert_eq!(ninth, Some(Err(SteerError::OverCapacity)));
+}
+
+/// C2 §4 between turns (persistent profile): an idle close whose
+/// session-level `VendorClosed` the stalled channel cannot take latches
+/// `Failed{overflow}`; the slot is still released and the pin invalidated.
+#[test]
+fn an_idle_close_the_stalled_channel_cannot_take_latches_overflow() {
+    if rerun_with_short_stall("an_idle_close_the_stalled_channel_cannot_take_latches_overflow") {
+        return;
+    }
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    // The accepted mark, 1022 model marks and the final text: a full channel.
+    let rig = Rig::new(
+        &profile,
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS - 2}),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    // Core never drains the channel.
+    let (driver, receiver) = rig.session();
+    let mut health = driver.health();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(receiver.len(), OBSERVATION_ITEMS, "the channel is full");
+    assert!(matches!(driver.prepare(), Prepared::Pinned(_)));
+    release(&rig.sync(), "idle");
+    let seen = rig
+        .runtime
+        .block_on(until_failed(&mut health, Duration::from_secs(15)));
+    assert_eq!(
+        seen,
+        DriverHealth::Failed {
+            first_cause: DriverFailure::ObservationOverflow
+        }
+    );
+    assert!(controls.released(), "the closed server's slot is released");
+    assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
+}
+
+/// C2 §2 Close: a `close()` dropped before it was polled leaves the driver
+/// untouched; a later close stops the running turn.
+#[test]
+fn a_dropped_unpolled_close_leaves_the_driver_open() {
+    let rig = Rig::new(&json!({}), &[script(1, &[accepted(1), gate("held")])]);
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), CLOSE_WALL);
+    let driver_ref = &driver;
+    let (end, _, (open, report)) = rig.run_beside(
+        &driver,
+        &mut receiver,
+        (prompt(), cx),
+        |mut seen| async move {
+            until_seen(&mut seen, |seen| seen.accepted).await;
+            let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_WITHIN);
+            drop(driver_ref.close(CloseMode::Graceful, deadline));
+            let open = *driver_ref.health().borrow() == DriverHealth::Open;
+            let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_WITHIN);
+            (open, driver_ref.close(CloseMode::Graceful, deadline).await)
+        },
+    );
+    assert!(open, "the dropped close changed nothing");
+    assert!(
+        matches!(
+            failure(&end).cause,
+            TurnCause::Route(RouteError::Stopped { .. })
+        ),
+        "{end:?}"
+    );
+    assert_eq!(report.cleanup, Cleanup::Quiescent, "{report:?}");
+    assert!(report.process_exit.is_some(), "{report:?}");
 }

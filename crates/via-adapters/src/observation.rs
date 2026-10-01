@@ -3,6 +3,7 @@
 //! sends them on. Kept in this module, not re-exported at the crate root,
 //! because the legacy `Observation` and channel still live there.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,7 +136,7 @@ pub enum SteerDelivery {
     /// Injected into the active turn.
     Injected,
     /// Delivered with the profile's declared partial semantics.
-    Partial(String),
+    Partial(Cow<'static, str>),
 }
 
 /// A normalized stop reason (AD5).

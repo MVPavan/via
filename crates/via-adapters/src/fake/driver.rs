@@ -3,11 +3,12 @@
 //! session's tracker owns, normalizes each decoded message into session
 //! observations in decode order, and builds the turn's one `TurnEnd`.
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -16,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
 use crate::driver::{
-    Active, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx, TurnSpec, lock,
-    rejected,
+    Active, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx, TurnSpec, latch,
+    lock, rejected,
 };
 use crate::harness::Harness;
 use crate::observation::{
@@ -28,13 +29,13 @@ use crate::observation::{
 use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
 use crate::{
-    AcceptanceToken, Deadline, DriverFailure, PrivateProcessSpec, ProcessOwner, RouteError,
-    StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus, VendorTurnId,
+    AcceptanceToken, Deadline, DriverFailure, DriverHealth, PrivateProcessSpec, ProcessOwner,
+    RouteError, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus, VendorTurnId,
     final_text_pieces,
 };
 use via_routes::{
     FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
-    RouteMessage, TerminalStatus, TurnCause, TurnFailure, TurnStart,
+    Retirement, RouteMessage, TerminalStatus, TurnCause, TurnFailure, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -57,13 +58,22 @@ enum Rest {
 /// A pending delivery, polled beside the route (Task 4 design §9).
 type Delivery = Pin<Box<dyn Future<Output = Result<(), Undelivered>> + Send>>;
 
+/// The turn's reservation, shared by its task and `run_turn`.
+type Shared = Arc<Mutex<Reservation>>;
+
+/// Locks the shared reservation; no code panics while holding it.
+fn held(reservation: &Shared) -> MutexGuard<'_, Reservation> {
+    reservation.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Runs one submitted turn (C2 §4.1): per-turn values are checked before
 /// anything launches (AD18, C2 §7 item 13); then the turn's process runs
 /// through Route on a tracker-owned task while each decoded message is
 /// delivered to the session channel. A delivery blocked for the stall bound
 /// drops the hop, so Route fails the turn `overflow`, keeping the decoded
-/// terminal (AD4). Dropping this future leaves the task, which owns the
-/// turn's cleanup and its connection's reservation, running.
+/// terminal (AD4). The persistent connection is committed only once the
+/// whole logical turn was delivered. Dropping this future leaves the task,
+/// which owns the turn's cleanup and its share of the reservation, running.
 pub(crate) async fn run_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
@@ -88,6 +98,7 @@ pub(crate) async fn run_turn(
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
+    let reservation = Arc::new(Mutex::new(reservation));
     let (process, start) = match launch_inputs(driver, adapter, &mut spec, (turn, first), capacity)
     {
         Ok(inputs) => inputs,
@@ -126,8 +137,9 @@ pub(crate) async fn run_turn(
         cancel: driver.cancel.clone(),
         lane,
         logical,
-        reservation,
+        reservation: Arc::clone(&reservation),
         state: Arc::clone(&driver.state),
+        health: Arc::clone(&driver.health),
         done,
     }));
     let mut normalizer = Normalizer {
@@ -146,6 +158,7 @@ pub(crate) async fn run_turn(
         &driver.observations,
         &activity,
         (force, cutoff),
+        &driver.health,
     )
     .await;
     end_active(&driver.state, turn);
@@ -154,11 +167,10 @@ pub(crate) async fn run_turn(
         driver.fail(DriverFailure::OwnedTask);
         return rejected(TurnError::TaskFailed);
     };
+    settle(driver, &reservation, &result, &rest, &normalizer);
+    drop(reservation);
     report_mismatch(driver, &result, cutoff).await;
     let end = turn_end(adapter, turn, result, &rest, persistent);
-    if let Some(cause) = health_failure(&end, &rest) {
-        driver.fail(cause);
-    }
     if persistent {
         after_persistent_turn(
             driver,
@@ -169,6 +181,31 @@ pub(crate) async fn run_turn(
         );
     }
     end
+}
+
+/// After the final delivery: one that failed latches `overflow` (C2 §2),
+/// and a kept server stays the session's only once its whole logical turn
+/// was delivered and the vendor did not close it (AD16); otherwise its
+/// generation is invalid.
+fn settle(
+    driver: &SessionDriver,
+    reservation: &Shared,
+    result: &FakeTurn,
+    rest: &Rest,
+    normalizer: &Normalizer,
+) {
+    if matches!(rest, Rest::Undelivered) {
+        driver.fail(DriverFailure::ObservationOverflow);
+    }
+    if !result.server_kept {
+        return;
+    }
+    let mut share = held(reservation);
+    if matches!(rest, Rest::Delivered) && !normalizer.vendor_closed {
+        share.commit(driver.cancel.is_cancelled());
+    } else {
+        share.release();
+    }
 }
 
 /// AD18, C2 §7 item 13: a per-turn value the route refuses rejects the
@@ -272,7 +309,7 @@ fn after_persistent_turn(
         driver.tracker.spawn(idle_source(
             Arc::clone(&driver.state),
             generation,
-            driver.observations.clone(),
+            (driver.observations.clone(), Arc::clone(&driver.health)),
             (
                 adapter.sync_dir().join(format!("{}.release", idle.gate)),
                 idle.reason.clone(),
@@ -328,7 +365,9 @@ fn start_values(
 /// How the profile's steer support reports a delivery (C2 §2).
 fn steer_delivery(profile: &FakeProfile) -> SteerDelivery {
     match &profile.capabilities.verbs.steer {
-        crate::Support::Partial { semantics } => SteerDelivery::Partial(semantics.clone()),
+        crate::Support::Partial { semantics } => {
+            SteerDelivery::Partial(Cow::Owned(semantics.clone()))
+        }
         crate::Support::Native | crate::Support::Unsupported { .. } => SteerDelivery::Injected,
     }
 }
@@ -346,33 +385,38 @@ fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
     }
 }
 
-/// The first failure a turn latches in the health lane (C2 §2): protocol,
-/// transport loss or overflow.
-fn health_failure(end: &TurnEnd, rest: &Rest) -> Option<DriverFailure> {
-    let Err(TurnError::Route(failure)) = &end.outcome else {
+/// The failure a Route result latches in the health lane (C2 §2):
+/// protocol, transport loss, overflow, a Store failure, the server's loss
+/// or a resume mismatch.
+fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
+    let Err(failure) = &turn.outcome else {
         return None;
     };
     match &failure.cause {
-        TurnCause::Route(RouteError::Overflow { .. }) if matches!(rest, Rest::Undelivered) => {
-            Some(DriverFailure::ObservationOverflow)
-        }
         TurnCause::Route(
             cause @ (RouteError::Protocol { .. }
             | RouteError::TransportLost { .. }
-            | RouteError::Overflow { .. }),
+            | RouteError::Overflow { .. }
+            | RouteError::Store { .. }),
         ) => Some(DriverFailure::Route(cause.clone())),
+        TurnCause::ServerLost { .. } => Some(DriverFailure::ServerLost),
+        TurnCause::ResumeMismatch { .. } => Some(DriverFailure::ResumeMismatch),
         TurnCause::Route(
             RouteError::ProcessExited { .. }
-            | RouteError::Store { .. }
             | RouteError::Stopped { .. }
             | RouteError::Deadline { .. }
             | RouteError::ForceStopped { .. },
         )
-        | TurnCause::ServerLost { .. }
         | TurnCause::HandshakeRefused { .. }
-        | TurnCause::InvalidParam { .. }
-        | TurnCause::ResumeMismatch { .. } => None,
+        | TurnCause::InvalidParam { .. } => None,
     }
+}
+
+/// Whether a persistent connection's helper retirement left its cleanup
+/// unproven (decision H1): a health failure, as no turn reports it.
+fn retirement_uncertain(retirement: &Retirement) -> bool {
+    retirement.launched
+        && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
 }
 
 /// One turn's route work, owned by the session's tracker.
@@ -386,15 +430,18 @@ struct TurnTask {
     cancel: CancellationToken,
     lane: Lane,
     logical: oneshot::Sender<FakeTurn>,
-    reservation: Reservation,
+    reservation: Shared,
     state: Arc<Mutex<DriverState>>,
+    health: Arc<watch::Sender<DriverHealth>>,
     done: watch::Sender<bool>,
 }
 
 /// Runs the turn through Route with Core's stop order merged with the
 /// driver's close and the session's cancellation. At the logical turn's
-/// end the reservation commits or releases, then the turn goes to
-/// `run_turn`; the process's retirement is recorded after it.
+/// end its failure is latched in the health lane, at once and whatever
+/// becomes of `run_turn`; a turn that ended its connection invalidates the
+/// generation, and the turn goes to `run_turn`, which commits a kept one.
+/// The process's retirement is recorded after it.
 async fn turn_task(task: TurnTask) {
     let TurnTask {
         route,
@@ -406,11 +453,13 @@ async fn turn_task(task: TurnTask) {
         cancel,
         lane,
         logical,
-        mut reservation,
+        reservation,
         state,
+        health,
         done,
     } = task;
     let turn = start.turn();
+    let persistent = lane.persistent;
     let (merged, merged_rx) =
         watch::channel(earliest(core_stop.borrow().clone(), close.borrow().clone()));
     let (inner, inner_rx) = oneshot::channel();
@@ -419,10 +468,11 @@ async fn turn_task(task: TurnTask) {
         let Ok(turn_result) = inner_rx.await else {
             return;
         };
-        if turn_result.server_kept {
-            reservation.commit(cancel.is_cancelled());
-        } else {
-            reservation.release();
+        if let Some(cause) = route_failure(&turn_result) {
+            latch(&health, cause);
+        }
+        if !turn_result.server_kept {
+            held(&reservation).release();
         }
         end_active(&state, turn);
         // `run_turn` was dropped: the retirement below is still owned here.
@@ -432,8 +482,12 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
-    reservation.retired(retirement);
-    // An uncommitted slot is released only now, after the cleanup.
+    if persistent && retirement_uncertain(&retirement) {
+        latch(&health, DriverFailure::RetirementUncertain);
+    }
+    held(&reservation).retired(retirement);
+    // An uncommitted slot is released with the last share, after the
+    // cleanup and after `run_turn`.
     drop(reservation);
     done.send_replace(true);
 }
@@ -514,12 +568,13 @@ fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
 /// The persistent emulation's idle source (decision H1, C2 §4): once the
 /// scenario's gate `release` exists, the emulated server closes its idle
 /// session: the slot is released, the pin invalidated, and a session-level
-/// `VendorClosed` sent. Started only after the turn before it returned;
-/// a later connection or the session's cancellation ends it.
+/// `VendorClosed` sent; one the channel does not take latches `overflow`.
+/// Started only after the turn before it returned; a later connection or
+/// the session's cancellation ends it.
 async fn idle_source(
     state: Arc<Mutex<DriverState>>,
     generation: u64,
-    sink: ObservationSink,
+    (sink, health): (ObservationSink, Arc<watch::Sender<DriverHealth>>),
     (release, reason): (PathBuf, String),
     cancel: CancellationToken,
 ) {
@@ -550,9 +605,12 @@ async fn idle_source(
     };
     tokio::select! {
         () = cancel.cancelled() => {}
-        // Core stalled or went away: the session-level item is lost with
-        // the session channel; the close itself is already in effect.
-        _undelivered = sink.send(closed, event_stall()) => {}
+        sent = sink.send(closed, event_stall()) => {
+            // The close itself is already in effect; its item is lost.
+            if sent.is_err() {
+                latch(&health, DriverFailure::ObservationOverflow);
+            }
+        }
     }
 }
 
@@ -566,6 +624,7 @@ async fn deliver_beside(
     sink: &ObservationSink,
     activity: &crate::TurnActivity,
     (mut force, cutoff): (ForceWatch, Deadline),
+    health: &watch::Sender<DriverHealth>,
 ) -> (Option<FakeTurn>, Rest) {
     tokio::pin!(route);
     let stall = event_stall();
@@ -578,8 +637,9 @@ async fn deliver_beside(
             outcome = poll_delivery(delivery.as_mut()), if delivery.is_some() => {
                 delivery = None;
                 if outcome.is_err() {
-                    // Route observes the closed hop as overflow, or as the
-                    // force's stop under a force.
+                    // Latched at once (C2 §2); Route observes the closed hop
+                    // as overflow, or as the force's stop under a force.
+                    latch(health, DriverFailure::ObservationOverflow);
                     hop_rx = None;
                     delivered = false;
                 }
