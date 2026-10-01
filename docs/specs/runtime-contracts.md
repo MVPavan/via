@@ -1186,6 +1186,17 @@ overhead and CI variance, and growth must stay below 32 MiB after the
 first 64 MiB of a 256 MiB flood. RSS is an empirical gate, not a
 mathematical bound. Failure of either assertion requires correction or
 explicit design review, not silently enlarging the limit.
+Design review of the growth assertion: with glibc's default per-thread
+malloc arenas, growth after the first 64 MiB failed 15 of 30 measured runs;
+the same code passed 10 of 10 with two arenas and 10 of 10 on the musl
+build, consistent with allocator retention and fragmentation rather than
+VIA retention, though not proof of its absence. F24 therefore starts a
+glibc-built daemon with `MALLOC_ARENA_MAX=2` as an empirical development
+proxy, with both limits unchanged. The proxy reduces allocator overhead,
+so it can leave room for a small leak and removes default glibc's
+fragmentation signal; F24 against the `x86_64-unknown-linux-musl` build,
+the shipped allocator (platform-packaging §1), is the authoritative memory
+gate.
 The disk free-space floor, the data-size warning, the WAL limit and its
 checkpoint triggers are keys of `daemon.json` in the state directory, with
 provisional defaults. The daemon reads it once at start; a change takes
