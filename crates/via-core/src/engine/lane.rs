@@ -6,13 +6,18 @@
 //!
 //! A lane outlives its dispatcher, so a later turn can pin the live
 //! connection its driver keeps (AD16) and the confirmed identity is kept;
-//! the session's close or final shutdown ends it. Its monitor (Sol r1 F2,
-//! F4) owns the session channel between turns and watches the driver's
-//! health throughout: a driver whose health failed is closed once no turn
-//! runs on it, and replaced at the session's next turn (C2 §2 health).
+//! the session's close or final shutdown ends it. One lifecycle state,
+//! under one lock with the channel's receiver, orders a turn's claim
+//! against retirement (Sol r2 #1, #2). The lane's monitor (Sol r1 F2, F4)
+//! drains the channel whenever no turn holds it, committing each durable
+//! item as it arrives (C2 §2 session drain, decision H3 as narrowed), and
+//! watches the driver's health throughout: a driver whose health failed is
+//! retired once no turn holds the lane, and replaced at the session's next
+//! turn (C2 §2 health).
 
 use std::{
     collections::VecDeque,
+    ops::Deref,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime},
@@ -22,16 +27,14 @@ use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, DriverFailure, DriverHealth, Inherit, Observation,
-    SessionCx, SessionDriver, SessionRef, SessionSpec, UsageSample, VendorOptions, VendorTerminal,
-    observation_channel,
+    ObservationBudget, SessionCx, SessionDriver, SessionRef, SessionSpec, TaskTracker, UsageSample,
+    VendorOptions, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
-use super::journal::{self, SessionWrite};
-use super::latch::{FailureScope, FailureSite};
+use super::journal::SessionWrite;
 use super::progress::UsageLedger;
-use super::queue::Slot;
-use super::{Drain, Engine, lock};
+use super::{Engine, SessionWriter, lock};
 use crate::api::{
     AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, Warning, rfc3339,
 };
@@ -45,32 +48,107 @@ pub(super) const VENDOR_TURNS: usize = 64;
 /// 64-bit hashes, so the bound is small whatever the IDs' length.
 const TOMBSTONES: usize = 1024;
 
-/// How long replacing a failed driver waits for its close.
+/// How long retiring a failed driver waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 
 /// How long final shutdown's session drain may take before Host
-/// reconciliation: a few Store commits ([`Engine::drop_lanes`]).
+/// reconciliation: the lanes' monitors joined and a few Store commits
+/// ([`Engine::drop_lanes`]).
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(1);
 
-/// How long final shutdown waits for a lane's channel: one a turn still
-/// holds is that turn's.
-const CHANNEL_RELEASE: Duration = Duration::from_millis(50);
+/// A lane's lifecycle (Sol r2 #1, #2). A turn claims the lane only from
+/// `Idle`, before its driver is prepared, and gives it back when its claim
+/// drops; retirement starts only from `Idle`, so it never closes a driver
+/// a turn holds, and `Retired` is set only once the close ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Life {
+    Idle,
+    Claimed,
+    Retiring,
+    Retired,
+}
 
-/// Durable session observations a lane holds between turns. Each keeps its
-/// share of the channel's 4 MiB budget; at the bound the monitor stops
-/// receiving, so the channel's own backpressure applies.
-const HELD: usize = 1024;
+/// The lifecycle and the session channel's receiver, under one lock.
+struct Core {
+    life: Life,
+    /// Absent while the monitor or a turn holds it ([`Observed`]).
+    receiver: Option<mpsc::Receiver<Admitted>>,
+    /// A turn waits for the receiver: the monitor gives it up.
+    wanted: bool,
+    /// A turn holds the receiver.
+    turn_holds: bool,
+}
 
-/// A durable observation received between turns, with the `(turn, late)`
-/// it is attributed to.
-pub(super) type Held = ((Option<u32>, bool), Admitted);
+/// A turn's claim on its lane (Sol r2 #1), taken before the driver is
+/// selected or prepared and held until the turn ends, however it ends; the
+/// lane is `Idle` again when it drops.
+pub(super) struct LaneClaim(Arc<Lane>);
 
-/// A running turn's claim on its lane's session channel.
-pub(super) struct TurnClaim<'a>(&'a Lane);
+impl LaneClaim {
+    /// The claimed lane.
+    #[cfg(test)]
+    pub(super) fn lane(&self) -> &Arc<Lane> {
+        &self.0
+    }
+}
 
-impl Drop for TurnClaim<'_> {
+impl Deref for LaneClaim {
+    type Target = Lane;
+
+    fn deref(&self) -> &Lane {
+        &self.0
+    }
+}
+
+impl Drop for LaneClaim {
     fn drop(&mut self) {
-        self.0.active.send_replace(false);
+        {
+            let mut core = lock(&self.0.core);
+            if core.life == Life::Claimed {
+                core.life = Life::Idle;
+            }
+        }
+        self.0.changed.send_replace(());
+    }
+}
+
+/// The session channel's receiver, taken from its lane and given back
+/// when this drops, so what its holder did not receive stays for the
+/// lane's next holder (Sol r2 #3).
+pub(super) struct Observed<'a> {
+    lane: &'a Lane,
+    receiver: Option<mpsc::Receiver<Admitted>>,
+    /// A turn's, not the monitor's or a closer's.
+    turn: bool,
+}
+
+impl Observed<'_> {
+    /// The next item, `None` once every sender is gone (cancel-safe).
+    pub(super) async fn recv(&mut self) -> Option<Admitted> {
+        match self.receiver.as_mut() {
+            Some(receiver) => receiver.recv().await,
+            None => None,
+        }
+    }
+
+    /// An item already queued, if any.
+    pub(super) fn try_recv(&mut self) -> Option<Admitted> {
+        self.receiver.as_mut()?.try_recv().ok()
+    }
+}
+
+impl Drop for Observed<'_> {
+    fn drop(&mut self) {
+        {
+            let mut core = lock(&self.lane.core);
+            if let Some(receiver) = self.receiver.take() {
+                core.receiver = Some(receiver);
+            }
+            if self.turn {
+                core.turn_holds = false;
+            }
+        }
+        self.lane.changed.send_replace(());
     }
 }
 
@@ -79,22 +157,22 @@ pub(super) struct Lane {
     pub(super) driver: SessionDriver,
     /// The session's route identity the driver was opened with.
     pub(super) reference: SessionRef,
-    /// The session channel's receiver; the session's dispatcher holds it
-    /// for the whole of a turn.
-    pub(super) observations: tokio::sync::Mutex<mpsc::Receiver<Admitted>>,
+    core: StdMutex<Core>,
+    /// Marked at every change of `core` that a waiter needs: a claim and
+    /// its end, a turn wanting the receiver and its return, and the end of
+    /// retirement.
+    changed: watch::Sender<()>,
+    /// The session's observation byte budget, the same across replacement
+    /// (Sol r2 #9).
+    budget: ObservationBudget,
     state: StdMutex<LaneState>,
-    /// The failed driver's close was started: the lane waits only for its
-    /// successor.
-    retired: std::sync::atomic::AtomicBool,
-    /// A turn owns the session channel: the monitor gives it up.
-    active: watch::Sender<bool>,
-    /// Durable session observations received between turns, in decode
-    /// order, for the session's dispatcher to commit, or a turn that
-    /// claims the channel first (decision H3 as narrowed).
-    held: StdMutex<VecDeque<Held>>,
-    /// Wakes the session's dispatcher for what the monitor holds.
-    wake: Drain,
-    /// Ends the lane's monitor.
+    /// Commits what arrives outside a running turn.
+    writer: SessionWriter,
+    /// Owns the retirement task.
+    tracker: TaskTracker,
+    /// The monitor's task, joined when the lane is replaced or removed.
+    monitor: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Ends the monitor.
     cancel: CancellationToken,
 }
 
@@ -259,61 +337,149 @@ fn tombstone_of(vendor_turn: &str) -> u64 {
 }
 
 impl Lane {
-    /// Whether the driver's health failed (C2 §2), or its close after
-    /// that started: its connection is not used for another turn.
-    fn failed(&self) -> bool {
-        self.retired.load(std::sync::atomic::Ordering::Acquire)
-            || matches!(*self.driver.health().borrow(), DriverHealth::Failed { .. })
-    }
-
-    /// Closes the failed driver once (C2 §2 health), releasing what it
-    /// holds, its connection slot included; its owned cleanup stays its own.
-    async fn retire(&self) {
-        if self.retired.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return;
-        }
-        let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
-        let _report = self.driver.close(CloseMode::Force, deadline).await;
-    }
-
-    /// A new lane on `driver` and its channel's `receiver`.
+    /// A new lane on `driver`, with its channel's `receiver` on the
+    /// session's `budget`, in lifecycle `life`.
     fn new(
-        driver: SessionDriver,
-        reference: SessionRef,
-        receiver: mpsc::Receiver<Admitted>,
-        (state, held): (LaneState, VecDeque<Held>),
-        (wake, cancel): (Drain, CancellationToken),
+        (driver, reference): (SessionDriver, SessionRef),
+        (receiver, budget): (mpsc::Receiver<Admitted>, ObservationBudget),
+        (state, life): (LaneState, Life),
+        (writer, tracker, cancel): (SessionWriter, TaskTracker, CancellationToken),
     ) -> Self {
         Self {
             driver,
             reference,
-            observations: tokio::sync::Mutex::new(receiver),
+            core: StdMutex::new(Core {
+                life,
+                receiver: Some(receiver),
+                wanted: false,
+                turn_holds: false,
+            }),
+            changed: watch::Sender::new(()),
+            budget,
             state: StdMutex::new(state),
-            retired: std::sync::atomic::AtomicBool::new(false),
-            active: watch::Sender::new(false),
-            held: StdMutex::new(held),
-            wake,
+            writer,
+            tracker,
+            monitor: StdMutex::new(None),
             cancel,
         }
     }
 
-    /// Claims the session channel for a running turn: the monitor gives
-    /// it up until the claim drops, however the turn ends, abandonment
-    /// included.
-    pub(super) fn claim(&self) -> TurnClaim<'_> {
-        self.active.send_replace(true);
-        TurnClaim(self)
+    fn life(&self) -> Life {
+        lock(&self.core).life
     }
 
-    /// The durable observations held since the last turn, in decode order.
-    pub(super) fn take_held(&self) -> VecDeque<Held> {
-        std::mem::take(&mut *lock(&self.held))
+    fn health_failed(&self) -> bool {
+        matches!(*self.driver.health().borrow(), DriverHealth::Failed { .. })
     }
 
-    /// How many durable observations the monitor holds.
-    #[cfg(test)]
-    pub(super) fn held_len(&self) -> usize {
-        lock(&self.held).len()
+    /// Whether the driver's health failed (C2 §2), or its retirement
+    /// started: its connection is not used for another turn.
+    pub(super) fn failed(&self) -> bool {
+        matches!(self.life(), Life::Retiring | Life::Retired) || self.health_failed()
+    }
+
+    /// Claims the lane for a turn (Sol r2 #1): only from `Idle`, with the
+    /// driver's health not failed, both read under the lifecycle lock.
+    pub(super) fn claim(self: &Arc<Self>) -> Option<LaneClaim> {
+        {
+            let mut core = lock(&self.core);
+            if core.life != Life::Idle || self.health_failed() {
+                return None;
+            }
+            core.life = Life::Claimed;
+        }
+        self.changed.send_replace(());
+        Some(LaneClaim(Arc::clone(self)))
+    }
+
+    /// Starts the lane's retirement from `Idle` (C2 §2 health, Sol r2 #2):
+    /// a task the tracker owns closes the driver, releasing what it holds,
+    /// its connection slot included, and only then marks the lane
+    /// `Retired`. True once the lane is retiring or retired; false while a
+    /// turn holds its claim.
+    pub(super) fn begin_retire(self: &Arc<Self>) -> bool {
+        {
+            let mut core = lock(&self.core);
+            match core.life {
+                Life::Claimed => return false,
+                Life::Retiring | Life::Retired => return true,
+                Life::Idle => core.life = Life::Retiring,
+            }
+        }
+        let lane = Arc::clone(self);
+        self.tracker.spawn(async move {
+            let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
+            let _report = lane.driver.close(CloseMode::Force, deadline).await;
+            lock(&lane.core).life = Life::Retired;
+            lane.changed.send_replace(());
+        });
+        true
+    }
+
+    /// Waits for the end of the lane's retirement, whoever started it:
+    /// the shared completion every caller awaits.
+    pub(super) async fn retired(&self) {
+        let mut changes = self.changed.subscribe();
+        while self.life() != Life::Retired {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Retires the lane once no turn holds it, and waits for the end.
+    async fn retire_now(self: &Arc<Self>) {
+        let mut changes = self.changed.subscribe();
+        while !self.begin_retire() {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+        self.retired().await;
+    }
+
+    /// The session channel's receiver for a running turn: the monitor
+    /// gives it up, and it comes back to the lane when the turn drops it.
+    pub(super) async fn observe(&self) -> Observed<'_> {
+        lock(&self.core).wanted = true;
+        self.changed.send_replace(());
+        let mut changes = self.changed.subscribe();
+        loop {
+            {
+                let mut core = lock(&self.core);
+                if let Some(receiver) = core.receiver.take() {
+                    core.wanted = false;
+                    core.turn_holds = true;
+                    return Observed {
+                        lane: self,
+                        receiver: Some(receiver),
+                        turn: true,
+                    };
+                }
+            }
+            if changes.changed().await.is_err() {
+                return Observed {
+                    lane: self,
+                    receiver: None,
+                    turn: false,
+                };
+            }
+        }
+    }
+
+    /// The receiver for the monitor, unless a turn wants it or the lane is
+    /// retiring.
+    fn take_for_monitor(&self) -> Option<Observed<'_>> {
+        let mut core = lock(&self.core);
+        if core.wanted || matches!(core.life, Life::Retiring | Life::Retired) {
+            return None;
+        }
+        let receiver = core.receiver.take()?;
+        Some(Observed {
+            lane: self,
+            receiver: Some(receiver),
+            turn: false,
+        })
     }
 
     /// The driver's first health failure the monitor saw.
@@ -322,29 +488,60 @@ impl Lane {
         lock(&self.state).first_cause.clone()
     }
 
-    /// The session drain (C2 §2 observations before turns): an item
-    /// received while no turn runs. A durable one (identity, denial,
-    /// decline, warning) is held with its attribution, session-level
-    /// unless it names an earlier turn, for the dispatcher to commit; an
-    /// expired one and every non-durable one (acceptance, progress, final
-    /// text, steer report, vendor close, mismatch, late terminal) is
+    /// Whether a turn holds the session channel.
+    #[cfg(test)]
+    pub(super) fn turn_holds_channel(&self) -> bool {
+        lock(&self.core).turn_holds
+    }
+
+    /// The session's byte budget.
+    #[cfg(test)]
+    pub(super) fn budget(&self) -> &ObservationBudget {
+        &self.budget
+    }
+
+    /// The session drain (C2 §2 observations before turns, decision H3 as
+    /// narrowed): an item received while no turn runs. A durable one is
+    /// committed at once with its own attribution: an identity as the
+    /// session's open event with its columns, a denial, decline or warning
+    /// session-level, or late with its turn when it names an earlier turn.
+    /// An expired one and every non-durable one (acceptance, progress,
+    /// final text, steer report, vendor close, mismatch, late terminal) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
-    /// connection, and the next turn reopens it.
-    pub(super) fn between(&self, admitted: Admitted) {
-        let attributed = match &admitted.item.observation {
-            Observation::IdentityConfirmed(_) => (None, false),
+    /// connection, and the next turn reopens it. Its budget returns once
+    /// it is handled.
+    pub(super) async fn dispose(&self, admitted: Admitted) {
+        let Admitted { item, permit } = admitted;
+        let at = rfc3339(SystemTime::now());
+        match &item.observation {
+            Observation::IdentityConfirmed(identity) => {
+                let confirmed = Self::confirmed(Some(self), identity);
+                let version = identity.vendor_version.clone();
+                let Some(body) = self.open_event(&identity.connection_id, &confirmed, version)
+                else {
+                    self.confirm(confirmed);
+                    return;
+                };
+                let columns = Some(confirmed.columns());
+                let written = self.writer.commit((body, &at, (None, false)), columns).await;
+                if let SessionWrite::Committed = written {
+                    self.opened(identity.connection_id.clone(), confirmed);
+                }
+            }
             Observation::ActionDenied(_)
             | Observation::RequestDeclined(_)
             | Observation::Warning(_) => {
-                let vendor_turn = admitted
-                    .item
+                let vendor_turn = item
                     .vendor_turn
                     .as_ref()
                     .map(via_adapters::VendorTurnId::as_str);
-                match self.attribute(vendor_turn, None) {
+                let attributed = match self.attribute(vendor_turn, None) {
                     Attribution::Late(turn) => (Some(turn.get()), true),
                     Attribution::Current | Attribution::Session => (None, false),
                     Attribution::Expired => return,
+                };
+                if let Some(body) = super::drive::held_body(&item.observation) {
+                    self.writer.commit((body, &at, attributed), None).await;
                 }
             }
             Observation::Accepted(_)
@@ -355,31 +552,47 @@ impl Lane {
             | Observation::ResumeMismatch { .. }
             // Discarded until via-jm4.35: a late terminal's revision
             // write is not in the Store yet.
-            | Observation::LateTerminal(_) => return,
-        };
-        lock(&self.held).push_back((attributed, admitted));
+            | Observation::LateTerminal(_) => {}
+        }
+        drop(permit);
     }
 
-    /// Once the lane is cancelled, what its channel still has goes through
-    /// [`Self::between`]; the monitor gives the channel up when cancelled.
+    /// Commits or drops what the channel still has, once the lane's
+    /// monitor is joined; a turn's holding of the receiver is left alone.
     async fn drain_rest(&self) {
-        let mut observed = self.observations.lock().await;
-        while let Ok(admitted) = observed.try_recv() {
-            self.between(admitted);
+        let receiver = lock(&self.core).receiver.take();
+        let mut observed = Observed {
+            lane: self,
+            receiver,
+            turn: false,
+        };
+        while let Some(admitted) = observed.try_recv() {
+            self.dispose(admitted).await;
         }
     }
 
-    /// The lane's monitor (C2 §2; Sol r1 F2, F4), on the daemon's tracker
-    /// for the lane's life: the one owner of the session channel while no
-    /// turn holds it, draining it ([`Self::between`]); and the independent
-    /// health consumer, which keeps the driver's first failure and closes
-    /// the failed driver once no turn runs on it (an abandoned turn's
-    /// claim is gone), without waiting for an observation or a dispatch.
-    /// It ends with the driver's close, the lane's cancellation or the
-    /// daemon's.
+    /// Ends the monitor and waits for it: an item it is committing is
+    /// finished, and it gives the receiver back.
+    async fn stop_monitor(&self) {
+        self.cancel.cancel();
+        let monitor = lock(&self.monitor).take();
+        if let Some(monitor) = monitor {
+            let _joined = monitor.await;
+        }
+    }
+
+    /// The lane's monitor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3), on the
+    /// daemon's tracker for the lane's life. Whenever no turn wants the
+    /// session channel it drains it, committing each durable item as it
+    /// arrives ([`Self::dispose`]). It is also the independent health
+    /// consumer: it keeps the driver's first failure and retires the failed
+    /// driver once no turn holds the lane (an abandoned turn's claim is
+    /// gone), without waiting for an observation or a dispatch. It ends
+    /// with the driver's close, the start of retirement, or the lane's or
+    /// the daemon's cancellation.
     pub(super) async fn monitor(self: Arc<Self>) {
         let mut health = self.driver.health();
-        let mut active = self.active.subscribe();
+        let mut changes = self.changed.subscribe();
         loop {
             let failed = match &*health.borrow_and_update() {
                 DriverHealth::Open => false,
@@ -391,54 +604,62 @@ impl Lane {
                 }
                 DriverHealth::Closed => return,
             };
-            let running = *active.borrow_and_update();
-            if failed && !running {
-                self.retire().await;
-                return;
-            }
-            let watching = if running {
+            changes.borrow_and_update();
+            if failed {
+                // Test builds: the monitor holds between its health read
+                // and its retirement (Sol r2 #1), until it is ended.
+                #[cfg(feature = "test-failpoints")]
                 tokio::select! {
-                    () = self.cancel.cancelled() => false,
-                    changed = health.changed() => changed.is_ok(),
-                    changed = active.changed() => changed.is_ok(),
+                    _held = via_store::failpoint::hit_async("core.lane.retire") => {}
+                    () = self.cancel.cancelled() => return,
                 }
-            } else {
-                self.drain_between(&mut health, &mut active).await
-            };
-            if !watching {
-                return;
+                if self.begin_retire() {
+                    return;
+                }
+            }
+            if let Some(observed) = self.take_for_monitor() {
+                if !self
+                    .drain_between(observed, failed, (&mut health, &mut changes))
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = self.cancel.cancelled() => return,
+                moved = health.changed() => if moved.is_err() { return },
+                bumped = changes.changed() => if bumped.is_err() { return },
             }
         }
     }
 
-    /// Owns the session channel until a turn claims it or health changes;
-    /// `false` once the monitor ends.
+    /// Drains the session channel until a turn wants it, the driver's
+    /// health changes, or a failed driver's claim ends; `false` once the
+    /// monitor ends.
     async fn drain_between(
         &self,
-        health: &mut watch::Receiver<DriverHealth>,
-        active: &mut watch::Receiver<bool>,
+        mut observed: Observed<'_>,
+        failed: bool,
+        (health, changes): (&mut watch::Receiver<DriverHealth>, &mut watch::Receiver<()>),
     ) -> bool {
-        let mut observed = tokio::select! {
-            () = self.cancel.cancelled() => return false,
-            changed = health.changed() => return changed.is_ok(),
-            changed = active.changed() => return changed.is_ok(),
-            observed = self.observations.lock() => observed,
-        };
         let mut open = true;
         loop {
-            let room = open && lock(&self.held).len() < HELD;
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => return false,
-                changed = health.changed() => return changed.is_ok(),
-                changed = active.changed() => return changed.is_ok(),
-                admitted = observed.recv(), if room => match admitted {
-                    Some(admitted) => {
-                        self.between(admitted);
-                        if !lock(&self.held).is_empty() {
-                            self.wake.wake().await;
-                        }
+                moved = health.changed() => return moved.is_ok(),
+                bumped = changes.changed() => {
+                    if bumped.is_err() {
+                        return false;
                     }
+                    let core = lock(&self.core);
+                    if core.wanted || (failed && core.life == Life::Idle) {
+                        return true;
+                    }
+                }
+                admitted = observed.recv(), if open => match admitted {
+                    Some(admitted) => self.dispose(admitted).await,
                     None => open = false,
                 },
             }
@@ -609,8 +830,7 @@ impl Retained {
 
 impl Engine {
     /// The session's kept lane, unless its driver's health failed: what
-    /// `prepare` is asked at dispatch. Without one a new driver needs a
-    /// connection.
+    /// `status` reports verification from.
     pub(super) fn kept_lane(&self, session: &SessionId) -> Option<Arc<Lane>> {
         lock(&self.lanes)
             .get(session)
@@ -618,47 +838,51 @@ impl Engine {
             .cloned()
     }
 
-    /// Sol r1 F3 (C2 §2 health, AD16): retires the session's kept lane if
-    /// its driver's health failed, before the next turn reserves a
-    /// connection slot, so the failed driver's own slot is released first.
-    /// The lane stays for [`Self::lane`] to replace with the identity and
-    /// tombstones it holds.
-    pub(super) async fn retire_failed_lane(&self, session: &SessionId) {
-        let kept = lock(&self.lanes).get(session).cloned();
-        if let Some(lane) = kept.filter(|lane| lane.failed()) {
-            lane.retire().await;
+    /// The session's kept lane claimed for its next turn, before the
+    /// driver is prepared (C2 §2 health, Sol r1 F3, Sol r2 #1). A lane
+    /// whose driver failed is retired first, so its connection slot is
+    /// free before the turn reserves one, and the turn opens a successor
+    /// ([`Self::open_lane`]). Retirement is shared: whoever started it,
+    /// this waits for its end.
+    pub(super) async fn claim_lane(&self, session: &SessionId) -> Option<LaneClaim> {
+        let lane = lock(&self.lanes).get(session).cloned()?;
+        if let Some(claim) = lane.claim() {
+            return Some(claim);
         }
+        if lane.begin_retire() {
+            lane.retired().await;
+        }
+        None
     }
 
-    /// The session's lane for its submitted turn: the one it has, unless
-    /// its driver's health failed, which is closed and replaced with the
-    /// identity it confirmed (C2 §2 health); else a lane opened for the
-    /// turn's `model` in `cwd` (C2 §2 `open_session`, logical: no vendor
-    /// I/O), from the session's stored route identity `route` (Sol r1 F12,
-    /// decision H3). A route identity the Store does not hold is not
-    /// invented: the driver then has no adapter and refuses the turn.
-    pub(super) async fn lane(
+    /// The session's lane for its submitted turn, which found none to
+    /// claim, opened for the turn's `model` in `cwd` (C2 §2
+    /// `open_session`, logical: no vendor I/O) from the session's stored
+    /// route identity `route` (Sol r1 F12, decision H3), and claimed. A
+    /// route identity the Store does not hold is not invented: the driver
+    /// then has no adapter and refuses the turn. A retired lane it
+    /// replaces is removed first (Sol r2 #3, #9): its monitor is joined,
+    /// what its channel still has is committed or dropped, and the
+    /// successor keeps its identity, its tombstones and the session's
+    /// byte budget.
+    pub(super) async fn open_lane(
         &self,
         session: &SessionId,
         route: &SessionRoute,
         model: &str,
         cwd: PathBuf,
-    ) -> Arc<Lane> {
-        let kept = lock(&self.lanes).get(session).cloned();
-        let mut state = LaneState::recovered(route);
-        let mut held = VecDeque::new();
-        if let Some(lane) = kept {
-            if !lane.failed() {
-                return lane;
+    ) -> LaneClaim {
+        let replaced = lock(&self.lanes).remove(session);
+        let (state, budget) = match replaced {
+            Some(lane) => {
+                lane.retire_now().await;
+                lane.stop_monitor().await;
+                lane.drain_rest().await;
+                let state = lock(&lane.state).successor();
+                (state, lane.budget.clone())
             }
-            // C2 §2: no turn runs on a failed driver's connection. What
-            // its monitor held is the successor's to commit.
-            lock(&self.lanes).remove(session);
-            state = lock(&lane.state).successor();
-            lane.retire().await;
-            lane.cancel.cancel();
-            held = lane.take_held();
-        }
+            None => (LaneState::recovered(route), ObservationBudget::new()),
+        };
         let reference = session_ref(route);
         let spec = SessionSpec {
             session_id: session.clone(),
@@ -674,142 +898,112 @@ impl Engine {
                 .map(|identity: &Identity| identity.vendor_session_id.clone()),
             allow_untested: false,
         };
-        let (sink, receiver) = observation_channel();
+        let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {
             observations: sink,
             tracker: self.tracker.clone(),
             cancel: self.cancel.child_token(),
         };
-        let lane = Arc::new(Lane::new(
-            self.adapter.open_session(&reference, spec, cx),
-            reference,
-            receiver,
-            (state, held),
-            (self.session_drain(session), self.cancel.child_token()),
-        ));
-        lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
-        self.tracker.spawn(Arc::clone(&lane).monitor());
-        lane
+        let driver = self.adapter.open_session(&reference, spec, cx);
+        let lane = self.install_lane(
+            session,
+            ((driver, reference), (receiver, budget)),
+            (state, Life::Claimed),
+        );
+        LaneClaim(lane)
     }
 
     /// Restart recovery's resumed driver (C2 §2 Recover) becomes the
-    /// session's lane, with the channel its recovery was given.
+    /// session's lane, with the channel its recovery was given on the
+    /// session's `budget`.
     pub(super) fn adopt_lane(
         &self,
         session: &SessionId,
-        (driver, receiver): (SessionDriver, mpsc::Receiver<Admitted>),
+        (driver, receiver, budget): (SessionDriver, mpsc::Receiver<Admitted>, ObservationBudget),
         (reference, route): (SessionRef, &SessionRoute),
     ) {
+        self.install_lane(
+            session,
+            ((driver, reference), (receiver, budget)),
+            (LaneState::recovered(route), Life::Idle),
+        );
+    }
+
+    /// Makes a lane the session's and starts its monitor.
+    fn install_lane(
+        &self,
+        session: &SessionId,
+        (opened, channel): (
+            (SessionDriver, SessionRef),
+            (mpsc::Receiver<Admitted>, ObservationBudget),
+        ),
+        initial: (LaneState, Life),
+    ) -> Arc<Lane> {
         let lane = Arc::new(Lane::new(
-            driver,
-            reference,
-            receiver,
-            (LaneState::recovered(route), VecDeque::new()),
-            (self.session_drain(session), self.cancel.child_token()),
+            opened,
+            channel,
+            initial,
+            (
+                self.session_writer(session),
+                self.tracker.clone(),
+                self.cancel.child_token(),
+            ),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
-        self.tracker.spawn(lane.monitor());
+        let monitor = self.tracker.spawn(Arc::clone(&lane).monitor());
+        *lock(&lane.monitor) = Some(monitor);
+        lane
     }
 
     /// A session's close (C2 §2 Close): its driver is closed by
-    /// `deadline`, releasing any connection it holds, and the lane goes.
-    /// The lane is returned with what its channel still had drained
-    /// ([`Lane::between`]), for the close to commit before `session.closed`.
+    /// `deadline`, releasing any connection it holds, unless its
+    /// retirement already did, and the lane goes. Its monitor is joined
+    /// and what the channel still has is committed or dropped, before
+    /// `session.closed` (Sol r2 #3).
     pub(super) async fn close_lane(
         &self,
         session: &SessionId,
         mode: CloseMode,
         deadline: Deadline,
-    ) -> Option<Arc<Lane>> {
-        let lane = lock(&self.lanes).remove(session)?;
-        let _report = lane.driver.close(mode, deadline).await;
-        lane.cancel.cancel();
+    ) {
+        let Some(lane) = lock(&self.lanes).remove(session) else {
+            return;
+        };
+        lane.stop_monitor().await;
+        let retiring = {
+            let mut core = lock(&lane.core);
+            match core.life {
+                Life::Retiring | Life::Retired => true,
+                Life::Idle | Life::Claimed => {
+                    core.life = Life::Retiring;
+                    false
+                }
+            }
+        };
+        if retiring {
+            lane.retired().await;
+        } else {
+            let _report = lane.driver.close(mode, deadline).await;
+            lock(&lane.core).life = Life::Retired;
+            lane.changed.send_replace(());
+        }
         lane.drain_rest().await;
-        Some(lane)
-    }
-
-    /// Commits what the session's lane holds from between turns
-    /// ([`Self::commit_lane_held`]); the dispatcher's, once its lane's
-    /// [`Drain`] woke it.
-    pub(super) async fn commit_held(&self, slot: &Slot, session: &SessionId) {
-        let lane = lock(&self.lanes).get(session).cloned();
-        if let Some(lane) = lane {
-            self.commit_lane_held(slot, session, &lane).await;
-        }
-    }
-
-    /// The durable session observations `lane` holds (C2 §2 session
-    /// drain; decision H3 as narrowed), committed in decode order, each at
-    /// the session's next sequence with its own attribution: a confirmed
-    /// identity's open event with the session's identity columns, and a
-    /// denial, decline or warning as itself. The Store refuses them once
-    /// the session is closed. A failed commit is the session's Store
-    /// failure (design §7.1); what it held after that is dropped.
-    pub(super) async fn commit_lane_held(&self, slot: &Slot, session: &SessionId, lane: &Lane) {
-        for (attributed, admitted) in lane.take_held() {
-            if self.store_failed() {
-                return;
-            }
-            let observation = &admitted.item.observation;
-            let (body, opened) = if let Observation::IdentityConfirmed(identity) = observation {
-                let confirmed = Lane::confirmed(Some(lane), identity);
-                let version = identity.vendor_version.clone();
-                let Some(body) = lane.open_event(&identity.connection_id, &confirmed, version)
-                else {
-                    lane.confirm(confirmed);
-                    continue;
-                };
-                (body, Some((identity.connection_id.clone(), confirmed)))
-            } else if let Some(body) = super::drive::held_body(observation) {
-                (body, None)
-            } else {
-                continue;
-            };
-            let at = rfc3339(SystemTime::now());
-            let columns = opened.as_ref().map(|(_, confirmed)| confirmed.columns());
-            let written = journal::commit_session_event(
-                &self.store,
-                (&slot.head, session),
-                (body, &at, attributed),
-                columns,
-            )
-            .await;
-            match written {
-                SessionWrite::Committed => {
-                    if let Some((generation, confirmed)) = opened {
-                        lane.opened(generation, confirmed);
-                    }
-                }
-                SessionWrite::Refused => return,
-                SessionWrite::Failed(outcome) => {
-                    self.store_failure(FailureSite::Event, outcome, FailureScope::Session(session))
-                        .finish()
-                        .await;
-                    return;
-                }
-            }
-        }
     }
 
     /// Final shutdown: every driver's owned work is cancelled and every
-    /// lane dropped, before Host reconciliation. What a lane still held or
-    /// its channel still had commits first, by `by` (C2 §2 session drain;
-    /// decision H3 as narrowed): a wake after the final-shutdown fence
-    /// started no dispatcher for it.
+    /// lane dropped, before Host reconciliation. Each lane's monitor is
+    /// joined and what its channel still has is committed or dropped
+    /// first, by `by` and within [`SHUTDOWN_DRAIN`] (C2 §2 session drain;
+    /// Sol r2 #3).
     pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) {
         self.cancel.cancel();
         self.tracker.close();
-        let lanes: Vec<(SessionId, Arc<Lane>)> = lock(&self.lanes).drain().collect();
+        let lanes: Vec<Arc<Lane>> = lock(&self.lanes).drain().map(|(_, lane)| lane).collect();
         let by = by.min(tokio::time::Instant::now() + SHUTDOWN_DRAIN);
         let _bounded = tokio::time::timeout_at(by, async {
-            for (session, lane) in &lanes {
-                if tokio::time::timeout(CHANNEL_RELEASE, lane.drain_rest())
-                    .await
-                    .is_ok()
-                {
-                    let slot = self.slot_for(session);
-                    self.commit_lane_held(&slot, session, lane).await;
-                }
+            for lane in &lanes {
+                lane.stop_monitor().await;
+                lane.drain_rest().await;
             }
         })
         .await;

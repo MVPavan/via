@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
-use via_adapters::{AnchorRecovery, Recovery, SessionCx, observation_channel};
+use via_adapters::{
+    AnchorRecovery, ObservationBudget, Recovery, SessionCx, observation_channel_in,
+};
 use via_store::{
     ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, StoreError, TerminalRecord, UnfinishedTurn,
 };
@@ -429,7 +431,8 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::STORE)?;
         let facts = reconciled.facts.get(session).map_or(&[][..], Vec::as_slice);
-        let (sink, receiver) = observation_channel();
+        let budget = ObservationBudget::new();
+        let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {
             observations: sink,
             tracker: self.tracker.clone(),
@@ -447,7 +450,11 @@ impl Engine {
             super::lock(&self.faults.recoveries).push((session.clone(), facts.len(), answer));
         }
         if let Recovery::Resumed(driver) = recovery {
-            self.adopt_lane(session, (*driver, receiver), (reference, &snapshot.route));
+            self.adopt_lane(
+                session,
+                (*driver, receiver, budget),
+                (reference, &snapshot.route),
+            );
         }
         Ok(())
     }

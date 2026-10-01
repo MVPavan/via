@@ -162,8 +162,9 @@ pub use driver::{
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
-    LeftoverReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
-    StopReason, TurnEnd, TurnEvidence, UsageSample, VendorTerminal, observation_channel,
+    LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,
+    ProgressMarks, SteerDelivery, StopReason, TurnEnd, TurnEvidence, UsageSample, VendorTerminal,
+    observation_channel, observation_channel_in,
 };
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,

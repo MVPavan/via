@@ -79,6 +79,11 @@ impl Drop for Abandonment<'_> {
     }
 }
 
+/// The ID identity confirmations name for connection `generation`.
+pub(crate) fn connection_id(generation: u64) -> String {
+    format!("fake-{generation}")
+}
+
 /// Runs one submitted turn (C2 §4.1): per-turn values are checked before
 /// anything launches (AD18, C2 §7 item 13); then the turn's process runs
 /// through Route on a tracker-owned task while each decoded message is
@@ -443,12 +448,17 @@ fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
 
 /// Whether a persistent connection's helper retirement left its cleanup
 /// unproven (decision H1): a health failure, as no turn reports it. Test
-/// builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN` makes every launched
-/// retirement unproven, as no fake profile can.
+/// builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN=<n>` makes the daemon's
+/// `n`th launched persistent retirement unproven, as no fake profile can.
 fn retirement_uncertain(retirement: &Retirement) -> bool {
     #[cfg(feature = "test-failpoints")]
-    if std::env::var_os("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN").is_some() {
-        return retirement.launched;
+    if let Some(nth) = std::env::var("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        static LAUNCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        return retirement.launched
+            && LAUNCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == nth;
     }
     retirement.launched
         && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
@@ -1050,7 +1060,7 @@ impl Normalizer {
         lock(&self.state).identity = Some(vendor_session_id.clone());
         Observation::IdentityConfirmed(Identity {
             vendor_session_id,
-            connection_id: format!("fake-{}", self.generation),
+            connection_id: connection_id(self.generation),
             transcript: transcript.map(PathBuf::from),
             // The fake's handshake carries none at confirmation.
             vendor_version: None,

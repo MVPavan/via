@@ -5,7 +5,7 @@
 mod driver;
 mod profile;
 
-pub(crate) use driver::run_turn;
+pub(crate) use driver::{connection_id, run_turn};
 pub(crate) use profile::FakeProfile;
 
 use crate::config::FakeFixture;

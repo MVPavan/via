@@ -14,7 +14,7 @@ use std::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::api::{Cancel, Exit, Failure, FailureClass, Warning};
+use crate::api::{Cancel, EventBody, Exit, Failure, FailureClass, Warning};
 use crate::{SessionId, TurnNumber};
 use via_adapters::{
     AdapterConfig, AdapterSet, CancellationToken, DescribeRequest, RefusalKind, RuntimeConfig,
@@ -97,13 +97,13 @@ pub struct Engine {
     finalized: AtomicBool,
     /// Sessions with dispatch state: queue, dispatcher and event head. A slot
     /// is retired when its dispatcher exits with nothing left (design §2).
-    /// Shared with each lane's [`Drain`].
+    /// Shared with each lane's [`SessionWriter`].
     sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
     /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
     /// Phase two of the latch, set under `admission` after `failure_pending`
     /// (runtime §7): the latch is ordered after every receipt inside it.
-    store_failed: AtomicBool,
+    store_failed: Arc<AtomicBool>,
     /// Sessions with dispatch state when force was accepted, for final
     /// shutdown's closure pass.
     force_sessions: StdMutex<Option<Vec<SessionId>>>,
@@ -115,7 +115,7 @@ pub struct Engine {
     /// Daemon main's end of `starts`, taken once.
     start_receiver: StdMutex<Option<mpsc::Receiver<SessionId>>>,
     /// Starts that found `starts` full; daemon main retries them.
-    pending_starts: Arc<StdMutex<HashSet<SessionId>>>,
+    pending_starts: StdMutex<HashSet<SessionId>>,
     /// Connection slots (design §11): a `Run` turn reserves one before its
     /// grant; at launch Host takes it for the group's life. FIFO waiters.
     slots: Arc<tokio::sync::Semaphore>,
@@ -369,12 +369,12 @@ impl Engine {
             finalized: AtomicBool::new(false),
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             queued: AtomicUsize::new(0),
-            store_failed: AtomicBool::new(false),
+            store_failed: Arc::new(AtomicBool::new(false)),
             force_sessions: StdMutex::new(None),
             read_retries_until: watch::Sender::new(None),
             starts,
             start_receiver: StdMutex::new(Some(start_receiver)),
-            pending_starts: Arc::new(StdMutex::new(HashSet::new())),
+            pending_starts: StdMutex::new(HashSet::new()),
             slots,
             slot_limit,
             recovered: slots::RecoveredSlots::default(),
@@ -419,17 +419,20 @@ impl Engine {
     /// Asks daemon main to start the session's dispatcher; a full channel
     /// leaves the start pending for daemon main's retry (design §5).
     fn request_start(&self, session: SessionId) {
-        request_start((&self.starts, &self.pending_starts), session);
+        let mut pending = lock(&self.pending_starts);
+        if let Err(mpsc::error::TrySendError::Full(session)) = self.starts.try_send(session) {
+            pending.insert(session);
+        }
     }
 
-    /// The session's [`Drain`], for its lane.
-    fn session_drain(&self, session: &SessionId) -> Drain {
-        Drain {
-            admission: Arc::clone(&self.admission),
-            fence: self.final_shutdown.subscribe(),
+    /// The session's [`SessionWriter`], for its lane.
+    fn session_writer(&self, session: &SessionId) -> SessionWriter {
+        SessionWriter {
+            store: self.store.clone(),
             sessions: Arc::clone(&self.sessions),
-            starts: self.starts.clone(),
-            pending_starts: Arc::clone(&self.pending_starts),
+            admission: Arc::clone(&self.admission),
+            signal: Arc::clone(&self.signal),
+            store_failed: Arc::clone(&self.store_failed),
             session: session.clone(),
         }
     }
@@ -517,50 +520,80 @@ impl Engine {
     }
 }
 
-/// Asks daemon main to start the session's dispatcher; a full channel
-/// leaves the start pending for daemon main's retry (design §5).
-fn request_start(
-    (starts, pending_starts): (&mpsc::Sender<SessionId>, &StdMutex<HashSet<SessionId>>),
-    session: SessionId,
-) {
-    let mut pending = lock(pending_starts);
-    if let Err(mpsc::error::TrySendError::Full(session)) = starts.try_send(session) {
-        pending.insert(session);
-    }
-}
-
-/// Wakes a session's dispatcher to commit the durable observations its
-/// lane received between turns (C2 §2 session drain; decision H3 as
-/// narrowed), so none waits for a next turn. The lane's monitor holds it.
-pub(super) struct Drain {
-    admission: Arc<tokio::sync::Mutex<()>>,
-    /// The `final_shutdown` fence's watch.
-    fence: watch::Receiver<bool>,
+/// What a lane needs to commit the session-level event of an observation
+/// received outside a running turn (C2 §2 session drain; decision H3 as
+/// narrowed), as it arrives.
+struct SessionWriter {
+    store: StoreClient,
     sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
-    starts: mpsc::Sender<SessionId>,
-    pending_starts: Arc<StdMutex<HashSet<SessionId>>>,
+    admission: Arc<tokio::sync::Mutex<()>>,
+    signal: Arc<latch::Signal>,
+    store_failed: Arc<AtomicBool>,
     session: SessionId,
 }
 
-impl Drain {
-    /// Marks the session's slot, created if it has none, and starts its
-    /// dispatcher unless one runs. Under `admission`, as a receipt's start
-    /// request is, so final shutdown's start drain sees the start or the
-    /// fence refused it; final shutdown then commits what the lane holds
-    /// itself ([`Engine::shutdown`]). Under `sessions`, as a dispatcher's
-    /// exit is, so the slot it marks is never one being retired.
-    pub(super) async fn wake(&self) {
+impl SessionWriter {
+    /// Commits `body`, attributed `(turn, late)`, at the session's next
+    /// sequence, with `identity` the session's identity columns in the same
+    /// transaction ([`journal::commit_session_event`]). Under `admission`,
+    /// on the session's slot head: a slot made for the write when the
+    /// session has none, and removed after it, so no receipt or dispatcher
+    /// meets it. The Store refuses it once the session is closed. A failed
+    /// commit is the session's Store failure (design §7: phase one, and
+    /// phase two under the `admission` held); nothing is written once Store
+    /// failure is pending.
+    async fn commit(
+        &self,
+        (body, at, attributed): (EventBody, &str, (Option<u32>, bool)),
+        identity: Option<via_store::SessionIdentity>,
+    ) -> journal::SessionWrite {
         let _admission = self.admission.lock().await;
-        if *self.fence.borrow() {
-            return;
+        if self.signal.failure_pending.load(Ordering::Acquire)
+            || self.store_failed.load(Ordering::Acquire)
+        {
+            return journal::SessionWrite::Refused;
         }
-        let start = lock(&self.sessions)
-            .entry(self.session.clone())
-            .or_insert_with(|| Slot::new(Head::new(None)))
-            .drain();
-        if start {
-            request_start((&self.starts, &self.pending_starts), self.session.clone());
+        let (slot, made) = {
+            let mut sessions = lock(&self.sessions);
+            if let Some(slot) = sessions.get(&self.session) {
+                (Arc::clone(slot), false)
+            } else {
+                let slot = Slot::new(Head::new(None));
+                sessions.insert(self.session.clone(), Arc::clone(&slot));
+                (slot, true)
+            }
+        };
+        let head = Arc::clone(&slot.head);
+        let written = journal::commit_session_event(
+            &self.store,
+            (&head, &self.session),
+            (body, at, attributed),
+            identity,
+        )
+        .await;
+        drop(head);
+        if made {
+            let mut sessions = lock(&self.sessions);
+            if slot.idle()
+                && slot.unleased()
+                && sessions
+                    .get(&self.session)
+                    .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
+            {
+                sessions.remove(&self.session);
+            }
         }
+        if let journal::SessionWrite::Failed(outcome) = written
+            && self.signal.report(
+                FailureSite::Event,
+                outcome,
+                latch::FailureScope::Session(&self.session),
+            )
+        {
+            // Phase two, under the `admission` held (design §7.4).
+            self.store_failed.store(true, Ordering::Release);
+        }
+        written
     }
 }
 

@@ -1315,8 +1315,8 @@ fn core_structured_output_write_failure_fails_the_commit() {
 /// `RetirementUncertain`, its committed slot still held) is retired by the
 /// lane's own health monitor, with no observation and no dispatch: its
 /// slot is released at once. Its next turn runs on a replacement driver
-/// that keeps the confirmed identity. (Every launched retirement is
-/// unproven here, so each persistent lane is retired after its turn.)
+/// that keeps the confirmed identity. (The daemon's first launched
+/// retirement is made unproven here.)
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_failed_lane_is_retired_by_its_health_monitor() {
@@ -1376,7 +1376,93 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
-        // Every retirement is unproven here, so the report is not clean.
+        // The first retirement is unproven, so the report is not clean.
+        let _report = daemon
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+    });
+}
+
+/// Sol r1 F3, Sol r2 #1, #2 (C2 §2 health, AD16): four persistent
+/// sessions hold every connection slot, and one's driver fails between
+/// turns while its monitor is held between its health read and its
+/// retirement (`core.lane.retire`). That session's next turn, needing a
+/// fifth slot, is refused the failed lane's claim, retires it at dispatch
+/// (releasing its slot) and runs on a successor while the monitor is still
+/// held; the monitor, released, finds the retirement already started and
+/// the successor untouched.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
+    let scripts = [
+        script("first", &completed(1)),
+        script(
+            "retires",
+            &[
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+                json!({"action":"exit","code":0}),
+            ],
+        ),
+        script("again", &completed(2)),
+        script("third", &completed(3)),
+    ];
+    let Some(root) = child(
+        "core_failed_lane_with_every_slot_held_retires_at_dispatch",
+        &scenario(&persistent(), &scripts),
+        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "4")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.lane.retire", "pause");
+    run(async {
+        let daemon = Daemon::open(&root);
+        for _ in 0..3 {
+            let session = daemon.spawn("first", &json!({})).await;
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+        }
+        let failed = daemon.spawn("retires", &json!({})).await;
+        let envelope = daemon.wait(&failed, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        let ack = root.join("points").join("core.lane.retire.1.ack");
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !ack.exists() {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the monitor never saw the failure"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(daemon.engine.connections().in_use, 4);
+        daemon.resume(&failed, "again").await;
+        let params = WaitParams {
+            address: format!("{failed}/2"),
+            timeout_ms: Some(20_000),
+        };
+        let envelope = daemon
+            .engine
+            .wait(params)
+            .await
+            .map_err(|error| error.kind)
+            .expect("the successor turn ran while the monitor was held");
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(daemon.engine.connections().in_use, 4);
+        fs::write(root.join("points").join("core.lane.retire.1.release"), b"").unwrap();
+        // The released monitor retires nothing: the successor keeps its
+        // slot and serves the session's next turn.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(daemon.engine.connections().in_use, 4);
+        daemon.resume(&failed, "third").await;
+        let envelope = daemon.wait(&failed, 3).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        // The fourth session's retirement is unproven: not clean.
         let _report = daemon
             .engine
             .shutdown(Deadline::at(

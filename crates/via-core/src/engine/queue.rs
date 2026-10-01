@@ -301,9 +301,6 @@ struct State {
     dispatcher: Dispatcher,
     running: Option<Running>,
     close: Option<CloseOrder>,
-    /// The session's lane holds durable observations from between turns
-    /// for the dispatcher to commit (C2 §2 session drain).
-    drain: bool,
 }
 
 impl State {
@@ -373,7 +370,6 @@ impl Slot {
                 dispatcher: Dispatcher::None,
                 running: None,
                 close: None,
-                drain: false,
             }),
             wake: Notify::new(),
         })
@@ -392,24 +388,6 @@ impl Slot {
         };
         self.wake();
         start
-    }
-
-    /// The session's lane holds durable observations from between turns
-    /// (C2 §2 session drain): the dispatcher commits them before it exits.
-    /// True when a dispatcher must start.
-    pub(super) fn drain(&self) -> bool {
-        let start = {
-            let mut state = lock(&self.state);
-            state.drain = true;
-            state.start()
-        };
-        self.wake();
-        start
-    }
-
-    /// Takes the session drain's request, if any.
-    pub(super) fn take_drain(&self) -> bool {
-        std::mem::take(&mut lock(&self.state).drain)
     }
 
     /// Wakes the dispatcher and every slot waiter; wakes before a wait
@@ -968,11 +946,7 @@ impl Slot {
     /// the caller holds `admission`. Returns whether it exited.
     pub(super) fn exit(&self) -> bool {
         let mut state = lock(&self.state);
-        if !state.queue.is_empty()
-            || state.running.is_some()
-            || state.close.is_some()
-            || state.drain
-        {
+        if !state.queue.is_empty() || state.running.is_some() || state.close.is_some() {
             return false;
         }
         state.dispatcher = Dispatcher::None;
@@ -982,10 +956,7 @@ impl Slot {
     /// No queued turn, close order or dispatcher: the slot may be retired.
     pub(super) fn idle(&self) -> bool {
         let state = lock(&self.state);
-        state.queue.is_empty()
-            && state.close.is_none()
-            && !state.drain
-            && state.dispatcher == Dispatcher::None
+        state.queue.is_empty() && state.close.is_none() && state.dispatcher == Dispatcher::None
     }
 
     /// Marks the dispatcher gone after a force stop or a Store failure,

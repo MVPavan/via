@@ -276,6 +276,14 @@ impl SessionDriver {
             .is_some_and(|adapter| adapter.profile().persistent)
     }
 
+    /// The ID identity confirmations name for the driver's current
+    /// connection generation, the latest it opened (C2 §2 delayed identity:
+    /// Core checks the current generation); `None` before the first.
+    pub fn connection_id(&self) -> Option<String> {
+        let generation = self.state().generation;
+        (generation > 0).then(|| crate::fake::connection_id(generation))
+    }
+
     /// AD16: a live persistent connection is pinned; otherwise the turn
     /// opens a new connection and Core reserves a slot for it.
     pub fn prepare(&self) -> Prepared {

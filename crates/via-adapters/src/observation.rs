@@ -428,10 +428,49 @@ pub struct ObservationSink {
 
 /// One session's observation channel (C2 §2 `SessionCx`).
 pub fn observation_channel() -> (ObservationSink, mpsc::Receiver<Admitted>) {
+    observation_channel_in(&ObservationBudget::new())
+}
+
+/// One session's 4 MiB observation byte budget (C2 A1), which a session
+/// keeps across its channels: a replaced driver's channel and its
+/// successor's share it, so the admitted payloads of both stay within it.
+#[derive(Clone, Debug)]
+pub struct ObservationBudget(Arc<Semaphore>);
+
+impl ObservationBudget {
+    /// A full budget.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Semaphore::new(OBSERVATION_BYTES)))
+    }
+
+    /// The bytes not held by an admitted item.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+
+    /// Whether `other` is a handle on this same budget.
+    #[must_use]
+    pub fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for ObservationBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A session channel on the session's `budget` (C2 §2 `SessionCx`).
+pub fn observation_channel_in(
+    budget: &ObservationBudget,
+) -> (ObservationSink, mpsc::Receiver<Admitted>) {
     // Full: the driver waits, up to the stall bound, then fails the turn
     // `overflow` (C2 §7 item 12).
     let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
-    let budget = Arc::new(Semaphore::new(OBSERVATION_BYTES));
+    let budget = Arc::clone(&budget.0);
     (ObservationSink { sender, budget }, receiver)
 }
 

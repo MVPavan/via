@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use via_adapters::{
     AdapterError, Admitted, Decline, Denial, DenialKind, Observation, ObservationItem, Prepared,
     RouteError, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd, TurnEvidence, TurnSpec,
@@ -236,12 +236,6 @@ impl Engine {
                 self.force_exit(&slot, &session).await;
                 return Ok(());
             }
-            // C2 §2 session drain: what the lane received between turns
-            // commits before any decision, so none waits for a next turn.
-            if slot.take_drain() {
-                self.commit_held(&slot, &session).await;
-                continue;
-            }
             let step = match slot.front() {
                 Front::Closing => match self.close_pass(&slot, &session, &mut refused).await {
                     Some(step) => step,
@@ -386,12 +380,14 @@ impl Engine {
         // design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
         // life. Force, the latch or a change of the head gives up the wait:
-        // the queued path, never submitted. A failed driver is retired
-        // first, so its own slot is free for its successor (C2 §2).
-        self.retire_failed_lane(session).await;
-        let prepared = self
-            .kept_lane(session)
-            .map_or(Prepared::NeedsConnection, |lane| lane.driver.prepare());
+        // the queued path, never submitted. The session's lane is claimed
+        // before its driver is prepared, and a failed driver is retired
+        // first, so its own slot is free for its successor (C2 §2, Sol r2
+        // #1). The claim is given back on every path that does not run.
+        let claim = self.claim_lane(session).await;
+        let prepared = claim
+            .as_ref()
+            .map_or(Prepared::NeedsConnection, |claim| claim.driver.prepare());
         let connection = match prepared {
             Prepared::Pinned(_) => None,
             Prepared::NeedsConnection => match self.reserve_connection(slot, turn).await {
@@ -452,11 +448,15 @@ impl Engine {
             .as_ref()
             .map_or_else(|| self.cwd.clone(), PathBuf::from);
         let route = submission.queued.route.clone();
-        let lane = self
-            .lane(session, &route, submission.effective.model(), cwd)
-            .await;
+        let claim = match claim {
+            Some(claim) => claim,
+            None => {
+                self.open_lane(session, &route, submission.effective.model(), cwd)
+                    .await
+            }
+        };
         self.queued.fetch_sub(1, Ordering::AcqRel);
-        self.run(slot, submission, (&lane, prepared, connection))
+        self.run(slot, submission, (&*claim, prepared, connection))
             .await;
         self.active.fetch_sub(1, Ordering::AcqRel);
         Step::Next
@@ -1403,7 +1403,7 @@ impl Engine {
 
     /// Runs the turn on the session's driver under the turn deadline,
     /// handling each observation on the session channel in decode order
-    /// before its result is acted on. The turn claims the channel from the
+    /// before its result is acted on. The turn takes the channel from the
     /// lane's monitor; what arrived before the turn is handled first, as
     /// the session drain handles it (C2 §2): durable items commit with
     /// their own attribution, late ones of earlier turns `late: true`
@@ -1422,17 +1422,12 @@ impl Engine {
         control: &mut Control<'_>,
     ) -> Driven {
         // The session channel (C2 A1): 1,024 items and a 4 MiB byte
-        // budget; an item's permit is held until it is handled.
-        let _claim = lane.claim();
-        let mut observed = lane.observations.lock().await;
-        while let Ok(admitted) = observed.try_recv() {
-            lane.between(admitted);
-        }
-        for (attributed, Admitted { item, permit }) in lane.take_held() {
-            self.observe_held(record, lane, attributed, item.observation)
-                .await;
-            drop(permit);
-            stop_for_store(record, control);
+        // budget; an item's permit is held until it is handled. The lane's
+        // monitor gives it up; what arrived before the turn is the session
+        // drain's (C2 §2).
+        let mut observed = lane.observe().await;
+        while let Some(admitted) = observed.try_recv() {
+            lane.dispose(admitted).await;
         }
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
@@ -1489,7 +1484,8 @@ impl Engine {
             }
         };
         // The driver delivered the turn's items before it returned.
-        self.drain(record, Some(lane), effective, control, &mut observed)
+        let queued: Vec<Admitted> = std::iter::from_fn(|| observed.try_recv()).collect();
+        self.drain(record, Some(lane), effective, control, queued)
             .await;
         let TurnEnd {
             terminal,
@@ -1536,13 +1532,39 @@ impl Engine {
         lane: Option<&Lane>,
         effective: &Effective,
         control: &mut Control<'_>,
-        observed: &mut mpsc::Receiver<Admitted>,
+        queued: impl IntoIterator<Item = Admitted>,
     ) {
-        while let Ok(Admitted { item, permit }) = observed.try_recv() {
+        for Admitted { item, permit } in queued {
             self.observe(record, lane, effective, control, item).await;
             drop(permit);
             stop_for_store(record, control);
         }
+    }
+
+    /// Test builds: runs the running turn of `slot` on `lane` as `run`
+    /// does, with the run loop's own order receiver.
+    #[cfg(test)]
+    pub(super) async fn execute_turn(
+        &self,
+        (slot, lane): (&Slot, &Lane),
+        (record, effective): (&mut TurnRecord, &Effective),
+        orders: watch::Receiver<Option<StopOrder>>,
+        (spec, cx): (TurnSpec, TurnCx),
+    ) {
+        let mut control = Control {
+            slot,
+            turn: record.turn,
+            orders,
+            observed: false,
+            stored: false,
+            refused: false,
+            idle_at: None,
+            idle: Duration::ZERO,
+            final_text: FinalText::new(),
+        };
+        let _driven = self
+            .execute(record, (lane, effective), (spec, cx), &mut control)
+            .await;
     }
 
     /// Test builds: drains `queued` for the running `turn` of `slot` as
@@ -1558,17 +1580,16 @@ impl Engine {
         orders: watch::Receiver<Option<StopOrder>>,
         queued: Vec<ObservationItem>,
     ) {
-        let (sender, mut observed) = mpsc::channel(queued.len().max(1));
         let budget = Arc::new(tokio::sync::Semaphore::new(queued.len()));
-        for item in queued {
-            let permit = Arc::clone(&budget)
-                .try_acquire_owned()
-                .expect("one permit per item");
-            sender
-                .try_send(Admitted { item, permit })
-                .expect("the test channel took the item");
-        }
-        drop(sender);
+        let queued: Vec<Admitted> = queued
+            .into_iter()
+            .map(|item| Admitted {
+                item,
+                permit: Arc::clone(&budget)
+                    .try_acquire_owned()
+                    .expect("one permit per item"),
+            })
+            .collect();
         let mut control = Control {
             slot,
             turn: record.turn,
@@ -1580,7 +1601,7 @@ impl Engine {
             idle: Duration::ZERO,
             final_text: FinalText::new(),
         };
-        self.drain(record, lane, effective, &mut control, &mut observed)
+        self.drain(record, lane, effective, &mut control, queued)
             .await;
     }
 
@@ -1703,22 +1724,6 @@ impl Engine {
             // Discarded until via-jm4.35: a late terminal's revision
             // write is not in the Store yet.
             | Observation::LateTerminal(_) => {}
-        }
-    }
-
-    /// A durable item the session drain held (C2 §2): an identity commits
-    /// as the session's; another commits with its own attribution.
-    async fn observe_held(
-        &self,
-        record: &mut TurnRecord,
-        lane: &Lane,
-        attributed: (Option<u32>, bool),
-        observation: Observation,
-    ) {
-        if let Observation::IdentityConfirmed(identity) = observation {
-            self.confirm_identity(record, Some(lane), identity).await;
-        } else {
-            self.observe_other(record, attributed, observation).await;
         }
     }
 

@@ -498,7 +498,12 @@ impl Signal {
     /// latches. A write aborted by a corrupt prerequisite read is not
     /// recorded again: Store's read reply recorded that one failure
     /// (T3-S5 round 3, decision 13).
-    fn report(&self, site: FailureSite, outcome: WriteOutcome, scope: FailureScope<'_>) -> bool {
+    pub(super) fn report(
+        &self,
+        site: FailureSite,
+        outcome: WriteOutcome,
+        scope: FailureScope<'_>,
+    ) -> bool {
         let latches = match outcome {
             WriteOutcome::Uncertain | WriteOutcome::Corrupt | WriteOutcome::ReadCorrupt => true,
             WriteOutcome::NotCommitted => !site.scoped(),
