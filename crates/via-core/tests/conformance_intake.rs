@@ -1423,3 +1423,97 @@ fn conformance_intake_corrupt_frozen_session_values_fail_submission() {
         });
     }
 }
+
+/// Sol r1 #3 (C1 §5 `bound`, C2 `RoutePlan.effective_bound`): on a route
+/// that normalizes bounds, the requested and effective bounds stay
+/// separate. The effective one is in the receipt, the launch input and the
+/// envelope; the requested one is the envelope's `requested`, inherited
+/// with it. An effective bound over 32 KiB encoded is `invalid_params`
+/// naming `bound`.
+#[test]
+fn conformance_intake_effective_bound_from_the_plan() {
+    let root = Root::new();
+    let normalized = json!({"mode":"full","extra_write_dirs":["/normalized"],"network":true});
+    let capabilities = capabilities(&[("/bounds", json!(["full"]))]);
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &json!({"capabilities": capabilities, "normalized_bound": normalized}),
+            &[
+                script_expecting(
+                    &json!({"prompt":"one","bound":normalized}),
+                    &[accepted(1), terminal(1)],
+                ),
+                script_expecting(
+                    &json!({"prompt":"two","bound":normalized}),
+                    &[accepted(2), terminal(2)],
+                ),
+                script_expecting(
+                    &json!({"prompt":"three","bound":normalized}),
+                    &[accepted(3), terminal(3)],
+                ),
+            ],
+        ),
+    );
+    let huge = json!({"mode":"full","extra_write_dirs":[format!("/{}", "d".repeat(33 * 1024))],
+                      "network":true});
+    let oversized = root.scenario(
+        "oversized.json",
+        &scenario(
+            &json!({"capabilities": capabilities, "normalized_bound": huge}),
+            &[],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let receipt = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"one",
+                               "bound":full_bound()}))
+            .await
+            .unwrap();
+        assert_eq!(receipt["effective"]["bound"], normalized, "{receipt}");
+        let session = session_of(&receipt);
+        let first = daemon.wait(&session, 1).await;
+        assert_eq!(first["state"], "completed", "{first}");
+        assert_eq!(
+            first["bound"],
+            json!({"requested":full_bound(),"effective":normalized,"inherited":false})
+        );
+        let two = daemon
+            .try_resume(&session, &json!({"prompt":"two","bound":full_bound()}))
+            .await
+            .unwrap();
+        assert_eq!(two["effective"]["bound"], normalized, "{two}");
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        assert_eq!(
+            second["bound"],
+            json!({"requested":full_bound(),"effective":normalized,"inherited":false})
+        );
+        let three = daemon
+            .try_resume(&session, &json!({"prompt":"three"}))
+            .await
+            .unwrap();
+        assert_eq!(three["effective"]["bound"], normalized, "{three}");
+        let third = daemon.wait(&session, 3).await;
+        assert_eq!(third["state"], "completed", "{third}");
+        assert_eq!(
+            third["bound"],
+            json!({"requested":full_bound(),"effective":normalized,"inherited":true})
+        );
+        daemon.stop().await;
+
+        let daemon = Daemon::open(&root, &oversized);
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"p",
+                               "bound":full_bound()}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused(&error),
+            ("invalid_params".to_owned(), json!("bound"), json!("fake")),
+            "{error:?}"
+        );
+        daemon.stop().await;
+    });
+}

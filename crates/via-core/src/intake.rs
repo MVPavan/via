@@ -25,6 +25,9 @@ use crate::api::{
 /// Longest `output_schema`, encoded (C1 §4).
 const OUTPUT_SCHEMA_MAX: usize = 256 * 1024;
 
+/// Longest effective `bound`, encoded (C1 §5).
+const EFFECTIVE_BOUND_MAX: usize = 32 * 1024;
+
 /// Longest `cwd`, encoded with its quotes (C1 §5).
 const CWD_MAX: usize = 4 * 1024;
 
@@ -216,6 +219,11 @@ impl Overrides {
     /// The `output_schema` this turn gives, if any.
     pub(crate) fn schema(&self) -> Option<&Value> {
         self.output_schema.given()
+    }
+
+    /// The `bound` this turn gives, if any.
+    pub(crate) fn bound(&self) -> Option<&Bound> {
+        self.bound.given()
     }
 }
 
@@ -451,7 +459,12 @@ pub(crate) fn plan_spawn(
             reason: None,
         }));
     }
-    let effective = Effective::first(plan.model.resolved.clone(), overrides);
+    let bound = EffectiveBound::of(
+        overrides.bound.given(),
+        plan.effective_bound.clone(),
+        plan.route,
+    )?;
+    let effective = Effective::first(plan.model.resolved.clone(), overrides, bound);
     let session = SessionRef {
         harness: plan.harness.to_owned(),
         route: plan.route.to_owned(),
@@ -523,6 +536,74 @@ pub(crate) struct Deadlines {
     idle_ms: u64,
 }
 
+/// A turn's bound as requested and as its route's plan enforces it (C1 §5
+/// `bound`, C2 `RoutePlan.effective_bound`); `requested` is kept only
+/// while it differs from `effective`.
+pub(crate) struct EffectiveBound {
+    effective: Option<Bound>,
+    requested: Option<Bound>,
+}
+
+impl EffectiveBound {
+    /// The plan's `effective` bound for `requested` on `route`: at most
+    /// 32 KiB encoded (C1 §5), and present whenever one was requested.
+    pub(crate) fn of(
+        requested: Option<&Bound>,
+        effective: Option<Bound>,
+        route: &'static str,
+    ) -> Result<Self, ApiError> {
+        let refuse = |kind| {
+            refused(&Refusal {
+                kind,
+                message: String::new(),
+                verb: None,
+                route: Some(route),
+                reason: None,
+            })
+        };
+        if requested.is_some() && effective.is_none() {
+            return Err(refuse(RefusalKind::BoundUnsupported));
+        }
+        if effective.as_ref().is_some_and(|bound| {
+            serde_json::to_string(bound).map_or(true, |text| text.len() > EFFECTIVE_BOUND_MAX)
+        }) {
+            return Err(ApiError {
+                message: "the route's effective bound is longer than 32 KiB encoded",
+                ..refuse(RefusalKind::InvalidParam { field: "bound" })
+            });
+        }
+        Ok(Self {
+            requested: requested
+                .filter(|requested| Some(*requested) != effective.as_ref())
+                .cloned(),
+            effective,
+        })
+    }
+}
+
+/// The effective bound of a resume turn's given `requested` bound (Sol r1
+/// #3): `check_turn` validates but does not normalize, so a fresh plan of
+/// the session's frozen harness, model and `cwd` gives it.
+pub(crate) fn resume_bound(
+    adapter: &AdapterSet,
+    frozen: &Frozen,
+    cwd: Option<&str>,
+    requested: Bound,
+) -> Result<EffectiveBound, ApiError> {
+    let request = DescribeRequest {
+        harness: Some(frozen.harness.clone()),
+        model: Some(frozen.model.clone()),
+        bound: Some(requested),
+        cwd: cwd.map(Into::into),
+        allow_untested: frozen.allow_untested,
+        ..DescribeRequest::default()
+    };
+    let plan = adapter
+        .plan(&request)
+        .map_err(|refusal| refused(&refusal))?;
+    EffectiveBound::of(request.bound.as_ref(), plan.effective_bound, plan.route)
+}
+
 /// A turn's values frozen at acceptance (C1 §3.2 `effective`, P5), as its
 /// Store row holds them and as it is driven. Beyond C1's five members it
 /// keeps the frozen `output_schema` and `vendor` options and whether its
@@ -532,9 +613,15 @@ pub(crate) struct Deadlines {
 pub(crate) struct Effective {
     model: String,
     effort: Option<String>,
+    /// The effective bound: what the route's plan enforces (C2
+    /// `RoutePlan.effective_bound`), C1's `effective.bound`.
     bound: Option<Bound>,
     deadlines: Deadlines,
     max_steps: Option<u64>,
+    /// The requested bound, kept only while it differs from the effective
+    /// one (Sol r1 #3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_requested: Option<Bound>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -544,12 +631,14 @@ pub(crate) struct Effective {
 }
 
 impl Effective {
-    /// Turn 1: its own values on the resolved `model`, else C1's defaults.
-    pub(crate) fn first(model: String, overrides: Overrides) -> Self {
+    /// Turn 1: its own values on the resolved `model`, else C1's defaults;
+    /// `bound` is the plan's effective bound for the requested one.
+    pub(crate) fn first(model: String, overrides: Overrides, bound: EffectiveBound) -> Self {
         Self {
             model,
             effort: overrides.effort.or(None),
-            bound: overrides.bound.or(None),
+            bound: bound.effective,
+            bound_requested: bound.requested,
             deadlines: Deadlines {
                 wall_ms: overrides.wall_ms.unwrap_or(DEFAULT_WALL_MS),
                 idle_ms: overrides.idle_ms.unwrap_or(DEFAULT_IDLE_MS),
@@ -563,13 +652,20 @@ impl Effective {
 
     /// C1 P5: a later turn's values, each omitted one inherited from the
     /// latest accepted turn's frozen `self`; `null` clears `output_schema`
-    /// and `max_steps`. An inherited bound is marked so (C1 §5 `bound`).
+    /// and `max_steps`. An omitted bound inherits both the requested and
+    /// the effective one and is marked so (C1 §5 `bound`); a given one
+    /// stands for both until [`Self::with_bound`] sets its plan's.
     pub(crate) fn inherit(&self, overrides: Overrides) -> Self {
         let bound_inherited = matches!(overrides.bound, Member::Omitted) && self.bound.is_some();
+        let (bound, bound_requested) = match overrides.bound {
+            Member::Given(bound) => (Some(bound), None),
+            Member::Omitted | Member::Null => (self.bound.clone(), self.bound_requested.clone()),
+        };
         Self {
             model: self.model.clone(),
             effort: overrides.effort.or(self.effort.clone()),
-            bound: overrides.bound.or(self.bound.clone()),
+            bound,
+            bound_requested,
             deadlines: Deadlines {
                 wall_ms: overrides.wall_ms.unwrap_or(self.deadlines.wall_ms),
                 idle_ms: overrides.idle_ms.unwrap_or(self.deadlines.idle_ms),
@@ -589,9 +685,23 @@ impl Effective {
         &self.model
     }
 
-    /// The turn's frozen bound, if any.
+    /// `self` with `bound`, a given bound as its plan enforces it.
+    pub(crate) fn with_bound(self, bound: EffectiveBound) -> Self {
+        Self {
+            bound: bound.effective,
+            bound_requested: bound.requested,
+            ..self
+        }
+    }
+
+    /// The turn's frozen effective bound, if any.
     pub(crate) fn bound(&self) -> Option<&Bound> {
         self.bound.as_ref()
+    }
+
+    /// The turn's requested bound, if any.
+    fn requested_bound(&self) -> Option<&Bound> {
+        self.bound_requested.as_ref().or(self.bound.as_ref())
     }
 
     /// The turn's frozen `output_schema`, if any.
@@ -625,11 +735,12 @@ impl Effective {
         serde_json::to_value(self).map_err(|_| ApiError::STORE)
     }
 
-    /// The values `check_turn` validates against the frozen route.
+    /// The values `check_turn` validates against the frozen route: the
+    /// bound as requested.
     pub(crate) fn turn_params(&self) -> TurnParams {
         TurnParams {
             effort: self.effort.clone(),
-            bound: self.bound.clone(),
+            bound: self.requested_bound().cloned(),
             output_schema: self.output_schema.is_some(),
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
@@ -871,17 +982,15 @@ impl TurnPlan {
         }
     }
 
-    /// C1 §5 `bound`: the turn's frozen bound, which the plan validated,
-    /// and whether it was inherited.
+    /// C1 §5 `bound`: the turn's requested bound, the effective one its
+    /// plan enforces, and whether they were inherited.
     pub(crate) fn bound(&self) -> api::Bound {
-        let bound = self
-            .effective
-            .as_ref()
-            .and_then(|effective| effective.bound.as_ref())
-            .and_then(|bound| serde_json::to_value(bound).ok());
+        let value =
+            |bound: Option<&Bound>| bound.and_then(|bound| serde_json::to_value(bound).ok());
+        let effective = self.effective.as_ref();
         api::Bound {
-            requested: bound.clone(),
-            effective: bound,
+            requested: value(effective.and_then(Effective::requested_bound)),
+            effective: value(effective.and_then(|effective| effective.bound.as_ref())),
             inherited: self
                 .effective
                 .as_ref()
@@ -904,7 +1013,7 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use super::{Effective, Member};
+    use super::{Effective, EffectiveBound, Member};
     use crate::SpawnParams;
 
     /// The per-turn type rules (C1 §4): an empty options object per
@@ -974,10 +1083,11 @@ mod tests {
             params.per_turn().overrides().unwrap()
         };
         let bound = json!({"mode":"full","extra_write_dirs":[],"network":true});
-        let first = Effective::first(
-            "m".to_owned(),
-            overrides(json!({"effort":"low","bound":bound,"output_schema":{},"max_steps":3})),
-        );
+        let first =
+            overrides(json!({"effort":"low","bound":bound,"output_schema":{},"max_steps":3}));
+        let planned =
+            EffectiveBound::of(first.bound.given(), first.bound.given().cloned(), "r").unwrap();
+        let first = Effective::first("m".to_owned(), first, planned);
         assert!(!first.bound_inherited);
         let second = first.inherit(overrides(json!({"effort":"high"})));
         assert_eq!(second.effort.as_deref(), Some("high"));

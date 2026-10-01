@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::capabilities::{Capabilities, ParamSupport, Support, UsageSupport, Verbs};
-use crate::plan::{CatalogModel, Category, CategoryDecl};
+use crate::plan::{Bound, CatalogModel, Category, CategoryDecl};
 
 /// A fake capability profile.
 #[derive(Clone, Debug, Deserialize)]
@@ -41,6 +41,10 @@ pub(crate) struct FakeProfile {
     /// The persistent emulation's idle close, when the scenario has one.
     #[serde(default)]
     pub(crate) idle_close: Option<IdleCloseDecl>,
+    /// The bound the route reports enforcing for any supported requested
+    /// one, when it normalizes bounds (C2 `RoutePlan.effective_bound`).
+    #[serde(default)]
+    pub(crate) normalized_bound: Option<Bound>,
 }
 
 /// The persistent emulation's idle close (decision H1, C2 §4): after turn
@@ -82,6 +86,7 @@ impl Default for FakeProfile {
             persistent: false,
             handshake: None,
             idle_close: None,
+            normalized_bound: None,
         }
     }
 }

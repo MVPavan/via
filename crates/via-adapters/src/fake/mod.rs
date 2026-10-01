@@ -147,11 +147,21 @@ impl FakeAdapter {
                 ),
             ));
         }
-        let effective_bound = req.bound.clone().filter(|_| {
-            !refusals
-                .iter()
-                .any(|r| r.kind == RefusalKind::BoundUnsupported)
-        });
+        let effective_bound = req
+            .bound
+            .clone()
+            .filter(|_| {
+                !refusals
+                    .iter()
+                    .any(|r| r.kind == RefusalKind::BoundUnsupported)
+            })
+            .map(|bound| {
+                self.fixture
+                    .profile
+                    .normalized_bound
+                    .clone()
+                    .unwrap_or(bound)
+            });
         let (inherit, switch_warning) =
             effective_inherit(&self.fixture.profile.categories, requested);
         let mut warnings = vec![Warning {
