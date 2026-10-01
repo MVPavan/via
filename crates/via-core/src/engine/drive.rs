@@ -1698,13 +1698,13 @@ impl Engine {
             // disposed from its end (r3). A vendor close has no C1 event:
             // the driver ends the connection, and the turn's end carries
             // what it did to the turn. Core routes no steer, so no steer
-            // report comes; a late terminal needs a revision write the
-            // Store does not have (decision H3). An identity was handled
-            // before attribution.
+            // report comes. An identity was handled before attribution.
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
             | Observation::VendorClosed(_)
             | Observation::SteerDelivered(_)
+            // Discarded until via-jm4.35: a late terminal's revision
+            // write is not in the Store yet.
             | Observation::LateTerminal(_) => {}
         }
     }
@@ -1860,8 +1860,8 @@ impl Engine {
     /// denial, a decline or a warning, is committed under the running
     /// turn, the one the Store admits events for; it never changes an
     /// envelope.
-    /// Non-durable ones are dropped, and so is a late terminal: the Store
-    /// has no revision write yet.
+    /// Non-durable ones are dropped, and so is a late terminal, until
+    /// via-jm4.35.
     async fn observe_other(
         &self,
         record: &mut TurnRecord,
@@ -1885,6 +1885,8 @@ impl Engine {
             | Observation::SteerDelivered(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
+            // Discarded until via-jm4.35: a late terminal's revision
+            // write is not in the Store yet.
             | Observation::LateTerminal(_) => {}
         }
     }

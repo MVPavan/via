@@ -351,6 +351,8 @@ impl Lane {
             | Observation::SteerDelivered(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
+            // Discarded until via-jm4.35: a late terminal's revision
+            // write is not in the Store yet.
             | Observation::LateTerminal(_) => return,
         };
         lock(&self.held).push_back((attributed, admitted));
