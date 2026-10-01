@@ -144,8 +144,9 @@ fn conformance_daemon_handshake_refused_is_submit_failed() -> TestResult {
 }
 
 /// (10), (11) through the daemon: a spawn naming only a model resolves its
-/// harness and the catalogued model; steer on a native profile waits for
-/// acceptance, is delivered and commits `steer.delivered`; a steer naming
+/// harness and the catalogued model; a steer on a native profile issued before
+/// acceptance is answered once accepted, delivered and commits
+/// `steer.delivered`; a steer naming
 /// another turn is `turn_mismatch`, and one on an idle session
 /// `no_active_turn`.
 #[test]
@@ -211,7 +212,11 @@ fn conformance_daemon_model_only_spawn_and_steer() -> TestResult {
             check(mismatch["error"]["data"]["kind"] == "turn_mismatch", || {
                 format!("steer naming another turn: {mismatch}")
             })?;
-            // The steer waits for acceptance on its own connection.
+            // Issued on its own connection while the gate holds the
+            // acceptance back, the steer is answered once the turn is
+            // accepted. Its entry into the acceptance wait is not observable
+            // from outside the daemon: via-core's engine unit tests prove it
+            // through the `steer_waiting` hold (Sol r1 #18).
             let reply = std::thread::scope(|scope| {
                 let steering = scope.spawn(|| {
                     Raw::open(&sandbox)?.exchange(&request(
@@ -220,10 +225,6 @@ fn conformance_daemon_model_only_spawn_and_steer() -> TestResult {
                         &json!({"session":session,"handle":HANDLE,"text":"also"}),
                     ))
                 });
-                std::thread::sleep(Duration::from_millis(200));
-                check(!steering.is_finished(), || {
-                    "steer did not wait for acceptance".to_owned()
-                })?;
                 sandbox.release_gate("submitting")?;
                 steering
                     .join()

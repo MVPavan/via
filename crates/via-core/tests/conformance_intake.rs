@@ -519,8 +519,8 @@ fn conformance_intake_model_only_spawn() {
 }
 
 /// (11) Steer on a native profile (C1 §3.4): a steer naming another turn is
-/// `turn_mismatch`; one arriving while the turn is submitting waits for
-/// acceptance, is delivered through the driver and commits
+/// `turn_mismatch`; one issued while the turn is submitting is answered
+/// once it is accepted, is delivered through the driver and commits
 /// `steer.delivered`; one whose turn fails before acceptance, and one on
 /// an idle session, are `no_active_turn`.
 #[test]
@@ -569,9 +569,10 @@ fn conformance_intake_steer_delivered_and_refused() {
                     .await
             })
         };
-        // It waits for the acceptance the gate holds back.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!steering.is_finished(), "steer did not wait for acceptance");
+        // Issued while the gate holds the acceptance back, it is answered
+        // once the turn is accepted. Its entry into the acceptance wait is
+        // not observable from here: the engine's unit tests prove it through
+        // the `steer_waiting` hold (Sol r1 #18).
         daemon.release("submitting");
         let reply = steering.await.unwrap().unwrap();
         assert_eq!(
@@ -606,8 +607,6 @@ fn conformance_intake_steer_delivered_and_refused() {
             let session = session.clone();
             tokio::spawn(async move { daemon.try_steer(&session, &json!({"text":"late"})).await })
         };
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!steering.is_finished(), "steer did not wait for acceptance");
         daemon.release("refusing");
         let error = steering.await.unwrap().unwrap_err();
         assert_eq!(error.kind, "no_active_turn", "{error:?}");

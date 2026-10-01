@@ -3573,6 +3573,108 @@ fn a_steer_in_the_submitting_window_waits_for_the_acceptance() {
     });
 }
 
+/// A workspace test build's sibling binary.
+fn sibling(name: &str) -> PathBuf {
+    let path = env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(name);
+    assert!(
+        path.is_file(),
+        "missing {}; build the workspace first",
+        path.display()
+    );
+    path
+}
+
+/// Sol r1 #18: a steer issued while its turn awaits acceptance enters the
+/// acceptance wait, observed through the `steer_waiting` hold rather than
+/// by elapsed time, and is delivered into that turn once it is accepted.
+/// The real anchor and fake agent run the turn; the agent holds its
+/// acceptance behind a gate.
+#[test]
+fn a_steer_before_acceptance_waits_and_is_delivered() {
+    let Some(root) = child("a_steer_before_acceptance_waits_and_is_delivered") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let turn = "fake-turn-1";
+    let scenario = json!({
+        "profile": {"capabilities": {
+            "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                      "steer":{"support":"native"},"cancel":{"support":"native"},
+                      "close":{"support":"native"}},
+            "params": {"instructions":unsupported,"output_schema":unsupported,
+                       "effort":unsupported,"max_steps":unsupported},
+            "bounds": [], "network_control": false, "recover": unsupported,
+            "usage": {"tokens":"turn","cost":"unavailable"}
+        }},
+        "scripts": [{"expected_request":{"type":"start","prompt":"p"},"steps":[
+            {"action":"gate","name":"submitting"},
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":turn}},
+            {"action":"expect_request","expected":{"type":"steer","id":3}},
+            {"action":"emit","message":{"type":"steer_delivered","id":3,"vendor_turn_id":turn}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":turn,
+             "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+        ]}],
+    });
+    fs::write(root.join("scenario.json"), scenario.to_string()).unwrap();
+    let sync = root.join("sync");
+    run(async {
+        let config = AdapterConfig::load(
+            BootstrapEnv::from_vars([
+                ("VIA_FAKE_AGENT_BINARY", sibling("via-fake-agent")),
+                ("VIA_FAKE_SCENARIO", root.join("scenario.json")),
+                ("VIA_FAKE_SYNC_DIR", sync.clone()),
+            ]),
+            None,
+        )
+        .unwrap();
+        let engine = Engine::open_with(
+            &root.join("state"),
+            &root.join("runtime"),
+            config,
+            sibling("via"),
+            super::DAEMON_QUEUE_LIMIT,
+            None,
+        )
+        .unwrap();
+        let session = new_session(&engine).await;
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        until(|| sync.join("submitting.entered").exists()).await;
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer enters the acceptance wait");
+        fs::write(sync.join("submitting.release"), b"").unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer returns once the turn is accepted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            json!({"turn":format!("{session}/1"),"delivery":"injected"})
+        );
+        dispatching.await.unwrap();
+        assert_eq!(steers(&engine, &session).await, [(json!(1), json!(false))]);
+    });
+}
+
 /// A steer report (C2 §4 `steer.delivered`).
 fn steered() -> via_adapters::Observation {
     via_adapters::Observation::SteerDelivered(via_adapters::observation::SteerDelivery::Injected)
