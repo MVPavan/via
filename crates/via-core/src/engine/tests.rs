@@ -5562,3 +5562,49 @@ fn a_journal_report_latches_while_a_turn_job_runs() {
         let _ = finish.send(());
     });
 }
+
+/// Critical r2 F7 (design §4 "Restart", O1.D9; runtime §7): the restart
+/// close checks the Store-failure latch under `admission` before any
+/// write of its own. A resumed lane whose driver close reports an
+/// uncertain journal write fails startup, and `Closed` is not committed.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_uncertain_journal_in_a_restart_close_fails_startup() {
+    let Some(root) = child("an_uncertain_journal_in_a_restart_close_fails_startup") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.admission_close");
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            earlier
+                .store
+                .commit_closing(via_store::ClosingRecord {
+                    session_id: session.clone(),
+                    operation: None,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        let (lane, _sender) = adopt_test_lane(&engine, &root, &session).await;
+        let (handoff, ()) = tokio::join!(engine.hand_off_queued(), async {
+            // The driver's close is done; it reports an uncertain journal.
+            until(|| acked(&points, "core.lane.admission_close", 1)).await;
+            lane.driver.report_journal_uncertain();
+            release_point(&points, "core.lane.admission_close", 1);
+        });
+        assert!(handoff.is_err(), "{handoff:?}");
+        assert!(engine.store_failed());
+        let snapshot = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.closed, "Closed was committed");
+    });
+}

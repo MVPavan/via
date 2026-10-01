@@ -451,8 +451,9 @@ impl Engine {
     /// The restart close completion (design §4): after the queued pass
     /// cancelled the session's queued turns with cause `close`, the
     /// session's lane, a resumed one's, is closed and its end awaited as
-    /// for a live close (critical r1 #3), then one bounded absence check,
-    /// then `Closed`, derived as for a live close. A lane that has not
+    /// for a live close (critical r1 #3), then the Store-failure latch is
+    /// checked (critical r2 F7), then one bounded absence check, then
+    /// `Closed`, derived as for a live close. A lane that has not
     /// ended by `bound` still owns admitted observations: the session stays
     /// `closing` (false). Any failure fails startup [O1.D9].
     pub(super) async fn finish_restart_close(
@@ -464,6 +465,19 @@ impl Engine {
         let closed = self.close_lane(session, mode, Deadline::at(bound));
         if tokio::time::timeout_at(bound, closed).await.is_err() || !self.lane_drained(session) {
             return Ok(false);
+        }
+        // Critical r2 F7 (runtime §7): a Store failure latched meanwhile,
+        // as by the lane close's uncertain journal write, is finalized under
+        // `admission` and fails startup before any write here [O1.D9].
+        {
+            let admission = self.admission.lock().await;
+            if self.store_failed() {
+                self.finish_pending(&admission);
+                return Err(format!(
+                    "store_error: closing session {session} could not be closed: \
+                     Store failure latched while its lane closed"
+                ));
+            }
         }
         // A failed proof write fails startup before `Closed` [O1.D9].
         if let Err(outcome) = self.absence_check(session, bound).await {
