@@ -2835,7 +2835,11 @@ async fn running_turn_2_with(
         .unwrap()
         .route;
     let lane = engine
-        .open_lane(&session, &route, "fake", root.to_path_buf())
+        .open_lane(
+            &session,
+            (&route, "fake", root.to_path_buf()),
+            resident(engine),
+        )
         .await;
     // `gone` is evicted by the bound's worth of later vendor turns.
     lane.map_vendor_turn("gone", turn(1));
@@ -3275,13 +3279,22 @@ async fn adopt_test_lane(
 ) {
     let (driver, reference, route) = open_test_driver(engine, root, session).await;
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    engine.adopt_lane(
-        session,
-        (driver, receiver, via_adapters::ObservationBudget::new()),
-        (reference, &route),
-    );
+    engine
+        .adopt_lane(
+            session,
+            (driver, receiver, via_adapters::ObservationBudget::new()),
+            (reference, &route),
+        )
+        .unwrap();
     let lane = super::lock(&engine.lanes).get(session).cloned().unwrap();
     (lane, sender)
+}
+
+/// A resident lane for a lane a test opens itself (runtime §8).
+fn resident(engine: &Engine) -> tokio::sync::OwnedSemaphorePermit {
+    std::sync::Arc::clone(&engine.resident)
+        .try_acquire_owned()
+        .unwrap()
 }
 
 /// A fake driver opened for `session` from its stored route, with that
@@ -3599,7 +3612,7 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, &route, "fake", root.clone())
+            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
             .await;
         assert!(!successor.failed());
         assert_eq!(
@@ -3817,7 +3830,7 @@ fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, &route, "fake", root.clone())
+            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
             .await;
         // Committed before the successor was made.
         assert_eq!(
@@ -4190,7 +4203,8 @@ fn a_dropped_replacement_leaves_the_old_lane_owning_its_work() {
             .unwrap()
             .route;
         {
-            let replacing = engine.open_lane(&session, &route, "fake", root.clone());
+            let replacing =
+                engine.open_lane(&session, (&route, "fake", root.clone()), resident(&engine));
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), replacing)
                     .await
@@ -5798,7 +5812,9 @@ fn lanes_idle_only_by_draining_come_back_to_the_bound() {
                 permit: budget.charge(10).unwrap(),
             };
             assert!(sender.try_send(item).is_ok());
-            engine.adopt_lane(&session, (driver, receiver, budget), (reference, &route));
+            engine
+                .adopt_lane(&session, (driver, receiver, budget), (reference, &route))
+                .unwrap();
             senders.push(sender);
         }
         assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 2);
@@ -5838,11 +5854,13 @@ fn lanes_idle_only_by_a_queued_cancel_come_back_to_the_bound() {
             // Queued, with no dispatcher to claim it.
             resume(&engine, &session, None).await;
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
-            engine.adopt_lane(
-                &session,
-                (driver, receiver, via_adapters::ObservationBudget::new()),
-                (reference, &route),
-            );
+            engine
+                .adopt_lane(
+                    &session,
+                    (driver, receiver, via_adapters::ObservationBudget::new()),
+                    (reference, &route),
+                )
+                .unwrap();
             senders.push(sender);
             sessions.push(session);
         }
@@ -5883,11 +5901,13 @@ fn a_spawn_slot_emptied_by_a_queued_cancel_comes_back_to_the_bound() {
             dispatch(&engine, &session).await;
             let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
-            engine.adopt_lane(
-                &session,
-                (driver, receiver, via_adapters::ObservationBudget::new()),
-                (reference, &route),
-            );
+            engine
+                .adopt_lane(
+                    &session,
+                    (driver, receiver, via_adapters::ObservationBudget::new()),
+                    (reference, &route),
+                )
+                .unwrap();
             senders.push(sender);
         }
         assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES);
@@ -5895,11 +5915,13 @@ fn a_spawn_slot_emptied_by_a_queued_cancel_comes_back_to_the_bound() {
         let session = new_session(&engine).await;
         let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
-        engine.adopt_lane(
-            &session,
-            (driver, receiver, via_adapters::ObservationBudget::new()),
-            (reference, &route),
-        );
+        engine
+            .adopt_lane(
+                &session,
+                (driver, receiver, via_adapters::ObservationBudget::new()),
+                (reference, &route),
+            )
+            .unwrap();
         senders.push(sender);
         assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 1);
         cancel(&engine, &session, 1).await.unwrap();
@@ -5913,6 +5935,124 @@ fn a_spawn_slot_emptied_by_a_queued_cancel_comes_back_to_the_bound() {
         assert!(bounded.is_ok(), "{lanes} lanes stay registered");
         assert_eq!(lanes, IDLE_LANES, "exactly the bound remains");
         drop(senders);
+    });
+}
+
+/// Critical r3 #3 (runtime §8 session lanes): resident lanes have a fixed
+/// count, lowered here to two by explicit test config. With both held, a
+/// dispatch that needs a new lane waits with its turn still queued
+/// (`core.dispatch.awaiting_lane`), and a cancel during that wait is
+/// honoured promptly; a later one waits until a lane has ended, then
+/// opens its own. The resident count never exceeds the cap.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_dispatch_past_the_resident_lanes_waits_queued() {
+    use super::lane::RESIDENT_LANES;
+    const CAP: usize = 2;
+    let Some(root) = child("a_dispatch_past_the_resident_lanes_waits_queued") else {
+        return;
+    };
+    let waiting = "core.dispatch.awaiting_lane";
+    let points = count_points(&root, &[waiting]);
+    run(async {
+        use via_adapters::CloseMode;
+        let engine = open(&root);
+        assert_eq!(
+            engine.resident.forget_permits(RESIDENT_LANES - CAP),
+            RESIDENT_LANES - CAP
+        );
+        let resident = || CAP - engine.resident.available_permits();
+        let mut senders = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..CAP {
+            // Each lane's session keeps a turn queued, undispatched: the
+            // lane is not idle, so nothing evicts it.
+            let session = new_session(&engine).await;
+            let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            engine
+                .adopt_lane(
+                    &session,
+                    (driver, receiver, via_adapters::ObservationBudget::new()),
+                    (reference, &route),
+                )
+                .unwrap();
+            senders.push(sender);
+            held.push(session);
+        }
+        assert_eq!(resident(), CAP);
+        // A dispatch past the cap waits, its turn queued; a cancel ends it.
+        let third = new_session(&engine).await;
+        let first_wait = arm_next_with(&points, waiting, &json!({"action":"delay","value":0}));
+        let (dispatched, cancelled) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(20), engine.dispatcher(third.clone())),
+            async {
+                until(|| acked(&points, waiting, first_wait) || engine.lane_census().1 > CAP).await;
+                let census = engine.lane_census();
+                let queued = engine
+                    .slot(&third)
+                    .is_some_and(|slot| slot.waiting_head(turn(1)));
+                let at = tokio::time::Instant::now();
+                let cancelled = cancel(&engine, &third, 1).await;
+                (census, queued, cancelled, at)
+            }
+        );
+        let (census, queued, cancelled, at) = cancelled;
+        assert!(
+            census.1 <= CAP,
+            "{} live lanes past the cap of {CAP}",
+            census.1
+        );
+        assert!(
+            acked(&points, waiting, first_wait),
+            "the dispatch did not wait"
+        );
+        assert!(queued, "the waiting turn left the queue");
+        assert!(cancelled.is_ok(), "{cancelled:?}");
+        assert!(dispatched.is_ok(), "the cancelled wait did not end");
+        assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+        assert!(resident() <= CAP);
+        // A later dispatch waits until a lane has ended, then opens its own.
+        let fourth = new_session(&engine).await;
+        let second_wait = arm_next_with(&points, waiting, &json!({"action":"delay","value":0}));
+        let (dispatched, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(20), engine.dispatcher(fourth.clone())),
+            async {
+                until(|| acked(&points, waiting, second_wait)).await;
+                assert!(resident() <= CAP);
+                let by = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3));
+                let _report = engine.close_lane(&held[0], CloseMode::Force, by).await;
+            }
+        );
+        assert!(dispatched.is_ok(), "the dispatch never opened its lane");
+        let result = engine
+            .result(&format!("{}/1", fourth.as_str()))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(result.get()).unwrap();
+        assert!(
+            !result["timestamps"]["submitted_at"].is_null(),
+            "the waiting turn ran: {result}"
+        );
+        assert!(resident() <= CAP);
+        drop(senders);
+    });
+}
+
+/// The default resident-lane ceiling (runtime §8): 320 daemon-wide, above
+/// the unresolved turns plus the idle lanes, and the Engine starts with
+/// every one free.
+#[test]
+fn resident_lanes_default_to_320() {
+    use super::lane::{IDLE_LANES, RESIDENT_LANES};
+    let Some(root) = child("resident_lanes_default_to_320") else {
+        return;
+    };
+    assert_eq!(RESIDENT_LANES, 320);
+    const { assert!(RESIDENT_LANES > super::journal::UNRESOLVED_LIMIT + IDLE_LANES) };
+    run(async {
+        let engine = open(&root);
+        assert_eq!(engine.resident.available_permits(), RESIDENT_LANES);
     });
 }
 

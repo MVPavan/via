@@ -35,7 +35,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
     OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
@@ -70,6 +70,13 @@ const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 /// closed, and the session's next dispatch reopens it from its stored
 /// identity ([`Engine::evict_idle`]).
 pub(super) const IDLE_LANES: usize = 32;
+
+/// Session lanes resident daemon-wide (runtime §8): each holds one from its
+/// creation until it has ended, whether serving, idle or retiring. Above
+/// the unresolved turns plus [`IDLE_LANES`], so normal work never waits; a
+/// dispatch that needs a new lane while none is free waits, its turn
+/// still queued ([`Engine::reserve_resident`]).
+pub(super) const RESIDENT_LANES: usize = 320;
 
 /// The daemon's lane use clock: each lane's last use is a tick of it, so
 /// the least recently used idle lane is the one with the oldest.
@@ -816,7 +823,12 @@ impl Lane {
     /// cancellation; and publishes the lane's end. That one completion serves every
     /// waiter: close, retirement, replacement and final shutdown. Nothing
     /// cancels the actor but the runtime's own end.
-    async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
+    async fn actor(
+        self: Arc<Self>,
+        mut inbox: Inbox,
+        (lanes, session): (Lanes, SessionId),
+        resident: OwnedSemaphorePermit,
+    ) {
         let ending = self.serve(&mut inbox).await;
         // A C1 close owns the report of the driver close it asked for or
         // took over before it started (C1 §3.6; C2 §3 idle lanes, §4.2).
@@ -886,6 +898,9 @@ impl Lane {
                 lanes.remove(&session);
             }
         }
+        // The lane has ended, its drain done: its resident lane is free
+        // (runtime §8, critical r3 #3).
+        drop(resident);
         self.changed.send_replace(());
     }
 
@@ -1247,9 +1262,8 @@ impl Engine {
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
-        route: &SessionRoute,
-        model: &str,
-        cwd: PathBuf,
+        (route, model, cwd): (&SessionRoute, &str, PathBuf),
+        resident: OwnedSemaphorePermit,
     ) -> LaneClaim {
         let replaced = lock(&self.lanes).get(session).cloned();
         let (state, budget) = match replaced {
@@ -1286,25 +1300,34 @@ impl Engine {
             session,
             ((driver, reference), (receiver, budget)),
             (state, true),
+            resident,
         );
         LaneClaim(lane)
     }
 
     /// Restart recovery's resumed driver (C2 §2 Recover) becomes the
     /// session's lane, with the channel its recovery was given on the
-    /// session's `budget`.
+    /// session's `budget`, holding a resident lane (runtime §8). Recovery
+    /// adopts at most one lane per session with a turn the earlier daemon
+    /// left unfinished, so at most `UNRESOLVED_LIMIT` (256), below
+    /// [`RESIDENT_LANES`]; none free fails startup.
     pub(super) fn adopt_lane(
         &self,
         session: &SessionId,
         (driver, receiver, budget): (SessionDriver, mpsc::Receiver<Admitted>, ObservationBudget),
         (reference, route): (SessionRef, &SessionRoute),
-    ) {
+    ) -> Result<(), String> {
+        let resident = Arc::clone(&self.resident)
+            .try_acquire_owned()
+            .map_err(|_| format!("no resident lane for recovered session {session}"))?;
         self.install_lane(
             session,
             ((driver, reference), (receiver, budget)),
             (LaneState::recovered(route), false),
+            resident,
         );
         self.evict_idle();
+        Ok(())
     }
 
     /// Makes a lane the session's, in place of any it had, and starts its
@@ -1317,6 +1340,7 @@ impl Engine {
             (mpsc::Receiver<Admitted>, ObservationBudget),
         ),
         initial: (LaneState, bool),
+        resident: OwnedSemaphorePermit,
     ) -> Arc<Lane> {
         let lane = Arc::new(Lane::new(
             opened,
@@ -1337,6 +1361,7 @@ impl Engine {
         self.tracker.spawn(Arc::clone(&lane).actor(
             Inbox(Some(receiver)),
             (Arc::clone(&self.lanes), session.clone()),
+            resident,
         ));
         lane
     }

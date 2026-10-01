@@ -125,6 +125,9 @@ pub struct Engine {
     slots: Arc<tokio::sync::Semaphore>,
     /// The pool's size: `connections.limit` (design §6.6).
     slot_limit: usize,
+    /// Resident session lanes (runtime §8, [`lane::RESIDENT_LANES`]): each
+    /// lane holds one from its creation until it has ended. FIFO waiters.
+    resident: Arc<tokio::sync::Semaphore>,
     /// Slots held for groups an earlier daemon left unproven (design §11).
     recovered: slots::RecoveredSlots,
     /// Sessions durably `closing`, or treated so after an uncertain
@@ -394,6 +397,7 @@ impl Engine {
             pending_starts: StdMutex::new(HashSet::new()),
             slots,
             slot_limit,
+            resident: Arc::new(tokio::sync::Semaphore::new(lane::RESIDENT_LANES)),
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),

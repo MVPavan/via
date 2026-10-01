@@ -391,7 +391,17 @@ impl Engine {
         // before its driver is prepared, and a failed driver is retired
         // first, so its own slot is free for its successor (C2 §2, Sol r2
         // #1). The claim is given back on every path that does not run.
-        let claim = self.claim_lane(session).await;
+        // The claimed lane, or the resident permit of the lane this
+        // dispatch opens: one that needs a new lane first waits for a
+        // resident one (runtime §8, critical r3 #3), before any connection
+        // slot, its turn still queued.
+        let claim = match self.claim_lane(session).await {
+            Some(claim) => Ok(claim),
+            None => match self.reserve_resident(slot, turn).await {
+                Some(resident) => Err(resident),
+                None => return Step::Next,
+            },
+        };
         let prepared = claim
             .as_ref()
             .map_or(Prepared::NeedsConnection, |claim| claim.driver.prepare());
@@ -464,10 +474,14 @@ impl Engine {
             .map_or_else(|| self.cwd.clone(), PathBuf::from);
         let route = submission.queued.route.clone();
         let claim = match claim {
-            Some(claim) => claim,
-            None => {
-                self.open_lane(session, &route, submission.effective.model(), cwd)
-                    .await
+            Ok(claim) => claim,
+            Err(resident) => {
+                self.open_lane(
+                    session,
+                    (&route, submission.effective.model(), cwd),
+                    resident,
+                )
+                .await
             }
         };
         self.queued.fetch_sub(1, Ordering::AcqRel);
@@ -528,22 +542,51 @@ impl Engine {
     }
 
     /// Waits for a connection slot, FIFO daemon-wide (design §3.1 capacity
-    /// wait). The acquire future stays pinned across slot wakes, so the turn
-    /// keeps its place; each wake re-checks that `turn` is still the
-    /// `Waiting` head with no close order. `None` once force is accepted or
-    /// Store failure is pending (the force signal carries both), or once the
-    /// head changed: the permit, if any, is dropped and the dispatcher
-    /// decides again.
+    /// wait; [`Self::reserve`] at `core.dispatch.awaiting_slot`).
     async fn reserve_connection(
         &self,
         slot: &Slot,
         turn: TurnNumber,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+        self.reserve(&self.slots, (slot, turn), "core.dispatch.awaiting_slot")
+            .await
+    }
+
+    /// Waits for a resident lane, FIFO daemon-wide, for a dispatch that
+    /// needs a new lane (runtime §8 session lanes, critical r3 #3): the
+    /// lane holds it until it has ended ([`Self::reserve`] at
+    /// `core.dispatch.awaiting_lane`).
+    async fn reserve_resident(
+        &self,
+        slot: &Slot,
+        turn: TurnNumber,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.reserve(&self.resident, (slot, turn), "core.dispatch.awaiting_lane")
+            .await
+    }
+
+    /// Waits for a permit of `pool`, FIFO daemon-wide, the turn still
+    /// queued (design §3.1 capacity wait). The acquire future stays pinned
+    /// across slot wakes, so the turn keeps its place; each wake re-checks
+    /// that `turn` is still the `Waiting` head with no close order (a
+    /// cancel or a close order changes it). `None` once force is accepted
+    /// or Store failure is pending (the force signal carries both), or once
+    /// the head changed: the permit, if any, is dropped and the dispatcher
+    /// decides again. Test builds: `point` acknowledges the registered
+    /// wait.
+    async fn reserve(
+        &self,
+        pool: &Arc<tokio::sync::Semaphore>,
+        (slot, turn): (&Slot, TurnNumber),
+        point: &'static str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = point;
+        if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
             return Some(permit);
         }
         let mut force = self.signal.force.subscribe();
-        let acquire = Arc::clone(&self.slots).acquire_owned();
+        let acquire = Arc::clone(pool).acquire_owned();
         tokio::pin!(acquire);
         // One poll registers the waiter in the semaphore's FIFO queue.
         tokio::select! {
@@ -553,10 +596,7 @@ impl Engine {
         }
         // The reservation is pending and registered (design §10).
         #[cfg(feature = "test-failpoints")]
-        if via_store::failpoint::hit_async("core.dispatch.awaiting_slot")
-            .await
-            .is_err()
-        {
+        if via_store::failpoint::hit_async(point).await.is_err() {
             return None;
         }
         loop {

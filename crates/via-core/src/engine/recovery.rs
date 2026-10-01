@@ -93,7 +93,7 @@ impl Engine {
                 .map_err(|error| format!("store_error: {error}"))?;
             if turns.is_empty() {
                 for (session, resumed) in resumed {
-                    Resumed::adopt(resumed, self, &session);
+                    Resumed::adopt(resumed, self, &session)?;
                 }
                 return Ok(recovered);
             }
@@ -796,12 +796,12 @@ struct Resumed {
 
 impl Resumed {
     /// Makes the driver `session`'s lane: its actor starts consuming.
-    fn adopt(self, engine: &Engine, session: &SessionId) {
+    fn adopt(self, engine: &Engine, session: &SessionId) -> Result<(), String> {
         engine.adopt_lane(
             session,
             (self.driver, self.receiver, self.budget),
             (self.reference, &self.route),
-        );
+        )
     }
 }
 
