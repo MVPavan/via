@@ -4,7 +4,7 @@
 //! uncertain cleanup. Nothing is resent: the prompt may have reached the
 //! vendor, and process exit proves neither non-submission nor inaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -74,7 +74,7 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
-        let mut asked = std::collections::HashSet::new();
+        let mut asked = HashSet::new();
         loop {
             let turns = self
                 .store
@@ -430,7 +430,7 @@ impl Engine {
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::STORE)?;
-        let facts = reconciled.facts.get(session).map_or(&[][..], Vec::as_slice);
+        let (facts, complete) = reconciled.session_facts(session);
         let budget = ObservationBudget::new();
         let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {
@@ -439,7 +439,7 @@ impl Engine {
             cancel: self.cancel.child_token(),
         };
         let reference = super::lane::session_ref(&snapshot.route);
-        let recovery = self.adapter.recover(&reference, facts, cx).await;
+        let recovery = bounded(self.adapter.recover(&reference, facts, cx).await, complete);
         #[cfg(test)]
         {
             let answer = match &recovery {
@@ -789,9 +789,12 @@ impl DurableSettlement {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
-    /// Host's reports for the anchors of each session's running turns: the
-    /// facts its adapter recovery is given (C2 §2 Recover).
+    /// Host's reports for every committed anchor of each session, one an
+    /// earlier, ended turn owns included: the facts its adapter recovery
+    /// is given (C2 §2 Recover, Sol r2 #7).
     facts: HashMap<SessionId, Vec<AnchorRecovery>>,
+    /// Sessions with a committed anchor Host returned no report for.
+    unreported: HashSet<SessionId>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
     /// The deadline stopped paging before the whole inventory was read.
@@ -807,19 +810,7 @@ impl Reconciled {
                     && report.session_id == owner.session_id
                     && report.turn == owner.turn
             });
-            if report.is_none() {
-                self.missing += 1;
-            }
-            if !owner.turn_running {
-                continue;
-            }
-            let entry = self
-                .turns
-                .entry((owner.session_id.clone(), owner.turn))
-                .or_insert((true, false));
             if let Some(report) = report {
-                entry.0 &= report.cleanup == Cleanup::Quiescent;
-                entry.1 |= report.forced;
                 self.facts
                     .entry(owner.session_id.clone())
                     .or_default()
@@ -832,10 +823,35 @@ impl Reconciled {
                         forced: report.forced,
                     });
             } else {
+                self.missing += 1;
+                self.unreported.insert(owner.session_id.clone());
+            }
+            if !owner.turn_running {
+                continue;
+            }
+            let entry = self
+                .turns
+                .entry((owner.session_id.clone(), owner.turn))
+                .or_insert((true, false));
+            if let Some(report) = report {
+                entry.0 &= report.cleanup == Cleanup::Quiescent;
+                entry.1 |= report.forced;
+            } else {
                 // An unreported anchor is never proved absent.
                 entry.0 = false;
             }
         }
+    }
+
+    /// Host's reports for every committed anchor of `session` (C2 §2
+    /// Recover), and whether they are complete: the whole inventory was
+    /// read and every anchor of the session has a report.
+    fn session_facts(&self, session: &SessionId) -> (&[AnchorRecovery], bool) {
+        let facts = self.facts.get(session).map_or(&[][..], Vec::as_slice);
+        (
+            facts,
+            !self.incomplete && !self.unreported.contains(session),
+        )
     }
 
     /// `(quiescent, forced)` for a turn. With a complete inventory and no
@@ -851,10 +867,25 @@ impl Reconciled {
     }
 }
 
+/// An adapter's recovery answer on facts that are `complete` or not:
+/// incomplete Host evidence never proves every process of the session gone
+/// (C2 §2 Recover rows, Sol r2 #7), so `Dead` becomes `Unknown`.
+fn bounded(recovery: Recovery, complete: bool) -> Recovery {
+    match recovery {
+        Recovery::Dead { .. } if !complete => Recovery::Unknown {
+            reason: "Host's evidence for the session is incomplete".to_owned(),
+        },
+        recovery @ (Recovery::Resumed(_) | Recovery::Unknown { .. } | Recovery::Dead { .. }) => {
+            recovery
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorOwner, AnchorRecovery, Cleanup, DurableSettlement, Reconciled, SessionId, TurnNumber,
+        AnchorOwner, AnchorRecovery, Cleanup, DurableSettlement, Reconciled, Recovery, SessionId,
+        TurnNumber, bounded,
     };
     use via_store::AnchorPhase;
 
@@ -958,6 +989,47 @@ mod tests {
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
         assert_eq!(reconciled.cleanup(&other, turn), (true, false));
         assert_eq!(reconciled.turns.len(), 2);
+    }
+
+    /// Sol r2 #7 (C2 §2 Recover): a session's recovery facts are Host's
+    /// reports for every committed anchor of the session, a persistent
+    /// anchor an earlier, ended turn owns included; a committed anchor
+    /// without a report, or an inventory the deadline cut, makes them
+    /// incomplete, and incomplete facts never give `Dead`.
+    #[test]
+    fn recovery_facts_cover_every_session_anchor_and_incomplete_ones_never_give_dead() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let unreported = SessionId::try_from("s_000000000001").expect("session");
+        let mut reconciled = Reconciled::default();
+        reconciled.add(
+            &[
+                owner("a1", &session, true),
+                // An earlier turn's persistent anchor survives.
+                owner("a0", &session, false),
+                owner("b1", &unreported, true),
+                owner("b0", &unreported, false),
+            ],
+            &[
+                report("a1", &session, Cleanup::Quiescent),
+                report("a0", &session, Cleanup::Uncertain),
+                report("b1", &unreported, Cleanup::Quiescent),
+            ],
+        );
+        let (facts, complete) = reconciled.session_facts(&session);
+        let mut anchors: Vec<&str> = facts.iter().map(|fact| fact.anchor_id.as_str()).collect();
+        anchors.sort_unstable();
+        assert_eq!(anchors, ["a0", "a1"]);
+        assert!(complete);
+        let (facts, complete) = reconciled.session_facts(&unreported);
+        assert_eq!(facts.len(), 1);
+        assert!(!complete, "b0 has no report");
+        let dead = || Recovery::Dead {
+            evidence: "e".to_owned(),
+        };
+        assert!(matches!(bounded(dead(), false), Recovery::Unknown { .. }));
+        assert!(matches!(bounded(dead(), true), Recovery::Dead { .. }));
+        reconciled.incomplete = true;
+        assert!(!reconciled.session_facts(&session).1, "a cut inventory");
     }
 
     /// A durable `cancel.settled` is read back as committed; a value outside
