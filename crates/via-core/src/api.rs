@@ -1930,6 +1930,54 @@ impl Warning {
         "usage_interval_unverified",
         "the reported usage covers an interval VIA could not verify",
     );
+
+    /// An adapter-reported warning as the envelope's (C1 §5: adapter
+    /// warnings "reach the envelope only as these codes"): a code of the
+    /// closed list with VIA's own message and the adapter's `data`, which
+    /// [`Self::capped`] bounds; `None` for any other code, which stays a
+    /// `warning` event only.
+    pub(crate) fn adapter(code: &str, data: Option<Value>) -> Option<Self> {
+        let (code, message) = match code {
+            "instructions_partial" => (
+                "instructions_partial",
+                "the vendor applied the turn's instructions only in part",
+            ),
+            "vendor_version_untested" => (
+                "vendor_version_untested",
+                "the vendor version is not one the adapter checked",
+            ),
+            "usage_interval_unverified" => (
+                "usage_interval_unverified",
+                Self::USAGE_INTERVAL_UNVERIFIED.message,
+            ),
+            "structured_output_missing" => (
+                "structured_output_missing",
+                "the vendor returned no structured output",
+            ),
+            "cancel_cleanup_uncertain" => (
+                "cancel_cleanup_uncertain",
+                Self::CANCEL_CLEANUP_UNCERTAIN.message,
+            ),
+            "predecessor_cleanup_uncertain" => (
+                "predecessor_cleanup_uncertain",
+                "cleanup of the session's previous process group is unconfirmed",
+            ),
+            "config_switch_unverified" => (
+                "config_switch_unverified",
+                "VIA could not apply or verify a requested inheritance setting",
+            ),
+            "deprecated" => (
+                "deprecated",
+                "the vendor reported a deprecated feature or setting",
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            code,
+            message,
+            data,
+        })
+    }
 }
 
 /// C1 §3.5/§7.4 cancel outcome with separate cleanup certainty.

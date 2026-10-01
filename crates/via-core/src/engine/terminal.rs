@@ -104,6 +104,8 @@ fn assemble(
     }
     let mut warnings = plan.warnings();
     warnings.extend(terminal.warnings);
+    // C1 §5: the turn's own adapter warnings of the closed list.
+    warnings.extend(vendor.warnings);
     if interval {
         warnings.push(Warning::USAGE_INTERVAL_UNVERIFIED);
     }
@@ -569,7 +571,11 @@ fn exit_of(evidence: &TurnEvidence) -> Option<Exit> {
 }
 
 /// A terminal with no failure yet, no text and no cancel.
-fn blank(state: &'static str, stop_reason: &'static str, exit: Option<Exit>) -> Terminal {
+pub(super) fn blank(
+    state: &'static str,
+    stop_reason: &'static str,
+    exit: Option<Exit>,
+) -> Terminal {
     Terminal {
         state,
         failure: None,

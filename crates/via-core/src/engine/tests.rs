@@ -3416,6 +3416,121 @@ fn a_between_turn_denial_followed_by_close_is_still_in_events() {
     });
 }
 
+/// S-CORE c4 r2 item 4 (C1 §5: adapter-reported warnings "reach the
+/// envelope only as these codes"): the running turn's own adapter warning
+/// whose code is in C1's closed list adds that code to the envelope's
+/// `warnings` once, with VIA's own message and the data within 4 KiB;
+/// another code, and a late one of an earlier turn, stay events only.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one turn's warnings and the envelope built from them"
+)]
+fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
+    let Some(root) = child("closed_list_adapter_warnings_reach_the_envelope_once_per_code") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let warning = |vendor_turn: &str, code: &'static str, data: Option<Value>| {
+            via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: Some(
+                    via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+                ),
+                observation: via_adapters::Observation::Warning(via_adapters::Warning {
+                    code,
+                    message: "the vendor's own words".to_owned(),
+                    data,
+                }),
+            }
+        };
+        let categories = json!({"categories":[{"category":"c","requested":"r","effective":"e"}]});
+        let queued = vec![
+            warning("fake-turn-2", "vendor_specific", None),
+            warning(
+                "fake-turn-2",
+                "config_switch_unverified",
+                Some(categories.clone()),
+            ),
+            warning(
+                "fake-turn-2",
+                "config_switch_unverified",
+                Some(json!({"second":true})),
+            ),
+            warning("fake-turn-1", "structured_output_missing", None),
+            warning(
+                "fake-turn-2",
+                "deprecated",
+                Some(json!({"big":"d".repeat(5000)})),
+            ),
+        ];
+        engine
+            .drain_queued(
+                (&slot, Some(&lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        let page = events_page(&engine, &session).await;
+        let events = page["events"].as_array().unwrap();
+        let codes: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "warning")
+            .map(|event| &event["code"])
+            .collect();
+        assert_eq!(codes.len(), 5, "every one is an event: {page}");
+        assert!(codes.contains(&&json!("vendor_specific")), "{page}");
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let envelope = super::terminal::turn_envelope(
+            (&session, record.turn),
+            super::terminal::blank("completed", "end_turn", None),
+            None,
+            (None, None),
+            (
+                crate::api::Timestamps {
+                    queued_at: at.clone(),
+                    submitted_at: None,
+                    accepted_at: None,
+                    ended_at: at,
+                },
+                None,
+            ),
+            (1, 1),
+            record.vendor.clone(),
+        );
+        let envelope = serde_json::to_value(&envelope).unwrap();
+        let adapter: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] != "vendor_version_untested")
+            .collect();
+        let listed: Vec<&Value> = adapter.iter().map(|warning| &warning["code"]).collect();
+        assert_eq!(
+            listed,
+            [&json!("config_switch_unverified"), &json!("deprecated")],
+            "{envelope}"
+        );
+        assert_eq!(adapter[0]["data"], categories, "the first one's data");
+        for warning in &adapter {
+            let message = warning["message"].as_str().unwrap();
+            assert!(!message.is_empty() && message != "the vendor's own words");
+            assert!(message.len() <= 1024);
+        }
+        assert!(
+            adapter[1].get("data").is_none(),
+            "over 4 KiB: {}",
+            adapter[1]
+        );
+    });
+}
+
 /// Sol r1 F4 (C1 §6.1, §5): adapter warnings while a turn runs commit
 /// `warning` events with their own attribution, the running turn's or an
 /// earlier turn's `late: true`, within C1 §5's caps: `message` cut to

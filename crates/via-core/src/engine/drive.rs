@@ -32,7 +32,7 @@ use super::{
 };
 use crate::api::{
     AutoDeclined, Cancel, DeniedAction, Effective, Event, EventBody, FailureClass, FinalTextFile,
-    STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, rfc3339,
+    STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, Warning, rfc3339,
 };
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
@@ -1690,10 +1690,7 @@ impl Engine {
                 let own = (Some(record.turn.get()), false);
                 self.commit_decline(record, own, decline).await;
             }
-            Observation::Warning(warning) => {
-                let own = (Some(record.turn.get()), false);
-                self.commit_warning(record, own, warning).await;
-            }
+            Observation::Warning(warning) => self.own_warning(record, warning).await,
             // C2 §4: a mismatch commits nothing itself; the turn is
             // disposed from its end (r3). A vendor close has no C1 event:
             // the driver ends the connection, and the turn's end carries
@@ -1725,21 +1722,40 @@ impl Engine {
         }
     }
 
+    /// Commits the running turn's own adapter warning; one of C1 §5's
+    /// closed list, once committed, is also its envelope's, once per code
+    /// ([`Warning::adapter`]).
+    async fn own_warning(&self, record: &mut TurnRecord, warning: via_adapters::Warning) {
+        let own = (Some(record.turn.get()), false);
+        let listed = Warning::adapter(warning.code, warning.data.clone());
+        let committed = self.commit_warning(record, own, warning).await;
+        if let (Some(_), Some(listed)) = (committed, listed)
+            && !record
+                .vendor
+                .warnings
+                .iter()
+                .any(|kept| kept.code() == listed.code())
+        {
+            record.vendor.warnings.push(listed);
+        }
+    }
+
     /// Commits an adapter-reported `warning` event attributed to `(turn,
     /// late)` (C1 §6.1), within C1 §5's caps: `message` cut to 1 KiB
-    /// encoded, `data` over 4 KiB encoded left out. Envelope warnings stay
-    /// VIA's own (C1 §5).
+    /// encoded, `data` over 4 KiB encoded left out. Its sequence once it
+    /// committed.
     async fn commit_warning(
         &self,
         record: &mut TurnRecord,
         attributed: (Option<u32>, bool),
         warning: via_adapters::Warning,
-    ) {
+    ) -> Option<u64> {
         let at = rfc3339(SystemTime::now());
         let body = EventBody::warning(warning.code, &warning.message, warning.data);
         let failed = record.first_failure.is_some();
-        journal::commit_event_as(&self.store, record, body, &at, attributed).await;
+        let seq = journal::commit_event_as(&self.store, record, body, &at, attributed).await;
         self.report_first_failure(record, failed).await;
+        seq
     }
 
     /// Commits a confirmed identity (C2 §2 delayed identity, C1 §6.1):

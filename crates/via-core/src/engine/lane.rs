@@ -32,7 +32,9 @@ use super::latch::{FailureScope, FailureSite};
 use super::progress::UsageLedger;
 use super::queue::Slot;
 use super::{Drain, Engine, lock};
-use crate::api::{AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, rfc3339};
+use crate::api::{
+    AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, Warning, rfc3339,
+};
 use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
@@ -556,6 +558,9 @@ pub(super) struct VendorRecord {
     pub(super) denied: Kept<DeniedAction>,
     /// Declines the turn committed as `vendor.request_declined`.
     pub(super) declined: Kept<AutoDeclined>,
+    /// The turn's own committed adapter warnings of C1 §5's closed list,
+    /// one per code, as its envelope's ([`Warning::adapter`]).
+    pub(super) warnings: Vec<Warning>,
     /// The handshake version of the instance that ran the turn, and
     /// whether the adapter checked it (AD7).
     pub(super) instance: Option<(Option<String>, bool)>,
