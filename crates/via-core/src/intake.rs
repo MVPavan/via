@@ -1,7 +1,7 @@
 //! The generic C1 intake (adapter design §5.1 #5–#17, #25): per-turn values
 //! with C1 P5 omission and clearing, a route's refusals as C1 errors,
-//! `describe` and `models` through the adapter set, and a session's frozen
-//! facts as its Store row holds them.
+//! `describe` and `models` through the adapter set. A session's frozen
+//! facts as its Store row holds them are [`frozen`]'s.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -11,16 +11,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
-    AdapterSet, Bound, Capabilities, DescribeRequest, Harness, Refusal, RefusalKind, RoutePlan,
-    SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
+    AdapterSet, Bound, DescribeRequest, Harness, Refusal, RefusalKind, RoutePlan, SessionRef,
+    Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
 };
-use via_store::SessionRoute;
 use via_store::json_limits::{self, Shape};
 
 use crate::api::{
-    self, ApiError, DEFAULT_IDLE_MS, DEFAULT_WALL_MS, DescribeParams, ModelsParams, Named,
-    Nullable, PerTurn, Requested, SpawnParams, Warning,
+    ApiError, DEFAULT_IDLE_MS, DEFAULT_WALL_MS, DescribeParams, ModelsParams, Named, Nullable,
+    PerTurn, SpawnParams,
 };
+
+mod frozen;
+
+pub(crate) use frozen::{Frozen, TurnPlan, c1_effective, frozen_params};
 
 /// Longest `output_schema`, encoded (C1 §4).
 const OUTPUT_SCHEMA_MAX: usize = 256 * 1024;
@@ -786,250 +789,6 @@ impl Effective {
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
         }
-    }
-}
-
-/// C1 §3.2's five `effective` members of a stored row: a queued turn's
-/// `status` entry.
-pub(crate) fn c1_effective(stored: &Value) -> Value {
-    let member = |name| stored.get(name).cloned().unwrap_or(Value::Null);
-    json!({
-        "model": member("model"),
-        "effort": member("effort"),
-        "bound": member("bound"),
-        "deadlines": member("deadlines"),
-        "max_steps": member("max_steps"),
-    })
-}
-
-/// The frozen session parameters as `sessions.params` holds them (design
-/// §11.1, adapter design §5.1 #25). The route and adapter version are the
-/// receipt's and the session's column (decision B5).
-#[derive(Deserialize, Serialize)]
-struct Params {
-    harness: String,
-    model: String,
-    cwd: Option<String>,
-    #[serde(default)]
-    allow_untested: bool,
-    /// The effective inherited-configuration states (AD13).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inherit: Option<Value>,
-    /// The categories whose effective state is not the requested one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inherit_unverified: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    vendor: VendorOptions,
-}
-
-/// A spawn's frozen `sessions.params` from its plan: its turn-1 `vendor`
-/// options are the session's.
-pub(crate) fn frozen_params(
-    planned: &Planned,
-    (params, members, cwd): (&SpawnParams, &SessionMembers, &str),
-) -> Result<Value, ApiError> {
-    let unverified = planned
-        .plan
-        .warnings
-        .iter()
-        .find(|warning| warning.code == "config_switch_unverified")
-        .and_then(|warning| warning.data.as_ref())
-        .and_then(|data| data.get("categories"))
-        .cloned();
-    serde_json::to_value(Params {
-        harness: planned.plan.harness.to_owned(),
-        model: params.model.clone(),
-        cwd: Some(cwd.to_owned()),
-        allow_untested: params.allow_untested,
-        inherit: Some(serde_json::to_value(planned.plan.inherit).map_err(|_| ApiError::STORE)?),
-        inherit_unverified: unverified,
-        instructions: members.instructions.clone(),
-        vendor: planned.effective.vendor.clone(),
-    })
-    .map_err(|_| ApiError::STORE)
-}
-
-/// A session's frozen facts, read back from its Store row (decision F12):
-/// what its plan fixed at spawn.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Frozen {
-    pub(crate) harness: String,
-    pub(crate) route: String,
-    /// The session's recorded adapter version (C1 §3.3, decision B5).
-    pub(crate) adapter_version: String,
-    /// The model as the caller requested it.
-    pub(crate) model: String,
-    pub(crate) instructions: Option<String>,
-    pub(crate) vendor: VendorOptions,
-    pub(crate) allow_untested: bool,
-    pub(crate) inherit: Option<Value>,
-    unverified: Option<Value>,
-    capabilities: Option<Capabilities>,
-}
-
-impl Frozen {
-    /// The facts of `route`, the session's Store identity; a member the row
-    /// lacks or Core cannot read stays empty, never invented.
-    pub(crate) fn of(route: &SessionRoute) -> Self {
-        let params = route
-            .params
-            .as_deref()
-            .and_then(|params| serde_json::from_str::<Params>(params).ok());
-        let capabilities = route
-            .capabilities
-            .as_deref()
-            .and_then(|capabilities| serde_json::from_str(capabilities).ok());
-        Self::from_parts(route, params, capabilities)
-    }
-
-    /// The facts of `route` for a submission (Sol r1 #14, T3 §7.3): a
-    /// frozen parameters or capabilities value that is present but cannot
-    /// be decoded is corruption, `None`; an absent one stays empty.
-    pub(crate) fn decode(route: &SessionRoute) -> Option<Self> {
-        let params = match route.params.as_deref() {
-            Some(params) => Some(serde_json::from_str::<Params>(params).ok()?),
-            None => None,
-        };
-        let capabilities = match route.capabilities.as_deref() {
-            Some(capabilities) => Some(serde_json::from_str(capabilities).ok()?),
-            None => None,
-        };
-        Some(Self::from_parts(route, params, capabilities))
-    }
-
-    fn from_parts(
-        route: &SessionRoute,
-        params: Option<Params>,
-        capabilities: Option<Capabilities>,
-    ) -> Self {
-        let mut frozen = Self {
-            harness: route.harness.clone(),
-            route: route.route.clone().unwrap_or_default(),
-            adapter_version: route.adapter_version.clone().unwrap_or_default(),
-            capabilities,
-            ..Self::default()
-        };
-        if let Some(params) = params {
-            frozen.model = params.model;
-            frozen.instructions = params.instructions;
-            frozen.vendor = params.vendor;
-            frozen.allow_untested = params.allow_untested;
-            frozen.inherit = params.inherit;
-            frozen.unverified = params.inherit_unverified;
-        }
-        frozen
-    }
-
-    /// The C2 §2 `SessionRef` of the session.
-    pub(crate) fn session_ref(&self) -> SessionRef {
-        SessionRef {
-            harness: self.harness.clone(),
-            route: self.route.clone(),
-            adapter_version: self.adapter_version.clone(),
-        }
-    }
-
-    /// The route's declared `capabilities.usage.tokens` (C1 §4.1), which
-    /// labels `status` `progress.tokens` and the envelope's `usage`.
-    pub(crate) fn token_scope(&self) -> &str {
-        self.capabilities
-            .as_ref()
-            .map_or("turn", |capabilities| capabilities.usage.tokens.as_str())
-    }
-
-    /// Whether the route's declared support of `verb` is unsupported; a
-    /// route whose capabilities are unread refuses nothing here.
-    pub(crate) fn lacks(&self, verb: Verb) -> bool {
-        self.capabilities.as_ref().is_some_and(|capabilities| {
-            matches!(capabilities.verbs.get(verb), Support::Unsupported { .. })
-        })
-    }
-
-    /// The route's declared `steer` support; none when unread.
-    pub(crate) fn steer(&self) -> Option<&Support> {
-        self.capabilities
-            .as_ref()
-            .map(|capabilities| &capabilities.verbs.steer)
-    }
-
-    /// The session's one `config_switch_unverified` warning (C1 §5, AD13),
-    /// listing every category whose effective state is not the requested
-    /// one; none when each is.
-    pub(crate) fn config_warning(&self) -> Option<Warning> {
-        self.unverified.as_ref().and_then(|categories| {
-            Warning::adapter(
-                "config_switch_unverified",
-                Some(json!({ "categories": categories })),
-            )
-        })
-    }
-}
-
-/// What a turn's envelope takes from its session's plan and its own
-/// frozen values (adapter design §5.1 #33).
-#[derive(Clone, Default)]
-pub(crate) struct TurnPlan {
-    pub(crate) frozen: Frozen,
-    /// The turn's frozen values; `None` where its writer did not read them.
-    pub(crate) effective: Option<Effective>,
-}
-
-impl TurnPlan {
-    /// The plan of a turn of the session `route`, with its stored values.
-    pub(crate) fn of(route: &SessionRoute, effective: Option<&Value>) -> Self {
-        Self {
-            frozen: Frozen::of(route),
-            effective: effective.and_then(|value| serde_json::from_value(value.clone()).ok()),
-        }
-    }
-
-    /// C1 §5 `model`: as requested at spawn, and as the turn ran it.
-    pub(crate) fn model(&self) -> Requested<String> {
-        Requested {
-            requested: self.frozen.model.clone(),
-            resolved: self.effective.as_ref().map_or_else(
-                || self.frozen.model.clone(),
-                |effective| effective.model.clone(),
-            ),
-        }
-    }
-
-    /// C1 §5 `effort`, as the turn froze it.
-    pub(crate) fn effort(&self) -> Requested<Option<String>> {
-        let effort = self
-            .effective
-            .as_ref()
-            .and_then(|effective| effective.effort.clone());
-        Requested {
-            requested: effort.clone(),
-            resolved: effort,
-        }
-    }
-
-    /// C1 §5 `bound`: the turn's requested bound, the effective one its
-    /// plan enforces, and whether they were inherited.
-    pub(crate) fn bound(&self) -> api::Bound {
-        let value =
-            |bound: Option<&Bound>| bound.and_then(|bound| serde_json::to_value(bound).ok());
-        let effective = self.effective.as_ref();
-        api::Bound {
-            requested: value(effective.and_then(Effective::requested_bound)),
-            effective: value(effective.and_then(|effective| effective.bound.as_ref())),
-            inherited: self
-                .effective
-                .as_ref()
-                .is_some_and(|effective| effective.bound_inherited),
-        }
-    }
-
-    /// C1 §5 `vendor_options`: the turn's frozen options.
-    pub(crate) fn vendor_options(&self) -> Value {
-        self.effective
-            .as_ref()
-            .and_then(|effective| serde_json::to_value(&effective.vendor).ok())
-            .unwrap_or_else(|| json!({}))
     }
 }
 
