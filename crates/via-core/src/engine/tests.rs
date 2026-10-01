@@ -5610,6 +5610,56 @@ fn an_uncertain_journal_in_a_restart_close_fails_startup() {
     });
 }
 
+/// Critical r3 #5 (runtime §7, design §4): restart close holds `admission`
+/// from its last latch check through `commit_closed`. A Store failure the
+/// lane's driver reports after the first check, while the absence check
+/// ran, fails startup and commits no `Closed`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_latch_published_before_the_restart_closed_commit_fails_startup() {
+    let Some(root) = child("a_latch_published_before_the_restart_closed_commit_fails_startup")
+    else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            earlier
+                .store
+                .commit_closing(via_store::ClosingRecord {
+                    session_id: session.clone(),
+                    operation: None,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        let (lane, _sender) = adopt_test_lane(&engine, &root, &session).await;
+        engine
+            .faults
+            .hold_before_closed
+            .store(true, Ordering::Release);
+        let (handoff, ()) = tokio::join!(engine.hand_off_queued(), async {
+            // Past the first check and the absence check, before `Closed`.
+            engine.faults.granted.notified().await;
+            lane.driver.report_journal_uncertain();
+            until(|| engine.store_failed()).await;
+            engine.faults.release.notify_one();
+        });
+        assert!(handoff.is_err(), "{handoff:?}");
+        let snapshot = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.closed, "Closed was committed");
+    });
+}
+
 /// Critical r2 F5 (runtime §8 idle session lanes): the bound is enforced
 /// whenever a lane becomes idle, its channel drained included. Lanes past
 /// the bound are adopted each holding an admitted item, so none is idle at

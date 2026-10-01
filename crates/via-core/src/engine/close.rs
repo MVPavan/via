@@ -453,14 +453,32 @@ impl Engine {
         }
     }
 
+    /// A Store failure latched before a restart close's write is finalized
+    /// under `admission` and fails startup [O1.D9].
+    fn latched_before_closed(
+        &self,
+        session: &SessionId,
+        admission: &Admission<'_>,
+    ) -> Result<(), String> {
+        if self.store_failed() {
+            self.finish_pending(admission);
+            return Err(format!(
+                "store_error: closing session {session} could not be closed: \
+                 Store failure latched while it closed"
+            ));
+        }
+        Ok(())
+    }
+
     /// The restart close completion (design §4): after the queued pass
     /// cancelled the session's queued turns with cause `close`, the
     /// session's lane, a resumed one's, is closed and its end awaited as
     /// for a live close (critical r1 #3), then the Store-failure latch is
-    /// checked (critical r2 F7), then one bounded absence check, then
-    /// `Closed`, derived as for a live close. A lane that has not
-    /// ended by `bound` still owns admitted observations: the session stays
-    /// `closing` (false). Any failure fails startup [O1.D9].
+    /// checked (critical r2 F7), then one bounded absence check, then,
+    /// under `admission` held from a second latch check through the write
+    /// (critical r3 #5), `Closed`, derived as for a live close. A lane that
+    /// has not ended by `bound` still owns admitted observations: the
+    /// session stays `closing` (false). Any failure fails startup [O1.D9].
     pub(super) async fn finish_restart_close(
         &self,
         session: &SessionId,
@@ -474,16 +492,7 @@ impl Engine {
         // Critical r2 F7 (runtime §7): a Store failure latched meanwhile,
         // as by the lane close's uncertain journal write, is finalized under
         // `admission` and fails startup before any write here [O1.D9].
-        {
-            let admission = self.admission.lock().await;
-            if self.store_failed() {
-                self.finish_pending(&admission);
-                return Err(format!(
-                    "store_error: closing session {session} could not be closed: \
-                     Store failure latched while its lane closed"
-                ));
-            }
-        }
+        self.latched_before_closed(session, &self.admission.lock().await)?;
         // A failed proof write fails startup before `Closed` [O1.D9].
         if let Err(outcome) = self.absence_check(session, bound).await {
             return Err(format!(
@@ -491,8 +500,15 @@ impl Engine {
                  an absence proof was not recorded ({outcome:?})"
             ));
         }
+        #[cfg(test)]
+        self.hold(&self.faults.hold_before_closed).await;
+        // Critical r3 #5: checked again under `admission`, held through
+        // `commit_closed`, as a live close does.
+        let admission = self.admission.lock().await;
+        self.latched_before_closed(session, &admission)?;
         let slot = self.slot_for(session);
         let closed = self.commit_closed(&slot, session, None).await;
+        drop(admission);
         drop(slot);
         self.retire(session);
         match closed {
