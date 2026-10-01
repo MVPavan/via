@@ -8,6 +8,10 @@
 #[expect(dead_code, reason = "shared support; this file uses its probe only")]
 mod daemon;
 #[path = "support/evidenced.rs"]
+#[expect(
+    dead_code,
+    reason = "shared support; this file tears down with its own one-deadline fallback"
+)]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
 #[expect(dead_code, reason = "shared support; this file uses part of it")]
@@ -23,7 +27,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -144,27 +150,22 @@ impl Sandbox {
     }
 }
 
+/// Runtime §11.2's one teardown deadline is shared: the ordinary stop and
+/// the exit wait end [`FALLBACK_SHARE`] before the kill fallback's end,
+/// which leaves [`ANCHOR_SHARE`] to `park`'s anchor cleanup.
+const FALLBACK_SHARE: Duration = Duration::from_secs(2);
+const ANCHOR_SHARE: Duration = Duration::from_secs(3);
+
 /// Every daemon the CLI auto-started is force-stopped and proved gone,
 /// then the evidence is collected (runtime §11.2). When the ordinary stop
-/// leaves a sandbox process alive, it is killed by identity and the
-/// incomplete clean stop is recorded as a cleanup failure.
+/// leaves a sandbox process alive, it is killed by identity within the
+/// fallback's share of the deadline, and the incomplete clean stop is
+/// recorded as a cleanup failure.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
             self.root.disable_cleanup(true);
-            let mut exited =
-                evidenced::stop_daemons(&self.runtime, &self.state, &self.teardown, |by| {
-                    outer_cleanup::run_within(
-                        self.command().args(["daemon", "stop", "--force", "--json"]),
-                        by,
-                    )
-                });
-            if exited.proof.is_err() {
-                let killed = kill_survivors(&self.runtime, &self.state);
-                exited.failures.push(format!(
-                    "the ordinary stop left the sandbox's daemon running; killed: {killed}"
-                ));
-            }
+            let exited = self.tear_down();
             let expected = evidenced::Expected {
                 store: self.store,
                 folders: false,
@@ -180,74 +181,277 @@ impl Drop for Sandbox {
     }
 }
 
-/// Sends `signal` to process `pid` only while it is still the process that
-/// started at `start` (clock ticks, `/proc/<pid>/stat`): its pidfd pins one
-/// process, and the start time is checked again after the pidfd is open, so
-/// a reused pid is never signalled. `false` when it is already gone.
-fn signal_identified(pid: u32, start: u64, signal: rustix::process::Signal) -> TestResult<bool> {
-    let raw = i32::try_from(pid)?;
-    let Some(target) = rustix::process::Pid::from_raw(raw) else {
-        return Err(format!("invalid pid {pid}").into());
-    };
-    let Ok(pidfd) = rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty())
-    else {
-        return Ok(false);
-    };
-    if outer_cleanup::process_stat(pid).map(|(_, now)| now) != Some(start) {
-        return Ok(false);
-    }
-    match rustix::process::pidfd_send_signal(&pidfd, signal) {
-        Ok(()) => Ok(true),
-        Err(rustix::io::Errno::SRCH) => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Whether the process `pid` that started at `start` has exited: gone, a
-/// zombie, or the pid now another process's.
-fn gone(pid: u32, start: u64) -> TestResult<bool> {
-    Ok(
-        process::exited(pid)?
-            || outer_cleanup::process_stat(pid).map(|(_, now)| now) != Some(start),
-    )
-}
-
-/// Kills the identified process `pid` (started at `start`) and waits, by a
-/// bound, until it is gone. Returns its record.
-fn kill_identified(pid: u32, start: u64) -> Value {
-    let signalled = match signal_identified(pid, start, rustix::process::Signal::KILL) {
-        Ok(signalled) => signalled,
-        Err(error) => return json!({"pid":pid,"status":"kill_failed","reason":error.to_string()}),
-    };
-    let deadline = Instant::now() + outer_cleanup::REAP * 5;
-    loop {
-        match gone(pid, start) {
-            Ok(true) => return json!({"pid":pid,"killed":signalled,"status":"gone"}),
-            Ok(false) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
+impl Sandbox {
+    /// [`evidenced::stop_daemons`]' proof with the kill fallback, all under
+    /// the teardown's one deadline.
+    fn tear_down(&self) -> evidenced::Exited {
+        let deadline = self.teardown.begin();
+        let kill_by = deadline.checked_sub(ANCHOR_SHARE).unwrap_or(deadline);
+        let stop_by = kill_by.checked_sub(FALLBACK_SHARE).unwrap_or(kill_by);
+        let scan = || evidenced::scan_processes(&self.runtime, &self.state, |path| fs::read(path));
+        let mut failures = Vec::new();
+        let mut stopped = false;
+        let mut proof = loop {
+            match scan() {
+                Ok(alive) if alive.is_empty() => break Ok(()),
+                Ok(alive) if Instant::now() >= stop_by => {
+                    break Err(format!(
+                        "sandbox processes {alive:?} did not exit after the ordinary stop"
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => break Err(error),
             }
-            Ok(false) => return json!({"pid":pid,"killed":signalled,"status":"alive"}),
-            Err(error) => {
-                return json!({"pid":pid,"killed":signalled,"status":"unknown",
-                    "reason":error.to_string()});
+            if stopped {
+                std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(stop_by)));
+            } else {
+                stopped = true;
+                let (record, failure) = outer_cleanup::run_within(
+                    self.command().args(["daemon", "stop", "--force", "--json"]),
+                    stop_by.min(Instant::now() + outer_cleanup::ORDINARY_STOP),
+                );
+                self.teardown
+                    .record(json!({"generation":"sandbox_stop","stop":record}), failure);
             }
+        };
+        if let Err(error) = &proof {
+            let killed = match scan() {
+                Ok(pids) => kill_candidates(
+                    &pids,
+                    &self.runtime,
+                    &self.state,
+                    &|path| fs::read(path),
+                    kill_by,
+                ),
+                Err(reason) => json!({"status":"scan_failed","reason":reason}),
+            };
+            failures.push(format!(
+                "the ordinary stop left the sandbox's daemon running ({error}); killed: {killed}"
+            ));
+            proof = match scan() {
+                Ok(alive) if alive.is_empty() => Ok(()),
+                Ok(alive) => Err(format!("sandbox processes {alive:?} survived the kill")),
+                Err(reason) => Err(reason),
+            };
+        }
+        if proof.is_ok() {
+            proof = locks_released(&self.runtime, &self.state, kill_by);
+        }
+        if Instant::now() > kill_by {
+            failures.push("the kill fallback overran its share of the teardown deadline".into());
+        }
+        let (_, mut recorded) = self.teardown.report();
+        recorded.extend(failures);
+        evidenced::Exited {
+            proof,
+            deadline,
+            teardown: self.teardown.summary(),
+            failures: recorded,
         }
     }
 }
 
-/// Kills every sandbox process still alive: one whose environment names
-/// the sandbox's runtime or State directory ([`evidenced::scan_processes`]),
-/// identified by its start time ([`kill_identified`]). Returns the record.
-fn kill_survivors(runtime: &Path, state: &Path) -> Value {
-    match evidenced::scan_processes(runtime, state, |path| fs::read(path)) {
-        Ok(pids) => pids
-            .into_iter()
-            .map(|pid| match outer_cleanup::process_stat(pid) {
-                Some((_, start)) => kill_identified(pid, start),
-                None => json!({"pid":pid,"status":"gone"}),
-            })
-            .collect(),
-        Err(error) => json!({"status":"scan_failed","reason":error}),
+/// Neither `daemon.lock` nor `store.lock` is still held, by `by`.
+fn locks_released(runtime: &Path, state: &Path, by: Instant) -> Result<(), String> {
+    for lock in [runtime.join("daemon.lock"), state.join("store.lock")] {
+        loop {
+            let held = match fs::File::open(&lock) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(format!("{}: {error}", lock.display())),
+                Ok(file) => file.try_lock().is_err(),
+            };
+            if !held {
+                break;
+            }
+            if Instant::now() >= by {
+                return Err(format!("{} is still held", lock.display()));
+            }
+            std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(by)));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a `/proc` read failed because the process is gone (Sol r2
+/// N4): any other failure is an observation error, never absence.
+fn vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+/// `/proc/<pid>/stat`'s pid, state and start time (clock ticks); `None`
+/// when malformed.
+fn parse_stat(bytes: &[u8]) -> Option<(u32, char, u64)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (head, rest) = text.rsplit_once(") ")?;
+    let pid = head.split_once(" (")?.0.parse().ok()?;
+    let fields: Vec<&str> = rest.split(' ').collect();
+    let state = fields.first()?.chars().next()?;
+    let start = fields.get(19)?.parse().ok()?;
+    Some((pid, state, start))
+}
+
+/// The pid the kernel reports for `pidfd` in `/proc/self/fdinfo`; `None`
+/// once its process was reaped (`Pid: -1`).
+fn pidfd_pid(pidfd: &OwnedFd) -> Result<Option<u32>, String> {
+    let path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
+    let text = fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .ok_or_else(|| format!("{path} has no Pid"))?
+        .trim();
+    if value == "-1" {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| format!("{path}: malformed Pid {value:?}"))
+}
+
+/// How the kill fallback reads `/proc`: `fs::read`, or a test's seam.
+type ProcRead<'a> = dyn Fn(&Path) -> std::io::Result<Vec<u8>> + 'a;
+
+/// A candidate process after [`pin_member`].
+enum Pinned {
+    /// A sandbox process, held by its pidfd.
+    Member(OwnedFd),
+    /// It had exited: nothing to signal.
+    Gone,
+    /// Not provably the sandbox's: never signalled.
+    Skipped(&'static str),
+}
+
+/// Pins `pid` before judging it (Sol r2 N1): opens its pidfd first, then
+/// reads its environment and stat through `read`, then confirms through
+/// the pidfd that the process is still `pid`, unreaped. A process holds
+/// its pid until it is reaped, so the reads, made between the pidfd's open
+/// and that confirmation, were of the pidfd's own process. It is the
+/// sandbox's when its environment names the sandbox's runtime or State
+/// directory, as every `via` process of the sandbox carries. Errors other
+/// than disappearance are returned, never read as absence (N4).
+fn pin_member(
+    pid: u32,
+    runtime: &Path,
+    state: &Path,
+    read: &ProcRead<'_>,
+) -> Result<Pinned, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let target = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| format!("invalid pid {pid}"))?;
+    let pidfd = match rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH) => return Ok(Pinned::Gone),
+        Err(error) => return Err(format!("pidfd_open({pid}): {error}")),
+    };
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let environ = match read(&proc.join("environ")) {
+        Ok(environ) => environ,
+        Err(error) if vanished(&error) => return Ok(Pinned::Gone),
+        Err(error) => return Err(format!("{pid} environ: {error}")),
+    };
+    let marks = [
+        [
+            b"VIA_RUNTIME_DIR=".as_slice(),
+            runtime.as_os_str().as_bytes(),
+        ]
+        .concat(),
+        [b"VIA_STATE_DIR=".as_slice(), state.as_os_str().as_bytes()].concat(),
+    ];
+    if !environ
+        .split(|byte| *byte == 0)
+        .any(|variable| marks.iter().any(|mark| variable == mark.as_slice()))
+    {
+        return Ok(Pinned::Skipped("not a sandbox process"));
+    }
+    let stat = match read(&proc.join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if vanished(&error) => return Ok(Pinned::Gone),
+        Err(error) => return Err(format!("{pid} stat: {error}")),
+    };
+    let (stat_pid, process_state, _) =
+        parse_stat(&stat).ok_or_else(|| format!("{pid} stat: malformed"))?;
+    if process_state == 'Z' {
+        return Ok(Pinned::Gone);
+    }
+    match pidfd_pid(&pidfd)? {
+        None => Ok(Pinned::Gone),
+        Some(held) if held == pid && stat_pid == pid => Ok(Pinned::Member(pidfd)),
+        Some(_) => Ok(Pinned::Skipped("its /proc data is another process's")),
+    }
+}
+
+/// Whether the pinned process `pid` has exited: reaped (its pidfd reports
+/// no pid), vanished, or a zombie. Observation errors are returned.
+fn pinned_exited(pidfd: &OwnedFd, pid: u32) -> Result<bool, String> {
+    if pidfd_pid(pidfd)?.is_none() {
+        return Ok(true);
+    }
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => parse_stat(&stat)
+            .map(|(_, state, _)| state == 'Z')
+            .ok_or_else(|| format!("{pid} stat: malformed")),
+        Err(error) if vanished(&error) => Ok(true),
+        Err(error) => Err(format!("{pid} stat: {error}")),
+    }
+}
+
+/// The kill fallback over the `candidates` a scan named, reading `/proc`
+/// through `read` (the test seam): each is pinned ([`pin_member`]), killed
+/// through its pidfd and waited for until `kill_by`, the fallback's share
+/// of the one teardown deadline. Returns one record per candidate.
+fn kill_candidates(
+    candidates: &[u32],
+    runtime: &Path,
+    state: &Path,
+    read: &ProcRead<'_>,
+    kill_by: Instant,
+) -> Value {
+    candidates
+        .iter()
+        .map(|&pid| {
+            let pidfd = match pin_member(pid, runtime, state, read) {
+                Ok(Pinned::Member(pidfd)) => pidfd,
+                Ok(Pinned::Gone) => return json!({"pid":pid,"status":"gone"}),
+                Ok(Pinned::Skipped(reason)) => {
+                    return json!({"pid":pid,"status":"skipped","reason":reason});
+                }
+                Err(reason) => return json!({"pid":pid,"status":"unknown","reason":reason}),
+            };
+            match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => {
+                    return json!({"pid":pid,"status":"kill_failed","reason":error.to_string()});
+                }
+            }
+            loop {
+                match pinned_exited(&pidfd, pid) {
+                    Ok(true) => return json!({"pid":pid,"status":"gone"}),
+                    Ok(false) if Instant::now() < kill_by => std::thread::sleep(
+                        Duration::from_millis(10).min(outer_cleanup::left(kill_by)),
+                    ),
+                    Ok(false) => return json!({"pid":pid,"status":"alive_at_deadline"}),
+                    Err(reason) => return json!({"pid":pid,"status":"unknown","reason":reason}),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Whether the process `pid` that started at `start` has exited: vanished,
+/// a zombie, or its pid now another process's. Observation errors are
+/// returned (N4).
+fn gone(pid: u32, start: u64) -> TestResult<bool> {
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(bytes) => {
+            let (_, state, began) = parse_stat(&bytes).ok_or("malformed stat")?;
+            Ok(state == 'Z' || began != start)
+        }
+        Err(error) if vanished(&error) => Ok(true),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -509,24 +713,111 @@ fn s_launch_teardown_kills_an_unresponsive_daemon() -> TestResult {
         let sandbox = Sandbox::new()?;
         let pid = auto_started(&sandbox)?;
         let (_, start) = outer_cleanup::process_stat(pid).ok_or("no daemon stat")?;
-        paused = Some((pid, start));
-        check(
-            signal_identified(pid, start, rustix::process::Signal::STOP)?,
-            || format!("daemon {pid} vanished before it was paused"),
-        )
+        paused = Some((pid, start, sandbox.runtime.clone(), sandbox.state.clone()));
+        let Pinned::Member(pidfd) = pin_member(pid, &sandbox.runtime, &sandbox.state, &|path| {
+            fs::read(path)
+        })?
+        else {
+            return Err(format!("daemon {pid} is not pinnable").into());
+        };
+        rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::STOP)?;
+        Ok(())
     });
-    let (pid, start) = paused.ok_or("the daemon was never paused")?;
+    let (pid, start, runtime, state) = paused.ok_or("the daemon was never paused")?;
     if !gone(pid, start)? {
         // Leave nothing behind, then fail.
-        let record = kill_identified(pid, start);
+        let by = Instant::now() + outer_cleanup::TEARDOWN;
+        let record = kill_candidates(&[pid], &runtime, &state, &|path| fs::read(path), by);
         return Err(format!("the paused daemon survived the teardown: {record}").into());
     }
     let error = outcome
         .err()
-        .ok_or("an incomplete clean stop passed the scenario")?;
-    check(error.to_string().contains("killed"), || {
+        .ok_or("an incomplete clean stop passed the scenario")?
+        .to_string();
+    check(error.contains("killed"), || {
         format!("the failure does not record the kill: {error}")
-    })
+    })?;
+    // Sol r2 N2: one teardown deadline, shared; the fallback leaves the
+    // anchor cleanup its time, which the artifact's cleanup.json shows.
+    let artifact = error
+        .split_once("scenario evidence: ")
+        .and_then(|(_, rest)| rest.split_once(": "))
+        .map(|(path, _)| PathBuf::from(path))
+        .ok_or_else(|| format!("no artifact named: {error}"))?;
+    let cleanup = fs::read_to_string(artifact.join("cleanup.json"))?;
+    check(
+        !error.contains("overran")
+            && !error.contains("unverified")
+            && !cleanup.contains("no time left"),
+        || format!("the fallback broke the teardown deadline: {error}\n{cleanup}"),
+    )
+}
+
+/// Kills the test's own helper children, whatever happened.
+struct Children(Vec<std::process::Child>);
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Sol r2 N1: the kill fallback signals only a process whose sandbox
+/// membership it read from that same process after pinning it with a
+/// pidfd. Through the seam, (a) a scan that names a process the sandbox
+/// did not start, and (b) reads that return another (member) process's
+/// `/proc` data for that pid, signal nothing; (c) a member is killed.
+#[test]
+fn s_launch_kill_fallback_never_signals_a_non_member() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let runtime = dir.path().join("runtime");
+    let state = dir.path().join("state");
+    let sleeper = |member: bool| {
+        let mut command = Command::new("sleep");
+        command.arg("60").env_clear();
+        if member {
+            command.env("VIA_RUNTIME_DIR", &runtime);
+        }
+        command.spawn()
+    };
+    let mut children = Children(vec![sleeper(false)?, sleeper(true)?]);
+    let (outsider, member) = (children.0[0].id(), children.0[1].id());
+    let kill_by = Instant::now() + Duration::from_secs(5);
+
+    let scanned = kill_candidates(
+        &[outsider],
+        &runtime,
+        &state,
+        &|path| fs::read(path),
+        kill_by,
+    );
+    check(children.0[0].try_wait()?.is_none(), || {
+        format!("(a) a process the sandbox did not start was signalled: {scanned}")
+    })?;
+    let member_proc = PathBuf::from(format!("/proc/{member}"));
+    let swapped = kill_candidates(
+        &[outsider],
+        &runtime,
+        &state,
+        &|path| fs::read(member_proc.join(path.file_name().unwrap_or_default())),
+        kill_by,
+    );
+    check(children.0[0].try_wait()?.is_none(), || {
+        format!("(b) another process's /proc data got the outsider signalled: {swapped}")
+    })?;
+    check(children.0[1].try_wait()?.is_none(), || {
+        format!("(b) the member was signalled: {swapped}")
+    })?;
+
+    let killed = kill_candidates(&[member], &runtime, &state, &|path| fs::read(path), kill_by);
+    let status = children.0[1].wait()?;
+    check(
+        status.signal() == Some(9) && killed[0]["status"] == "gone",
+        || format!("(c) the member was not killed: {status} {killed}"),
+    )
 }
 
 /// Sol r1 #5, runtime §11.2: a CLI run that outlives its bound is a typed
@@ -549,4 +840,43 @@ fn s_launch_cli_timeout_is_typed() -> TestResult {
             || format!("not a typed timeout: {error:?}"),
         )
     })
+}
+
+/// Sol r2 N4: an observation error is not absence. Through the seam, an
+/// unreadable environment or a malformed stat of a live sandbox process
+/// is reported `unknown`, never `gone`, and nothing is signalled.
+#[test]
+fn s_launch_kill_fallback_reports_observation_errors() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let runtime = dir.path().join("runtime");
+    let state = dir.path().join("state");
+    let mut member = Command::new("sleep");
+    member
+        .arg("60")
+        .env_clear()
+        .env("VIA_RUNTIME_DIR", &runtime);
+    let mut children = Children(vec![member.spawn()?]);
+    let pid = children.0[0].id();
+    let kill_by = Instant::now() + Duration::from_secs(5);
+    let denied = |_: &Path| -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    };
+    let malformed = |path: &Path| -> std::io::Result<Vec<u8>> {
+        if path.ends_with("stat") {
+            Ok(b"garbage".to_vec())
+        } else {
+            fs::read(path)
+        }
+    };
+    let observations: [&ProcRead<'_>; 2] = [&denied, &malformed];
+    for read in observations {
+        let record = kill_candidates(&[pid], &runtime, &state, read, kill_by);
+        check(record[0]["status"] == "unknown", || {
+            format!("an observation error was not reported unknown: {record}")
+        })?;
+        check(children.0[0].try_wait()?.is_none(), || {
+            format!("a process observed with an error was signalled: {record}")
+        })?;
+    }
+    Ok(())
 }
