@@ -198,6 +198,9 @@ pub(crate) struct DriverState {
     pub(crate) vendor_closed: bool,
     /// The session was closed.
     pub(crate) closed: bool,
+    /// Test builds: the daemon adapter's nth-retirement fault (Sol r3 N10).
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) retirement_fault: Option<Arc<crate::fake::RetirementFault>>,
 }
 
 /// The running turn's driver-side lanes.
@@ -252,6 +255,10 @@ impl SessionDriver {
     ) -> Self {
         let state = DriverState {
             identity: spec.confirmed_vendor_session_id.clone(),
+            #[cfg(feature = "test-failpoints")]
+            retirement_fault: adapter
+                .as_ref()
+                .and_then(|adapter| adapter.retirement_fault.clone()),
             ..DriverState::default()
         };
         Self {

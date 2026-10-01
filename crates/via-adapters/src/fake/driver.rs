@@ -446,22 +446,56 @@ fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
     }
 }
 
-/// Whether a persistent connection's helper retirement left its cleanup
-/// unproven (decision H1): a health failure, as no turn reports it. Test
-/// builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN=<n>` makes the daemon's
-/// `n`th launched persistent retirement unproven, as no fake profile can.
-fn retirement_uncertain(retirement: &Retirement) -> bool {
-    #[cfg(feature = "test-failpoints")]
-    if let Some(nth) = std::env::var("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        static LAUNCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        return retirement.launched
-            && LAUNCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == nth;
+/// Test builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN=<n>`, read once
+/// per daemon's adapter, makes that daemon's `n`th launched persistent
+/// retirement unproven, as no fake profile can (Sol r3 N10).
+#[cfg(feature = "test-failpoints")]
+pub(crate) struct RetirementFault {
+    nth: u64,
+    launched: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl RetirementFault {
+    fn new(nth: u64) -> Self {
+        Self {
+            nth,
+            launched: std::sync::atomic::AtomicU64::new(0),
+        }
     }
-    retirement.launched
-        && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
+
+    /// The fault the environment names, if any.
+    pub(crate) fn from_environment() -> Option<Arc<Self>> {
+        std::env::var("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|nth| Arc::new(Self::new(nth)))
+    }
+
+    /// Counts one launched retirement; true for the `n`th.
+    fn injects(&self) -> bool {
+        self.launched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+            == self.nth
+    }
+}
+
+/// Whether a persistent connection's helper retirement left its cleanup
+/// unproven (decision H1): a health failure, as no turn reports it. In
+/// test builds a [`RetirementFault`] adds its injected one; it never
+/// hides a real one (Sol r3 N10).
+fn retirement_uncertain(
+    retirement: &Retirement,
+    #[cfg(feature = "test-failpoints")] fault: Option<&RetirementFault>,
+) -> bool {
+    #[cfg(feature = "test-failpoints")]
+    let injected = retirement.launched && fault.is_some_and(RetirementFault::injects);
+    #[cfg(not(feature = "test-failpoints"))]
+    let injected = false;
+    injected
+        || retirement.launched
+            && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
 }
 
 /// One turn's route work, owned by the session's tracker.
@@ -536,7 +570,13 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
-    if persistent && retirement_uncertain(&retirement) {
+    if persistent
+        && retirement_uncertain(
+            &retirement,
+            #[cfg(feature = "test-failpoints")]
+            lock(&state).retirement_fault.as_deref(),
+        )
+    {
         latch(&health, DriverFailure::RetirementUncertain);
     }
     held(&reservation).retired(retirement);
@@ -1107,5 +1147,49 @@ async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<Rou
 async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
     if force.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-failpoints"))]
+mod tests {
+    use super::{Retirement, RetirementFault, WireCleanup, retirement_uncertain};
+
+    fn retirement(cleanup: WireCleanup) -> Retirement {
+        Retirement {
+            launched: true,
+            exit: None,
+            cleanup: Some(cleanup),
+            forced: false,
+            journal_uncertain: false,
+        }
+    }
+
+    /// Sol r3 N10: the nth-retirement fault adds its injected uncertainty
+    /// to the real one and never hides it, and each daemon's adapter
+    /// counts its own launched retirements.
+    #[test]
+    fn the_retirement_fault_adds_to_real_uncertainty_per_adapter() {
+        let fault = RetirementFault::new(2);
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Uncertain), Some(&fault)),
+            "a real uncertainty the fault does not inject stays"
+        );
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Quiescent), Some(&fault)),
+            "the second launched retirement is injected"
+        );
+        assert!(!retirement_uncertain(
+            &retirement(WireCleanup::Quiescent),
+            Some(&fault)
+        ));
+        let other = RetirementFault::new(1);
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Quiescent), Some(&other)),
+            "another daemon's adapter counts from its own first"
+        );
+        assert!(!retirement_uncertain(
+            &retirement(WireCleanup::Quiescent),
+            None
+        ));
     }
 }
