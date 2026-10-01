@@ -66,6 +66,19 @@ fn held(reservation: &Shared) -> MutexGuard<'_, Reservation> {
     reservation.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Armed while `run_turn` awaits its result: dropped armed, the future was
+/// abandoned, which latches its own first cause (C2 §2 health) before
+/// Route sees the closed hop.
+struct Abandonment<'a>(Option<&'a watch::Sender<DriverHealth>>);
+
+impl Drop for Abandonment<'_> {
+    fn drop(&mut self) {
+        if let Some(health) = self.0 {
+            latch(health, DriverFailure::TurnAbandoned);
+        }
+    }
+}
+
 /// Runs one submitted turn (C2 §4.1): per-turn values are checked before
 /// anything launches (AD18, C2 §7 item 13); then the turn's process runs
 /// through Route on a tracker-owned task while each decoded message is
@@ -149,6 +162,7 @@ pub(crate) async fn run_turn(
         vendor_closed: false,
     };
     let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
+    let mut abandonment = Abandonment(Some(&driver.health));
     let (result, rest) = deliver_beside(
         // A closed channel is the task ending without its turn, handled
         // below as an owned-task failure.
@@ -161,6 +175,7 @@ pub(crate) async fn run_turn(
         &driver.health,
     )
     .await;
+    abandonment.0 = None;
     end_active(&driver.state, turn);
     let Some(result) = result else {
         // The task ended without its turn: it failed (C2 §2 health).

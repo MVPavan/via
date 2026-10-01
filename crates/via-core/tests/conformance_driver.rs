@@ -2163,8 +2163,9 @@ fn health_fails_at_detection_with_a_stalled_consumer() {
     );
 }
 
-/// C2 §2 health: a failure after the `run_turn` future was dropped is still
-/// published by the turn's owned task.
+/// C2 §2 health: dropping the `run_turn` future before its result latches
+/// its own first cause, `TurnAbandoned`; the overflow Route then sees on
+/// the closed hop does not replace it.
 #[test]
 fn health_fails_after_the_turn_future_was_dropped() {
     let rig = Rig::new(&json!({}), &[script(1, &[accepted(1), gate("held")])]);
@@ -2188,7 +2189,7 @@ fn health_fails_after_the_turn_future_was_dropped() {
         }
         until_failed(&mut health, FIXTURE_WAIT).await
     });
-    assert!(matches!(seen, DriverHealth::Failed { .. }), "{seen:?}");
+    assert_eq!(format!("{seen:?}"), "Failed { first_cause: TurnAbandoned }");
 }
 
 /// C2 §2 health: the persistent server's loss and a resume mismatch each
@@ -2390,4 +2391,72 @@ fn a_persistent_daemon_force_reports_host_facts() {
     );
     assert!(failure.forced, "{end:?}");
     assert!(failure.exit.is_some(), "{end:?}");
+}
+
+/// AD16 (persistent profile): a pinned turn 2 whose final delivery fails
+/// invalidates the pin at once, but the committed slot stays with its
+/// helper's retirement until the helper is gone.
+#[test]
+fn a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement() {
+    if rerun_with_short_stall("a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement")
+    {
+        return;
+    }
+    let text = json!({"type":"text","vendor_turn_id":vendor_turn(2)}).to_string() + "\n";
+    let rig = Rig::new(
+        &persistent(),
+        &[
+            script(1, &[accepted(1), terminal(1, "completed", "end_turn")]),
+            script(
+                2,
+                &[
+                    json!({"action":"report_pids"}),
+                    accepted(2),
+                    json!({"action":"flood","text":text,"count":OBSERVATION_ITEMS}),
+                    terminal(2, "completed", "end_turn"),
+                    gate("after"),
+                ],
+            ),
+        ],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let pinned = driver.prepare();
+    assert!(matches!(pinned, Prepared::Pinned(_)));
+    // Core stops draining: turn 2's delivery stalls.
+    let (cx, _second) = turn_cx(2, pinned, WALL);
+    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    assert!(
+        matches!(
+            failure(&end).cause,
+            TurnCause::Route(RouteError::Overflow { .. })
+        ),
+        "{end:?}"
+    );
+    assert!(
+        matches!(driver.prepare(), Prepared::NeedsConnection),
+        "the pin is invalid at once"
+    );
+    let pid = fs::read_to_string(rig.sync().join("agent.pid")).unwrap();
+    let helper = PathBuf::from(format!("/proc/{pid}"));
+    // Only the lowered stall fails the delivery while the helper still
+    // retires; with 10 s it has long retired.
+    if cfg!(feature = "test-failpoints") {
+        assert!(helper.exists(), "the helper is still retiring");
+    }
+    let released = controls.released();
+    assert!(
+        !released || !helper.exists(),
+        "the slot stays while the helper lives"
+    );
+    rig.runtime.block_on(async {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !controls.released() && tokio::time::Instant::now() < by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    assert!(controls.released(), "released once the helper retired");
+    assert!(!helper.exists(), "the helper is gone");
 }

@@ -137,6 +137,8 @@ pub enum DriverFailure {
     ObservationOverflow,
     /// A task the driver owns ended without its result.
     OwnedTask,
+    /// The `run_turn` future was dropped before its result.
+    TurnAbandoned,
     /// Host confirmed the persistent connection's server died.
     ServerLost,
     /// The vendor returned another session than the one VIA continues.

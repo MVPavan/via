@@ -533,14 +533,16 @@ impl Reservation {
     }
 
     /// The logical turn ended its connection, or the Adapter could not
-    /// deliver it: the generation is invalid now; the uncommitted slot goes
-    /// with the reservation.
-    pub(crate) fn release(&self) {
+    /// deliver it: the generation is invalid now; its slot, the session's
+    /// committed one included, goes with the reservation, after the
+    /// process's retirement.
+    pub(crate) fn release(&mut self) {
         self.invalidate();
     }
 
-    fn invalidate(&self) {
-        let released = {
+    /// Invalidates the generation and takes over its committed slot.
+    fn invalidate(&mut self) {
+        let committed = {
             let mut state = lock(&self.state);
             if state.generation == self.generation {
                 state.live = false;
@@ -549,7 +551,9 @@ impl Reservation {
                 None
             }
         };
-        drop(released);
+        if committed.is_some() {
+            self.slot = committed;
+        }
     }
 
     /// Records the turn's process retirement for a later close. A session
@@ -570,8 +574,8 @@ impl Reservation {
 }
 
 impl Drop for Reservation {
-    /// Uncommitted, the generation is invalidated; the slot is released
-    /// with the reservation's fields.
+    /// Uncommitted, the generation is invalidated; the slot it holds is
+    /// released with the reservation's fields.
     fn drop(&mut self) {
         if !self.committed {
             self.invalidate();
