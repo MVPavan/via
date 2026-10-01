@@ -523,7 +523,12 @@ fn item_cost(item: &ObservationItem) -> usize {
         lengths.push(vendor_turn.as_str().len());
     }
     match &item.observation {
-        Observation::Accepted(_) => {}
+        // The acceptance keeps its own copy of the vendor turn ID.
+        Observation::Accepted(acceptance) => {
+            if let Some(vendor_turn_id) = &acceptance.vendor_turn_id {
+                lengths.push(vendor_turn_id.as_str().len());
+            }
+        }
         Observation::SteerDelivered(delivery) => match delivery {
             SteerDelivery::Injected => {}
             SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
@@ -721,5 +726,15 @@ mod tests {
             })
         };
         assert!(cost(late(&"b".repeat(1024))) >= cost(late("")) + 4 * 1024);
+
+        // Critical r1 #13: the acceptance keeps its own copy of the ID.
+        let accepted = |id: Option<&str>| {
+            Observation::Accepted(super::Acceptance {
+                correlation: crate::AcceptanceToken::FIRST,
+                vendor_turn_id: id.map(|id| crate::VendorTurnId::try_from(id.to_owned()).unwrap()),
+            })
+        };
+        let id = "i".repeat(4096);
+        assert!(cost(accepted(Some(&id))) >= cost(accepted(None)) + 4096);
     }
 }
