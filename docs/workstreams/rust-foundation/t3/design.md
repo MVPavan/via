@@ -538,6 +538,14 @@ state: "closed", cancelled_turns: [address], cleanup}`.
 Then subscribe to the slot's close watch, still under `admission`; release
 `admission`; and await it [r4.6].
 
+**Idle-lane retirement** (S-CORE chunk 4; C2 §3, idle lanes; C1 §3.6). A
+close order that finds the session's idle lane retiring joins that driver
+close. Before the driver close starts, the order's mode and deadline
+replace the retirement's, and the close owns its report. After it starts,
+the close waits for the retirement's end: the driver close (3 s) and then
+the drain, which no `Closed` precedes. A later forcing close has no turn to
+escalate.
+
 **Dispatcher step.** Once the force and latch checks are done, a slot with a close order is handled before any other decision:
 
 1. Every `Waiting` entry becomes `Cancelling{dispatcher}` and is cancelled
@@ -603,7 +611,9 @@ Then subscribe to the slot's close watch, still under `admission`; release
     enqueueing them.
   - After the queued pass it pages closing sessions and commits `Closed`
     for each, with the same derivation and a bounded absence check under
-    the startup deadline.
+    the startup deadline. A resumed lane is closed and its drain awaited
+    first, as in a live close; a lane whose drain does not finish keeps
+    the session `closing` for a later recovery.
   - A write failure here fails startup [O1.D9]. This includes a failed or
     uncertain absence-proof write in that bounded check; ordinary unproved
     absence stays `cleanup: uncertain` [t3r.2].

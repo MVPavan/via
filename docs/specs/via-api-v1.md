@@ -304,6 +304,12 @@ leftovers}`; `leftovers` (§5) is always present and non-null only when this
 close stopped the session's server, where a keyed replay returns the stored
 report; otherwise `null`.
 Idempotent; a second `close` during closing waits for the first. A close
+that finds Core retiring the session's idle lane (C2 §3, idle lanes) takes
+that driver close over with its own mode and deadline if it has not
+started. Otherwise it waits for the retirement to end: the driver close,
+bounded by 3 s, then the lane's drain, which can outlast this close's own
+deadline. That driver close belongs to no C1 close, so `leftovers` is
+`null`. A close
 whose `session.closed` commit is refused a second time because turns of the
 session are unfinished replies `admission_refused` ([Task 3 design](../workstreams/rust-foundation/t3/design.md) §4 step 6).
 

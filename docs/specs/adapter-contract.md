@@ -167,6 +167,7 @@ impl SessionDriver {
     pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError>;
     pub async fn close(&self, mode: CloseMode, deadline: Deadline) -> CloseReport;
     pub fn health(&self) -> watch::Receiver<DriverHealth>;
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool>; // sticky: a journal write outside any turn was uncertain
 }
 pub enum Prepared { Pinned(ConnectionPin), NeedsConnection }
 pub struct TurnCx { pub turn: TurnNumber, pub prepared: Prepared, pub capacity: Option<CapacityToken>,
@@ -206,7 +207,7 @@ pub struct VendorIdentity {
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
 | `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict\|InvalidParam { field }\|MissingCapability { verb }`, `message`, `verb: Option<Verb>`, `route` (every refusal) |
 | `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts, plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence: `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
-| `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
+| `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it. An uncertain journal write is also published on the sticky `journal_uncertain()` watch, whatever the first cause, and Core latches Store failure on it, runtime §7), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
 | `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(VendorCode, String)`, `SessionGone`, `Protocol(String)` |
 
 Contract points:
@@ -275,7 +276,13 @@ Contract points:
   ones become session-level (`turn: null`) only when genuinely unseen.
   Previously accepted vendor IDs retain bounded tombstones so late traffic
   never becomes another session's or a null-turn event. Codex Route also
-  keys ownership by connection generation, thread and turn IDs.
+  keys ownership by connection generation, thread and turn IDs. The
+  channel is ordered across a session's connection generations: a driver
+  admits a new generation's first observation only after the previous
+  generation's last, so a new generation may take a vendor turn ID an older
+  one used, and the older generation's traffic for it is already handled.
+  A turn waiting on that barrier has not launched: a stop or force order
+  ends it there, as before any launch.
 - **Interrupt** is an S1 stop order. The adapter runs the vendor's soft stop
   (§6.2) and reports `Acknowledged` only on vendor evidence; the turn's
   `TurnEnd` carries the outcome and `Cleanup` (§4.1). Cleanup keeps its
@@ -366,6 +373,17 @@ grant:
 Idle retirement releases the slot. Codex: the last lease released. OpenCode:
 the route's idle policy, defined in `via-4sw.3.2` within runtime §8.
 
+**Idle lanes.** To bound resident sessions (runtime §8), Core may close an
+idle session's driver gracefully: no turn running or queued, and its
+observation channel drained. That is not a session close: it commits no
+session-close or eviction event (durable observations admitted meanwhile
+still commit as the lane drains), and the next dispatch opens a new driver
+from the stored identity, as after a restart. A C1 `close` that arrives
+during an eviction joins it (C1 §3.6). Before the driver close starts, the
+C1 close takes it over: its mode and deadline apply, and its report goes
+to that close (§4.2). After, the C1 close waits for it; that driver close
+stays an idle-lane close.
+
 ## 4. Observations and ordering
 
 `Observation` = the C1 event payloads Core commits (`action.denied`,
@@ -387,7 +405,9 @@ terminal is not an observation: it is retained in the turn's `TurnEnd`
 
 Each observation carries `at: Instant` (Core records wall time).
 Ordering (D4): per session, the order the driver
-decoded them; none across sessions. `class_hint` is a suggestion from the
+decoded them, across all of the driver's producers, with `at` never
+earlier than the previous observation's (Core times idle progress by it,
+runtime §8); none across sessions. `class_hint` is a suggestion from the
 vendor code table (§6); Core applies C1 §7.6 precedence (cancel evidence
 before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure
@@ -512,7 +532,7 @@ the full scan rules.
 | Aspect | Rule |
 |---|---|
 | Destinations | Only where an existing surface ends the connection synchronously. (1) Per-turn routes (Claude, fake): the turn envelope; the report completes before the terminal commits. (2) A C1 `close` that stops the server (OpenCode's dispose): that close result and `session.closed`, persisted atomically with the close by Store `commit_closed` (in the event, `close_result` and the operation result), so a keyed replay returns the same report. A Codex C1 close only unsubscribes: `null`. (3) Server lost with turns in flight: one report, completed before the loss reaches any turn; the same snapshot (`scope: server`; on Codex it may list other sessions' processes) goes on every `server_lost` turn. One report per connection generation; a turn spans at most one (§3 connection admission). |
-| Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle policy); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
+| Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle policy); Core's idle-lane close that no C1 close took over (§3); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
 | Carried by | Host `CloseReport.leftovers` → Wire `WireCloseReport` → Route result (the shared runtime and each server route's close and loss paths) → Adapter `TurnEnd.leftovers` or driver `CloseReport.leftovers` (§2) → Core envelope, close result and `session.closed` (Store `commit_closed`). Recovery carries none. |
 | Trigger | After Host's close of the connection completes, within its existing bound (unchanged); the report is ready before its destination commits. |
 | Detection | Host sets a random `VIA_PROCESS_MARKER` in every vendor environment; children inherit it. The scan lists same-uid processes started at or after the vendor (start bound from the anchor's `Spawned {pid, start_ticks}`) whose environment holds the exact marker entry, reading each through one `/proc/<pid>` descriptor with start-tick, uid and state rechecks and a 256 KiB environment cap. Bound: `min(close_by, scan_started + 1 s)`, one scanner task per report (runtime §5, §8). |
