@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
 use crate::driver::{
-    Active, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx, TurnSpec, latch,
-    lock, rejected,
+    Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx,
+    TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::observation::{
@@ -114,7 +114,7 @@ pub(crate) async fn run_turn(
     let first = matches!(prepared, Prepared::NeedsConnection);
     let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let connected = driver.connect((prepared, capacity), ordered).await;
-    let (generation, capacity, reservation) = match connected {
+    let (generation, capacity, reservation, delivering) = match connected {
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
@@ -196,7 +196,7 @@ pub(crate) async fn run_turn(
     after_persistent_turn(
         driver,
         adapter,
-        (turn, generation),
+        (turn, generation, delivering),
         &end,
         normalizer.vendor_closed,
     );
@@ -323,14 +323,16 @@ async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Dead
 
 /// The persistent profile after a turn returned: a vendor close in the
 /// turn ends its connection, and the scenario's idle close starts now.
-/// Nothing on the per-turn profile.
+/// Nothing on the per-turn profile. The turn's last delivery is done: it
+/// no longer holds off an idle close (`delivering`, C2 D4).
 fn after_persistent_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
-    (turn, generation): (crate::TurnNumber, u64),
+    (turn, generation, delivering): (crate::TurnNumber, u64, Delivering),
     end: &TurnEnd,
     vendor_closed: bool,
 ) {
+    drop(delivering);
     if !adapter.profile().persistent {
         return;
     }
@@ -699,8 +701,9 @@ fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
 /// scenario's gate `release` exists, the emulated server closes its idle
 /// session: the slot is released, the pin invalidated, and a session-level
 /// `VendorClosed` sent; one the channel does not take latches `overflow`.
-/// Started only after the turn before it returned; a later connection or
-/// the session's cancellation ends it. It holds the generation barrier
+/// Started only after the turn before it returned; a later connection, a
+/// turn holding the connection when it decides, or the session's
+/// cancellation ends it. It holds the generation barrier
 /// from its check until its item was delivered or given up, so the next
 /// connection's first observation follows it.
 async fn idle_source(
@@ -727,12 +730,25 @@ async fn idle_source(
     };
     let released = {
         let mut state = lock(&state);
-        if state.generation != generation || !state.live || state.closed {
-            return;
+        // Never during a turn (C2 D4): a vendor does not idle-close a
+        // session it is serving, and the turn's observations stay in order.
+        if state.generation != generation
+            || !state.live
+            || state.closed
+            || state.delivering.is_some()
+        {
+            None
+        } else {
+            state.live = false;
+            state.vendor_closed = true;
+            Some(state.capacity.take())
         }
-        state.live = false;
-        state.vendor_closed = true;
-        state.capacity.take()
+    };
+    // Test builds: the idle close decided whether to close.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.idle_decided").await;
+    let Some(released) = released else {
+        return;
     };
     drop(released);
     let closed = ObservationItem {
@@ -1166,6 +1182,9 @@ async fn send_all(
     sink: ObservationSink,
     stall: Duration,
 ) -> Result<(), Undelivered> {
+    // Test builds: one message's items are stamped, not yet delivered.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.stamped").await;
     for item in items {
         sink.send(item, stall).await?;
     }

@@ -198,9 +198,25 @@ pub(crate) struct DriverState {
     pub(crate) vendor_closed: bool,
     /// The session was closed.
     pub(crate) closed: bool,
+    /// The generation a turn holds and may still deliver on
+    /// ([`Delivering`]).
+    pub(crate) delivering: Option<u64>,
     /// Test builds: the daemon adapter's nth-retirement fault (Sol r3 N10).
     #[cfg(feature = "test-failpoints")]
     pub(crate) retirement_fault: Option<Arc<crate::fake::RetirementFault>>,
+}
+
+/// A turn that took the connection and may still deliver (C2 D4): set
+/// under the state lock that pinning takes ([`SessionDriver::connect`]),
+/// cleared when its `run_turn` returns or is dropped. The persistent idle
+/// close never runs meanwhile, so the turn's observations and the idle
+/// close's never interleave out of decode order.
+pub(crate) struct Delivering(Arc<Mutex<DriverState>>);
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        lock(&self.0).delivering = None;
+    }
 }
 
 /// The running turn's driver-side lanes.
@@ -344,7 +360,7 @@ impl SessionDriver {
         &self,
         (prepared, capacity): (Prepared, Option<CapacityToken>),
         ordered: impl Future<Output = ()>,
-    ) -> Result<(u64, Option<CapacityToken>, Reservation), AdapterError> {
+    ) -> Result<(u64, Option<CapacityToken>, Reservation, Delivering), AdapterError> {
         let _barrier = match prepared {
             Prepared::NeedsConnection => {
                 // Test builds: `adapter.connection.barrier_wait` acknowledges
@@ -373,11 +389,18 @@ impl SessionDriver {
             persistent,
             committed: false,
         };
+        let delivering = || Delivering(Arc::clone(&self.state));
         match prepared {
             Prepared::Pinned(pin)
                 if persistent && state.live && pin.generation == state.generation =>
             {
-                Ok((state.generation, None, reservation(state.generation, None)))
+                state.delivering = Some(state.generation);
+                Ok((
+                    state.generation,
+                    None,
+                    reservation(state.generation, None),
+                    delivering(),
+                ))
             }
             // The pinned connection died before submission: nothing sent.
             Prepared::Pinned(_) => Err(session_gone()),
@@ -385,15 +408,26 @@ impl SessionDriver {
                 state.generation += 1;
                 state.live = false;
                 state.vendor_closed = false;
+                state.delivering = Some(state.generation);
                 let generation = state.generation;
                 // A new connection replaces the earlier one, whose slot goes.
                 let replaced = state.capacity.take();
                 drop(state);
                 drop(replaced);
                 if persistent {
-                    Ok((generation, None, reservation(generation, capacity)))
+                    Ok((
+                        generation,
+                        None,
+                        reservation(generation, capacity),
+                        delivering(),
+                    ))
                 } else {
-                    Ok((generation, capacity, reservation(generation, None)))
+                    Ok((
+                        generation,
+                        capacity,
+                        reservation(generation, None),
+                        delivering(),
+                    ))
                 }
             }
         }

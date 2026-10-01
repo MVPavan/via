@@ -2560,6 +2560,61 @@ fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
     );
 }
 
+/// C2 D4 (persistent profile): a session's observations reach the channel
+/// in decode order across all of the driver's producers, `at` never
+/// earlier than the previous one's. A pinned turn's progress is stamped and
+/// held before its delivery (`adapter.fake.stamped`) while the scenario's
+/// idle close is released and decides (`adapter.fake.idle_decided`): the
+/// idle close never runs during a turn, so nothing overtakes the progress.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_pinned_turns_stamped_progress_is_not_overtaken_by_the_idle_close() {
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    let text = emit(&json!({"type":"text","vendor_turn_id":vendor_turn(2)}));
+    let rig = Rig::new(
+        &profile,
+        &[
+            script(1, &[accepted(1), terminal(1, "completed", "end_turn")]),
+            script(
+                2,
+                &[accepted(2), text, terminal(2, "completed", "end_turn")],
+            ),
+        ],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _first) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    // Counted from here: turn 2's second message, its progress, is held.
+    let points = rig.points();
+    let held = json!({"token":POINTS_TOKEN,"occurrence":2,"action":"pause"});
+    fs::write(points.join("adapter.fake.stamped.json"), held.to_string()).unwrap();
+    acknowledge(&points, "adapter.fake.idle_decided");
+    let pin = driver.prepare();
+    assert!(matches!(pin, Prepared::Pinned(_)));
+    let (cx, _second) = turn_cx(2, pin, WALL);
+    let sync = rig.sync();
+    let (end, items, ()) = rig.run_beside(&driver, &mut receiver, (prompt(), cx), |_| {
+        let points = points.clone();
+        async move {
+            until_file(points.join("adapter.fake.stamped.2.ack")).await;
+            release(&sync, "idle");
+            until_file(points.join("adapter.fake.idle_decided.1.ack")).await;
+            fs::write(points.join("adapter.fake.stamped.2.release"), b"").unwrap();
+        }
+    });
+    assert!(
+        items.windows(2).all(|pair| pair[0].at <= pair[1].at),
+        "out of decode order: {:?}",
+        items
+            .iter()
+            .map(|item| (&item.observation, item.at))
+            .collect::<Vec<_>>()
+    );
+    assert!(end.outcome.is_ok(), "{end:?}");
+}
+
 /// C2 §4 generation barrier: a turn waiting on it has not launched, so a
 /// stop, the daemon force or its wall (turn `wall`) ends it there as before
 /// any launch, promptly and well within the stall bound that holds the old
