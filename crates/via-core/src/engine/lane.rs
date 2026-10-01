@@ -373,6 +373,12 @@ pub(super) fn session_ref(route: &SessionRoute) -> SessionRef {
 }
 
 /// A vendor turn ID's tombstone: its 64-bit hash, the same in every lane.
+///
+/// Accepted limit (critical r1 #14): a tombstone keeps only this fixed-key
+/// 64-bit SipHash, not the ID. Two distinct IDs with one hash would be one
+/// tombstone; within the bounded set ([`TOMBSTONES`]) such a collision is
+/// negligible, and vendor turn IDs are vendor-generated, never chosen by
+/// the model.
 fn tombstone_of(vendor_turn: &str) -> u64 {
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
     BuildHasherDefault::<DefaultHasher>::default().hash_one(vendor_turn)
