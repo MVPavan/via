@@ -982,3 +982,44 @@ fn replay_trailing_input_after_the_last_expect_fails() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn replay_await_eof_fails_on_a_partial_line() -> TestResult {
+    // Held open, the partial line is never a line, so the run deadline ends the wait.
+    let steps = json!([{"await_eof": {}}, {"emit": {"line": "done"}}]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 1_000, &steps))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.stdin.as_mut().ok_or("stdin closed")?.write_all(b"{")?;
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+
+    // Closed after it, the partial line fails at EOF.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.stdin.as_mut().ok_or("stdin closed")?.write_all(b"{")?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
+fn replay_concurrent_starts_each_log_one_launch() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &json!([])))?;
+    let runs = (0..8)
+        .map(|_| spawn::<&str>(&binary, &[]))
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut pids: Vec<String> = runs.iter().map(|run| run.child.id().to_string()).collect();
+    for run in runs {
+        assert_eq!(run.finish(true)?.code, Some(0));
+    }
+    let log = fs::read_to_string(root.path().join("vendor.launches"))?;
+    assert!(log.ends_with('\n'), "{log:?}");
+    let mut logged: Vec<String> = log.lines().map(str::to_owned).collect();
+    pids.sort();
+    logged.sort();
+    assert_eq!(logged, pids);
+    Ok(())
+}
