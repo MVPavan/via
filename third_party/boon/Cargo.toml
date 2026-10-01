@@ -44,6 +44,10 @@ name = "bench"
 path = "benches/bench.rs"
 harness = false
 
+# VIA patch: upstream's elided-lifetime style, warned by newer toolchains.
+[lints.rust]
+mismatched_lifetime_syntaxes = "allow"
+
 [dependencies.ahash]
 version = "0.8.3"
 

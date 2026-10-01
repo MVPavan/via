@@ -9,6 +9,7 @@ use url::Url;
 
 pub(crate) struct Roots {
     pub(crate) default_draft: &'static Draft,
+    pub(crate) required_draft: Option<&'static Draft>, // VIA patch
     map: HashMap<Url, Root>,
     pub(crate) loader: DefaultUrlLoader,
 }
@@ -17,6 +18,7 @@ impl Roots {
     fn new() -> Self {
         Self {
             default_draft: latest(),
+            required_draft: None,
             map: Default::default(),
             loader: DefaultUrlLoader::new(),
         }
@@ -50,6 +52,9 @@ impl Roots {
         if !root.draft.is_subschema(up.ptr.as_str()) {
             let doc = self.loader.load(&root.url)?;
             let v = up.ptr.lookup(doc, &up.url)?;
+            if let Some(required) = self.required_draft {
+                required.require(v)?;
+            }
             root.draft.validate(up, v)?;
             root.add_subschema(doc, &up.ptr)?;
         }
@@ -76,6 +81,12 @@ impl Roots {
             self.loader
                 .get_draft(&up, doc, self.default_draft, HashSet::new())?
         };
+        if let Some(required) = self.required_draft {
+            if draft.version != required.version {
+                return Err(CompileError::UnsupportedDraft { url: url.into() });
+            }
+            required.require(doc)?;
+        }
         let vocabs = self.loader.get_meta_vocabs(doc, draft)?;
         let resources = {
             let mut m = HashMap::default();

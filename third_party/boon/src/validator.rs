@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp::min, collections::HashSet, fmt::Write};
+use std::{borrow::Cow, cell::Cell, cmp::min, collections::HashSet, fmt::Write};
 
 use serde_json::{Map, Value};
 
@@ -16,15 +16,81 @@ macro_rules! item {
     };
 }
 
+// VIA patch: a work budget shared by every evaluation of one validation.
+/// The work budget of one validation (VIA patch, `VIA-PATCH.md`): one unit
+/// per subschema evaluation, units in proportion to the work of `enum`,
+/// `const`, `uniqueItems`, `pattern` and `patternProperties`, and a cap on
+/// the evaluation depth. Once spent, every pending evaluation returns at
+/// once and no further errors are built.
+pub(crate) struct Budget {
+    left: Cell<u64>,
+    max_depth: usize,
+    spent: Cell<bool>,
+}
+
+impl Budget {
+    pub(crate) fn new(units: u64, max_depth: usize) -> Self {
+        Self {
+            left: Cell::new(units),
+            max_depth,
+            spent: Cell::new(false),
+        }
+    }
+
+    fn unlimited() -> Self {
+        Self::new(u64::MAX, usize::MAX)
+    }
+
+    /// Takes `units`; false, and spent, when fewer are left.
+    pub(crate) fn charge(&self, units: u64) -> bool {
+        if self.spent.get() {
+            return false;
+        }
+        match self.left.get().checked_sub(units) {
+            Some(left) => {
+                self.left.set(left);
+                true
+            }
+            None => {
+                self.exhaust();
+                false
+            }
+        }
+    }
+
+    pub(crate) fn exhaust(&self) {
+        self.left.set(0);
+        self.spent.set(true);
+    }
+
+    pub(crate) fn spent(&self) -> bool {
+        self.spent.get()
+    }
+}
+
 pub(crate) fn validate<'s, 'v>(
     v: &'v Value,
     schema: &'s Schema,
     schemas: &'s Schemas,
 ) -> Result<(), ValidationError<'s, 'v>> {
+    validate_within(v, schema, schemas, &Budget::unlimited(), false)
+}
+
+// VIA patch: `validate` with a caller's budget; `bool_result` asks only
+// whether `v` is valid, so no error detail is built.
+pub(crate) fn validate_within<'s, 'v>(
+    v: &'v Value,
+    schema: &'s Schema,
+    schemas: &'s Schemas,
+    budget: &Budget,
+    bool_result: bool,
+) -> Result<(), ValidationError<'s, 'v>> {
     let scope = Scope {
         sch: schema.idx,
         ref_kw: None,
         vid: 0,
+        depth: 0,
+        run: 0,
         parent: None,
     };
     let mut vloc = Vec::with_capacity(8);
@@ -36,7 +102,8 @@ pub(crate) fn validate<'s, 'v>(
         scope,
         uneval: Uneval::from(v, schema, false),
         errors: vec![],
-        bool_result: false,
+        bool_result,
+        budget,
     }
     .validate();
     match result {
@@ -89,12 +156,30 @@ struct Validator<'v, 's, 'd, 'e> {
     uneval: Uneval<'v>,
     errors: Vec<ValidationError<'s, 'v>>,
     bool_result: bool, // is interested to know valid or not (but not actuall error)
+    budget: &'e Budget, // VIA patch
 }
 
 impl<'v, 's> Validator<'v, 's, '_, '_> {
     fn validate(mut self) -> Result<Uneval<'v>, ValidationError<'s, 'v>> {
         let s = self.schema;
         let v = self.v;
+
+        // VIA patch: one unit per evaluation, plus one per member or item
+        // of a container (its scan and evaluation bookkeeping), within the
+        // depth cap.
+        if self.scope.depth > self.budget.max_depth {
+            self.budget.exhaust();
+        }
+        let members = match v {
+            Value::Object(obj) => obj.len(),
+            Value::Array(arr) => arr.len(),
+            _ => 0,
+        };
+        // The cycle check below walks the ancestors validating this value.
+        let walk = self.scope.run;
+        if !self.budget.charge(1 + members as u64 + walk as u64) {
+            return Err(self.spent_error());
+        }
 
         // boolean --
         if let Some(b) = s.boolean {
@@ -106,6 +191,10 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
 
         // check cycle --
         if let Some(scp) = self.scope.check_cycle() {
+            if self.bool_result {
+                // VIA patch: no keyword locations for a yes/no answer.
+                return Err(self.error(kind!(Group)));
+            }
             let kind = ErrorKind::RefCycle {
                 url: &self.schema.loc,
                 kw_loc1: self.kw_loc(&self.scope),
@@ -126,14 +215,18 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
 
         // constant --
         if let Some(c) = &s.constant {
-            if !equals(v, c) {
+            if !equals_within(v, c, self.budget) {
                 return Err(self.error(kind!(Const, want: c)));
             }
         }
 
         // enum --
         if let Some(Enum { types, values }) = &s.enum_ {
-            if !types.contains(Type::of(v)) || !values.iter().any(|e| equals(e, v)) {
+            if !types.contains(Type::of(v))
+                || !values
+                    .iter()
+                    .any(|e| self.budget.spent() || equals_within(e, v, self.budget))
+            {
                 return Err(self.error(kind!(Enum, want: values)));
             }
         }
@@ -152,6 +245,11 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
                 return result.map(|_| self.uneval);
             }
             self.errors.extend(result.err());
+        }
+
+        // VIA patch: a spent budget ends every pending evaluation.
+        if self.budget.spent() {
+            return Err(self.spent_error());
         }
 
         // type specific validations --
@@ -173,12 +271,17 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
             }
         }
 
+        if self.budget.spent() {
+            return Err(self.spent_error());
+        }
         match self.errors.len() {
             0 => Ok(self.uneval),
             1 => Err(self.errors.remove(0)),
             _ => {
                 let mut e = self.error(kind!(Group));
-                e.causes = self.errors;
+                if !self.bool_result {
+                    e.causes = self.errors;
+                }
                 Err(e)
             }
         }
@@ -189,6 +292,14 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
 impl<'v> Validator<'v, '_, '_, '_> {
     fn obj_validate(&mut self, obj: &'v Map<String, Value>) {
         let s = self.schema;
+        // VIA patch: the name lists this evaluation scans.
+        let names = s.required.len()
+            + s.dependencies.len()
+            + s.dependent_schemas.len()
+            + s.dependent_required.len();
+        if !self.budget.charge(names as u64) {
+            return;
+        }
         macro_rules! add_err {
             ($result:expr) => {
                 if let Err(e) = $result {
@@ -224,6 +335,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         // dependencies --
         for (prop, dep) in &s.dependencies {
+            if self.budget.spent() {
+                return;
+            }
             if obj.contains_key(prop) {
                 match dep {
                     Dependency::Props(required) => {
@@ -240,7 +354,7 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         let mut additional_props = vec![];
         for (pname, pvalue) in obj {
-            if self.bool_result && !self.errors.is_empty() {
+            if (self.bool_result && !self.errors.is_empty()) || self.budget.spent() {
                 return;
             }
             let mut evaluated = false;
@@ -253,6 +367,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
             // patternProperties --
             for (regex, sch) in &s.pattern_properties {
+                if !self.budget.charge(regex.units(pname)) {
+                    return;
+                }
                 if regex.is_match(pname) {
                     evaluated = true;
                     add_err!(self.validate_val(*sch, pvalue, prop!(pname)));
@@ -291,8 +408,11 @@ impl<'v> Validator<'v, '_, '_, '_> {
         // propertyNames --
         if let Some(sch) = &s.property_names {
             for pname in obj.keys() {
+                if self.budget.spent() {
+                    return;
+                }
                 let v = Value::String(pname.to_owned());
-                if let Err(mut e) = self.schemas.validate(&v, *sch) {
+                if let Err(mut e) = self.validate_nested(&v, *sch) {
                     e.schema_url = &s.loc;
                     e.kind = ErrorKind::PropertyName {
                         prop: pname.to_owned(),
@@ -308,6 +428,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         // dependentSchemas --
         for (pname, sch) in &s.dependent_schemas {
+            if self.budget.spent() {
+                return;
+            }
             if obj.contains_key(pname) {
                 add_err!(self.validate_self(*sch));
             }
@@ -349,8 +472,8 @@ impl<'v> Validator<'v, '_, '_, '_> {
         }
 
         // uniqueItems --
-        if len > 1 && s.unique_items {
-            if let Some((i, j)) = duplicates(arr) {
+        if len > 1 && s.unique_items && charge_nodes(self.v, self.budget) {
+            if let Some((i, j)) = duplicates(arr, self.budget) {
                 self.add_error(kind!(UniqueItems, got: [i, j]));
             }
         }
@@ -363,6 +486,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
                 match items {
                     Items::SchemaRef(sch) => {
                         for (i, item) in arr.iter().enumerate() {
+                            if self.budget.spent() {
+                                return;
+                            }
                             add_err!(self.validate_val(*sch, item, item!(i)));
                         }
                         evaluated = len;
@@ -370,6 +496,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
                     }
                     Items::SchemaRefs(list) => {
                         for (i, (item, sch)) in arr.iter().zip(list).enumerate() {
+                            if self.budget.spent() {
+                                return;
+                            }
                             add_err!(self.validate_val(*sch, item, item!(i)));
                         }
                         evaluated = min(list.len(), len);
@@ -387,6 +516,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
                     }
                     Additional::SchemaRef(sch) => {
                         for (i, item) in arr[evaluated..].iter().enumerate() {
+                            if self.budget.spent() {
+                                return;
+                            }
                             add_err!(self.validate_val(*sch, item, item!(i)));
                         }
                     }
@@ -396,6 +528,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
         } else {
             // prefixItems --
             for (i, (sch, item)) in s.prefix_items.iter().zip(arr).enumerate() {
+                if self.budget.spent() {
+                    return;
+                }
                 add_err!(self.validate_val(*sch, item, item!(i)));
             }
 
@@ -403,6 +538,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
             if let Some(sch) = &s.items2020 {
                 let evaluated = min(s.prefix_items.len(), len);
                 for (i, item) in arr[evaluated..].iter().enumerate() {
+                    if self.budget.spent() {
+                        return;
+                    }
                     add_err!(self.validate_val(*sch, item, item!(i)));
                 }
                 debug_assert!(self.uneval.items.is_empty());
@@ -415,6 +553,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
             let mut errors = vec![];
 
             for (i, item) in arr.iter().enumerate() {
+                if self.budget.spent() {
+                    return;
+                }
                 if let Err(e) = self.validate_val(*sch, item, item!(i)) {
                     errors.push(e);
                 } else {
@@ -429,12 +570,16 @@ impl<'v> Validator<'v, '_, '_, '_> {
             if let Some(min) = s.min_contains {
                 if matched.len() < min {
                     let mut e = self.error(kind!(MinContains, matched.clone(), min));
-                    e.causes = errors;
+                    if !self.bool_result {
+                        e.causes = errors;
+                    }
                     self.errors.push(e);
                 }
             } else if matched.is_empty() {
                 let mut e = self.error(kind!(Contains));
-                e.causes = errors;
+                if !self.bool_result {
+                    e.causes = errors;
+                }
                 self.errors.push(e);
             }
 
@@ -450,6 +595,12 @@ impl<'v> Validator<'v, '_, '_, '_> {
     fn str_validate(&mut self, str: &'v String) {
         let s = self.schema;
         let mut len = None;
+        // VIA patch: counting characters scans the string.
+        if (s.min_length.is_some() || s.max_length.is_some())
+            && !self.budget.charge(pattern_units(str))
+        {
+            return;
+        }
 
         // minLength --
         if let Some(min) = s.min_length {
@@ -469,6 +620,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         // pattern --
         if let Some(regex) = &s.pattern {
+            if !self.budget.charge(regex.units(str)) {
+                return;
+            }
             if !regex.is_match(str) {
                 self.add_error(kind!(Pattern, str.into(), regex.as_str()));
             }
@@ -506,7 +660,7 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         // contentSchema --
         if let (Some(sch), Some(v)) = (s.content_schema, deserialized) {
-            if let Err(mut e) = self.schemas.validate(&v, sch) {
+            if let Err(mut e) = self.validate_nested(&v, sch) {
                 e.schema_url = &s.loc;
                 e.kind = kind!(ContentSchema);
                 self.errors.push(e.clone_static());
@@ -606,7 +760,9 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
         if let Err(err) = self._validate_self(sch, kw.into(), false) {
             let url = &self.schemas.get(sch).loc;
             let mut ref_err = self.error(ErrorKind::Reference { kw, url });
-            if let ErrorKind::Group = err.kind {
+            if self.bool_result {
+                // VIA patch: a yes/no answer keeps no error tree.
+            } else if let ErrorKind::Group = err.kind {
                 ref_err.causes = err.causes;
             } else {
                 ref_err.causes.push(err);
@@ -675,6 +831,9 @@ impl Validator<'_, '_, '_, '_> {
         if !s.all_of.is_empty() {
             let mut errors = vec![];
             for sch in &s.all_of {
+                if self.budget.spent() {
+                    return;
+                }
                 if let Err(e) = self.validate_self(*sch) {
                     errors.push(e);
                     if self.bool_result {
@@ -692,6 +851,9 @@ impl Validator<'_, '_, '_, '_> {
             let mut matched = false;
             let mut errors = vec![];
             for sch in &s.any_of {
+                if self.budget.spent() {
+                    return;
+                }
                 match self.validate_self(*sch) {
                     Ok(_) => {
                         matched = true;
@@ -713,6 +875,9 @@ impl Validator<'_, '_, '_, '_> {
             let mut matched = None;
             let mut errors = vec![];
             for (i, sch) in s.one_of.iter().enumerate() {
+                if self.budget.spent() {
+                    return;
+                }
                 if let Err(e) = self._validate_self(*sch, None, matched.is_some()) {
                     if matched.is_none() {
                         errors.push(e);
@@ -762,6 +927,9 @@ impl Validator<'_, '_, '_, '_> {
         if let (Some(sch), Value::Object(obj)) = (s.unevaluated_properties, v) {
             let uneval = std::mem::take(&mut self.uneval);
             for pname in &uneval.props {
+                if self.budget.spent() {
+                    return;
+                }
                 if let Some(pvalue) = obj.get(*pname) {
                     add_err!(self.validate_val(sch, pvalue, prop!(pname)));
                 }
@@ -773,6 +941,9 @@ impl Validator<'_, '_, '_, '_> {
         if let (Some(sch), Value::Array(arr)) = (s.unevaluated_items, v) {
             let uneval = std::mem::take(&mut self.uneval);
             for i in &uneval.items {
+                if self.budget.spent() {
+                    return;
+                }
                 if let Some(pvalue) = arr.get(*i) {
                     add_err!(self.validate_val(sch, pvalue, item!(*i)));
                 }
@@ -806,6 +977,7 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
             uneval: Uneval::from(v, schema, false),
             errors: vec![],
             bool_result: self.bool_result,
+            budget: self.budget,
         }
         .validate()
         .map(|_| ())
@@ -828,6 +1000,7 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
             uneval: Uneval::from(self.v, schema, !self.uneval.is_empty()),
             errors: vec![],
             bool_result: self.bool_result || bool_result,
+            budget: self.budget,
         }
         .validate();
         if let Ok(reply) = &result {
@@ -840,13 +1013,24 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
     fn validate_self(&mut self, sch: SchemaIndex) -> Result<(), ValidationError<'s, 'v>> {
         self._validate_self(sch, None, false)
     }
+
+    // VIA patch: a value built during validation (`propertyNames`,
+    // `contentSchema`) is validated within the same budget.
+    fn validate_nested<'n>(
+        &self,
+        v: &'n Value,
+        sch: SchemaIndex,
+    ) -> Result<(), ValidationError<'s, 'n>> {
+        let schema = self.schemas.get(sch);
+        validate_within(v, schema, self.schemas, self.budget, self.bool_result)
+    }
 }
 
 // error helpers
 impl<'v, 's> Validator<'v, 's, '_, '_> {
     #[inline(always)]
     fn error(&self, kind: ErrorKind<'s, 'v>) -> ValidationError<'s, 'v> {
-        if self.bool_result {
+        if self.bool_result || self.budget.spent() {
             return ValidationError {
                 schema_url: &self.schema.loc,
                 instance_location: InstanceLocation::new(),
@@ -862,6 +1046,17 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
         }
     }
 
+    // VIA patch: the error of an evaluation the spent budget ended; it
+    // allocates nothing.
+    fn spent_error(&self) -> ValidationError<'s, 'v> {
+        ValidationError {
+            schema_url: &self.schema.loc,
+            instance_location: InstanceLocation::new(),
+            kind: ErrorKind::Group,
+            causes: vec![],
+        }
+    }
+
     #[inline(always)]
     fn add_error(&mut self, kind: ErrorKind<'s, 'v>) {
         self.errors.push(self.error(kind));
@@ -873,7 +1068,9 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
             self.errors.extend(errors);
         } else {
             let mut err = self.error(kind);
-            err.causes = errors;
+            if !self.bool_result {
+                err.causes = errors;
+            }
             self.errors.push(err);
         }
     }
@@ -978,6 +1175,10 @@ struct Scope<'a> {
     /// unique id of value being validated
     // if two scope validate same value, they will have same vid
     vid: usize,
+    /// VIA patch: the evaluation depth, for the budget's depth cap.
+    depth: usize,
+    /// VIA patch: how many ancestors in a row validate the same value.
+    run: usize,
     parent: Option<&'a Scope<'a>>,
 }
 
@@ -992,6 +1193,8 @@ impl Scope<'_> {
             sch,
             ref_kw,
             vid,
+            depth: self.depth + 1,
+            run: if vid == self.vid { self.run + 1 } else { 0 },
             parent: Some(self),
         }
     }

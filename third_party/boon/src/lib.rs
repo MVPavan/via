@@ -130,7 +130,6 @@ pub use {
 use std::{borrow::Cow, collections::HashMap, error::Error, fmt::Display};
 
 use ahash::AHashMap;
-use regex::Regex;
 use serde_json::{Number, Value};
 use util::*;
 
@@ -193,6 +192,47 @@ impl Schemas {
         };
         validator::validate(v, sch, self)
     }
+
+    /**
+    VIA patch: whether `v` is valid against the schema `sch_index`,
+    within a work budget of `units` and an evaluation depth of
+    `max_depth` (`VIA-PATCH.md`). No error detail is built.
+
+    # Panics
+
+    Panics if `sch_index` is not generated for this instance.
+    */
+    pub fn validate_within(
+        &self,
+        v: &Value,
+        sch_index: SchemaIndex,
+        units: u64,
+        max_depth: usize,
+    ) -> Validation {
+        let Some(sch) = self.list.get(sch_index.0) else {
+            panic!("Schemas::validate_within: schema index out of bounds");
+        };
+        let budget = validator::Budget::new(units, max_depth);
+        let result = validator::validate_within(v, sch, self, &budget, true);
+        if budget.spent() {
+            Validation::BudgetSpent
+        } else if result.is_ok() {
+            Validation::Valid
+        } else {
+            Validation::Invalid
+        }
+    }
+}
+
+/// VIA patch: the outcome of [`Schemas::validate_within`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validation {
+    /// The value is valid.
+    Valid,
+    /// The value is invalid.
+    Invalid,
+    /// The work budget or the depth cap was spent before an answer.
+    BudgetSpent,
 }
 
 #[derive(Default)]
@@ -230,7 +270,7 @@ struct Schema {
     max_properties: Option<usize>,
     required: Vec<String>,
     properties: AHashMap<String, SchemaIndex>,
-    pattern_properties: Vec<(Regex, SchemaIndex)>,
+    pattern_properties: Vec<(Pattern, SchemaIndex)>,
     property_names: Option<SchemaIndex>,
     additional_properties: Option<Additional>,
     dependent_required: Vec<(String, Vec<String>)>,
@@ -254,7 +294,7 @@ struct Schema {
     // string --
     min_length: Option<usize>,
     max_length: Option<usize>,
-    pattern: Option<Regex>,
+    pattern: Option<Pattern>,
     content_encoding: Option<Decoder>,
     content_media_type: Option<MediaType>,
     content_schema: Option<SchemaIndex>,

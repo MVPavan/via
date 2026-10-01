@@ -384,6 +384,43 @@ impl Draft {
         Ok(())
     }
 
+    // VIA patch: `CompileError::UnsupportedDraft` for the first `$schema`,
+    // at `sch` or in any subschema position under it, that does not name
+    // this draft.
+    pub(crate) fn require(&self, sch: &Value) -> Result<(), CompileError> {
+        let Value::Object(obj) = sch else {
+            return Ok(());
+        };
+        if let Some(Value::String(url)) = obj.get("$schema") {
+            if Draft::from_url(url).map(|d| d.version) != Some(self.version) {
+                return Err(CompileError::UnsupportedDraft { url: url.clone() });
+            }
+        }
+        for (&kw, &pos) in &self.subschemas {
+            let Some(v) = obj.get(kw) else {
+                continue;
+            };
+            if pos & POS_SELF != 0 {
+                self.require(v)?;
+            }
+            if pos & POS_ITEM != 0 {
+                if let Value::Array(arr) = v {
+                    for item in arr {
+                        self.require(item)?;
+                    }
+                }
+            }
+            if pos & POS_PROP != 0 {
+                if let Value::Object(obj) = v {
+                    for pvalue in obj.values() {
+                        self.require(pvalue)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_subschema(&self, ptr: &str) -> bool {
         if ptr.is_empty() {
             return true;

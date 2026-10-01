@@ -8,9 +8,10 @@ use std::{
 use ahash::{AHashMap, AHasher};
 use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
 use serde_json::Value;
+use regex::{Regex, RegexBuilder};
 use url::Url;
 
-use crate::CompileError;
+use crate::{validator::Budget, CompileError};
 
 // --
 
@@ -387,7 +388,123 @@ pub(crate) fn equals(v1: &Value, v2: &Value) -> bool {
     }
 }
 
-pub(crate) fn duplicates(arr: &Vec<Value>) -> Option<(usize, usize)> {
+// VIA patch: `equals` taking one budget unit per value it compares; false
+// once the budget is spent.
+pub(crate) fn equals_within(v1: &Value, v2: &Value, budget: &Budget) -> bool {
+    if !budget.charge(1) {
+        return false;
+    }
+    match (v1, v2) {
+        (Value::Array(arr1), Value::Array(arr2)) => {
+            arr1.len() == arr2.len()
+                && arr1
+                    .iter()
+                    .zip(arr2)
+                    .all(|(e1, e2)| equals_within(e1, e2, budget))
+        }
+        (Value::Object(obj1), Value::Object(obj2)) => {
+            obj1.len() == obj2.len()
+                && obj1.iter().all(|(k1, v1)| {
+                    obj2.get(k1)
+                        .is_some_and(|v2| equals_within(v1, v2, budget))
+                })
+        }
+        (Value::String(s1), Value::String(s2)) => {
+            budget.charge(pattern_units(s1)) && s1 == s2
+        }
+        _ => equals(v1, v2),
+    }
+}
+
+// VIA patch: one budget unit per node of `v`, the work of hashing it;
+// false once the budget is spent.
+pub(crate) fn charge_nodes(v: &Value, budget: &Budget) -> bool {
+    let mut pending = vec![v];
+    while let Some(v) = pending.pop() {
+        let units = match v {
+            Value::String(s) => pattern_units(s),
+            _ => 1,
+        };
+        if !budget.charge(units) {
+            return false;
+        }
+        match v {
+            Value::Array(arr) => pending.extend(arr),
+            Value::Object(obj) => pending.extend(obj.values()),
+            _ => {}
+        }
+    }
+    true
+}
+
+// VIA patch: the budget units of scanning a string: one per 64 bytes,
+// at least one.
+pub(crate) fn pattern_units(s: &str) -> u64 {
+    1 + (s.len() / 64) as u64
+}
+
+// VIA patch: a compiled `pattern` with the weight of matching it, an
+// estimate of how many automaton states can be live at once. Matching
+// costs one budget unit per 16 bytes per unit of weight, at least one:
+// a lazy DFA that gives up falls back to a search whose work per byte is
+// proportional to the live states. The compiled program and the lazy
+// DFA cache are capped, so a pattern's memory is bounded.
+pub(crate) struct Pattern {
+    regex: Regex,
+    weight: u64,
+}
+
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+const REGEX_DFA_SIZE_LIMIT: usize = 0;
+
+impl Pattern {
+    pub(crate) fn new(pattern: &str) -> Result<Self, regex::Error> {
+        let regex = RegexBuilder::new(pattern)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+            .build()?;
+        let weight = regex_syntax::Parser::new()
+            .parse(pattern)
+            .map_or(u64::MAX, |hir| hir_weight(&hir));
+        Ok(Self { regex, weight })
+    }
+
+    pub(crate) fn units(&self, subject: &str) -> u64 {
+        (subject.len() as u64)
+            .saturating_mul(self.weight)
+            .div_ceil(16)
+            .max(1)
+    }
+}
+
+impl std::ops::Deref for Pattern {
+    type Target = Regex;
+
+    fn deref(&self) -> &Regex {
+        &self.regex
+    }
+}
+
+fn hir_weight(hir: &regex_syntax::hir::Hir) -> u64 {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(_) => 1,
+        HirKind::Literal(lit) => lit.0.len() as u64,
+        HirKind::Repetition(rep) => {
+            let copies = u64::from(rep.max.unwrap_or(rep.min).max(1)) + 1;
+            hir_weight(&rep.sub).saturating_mul(copies)
+        }
+        HirKind::Capture(cap) => hir_weight(&cap.sub),
+        HirKind::Concat(subs) | HirKind::Alternation(subs) => subs
+            .iter()
+            .map(hir_weight)
+            .fold(0, u64::saturating_add)
+            .max(1),
+    }
+}
+
+pub(crate) fn duplicates(arr: &Vec<Value>, budget: &Budget) -> Option<(usize, usize)> {
+    let equals = |e1: &Value, e2: &Value| equals_within(e1, e2, budget);
     match arr.as_slice() {
         [e0, e1] => {
             if equals(e0, e1) {
@@ -408,6 +525,9 @@ pub(crate) fn duplicates(arr: &Vec<Value>) -> Option<(usize, usize)> {
             if len <= 20 {
                 for i in 0..len - 1 {
                     for j in i + 1..len {
+                        if budget.spent() {
+                            return None;
+                        }
                         if equals(&arr[i], &arr[j]) {
                             return Some((i, j));
                         }

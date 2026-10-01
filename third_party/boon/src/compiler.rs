@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, collections::HashMap, error::Error, fmt::Display};
 
-use regex::Regex;
 use serde_json::{Map, Value};
 use url::Url;
 
@@ -76,6 +75,10 @@ pub struct Compiler {
     roots: Roots,
     assert_format: bool,
     assert_content: bool,
+    // VIA patch: compile limits, and the patterns compiled so far.
+    max_schemas: Option<usize>,
+    max_patterns: Option<usize>,
+    patterns: std::cell::Cell<usize>,
     formats: HashMap<&'static str, Format>,
     decoders: HashMap<&'static str, Decoder>,
     media_types: HashMap<&'static str, MediaType>,
@@ -98,6 +101,37 @@ impl Compiler {
     */
     pub fn set_default_draft(&mut self, d: Draft) {
         self.roots.default_draft = d.internal()
+    }
+
+    /**
+    VIA patch: compiling fails with [`CompileError::UnsupportedDraft`]
+    unless every schema resource is draft `d`: a `$schema` naming another
+    draft or metaschema, at a root or in any subschema position (embedded
+    resources included), is refused.
+    */
+    pub fn require_draft(&mut self, d: Draft) {
+        self.roots.required_draft = Some(d.internal())
+    }
+
+    /**
+    VIA patch: compiling fails with [`CompileError::LimitExceeded`] once
+    it would compile more than `schemas` subschemas, or more than
+    `patterns` `pattern` and `patternProperties` regular expressions, into
+    one [`Schemas`].
+    */
+    pub fn set_limits(&mut self, schemas: usize, patterns: usize) {
+        self.max_schemas = Some(schemas);
+        self.max_patterns = Some(patterns);
+    }
+
+    // VIA patch: counts one compiled pattern against the limit.
+    fn count_pattern(&self) -> Result<(), CompileError> {
+        let n = self.patterns.get() + 1;
+        self.patterns.set(n);
+        match self.max_patterns {
+            Some(max) if n > max => Err(CompileError::LimitExceeded { what: "patterns" }),
+            _ => Ok(()),
+        }
     }
 
     /**
@@ -226,6 +260,12 @@ impl Compiler {
         }
 
         while queue.schemas.len() > compiled.len() {
+            if self
+                .max_schemas
+                .is_some_and(|max| target.size() + queue.schemas.len() > max)
+            {
+                return Err(CompileError::LimitExceeded { what: "subschemas" });
+            }
             let up = &queue.schemas[compiled.len()];
             self.roots.ensure_subschema(up)?;
             let Some(root) = self.roots.get(&up.url) else {
@@ -381,8 +421,9 @@ impl ObjCompiler<'_, '_, '_, '_, '_, '_> {
                                 regex: pname.to_owned(),
                                 src,
                             })?;
+                        self.c.count_pattern()?;
                         let regex =
-                            Regex::new(ecma.as_ref()).map_err(|e| CompileError::InvalidRegex {
+                            Pattern::new(ecma.as_ref()).map_err(|e| CompileError::InvalidRegex {
                                 url: self.up.format("patternProperties"),
                                 regex: ecma.into_owned(),
                                 src: e.into(),
@@ -468,8 +509,21 @@ impl ObjCompiler<'_, '_, '_, '_, '_, '_> {
             s.min_length = self.usize("minLength");
 
             if let Some(Value::String(p)) = self.value("pattern") {
-                let p = ecma::convert(p).map_err(CompileError::Bug)?;
-                s.pattern = Some(Regex::new(p.as_ref()).map_err(|e| CompileError::Bug(e.into()))?);
+                // VIA patch: a pattern that does not compile, or exceeds the
+                // regex size limit, is an invalid regex, not a bug.
+                let p = ecma::convert(p).map_err(|src| CompileError::InvalidRegex {
+                    url: self.up.format("pattern"),
+                    regex: p.to_owned(),
+                    src,
+                })?;
+                self.c.count_pattern()?;
+                s.pattern = Some(Pattern::new(p.as_ref()).map_err(|e| {
+                    CompileError::InvalidRegex {
+                        url: self.up.format("pattern"),
+                        regex: p.clone().into_owned(),
+                        src: e.into(),
+                    }
+                })?);
             }
 
             s.max_items = self.usize("maxItems");
@@ -750,6 +804,10 @@ impl<'v> ObjCompiler<'_, 'v, '_, '_, '_, '_> {
 /// Error type for compilation failures.
 #[derive(Debug)]
 pub enum CompileError {
+    /// VIA patch: the schema needs more subschemas or patterns than the
+    /// limits set by [`Compiler::set_limits`].
+    LimitExceeded { what: &'static str },
+
     /// Error in parsing `url`.
     ParseUrlError { url: String, src: Box<dyn Error> },
 
@@ -859,6 +917,7 @@ impl Display for CompileError {
                 }
             }
             Self::UnsupportedDraft { url } => write!(f, "draft {url} is not supported"),
+            Self::LimitExceeded { what } => write!(f, "too many {what}"),
             Self::MetaSchemaCycle { url } => {
                 write!(f, "cycle in resolving $schema in {url}")
             }
