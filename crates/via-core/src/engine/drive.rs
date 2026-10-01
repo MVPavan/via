@@ -380,7 +380,9 @@ impl Engine {
         // design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
         // life. Force, the latch or a change of the head gives up the wait:
-        // the queued path, never submitted.
+        // the queued path, never submitted. A failed driver is retired
+        // first, so its own slot is free for its successor (C2 §2).
+        self.retire_failed_lane(session).await;
         let prepared = self
             .kept_lane(session)
             .map_or(Prepared::NeedsConnection, |lane| lane.driver.prepare());

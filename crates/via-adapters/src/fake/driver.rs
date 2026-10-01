@@ -442,8 +442,14 @@ fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
 }
 
 /// Whether a persistent connection's helper retirement left its cleanup
-/// unproven (decision H1): a health failure, as no turn reports it.
+/// unproven (decision H1): a health failure, as no turn reports it. Test
+/// builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN` makes every launched
+/// retirement unproven, as no fake profile can.
 fn retirement_uncertain(retirement: &Retirement) -> bool {
+    #[cfg(feature = "test-failpoints")]
+    if std::env::var_os("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN").is_some() {
+        return retirement.launched;
+    }
     retirement.launched
         && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
 }

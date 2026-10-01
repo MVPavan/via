@@ -47,6 +47,9 @@ pub(super) struct Lane {
     /// for the whole of a turn.
     pub(super) observations: tokio::sync::Mutex<mpsc::Receiver<Admitted>>,
     state: StdMutex<LaneState>,
+    /// The failed driver's close was started: the lane waits only for its
+    /// successor.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 /// What the lane learned from the session's observations.
@@ -160,10 +163,21 @@ fn tombstone_of(vendor_turn: &str) -> u64 {
 }
 
 impl Lane {
-    /// Whether the driver's health failed (C2 §2): its connection is not
-    /// used for another turn.
+    /// Whether the driver's health failed (C2 §2), or its close after
+    /// that started: its connection is not used for another turn.
     fn failed(&self) -> bool {
-        matches!(*self.driver.health().borrow(), DriverHealth::Failed { .. })
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+            || matches!(*self.driver.health().borrow(), DriverHealth::Failed { .. })
+    }
+
+    /// Closes the failed driver once (C2 §2 health), releasing what it
+    /// holds, its connection slot included; its owned cleanup stays its own.
+    async fn retire(&self) {
+        if self.retired.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
+        let _report = self.driver.close(CloseMode::Force, deadline).await;
     }
 
     /// Records `vendor_turn` as `turn`'s, the newest.
@@ -261,6 +275,18 @@ impl Engine {
             .cloned()
     }
 
+    /// Sol r1 F3 (C2 §2 health, AD16): retires the session's kept lane if
+    /// its driver's health failed, before the next turn reserves a
+    /// connection slot, so the failed driver's own slot is released first.
+    /// The lane stays for [`Self::lane`] to replace with the identity and
+    /// tombstones it holds.
+    pub(super) async fn retire_failed_lane(&self, session: &SessionId) {
+        let kept = lock(&self.lanes).get(session).cloned();
+        if let Some(lane) = kept.filter(|lane| lane.failed()) {
+            lane.retire().await;
+        }
+    }
+
     /// The session's lane for its submitted turn: the one it has, unless
     /// its driver's health failed, which is closed and replaced with the
     /// identity it confirmed (C2 §2 health); else a lane opened for the
@@ -282,8 +308,7 @@ impl Engine {
             // C2 §2: no turn runs on a failed driver's connection.
             lock(&self.lanes).remove(session);
             state = lock(&lane.state).successor();
-            let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
-            let _report = lane.driver.close(CloseMode::Force, deadline).await;
+            lane.retire().await;
         }
         let reference = SessionRef {
             harness: FAKE.to_owned(),
@@ -316,6 +341,7 @@ impl Engine {
             driver: self.adapter.open_session(&reference, spec, cx),
             observations: tokio::sync::Mutex::new(receiver),
             state: StdMutex::new(state),
+            retired: std::sync::atomic::AtomicBool::new(false),
         });
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         lane
