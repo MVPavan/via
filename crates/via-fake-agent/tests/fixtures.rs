@@ -30,6 +30,8 @@ const OUTER: Duration = Duration::from_secs(30);
 const CAPTURED_ARG: &str = "0f1de11e-0000-4000-8000-000000000001";
 /// Credential fields that may hold only a placeholder.
 const SECRET_KEYS: [&str; 3] = ["access_token", "refresh_token", "api_key"];
+/// The only values a credential field may hold.
+const PLACEHOLDERS: [&str; 4] = ["", "<redacted>", "REDACTED", "PLACEHOLDER"];
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures")
@@ -329,18 +331,44 @@ fn fixtures_replay_with_a_generic_driver_to_exit_zero() -> TestResult {
     Ok(())
 }
 
-/// What a hygiene finding is, or `None` when the text is clean.
-fn hygiene_finding(text: &str) -> Option<String> {
-    for needle in [
-        "/home/",
-        "/Users/",
-        "C:\\Users",
-        "C:\\\\Users",
-        "Bearer ",
-        "eyJ",
-        "ghp_",
-        "gho_",
+/// Undoes the escapes a sensitive value could hide behind in text that is
+/// not itself parsed: backslash-escaped slashes, doubled backslashes and
+/// `\u` escapes of `/`, `\` and `@`.
+fn unescape(text: &str) -> String {
+    let mut text = text.to_owned();
+    for (escaped, plain) in [
+        ("\\u002f", "/"),
+        ("\\u002F", "/"),
+        ("\\u005c", "\\"),
+        ("\\u005C", "\\"),
+        ("\\u0040", "@"),
     ] {
+        text = text.replace(escaped, plain);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Drop a backslash that escapes a slash or another backslash.
+            if matches!(chars.peek(), Some('/' | '\\')) {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What a hygiene finding is in one (decoded) string, or `None`.
+fn hygiene_finding(text: &str) -> Option<String> {
+    let text = unescape(text);
+    let lower = text.to_ascii_lowercase();
+    for needle in ["/home/", "/users/", "c:\\users", "bearer "] {
+        if lower.contains(needle) {
+            return Some(format!("contains {needle:?}"));
+        }
+    }
+    for needle in ["eyJ", "ghp_", "gho_"] {
         if text.contains(needle) {
             return Some(format!("contains {needle:?}"));
         }
@@ -354,10 +382,7 @@ fn hygiene_finding(text: &str) -> Option<String> {
             return Some("contains a token-like sk- value".to_owned());
         }
     }
-    if let Some(email) = email_in(text) {
-        return Some(format!("contains an email address {email:?}"));
-    }
-    None
+    email_in(&text).map(|email| format!("contains an email address {email:?}"))
 }
 
 /// The first `local@domain.tld` in `text`.
@@ -387,36 +412,71 @@ fn email_in(text: &str) -> Option<&str> {
     None
 }
 
-/// Whether a credential field's value is only a placeholder.
+/// Whether a credential field's value is exactly a placeholder.
 fn placeholder(value: &Value) -> bool {
     match value {
         Value::Null => true,
-        Value::String(text) => {
-            text.is_empty()
-                || text.starts_with('<')
-                || text.contains("REDACTED")
-                || text.contains("PLACEHOLDER")
-        }
+        Value::String(text) => PLACEHOLDERS.contains(&text.as_str()),
         Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => false,
     }
 }
 
-/// A credential field with a real value anywhere in `value`, including
-/// inside strings that are themselves JSON (emit lines).
-fn secret_field(value: &Value) -> Option<String> {
+/// Text as JSON would see it once replay substitutes captures: each
+/// `${name}` becomes the neutral `0` (valid both bare and inside a string)
+/// and `$${` the literal `${`.
+fn neutralize_captures(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('$') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        if let Some(after) = rest.strip_prefix("$${") {
+            out.push_str("${");
+            rest = after;
+        } else if let Some((_, after)) = rest
+            .strip_prefix("${")
+            .and_then(|after| after.split_once('}'))
+        {
+            out.push('0');
+            rest = after;
+        } else {
+            out.push('$');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The first finding anywhere in `value`: every key and decoded string leaf
+/// is scanned, credential fields must hold an exact placeholder, and a
+/// string that is itself JSON (an emit line, templated or not) is decoded
+/// and scanned recursively.
+fn value_finding(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => map.iter().find_map(|(key, item)| {
             if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str()) && !placeholder(item) {
-                Some(format!("{key} has a non-placeholder value"))
-            } else {
-                secret_field(item)
+                return Some(format!("{key} has a non-placeholder value"));
+            }
+            hygiene_finding(key).or_else(|| value_finding(item))
+        }),
+        Value::Array(items) => items.iter().find_map(value_finding),
+        Value::String(text) => hygiene_finding(text).or_else(|| {
+            let trimmed = text.trim_start();
+            if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+                return None;
+            }
+            match serde_json::from_str::<Value>(&neutralize_captures(text)) {
+                Ok(inner) => value_finding(&inner),
+                // An object-shaped emit that cannot be decoded cannot be
+                // shown clean; bracketed prose is covered by the text scan
+                // plus a credential-name check.
+                Err(error) if trimmed.starts_with('{') => {
+                    Some(format!("embedded JSON does not parse: {error}"))
+                }
+                Err(_) => secret_mention(text),
             }
         }),
-        Value::Array(items) => items.iter().find_map(secret_field),
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(|inner| inner.is_object() || inner.is_array())
-            .and_then(|inner| secret_field(&inner)),
         Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
 }
@@ -426,12 +486,18 @@ fn file_finding(text: &str) -> Option<String> {
         return Some(finding);
     }
     match serde_json::from_str::<Value>(text) {
-        Ok(value) => secret_field(&value),
-        Err(_) => SECRET_KEYS
-            .iter()
-            .find(|key| text.contains(**key))
-            .map(|key| format!("non-JSON file mentions {key}")),
+        Ok(value) => value_finding(&value),
+        Err(_) => secret_mention(text),
     }
+}
+
+/// A credential field name in text that is not JSON.
+fn secret_mention(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    SECRET_KEYS
+        .iter()
+        .find(|key| lower.contains(**key))
+        .map(|key| format!("non-JSON text mentions {key}"))
 }
 
 #[test]
@@ -453,27 +519,52 @@ fn fixtures_hygiene_scan_finds_nothing() -> TestResult {
 fn fixtures_hygiene_scan_detects_each_pattern() {
     let jwt = format!("{}{}", "ey", "J0eXAiOiJKV1QifQ");
     let bad = [
-        "/home/someone/project".to_owned(),
-        "/Users/someone".to_owned(),
-        r"C:\Users\someone".to_owned(),
-        r#"{"path":"C:\\Users\\someone"}"#.to_owned(),
-        "contact a.person@example.org today".to_owned(),
-        "key sk-abc123".to_owned(),
-        "ghp_abc".to_owned(),
-        "gho_abc".to_owned(),
-        "Authorization: Bearer abc".to_owned(),
-        jwt,
+        // Plain.
+        r#"{"p":"/home/someone/project"}"#.to_owned(),
+        r#"{"p":"/Users/someone"}"#.to_owned(),
+        r#"{"p":"C:\\Users\\someone"}"#.to_owned(),
+        r#"{"t":"contact a.person@example.org today"}"#.to_owned(),
+        r#"{"t":"key sk-abc123"}"#.to_owned(),
+        r#"{"t":"ghp_abc"}"#.to_owned(),
+        r#"{"t":"gho_abc"}"#.to_owned(),
+        r#"{"t":"Authorization: Bearer abc"}"#.to_owned(),
+        format!(r#"{{"t":"{jwt}"}}"#),
         r#"{"access_token":"abc"}"#.to_owned(),
-        r#"{"line":"{\"refresh_token\":\"abc\"}"}"#.to_owned(),
         r#"{"nested":{"API_KEY":"abc"}}"#.to_owned(),
+        // Escaped representations.
+        r#"{"p":"\u002fhome\u002fsomeone"}"#.to_owned(),
+        r#"{"p":"\/home\/someone"}"#.to_owned(),
+        r#"{"line":"{\"p\":\"\\u002fhome\\u002fsomeone\"}"}"#.to_owned(),
+        r#"{"line":"{\"p\":\"C:\\\\Users\\\\someone\"}"}"#.to_owned(),
+        r#"{"t":"C:\\\\Users\\\\someone"}"#.to_owned(),
+        r#"{"t":"a.person\u0040example.org"}"#.to_owned(),
+        r#"{"t":"\u0073k-abc123"}"#.to_owned(),
+        r#"{"t":"authorization: bearer abc"}"#.to_owned(),
+        r#"{"line":"{\"refresh_token\":\"abc\"}"}"#.to_owned(),
+        r#"{"line":"{\"\\u0061ccess_token\":\"abc\"}"}"#.to_owned(),
+        // Templated emits are decoded, not skipped.
+        r#"{"line":"{\"id\":${request},\"api_key\":\"abc\"}"}"#.to_owned(),
+        r#"{"line":"{\"session_id\":\"${sid}\",\"cwd\":\"/home/someone\"}"}"#.to_owned(),
+        // Placeholders match exactly.
+        r#"{"access_token":"<redacted>abc"}"#.to_owned(),
+        r#"{"api_key":"REDACTED-abc"}"#.to_owned(),
+        r#"{"api_key":"abcPLACEHOLDER"}"#.to_owned(),
+        // An emit that cannot be decoded is a finding.
+        r#"{"line":"{\"broken\":"}"#.to_owned(),
+        r#"{"t":"[not json] access_token abc"}"#.to_owned(),
+        // Non-JSON text.
+        "access_token=abc".to_owned(),
     ];
     for text in bad {
         assert!(file_finding(&text).is_some(), "missed {text}");
     }
     let clean = [
-        r#"{"access_token":"<redacted>","api_key":""}"#,
+        r#"{"access_token":"<redacted>","api_key":"","refresh_token":"REDACTED"}"#,
         r#"{"source":"cc-plugin-agents-md@builtin","cwd":"/work/project"}"#,
         r#"{"subtype":"task_started","text":"ask-me desk-top"}"#,
+        r#"{"line":"{\"request_id\":${rid},\"session_id\":\"${sid}\",\"cmd\":\"echo $${HOME}\"}"}"#,
+        r#"{"capabilities":["msg_lifecycle_v1"]}"#,
+        r#"{"text":"[Request interrupted by user for tool use]"}"#,
     ];
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
