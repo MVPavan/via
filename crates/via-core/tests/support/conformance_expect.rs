@@ -106,7 +106,7 @@
 //! plan-refused turn has no plan, so its set is empty. Core-derived codes
 //! are excluded: `vendor_version_untested` (from `InstanceReport`) and
 //! `structured_output_missing` (Core's schema check) are S-CORE's to test.
-//! On a server route (C2 §2 AdapterError row, server-route evidence) a
+//! On a server route (C2 §2 `AdapterError` row, server-route evidence) a
 //! turn's `exit` is always null, and cleanup is its reported tool items
 //! while the server lives (`group_absent` false), or Host `GroupAbsent` for
 //! the server's group after a crash (`group_absent` true).
