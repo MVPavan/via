@@ -533,17 +533,17 @@ impl Engine {
         let given = overrides.bound().cloned();
         let effective = latest.inherit(overrides);
         // C2 §2 `check_turn` (decision F12): the turn's values against the
-        // session's frozen route, AD12's adapter version included.
-        self.adapter
+        // session's frozen route, AD12's adapter version included; a given
+        // bound's effective one is the route's (Sol r2 #4).
+        let checked = self
+            .adapter
             .check_turn(&frozen.session_ref(), &effective.turn_params())
             .map_err(|refusal| intake::refused(&refusal))?;
-        // Sol r1 #3: a given bound's effective one comes from its plan.
         let effective = match given {
-            Some(bound) => effective.with_bound(intake::resume_bound(
-                &self.adapter,
-                &frozen,
-                snapshot.cwd.as_deref(),
-                bound,
+            Some(bound) => effective.with_bound(intake::EffectiveBound::of(
+                Some(&bound),
+                checked.effective_bound,
+                intake::route_name(&frozen.route).ok_or(ApiError::STORE)?,
             )?),
             None => effective,
         };

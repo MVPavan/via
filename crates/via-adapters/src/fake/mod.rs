@@ -155,13 +155,7 @@ impl FakeAdapter {
                     .iter()
                     .any(|r| r.kind == RefusalKind::BoundUnsupported)
             })
-            .map(|bound| {
-                self.fixture
-                    .profile
-                    .normalized_bound
-                    .clone()
-                    .unwrap_or(bound)
-            });
+            .map(|bound| self.effective_bound(bound));
         let (inherit, switch_warning) =
             effective_inherit(&self.fixture.profile.categories, requested);
         let mut warnings = vec![Warning {
@@ -185,6 +179,16 @@ impl FakeAdapter {
             // Every fake turn is its own private process.
             server_key: None,
         }
+    }
+
+    /// The bound the route applies for a supported `requested` one: the
+    /// profile's normalized bound, else the one requested.
+    pub(crate) fn effective_bound(&self, requested: crate::plan::Bound) -> crate::plan::Bound {
+        self.fixture
+            .profile
+            .normalized_bound
+            .clone()
+            .unwrap_or(requested)
     }
 
     /// Every per-turn refusal of a resume turn, in C1 member order.

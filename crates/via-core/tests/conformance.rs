@@ -19,7 +19,7 @@ use via_adapters::observation::{Observation, ProgressMarks, UsageSample};
 use via_adapters::{
     AdapterConfig, AdapterSet, BOOTSTRAP_ENV, BootstrapEnv, Bound, CatalogModel, Category,
     CategoryDecl, DescribeRequest, InheritState, ModelSource, RefusalKind, RuntimeConfig,
-    SessionRef, Switch, TurnParams, Verb, VerbReq, harness_names, resolve_model,
+    SessionRef, Switch, TurnCheck, TurnParams, Verb, VerbReq, harness_names, resolve_model,
 };
 use via_store::Store;
 
@@ -216,10 +216,22 @@ fn conformance_adapter_version_chain() {
     let v3 = fake_set(&json!({"adapter_version":"3","compatible":["2"]}));
     let turn = TurnParams::default();
 
-    assert_eq!(v2.check_turn(&session("1"), &turn), Ok(()));
-    assert_eq!(v2.check_turn(&session("2"), &turn), Ok(()));
-    assert_eq!(v3.check_turn(&session("2"), &turn), Ok(()));
-    assert_eq!(v3.check_turn(&session("3"), &turn), Ok(()));
+    assert_eq!(
+        v2.check_turn(&session("1"), &turn),
+        Ok(TurnCheck::default())
+    );
+    assert_eq!(
+        v2.check_turn(&session("2"), &turn),
+        Ok(TurnCheck::default())
+    );
+    assert_eq!(
+        v3.check_turn(&session("2"), &turn),
+        Ok(TurnCheck::default())
+    );
+    assert_eq!(
+        v3.check_turn(&session("3"), &turn),
+        Ok(TurnCheck::default())
+    );
     assert_eq!(
         v3.plan(&describe(Some("fake"), None))
             .unwrap()
@@ -244,6 +256,38 @@ fn conformance_adapter_version_chain() {
     assert_eq!(
         v3.check_turn(&rerouted, &turn).unwrap_err().kind,
         RefusalKind::HarnessUnavailable
+    );
+}
+
+/// Sol r2 #4 (C2 `check_turn` → `TurnCheck`): `check_turn` reports the
+/// turn's bound as the route will apply it, normalized as the plan's
+/// `effective_bound` is; a turn with no bound has none.
+#[test]
+fn conformance_check_turn_reports_the_effective_bound() {
+    let normalized = json!({"mode":"full","extra_write_dirs":["/normalized"],"network":true});
+    let mut capabilities = partial_capabilities();
+    capabilities["bounds"] = json!(["full"]);
+    let set = fake_set(&json!({"capabilities": capabilities, "normalized_bound": normalized}));
+    let current = session(env!("CARGO_PKG_VERSION"));
+    let bound: Bound =
+        serde_json::from_value(json!({"mode":"full","extra_write_dirs":[],"network":true}))
+            .unwrap();
+    let checked = set
+        .check_turn(
+            &current,
+            &TurnParams {
+                bound: Some(bound),
+                ..TurnParams::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(checked.effective_bound).unwrap(),
+        normalized
+    );
+    assert_eq!(
+        set.check_turn(&current, &TurnParams::default()),
+        Ok(TurnCheck::default())
     );
 }
 
@@ -273,7 +317,10 @@ fn conformance_unknown_effort_refused() {
         ..TurnParams::default()
     };
     let current = session(env!("CARGO_PKG_VERSION"));
-    assert_eq!(set.check_turn(&current, &turn("low")), Ok(()));
+    assert_eq!(
+        set.check_turn(&current, &turn("low")),
+        Ok(TurnCheck::default())
+    );
     for effort in ["turbo", ""] {
         assert_eq!(
             set.check_turn(&current, &turn(effort)).unwrap_err().kind,
@@ -573,7 +620,10 @@ fn conformance_check_turn_refusals() {
         assert_eq!(refusal.kind, kind);
         assert_eq!(refusal.route, Some("fake"));
     }
-    assert_eq!(set.check_turn(&current, &TurnParams::default()), Ok(()));
+    assert_eq!(
+        set.check_turn(&current, &TurnParams::default()),
+        Ok(TurnCheck::default())
+    );
 
     let partial = fake_set(&json!({"capabilities": partial_capabilities()}));
     let mut request = describe(Some("fake"), None);

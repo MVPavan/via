@@ -1738,3 +1738,57 @@ fn conformance_intake_running_status_reports_the_accepted_instance() {
         daemon.stop().await;
     });
 }
+
+/// Sol r2 #4 (C2 `check_turn` → `TurnCheck`): a resume turn's effective
+/// bound is the one `check_turn` reports against the session's frozen
+/// route, not a fresh plan's. A daemon whose model catalog no longer
+/// lists the session's model still normalizes and runs the turn.
+#[test]
+fn conformance_intake_resume_bound_from_check_turn() {
+    let root = Root::new();
+    let normalized = json!({"mode":"full","extra_write_dirs":["/normalized"],"network":true});
+    let profile = |models: Value| {
+        json!({"capabilities": capabilities(&[("/bounds", json!(["full"]))]),
+               "normalized_bound": normalized, "models": models})
+    };
+    let scripts = [
+        script("one", &[accepted(1), terminal(1)]),
+        script_expecting(
+            &json!({"prompt":"two","bound":normalized}),
+            &[accepted(2), terminal(2)],
+        ),
+    ];
+    let v1 = root.scenario(
+        "v1.json",
+        &scenario(
+            &profile(json!([{"model":"fake-pro","aliases":["pro"]}])),
+            &scripts,
+        ),
+    );
+    let v2 = root.scenario(
+        "v2.json",
+        &scenario(&profile(json!([{"model":"fake-next"}])), &scripts),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &v1);
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"pro","prompt":"one"}))
+            .await;
+        assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+        daemon.stop().await;
+
+        let daemon = Daemon::open(&root, &v2);
+        let two = daemon
+            .try_resume(&session, &json!({"prompt":"two","bound":full_bound()}))
+            .await
+            .unwrap();
+        assert_eq!(two["effective"]["bound"], normalized, "{two}");
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        assert_eq!(
+            second["bound"],
+            json!({"requested":full_bound(),"effective":normalized,"inherited":false})
+        );
+        daemon.stop().await;
+    });
+}

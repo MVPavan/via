@@ -341,6 +341,14 @@ pub(crate) fn refused(refusal: &Refusal) -> ApiError {
 }
 
 /// The harness `route` serves, when this build knows it.
+/// The static name of a known `route`, as frozen in a session.
+pub(crate) fn route_name(route: &str) -> Option<&'static str> {
+    harness_names()
+        .filter_map(Harness::parse)
+        .map(Harness::route)
+        .find(|known| *known == route)
+}
+
 fn harness_of(route: &str) -> Option<&'static str> {
     harness_names()
         .filter_map(Harness::parse)
@@ -608,29 +616,6 @@ impl EffectiveBound {
             effective,
         })
     }
-}
-
-/// The effective bound of a resume turn's given `requested` bound (Sol r1
-/// #3): `check_turn` validates but does not normalize, so a fresh plan of
-/// the session's frozen harness, model and `cwd` gives it.
-pub(crate) fn resume_bound(
-    adapter: &AdapterSet,
-    frozen: &Frozen,
-    cwd: Option<&str>,
-    requested: Bound,
-) -> Result<EffectiveBound, ApiError> {
-    let request = DescribeRequest {
-        harness: Some(frozen.harness.clone()),
-        model: Some(frozen.model.clone()),
-        bound: Some(requested),
-        cwd: cwd.map(Into::into),
-        allow_untested: frozen.allow_untested,
-        ..DescribeRequest::default()
-    };
-    let plan = adapter
-        .plan(&request)
-        .map_err(|refusal| refused(&refusal))?;
-    EffectiveBound::of(request.bound.as_ref(), plan.effective_bound, plan.route)
 }
 
 /// A turn's values frozen at acceptance (C1 §3.2 `effective`, P5), as its

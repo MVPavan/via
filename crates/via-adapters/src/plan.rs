@@ -70,6 +70,14 @@ pub struct TurnParams {
     pub vendor: VendorOptions,
 }
 
+/// What `check_turn` reports of a resume turn it accepts (C2 §2).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TurnCheck {
+    /// The turn's bound as the route will apply it, like
+    /// [`RoutePlan::effective_bound`]; `None` when the turn sets none.
+    pub effective_bound: Option<Bound>,
+}
+
 /// The route identity a session stores and hands back on resume, reopen
 /// and recovery (AD12).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -580,8 +588,13 @@ impl AdapterSet {
     }
 
     /// Pure: validates a resume turn's values against the frozen route,
-    /// including AD12's adapter-version compatibility.
-    pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<(), Refusal> {
+    /// including AD12's adapter-version compatibility, and reports the
+    /// turn's bound as the route will apply it.
+    pub fn check_turn(
+        &self,
+        session: &SessionRef,
+        turn: &TurnParams,
+    ) -> Result<TurnCheck, Refusal> {
         let harness = Harness::parse(&session.harness).ok_or_else(|| unavailable(None))?;
         let route = harness.route();
         let adapter = self
@@ -591,7 +604,12 @@ impl AdapterSet {
         adapter.check_version(route, &session.adapter_version)?;
         match adapter.check_turn(route, turn).into_iter().next() {
             Some(refusal) => Err(refusal),
-            None => Ok(()),
+            None => Ok(TurnCheck {
+                effective_bound: turn
+                    .bound
+                    .clone()
+                    .map(|bound| adapter.effective_bound(bound)),
+            }),
         }
     }
 
