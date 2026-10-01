@@ -380,20 +380,21 @@ pub(super) async fn commit_event_at(
     body: EventBody,
     at: &str,
 ) {
-    let own = (record.turn.get(), false);
+    let own = (Some(record.turn.get()), false);
     commit_event_as(journal, record, body, at, own).await;
 }
 
 /// [`commit_event_at`] attributed to `(turn, late)`: a late observation of
 /// an earlier turn is committed under the running turn's record, the one
-/// the Store admits events for, with its own turn and `late: true` (C1
-/// §6.1, AD4). Returns the event's sequence once it committed.
+/// the Store admits events for, with its own turn and `late: true`, and a
+/// session-level one with `turn: null` (C1 §6.1, AD4). Returns the event's
+/// sequence once it committed.
 pub(super) async fn commit_event_as(
     journal: &impl TurnJournal,
     record: &mut TurnRecord,
     body: EventBody,
     at: &str,
-    (turn, late): (u32, bool),
+    (turn, late): (Option<u32>, bool),
 ) -> Option<u64> {
     if record.first_failure.is_some() {
         return None;
@@ -417,7 +418,7 @@ pub(super) async fn commit_event_as(
     let event = Event {
         seq,
         session_id: &record.session,
-        turn: Some(turn),
+        turn,
         late,
         at,
         body,

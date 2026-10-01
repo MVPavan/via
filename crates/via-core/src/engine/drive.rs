@@ -1587,9 +1587,21 @@ impl Engine {
         let attribution = lane.map_or(Attribution::Current, |lane| {
             lane.attribute(vendor_turn.as_deref(), Some(record.turn))
         });
-        if let Attribution::Late(turn) = attribution {
-            self.observe_late(record, turn, item.observation).await;
-            return;
+        match attribution {
+            Attribution::Current => {}
+            Attribution::Late(turn) => {
+                self.observe_other(record, (Some(turn.get()), true), item.observation)
+                    .await;
+                return;
+            }
+            Attribution::Session => {
+                self.observe_other(record, (None, false), item.observation)
+                    .await;
+                return;
+            }
+            // C2 §2: an expired vendor turn's traffic is dropped; it is
+            // never another turn's or the session's.
+            Attribution::Expired => return,
         }
         match item.observation {
             Observation::Accepted(acceptance) => {
@@ -1657,11 +1669,11 @@ impl Engine {
                 record.vendor.identity = Some(identity);
             }
             Observation::ActionDenied(denial) => {
-                let own = (record.turn.get(), false);
+                let own = (Some(record.turn.get()), false);
                 self.commit_denial(record, own, denial).await;
             }
             Observation::RequestDeclined(decline) => {
-                let own = (record.turn.get(), false);
+                let own = (Some(record.turn.get()), false);
                 self.commit_decline(record, own, decline).await;
             }
             // C2 §4: a mismatch commits nothing itself; the turn is
@@ -1736,22 +1748,25 @@ impl Engine {
         }
     }
 
-    /// A late observation of `turn`, already ended (AD4, C1 §6.1): a
-    /// durable one, a denial or a decline, is committed `late: true` under
-    /// the running turn, the one the Store admits events for; it never
-    /// changes `turn`'s envelope. Non-durable ones are dropped, and so is a
-    /// late terminal: the Store has no revision write yet.
-    async fn observe_late(
+    /// An observation that is not the running turn's (AD4, C1 §6.1, C2
+    /// §2), attributed to `(turn, late)`: of an earlier, ended turn with
+    /// `late: true`, or session-level with `turn: null`. A durable one, a
+    /// denial or a decline, is committed under the running turn, the one
+    /// the Store admits events for; it never changes an envelope.
+    /// Non-durable ones are dropped, and so is a late terminal: the Store
+    /// has no revision write yet.
+    async fn observe_other(
         &self,
         record: &mut TurnRecord,
-        turn: TurnNumber,
+        attributed: (Option<u32>, bool),
         observation: Observation,
     ) {
-        let late = (turn.get(), true);
         match observation {
-            Observation::ActionDenied(denial) => self.commit_denial(record, late, denial).await,
+            Observation::ActionDenied(denial) => {
+                self.commit_denial(record, attributed, denial).await;
+            }
             Observation::RequestDeclined(decline) => {
-                self.commit_decline(record, late, decline).await;
+                self.commit_decline(record, attributed, decline).await;
             }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
@@ -1770,7 +1785,7 @@ impl Engine {
     async fn commit_denial(
         &self,
         record: &mut TurnRecord,
-        (turn, late): (u32, bool),
+        (turn, late): (Option<u32>, bool),
         denial: Denial,
     ) {
         let kind = denial_kind(denial.kind);
@@ -1783,7 +1798,8 @@ impl Engine {
         let failed = record.first_failure.is_some();
         let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
         self.report_first_failure(record, failed).await;
-        if let (Some(seq), false) = (seq, late) {
+        let own = turn == Some(record.turn.get()) && !late;
+        if let (Some(seq), true) = (seq, own) {
             let entry = DeniedAction::new((kind, denial.target, denial.reason), at, seq);
             record.vendor.denied.push(entry);
         }
@@ -1795,7 +1811,7 @@ impl Engine {
     async fn commit_decline(
         &self,
         record: &mut TurnRecord,
-        (turn, late): (u32, bool),
+        (turn, late): (Option<u32>, bool),
         decline: Decline,
     ) {
         let at = rfc3339(SystemTime::now());
@@ -1807,7 +1823,8 @@ impl Engine {
         let failed = record.first_failure.is_some();
         let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
         self.report_first_failure(record, failed).await;
-        if let (Some(seq), false) = (seq, late) {
+        let own = turn == Some(record.turn.get()) && !late;
+        if let (Some(seq), true) = (seq, own) {
             let entry = AutoDeclined::new(
                 (decline.vendor_method, decline.summary, decline.blocking),
                 at,

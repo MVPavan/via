@@ -2787,10 +2787,16 @@ fn without_a_latch_unjoined_sessions_count_by_their_durable_state() {
 /// (14) AD4, C1 §6.1: a denial naming an earlier, ended turn's vendor turn
 /// arrives while turn 2 runs. It is committed `action.denied` with that
 /// turn's number and `late: true`, under the running turn, and stays out
-/// of turn 2's `denied_actions`; turn 2's own denial is kept there. The
-/// fake cannot emit it end to end: its decoder refuses a denial naming
-/// another turn, and its persistent helper retires at the terminal.
+/// of turn 2's `denied_actions`; turn 2's own denial is kept there. Sol r1
+/// F6 (C2 §2): one naming a genuinely unseen vendor turn is session-level,
+/// `turn: null`, and one naming a vendor turn evicted past the 64-mapping
+/// bound is dropped; neither reaches turn 2's list. The end-to-end case is
+/// `conformance_core`'s.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one running turn receives each attribution class"
+)]
 fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     let Some(root) = child("a_late_denial_is_committed_late_and_kept_out_of_the_running_turn")
     else {
@@ -2833,7 +2839,13 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
         let (_route, orders) =
             slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
         let lane = engine.lane(&session, "fake", root.clone()).await;
+        // `gone` is evicted by the bound's worth of later vendor turns.
+        lane.map_vendor_turn("gone", turn(1));
+        for filler in 1..super::lane::VENDOR_TURNS {
+            lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
+        }
         lane.map_vendor_turn("fake-turn-1", turn(1));
+        lane.map_vendor_turn("fake-turn-2", turn(2));
         let mut record = super::TurnRecord {
             session: session.clone(),
             turn: turn(2),
@@ -2860,7 +2872,12 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
                 reason: "policy".to_owned(),
             }),
         };
-        let queued = vec![denial("fake-turn-1", "late"), denial("fake-turn-2", "own")];
+        let queued = vec![
+            denial("fake-turn-1", "late"),
+            denial("fake-turn-2", "own"),
+            denial("stranger", "session"),
+            denial("gone", "expired"),
+        ];
         engine
             .drain_queued(
                 (&slot, Some(&lane)),
@@ -2878,7 +2895,7 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
             .iter()
             .filter(|event| event["type"] == "action.denied")
             .collect();
-        assert_eq!(denied.len(), 2, "{page}");
+        assert_eq!(denied.len(), 3, "{page}");
         assert_eq!(
             (&denied[0]["turn"], &denied[0]["late"], &denied[0]["target"]),
             (&json!(1), &json!(true), &json!("late")),
@@ -2887,6 +2904,11 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
         assert_eq!(
             (&denied[1]["turn"], &denied[1]["late"], &denied[1]["target"]),
             (&json!(2), &json!(false), &json!("own")),
+            "{page}"
+        );
+        assert_eq!(
+            (&denied[2]["turn"], &denied[2]["late"], &denied[2]["target"]),
+            (&Value::Null, &json!(false), &json!("session")),
             "{page}"
         );
         let (kept, total) = record.vendor.denied.into_parts();

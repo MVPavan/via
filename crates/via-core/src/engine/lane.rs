@@ -31,7 +31,11 @@ use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
 /// dropped.
-const VENDOR_TURNS: usize = 64;
+pub(super) const VENDOR_TURNS: usize = 64;
+
+/// Tombstones a lane keeps of vendor turns whose mapping expired (C2 §2):
+/// 64-bit hashes, so the bound is small whatever the IDs' length.
+const TOMBSTONES: usize = 1024;
 
 /// How long replacing a failed driver waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
@@ -50,6 +54,8 @@ pub(super) struct Lane {
 struct LaneState {
     /// Vendor turn IDs of the session's accepted turns, oldest first.
     turns: VecDeque<(String, TurnNumber)>,
+    /// Hashes of vendor turn IDs whose mapping expired, oldest first.
+    tombstones: VecDeque<u64>,
     /// The session's confirmed vendor identity.
     identity: Option<Identity>,
 }
@@ -64,10 +70,93 @@ pub(super) struct Identity {
 /// Which turn an observation belongs to (C1 §6.1, AD4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Attribution {
-    /// The running turn, or the session between turns.
+    /// The running turn.
     Current,
     /// An earlier turn of the session, already ended: a late observation.
     Late(TurnNumber),
+    /// No turn: the session's, a vendor turn genuinely unseen (`turn: null`).
+    Session,
+    /// A vendor turn whose mapping expired, past the bound or with a
+    /// replaced lane: its traffic is dropped.
+    Expired,
+}
+
+impl LaneState {
+    /// A replacing lane's state (C2 §2 health): the confirmed identity,
+    /// with every vendor turn the failed lane mapped or tombstoned now
+    /// tombstoned, so its traffic never becomes current or session-level.
+    fn successor(&self) -> Self {
+        let mut successor = Self {
+            turns: VecDeque::new(),
+            tombstones: self.tombstones.clone(),
+            identity: self.identity.clone(),
+        };
+        for (vendor_turn, _) in &self.turns {
+            successor.tombstone(vendor_turn);
+        }
+        successor
+    }
+
+    /// Records `vendor_turn` as `turn`'s, the newest; the oldest mapping
+    /// past the bound is tombstoned.
+    fn map(&mut self, vendor_turn: &str, turn: TurnNumber) {
+        if self.turns.iter().any(|(known, _)| known == vendor_turn) {
+            return;
+        }
+        if self.turns.len() == VENDOR_TURNS
+            && let Some((expired, _)) = self.turns.pop_front()
+        {
+            self.tombstone(&expired);
+        }
+        self.turns.push_back((vendor_turn.to_owned(), turn));
+    }
+
+    /// Keeps `vendor_turn`'s tombstone, the oldest dropped past the bound.
+    fn tombstone(&mut self, vendor_turn: &str) {
+        if self.tombstones.len() == TOMBSTONES {
+            self.tombstones.pop_front();
+        }
+        self.tombstones.push_back(tombstone_of(vendor_turn));
+    }
+
+    /// The turn an item naming `vendor_turn` belongs to while `running`
+    /// runs, or between turns with `None` (C2 §2): a mapped vendor turn is
+    /// the running turn's or an earlier turn's (late), and a tombstoned
+    /// one has expired. A genuinely unseen one, or none, is the running
+    /// turn's while that turn has no vendor turn of its own yet (it names
+    /// it at acceptance), else session-level.
+    fn attribute(&self, vendor_turn: Option<&str>, running: Option<TurnNumber>) -> Attribution {
+        if let Some(vendor_turn) = vendor_turn {
+            let known = self
+                .turns
+                .iter()
+                .find(|(known, _)| known == vendor_turn)
+                .map(|(_, turn)| *turn);
+            match known {
+                Some(turn) if Some(turn) == running => return Attribution::Current,
+                Some(turn) => return Attribution::Late(turn),
+                None if self.tombstones.contains(&tombstone_of(vendor_turn)) => {
+                    return Attribution::Expired;
+                }
+                None => {}
+            }
+        }
+        match running {
+            Some(running) if vendor_turn.is_none() || !self.mapped(running) => Attribution::Current,
+            Some(_) | None => Attribution::Session,
+        }
+    }
+
+    /// Whether `turn` has its vendor turn mapped.
+    fn mapped(&self, turn: TurnNumber) -> bool {
+        self.turns.iter().any(|(_, mapped)| *mapped == turn)
+    }
+}
+
+/// A vendor turn ID's tombstone: its 64-bit hash, the same in every lane.
+fn tombstone_of(vendor_turn: &str) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(vendor_turn)
 }
 
 impl Lane {
@@ -79,35 +168,17 @@ impl Lane {
 
     /// Records `vendor_turn` as `turn`'s, the newest.
     pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) {
-        let mut state = lock(&self.state);
-        if state.turns.iter().any(|(known, _)| known == vendor_turn) {
-            return;
-        }
-        if state.turns.len() == VENDOR_TURNS {
-            state.turns.pop_front();
-        }
-        state.turns.push_back((vendor_turn.to_owned(), turn));
+        lock(&self.state).map(vendor_turn, turn);
     }
 
     /// The turn an item naming `vendor_turn` belongs to while `running`
-    /// runs, or between turns with `None`: a vendor turn of an earlier turn
-    /// is late; one not yet known is the running turn's.
+    /// runs, or between turns with `None` ([`LaneState::attribute`]).
     pub(super) fn attribute(
         &self,
         vendor_turn: Option<&str>,
         running: Option<TurnNumber>,
     ) -> Attribution {
-        let known = vendor_turn.and_then(|vendor_turn| {
-            lock(&self.state)
-                .turns
-                .iter()
-                .find(|(known, _)| known == vendor_turn)
-                .map(|(_, turn)| *turn)
-        });
-        match known {
-            Some(turn) if Some(turn) != running => Attribution::Late(turn),
-            Some(_) | None => Attribution::Current,
-        }
+        lock(&self.state).attribute(vendor_turn, running)
     }
 
     /// The session's confirmed identity, as the lane last saw it.
@@ -203,14 +274,14 @@ impl Engine {
     /// fails (design §7.3), so dispatch does not read it.
     pub(super) async fn lane(&self, session: &SessionId, model: &str, cwd: PathBuf) -> Arc<Lane> {
         let kept = lock(&self.lanes).get(session).cloned();
-        let mut identity = None;
+        let mut state = LaneState::default();
         if let Some(lane) = kept {
             if !lane.failed() {
                 return lane;
             }
             // C2 §2: no turn runs on a failed driver's connection.
             lock(&self.lanes).remove(session);
-            identity = lane.identity();
+            state = lock(&lane.state).successor();
             let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
             let _report = lane.driver.close(CloseMode::Force, deadline).await;
         }
@@ -229,7 +300,8 @@ impl Engine {
             cwd,
             vendor: VendorOptions::new(),
             inherit: Inherit::OD2_DEFAULT,
-            confirmed_vendor_session_id: identity
+            confirmed_vendor_session_id: state
+                .identity
                 .as_ref()
                 .map(|identity: &Identity| identity.vendor_session_id.clone()),
             allow_untested: false,
@@ -243,10 +315,7 @@ impl Engine {
         let lane = Arc::new(Lane {
             driver: self.adapter.open_session(&reference, spec, cx),
             observations: tokio::sync::Mutex::new(receiver),
-            state: StdMutex::new(LaneState {
-                turns: VecDeque::new(),
-                identity,
-            }),
+            state: StdMutex::new(state),
         });
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
         lane
@@ -272,5 +341,69 @@ impl Engine {
         self.cancel.cancel();
         self.tracker.close();
         lock(&self.lanes).clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attribution, LaneState, VENDOR_TURNS};
+    use crate::TurnNumber;
+
+    fn turn(number: u32) -> TurnNumber {
+        TurnNumber::try_from(number).expect("a turn number")
+    }
+
+    /// Sol r1 F6 (C2 §2 observations): a mapped vendor turn is the running
+    /// turn's or an earlier turn's (late); a genuinely unseen one is the
+    /// running turn's only before that turn has its own vendor turn, and
+    /// otherwise, or between turns, session-level; one evicted past the
+    /// bound, or held by a replaced lane, has expired.
+    #[test]
+    fn vendor_turns_attribute_current_late_session_or_expired() {
+        let mut state = LaneState::default();
+        // Before turn 1 maps its vendor turn, unseen traffic is its own.
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(1))),
+            Attribution::Current
+        );
+        assert_eq!(state.attribute(None, Some(turn(1))), Attribution::Current);
+        state.map("v1", turn(1));
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(1))),
+            Attribution::Current
+        );
+        assert_eq!(
+            state.attribute(Some("x"), Some(turn(1))),
+            Attribution::Session
+        );
+        // Between turns.
+        assert_eq!(
+            state.attribute(Some("v1"), None),
+            Attribution::Late(turn(1))
+        );
+        assert_eq!(state.attribute(Some("x"), None), Attribution::Session);
+        assert_eq!(state.attribute(None, None), Attribution::Session);
+        // `v1` is evicted by the bound's worth of later vendor turns.
+        for number in 2..=u32::try_from(VENDOR_TURNS).expect("a small bound") + 1 {
+            state.map(&format!("v{number}"), turn(number));
+        }
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(65))),
+            Attribution::Expired
+        );
+        assert_eq!(
+            state.attribute(Some("v2"), Some(turn(65))),
+            Attribution::Late(turn(2))
+        );
+        // A replacing lane keeps none of the mappings: all expired.
+        let successor = state.successor();
+        for id in ["v1", "v2", "v65"] {
+            assert_eq!(
+                successor.attribute(Some(id), None),
+                Attribution::Expired,
+                "{id}"
+            );
+        }
+        assert_eq!(successor.attribute(Some("x"), None), Attribution::Session);
     }
 }
