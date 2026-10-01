@@ -10,7 +10,7 @@ mod daemon;
 #[path = "support/evidenced.rs"]
 #[expect(
     dead_code,
-    reason = "shared support; this file tears down with its own one-deadline fallback"
+    reason = "shared support; this file tears down with its own owned-child fallback"
 )]
 mod evidenced;
 #[path = "support/outer_cleanup.rs"]
@@ -23,15 +23,15 @@ mod process;
 mod scenario;
 mod support;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use evidenced::evidenced;
@@ -44,8 +44,10 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const CREDENTIALS: [&str; 3] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "VIA_UNLISTED_SECRET"];
 
 /// One isolated deployment whose CLI runs with a known environment: every
-/// bootstrap name set, plus credential-like names. Its drop force-stops
-/// whatever daemon the CLI auto-started and collects the evidence.
+/// bootstrap name set, plus credential-like names. Its daemon is its own
+/// direct child ([`Sandbox::start_daemon`]), or, for the auto-start
+/// scenario only, the one the CLI started. Its drop stops the daemon and
+/// collects the evidence.
 struct Sandbox {
     root: tempfile::TempDir,
     state: PathBuf,
@@ -59,6 +61,10 @@ struct Sandbox {
     teardown: outer_cleanup::Teardown,
     /// Cleared by a scenario whose daemon never opens a Store.
     store: bool,
+    /// The directly owned daemon, the only process teardown may signal.
+    daemon: Option<Child>,
+    /// The teardown's one deadline, once it began.
+    deadline: Rc<Cell<Option<Instant>>>,
 }
 
 impl Sandbox {
@@ -90,7 +96,41 @@ impl Sandbox {
             evidence,
             teardown: outer_cleanup::Teardown::new(),
             store: true,
+            daemon: None,
+            deadline: Rc::default(),
         })
+    }
+
+    /// Starts `via daemon` as this sandbox's directly owned child, with
+    /// the CLI's environment and roots, its stderr traced, and waits until
+    /// it serves the sandbox's socket. Teardown signals it only through
+    /// this retained handle (runtime §11.2).
+    fn start_daemon(&mut self) -> TestResult<u32> {
+        let trace = fs::File::create(self.root.path().join("daemon.trace"))?;
+        let child = self
+            .command()
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(trace)
+            .spawn()?;
+        let pid = child.id();
+        let child = self.daemon.insert(child);
+        let by = Instant::now() + Duration::from_secs(20);
+        loop {
+            if daemon::serving_pid(&self.runtime) == Some(pid) {
+                return Ok(pid);
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(format!("daemon {pid} exited before serving: {status}").into());
+            }
+            if Instant::now() >= by {
+                return Err(Box::new(ScenarioError::Timeout(format!(
+                    "daemon {pid} did not serve within 20 s"
+                ))));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn command(&self) -> Command {
@@ -156,11 +196,13 @@ impl Sandbox {
 const FALLBACK_SHARE: Duration = Duration::from_secs(2);
 const ANCHOR_SHARE: Duration = Duration::from_secs(3);
 
-/// Every daemon the CLI auto-started is force-stopped and proved gone,
-/// then the evidence is collected (runtime §11.2). When the ordinary stop
-/// leaves a sandbox process alive, it is killed by identity within the
-/// fallback's share of the deadline, and the incomplete clean stop is
-/// recorded as a cleanup failure.
+/// The sandbox's daemon is force-stopped and proved gone, then the
+/// evidence is collected (runtime §11.2). Only the directly owned daemon
+/// is ever signalled, by its retained child handle, when the ordinary stop
+/// left it running; that incomplete clean stop is a cleanup failure. A
+/// daemon the CLI auto-started has no handle and is never signalled: an
+/// exit not proved is recorded with the processes observed, the sandbox
+/// is kept and the scenario fails.
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(evidence) = self.evidence.take() {
@@ -182,25 +224,30 @@ impl Drop for Sandbox {
 }
 
 impl Sandbox {
-    /// [`evidenced::stop_daemons`]' proof with the kill fallback, all under
-    /// the teardown's one deadline.
-    fn tear_down(&self) -> evidenced::Exited {
+    /// [`evidenced::stop_daemons`]' proof with the owned-child fallback,
+    /// all under the teardown's one deadline. `/proc` is only observed,
+    /// each scan by its cutoff.
+    fn tear_down(&mut self) -> evidenced::Exited {
         let deadline = self.teardown.begin();
+        self.deadline.set(Some(deadline));
         let kill_by = deadline.checked_sub(ANCHOR_SHARE).unwrap_or(deadline);
         let stop_by = kill_by.checked_sub(FALLBACK_SHARE).unwrap_or(kill_by);
-        let scan = || evidenced::scan_processes(&self.runtime, &self.state, |path| fs::read(path));
+        let scan = |cutoff| {
+            evidenced::scan_processes_by(&self.runtime, &self.state, Some(cutoff), read_capped)
+        };
         let mut failures = Vec::new();
+        let mut observed = Vec::new();
         let mut stopped = false;
         let mut proof = loop {
-            match scan() {
+            match scan(stop_by) {
                 Ok(alive) if alive.is_empty() => break Ok(()),
-                Ok(alive) if Instant::now() >= stop_by => {
+                Ok(alive) => observed = alive,
+                Err(reason) if observed.is_empty() => break Err(reason),
+                Err(reason) => {
                     break Err(format!(
-                        "sandbox processes {alive:?} did not exit after the ordinary stop"
+                        "sandbox processes {observed:?} did not exit after the ordinary stop ({reason})"
                     ));
                 }
-                Ok(_) => {}
-                Err(error) => break Err(error),
             }
             if stopped {
                 std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(stop_by)));
@@ -214,31 +261,40 @@ impl Sandbox {
                     .record(json!({"generation":"sandbox_stop","stop":record}), failure);
             }
         };
-        if let Err(error) = &proof {
-            let killed = match scan() {
-                Ok(pids) => kill_candidates(
-                    &pids,
-                    &self.runtime,
-                    &self.state,
-                    &|path| fs::read(path),
-                    kill_by,
-                ),
-                Err(reason) => json!({"status":"scan_failed","reason":reason}),
-            };
+        if let Some(mut child) = self.daemon.take() {
+            let pid = child.id();
+            if let Err(error) = &proof {
+                let killed = child.kill().map_err(|error| error.to_string());
+                failures.push(format!(
+                    "the ordinary stop left the sandbox's daemon running ({error}); \
+                     killed its retained child {pid}: {killed:?}"
+                ));
+            }
+            if !outer_cleanup::reap_by(&mut child, kill_by) {
+                failures.push(format!(
+                    "daemon child {pid} was not reaped by the fallback's deadline"
+                ));
+            }
+            if proof.is_err() {
+                proof = match scan(kill_by) {
+                    Ok(alive) if alive.is_empty() => Ok(()),
+                    Ok(alive) => Err(format!(
+                        "sandbox processes {alive:?} survived; nothing else signalled"
+                    )),
+                    Err(reason) => Err(reason),
+                };
+            }
+        } else if let Err(error) = &proof {
             failures.push(format!(
-                "the ordinary stop left the sandbox's daemon running ({error}); killed: {killed}"
+                "the sandbox's exit is unproven ({error}); nothing signalled: \
+                 no retained child handle"
             ));
-            proof = match scan() {
-                Ok(alive) if alive.is_empty() => Ok(()),
-                Ok(alive) => Err(format!("sandbox processes {alive:?} survived the kill")),
-                Err(reason) => Err(reason),
-            };
         }
         if proof.is_ok() {
             proof = locks_released(&self.runtime, &self.state, kill_by);
         }
         if Instant::now() > kill_by {
-            failures.push("the kill fallback overran its share of the teardown deadline".into());
+            failures.push("the teardown overran the fallback's share of its deadline".into());
         }
         let (_, mut recorded) = self.teardown.report();
         recorded.extend(failures);
@@ -249,6 +305,30 @@ impl Sandbox {
             failures: recorded,
         }
     }
+
+    /// Stops (SIGSTOP) the directly owned daemon through its retained
+    /// handle, checked unreaped first: only this process reaps it, so its
+    /// pid cannot name another process.
+    fn pause_daemon(&mut self) -> TestResult {
+        let child = self.daemon.as_mut().ok_or("no directly owned daemon")?;
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("the daemon already exited: {status}").into());
+        }
+        let pid = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("invalid daemon pid")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP)?;
+        Ok(())
+    }
+}
+
+/// At most `cap` bytes of `path`: the teardown's `/proc` reads.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(cap).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Neither `daemon.lock` nor `store.lock` is still held, by `by`.
@@ -291,165 +371,6 @@ fn parse_stat(bytes: &[u8]) -> Option<(u32, char, u64)> {
     Some((pid, state, start))
 }
 
-/// The pid the kernel reports for `pidfd` in `/proc/self/fdinfo`; `None`
-/// once its process was reaped (`Pid: -1`).
-fn pidfd_pid(pidfd: &OwnedFd) -> Result<Option<u32>, String> {
-    let path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
-    let text = fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
-    let value = text
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:"))
-        .ok_or_else(|| format!("{path} has no Pid"))?
-        .trim();
-    if value == "-1" {
-        return Ok(None);
-    }
-    value
-        .parse()
-        .map(Some)
-        .map_err(|_| format!("{path}: malformed Pid {value:?}"))
-}
-
-/// How the kill fallback reads `/proc`: `fs::read`, or a test's seam.
-type ProcRead<'a> = dyn Fn(&Path) -> std::io::Result<Vec<u8>> + 'a;
-
-/// A candidate process after [`pin_member`].
-enum Pinned {
-    /// A sandbox process, held by its pidfd.
-    Member(OwnedFd),
-    /// It had exited: nothing to signal.
-    Gone,
-    /// Not provably the sandbox's: never signalled.
-    Skipped(&'static str),
-}
-
-/// Pins `pid` before judging it (Sol r2 N1): opens its pidfd first, then
-/// reads its environment and stat through `read`, then confirms through
-/// the pidfd that the process is still `pid`, unreaped. A process holds
-/// its pid until it is reaped, so the reads, made between the pidfd's open
-/// and that confirmation, were of the pidfd's own process. It is the
-/// sandbox's when its environment names the sandbox's runtime or State
-/// directory, as every `via` process of the sandbox carries. Errors other
-/// than disappearance are returned, never read as absence (N4).
-fn pin_member(
-    pid: u32,
-    runtime: &Path,
-    state: &Path,
-    read: &ProcRead<'_>,
-) -> Result<Pinned, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let target = i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .ok_or_else(|| format!("invalid pid {pid}"))?;
-    let pidfd = match rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()) {
-        Ok(pidfd) => pidfd,
-        Err(rustix::io::Errno::SRCH) => return Ok(Pinned::Gone),
-        Err(error) => return Err(format!("pidfd_open({pid}): {error}")),
-    };
-    let proc = PathBuf::from(format!("/proc/{pid}"));
-    let environ = match read(&proc.join("environ")) {
-        Ok(environ) => environ,
-        Err(error) if vanished(&error) => return Ok(Pinned::Gone),
-        Err(error) => return Err(format!("{pid} environ: {error}")),
-    };
-    let marks = [
-        [
-            b"VIA_RUNTIME_DIR=".as_slice(),
-            runtime.as_os_str().as_bytes(),
-        ]
-        .concat(),
-        [b"VIA_STATE_DIR=".as_slice(), state.as_os_str().as_bytes()].concat(),
-    ];
-    if !environ
-        .split(|byte| *byte == 0)
-        .any(|variable| marks.iter().any(|mark| variable == mark.as_slice()))
-    {
-        return Ok(Pinned::Skipped("not a sandbox process"));
-    }
-    let stat = match read(&proc.join("stat")) {
-        Ok(stat) => stat,
-        Err(error) if vanished(&error) => return Ok(Pinned::Gone),
-        Err(error) => return Err(format!("{pid} stat: {error}")),
-    };
-    let (stat_pid, process_state, _) =
-        parse_stat(&stat).ok_or_else(|| format!("{pid} stat: malformed"))?;
-    if process_state == 'Z' {
-        return Ok(Pinned::Gone);
-    }
-    match pidfd_pid(&pidfd)? {
-        None => Ok(Pinned::Gone),
-        Some(held) if held == pid && stat_pid == pid => Ok(Pinned::Member(pidfd)),
-        Some(_) => Ok(Pinned::Skipped("its /proc data is another process's")),
-    }
-}
-
-/// Whether the pinned process `pid` has exited: reaped (its pidfd reports
-/// no pid), vanished, or a zombie. Observation errors are returned.
-fn pinned_exited(pidfd: &OwnedFd, pid: u32) -> Result<bool, String> {
-    if pidfd_pid(pidfd)?.is_none() {
-        return Ok(true);
-    }
-    match fs::read(format!("/proc/{pid}/stat")) {
-        Ok(stat) => parse_stat(&stat)
-            .map(|(_, state, _)| state == 'Z')
-            .ok_or_else(|| format!("{pid} stat: malformed")),
-        Err(error) if vanished(&error) => Ok(true),
-        Err(error) => Err(format!("{pid} stat: {error}")),
-    }
-}
-
-/// The kill fallback over the `candidates` a scan named, reading `/proc`
-/// through `read` (the test seam): each is pinned ([`pin_member`]), killed
-/// through its pidfd and waited for until `kill_by`, the fallback's share
-/// of the one teardown deadline. Once `kill_by` has passed, no candidate
-/// is pinned or signalled: each left is recorded `deadline_passed`.
-/// Returns one record per candidate.
-fn kill_candidates(
-    candidates: &[u32],
-    runtime: &Path,
-    state: &Path,
-    read: &ProcRead<'_>,
-    kill_by: Instant,
-) -> Value {
-    candidates
-        .iter()
-        .map(|&pid| {
-            let expired = || json!({"pid":pid,"status":"deadline_passed"});
-            if Instant::now() >= kill_by {
-                return expired();
-            }
-            let pidfd = match pin_member(pid, runtime, state, read) {
-                Ok(Pinned::Member(pidfd)) => pidfd,
-                Ok(Pinned::Gone) => return json!({"pid":pid,"status":"gone"}),
-                Ok(Pinned::Skipped(reason)) => {
-                    return json!({"pid":pid,"status":"skipped","reason":reason});
-                }
-                Err(reason) => return json!({"pid":pid,"status":"unknown","reason":reason}),
-            };
-            if Instant::now() >= kill_by {
-                return expired();
-            }
-            match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                Err(error) => {
-                    return json!({"pid":pid,"status":"kill_failed","reason":error.to_string()});
-                }
-            }
-            loop {
-                match pinned_exited(&pidfd, pid) {
-                    Ok(true) => return json!({"pid":pid,"status":"gone"}),
-                    Ok(false) if Instant::now() < kill_by => std::thread::sleep(
-                        Duration::from_millis(10).min(outer_cleanup::left(kill_by)),
-                    ),
-                    Ok(false) => return json!({"pid":pid,"status":"alive_at_deadline"}),
-                    Err(reason) => return json!({"pid":pid,"status":"unknown","reason":reason}),
-                }
-            }
-        })
-        .collect()
-}
-
 /// Whether the process `pid` that started at `start` has exited: vanished,
 /// a zombie, or its pid now another process's. Observation errors are
 /// returned (N4).
@@ -461,6 +382,25 @@ fn gone(pid: u32, start: u64) -> TestResult<bool> {
         }
         Err(error) if vanished(&error) => Ok(true),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the process `pid` that started at `start` outlived its
+/// teardown, observed until that teardown's own `deadline` (critical r1
+/// #4): never signalled and given no new budget. A survivor at the
+/// deadline is reported uncertain.
+fn survived(pid: u32, start: u64, deadline: Instant) -> TestResult<Option<String>> {
+    loop {
+        if gone(pid, start)? {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some(format!(
+                "process {pid} survived its teardown: uncertain at the teardown deadline; \
+                 nothing signalled"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10).min(outer_cleanup::left(deadline)));
     }
 }
 
@@ -569,7 +509,7 @@ fn marking_script(path: &Path, marker: &Path) -> TestResult {
 #[test]
 fn s_launch_describe_starts_nothing() -> TestResult {
     evidenced(|| {
-        let sandbox = Sandbox::new()?;
+        let mut sandbox = Sandbox::new()?;
         let marker = sandbox.root.path().join("ran.marker");
         let pinned = sandbox.root.path().join("pinned");
         daemon::private_dir(&pinned)?;
@@ -586,7 +526,7 @@ fn s_launch_describe_starts_nothing() -> TestResult {
             }})
             .to_string(),
         )?;
-        auto_started(&sandbox)?;
+        sandbox.start_daemon()?;
         let mut outcomes = Vec::new();
         for harness in ["claude", "codex", "opencode"] {
             let described = sandbox.run(&["describe", "--harness", harness, "--json"])?;
@@ -629,6 +569,12 @@ fn listing(dir: &Path, into: &mut BTreeMap<PathBuf, (u64, SystemTime)>) -> TestR
         }
     }
     Ok(())
+}
+
+/// `via daemon` in the foreground, by `timeout`: a run that outlives it
+/// is a typed timeout with its cleanup notes ([`Sandbox::run_within`]).
+fn foreground_daemon(sandbox: &Sandbox, timeout: Duration) -> TestResult<Captured> {
+    sandbox.run_within(&["daemon"], timeout)
 }
 
 /// Runtime §8, design §5.4: an invalid `harnesses` is an invalid
@@ -684,9 +630,7 @@ fn s_launch_invalid_harnesses_refuse_start() -> TestResult {
             let mut before = BTreeMap::new();
             listing(&sandbox.state, &mut before)?;
             listing(&sandbox.runtime, &mut before)?;
-            let mut command = sandbox.command();
-            command.arg("daemon");
-            let run = run_command(&mut command, Duration::from_secs(10))?;
+            let run = foreground_daemon(&sandbox, Duration::from_secs(10))?;
             let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
             let prefix = format!("via: daemon config invalid: {key}: ");
             check(
@@ -711,33 +655,26 @@ fn s_launch_invalid_harnesses_refuse_start() -> TestResult {
     })
 }
 
-/// Sol r1 #2, runtime §11.2: a daemon whose stop request cannot be served
-/// (here, stopped by SIGSTOP) is still gone after the sandbox's teardown,
-/// killed by identity after the ordinary stop, and the incomplete clean
-/// stop fails the scenario.
+/// Sol r1 #2, critical r1 #1, runtime §11.2: a directly owned daemon
+/// whose stop request cannot be served (here, stopped by SIGSTOP) is
+/// killed by its retained child handle and reaped within the teardown's
+/// deadline, and the incomplete clean stop fails the scenario.
 #[test]
 fn s_launch_teardown_kills_an_unresponsive_daemon() -> TestResult {
     let mut paused = None;
+    let mut deadline = Rc::default();
     let outcome = evidenced(|| {
-        let sandbox = Sandbox::new()?;
-        let pid = auto_started(&sandbox)?;
+        let mut sandbox = Sandbox::new()?;
+        deadline = Rc::clone(&sandbox.deadline);
+        let pid = sandbox.start_daemon()?;
         let (_, start) = outer_cleanup::process_stat(pid).ok_or("no daemon stat")?;
-        paused = Some((pid, start, sandbox.runtime.clone(), sandbox.state.clone()));
-        let Pinned::Member(pidfd) = pin_member(pid, &sandbox.runtime, &sandbox.state, &|path| {
-            fs::read(path)
-        })?
-        else {
-            return Err(format!("daemon {pid} is not pinnable").into());
-        };
-        rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::STOP)?;
-        Ok(())
+        paused = Some((pid, start));
+        sandbox.pause_daemon()
     });
-    let (pid, start, runtime, state) = paused.ok_or("the daemon was never paused")?;
-    if !gone(pid, start)? {
-        // Leave nothing behind, then fail.
-        let by = Instant::now() + outer_cleanup::TEARDOWN;
-        let record = kill_candidates(&[pid], &runtime, &state, &|path| fs::read(path), by);
-        return Err(format!("the paused daemon survived the teardown: {record}").into());
+    let (pid, start) = paused.ok_or("the daemon was never paused")?;
+    let deadline = deadline.get().ok_or("the teardown never began")?;
+    if let Some(survivor) = survived(pid, start, deadline)? {
+        return Err(survivor.into());
     }
     let error = outcome
         .err()
@@ -785,66 +722,6 @@ impl Drop for Children {
     }
 }
 
-/// Sol r2 N1: the kill fallback signals only a process whose sandbox
-/// membership it read from that same process after pinning it with a
-/// pidfd. Through the seam, (a) a scan that names a process the sandbox
-/// did not start, and (b) reads that return another (member) process's
-/// `/proc` data for that pid, signal nothing; (c) a member is killed.
-#[test]
-fn s_launch_kill_fallback_never_signals_a_non_member() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let runtime = dir.path().join("runtime");
-    let state = dir.path().join("state");
-    let sleeper = |member: bool| {
-        let mut command = Command::new("sleep");
-        command.arg("60").env_clear();
-        if member {
-            command.env("VIA_RUNTIME_DIR", &runtime);
-        }
-        command.spawn()
-    };
-    let mut children = Children(Vec::new());
-    children.0.push(sleeper(false)?);
-    children.0.push(sleeper(true)?);
-    let (outsider, member) = (children.0[0].id(), children.0[1].id());
-    let kill_by = Instant::now() + Duration::from_secs(5);
-
-    let scanned = kill_candidates(
-        &[outsider],
-        &runtime,
-        &state,
-        &|path| fs::read(path),
-        kill_by,
-    );
-    check(children.0[0].try_wait()?.is_none(), || {
-        format!("(a) a process the sandbox did not start was signalled: {scanned}")
-    })?;
-    let member_proc = PathBuf::from(format!("/proc/{member}"));
-    let swapped = kill_candidates(
-        &[outsider],
-        &runtime,
-        &state,
-        &|path| fs::read(member_proc.join(path.file_name().unwrap_or_default())),
-        kill_by,
-    );
-    check(children.0[0].try_wait()?.is_none(), || {
-        format!("(b) another process's /proc data got the outsider signalled: {swapped}")
-    })?;
-    check(children.0[1].try_wait()?.is_none(), || {
-        format!("(b) the member was signalled: {swapped}")
-    })?;
-
-    let killed = kill_candidates(&[member], &runtime, &state, &|path| fs::read(path), kill_by);
-    check(killed[0]["status"] == "gone", || {
-        format!("(c) the member was not killed: {killed}")
-    })?;
-    let status = outer_cleanup::wait_by(&mut children.0[1], Instant::now() + outer_cleanup::REAP);
-    check(
-        status.is_some_and(|status| status.signal() == Some(9)),
-        || format!("(c) the member did not end by SIGKILL: {status:?} {killed}"),
-    )
-}
-
 /// Sol r1 #5, runtime §11.2: a CLI run that outlives its bound is a typed
 /// timeout, not a plain failure.
 #[test]
@@ -852,9 +729,9 @@ fn s_launch_cli_timeout_is_typed() -> TestResult {
     evidenced(|| {
         let mut sandbox = Sandbox::new()?;
         sandbox.store = false;
-        // The foreground daemon serves until killed at the bound.
-        let error = sandbox
-            .run_within(&["daemon"], Duration::from_millis(300))
+        // The foreground daemon serves until killed at the bound; the
+        // invalid-configuration runs share this path.
+        let error = foreground_daemon(&sandbox, Duration::from_millis(300))
             .err()
             .ok_or("the foreground daemon returned")?;
         check(
@@ -867,70 +744,138 @@ fn s_launch_cli_timeout_is_typed() -> TestResult {
     })
 }
 
-/// Sol r2 N4: an observation error is not absence. Through the seam, an
-/// unreadable environment or a malformed stat of a live sandbox process
-/// is reported `unknown`, never `gone`, and nothing is signalled.
+/// Critical r1 #2, runtime §11.2: a process scan keeps its cutoff. One
+/// whose cutoff has passed reads nothing and reports uncertainty, never
+/// absence; one that reaches its cutoff mid-scan stops before its next
+/// read. Each environment and command-line read is capped, and an
+/// environment cut at its cap is indeterminate for this build's `via`.
 #[test]
-fn s_launch_kill_fallback_reports_observation_errors() -> TestResult {
+fn s_launch_scan_keeps_its_cutoff() -> TestResult {
+    use std::cell::{Cell, RefCell};
     let dir = tempfile::tempdir()?;
-    let runtime = dir.path().join("runtime");
-    let state = dir.path().join("state");
-    let mut member = Command::new("sleep");
-    member
-        .arg("60")
-        .env_clear()
-        .env("VIA_RUNTIME_DIR", &runtime);
-    let mut children = Children(Vec::new());
-    children.0.push(member.spawn()?);
-    let pid = children.0[0].id();
-    let kill_by = Instant::now() + Duration::from_secs(5);
-    let denied = |_: &Path| -> std::io::Result<Vec<u8>> {
-        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    let (runtime, state) = (dir.path().join("runtime"), dir.path().join("state"));
+    let reads = Cell::new(0_usize);
+    let counted = |path: &Path, cap: u64| {
+        reads.set(reads.get() + 1);
+        read_capped(path, cap)
     };
-    let malformed = |path: &Path| -> std::io::Result<Vec<u8>> {
-        if path.ends_with("stat") {
-            Ok(b"garbage".to_vec())
+    let expired = evidenced::scan_processes_by(&runtime, &state, Some(Instant::now()), counted);
+    check(expired.is_err() && reads.get() == 0, || {
+        format!("an expired scan: {expired:?} after {} reads", reads.get())
+    })?;
+
+    reads.set(0);
+    let slow = |path: &Path, cap: u64| {
+        reads.set(reads.get() + 1);
+        std::thread::sleep(Duration::from_millis(100));
+        read_capped(path, cap)
+    };
+    let cutoff = Instant::now() + Duration::from_millis(50);
+    let cut = evidenced::scan_processes_by(&runtime, &state, Some(cutoff), slow);
+    check(cut.is_err() && reads.get() == 1, || {
+        format!(
+            "a scan past its cutoff: {cut:?} after {} reads",
+            reads.get()
+        )
+    })?;
+
+    let caps = RefCell::new(BTreeSet::new());
+    let via = Path::new(env!("CARGO_BIN_EXE_via"));
+    let capped = |path: &Path, cap: u64| -> std::io::Result<Vec<u8>> {
+        caps.borrow_mut()
+            .insert((path.file_name().map(ToOwned::to_owned), cap));
+        if path.ends_with("environ") {
+            // A full environment without the mark: possibly cut.
+            Ok(vec![
+                b'x';
+                usize::try_from(cap).unwrap_or(usize::MAX).min(1 << 20)
+            ])
         } else {
-            fs::read(path)
+            Ok([via.as_os_str().as_encoded_bytes(), b"\0"].concat())
         }
     };
-    let observations: [&ProcRead<'_>; 2] = [&denied, &malformed];
-    for read in observations {
-        let record = kill_candidates(&[pid], &runtime, &state, read, kill_by);
-        check(record[0]["status"] == "unknown", || {
-            format!("an observation error was not reported unknown: {record}")
-        })?;
-        check(children.0[0].try_wait()?.is_none(), || {
-            format!("a process observed with an error was signalled: {record}")
-        })?;
-    }
-    Ok(())
+    let far = Instant::now() + Duration::from_secs(5);
+    let truncated = evidenced::scan_processes_by(&runtime, &state, Some(far), capped);
+    let caps = caps.into_inner();
+    check(
+        truncated.is_err() && caps.iter().all(|(_, cap)| *cap <= evidenced::ENVIRON_CAP),
+        || format!("a cut environment of a `via`: {truncated:?}; caps {caps:?}"),
+    )
 }
 
-/// Sol r3 (N2 residual): once the fallback's cutoff has passed, it starts
-/// no further work. A member candidate with an expired cutoff is neither
-/// pinned nor signalled, and its record names the deadline.
+/// Critical r1 #1, runtime §11.2: teardown never signals a guessed daemon
+/// pid. An outsider that carries the sandbox's runtime mark and its own
+/// genuine stat, still alive after the ordinary stop, is not signalled:
+/// the teardown records the uncertainty with its pid, keeps the sandbox
+/// and fails.
 #[test]
-fn s_launch_kill_fallback_stops_at_its_cutoff() -> TestResult {
+fn s_launch_teardown_never_signals_an_outsider() -> TestResult {
+    let mut children = Children(Vec::new());
+    let mut root = None;
+    let outcome = evidenced(|| {
+        let mut sandbox = Sandbox::new()?;
+        sandbox.store = false;
+        root = Some(sandbox.root.path().to_owned());
+        let mut outsider = Command::new("sleep");
+        outsider
+            .arg("60")
+            .env_clear()
+            .env("VIA_RUNTIME_DIR", &sandbox.runtime);
+        children.0.push(outsider.spawn()?);
+        Ok(())
+    });
+    let pid = children
+        .0
+        .first()
+        .map(std::process::Child::id)
+        .ok_or("the outsider never started")?;
+    let exit = outer_cleanup::wait_by(&mut children.0[0], Instant::now() + Duration::from_secs(1));
+    drop(children);
+    // The kept sandbox is this test's own; the outsider is gone now.
+    if let Some(root) = root {
+        let _ = fs::remove_dir_all(root);
+    }
+    check(exit.is_none(), || {
+        format!("the teardown signalled an outsider: {exit:?} {outcome:?}")
+    })?;
+    let error = outcome
+        .err()
+        .ok_or("a teardown that left an outsider passed")?
+        .to_string();
+    check(
+        error.contains(&pid.to_string()) && error.contains("nothing signalled"),
+        || format!("the uncertainty is not recorded: {error}"),
+    )
+}
+
+/// Critical r1 #4, runtime §11.2: the survivor check after a teardown
+/// keeps that teardown's deadline: once it has passed, a survivor is
+/// reported uncertain at once, never signalled and given no new budget.
+#[test]
+fn s_launch_survivor_check_keeps_the_deadline() -> TestResult {
     let dir = tempfile::tempdir()?;
     let runtime = dir.path().join("runtime");
-    let state = dir.path().join("state");
     let mut children = Children(Vec::new());
-    let mut member = Command::new("sleep");
-    member
+    let mut survivor = Command::new("sleep");
+    survivor
         .arg("60")
         .env_clear()
         .env("VIA_RUNTIME_DIR", &runtime);
-    children.0.push(member.spawn()?);
+    children.0.push(survivor.spawn()?);
     let pid = children.0[0].id();
-    let expired = Instant::now();
-    let record = kill_candidates(&[pid], &runtime, &state, &|path| fs::read(path), expired);
-    check(record[0]["status"] == "deadline_passed", || {
-        format!("the expired cutoff is not recorded: {record}")
-    })?;
-    // A SIGKILL would end the helper well within this bound.
+    let (_, start) = outer_cleanup::process_stat(pid).ok_or("no helper stat")?;
+    let began = Instant::now();
+    let report = survived(pid, start, began)?;
+    let took = began.elapsed();
     let exit = outer_cleanup::wait_by(&mut children.0[0], Instant::now() + Duration::from_secs(1));
     check(exit.is_none(), || {
-        format!("a candidate was signalled after the cutoff: {exit:?} {record}")
-    })
+        format!("the survivor check signalled: {exit:?} {report:?}")
+    })?;
+    check(
+        report
+            .as_deref()
+            .is_some_and(|report| report.contains("uncertain"))
+            && took < Duration::from_millis(500),
+        || format!("the expired survivor check: {report:?} after {took:?}"),
+    )
 }
