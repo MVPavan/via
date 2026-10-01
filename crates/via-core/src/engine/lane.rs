@@ -228,10 +228,16 @@ pub(super) struct Lane {
 /// What the lane learned from the session's observations.
 #[derive(Default)]
 struct LaneState {
-    /// Vendor turn IDs of the session's accepted turns, oldest first.
-    turns: VecDeque<(String, TurnNumber)>,
-    /// Hashes of vendor turn IDs whose mapping expired, oldest first.
-    tombstones: VecDeque<u64>,
+    /// Vendor turn IDs of the session's accepted turns, oldest first, with
+    /// the connection generation that accepted each.
+    turns: VecDeque<(String, TurnNumber, u64)>,
+    /// Hashes of vendor turn IDs whose mapping expired, oldest first, with
+    /// the generation that accepted each.
+    tombstones: VecDeque<(u64, u64)>,
+    /// The driver's current connection generation, counted by the lane
+    /// ([`Lane::new_generation`]): vendor turn ownership is scoped to it
+    /// (C2 §2).
+    generation: u64,
     /// The session's confirmed vendor identity.
     identity: Option<Identity>,
     /// A `session.opened` is committed: later generations reopen.
@@ -264,6 +270,20 @@ impl Identity {
             transcript: self.transcript.clone(),
         }
     }
+}
+
+/// What an acceptance's vendor turn ID did to the lane's ownership
+/// ([`LaneState::map`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Mapped {
+    /// The ID is the turn's.
+    Taken,
+    /// The ID is another turn's, or tombstoned, in this generation (Sol r3
+    /// N6): a protocol failure of the lane; nothing is mapped.
+    Collided,
+    /// The ID is the turn's, but every tombstone is taken (C2 §4.1): the
+    /// lane overflowed.
+    Exhausted,
 }
 
 /// Which turn an observation belongs to (C1 §6.1, AD4).
@@ -316,26 +336,59 @@ impl LaneState {
 
     /// Records `vendor_turn` as `turn`'s, the newest (at its acceptance);
     /// the oldest mapping past the bound is tombstoned. With every
-    /// tombstone taken, none is forgotten to make room: the lane overflows
-    /// and keeps the mapping (C2 §4.1, Sol r2 #5). Only a genuinely unseen
-    /// ID is taken (Sol r3 N6): false, mapping nothing, for one mapped to
+    /// tombstone taken by the current connection generation, none is
+    /// forgotten to make room: the lane overflows and keeps the mapping
+    /// (C2 §4.1, Sol r2 #5). Only an ID unseen in the current generation
+    /// is taken (Sol r3 N6): false, mapping nothing, for one it mapped to
     /// another turn or tombstoned; true for one already `turn`'s.
-    fn map(&mut self, vendor_turn: &str, turn: TurnNumber) -> bool {
-        if self.tombstones.contains(&tombstone_of(vendor_turn)) {
-            return false;
+    ///
+    /// Ownership is per connection generation (C2 §2, critical r1 #5): an
+    /// ID an older generation mapped or tombstoned is the new generation's
+    /// to take, and an older generation's tombstone is forgotten first to
+    /// make room, so older generations never count toward exhaustion.
+    /// Until then they keep late traffic attributed (AD4).
+    fn map(&mut self, vendor_turn: &str, turn: TurnNumber) -> Mapped {
+        let generation = self.generation;
+        let hash = tombstone_of(vendor_turn);
+        if self.tombstones.contains(&(hash, generation)) {
+            return Mapped::Collided;
         }
-        if let Some((_, known)) = self.turns.iter().find(|(known, _)| known == vendor_turn) {
-            return *known == turn;
+        if let Some((_, known, _)) = self
+            .turns
+            .iter()
+            .find(|(known, _, owner)| known == vendor_turn && *owner == generation)
+        {
+            return if *known == turn {
+                Mapped::Taken
+            } else {
+                Mapped::Collided
+            };
         }
+        self.turns.retain(|(known, ..)| known != vendor_turn);
+        self.tombstones.retain(|(known, _)| *known != hash);
+        let mut mapped = Mapped::Taken;
         if self.turns.len() >= VENDOR_TURNS {
             if self.tombstones.len() >= TOMBSTONES {
-                self.overflowed = true;
-            } else if let Some((expired, _)) = self.turns.pop_front() {
-                self.tombstones.push_back(tombstone_of(&expired));
+                let older = self
+                    .tombstones
+                    .iter()
+                    .position(|(_, owner)| *owner != generation);
+                if let Some(older) = older {
+                    self.tombstones.remove(older);
+                } else {
+                    self.overflowed = true;
+                    mapped = Mapped::Exhausted;
+                }
+            }
+            if mapped == Mapped::Taken
+                && let Some((expired, _, owner)) = self.turns.pop_front()
+            {
+                self.tombstones.push_back((tombstone_of(&expired), owner));
             }
         }
-        self.turns.push_back((vendor_turn.to_owned(), turn));
-        true
+        self.turns
+            .push_back((vendor_turn.to_owned(), turn, generation));
+        mapped
     }
 
     /// The turn an item naming `vendor_turn` belongs to while `running`
@@ -350,14 +403,15 @@ impl LaneState {
         let Some(vendor_turn) = vendor_turn else {
             return running.map_or(Attribution::Session, |_| Attribution::Current);
         };
-        if self.tombstones.contains(&tombstone_of(vendor_turn)) {
+        let hash = tombstone_of(vendor_turn);
+        if self.tombstones.iter().any(|(known, _)| *known == hash) {
             return Attribution::Expired;
         }
         let known = self
             .turns
             .iter()
-            .find(|(known, _)| known == vendor_turn)
-            .map(|(_, turn)| *turn);
+            .find(|(known, ..)| known == vendor_turn)
+            .map(|(_, turn, _)| *turn);
         match known {
             Some(turn) if Some(turn) == running => Attribution::Current,
             Some(turn) => Attribution::Late(turn),
@@ -778,7 +832,7 @@ impl Lane {
         let (mapped, failed) = {
             let mut state = lock(&self.state);
             let before = state.overflowed || state.collided;
-            let mapped = state.map(vendor_turn, turn);
+            let mapped = state.map(vendor_turn, turn) != Mapped::Collided;
             state.collided |= !mapped;
             (mapped, (state.overflowed || state.collided) && !before)
         };
@@ -786,6 +840,13 @@ impl Lane {
             self.changed.send_replace(());
         }
         mapped
+    }
+
+    /// The driver opens a new connection generation (C2 §2): vendor turn
+    /// ownership is scoped to it ([`LaneState::map`]). The caller disposed
+    /// of what the channel held from the older one first.
+    pub(super) fn new_generation(&self) {
+        lock(&self.state).generation += 1;
     }
 
     /// The turn an item naming `vendor_turn` belongs to while `running`
@@ -1163,7 +1224,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attribution, LaneState, TOMBSTONES, VENDOR_TURNS};
+    use super::{Attribution, LaneState, Mapped, TOMBSTONES, VENDOR_TURNS};
     use crate::TurnNumber;
 
     fn turn(number: u32) -> TurnNumber {
@@ -1229,9 +1290,17 @@ mod tests {
     #[test]
     fn a_mapped_or_tombstoned_vendor_turn_is_never_taken_again() {
         let mut state = LaneState::default();
-        assert!(state.map("v1", turn(1)));
-        assert!(state.map("v1", turn(1)), "the same turn's again");
-        assert!(!state.map("v1", turn(2)), "another turn's is refused");
+        assert_eq!(state.map("v1", turn(1)), Mapped::Taken);
+        assert_eq!(
+            state.map("v1", turn(1)),
+            Mapped::Taken,
+            "the same turn's again"
+        );
+        assert_eq!(
+            state.map("v1", turn(2)),
+            Mapped::Collided,
+            "another turn's is refused"
+        );
         assert_eq!(
             state.attribute(Some("v1"), Some(turn(2))),
             Attribution::Late(turn(1))
@@ -1240,7 +1309,11 @@ mod tests {
             let _ = state.map(&format!("v{number}"), turn(number));
         }
         assert_eq!(state.attribute(Some("v1"), None), Attribution::Expired);
-        assert!(!state.map("v1", turn(70)), "a tombstoned one is refused");
+        assert_eq!(
+            state.map("v1", turn(70)),
+            Mapped::Collided,
+            "a tombstoned one is refused"
+        );
         assert_eq!(
             state.attribute(Some("v1"), Some(turn(70))),
             Attribution::Expired,
@@ -1261,7 +1334,10 @@ mod tests {
         }
         assert!(!state.overflowed);
         assert_eq!(state.attribute(Some("v1"), None), Attribution::Expired);
-        state.map(&format!("v{}", bound + 1), turn(bound + 1));
+        assert_eq!(
+            state.map(&format!("v{}", bound + 1), turn(bound + 1)),
+            Mapped::Exhausted
+        );
         assert!(state.overflowed, "the bound overflows the lane");
         assert_eq!(state.attribute(Some("v1"), None), Attribution::Expired);
         assert_eq!(state.attribute(Some("v1024"), None), Attribution::Expired);
@@ -1272,6 +1348,52 @@ mod tests {
         assert_eq!(
             state.attribute(Some(&format!("v{}", bound + 1)), None),
             Attribution::Late(turn(bound + 1))
+        );
+    }
+
+    /// Critical r1 #5 (C2 §2: ownership is per connection generation): an
+    /// ID an older generation mapped or tombstoned is a new generation's to
+    /// take, and older generations' tombstones never count toward the new
+    /// one's exhaustion. Until a new generation takes an older ID, its late
+    /// traffic keeps its attribution (AD4).
+    #[test]
+    fn ownership_is_per_connection_generation() {
+        let mut state = LaneState::default();
+        let bound = u32::try_from(VENDOR_TURNS + TOMBSTONES).expect("a small bound");
+        for number in 1..=bound {
+            state.map(&format!("v{number}"), turn(number));
+        }
+        state.generation += 1;
+        assert_eq!(
+            state.attribute(Some(&format!("v{bound}")), None),
+            Attribution::Late(turn(bound)),
+            "an older generation's late traffic keeps its turn"
+        );
+        let next = bound + 1;
+        assert_eq!(
+            state.map(&format!("v{next}"), turn(next)),
+            Mapped::Taken,
+            "older generations' tombstones do not exhaust the new one"
+        );
+        assert!(!state.overflowed);
+        assert_eq!(
+            state.map("v1", turn(next + 1)),
+            Mapped::Taken,
+            "a tombstoned ID"
+        );
+        assert_eq!(
+            state.map(&format!("v{bound}"), turn(next + 2)),
+            Mapped::Taken,
+            "a mapped ID"
+        );
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(next + 1))),
+            Attribution::Current
+        );
+        assert_eq!(
+            state.map("v1", turn(next + 3)),
+            Mapped::Collided,
+            "the new generation's own ownership still holds"
         );
     }
 }

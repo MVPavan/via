@@ -1478,6 +1478,30 @@ impl Engine {
         }
     }
 
+    /// The session channel (C2 A1): 1,024 items and a 4 MiB byte budget;
+    /// an item's permit is held until it is handled. What arrived before
+    /// the turn is the session drain's (C2 §2), which keeps servicing the
+    /// turn's order and idle deadline (runtime §8). It is finite (critical
+    /// r1 #1): only what the channel held at the handover; what arrives
+    /// later is the running turn's to attribute.
+    async fn pre_turn_drain(
+        &self,
+        record: &mut TurnRecord,
+        lane: &Lane,
+        control: &mut Control<'_>,
+        inbox: &mut Inbox,
+    ) {
+        let mut handled = 0;
+        for _ in 0..inbox.len() {
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
+            self.between_items(record, control, &mut handled, true)
+                .await;
+            lane.dispose(admitted).await;
+        }
+    }
+
     /// Runs the turn on the session's driver under the turn deadline,
     /// handling each observation on the session channel, the lane actor's
     /// `inbox`, in decode order before its result is acted on. What
@@ -1501,20 +1525,12 @@ impl Engine {
         (spec, cx): (TurnSpec, TurnCx),
         (control, inbox): (&mut Control<'_>, &mut Inbox),
     ) -> Driven {
-        // The session channel (C2 A1): 1,024 items and a 4 MiB byte
-        // budget; an item's permit is held until it is handled. What
-        // arrived before the turn is the session drain's (C2 §2), which
-        // keeps servicing the turn's order and idle deadline (runtime §8).
-        // It is finite (critical r1 #1): only what the channel held at the
-        // handover; what arrives later is the running turn's to attribute.
-        let mut handled = 0;
-        for _ in 0..inbox.len() {
-            let Some(admitted) = inbox.try_recv() else {
-                break;
-            };
-            self.between_items(record, control, &mut handled, true)
-                .await;
-            lane.dispose(admitted).await;
+        self.pre_turn_drain(record, lane, control, inbox).await;
+        if matches!(cx.prepared, Prepared::NeedsConnection) {
+            // The turn opens a connection generation (C2 §2, critical r1
+            // #5): ownership is scoped to it, once the older generation's
+            // items above were disposed of.
+            lane.new_generation();
         }
         record.vendor.identity = lane.identity();
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));

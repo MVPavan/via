@@ -4848,3 +4848,75 @@ fn only_the_running_turns_progress_resets_its_idle_deadline() {
         ));
     });
 }
+
+/// Critical r1 #5 (C2 §2: ownership is scoped per connection generation):
+/// a turn that opens a new connection generation (`NeedsConnection`) may
+/// take a vendor turn ID an earlier generation mapped or tombstoned: the
+/// new generation's acceptance of a tombstoned ID is the turn's, with no
+/// protocol stop. Until then the older ID keeps its late attribution (AD4).
+#[test]
+fn a_new_connection_generation_starts_with_no_old_ownership() {
+    let Some(root) = child("a_new_connection_generation_starts_with_no_old_ownership") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{Prepared, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let (_session, slot, lane, mut record, effective, orders) =
+            running_turn_2_with(&engine, &root, false).await;
+        let probe = orders.clone();
+        let now = tokio::time::Instant::now();
+        let (_stop, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(2),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        let (_sender, receiver) = tokio::sync::mpsc::channel(4);
+        let mut inbox = super::lane::Inbox::of(receiver);
+        engine
+            .execute_turn(
+                (&slot, &lane),
+                (&mut record, &effective),
+                (orders.clone(), &mut inbox),
+                (spec, cx),
+            )
+            .await;
+        assert_eq!(
+            lane.attribute(Some("gone"), Some(turn(2))),
+            super::lane::Attribution::Expired,
+            "the older generation's tombstone"
+        );
+        let accepted = via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(via_adapters::VendorTurnId::try_from("gone".to_owned()).unwrap()),
+            observation: via_adapters::Observation::Accepted(
+                via_adapters::observation::Acceptance {
+                    correlation: via_adapters::AcceptanceToken::FIRST,
+                    vendor_turn_id: None,
+                },
+            ),
+        };
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                vec![accepted],
+            )
+            .await;
+        assert!(record.accepted.is_some(), "the new generation's acceptance");
+        assert!(probe.borrow().is_none(), "no protocol stop");
+    });
+}
