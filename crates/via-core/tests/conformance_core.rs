@@ -1282,6 +1282,10 @@ fn core_structured_output_write_failure_fails_the_commit() {
             let path = envelope["structured_output_file"]["path"].as_str().unwrap();
             let written = fs::read(path).unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), spilled);
+            // Sol r2 #8: the retried write's first failure reached the
+            // Store failure hook, as a retried commit's does.
+            let status = daemon.engine.store_failure_status().expect("reported");
+            assert_eq!(status["count"], 1, "{status}");
             daemon.shutdown().await;
             return;
         }
@@ -1307,6 +1311,52 @@ fn core_structured_output_write_failure_fails_the_commit() {
         assert!(envelope["structured_output_file"].is_null(), "{envelope}");
         let folder = PathBuf::from(envelope["evidence"]["folder"].as_str().unwrap());
         assert!(!folder.join("structured_output.json").exists());
+    });
+}
+
+/// Sol r2 #8 (C1 §5, §7.6 spill amendment; design §7.2 row 7): the spill
+/// write and the terminal commit are one logical commit with one retry. A
+/// first spill write that fails takes the retry, so the terminal's first
+/// failed attempt is its last: no third attempt. Reads report
+/// `store_error`, and final shutdown's resolution batch ends the turn
+/// `failed(store)`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_spill_and_terminal_share_one_retry() {
+    let (step, _spilled) = structured(1, 32 * 1024 + 1);
+    let scenario = scenario(&json!({}), &[script("p", &[accepted(1), step])]);
+    let Some(root) = child("core_spill_and_terminal_share_one_retry", &scenario, &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_failing(&root, "structured_output.write.fail", false);
+    arm_failing(&root, "store.commit.terminal", false);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let params = WaitParams {
+            address: format!("{session}/1"),
+            timeout_ms: Some(WAIT_MS),
+        };
+        let error = daemon.engine.wait(params).await.unwrap_err();
+        assert_eq!(error.kind, "store_error");
+        assert!(
+            root.join("points")
+                .join("store.commit.terminal.1.ack")
+                .exists()
+        );
+        let engine = Arc::clone(&daemon.engine);
+        let report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+        assert_eq!(report.failure_batches.committed, 1, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "store", "{envelope}");
     });
 }
 

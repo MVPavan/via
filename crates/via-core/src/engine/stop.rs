@@ -277,9 +277,10 @@ impl Engine {
         // C1 §5, §7.6: a spilled structured output's write is part of the
         // terminal's commit; when it fails, the turn resolves through the
         // failure-resolution batch, as a terminal that did not commit.
-        let spilled = tokio::time::timeout_at(by, self.spill(&mut turn.record, false))
-            .await
-            .unwrap_or(false);
+        let spilled = matches!(
+            tokio::time::timeout_at(by, self.spill(&mut turn.record, false)).await,
+            Ok(Some(_))
+        );
         if batch::affected(&turn.record) || !spilled {
             // After the first failure `cancel.settled` is not written: no I/O.
             let (started, record, terminal) = self.forced_terminal(turn, facts).await;

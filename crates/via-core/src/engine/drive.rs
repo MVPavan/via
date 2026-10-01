@@ -1126,12 +1126,17 @@ impl Engine {
     ) -> Result<(), ApiError> {
         let extras = TerminalExtras { cancel_cause };
         let mut record = record;
-        let mode = Commit {
-            retry: record.first_failure.is_none(),
-            latch: Some(&self.signal),
-        };
-        let (finished, kept) = if self.spill(&mut record, mode.retry).await {
+        let retry = record.first_failure.is_none();
+        // C1 §5, §7.6 (Sol r2 #8): the spill write and the terminal are one
+        // logical commit with one retry; a spill that took it leaves the
+        // terminal none, and its first failure is reported as a retried
+        // commit's is.
+        let (finished, kept) = if let Some(spill_retried) = self.spill(&mut record, retry).await {
             let kept = (record.clone(), terminal.clone());
+            let mode = Commit {
+                retry: retry && !spill_retried,
+                latch: Some(&self.signal),
+            };
             let finished = Self::finish_turn_with(
                 &self.store,
                 &self.unresolved,
@@ -1141,7 +1146,11 @@ impl Engine {
                 extras,
                 mode,
             )
-            .await;
+            .await
+            .map(|durable| Durable {
+                retried: durable.retried || spill_retried,
+                ..durable
+            });
             (finished, kept)
         } else {
             // C1 §5, §7.6: the file write is part of the commit naming it,
@@ -1170,15 +1179,16 @@ impl Engine {
     /// C1 §5: before the commit that names it, writes a structured output
     /// over [`STRUCTURED_OUTPUT_INLINE`] encoded whole to the turn's
     /// `structured_output.json`, synced with its folder, and puts the file
-    /// in its place; with `retry` a failed write is tried once more, as the
-    /// commit itself is. `false` when the write failed: the commit that
-    /// would name the file fails, and both fields are `null`. A value
-    /// already spilled or within the limit writes nothing.
-    pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> bool {
+    /// in its place; with `retry` a failed write is tried once more, taking
+    /// the commit's one retry. `Some(retried)` once written, or with
+    /// nothing to write: whether that took the retry. `None` when the
+    /// write failed: the commit that would name the file fails, and both
+    /// fields are `null`.
+    pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> Option<bool> {
         let session = record.session.clone();
         let turn = record.turn;
         let Some(retained) = record.vendor.retained.as_mut() else {
-            return true;
+            return Some(false);
         };
         let Some(encoded) = retained
             .structured_output
@@ -1186,11 +1196,11 @@ impl Engine {
             .and_then(|value| serde_json::to_vec(value).ok())
             .filter(|encoded| encoded.len() > STRUCTURED_OUTPUT_INLINE)
         else {
-            return true;
+            return Some(false);
         };
         // Taken first: a write cut short by a caller's bound names nothing.
         retained.structured_output = None;
-        for _ in 0..=u8::from(retry) {
+        for attempt in 0..=u8::from(retry) {
             let written = self
                 .store
                 .write_structured_output(&session, turn, encoded.clone())
@@ -1200,10 +1210,10 @@ impl Engine {
                     path: file.path.display().to_string(),
                     bytes: file.bytes,
                 });
-                return true;
+                return Some(attempt > 0);
             }
         }
-        false
+        None
     }
 
     /// Reports a terminal commit to the failure hook: a first attempt that
