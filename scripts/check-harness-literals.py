@@ -470,64 +470,78 @@ def computed_include(lexed):
     return False
 
 
-def module_declarations(tokens, name):
-    """`(index, top_level)` of each `mod name` declaration in `tokens`."""
+def module_declarations(path, tokens, regions):
+    """`(targets, test_only)` for each `mod x;` declaration in the file.
+
+    `targets` are the files the declaration resolves to by standard layout:
+    the file's module directory (its own directory for `lib.rs`, `main.rs`
+    and `mod.rs`, else `<dir>/<stem>`), then the enclosing inline modules,
+    then `x.rs` or `x/mod.rs`. `test_only` holds for a top-level
+    declaration inside a `#[cfg(test)]` region.
+    """
+    if path.name in ("lib.rs", "main.rs", "mod.rs"):
+        base = path.parent
+    else:
+        base = path.parent / path.stem
     found = []
     depth = 0
+    inline = []  # (name, depth inside its braces)
+    opening = None  # (brace index, name) of an inline `mod name {`
     for i, token in enumerate(tokens):
         if token.kind == "comment":
             continue
         if token.kind == "punct" and token.text == "{":
             depth += 1
+            if opening is not None and opening[0] == i:
+                inline.append((opening[1], depth))
+                opening = None
         elif token.kind == "punct" and token.text == "}":
+            if inline and inline[-1][1] == depth:
+                inline.pop()
             depth -= 1
-        elif token.text == "mod":
+        elif token.kind == "ident" and token.text == "mod":
             target = code_at(tokens, i + 1)
-            if text_at(tokens, target) in (name, f"r#{name}"):
-                after = text_at(tokens, code_at(tokens, target + 1))
-                if after in (";", "{"):
-                    found.append((i, depth == 0 and after == ";"))
+            if target >= len(tokens) or tokens[target].kind != "ident":
+                continue
+            name = tokens[target].text.removeprefix("r#")
+            after = code_at(tokens, target + 1)
+            if text_at(tokens, after) == "{":
+                opening = (after, name)
+            elif text_at(tokens, after) == ";":
+                directory = base.joinpath(*(entry[0] for entry in inline))
+                targets = {directory / f"{name}.rs", directory / name / "mod.rs"}
+                found.append((targets, depth == 0 and in_regions(i, regions)))
     return found
 
 
 def excluded_files(scope, lexed, regions, mentions):
-    """Files reached only through one top-level `#[cfg(test)] mod name;`.
+    """Files reached only through one top-level `#[cfg(test)] mod x;`.
 
-    Deliberately conservative: the file is excluded only when the crate
-    holds exactly one `mod name` declaration (inline or not, at any depth,
-    in any of its files), and that one is a top-level, test-only
-    `mod name;` in the file's standard-layout declaring file; no `#[path]`
-    or `include!` names it; no `include!` in the crate has a computed
-    argument; and it is not a crate root. Anything else is scanned.
+    Deliberately conservative: a file is excluded only when exactly one
+    `mod x;` declaration in the crate (at any depth, inside inline modules
+    too) resolves to it, and that one is a top-level `#[cfg(test)] mod x;`;
+    no `#[path]` or `include!` names it; no `include!` in the crate has a
+    computed argument; and it is not a crate root. Anything else is scanned.
     """
     excluded = set()
     if computed_include(lexed):
         return excluded
+    declarations = [
+        declaration
+        for path, tokens in lexed.items()
+        for declaration in module_declarations(path, tokens, regions[path])
+    ]
     for path in lexed:
         relative = path.relative_to(scope)
         if path.name in ("lib.rs", "main.rs") and path.parent == scope:
             continue
         if relative.parts[0] == "bin":
             continue
-        if mentions is None or any(path.name in mention for mention in mentions):
+        if any(path.name in mention for mention in mentions):
             continue
-        if path.name == "mod.rs":
-            name, directory = path.parent.name, path.parent.parent
-        else:
-            name, directory = path.stem, path.parent
-        if directory == scope:
-            parents = [scope / "lib.rs", scope / "main.rs"]
-        else:
-            parents = [directory.parent / f"{directory.name}.rs", directory / "mod.rs"]
-        declarations = [
-            (declaring, index, top)
-            for declaring in lexed
-            for index, top in module_declarations(lexed[declaring], name)
-        ]
-        if len(declarations) == 1:
-            declaring, index, top = declarations[0]
-            if declaring in parents and top and in_regions(index, regions[declaring]):
-                excluded.add(path)
+        resolving = [test_only for targets, test_only in declarations if path in targets]
+        if resolving == [True]:
+            excluded.add(path)
     return excluded
 
 
@@ -794,10 +808,10 @@ mod /* c */ helpers /* d */;
             CORE + "tests.rs": "fn fake() {}\nmod deep;\n",
             CORE + "tests/deep.rs": "fn fake_deep() {}\n",
             CORE + "helpers.rs": "fn fake_helper() {}\n",
-            CORE + "engine.rs": "#[cfg(test)]\nmod engine_tests;\n",
-            CORE + "engine/engine_tests.rs": "fn codex() {}\n",
-            CORE + "nested/mod.rs": "#[cfg(test)]\nmod nested_tests;\n",
-            CORE + "nested/nested_tests.rs": "fn claude() {}\n",
+            CORE + "engine.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "engine/tests.rs": "fn codex() {}\n",
+            CORE + "nested/mod.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "nested/tests.rs": "fn claude() {}\n",
         },
         "expect": [
             # A child of a test-only file is scanned: that is conservative.
@@ -850,7 +864,7 @@ mod /* c */ helpers /* d */;
         "expect": [(CORE + "lib.rs", "fake_root", "fake")],
     },
     {
-        "name": "same module name declared elsewhere in the crate",
+        "name": "inline declaration resolving to the same file",
         "files": {
             CORE + "lib.rs": "mod engine { mod tests; }\n",
             CORE + "engine.rs": "#[cfg(test)]\nmod tests;\n",
@@ -859,18 +873,26 @@ mod /* c */ helpers /* d */;
         "expect": [(CORE + "engine/tests.rs", "const S", "codex")],
     },
     {
-        "name": "two test-only declarations of one name",
+        "name": "distinct test modules sharing the name tests",
         "files": {
-            CORE + "lib.rs": "mod a;\nmod b;\n",
+            CORE + "lib.rs": "mod a;\nmod b;\nmod c { #[cfg(test)] mod tests { fn fake_inline_ok() {} } }\n",
             CORE + "a.rs": "#[cfg(test)]\nmod tests;\n",
             CORE + "a/tests.rs": "fn fake_a() {}\n",
             CORE + "b.rs": "#[cfg(test)]\nmod tests;\n",
             CORE + "b/tests.rs": "fn fake_b() {}\n",
         },
-        "expect": [
-            (CORE + "a/tests.rs", "fake_a", "fake"),
-            (CORE + "b/tests.rs", "fake_b", "fake"),
-        ],
+        "expect": [],
+    },
+    {
+        "name": "nested declaration resolving to the same file",
+        "files": {
+            CORE + "lib.rs": "mod a;\nmod outer { mod inner { mod t; } }\n",
+            CORE + "a.rs": "#[cfg(test)]\nmod t;\n",
+            CORE + "a/t.rs": "fn fake_a() {}\n",
+            CORE + "outer.rs": "#[cfg(test)]\nmod inner;\n",
+            CORE + "outer/inner/t.rs": "fn codex_t() {}\n",
+        },
+        "expect": [(CORE + "outer/inner/t.rs", "codex_t", "codex")],
     },
     {
         "name": "computed include",
