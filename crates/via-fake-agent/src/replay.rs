@@ -4,7 +4,8 @@
 //! fake checks its argv, answers `--version`, then runs the fixture's steps:
 //! - `expect` reads one stdin line and matches a JSON subset, capturing
 //!   values by JSON pointer; its `absent` pointers must not resolve in the
-//!   line;
+//!   line, and with `within_ms` the line must arrive within that many
+//!   milliseconds of the previous step's end;
 //! - `emit` writes one verbatim line;
 //! - `delay` sleeps; `await_signal` waits for a signal;
 //! - `await_eof` waits for stdin to end; any input instead fails.
@@ -56,6 +57,10 @@ const DIAGNOSTIC_PREFIX: &str = "fake replay: ";
 const LOAD_LIMIT: Duration = Duration::from_secs(5);
 /// How long the deadline's message may take before the process exits anyway.
 const MESSAGE_GRACE: Duration = Duration::from_millis(100);
+/// Names of the watchdog's deadlines, for its expiry message.
+const LOAD_DEADLINE: &str = "load deadline";
+const RUN_DEADLINE: &str = "deadline";
+const WITHIN_MS: &str = "within_ms";
 /// Exit code for any replay failure; distinct from the start-request mode's 2.
 const FAILED: i32 = 3;
 
@@ -97,6 +102,9 @@ enum Step {
         /// JSON pointers that must not resolve in the received line.
         #[serde(default)]
         absent: Vec<String>,
+        /// Most milliseconds the line may take, from the previous step's end.
+        #[serde(default)]
+        within_ms: Option<u64>,
     },
     Emit {
         line: String,
@@ -142,8 +150,8 @@ impl Captures {
 
 /// A message to the watchdog.
 enum Arm {
-    /// Replaces the deadline.
-    Deadline(Instant),
+    /// Replaces the deadline, naming it for the expiry message.
+    Deadline(Instant, &'static str),
     /// Not replay mode: the watchdog ends without acting.
     Disarm,
 }
@@ -195,9 +203,8 @@ fn replay(
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
         .ok_or("deadline_ms is out of range")?;
-    watchdog
-        .send(Arm::Deadline(deadline))
-        .map_err(|_| "the watchdog is gone".to_owned())?;
+    let watch = Watch { watchdog, deadline };
+    watch.set(deadline, RUN_DEADLINE)?;
     let mut captures = Captures::default();
     let args = check_argv(&fixture.argv, &mut captures)?;
     if args == ["--version"] {
@@ -230,8 +237,15 @@ fn replay(
     for (index, current) in fixture.steps.into_iter().enumerate() {
         let number = index + 1;
         step.store(number, Ordering::SeqCst);
-        run_step(current, &mut input, &mut captures, &runtime, &mut signals)
-            .map_err(|error| format!("step {number}: {error}"))?;
+        run_step(
+            current,
+            &mut input,
+            &mut captures,
+            &runtime,
+            &mut signals,
+            &watch,
+        )
+        .map_err(|error| format!("step {number}: {error}"))?;
     }
     Ok(())
 }
@@ -301,24 +315,26 @@ fn check_argv(expected: &[Arg], captures: &mut Captures) -> Result<Vec<String>, 
 /// whatever the other threads are doing. If it cannot start, the process
 /// exits at once.
 fn arm(deadline: Instant, step: Arc<AtomicUsize>) -> SyncSender<Arm> {
-    // Capacity 1: the main thread sends at most one message, so it never waits.
+    // Capacity 1: the watchdog takes each message as it comes, so the main
+    // thread waits at most until then, or until an expiring watchdog exits.
     let (sender, receiver) = mpsc::sync_channel(1);
     // Detached on purpose: it only ever ends the process, or returns when disarmed.
     let spawned = thread::Builder::new().spawn(move || {
         let mut deadline = deadline;
+        let mut name = LOAD_DEADLINE;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
             match receiver.recv_timeout(left) {
-                Ok(Arm::Deadline(next)) => deadline = next,
+                Ok(Arm::Deadline(next, next_name)) => (deadline, name) = (next, next_name),
                 Ok(Arm::Disarm) => return,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => thread::sleep(left),
             }
         }
-        expire(step.load(Ordering::SeqCst));
+        expire(name, step.load(Ordering::SeqCst));
     });
     if spawned.is_err() {
         process::exit(FAILED);
@@ -331,10 +347,10 @@ fn arm(deadline: Instant, step: Arc<AtomicUsize>) -> SyncSender<Arm> {
 /// full, and neither may hold the exit back longer than [`MESSAGE_GRACE`].
 /// The exit status alone reports the failure, so a helper that cannot be
 /// created means exiting at once with no message.
-fn expire(step: usize) -> ! {
+fn expire(name: &'static str, step: usize) -> ! {
     let (done, wait) = mpsc::sync_channel(1);
     let helper = thread::Builder::new().spawn(move || {
-        diagnostic(&format!("deadline passed at step {step}"));
+        diagnostic(&format!("{name} passed at step {step}"));
         // The watchdog may already have stopped waiting; nothing to do.
         let _ = done.send(());
     });
@@ -345,23 +361,63 @@ fn expire(step: usize) -> ! {
     process::exit(FAILED)
 }
 
+/// The run deadline and the watchdog that enforces it.
+struct Watch<'a> {
+    watchdog: &'a SyncSender<Arm>,
+    deadline: Instant,
+}
+
+impl Watch<'_> {
+    fn set(&self, deadline: Instant, name: &'static str) -> Result<(), String> {
+        self.watchdog
+            .send(Arm::Deadline(deadline, name))
+            .map_err(|_| "the watchdog is gone".to_owned())
+    }
+
+    /// Reads a line that must arrive by `within_ms` after `start`, when given,
+    /// and always by the run deadline.
+    fn read_line<R: BufRead>(
+        &self,
+        input: &mut R,
+        start: Instant,
+        within_ms: Option<u64>,
+    ) -> Result<Value, String> {
+        let Some(limit) = within_ms
+            .and_then(|ms| start.checked_add(Duration::from_millis(ms)))
+            .filter(|limit| *limit < self.deadline)
+        else {
+            return read_line(input);
+        };
+        self.set(limit, WITHIN_MS)?;
+        let actual = read_line(input)?;
+        if Instant::now() > limit {
+            return Err(format!("{WITHIN_MS} passed before the line arrived"));
+        }
+        self.set(self.deadline, RUN_DEADLINE)?;
+        Ok(actual)
+    }
+}
+
 fn run_step<R: BufRead>(
     step: Step,
     input: &mut R,
     captures: &mut Captures,
     runtime: &tokio::runtime::Runtime,
     signals: &mut BTreeMap<SignalName, Signal>,
+    watch: &Watch<'_>,
 ) -> Result<(), String> {
+    let start = Instant::now();
     match step {
         Step::Expect {
             line,
             capture,
             absent,
+            within_ms,
         } => {
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
-            let actual = read_line(input)?;
+            let actual = watch.read_line(input, start, within_ms)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
             }

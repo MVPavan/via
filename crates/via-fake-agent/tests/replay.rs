@@ -720,3 +720,54 @@ fn replay_absent_pointer_fails_when_it_resolves() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn replay_within_ms_bounds_the_wait_for_an_expected_line() -> TestResult {
+    // The run deadline outlasts the outer bound, so only within_ms can end the run.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            60_000,
+            &json!([
+                {"emit": {"line": "ready"}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "late"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert_eq!(end.stdout, vec![line("ready")]);
+    // The message is best-effort, like the run deadline's.
+    if !end.stderr.is_empty() {
+        assert!(
+            end.stderr.contains("within_ms") && end.stderr.contains("step 2"),
+            "{}",
+            end.stderr
+        );
+    }
+
+    // It counts from the previous step's completion, not from the start.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"delay": {"ms": 500}},
+                {"expect": {"line": {"type": "decline"}, "within_ms": 300}},
+                {"emit": {"line": "ok"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "decline"}))?;
+    assert_eq!(run.next_line()?, line("ok"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+    Ok(())
+}
