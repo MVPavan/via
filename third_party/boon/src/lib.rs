@@ -209,11 +209,22 @@ impl Schemas {
         units: u64,
         max_depth: usize,
     ) -> Validation {
-        let Some(sch) = self.list.get(sch_index.0) else {
-            panic!("Schemas::validate_within: schema index out of bounds");
-        };
         let budget = validator::Budget::new(units, max_depth);
-        let result = validator::validate_within(v, sch, self, &budget, true);
+        self.validate_budgeted(v, sch_index, &budget)
+    }
+
+    // VIA patch: `validate_within` on a budget the caller keeps, which
+    // several validations may share.
+    pub(crate) fn validate_budgeted(
+        &self,
+        v: &Value,
+        sch_index: SchemaIndex,
+        budget: &validator::Budget,
+    ) -> Validation {
+        let Some(sch) = self.list.get(sch_index.0) else {
+            panic!("Schemas::validate_budgeted: schema index out of bounds");
+        };
+        let result = validator::validate_within(v, sch, self, budget, true);
         if budget.spent() {
             Validation::BudgetSpent
         } else if result.is_ok() {

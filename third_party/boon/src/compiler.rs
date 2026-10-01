@@ -124,6 +124,19 @@ impl Compiler {
         self.max_patterns = Some(patterns);
     }
 
+    /**
+    VIA patch: every metaschema check this compiler makes, of the schema
+    documents and of each value a reference reaches outside the known
+    subschemas, shares one work budget of `units` and an evaluation depth
+    of `max_depth`, charged as in [`Schemas::validate_within`] plus one
+    unit per node of each value checked. The checks build no error detail:
+    an invalid schema fails with [`CompileError::SchemaInvalid`], and a
+    spent budget with [`CompileError::LimitExceeded`].
+    */
+    pub fn set_metaschema_budget(&mut self, units: u64, max_depth: usize) {
+        self.roots.meta_budget = Some(crate::validator::Budget::new(units, max_depth));
+    }
+
     // VIA patch: counts one compiled pattern against the limit.
     fn count_pattern(&self) -> Result<(), CompileError> {
         let n = self.patterns.get() + 1;
@@ -805,8 +818,13 @@ impl<'v> ObjCompiler<'_, 'v, '_, '_, '_, '_> {
 #[derive(Debug)]
 pub enum CompileError {
     /// VIA patch: the schema needs more subschemas or patterns than the
-    /// limits set by [`Compiler::set_limits`].
+    /// limits set by [`Compiler::set_limits`], or its metaschema checks
+    /// more work than [`Compiler::set_metaschema_budget`] allows.
     LimitExceeded { what: &'static str },
+
+    /// VIA patch: `url` is not valid against its metaschema, found by a
+    /// bounded check that keeps no detail.
+    SchemaInvalid { url: String },
 
     /// Error in parsing `url`.
     ParseUrlError { url: String, src: Box<dyn Error> },
@@ -918,6 +936,7 @@ impl Display for CompileError {
             }
             Self::UnsupportedDraft { url } => write!(f, "draft {url} is not supported"),
             Self::LimitExceeded { what } => write!(f, "too many {what}"),
+            Self::SchemaInvalid { url } => write!(f, "{url} is not valid against its metaschema"),
             Self::MetaSchemaCycle { url } => {
                 write!(f, "cycle in resolving $schema in {url}")
             }

@@ -4,13 +4,18 @@
 //! no URL loader, so a schema that refers to anything outside itself, a
 //! file or a network address, does not compile; one that declares another
 //! draft anywhere does not compile either. Compiling and validating are
-//! bounded (fix round 1 #1), and both run off the async executor.
+//! bounded (fix round 1 #1), its metaschema check included (fix round 2
+//! #3), and both run off the async executor.
 //!
-//! The bounds were sized by measurement (release build): validating a
+//! The bounds were sized by measurement (release build). These are the
+//! results for the recorded cases, not a general guarantee: validating a
 //! value at C1's maximum (65,536 nodes, depth 64) against a moderately
-//! complex schema takes about 333,000 units and 3 ms; the slowest
-//! adversarial case spends the whole budget in about 55 ms with peak
-//! memory under 25 MiB; compiling stays under about 80 ms.
+//! complex schema needed 381,056 units in about 3 ms; the slowest
+//! adversarial validation spent the whole budget in about 55 ms, and the
+//! largest peak was 36,864 KiB (27,860 KiB in fix round 1, before the
+//! cases added in round 2); the compiles measured stayed under about
+//! 70 ms; a 256 KiB schema of about 2,000 subschemas needed about 325,000
+//! metaschema units.
 
 use boon::{Compiler, Draft, SchemaIndex, Schemas, SchemeUrlLoader, Validation};
 use serde_json::Value;
@@ -28,11 +33,18 @@ const PATTERNS: usize = 64;
 /// evaluation, more for keywords whose work grows with the value).
 const UNITS: u64 = 1_000_000;
 
+/// Work units every metaschema check of one compile may spend together
+/// (boon patch): the schema's own, and those of the values its references
+/// reach outside the known subschemas.
+const META_UNITS: u64 = 1_000_000;
+
 /// Deepest evaluation nesting one validation may reach.
 const DEPTH: usize = 512;
 
 /// Stack of the thread that runs a compile or a validation: room for
-/// [`DEPTH`] nested evaluations in an unoptimized build.
+/// [`DEPTH`] active evaluations, nested validations' included, in an
+/// unoptimized build (about 500 needed 4 MiB there, and 512 KiB in a
+/// release build).
 const STACK: usize = 16 << 20;
 
 /// A validation's answer.
@@ -62,6 +74,7 @@ impl Validator {
         compiler.set_default_draft(Draft::V2020_12);
         compiler.require_draft(Draft::V2020_12);
         compiler.set_limits(SUBSCHEMAS, PATTERNS);
+        compiler.set_metaschema_budget(META_UNITS, DEPTH);
         compiler.use_loader(Box::new(SchemeUrlLoader::new()));
         compiler.add_resource(LOCATION, schema.clone()).ok()?;
         let mut schemas = Schemas::new();
@@ -161,6 +174,27 @@ mod tests {
         assert_eq!(validator.check(&json!({"a":1})), Checked::Invalid);
     }
 
+    /// Fix round 2, C1 §4: a `$schema` inside an instance value (`const`,
+    /// `enum`, `default`, `examples`) is data, not a declaration: the
+    /// schema compiles, and the value is matched as written.
+    #[test]
+    fn schema_keywords_inside_instance_values_are_data() {
+        let other = json!({"$schema":"http://json-schema.org/draft-07/schema#"});
+        let schema = json!({
+            "properties":{
+                "c":{"const": other},
+                "e":{"enum":[other, 1]},
+                "d":{"default": other, "examples":[other]}
+            }
+        });
+        let validator = Validator::compile(&schema).unwrap();
+        assert_eq!(
+            validator.check(&json!({"c": other, "e": other, "d": 1})),
+            Checked::Valid
+        );
+        assert_eq!(validator.check(&json!({"c": {}})), Checked::Invalid);
+    }
+
     /// Fix round 1 #1: validation work is bounded. Sol's reference-doubling
     /// `$defs` chain (exponential work, and an error tree that exhausted
     /// 256 MiB at 1,562 bytes) ends at the budget as `Limit`.
@@ -234,6 +268,118 @@ mod tests {
         );
     }
 
+    /// Fix round 2 #1: `uniqueItems` over more than 20 items compares the
+    /// items whose hashes collide, and each comparison is charged. Arrays
+    /// hash as the flat sequence of their leaves, so `[P, c]` for every
+    /// nesting `c` of `[1..7]` collide: 64 distinct items whose pairwise
+    /// comparisons each walk the shared 1,000-node prefix `P`, about two
+    /// million units, while the value has 64,000 nodes.
+    #[test]
+    fn colliding_unique_items_are_charged() {
+        fn nestings(leaves: &[u64]) -> Vec<Value> {
+            // Every split of `leaves` into consecutive runs, as arrays.
+            if leaves.is_empty() {
+                return vec![json!([])];
+            }
+            let mut all = Vec::new();
+            for cut in 1..=leaves.len() {
+                for rest in nestings(&leaves[cut..]) {
+                    let mut runs = vec![json!(leaves[..cut])];
+                    runs.extend(rest.as_array().unwrap().iter().cloned());
+                    all.push(Value::Array(runs));
+                }
+            }
+            all
+        }
+        let prefix: Vec<Value> = (0..1000).map(|i| json!(i)).collect();
+        let items: Vec<Value> = nestings(&[1, 2, 3, 4, 5, 6, 7])
+            .into_iter()
+            .map(|nesting| json!([prefix, nesting]))
+            .collect();
+        assert_eq!(items.len(), 64);
+        assert_eq!(
+            validate(&json!({"uniqueItems":true}), &Value::Array(items)),
+            Checked::Limit
+        );
+    }
+
+    /// Fix round 2 #1: the names a `dependentRequired` entry lists are
+    /// charged as they are scanned: 500 entries of 100 names over 300
+    /// objects that have every name scan 15 million names.
+    #[test]
+    fn dependent_required_names_are_charged() {
+        let names: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
+        let mut required = serde_json::Map::new();
+        for i in 0..500 {
+            required.insert(format!("d{i}"), json!(names));
+        }
+        let object: serde_json::Map<String, Value> =
+            names.iter().map(|name| (name.clone(), json!(1))).collect();
+        let mut object = object;
+        for i in 0..500 {
+            object.insert(format!("d{i}"), json!(1));
+        }
+        let objects: Vec<Value> = (0..300).map(|_| Value::Object(object.clone())).collect();
+        assert_eq!(
+            validate(
+                &json!({"items":{"dependentRequired":required}}),
+                &Value::Array(objects)
+            ),
+            Checked::Limit
+        );
+    }
+
+    /// A schema that walks `objects` levels of `{"a":…}`, one `$defs`
+    /// schema per level, and at the last level checks the property name
+    /// through a chain of `chain` `allOf` references: the name's
+    /// evaluations nest inside the object's.
+    fn nesting_schema(objects: usize, chain: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for i in 0..objects {
+            defs.insert(
+                format!("o{i}"),
+                json!({"properties":{"a":{"$ref": format!("#/$defs/o{}", i + 1)}}}),
+            );
+        }
+        defs.insert(
+            format!("o{objects}"),
+            json!({"propertyNames":{"$ref":"#/$defs/c0"}}),
+        );
+        for i in 0..chain {
+            defs.insert(
+                format!("c{i}"),
+                json!({"allOf":[{"$ref": format!("#/$defs/c{}", i + 1)}]}),
+            );
+        }
+        defs.insert(format!("c{chain}"), json!({"type":"string"}));
+        json!({"$ref":"#/$defs/o0","$defs":defs})
+    }
+
+    /// Fix round 2 #2: `propertyNames` evaluations nest inside the
+    /// evaluation that reached them and count against the same depth of
+    /// 512. Each chain alone stays within it, together they do not; just
+    /// within it, the nesting runs on the validation thread's stack.
+    #[test]
+    fn nested_evaluations_share_one_depth() {
+        // About 2 levels per object and 2 per chain link.
+        assert_eq!(
+            validate(&nesting_schema(1, 200), &nested(2)),
+            Checked::Valid
+        );
+        assert_eq!(
+            validate(&nesting_schema(200, 1), &nested(201)),
+            Checked::Valid
+        );
+        assert_eq!(
+            validate(&nesting_schema(120, 120), &nested(121)),
+            Checked::Valid
+        );
+        assert_eq!(
+            validate(&nesting_schema(200, 200), &nested(201)),
+            Checked::Limit
+        );
+    }
+
     /// Fix round 1 #1: a value at C1's maximum (65,536 nodes, depth 64)
     /// against a moderately complex schema fits the budget.
     #[test]
@@ -264,6 +410,28 @@ mod tests {
         let tree = (0..61).fold(json!({"v":1}), |inner, _| json!({"a":inner,"v":1}));
         let value = json!({"items":items,"tree":tree});
         assert_eq!(validate(&schema, &value), Checked::Valid);
+    }
+
+    /// Fix round 2 #3: the metaschema check of compiling is bounded. Each
+    /// `$ref` to a location that is not yet a subschema checks the value
+    /// there against the metaschema; refs taken deepest first into a chain
+    /// of 28 `allOf` levels re-check the 50,000-item `enum` at its end for
+    /// every level, about 1.4 million evaluations for one 250 KiB schema
+    /// with 60 subschemas. It does not compile; the plain chain does.
+    #[test]
+    fn the_metaschema_check_is_bounded() {
+        let levels = 28;
+        let payload: Vec<Value> = (0..50_000).map(|i| json!(i)).collect();
+        let chain = (0..levels).fold(
+            json!({ "enum": payload }),
+            |inner, _| json!({"allOf":[inner]}),
+        );
+        let refs: Vec<Value> = (0..=levels)
+            .rev()
+            .map(|depth| json!({"$ref": format!("#/enum/0{}", "/allOf/0".repeat(depth))}))
+            .collect();
+        assert!(compiles(&json!({ "enum": [chain.clone()] })));
+        assert!(!compiles(&json!({"enum":[chain],"anyOf":refs})));
     }
 
     /// Fix round 1 #1: compiling is bounded too: too many subschemas, or

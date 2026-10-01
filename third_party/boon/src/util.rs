@@ -405,8 +405,11 @@ pub(crate) fn equals_within(v1: &Value, v2: &Value, budget: &Budget) -> bool {
         (Value::Object(obj1), Value::Object(obj2)) => {
             obj1.len() == obj2.len()
                 && obj1.iter().all(|(k1, v1)| {
-                    obj2.get(k1)
-                        .is_some_and(|v2| equals_within(v1, v2, budget))
+                    // Looking the name up hashes it.
+                    budget.charge(pattern_units(k1))
+                        && obj2
+                            .get(k1)
+                            .is_some_and(|v2| equals_within(v1, v2, budget))
                 })
         }
         (Value::String(s1), Value::String(s2)) => {
@@ -416,13 +419,15 @@ pub(crate) fn equals_within(v1: &Value, v2: &Value, budget: &Budget) -> bool {
     }
 }
 
-// VIA patch: one budget unit per node of `v`, the work of hashing it;
-// false once the budget is spent.
+// VIA patch: one budget unit per node of `v`, and per 64 bytes of its
+// strings and member names, the work of hashing it; false once the budget
+// is spent.
 pub(crate) fn charge_nodes(v: &Value, budget: &Budget) -> bool {
     let mut pending = vec![v];
     while let Some(v) = pending.pop() {
         let units = match v {
             Value::String(s) => pattern_units(s),
+            Value::Object(obj) => 1 + name_units(obj),
             _ => 1,
         };
         if !budget.charge(units) {
@@ -435,6 +440,12 @@ pub(crate) fn charge_nodes(v: &Value, budget: &Budget) -> bool {
         }
     }
     true
+}
+
+// VIA patch: the budget units of hashing or copying every member name of
+// `obj`: one per 64 bytes of each name, at least one per name.
+pub(crate) fn name_units(obj: &serde_json::Map<String, Value>) -> u64 {
+    obj.keys().map(|name| pattern_units(name)).sum()
 }
 
 // VIA patch: the budget units of scanning a string: one per 64 bytes,
@@ -534,9 +545,14 @@ pub(crate) fn duplicates(arr: &Vec<Value>, budget: &Budget) -> Option<(usize, us
                     }
                 }
             } else {
+                // VIA patch: items whose hashes collide are compared within
+                // the budget, and a spent budget ends the search.
                 let mut seen = AHashMap::with_capacity(len);
                 for (i, item) in arr.iter().enumerate() {
-                    if let Some(j) = seen.insert(HashedValue(item), i) {
+                    if budget.spent() {
+                        return None;
+                    }
+                    if let Some(j) = seen.insert(BudgetedValue(item, budget), i) {
                         return Some((j, i));
                     }
                 }
@@ -559,6 +575,24 @@ impl PartialEq for HashedValue<'_> {
 }
 
 impl Eq for HashedValue<'_> {}
+
+// VIA patch: a `HashedValue` whose equality, the comparison a hash
+// collision makes, is charged to the budget.
+struct BudgetedValue<'a>(&'a Value, &'a Budget);
+
+impl PartialEq for BudgetedValue<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        equals_within(self.0, other.0, self.1)
+    }
+}
+
+impl Eq for BudgetedValue<'_> {}
+
+impl Hash for BudgetedValue<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        HashedValue(self.0).hash(state);
+    }
+}
 
 impl Hash for HashedValue<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {

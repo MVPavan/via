@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::{compiler::*, root::Resource, util::*, SchemaIndex, Schemas};
+use crate::{compiler::*, root::Resource, util::*, validator::Budget, SchemaIndex, Schemas, Validation};
 
 const POS_SELF: u8 = 1 << 0;
 const POS_PROP: u8 = 1 << 1;
@@ -174,12 +174,35 @@ impl Draft {
         STD_METASCHEMAS.get_by_loc(&up).map(|s| s.idx)
     }
 
-    pub(crate) fn validate(&self, up: &UrlPtr, v: &Value) -> Result<(), CompileError> {
+    pub(crate) fn validate(
+        &self,
+        up: &UrlPtr,
+        v: &Value,
+        budget: Option<&Budget>,
+    ) -> Result<(), CompileError> {
         let Some(sch) = self.get_schema() else {
             return Err(CompileError::Bug(
                 format!("no metaschema preloaded for draft {}", self.version).into(),
             ));
         };
+        // VIA patch: within a budget, a yes/no check with no error detail;
+        // walking `v` for its resources and draft is charged with it.
+        if let Some(budget) = budget {
+            if !charge_nodes(v, budget) {
+                return Err(CompileError::LimitExceeded {
+                    what: "metaschema checks",
+                });
+            }
+            return match STD_METASCHEMAS.validate_budgeted(v, sch, budget) {
+                Validation::Valid => Ok(()),
+                Validation::Invalid => Err(CompileError::SchemaInvalid {
+                    url: up.to_string(),
+                }),
+                Validation::BudgetSpent => Err(CompileError::LimitExceeded {
+                    what: "metaschema checks",
+                }),
+            };
+        }
         STD_METASCHEMAS
             .validate(v, sch)
             .map_err(|src| CompileError::ValidationError {

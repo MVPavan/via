@@ -25,6 +25,9 @@ macro_rules! item {
 pub(crate) struct Budget {
     left: Cell<u64>,
     max_depth: usize,
+    /// The evaluations active now, nested ones (`propertyNames`,
+    /// `contentSchema`) included: the depth the cap bounds.
+    active: Cell<usize>,
     spent: Cell<bool>,
 }
 
@@ -33,6 +36,7 @@ impl Budget {
         Self {
             left: Cell::new(units),
             max_depth,
+            active: Cell::new(0),
             spent: Cell::new(false),
         }
     }
@@ -56,6 +60,20 @@ impl Budget {
                 false
             }
         }
+    }
+
+    /// One more active evaluation; false, and spent, beyond the depth cap.
+    fn enter(&self) -> bool {
+        let active = self.active.get() + 1;
+        self.active.set(active);
+        if active > self.max_depth {
+            self.exhaust();
+        }
+        !self.spent()
+    }
+
+    fn leave(&self) {
+        self.active.set(self.active.get() - 1);
     }
 
     pub(crate) fn exhaust(&self) {
@@ -160,24 +178,35 @@ struct Validator<'v, 's, 'd, 'e> {
 }
 
 impl<'v, 's> Validator<'v, 's, '_, '_> {
-    fn validate(mut self) -> Result<Uneval<'v>, ValidationError<'s, 'v>> {
+    // VIA patch: every evaluation, nested validations' included, counts
+    // against the budget's one depth cap while it is active.
+    fn validate(self) -> Result<Uneval<'v>, ValidationError<'s, 'v>> {
+        let budget = self.budget;
+        if !budget.enter() {
+            budget.leave();
+            return Err(self.spent_error());
+        }
+        let result = self.evaluate();
+        budget.leave();
+        result
+    }
+
+    fn evaluate(mut self) -> Result<Uneval<'v>, ValidationError<'s, 'v>> {
         let s = self.schema;
         let v = self.v;
 
         // VIA patch: one unit per evaluation, plus one per member or item
-        // of a container (its scan and evaluation bookkeeping), within the
-        // depth cap.
-        if self.scope.depth > self.budget.max_depth {
-            self.budget.exhaust();
-        }
+        // of a container (its scan and evaluation bookkeeping).
+        // A member name costs one unit per 64 bytes: it is hashed and may
+        // be copied.
         let members = match v {
-            Value::Object(obj) => obj.len(),
-            Value::Array(arr) => arr.len(),
+            Value::Object(obj) => name_units(obj),
+            Value::Array(arr) => arr.len() as u64,
             _ => 0,
         };
         // The cycle check below walks the ancestors validating this value.
         let walk = self.scope.run;
-        if !self.budget.charge(1 + members as u64 + walk as u64) {
+        if !self.budget.charge(1 + members + walk as u64) {
             return Err(self.spent_error());
         }
 
@@ -292,12 +321,17 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
 impl<'v> Validator<'v, '_, '_, '_> {
     fn obj_validate(&mut self, obj: &'v Map<String, Value>) {
         let s = self.schema;
-        // VIA patch: the name lists this evaluation scans.
-        let names = s.required.len()
-            + s.dependencies.len()
-            + s.dependent_schemas.len()
-            + s.dependent_required.len();
-        if !self.budget.charge(names as u64) {
+        // VIA patch: the names the dependency keywords look up; the
+        // required names are charged as `find_missing` scans them.
+        let names: u64 = s
+            .dependencies
+            .iter()
+            .map(|(name, _)| name)
+            .chain(s.dependent_schemas.iter().map(|(name, _)| name))
+            .chain(s.dependent_required.iter().map(|(name, _)| name))
+            .map(|name| pattern_units(name))
+            .sum();
+        if !self.budget.charge(names) {
             return;
         }
         macro_rules! add_err {
@@ -411,6 +445,8 @@ impl<'v> Validator<'v, '_, '_, '_> {
                 if self.budget.spent() {
                     return;
                 }
+                // The name is copied: its units were charged with the
+                // object's members.
                 let v = Value::String(pname.to_owned());
                 if let Err(mut e) = self.validate_nested(&v, *sch) {
                     e.schema_url = &s.loc;
@@ -438,6 +474,9 @@ impl<'v> Validator<'v, '_, '_, '_> {
 
         // dependentRequired --
         for (prop, required) in &s.dependent_required {
+            if self.budget.spent() {
+                return;
+            }
             if obj.contains_key(prop) {
                 if let Some(missing) = self.find_missing(obj, required) {
                     self.add_error(ErrorKind::DependentRequired { prop, missing });
@@ -773,6 +812,10 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
     }
 
     fn resolve_recursive_anchor(&self, fallback: SchemaIndex) -> SchemaIndex {
+        // VIA patch: the walk over the scope chain is charged.
+        if !self.budget.charge(self.scope.depth as u64 + 1) {
+            return fallback;
+        }
         let mut sch = fallback;
         let mut scope = &self.scope;
         loop {
@@ -790,6 +833,10 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
     }
 
     fn resolve_dynamic_anchor(&self, name: &String, fallback: SchemaIndex) -> SchemaIndex {
+        // VIA patch: the walk over the scope chain is charged.
+        if !self.budget.charge(self.scope.depth as u64 + 1) {
+            return fallback;
+        }
         let mut sch = fallback;
         let mut scope = &self.scope;
         loop {
@@ -1096,8 +1143,12 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
         obj: &'v Map<String, Value>,
         required: &'s [String],
     ) -> Option<Vec<&'s str>> {
+        // VIA patch: each name scanned is charged; a spent budget ends the
+        // scan, and the evaluation with it.
+        let budget = self.budget;
         let mut missing = required
             .iter()
+            .take_while(|p| budget.charge(pattern_units(p)))
             .filter(|p| !obj.contains_key(p.as_str()))
             .map(|p| p.as_str());
         if self.bool_result {
@@ -1175,7 +1226,8 @@ struct Scope<'a> {
     /// unique id of value being validated
     // if two scope validate same value, they will have same vid
     vid: usize,
-    /// VIA patch: the evaluation depth, for the budget's depth cap.
+    /// VIA patch: how many scopes this chain has above this one, which
+    /// the dynamic-anchor walks visit.
     depth: usize,
     /// VIA patch: how many ancestors in a row validate the same value.
     run: usize,

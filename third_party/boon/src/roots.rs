@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{compiler::CompileError, draft::*, loader::DefaultUrlLoader, root::Root, util::*};
+use crate::{
+    compiler::CompileError, draft::*, loader::DefaultUrlLoader, root::Root, util::*,
+    validator::Budget,
+};
 
 use serde_json::Value;
 use url::Url;
@@ -10,6 +13,9 @@ use url::Url;
 pub(crate) struct Roots {
     pub(crate) default_draft: &'static Draft,
     pub(crate) required_draft: Option<&'static Draft>, // VIA patch
+    // VIA patch: the budget every metaschema check of this compiler
+    // shares, when one is set.
+    pub(crate) meta_budget: Option<Budget>,
     map: HashMap<Url, Root>,
     pub(crate) loader: DefaultUrlLoader,
 }
@@ -19,6 +25,7 @@ impl Roots {
         Self {
             default_draft: latest(),
             required_draft: None,
+            meta_budget: None,
             map: Default::default(),
             loader: DefaultUrlLoader::new(),
         }
@@ -55,7 +62,7 @@ impl Roots {
             if let Some(required) = self.required_draft {
                 required.require(v)?;
             }
-            root.draft.validate(up, v)?;
+            root.draft.validate(up, v, self.meta_budget.as_ref())?;
             root.add_subschema(doc, &up.ptr)?;
         }
         Ok(())
@@ -101,6 +108,7 @@ impl Roots {
                     ptr: "".into(),
                 },
                 doc,
+                self.meta_budget.as_ref(),
             )?;
         }
 
