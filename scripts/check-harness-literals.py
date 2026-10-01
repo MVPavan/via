@@ -470,6 +470,26 @@ def computed_include(lexed):
     return False
 
 
+def path_attribute(lexed):
+    """True if any attribute in the files has `path = ...`, at any depth."""
+    for tokens in lexed.values():
+        code = [t for t in tokens if t.kind != "comment"]
+        for k, token in enumerate(code):
+            if token.text != "#" or token.kind != "punct":
+                continue
+            bracket = k + 2 if k + 1 < len(code) and code[k + 1].text == "!" else k + 1
+            if bracket >= len(code) or code[bracket].text != "[":
+                continue
+            end = closing(code, bracket)
+            body = code[bracket + 1 : end if end is not None else len(code)]
+            if any(
+                t.text == "path" and i + 1 < len(body) and body[i + 1].text == "="
+                for i, t in enumerate(body)
+            ):
+                return True
+    return False
+
+
 def module_declarations(path, tokens, regions):
     """`(targets, test_only)` for each `mod x;` declaration in the file.
 
@@ -521,10 +541,12 @@ def excluded_files(scope, lexed, regions, mentions):
     `mod x;` declaration in the crate (at any depth, inside inline modules
     too) resolves to it, and that one is a top-level `#[cfg(test)] mod x;`;
     no `#[path]` or `include!` names it; no `include!` in the crate has a
-    computed argument; and it is not a crate root. Anything else is scanned.
+    computed argument; no `#[path]` attribute appears anywhere in the crate,
+    since paths are not resolved; and it is not a crate root. Anything else
+    is scanned.
     """
     excluded = set()
-    if computed_include(lexed):
+    if computed_include(lexed) or path_attribute(lexed):
         return excluded
     declarations = [
         declaration
@@ -846,6 +868,27 @@ mod /* c */ helpers /* d */;
             CORE + "tests.rs": "fn codex() {}\n",
         },
         "expect": [(CORE + "tests.rs", "codex", "codex")],
+    },
+    {
+        "name": "path attribute on an inline module",
+        "files": {
+            CORE + "lib.rs": '#[path = "actual"]\nmod logical {\n    mod tests;\n}\nmod actual;\n',
+            CORE + "actual.rs": "#[cfg(test)]\nmod tests;\n",
+            CORE + "actual/tests.rs": 'const S: &str = "codex";\n',
+        },
+        "expect": [(CORE + "actual/tests.rs", "const S", "codex")],
+    },
+    {
+        "name": "path-qualified test declaration",
+        "files": {
+            CORE + "lib.rs": '#[cfg(test)]\n#[path = "x.rs"]\nmod tests;\n',
+            CORE + "x.rs": "fn fake_x() {}\n",
+            CORE + "tests.rs": 'const S: &str = "claude";\n',
+        },
+        "expect": [
+            (CORE + "tests.rs", "const S", "claude"),
+            (CORE + "x.rs", "fake_x", "fake"),
+        ],
     },
     {
         "name": "include of a test module",
