@@ -205,9 +205,10 @@ impl Daemon {
         self.engine.request_stop(&force).await.unwrap();
         let joins = std::mem::take(&mut *self.dispatchers.lock().unwrap());
         for join in joins {
+            // A dispatcher that never joins fails the case here.
             tokio::time::timeout(Duration::from_secs(20), join)
                 .await
-                .expect("a dispatcher joins after the force")
+                .unwrap()
                 .unwrap();
         }
         let report = self
