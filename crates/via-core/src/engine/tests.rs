@@ -5227,3 +5227,84 @@ fn an_undrained_lane_keeps_a_restart_closing_session_open() {
         .await;
     });
 }
+
+/// The lanes registered and the tasks on the daemon's tracker.
+fn lane_census(engine: &Engine) -> (usize, usize) {
+    (super::lock(&engine.lanes).len(), engine.tracker.len())
+}
+
+/// Critical r1b #8 (runtime §8 idle session lanes, C2 §3 idle lanes):
+/// sessions run one after another to the end of their turns keep at most
+/// `IDLE_LANES` lanes registered and their actors live. Here each turn
+/// fails at launch (no anchor), which retires its lane: a lane that ended
+/// leaves the registry too, and the latest session's stays. Live idle
+/// lanes past the bound are `a_claimed_or_queued_lane_is_never_taken_past_the_bound`'s
+/// and `conformance_core.rs`'s.
+#[test]
+fn sequential_sessions_keep_the_idle_lanes_bounded() {
+    use super::lane::IDLE_LANES;
+    let Some(root) = child("sequential_sessions_keep_the_idle_lanes_bounded") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut sessions = Vec::new();
+        for _ in 0..IDLE_LANES + 8 {
+            let session = new_session(&engine).await;
+            dispatch(&engine, &session).await;
+            sessions.push(session);
+        }
+        let census = || lane_census(&engine);
+        let bounded = tokio::time::timeout(Duration::from_secs(10), async {
+            while census().0 > IDLE_LANES || census().1 > IDLE_LANES {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            bounded.is_ok(),
+            "{} sessions leave (lanes, tracked tasks) {:?} past the bound {IDLE_LANES}",
+            sessions.len(),
+            census()
+        );
+        let lanes = super::lock(&engine.lanes);
+        assert!(!lanes.contains_key(&sessions[0]), "the least recently used");
+        assert!(lanes.contains_key(sessions.last().unwrap()), "the latest");
+    });
+}
+
+/// Critical r1b #8 (C2 §3 idle lanes): a lane that is claimed, or whose
+/// session has a turn queued, is never taken past the bound; the least
+/// recently used idle one is, through its actor's live close: its driver
+/// closed, its end published and the registry left.
+#[test]
+fn a_claimed_or_queued_lane_is_never_taken_past_the_bound() {
+    use super::lane::IDLE_LANES;
+    let Some(root) = child("a_claimed_or_queued_lane_is_never_taken_past_the_bound") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (_claimed_session, claimed, _sender) = idle_session_with_lane(&engine, &root).await;
+        let claim = claimed.claim().expect("an open lane is claimed");
+        // A queued turn, its dispatcher not run.
+        let queued_session = new_session(&engine).await;
+        let (queued, _queued_sender) = adopt_test_lane(&engine, &root, &queued_session).await;
+        let mut idle = Vec::new();
+        for _ in 0..=IDLE_LANES {
+            let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+            idle.push((session, lane, sender));
+        }
+        // The bound's one more took the oldest idle lane.
+        tokio::time::timeout(Duration::from_secs(10), idle[0].1.retired())
+            .await
+            .expect("the oldest idle lane ends");
+        until(|| !super::lock(&engine.lanes).contains_key(&idle[0].0)).await;
+        assert!(!claimed.failed(), "a claimed lane is kept");
+        assert!(!queued.failed(), "a queued session's lane is kept");
+        for (_, lane, _) in &idle[1..] {
+            assert!(!lane.failed(), "within the bound");
+        }
+        drop(claim);
+    });
+}

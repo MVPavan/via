@@ -953,6 +953,13 @@ impl Slot {
         true
     }
 
+    /// No turn queued or running and no close order: the session has no
+    /// work for its lane (C2 §3 idle lanes).
+    pub(super) fn unoccupied(&self) -> bool {
+        let state = lock(&self.state);
+        state.queue.is_empty() && state.running.is_none() && state.close.is_none()
+    }
+
     /// No queued turn, close order or dispatcher: the slot may be retired.
     pub(super) fn idle(&self) -> bool {
         let state = lock(&self.state);

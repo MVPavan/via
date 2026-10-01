@@ -6,7 +6,8 @@
 //!
 //! A lane outlives its dispatcher, so a later turn can pin the live
 //! connection its driver keeps (AD16) and the confirmed identity is kept;
-//! the session's close, its driver's failure or final shutdown ends it.
+//! the session's close, its driver's failure, the idle lanes' bound (C2
+//! §3 idle lanes) or final shutdown ends it.
 //! One task on the daemon's tracker, the lane's actor (Sol r3 N1-N5),
 //! owns the session channel's receiver and the lane's lifecycle for the
 //! lane's whole life, and runs each operation on them to completion: a
@@ -28,7 +29,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -36,9 +37,9 @@ use std::{
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    Admitted, CancellationToken, CloseMode, DriverFailure, DriverHealth, Inherit, Observation,
-    ObservationBudget, SessionCx, SessionDriver, SessionRef, SessionSpec, UsageSample,
-    VendorOptions, VendorTerminal, observation_channel_in,
+    Admitted, CancellationToken, CloseMode, DriverFailure, DriverHealth, Inherit,
+    OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
+    SessionSpec, UsageSample, VendorOptions, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
@@ -59,8 +60,25 @@ pub(super) const VENDOR_TURNS: usize = 64;
 /// overflows the lane: a tombstone is never reassigned (C2 §4.1).
 pub(super) const TOMBSTONES: usize = 1024;
 
-/// How long retiring a failed or replaced driver waits for its close.
+/// How long retiring a failed or replaced driver, or closing an idle
+/// one, waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
+
+/// Idle session lanes kept daemon-wide (runtime §8; C2 §3 idle lanes):
+/// lanes with no turn running or queued for their session and a drained
+/// observation channel. Past it the least recently used one's driver is
+/// closed, and the session's next dispatch reopens it from its stored
+/// identity ([`Engine::evict_idle`]).
+pub(super) const IDLE_LANES: usize = 32;
+
+/// The daemon's lane use clock: each lane's last use is a tick of it, so
+/// the least recently used idle lane is the one with the oldest.
+static USES: AtomicU64 = AtomicU64::new(0);
+
+/// A new tick of [`USES`].
+fn use_tick() -> u64 {
+    USES.fetch_add(1, Ordering::Relaxed)
+}
 
 /// How long final shutdown waits for the lanes' actors to finish their
 /// drain before Host reconciliation ([`Engine::drop_lanes`]): a turn
@@ -105,7 +123,8 @@ enum Ending {
     /// within [`REPLACE_CLOSE`]. It stays the session's lane, so the
     /// session's next turn opens its successor from it.
     Retire,
-    /// The session's close (C2 §2 Close), by its mode and deadline.
+    /// The session's close (C2 §2 Close), or an idle lane's driver close
+    /// (C2 §3 idle lanes), by its mode and deadline.
     Close(CloseMode, Deadline),
 }
 
@@ -116,8 +135,8 @@ struct Core {
     /// A turn holds the lane, from before its driver is prepared until it
     /// ends (Sol r2 #1): the lane does not end meanwhile.
     claimed: bool,
-    /// The session's close asked for the lane's end: the lane leaves the
-    /// session's registration once it ended.
+    /// The session's close or the idle lanes' bound asked for the lane's
+    /// end: the lane leaves the session's registration once it ended.
     removed: bool,
     /// The claimed turn handed to the actor, not yet started.
     job: Option<TurnJob>,
@@ -146,6 +165,7 @@ impl Deref for LaneClaim {
 
 impl Drop for LaneClaim {
     fn drop(&mut self) {
+        self.0.used.store(use_tick(), Ordering::Relaxed);
         lock(&self.0.core).claimed = false;
         self.0.changed.send_replace(());
     }
@@ -229,6 +249,9 @@ pub(super) struct Lane {
     /// The driver's uncertain journal write latched Store failure
     /// ([`Lane::journal_read`]).
     journal_latched: AtomicBool,
+    /// The lane's last use, a tick of [`USES`]: its making, then each
+    /// turn's claim released.
+    used: AtomicU64,
 }
 
 /// What the lane learned from the session's observations.
@@ -480,6 +503,7 @@ impl Lane {
             writer,
             cancel,
             journal_latched: AtomicBool::new(false),
+            used: AtomicU64::new(use_tick()),
         }
     }
 
@@ -553,6 +577,43 @@ impl Lane {
             core.removed = true;
         }
         self.changed.send_replace(());
+    }
+
+    /// Whether the lane is idle (C2 §3 idle lanes), as far as the lane
+    /// knows: open with a healthy driver, no turn holding or handed over,
+    /// and no admitted item outstanding on its channel. The session's
+    /// queue is the caller's to read ([`Engine::evict_idle`]).
+    fn idle(&self) -> bool {
+        let core = lock(&self.core);
+        core.life == Life::Open
+            && !core.claimed
+            && core.job.is_none()
+            && !self.health_failed()
+            && !self.overflowed()
+            && self.budget.available() == OBSERVATION_BYTES
+    }
+
+    /// Asks for an idle lane's end (C2 §3 idle lanes, runtime §8): its
+    /// actor closes the driver gracefully, disposes of what the channel
+    /// still has and ends the lane, which then leaves the session's
+    /// registration. That is not the session's close: nothing is
+    /// committed for it, and the session's next dispatch opens a new
+    /// driver from its stored identity. Only an open lane no turn holds
+    /// or was handed is taken, under the lifecycle lock: a claim or an end
+    /// asked for first keeps it.
+    fn begin_evict(&self) -> bool {
+        {
+            let mut core = lock(&self.core);
+            if core.life != Life::Open || core.claimed || core.job.is_some() {
+                return false;
+            }
+            let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
+            core.life = Life::Ending;
+            core.ending = Some(Ending::Close(CloseMode::Graceful, deadline));
+            core.removed = true;
+        }
+        self.changed.send_replace(());
+        true
     }
 
     /// Waits for the lane's end, whoever asked for it: the completion
@@ -1159,6 +1220,7 @@ impl Engine {
             ((driver, reference), (receiver, budget)),
             (LaneState::recovered(route), false),
         );
+        self.evict_idle();
     }
 
     /// Makes a lane the session's, in place of any it had, and starts its
@@ -1213,6 +1275,56 @@ impl Engine {
         {
             lanes.remove(session);
         }
+    }
+
+    /// Keeps the idle lanes within [`IDLE_LANES`] (runtime §8, C2 §3 idle
+    /// lanes), after a turn released its lane and when a lane is adopted.
+    /// Lanes that ended, such as retired ones, leave the registry: their
+    /// channel was drained to its end, and the session's next dispatch
+    /// opens a fresh lane from its stored identity. Past the bound, the
+    /// least recently used idle lanes are taken through the live-close
+    /// barrier ([`Lane::begin_evict`]), which their actors carry out; this
+    /// waits for none of it. A lane whose session has a turn queued or
+    /// running, or a close order, is not idle; one claimed, handed a turn
+    /// or ending is never taken. A dispatch that finds its lane taken
+    /// waits for its end, then opens the successor ([`Self::claim_lane`],
+    /// [`Self::open_lane`]): one driver at a time, and no turn lost.
+    pub(super) fn evict_idle(&self) {
+        let candidates: Vec<(SessionId, Arc<Lane>)> = {
+            let mut lanes = lock(&self.lanes);
+            lanes.retain(|_, lane| !lane.ended());
+            lanes
+                .iter()
+                .filter(|(_, lane)| lane.idle())
+                .map(|(session, lane)| (session.clone(), Arc::clone(lane)))
+                .collect()
+        };
+        if candidates.len() <= IDLE_LANES {
+            return;
+        }
+        let mut idle: Vec<Arc<Lane>> = {
+            let sessions = lock(&self.sessions);
+            candidates
+                .into_iter()
+                .filter(|(session, _)| sessions.get(session).is_none_or(|slot| slot.unoccupied()))
+                .map(|(_, lane)| lane)
+                .collect()
+        };
+        let Some(excess) = idle.len().checked_sub(IDLE_LANES) else {
+            return;
+        };
+        idle.sort_unstable_by_key(|lane| lane.used.load(Ordering::Relaxed));
+        for lane in idle.into_iter().take(excess) {
+            lane.begin_evict();
+        }
+    }
+
+    /// Test builds: the lanes registered, and the tasks on the daemon's
+    /// tracker (the lanes' actors and their drivers' owned tasks).
+    #[cfg(feature = "test-failpoints")]
+    #[must_use]
+    pub fn lane_census(&self) -> (usize, usize) {
+        (lock(&self.lanes).len(), self.tracker.len())
     }
 
     /// Whether `session`'s lane drain is complete (design §6.8 step 3, Sol

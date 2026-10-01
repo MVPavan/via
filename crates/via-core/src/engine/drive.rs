@@ -510,6 +510,9 @@ impl Engine {
                     .await;
                 engine.active.fetch_sub(1, Ordering::AcqRel);
                 drop(claim);
+                // The lane may be idle now: the bound on idle lanes holds
+                // (runtime §8).
+                engine.evict_idle();
                 // The dispatcher may be gone: nothing waits for the end.
                 let _ = done.send(());
             })
