@@ -29,7 +29,7 @@ use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
 use crate::api::{Cancel, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
-use crate::intake::{Effective, TurnPlan};
+use crate::intake::{Effective, Frozen, TurnPlan};
 use crate::{ApiError, Cleanup, Deadline, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
@@ -236,7 +236,8 @@ impl Engine {
 
     /// Whether `turn`'s queued row holds a frozen value that is present but
     /// unparseable (design §7.3): Store cannot read the row, or, for a turn
-    /// the handoff would enqueue (`parse`), Core cannot read its `effective`.
+    /// the handoff would enqueue (`parse`), Core cannot read its `effective`
+    /// or its session's frozen parameters or capabilities (Sol r1 #14).
     /// Any other read failure fails startup.
     async fn frozen_row_corrupt(
         &self,
@@ -245,9 +246,9 @@ impl Engine {
         parse: bool,
     ) -> Result<bool, String> {
         match self.store.queued_turn(session, turn).await {
-            Ok(Some(queued)) => {
-                Ok(parse && serde_json::from_value::<Effective>(queued.effective).is_err())
-            }
+            Ok(Some(queued)) => Ok(parse
+                && (serde_json::from_value::<Effective>(queued.effective).is_err()
+                    || Frozen::decode(&queued.route).is_none())),
             // Store's own parse of the row's values failed.
             Err(StoreError::CorruptEvidence) => Ok(true),
             Ok(None) => Err(format!(

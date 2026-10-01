@@ -2451,6 +2451,10 @@ impl Engine {
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
             return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
         };
+        // Sol r1 #14: so does a session's frozen parameters or capabilities.
+        if Frozen::decode(&queued.route).is_none() {
+            return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
+        }
         // Design §6.5: a blob prompt is loaded into one exact `String` with
         // its SHA-256 and UTF-8 checks; a blob that differs from its record
         // fails the turn as corrupt evidence, before anything is sent.

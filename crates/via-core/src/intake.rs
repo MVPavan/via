@@ -744,6 +744,29 @@ impl Frozen {
             .capabilities
             .as_deref()
             .and_then(|capabilities| serde_json::from_str(capabilities).ok());
+        Self::from_parts(route, params, capabilities)
+    }
+
+    /// The facts of `route` for a submission (Sol r1 #14, T3 §7.3): a
+    /// frozen parameters or capabilities value that is present but cannot
+    /// be decoded is corruption, `None`; an absent one stays empty.
+    pub(crate) fn decode(route: &SessionRoute) -> Option<Self> {
+        let params = match route.params.as_deref() {
+            Some(params) => Some(serde_json::from_str::<Params>(params).ok()?),
+            None => None,
+        };
+        let capabilities = match route.capabilities.as_deref() {
+            Some(capabilities) => Some(serde_json::from_str(capabilities).ok()?),
+            None => None,
+        };
+        Some(Self::from_parts(route, params, capabilities))
+    }
+
+    fn from_parts(
+        route: &SessionRoute,
+        params: Option<Params>,
+        capabilities: Option<Capabilities>,
+    ) -> Self {
         let mut frozen = Self {
             harness: route.harness.clone(),
             route: route.route.clone().unwrap_or_default(),

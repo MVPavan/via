@@ -1322,3 +1322,104 @@ fn conformance_intake_refusal_metadata() {
         daemon.stop().await;
     });
 }
+
+/// Rewrites a session's frozen row in the Store under `root` with `sql`
+/// (`?1` is the session), as a corrupting writer would.
+fn tamper(root: &Path, session: &SessionId, sql: &str) {
+    let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(db.execute(sql, [session.as_str()]).unwrap(), 1, "{sql}");
+}
+
+/// Frozen values that are present, valid JSON, but not what Core froze.
+const BAD_PARAMS: &str =
+    "UPDATE sessions SET params=json_set(params,'$.allow_untested','yes') WHERE id=?1";
+const BAD_CAPABILITIES: &str =
+    "UPDATE sessions SET receipt=json_set(receipt,'$.capabilities.usage',7) WHERE id=?1";
+
+/// Sol r1 #14 (T3 §7.3): a queued turn whose session's frozen parameters
+/// or capabilities cannot be decoded fails its submission through
+/// `commit_submit_failed`, `failed(store)` with no agent I/O, both live
+/// (corrupted while it waits behind a running turn) and on restart (the
+/// handoff meets it at its session's head).
+#[test]
+fn conformance_intake_corrupt_frozen_session_values_fail_submission() {
+    // Live: turn 2 waits behind turn 1 while its session row is corrupted.
+    for corruption in [BAD_PARAMS, BAD_CAPABILITIES] {
+        let root = Root::new();
+        let path = root.scenario(
+            "scenario.json",
+            &scenario(
+                &json!({}),
+                &[
+                    script("first", &[gate("hold"), accepted(1), terminal(1)]),
+                    script("second", &[accepted(2), terminal(2)]),
+                ],
+            ),
+        );
+        run(async {
+            let daemon = Daemon::open(&root, &path);
+            let session = daemon
+                .spawn(&json!({"harness":"fake","model":"fake","prompt":"first"}))
+                .await;
+            daemon.entered("hold").await;
+            daemon
+                .try_resume(&session, &json!({"prompt":"second"}))
+                .await
+                .unwrap();
+            tamper(root.path(), &session, corruption);
+            daemon.release("hold");
+            assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+            let envelope = daemon.wait(&session, 2).await;
+            assert_eq!(envelope["state"], "failed", "{corruption}: {envelope}");
+            assert_eq!(envelope["failure"]["class"], "store", "{envelope}");
+            assert!(
+                envelope["timestamps"]["accepted_at"].is_null(),
+                "{envelope}"
+            );
+            daemon.stop().await;
+        });
+    }
+    // Restart: a queued turn left by an Engine that dispatched nothing.
+    for corruption in [BAD_PARAMS, BAD_CAPABILITIES] {
+        let root = Root::new();
+        let path = root.scenario("scenario.json", &scenario(&json!({}), &[]));
+        let open = || {
+            let env = BootstrapEnv::from_vars([
+                ("VIA_FAKE_AGENT_BINARY", binary("via-fake-agent")),
+                ("VIA_FAKE_SCENARIO", path.clone()),
+                ("VIA_FAKE_SYNC_DIR", root.path().join("sync")),
+            ]);
+            Engine::open(
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+                AdapterConfig::load(env, None).unwrap(),
+                binary("via"),
+            )
+            .unwrap()
+        };
+        run(async {
+            let engine = open();
+            let raw = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE});
+            let (session, _) = engine
+                .spawn(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap()
+                .enqueued
+                .unwrap();
+            drop(engine);
+            tamper(root.path(), &session, corruption);
+            let engine = open();
+            assert_eq!(engine.recover().await.unwrap(), 0);
+            let handoff = engine.hand_off_queued().await.unwrap();
+            assert_eq!((handoff.enqueued, handoff.failed), (0, 1), "{corruption}");
+            let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+            let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+            assert_eq!(envelope["state"], "failed", "{envelope}");
+            assert_eq!(envelope["failure"]["class"], "store", "{envelope}");
+        });
+    }
+}

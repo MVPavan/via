@@ -22,6 +22,8 @@ boon = { workspace = true }
 [dev-dependencies]
 # Tests drive Store's test seams.
 via-store = { path = "../via-store", features = ["test-failpoints"] }
+# Conformance cases corrupt a frozen row directly (Sol r1 #14).
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
