@@ -265,10 +265,14 @@ the historical checkpoint; its findings table is updated by this section.
     hard-stops only the agent's own group, and reports leftovers (AD20)
     without killing them.
 
-  **Pending owner choice:** conflict 4 on leftover detection. A: a
-  report-only marker scan that transiently reads same-uid environments,
-  touching invariant 1. B: anchor-subreaper detection. C: no report this
-  release. Recommended: A. It is decided in S-SPEC (`via-jm4.25`).
+  - **Leftover detection (2026-10-01): option A.** A report-only scan
+    for VIA's exact process marker. It transiently reads the environment of
+    same-uid processes started at or after the vendor launch. Invariant 1
+    carries this as its one narrow exception (C2 §4.2).
+
+  S-SPEC (`via-jm4.25`) and its follow-up for option A (S-SPEC-C4) are
+  merged, and so is S-CORE chunk 2 (the harness table). S-CORE (`via-jm4.26`)
+  is in progress; its plan and decisions are in `scratchpad/execution/s-core/`.
   Slices: `via-jm4.25` S-SPEC → `via-jm4.26` S-CORE → each `x.3.2`;
   `via-jm4.27` S-LAUNCH → each `x.3.2`; each `x.3.3` → `via-jm4.28`
   S-LEFTOVER → `via-gvg.1`/`via-d9o.1`. Unreported leftover cases:
