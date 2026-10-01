@@ -1280,6 +1280,47 @@ fn replay_progress_markers_name_their_launch() -> TestResult {
 }
 
 #[test]
+fn replay_a_failed_input_ack_fails_the_replay() -> TestResult {
+    // Review r4 #1: an EOF (or line) whose ack cannot be written is an input
+    // error, never a good EOF, so a sealed replay cannot pass without it.
+    let steps = json!([
+        {"emit": {"line": "ready"}},
+        {"await_eof": {}},
+        {"emit": {"line": "done"}}
+    ]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    fs::create_dir(root.path().join("vendor.progress"))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("ready"));
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
+    assert!(
+        end.stderr.contains("step 2: cannot write the progress log"),
+        "{}",
+        end.stderr
+    );
+
+    // A line whose ack fails is not taken as the expected line either.
+    let steps = json!([{"expect": {"line": {"n": 1}}}, {"await_eof": {}}]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    fs::create_dir(root.path().join("vendor.progress"))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    let input = run.stdin.as_mut().ok_or("no stdin")?;
+    input.write_all(b"{\"n\":1}\n")?;
+    input.flush()?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
+    assert!(
+        end.stderr.contains("step 1: cannot write the progress log"),
+        "{}",
+        end.stderr
+    );
+    Ok(())
+}
+
+#[test]
 fn replay_a_cached_eof_satisfies_consecutive_await_eof_steps() -> TestResult {
     let end = run_closed(
         &json!([{"await_eof": {}}, {"await_eof": {}}, {"emit": {"line": "done"}}]),

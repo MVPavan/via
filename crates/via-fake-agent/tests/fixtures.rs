@@ -79,28 +79,6 @@ const CREDENTIAL_SUFFIXES: [&str; 10] = [
 /// Identity-bearing fields, normalized: a string value is a placeholder.
 const IDENTITY_FIELDS: [&str; 5] = ["user", "username", "login", "email", "account"];
 /// The only values a credential or identity field may hold.
-/// The options of the recorded vendor argv recipes. A credential option
-/// followed by one of these was given no value; any other following word,
-/// hyphenated or quoted, is its value.
-const KNOWN_OPTIONS: [&str; 17] = [
-    "-p",
-    "--allowedTools",
-    "--append-system-prompt",
-    "--disable",
-    "--effort",
-    "--input-format",
-    "--json-schema",
-    "--model",
-    "--output-format",
-    "--permission-mode",
-    "--permission-prompts",
-    "--restricted",
-    "--resume",
-    "--session-id",
-    "--strict-mcp-config",
-    "--tools",
-    "--verbose",
-];
 const PLACEHOLDERS: [&str; 4] = ["", "<redacted>", "REDACTED", "PLACEHOLDER"];
 /// Fixtures whose input is not sealed by a final `await_eof` (alone, or
 /// right before the closing `exit`), each with its reason.
@@ -373,12 +351,41 @@ enum Deviation {
     ExtraInput,
     /// Closes stdin right after the first answered line.
     EarlyEof,
-    /// Writes each `after_emit` step's line together with the last answer
-    /// before its predecessor emit, as an adapter that did not wait for that
-    /// reply would. The fixture gets a gate before each such emit (see
-    /// [`gated`]), released only once the fake acknowledged the early line,
-    /// so it provably arrives before the emit.
-    Hoisted,
+    /// Writes one `after_emit` step's line (`step` of lifetime `lifetime`,
+    /// both 1-based) together with the last answer before its predecessor
+    /// emit, as an adapter that did not wait for that reply would. The
+    /// fixture gets a gate before that emit (see [`gated`]), released only
+    /// once the fake acknowledged the early line, so it provably arrives
+    /// before the emit. One line per run never outgrows the fake's input
+    /// queue.
+    Hoisted { lifetime: usize, step: usize },
+}
+
+/// The last expect step (0-based index) before the predecessor emit of the
+/// `after_emit` step at `index`: the answer a hoisted line rides with.
+fn carrier(steps: &[Value], index: usize) -> Option<usize> {
+    let emit = usize::try_from(steps[index]["expect"]["after_emit"].as_u64()?).ok()?;
+    steps[..emit.saturating_sub(1)]
+        .iter()
+        .rposition(|step| step.get("expect").is_some())
+}
+
+/// The `after_emit` steps (1-based) that can be hoisted alone: no expect
+/// lies between their carrier and them, so the hoisted line is the next one
+/// the fake reads and fails on its causal floor, not on order.
+fn hoist_targets(fixture: &Value) -> Vec<usize> {
+    let steps = fixture["steps"].as_array().map_or(&[][..], Vec::as_slice);
+    (0..steps.len())
+        .filter(|&index| {
+            steps[index]["expect"].get("after_emit").is_some()
+                && carrier(steps, index).is_some_and(|carrier| {
+                    !steps[carrier + 1..index]
+                        .iter()
+                        .any(|step| step.get("expect").is_some())
+                })
+        })
+        .map(|index| index + 1)
+        .collect()
 }
 
 /// The fixtures one file holds, in launch order: the file itself, or each
@@ -415,34 +422,33 @@ fn after_emit_have_reasons(fixture: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// `fixture` with a `SIGUSR1` gate before each emit that an `after_emit`
-/// names, every `after_emit` renumbered to match. The driver releases a
-/// gate only once the fake has acknowledged every line written so far, so
-/// a hoisted line has provably arrived before its predecessor's emit.
-fn gated(fixture: &Value) -> Value {
-    let steps = fixture["steps"].as_array().cloned().unwrap_or_default();
-    let named: Vec<u64> = steps
-        .iter()
-        .filter_map(|step| step["expect"]["after_emit"].as_u64())
-        .collect();
-    // Old step number to new, 1-based.
-    let mut moved = BTreeMap::new();
-    let mut out = Vec::new();
-    for (index, step) in steps.into_iter().enumerate() {
-        let number = index as u64 + 1;
-        if named.contains(&number) {
-            out.push(serde_json::json!({"await_signal": {"signal": "SIGUSR1"}}));
-        }
-        moved.insert(number, out.len() as u64 + 1);
-        out.push(step);
-    }
-    for step in &mut out {
-        if let Some(emit) = step["expect"]["after_emit"].as_u64() {
-            step["expect"]["after_emit"] = Value::from(moved[&emit]);
+/// `fixture` with a `SIGUSR1` gate before the emit that step `target`'s
+/// `after_emit` names, every `after_emit` renumbered to match (so `target`
+/// becomes `target + 1`). The driver releases the gate only once the fake
+/// has acknowledged every line written so far, so the hoisted line has
+/// provably arrived before its predecessor's emit.
+fn gated(fixture: &Value, target: usize) -> Value {
+    let mut steps = fixture["steps"].as_array().cloned().unwrap_or_default();
+    let Some(emit) = steps
+        .get(target.wrapping_sub(1))
+        .and_then(|step| step["expect"]["after_emit"].as_u64())
+    else {
+        return fixture.clone();
+    };
+    for step in &mut steps {
+        if let Some(named) = step["expect"]["after_emit"].as_u64()
+            && named >= emit
+        {
+            step["expect"]["after_emit"] = Value::from(named + 1);
         }
     }
+    let at = usize::try_from(emit - 1).unwrap_or(steps.len());
+    steps.insert(
+        at,
+        serde_json::json!({"await_signal": {"signal": "SIGUSR1"}}),
+    );
     let mut fixture = fixture.clone();
-    fixture["steps"] = Value::Array(out);
+    fixture["steps"] = Value::Array(steps);
     fixture
 }
 
@@ -460,8 +466,8 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     for fixture in lifetimes_of(&file) {
         after_emit_have_reasons(fixture)?;
     }
-    if deviation == Deviation::Hoisted {
-        file = gated_file(&file);
+    if let Deviation::Hoisted { lifetime, step } = deviation {
+        file = gated_file(&file, lifetime, step);
         fs::write(
             root.path().join("vendor.replay.json"),
             serde_json::to_vec(&file)?,
@@ -470,11 +476,21 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     let lifetimes = lifetimes_of(&file);
     let single = file.get("lifetimes").is_none();
     let mut starts = 0;
-    if single && file.get("version").is_some() {
+    // A null `version` means none, as the replay schema reads it.
+    if single && file.get("version").is_some_and(Value::is_string) {
         probe_version(&binary, &file)?;
         starts += 1;
     }
     for (index, fixture) in lifetimes.into_iter().enumerate() {
+        // Only the targeted lifetime hoists, its step renumbered by the gate.
+        let deviation = match deviation {
+            Deviation::Hoisted { lifetime, step } if lifetime == index + 1 => Deviation::Hoisted {
+                lifetime,
+                step: step + 1,
+            },
+            Deviation::Hoisted { .. } => Deviation::None,
+            other @ (Deviation::None | Deviation::ExtraInput | Deviation::EarlyEof) => other,
+        };
         // This start's launch ordinal: the probe, if any, was the first.
         run_lifetime(&binary, fixture, (deviation, starts + 1))
             .map_err(|error| format!("lifetime {}: {error}", index + 1))?;
@@ -487,15 +503,26 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     Ok(())
 }
 
-/// [`gated`] applied to the file's fixture or to each of its lifetimes.
-fn gated_file(file: &Value) -> Value {
+/// [`gated`] applied to step `step` of the file's lifetime `lifetime`.
+fn gated_file(file: &Value, lifetime: usize, step: usize) -> Value {
     match file.get("lifetimes").and_then(Value::as_array) {
         Some(lifetimes) => {
             let mut gated_file = file.clone();
-            gated_file["lifetimes"] = lifetimes.iter().map(gated).collect();
+            gated_file["lifetimes"] = lifetimes
+                .iter()
+                .enumerate()
+                .map(|(index, fixture)| {
+                    if index + 1 == lifetime {
+                        gated(fixture, step)
+                    } else {
+                        fixture.clone()
+                    }
+                })
+                .collect();
             gated_file
         }
-        None => gated(file),
+        None if lifetime == 1 => gated(file, step),
+        None => file.clone(),
     }
 }
 
@@ -646,28 +673,18 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult {
                 .stdin
                 .as_mut()
                 .ok_or_else(|| fail("stdin already closed".to_owned()))?;
-            // Answered at once, so any `within_ms` is met. Hoisted lines go
-            // in the same write, ahead of the emit they should wait for.
+            // Answered at once, so any `within_ms` is met. A hoisted line
+            // goes in the same write, ahead of the emit it should wait for.
             let mut text = format!("{line}\n");
-            if run.deviation == Deviation::Hoisted {
-                for (later, ahead) in steps.iter().enumerate().skip(index + 1) {
-                    let Some(emit) = ahead["expect"]["after_emit"]
-                        .as_u64()
-                        .and_then(|emit| usize::try_from(emit).ok())
-                    else {
-                        continue;
-                    };
-                    // The last expect before the predecessor emit carries it.
-                    let carrier = steps[..emit.saturating_sub(1)]
-                        .iter()
-                        .rposition(|step| step.get("expect").is_some());
-                    if carrier == Some(index) {
-                        let early = answer(&ahead["expect"], &mut run.captures).map_err(fail)?;
-                        text.push_str(&early.to_string());
-                        text.push('\n');
-                        hoisted.insert(later + 1, early);
-                    }
-                }
+            if let Deviation::Hoisted { step: target, .. } = run.deviation
+                && target > number
+                && carrier(steps, target - 1) == Some(index)
+            {
+                let early =
+                    answer(&steps[target - 1]["expect"], &mut run.captures).map_err(fail)?;
+                text.push_str(&early.to_string());
+                text.push('\n');
+                hoisted.insert(target, early);
             }
             input.write_all(text.as_bytes())?;
             input.flush()?;
@@ -1047,8 +1064,8 @@ fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// stderr or prefixed JSON: the name (normalized), an optional quote, `=`
 /// or `:`, then a value that is not exactly a placeholder (or a bare
 /// `null`). A credential option (`--password VALUE`, `--token VALUE`) takes
-/// the next word as its value unless that word is one of [`KNOWN_OPTIONS`]
-/// (no value), whatever its leading hyphens. A quoted value is taken whole, through its
+/// the next word as its value, whatever it looks like (another flag
+/// included); only the end of the text means no value. A quoted value is taken whole, through its
 /// closing quote, so whitespace inside it hides nothing. An identity value
 /// that is a number, boolean, object or array is not an identity string.
 /// `\u` escapes are decoded first.
@@ -1062,7 +1079,6 @@ fn secret_assignment(text: &str) -> Option<String> {
         }
         let after = &text[at + name.len()..];
         let rest = after.trim_start_matches(quote).trim_start();
-        let option = !rest.starts_with(['=', ':']);
         let rest = match rest.strip_prefix(['=', ':']) {
             Some(rest) => rest,
             // A credential option's value is the next word.
@@ -1086,10 +1102,6 @@ fn secret_assignment(text: &str) -> Option<String> {
                 (&rest[..end], false)
             }
         };
-        // An option followed by a known option of the recipes has no value.
-        if option && !quoted && KNOWN_OPTIONS.contains(&value) {
-            continue;
-        }
         if !secret
             && !quoted
             && (rest.starts_with(['{', '['])
@@ -1110,18 +1122,14 @@ fn secret_assignment(text: &str) -> Option<String> {
 }
 
 /// A credential option in an argument list (`["--token", "abc"]`) whose
-/// next element is not a placeholder or a known option of the recipes.
+/// next element is not a placeholder. One with no next element (the end
+/// of the list) has no value.
 fn credential_argument(items: &[Value]) -> Option<String> {
     items.windows(2).find_map(|pair| {
         let flag = pair[0].as_str()?;
         let value = &pair[1];
-        (flag.starts_with("--")
-            && credential(flag).is_some()
-            && !placeholder(value)
-            && !value
-                .as_str()
-                .is_some_and(|next| KNOWN_OPTIONS.contains(&next)))
-        .then(|| format!("{flag} is passed a non-placeholder value"))
+        (flag.starts_with("--") && credential(flag).is_some() && !placeholder(value))
+            .then(|| format!("{flag} is passed a non-placeholder value"))
     })
 }
 
@@ -1289,6 +1297,10 @@ fn fixtures_hygiene_scan_detects_the_r2_probes() {
         r#"{"stderr":"--password \"-hunter2\""}"#,
         r#"{"argv":["--password","-hunter2"]}"#,
         r#"{"t":"pass --password - to read it from stdin"}"#,
+        // Review r4 #2: a flag-shaped token is still the option's value.
+        r#"{"argv":["--password","--verbose"]}"#,
+        r#"{"stderr":"--password --verbose"}"#,
+        r#"{"t":"run --password --model m"}"#,
     ];
     let missed: Vec<&str> = bad
         .into_iter()
@@ -1300,8 +1312,8 @@ fn fixtures_hygiene_scan_detects_the_r2_probes() {
         r#"{"t":"The user doesn't want to proceed; account/updated arrived."}"#,
         r#"{"t":"username=REDACTED login: PLACEHOLDER"}"#,
         r#"{"argv":["--max-tokens","5","--token","<redacted>","--token-file","-"]}"#,
-        r#"{"argv":["--token","--verbose"]}"#,
-        r#"{"t":"run --password --model m"}"#,
+        r#"{"argv":["-p","--token"]}"#,
+        r#"{"t":"the last flag is --password"}"#,
     ];
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
@@ -1385,42 +1397,74 @@ fn eof_follows_first_expect(steps: &[Value]) -> bool {
     })
 }
 
+/// Drives `path` hoisting its lifetime `lifetime`'s step `step` and checks
+/// that replay fails on that line's causal floor.
+fn hoisted_fails(path: &Path, lifetime: usize, step: usize) -> Result<(), String> {
+    let file: Value = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let fixture = lifetimes_of(&file)[lifetime - 1];
+    let emit = fixture["steps"][step - 1]["expect"]["after_emit"]
+        .as_u64()
+        .ok_or("not an after_emit step")?;
+    // The gate before the predecessor moves it and the target by one.
+    let wanted = format!(
+        "step {}: the line arrived before step {}'s emit",
+        step + 1,
+        emit + 1
+    );
+    let at = format!("lifetime {lifetime}: ");
+    match drive(path, Deviation::Hoisted { lifetime, step }) {
+        Err(error) if error.to_string().starts_with(&at) && error.to_string().contains(&wanted) => {
+            Ok(())
+        }
+        other => Err(format!(
+            "{} lifetime {lifetime} step {step}: gave {:?}",
+            path.display(),
+            other.map_err(|error| error.to_string())
+        )),
+    }
+}
+
 /// Review r2 #1: a line written before its `after_emit` predecessor, as an
 /// adapter that sent `turn/start` before reading the `thread/start` reply
-/// would (c11), fails replay at that step. Every fixture with an
-/// `after_emit` is exercised.
+/// would (c11), fails replay at that step. Every recorded `after_emit` step
+/// must be one that can be hoisted alone ([`hoist_targets`]), and each is
+/// exercised in its own run.
 #[test]
 fn fixtures_fail_replay_on_a_line_before_its_after_emit() -> TestResult {
+    let mut runs = Vec::new();
     let mut misses = Vec::new();
-    let mut exercised = Vec::new();
-    for (path, result) in drive_all(Deviation::Hoisted)? {
-        let file = gated_file(&serde_json::from_slice(&fs::read(&path)?)?);
-        // The first lifetime with an `after_emit` is the one that fails.
-        let Some((lifetime, steps, first)) =
-            lifetimes_of(&file)
+    for path in replay_fixtures()? {
+        let file: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        for (index, fixture) in lifetimes_of(&file).into_iter().enumerate() {
+            let named = fixture["steps"]
+                .as_array()
                 .into_iter()
-                .enumerate()
-                .find_map(|(index, fixture)| {
-                    let steps = fixture["steps"].as_array()?;
-                    let first = steps
-                        .iter()
-                        .position(|step| step["expect"].get("after_emit").is_some())?;
-                    Some((index + 1, steps.clone(), first))
-                })
-        else {
-            continue;
-        };
-        exercised.push(path.display().to_string());
-        let emit = &steps[first]["expect"]["after_emit"];
-        let wanted = format!(
-            "step {}: the line arrived before step {emit}'s emit",
-            first + 1
-        );
-        let at = format!("lifetime {lifetime}: ");
-        match result {
-            Err(error) if error.starts_with(&at) && error.contains(&wanted) => {}
-            other => misses.push(format!("{}: gave {other:?}", path.display())),
+                .flatten()
+                .filter(|step| step["expect"].get("after_emit").is_some())
+                .count();
+            // No recorded `after_emit` step goes unexercised.
+            if hoist_targets(fixture).len() != named {
+                misses.push(format!(
+                    "{}: an after_emit step cannot be hoisted alone",
+                    path.display()
+                ));
+            }
+            for step in hoist_targets(fixture) {
+                let worker = path.clone();
+                let run = thread::spawn(move || hoisted_fails(&worker, index + 1, step));
+                runs.push((path.display().to_string(), run));
+            }
         }
+    }
+    let mut exercised = Vec::new();
+    for (name, run) in runs {
+        match run.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(miss)) => misses.push(miss),
+            Err(_) => misses.push(format!("{name}: driver panicked")),
+        }
+        exercised.push(name);
     }
     assert!(
         exercised
@@ -1429,6 +1473,53 @@ fn fixtures_fail_replay_on_a_line_before_its_after_emit() -> TestResult {
         "c11 not exercised: {exercised:?}"
     );
     assert!(misses.is_empty(), "{}", misses.join("\n"));
+    Ok(())
+}
+
+/// Review r4 #3: a null `version` means none, as the replay schema reads
+/// it, so the generic driver probes no `--version`.
+#[test]
+fn fixtures_a_null_version_is_not_probed() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("unversioned.replay.json");
+    let fixture = serde_json::json!({
+        "source": "synthetic: a null version (review r4 #3)",
+        "argv": [],
+        "version": null,
+        "deadline_ms": 10_000,
+        "steps": [{"emit": {"line": "{}"}}, {"await_eof": {}}]
+    });
+    fs::write(&path, serde_json::to_vec(&fixture)?)?;
+    drive(&path, Deviation::None)
+}
+
+/// Review r4 #4: three requests written on one reply. Hoisting the first
+/// alone reaches its causal failure; batching all three outgrew the fake's
+/// two-event input queue and stalled at the gate.
+#[test]
+fn fixtures_hoist_one_of_three_requests_on_one_reply() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("three.replay.json");
+    let fixture = serde_json::json!({
+        "source": "synthetic: three requests on one reply (review r4 #4)",
+        "notes": "step 5, step 6 and step 7 are each written on step 2's reply",
+        "argv": [],
+        "deadline_ms": 10_000,
+        "steps": [
+            {"expect": {"line": {"id": 1}}},
+            {"emit": {"line": "{\"id\":1,\"result\":{}}"}},
+            {"emit": {"line": "{\"method\":\"a\"}"}},
+            {"emit": {"line": "{\"method\":\"b\"}"}},
+            {"expect": {"line": {"id": 2}, "after_emit": 2}},
+            {"expect": {"line": {"id": 3}, "after_emit": 2}},
+            {"expect": {"line": {"id": 4}, "after_emit": 2}},
+            {"await_eof": {}}
+        ]
+    });
+    fs::write(&path, serde_json::to_vec(&fixture)?)?;
+    drive(&path, Deviation::None)?;
+    assert_eq!(hoist_targets(&fixture), vec![5]);
+    hoisted_fails(&path, 1, 5)?;
     Ok(())
 }
 

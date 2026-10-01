@@ -212,9 +212,8 @@ impl Input {
                 self.eof = Some(at);
                 Ok(())
             }
-            Some((_, Event::Line(_) | Event::Error(_))) => {
-                Err("unexpected input after the last expect".to_owned())
-            }
+            Some((_, Event::Line(_))) => Err("unexpected input after the last expect".to_owned()),
+            Some((_, Event::Error(error))) => Err(error),
             None => Ok(()),
         }
     }
@@ -222,8 +221,8 @@ impl Input {
 
 /// Reads stdin line by line until EOF or an error. It waits for room before
 /// each read, reads without the lock, then stamps, publishes and
-/// acknowledges a line or EOF in the progress log under it. A failed
-/// acknowledgement is published as an input error.
+/// acknowledges a line or EOF in the progress log under it. An event whose
+/// acknowledgement failed is replaced by that input error.
 fn read_stdin(shared: &Shared, progress: &Progress) {
     let mut input = io::stdin().lock();
     let mut lines = 0_usize;
@@ -255,19 +254,21 @@ fn read_stdin(shared: &Shared, progress: &Progress) {
             Event::Eof => Some("eof".to_owned()),
             Event::Error(_) => None,
         };
-        let last = !matches!(event, Event::Line(_));
         let mut queue = shared.lock();
-        queue.push_back((Instant::now(), event));
+        let at = Instant::now();
         // Acknowledged under the lock, so the main thread cannot take the
         // event (and the process cannot end on it) before the ack is written.
-        let failed = ack.and_then(|ack| progress.log(&ack).err());
-        let stop = last || failed.is_some();
-        if let Some(error) = failed {
-            queue.push_back((Instant::now(), Event::Error(error)));
-        }
+        // An event whose ack failed is published as that error instead, so
+        // it can never be taken as a good line or EOF.
+        let event = match ack.and_then(|ack| progress.log(&ack).err()) {
+            Some(error) => Event::Error(error),
+            None => event,
+        };
+        let last = !matches!(event, Event::Line(_));
+        queue.push_back((at, event));
         drop(queue);
         shared.changed.notify_all();
-        if stop {
+        if last {
             return;
         }
     }
