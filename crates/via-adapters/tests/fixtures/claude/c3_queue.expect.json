@@ -90,6 +90,9 @@
         },
         "journal_uncertain": false,
         "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [
           {
             "kind": "session.vendor_identity_confirmed",

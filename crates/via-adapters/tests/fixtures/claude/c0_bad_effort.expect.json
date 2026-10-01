@@ -52,6 +52,7 @@
         "cleanup_settles": null,
         "stop_facts": null,
         "instance": null,
+        "warnings": [],
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",

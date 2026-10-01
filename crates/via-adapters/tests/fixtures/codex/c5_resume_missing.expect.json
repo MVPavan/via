@@ -47,12 +47,17 @@
         "usage": null,
         "final_text": null,
         "error": null,
+        "cleanup": "quiescent",
         "stop_facts": null,
         "instance": {
           "vendor_version": "0.159.2",
           "version_status": "tested"
         },
         "exit": null,
+        "group_absent": false,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "journal_uncertain": false,
         "observations_include": [],
         "observations_exclude": [
@@ -63,17 +68,8 @@
         "observation_counts": {
           "turn.accepted": 0
         },
-        "unasserted": [
-          {
-            "field": "cleanup",
-            "why": "a definite rejection on the server route: C2 §2's cleanup table has no row for a rejected submission that started no vendor turn, so quiescent versus uncertain is undecided; reported to the coordinator"
-          },
-          {
-            "field": "group_absent",
-            "why": "follows the undecided cleanup above"
-          }
-        ],
-        "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600. The replay pins the stdin sequence: thread/resume without developerInstructions, then nothing but EOF after the refusal (await_eof), so no thread/start or turn/start follows."
+        "unasserted": [],
+        "notes": "thread/resume of a thread with no stored rollout is refused with -32600 `no rollout found for thread id ...` before any turn/start: a definite rejection, Err(Rejected(SessionGone)), no resend and no replacement thread/start (C2 §2 Submission boundary, Reopen; vendors/codex.md §3). The kind comes from the message text, since the code is the generic -32600. The replay pins the stdin sequence: thread/resume without developerInstructions, then nothing but EOF after the refusal (await_eof), so no thread/start or turn/start follows. Server-route evidence (C2 §2 AdapterError row): exit is null and cleanup is the turn's reported tool items, quiescent when none was reported; after a server crash cleanup is GroupAbsent for the server's group."
       }
     }
   ]

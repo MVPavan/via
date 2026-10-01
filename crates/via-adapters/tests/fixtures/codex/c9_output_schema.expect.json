@@ -92,6 +92,9 @@
         },
         "exit": null,
         "group_absent": false,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "journal_uncertain": false,
         "observations_include": [
           {
@@ -166,6 +169,9 @@
         },
         "exit": null,
         "group_absent": false,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "journal_uncertain": false,
         "observations_include": [
           {

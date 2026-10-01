@@ -50,6 +50,7 @@
         "cleanup": null,
         "stop_facts": null,
         "instance": null,
+        "warnings": [],
         "observations_include": [],
         "observations_exclude": [
           "turn.accepted"

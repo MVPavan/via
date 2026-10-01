@@ -51,15 +51,16 @@
         "cleanup": "quiescent",
         "cleanup_settles": null,
         "stop_facts": null,
-        "instance": {
-          "vendor_version": null
-        },
+        "instance": null,
         "exit": {
           "code": 1,
           "signal": null
         },
         "journal_uncertain": false,
         "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",
@@ -69,12 +70,7 @@
         ],
         "observation_counts": {},
         "observations_order": [],
-        "unasserted": [
-          {
-            "field": "instance.version_status",
-            "why": "no version was read (pre-init result, no init): C2 §5 and the vendor spec do not decide whether TurnEnd.instance is null or {vendor_version: null, version_status: untested} for a pre-handshake failure; reported to the coordinator"
-          }
-        ],
+        "unasserted": [],
         "notes": "The replay pins the literal --resume value, sessions.main.resume, so a driver that passes another ID fails the replay. --resume of a missing session gives a pre-init result (error_during_execution, num_turns 0, errors 'No conversation found ...') that echoes the requested UUID. A pre-init rejection never confirms identity or opens (C2 §2 delayed identity); the definite, fixture-backed missing-session rejection is StartRejected::SessionGone and the same VIA session is kept (packet §2). No init was read, so vendor_version is null (C2 §5). The rejection carries TurnEvidence (C2 §2 AdapterError::Rejected): the launched process exited, so cleanup is quiescent on Host's group cleanup evidence."
       }
     }

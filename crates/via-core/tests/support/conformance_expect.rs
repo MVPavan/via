@@ -15,7 +15,10 @@
 //! - `launch_checkpoints` `{after_pure, after_open: {label: n}, after_turn:
 //!   [n, …]}`: the launch-log count after the pure operations, after each
 //!   session's logical open and after each turn. Each part is stated, or
-//!   named in the top-level `unasserted` with its reason.
+//!   named in the top-level `unasserted` with its reason. `open_session` is
+//!   logical only on every route, so vendor session creation happens in the
+//!   first `run_turn` (adapters design P1/AD3; claude-code.md amendments):
+//!   `after_open` equals `after_pure`.
 //! - `pure_writes`: the files the pure operations changed (normally `[]`),
 //!   compared as a set.
 //! - `plan_checks` `[{require, refusal}]`: one `plan` per entry with that
@@ -56,7 +59,7 @@
 //! How each field compares:
 //! - **Exact:** the opaque vendor JSON C2 passes through unparsed
 //!   (`terminal.structured_output`, `terminal.vendor`), `warnings` (a set of
-//!   C1 warning codes from the turn's `warning` observations), the version
+//!   C1 warning codes, below), the version
 //!   fields, `pure_writes`, launch counts and checkpoints, `health`, and every
 //!   scalar.
 //! - **Assembled:** `final_text`, a list of pieces compared by their
@@ -97,6 +100,16 @@
 //! vendor cost gives `{usd, scope, provenance: "reported"}`; none gives
 //! `{usd: null, provenance: "unavailable"}`. `instance` is
 //! `TurnEnd.instance`: `{vendor_version, version_status}` or null.
+//!
+//! `warnings` holds what the adapter produces: the codes of the session
+//! plan's `RoutePlan.warnings` plus the turn's `warning` observations. A
+//! plan-refused turn has no plan, so its set is empty. Core-derived codes
+//! are excluded: `vendor_version_untested` (from `InstanceReport`) and
+//! `structured_output_missing` (Core's schema check) are S-CORE's to test.
+//! On a server route (C2 §2 AdapterError row, server-route evidence) a
+//! turn's `exit` is always null, and cleanup is its reported tool items
+//! while the server lives (`group_absent` false), or Host `GroupAbsent` for
+//! the server's group after a crash (`group_absent` true).
 //!
 //! # Gates
 //!
@@ -215,7 +228,8 @@ pub(crate) struct TurnOutcome {
     pub(crate) journal_uncertain: bool,
     /// Host `GroupAbsent` evidence backs the cleanup.
     pub(crate) group_absent: bool,
-    /// Codes of the turn's `warning` observations.
+    /// The adapter's warning codes: the session plan's `RoutePlan.warnings`
+    /// plus the turn's `warning` observations.
     pub(crate) warnings: Vec<String>,
     /// The result kind of each steer attempt, in the turn's `steer` order.
     pub(crate) steer: Vec<String>,
