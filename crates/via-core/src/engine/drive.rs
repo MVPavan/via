@@ -1545,25 +1545,13 @@ impl Engine {
                 break (end, inbox.len());
             }
             let idle_at = control.idle_at;
+            // Critical r1b #12 (runtime §8): biased, controls first. A ready
+            // order or idle deadline is serviced before the next data item,
+            // and the driver's return before it too: the final drain then
+            // takes what was delivered by the return (critical r1 #1), and
+            // a never-empty channel cannot hold the run's end.
             tokio::select! {
-                Some(admitted) = inbox.recv() => {
-                    let Admitted { item, permit } = admitted;
-                    if let Some(idle_at) = control.idle_at.as_mut()
-                        && current_progress(lane, control.turn, &item)
-                    {
-                        *idle_at = tokio::time::Instant::now() + control.idle;
-                    }
-                    while_polling(&mut run, &mut early, async {
-                        // Test builds: Core holds before handling an observation.
-                        #[cfg(feature = "test-failpoints")]
-                        let _ = via_store::failpoint::hit_async("core.observations.pause").await;
-                        self.observe(record, Some(lane), effective, control, item).await;
-                    })
-                    .await;
-                    // Handled: its bytes return to the budget.
-                    drop(permit);
-                    stop_for_store(record, control);
-                }
+                biased;
                 changed = control.orders.changed(), if !control.observed => {
                     let order = changed
                         .ok()
@@ -1591,6 +1579,24 @@ impl Engine {
                     #[cfg(feature = "test-failpoints")]
                     let _ = via_store::failpoint::hit_async("core.run.returned").await;
                     break (end, inbox.len());
+                }
+                Some(admitted) = inbox.recv() => {
+                    let Admitted { item, permit } = admitted;
+                    if let Some(idle_at) = control.idle_at.as_mut()
+                        && current_progress(lane, control.turn, &item)
+                    {
+                        *idle_at = tokio::time::Instant::now() + control.idle;
+                    }
+                    while_polling(&mut run, &mut early, async {
+                        // Test builds: Core holds before handling an observation.
+                        #[cfg(feature = "test-failpoints")]
+                        let _ = via_store::failpoint::hit_async("core.observations.pause").await;
+                        self.observe(record, Some(lane), effective, control, item).await;
+                    })
+                    .await;
+                    // Handled: its bytes return to the budget.
+                    drop(permit);
+                    stop_for_store(record, control);
                 }
             }
         };

@@ -641,6 +641,69 @@ fn core_retained_terminal_under_stalled_observations() {
     });
 }
 
+/// Critical r1b #12 (runtime §8: control before data): with a stop order
+/// and an observation both ready, the run loop services the order first.
+/// Core is held on the turn's second observation while the vendor's
+/// denial reaches the channel and a cancel attaches its order; once
+/// released, `cancel.requested` commits before `action.denied`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_ready_order_is_serviced_before_a_ready_observation() {
+    let steps = [
+        accepted(1),
+        text(1),
+        gate("ready"),
+        emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                     "kind":"command","target":"ready","reason":"policy"})),
+        hang(),
+    ];
+    let Some(root) = child(
+        "core_a_ready_order_is_serviced_before_a_ready_observation",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // Held on the text, the acceptance handled.
+    arm_at(&root, "core.observations.pause", 2, "pause");
+    acknowledge(&root, "adapter.observation.admitted", 3);
+    acknowledge(&root, "core.cancel.ordered", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        until_acked(&root, "core.observations.pause", 2).await;
+        daemon.entered("ready").await;
+        daemon.release("ready");
+        // The denial is in the session channel.
+        until_acked(&root, "adapter.observation.admitted", 3).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 200), async {
+            until_acked(&root, "core.cancel.ordered", 1).await;
+            fs::write(
+                root.join("points")
+                    .join("core.observations.pause.2.release"),
+                b"",
+            )
+            .unwrap();
+        });
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        let events = events(&daemon, &session).await;
+        let seq = |kind: &str| {
+            events
+                .iter()
+                .find(|event| event["type"] == kind)
+                .and_then(|event| event["seq"].as_u64())
+                .unwrap_or_else(|| panic!("no {kind}: {events:?}"))
+        };
+        assert!(
+            seq("cancel.requested") < seq("action.denied"),
+            "the ready order is serviced first: {events:?}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
 /// Cancels `session`'s turn `turn` with `force_after_ms`.
 async fn cancel(daemon: &Daemon, session: &SessionId, turn: u32, force_after_ms: u64) {
     let params = serde_json::from_value(json!({
