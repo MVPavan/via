@@ -1,29 +1,42 @@
 {
-  "source": "CC c3_queue, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c3_queue, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
-  },
+  "launches": 1,
   "plan_checks": [
     {
-      "require": [
-        "steer"
-      ],
+      "require": "steer",
       "refusal": "missing_capability:steer"
     }
   ],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Use Bash to run exactly sleep 3, then reply FIRST_DONE.",
         "effort": null,
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [
+        {
+          "after": "tool_started",
+          "text": "After that, reply SECOND_DONE without tools.",
+          "result": "unsupported_verb"
+        }
+      ],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -31,11 +44,29 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
           "class_hint": null,
-          "vendor_stop_reason": "end_turn"
+          "cost": {
+            "scope": "session_cumulative"
+          }
         },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 15986,
+          "cached_input_tokens": 13534,
+          "output_tokens": 228,
+          "scope": "turn"
+        },
+        "final_text": [
+          "FIRST_DONE"
+        ],
         "error": null,
         "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -45,20 +76,20 @@
         "observations_exclude": [
           "steer.delivered"
         ],
-        "steer": {
-          "text": "After that, reply SECOND_DONE without tools.",
-          "after": "tool_started",
-          "refusal": "unsupported_verb"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "final_text": "FIRST_DONE",
-        "instance": {
-          "vendor_version": "2.1.285"
-        },
-        "stdin_sequence": [
-          "user",
-          "eof"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "notes": "Live, a second user line written during the tool merged into one result, so steer is unsupported and VIA never writes busy input (C2 A3, §6.2 Steer; packet §6). A steer while the tool runs is refused unsupported_verb and writes nothing; the turn completes as if no steer was asked; require steer is refused missing_capability (C1 -32007)."
+        "unasserted": [
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending (replay-additions.md): absent; exactly one user line, then eof"
+          }
+        ],
+        "notes": "Live, a second user line written during the tool merged into one result, so steer is unsupported and VIA never writes busy input (C2 A3, §6.2 Steer; packet §6). A steer while the tool runs is refused unsupported_verb and writes nothing; require steer is refused missing_capability. Usage still counts the probe's merged second prompt."
       }
     }
   ]

@@ -1,21 +1,31 @@
 {
-  "source": "CC c11b_stdio_prompt, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c11b_stdio_prompt, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Use Edit to create probe.txt containing READY in the current directory. If permission is denied, say DENIED.",
         "effort": null,
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -23,11 +33,29 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
           "class_hint": null,
-          "vendor_stop_reason": "end_turn"
+          "cost": {
+            "scope": "session_cumulative"
+          }
         },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 12287,
+          "cached_input_tokens": 10255,
+          "output_tokens": 852,
+          "scope": "turn"
+        },
+        "final_text": [
+          "DENIED"
+        ],
         "error": null,
         "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -36,21 +64,26 @@
           "vendor.request_declined"
         ],
         "observations_exclude": [],
-        "steer": null,
-        "final_text": "DENIED",
         "observation_counts": {
+          "turn.accepted": 1,
           "vendor.request_declined": 1,
           "action.denied": 0
         },
-        "instance": {
-          "vendor_version": "2.1.285"
-        },
-        "stdin_sequence": [
-          "user",
-          "control_response:error",
-          "eof"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "notes": "An incoming can_use_tool control_request is declined within 5 s on the control path with the pinned error reply (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9)."
+        "unasserted": [
+          {
+            "field": "decline_deadline",
+            "why": "replay-format addition pending (replay-additions.md): within_ms; the decline must be written within 5 s"
+          },
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, control_response:error, eof"
+          }
+        ],
+        "notes": "An incoming can_use_tool control_request is declined on the control path with the pinned error reply, response.error included (packet §6), giving one vendor.request_declined. The result's permission_denials entry for the same tool_use_id was caused by VIA's decline and is suppressed: zero action.denied (C2 §6.2 auto-decline, §7 items 8-9)."
       }
     }
   ]

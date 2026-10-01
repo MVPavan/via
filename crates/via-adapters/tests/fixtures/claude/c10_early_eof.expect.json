@@ -1,24 +1,31 @@
 {
-  "source": "CC c10_early_eof, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c10_early_eof, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with just READY.",
         "effort": null,
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
-      "stop": {
-        "kind": "close",
-        "after": "handshake"
-      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -26,11 +33,29 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
+          "vendor_stop_reason": "end_turn",
           "class_hint": null,
-          "vendor_stop_reason": "end_turn"
+          "cost": {
+            "scope": "session_cumulative"
+          }
         },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 3932,
+          "cached_input_tokens": 0,
+          "output_tokens": 39,
+          "scope": "turn"
+        },
+        "final_text": [
+          "READY."
+        ],
         "error": null,
         "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -38,19 +63,20 @@
           "final_text"
         ],
         "observations_exclude": [],
-        "steer": null,
-        "final_text": "READY.",
-        "instance": {
-          "vendor_version": "2.1.285"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "stdin_sequence": [
-          "user",
-          "eof"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "unsettled": [
-          "cancel"
+        "unasserted": [
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending (replay-additions.md): await_eof; the vendor saw EOF right after the prompt, before init"
+          }
         ],
-        "notes": "Stdin EOF does not cancel: with no tool open the turn completed (exit 0) after an EOF sent right after the prompt. A close order with no open tool item therefore only closes stdin and the natural terminal wins (C2 §6.2 Close; packet §7; C1 §7.6). Recorded EOF preceded init; the replay cannot observe EOF timing. Whether the cancel report is requested or absent is not settled by C2."
+        "notes": "Vendor-behaviour case only (coordinator ruling): stdin EOF right after the prompt, before init, with no stop order, still completed the turn naturally (exit 0); EOF does not cancel (C2 §6.2 Close; packet §7). A close order on a running turn always interrupts first; c7 pins that sequence."
       }
     }
   ]

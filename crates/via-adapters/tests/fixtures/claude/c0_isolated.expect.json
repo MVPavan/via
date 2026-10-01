@@ -1,21 +1,31 @@
 {
-  "source": "CC c0_isolated, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c0_isolated, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with just READY.",
         "effort": null,
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -23,11 +33,26 @@
         "terminal": {
           "status": "failed",
           "stop_reason": "error",
+          "vendor_stop_reason": "stop_sequence",
           "class_hint": "auth",
-          "vendor_code": "authentication_failed"
+          "vendor_code": "authentication_failed",
+          "detail": "Not logged in · Please run /login"
         },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0,
+          "scope": "turn"
+        },
+        "final_text": null,
         "error": null,
         "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted"
@@ -36,15 +61,24 @@
           "progress",
           "final_text"
         ],
-        "steer": null,
-        "instance": {
-          "vendor_version": "2.1.285"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "stdin_sequence": [
-          "user",
-          "eof"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "notes": "Not logged in. The matching init confirms identity but is not acceptance (C2 §2 delayed identity; packet §2). The synthetic assistant message (is_api_error_message, model <synthetic>) is never acceptance, progress or final text (C2 §2 submission boundary, §7 item 5); the post-init result is acceptance evidence, so the vendor failure is a Failed terminal with vendor code and class hint, never submit_failed (C2 §2; packet §5). Classified from the synthetic error code authentication_failed, not from subtype:success (C2 §6.2 class hints). The result text repeats the synthetic text and is not final text because is_error is true."
+        "unasserted": [
+          {
+            "field": "acceptance_timing",
+            "why": "acceptance on the result, not the synthetic message: pinned by via-p98.3.2's normalizer unit test, not by replay"
+          },
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
+          }
+        ],
+        "notes": "Not logged in. The matching init confirms identity but is not acceptance (C2 §2 delayed identity; packet §2). The synthetic assistant message (is_api_error_message, model <synthetic>) is never acceptance, progress or final text (C2 §2 submission boundary, §7 item 5); the post-init result is acceptance evidence, so the vendor failure is a Failed terminal with vendor code, class hint and detail, never submit_failed (C2 §2; packet §5). Class from the synthetic error code authentication_failed, not from subtype:success (C2 §6.2 class hints). Coordinator ruling: the is_error result text is terminal.detail, never final_text."
       }
     }
   ]

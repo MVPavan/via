@@ -1,28 +1,43 @@
 {
-  "source": "CC c0_bad_effort, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c0_bad_effort, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
+  "launches": 0,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Reply with just READY.",
         "effort": "bogus",
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": "invalid_param:effort",
         "rejected": null,
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
         "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",
@@ -32,9 +47,9 @@
           "action.denied",
           "vendor.request_declined"
         ],
-        "steer": null,
-        "launched": false,
-        "stdin_sequence": [],
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
         "notes": "Claude ignores an unknown --effort with only a stderr warning (recorded: exit 0), so plan validates effort against {low, medium, high, xhigh, max} and refuses invalid_params (field effort) before any receipt or launch (C2 §5 effort validation, AD18; packet §4 effort). The fixture is never started."
       }
     }

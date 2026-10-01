@@ -1,32 +1,43 @@
 {
-  "source": "CC c5_read_only, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c5_read_only, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": null,
-    "instructions": null
+  "launches": 0,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Read input.txt, then try to write output.txt containing its text using a file-edit tool. Report what happened.",
         "effort": null,
+        "bound": "read_only",
         "output_schema": null,
-        "max_steps": null,
-        "bound": {
-          "mode": "read_only",
-          "extra_write_dirs": [],
-          "network": true
-        }
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": "bound_unsupported",
         "rejected": null,
         "accepted": false,
         "terminal": null,
+        "usage": null,
+        "final_text": null,
         "error": null,
         "cleanup": null,
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": null,
         "observations_include": [],
         "observations_exclude": [
           "session.vendor_identity_confirmed",
@@ -36,10 +47,10 @@
           "action.denied",
           "vendor.request_declined"
         ],
-        "steer": null,
-        "launched": false,
-        "stdin_sequence": [],
-        "notes": "read_only is refused bound_unsupported before any vendor I/O while CLAUDE-BOUND-1 is open (C2 §6.2 Bound, §7 item 13; packet §8). Restricted file tools are not all-tool containment. The fixture records the candidate recipe and is never started."
+        "observation_counts": {},
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "read_only is refused bound_unsupported before any vendor I/O while CLAUDE-BOUND-1 is open (C2 §6.2 Bound, §7 item 13; packet §8). The fixture records the candidate recipe and is never started."
       }
     }
   ]

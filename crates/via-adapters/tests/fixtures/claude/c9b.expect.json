@@ -1,21 +1,31 @@
 {
-  "source": "CC c9b, 2026-09-30 re-probe, Claude Code 2.1.285",
+  "source": "CC c9b, 2026-09-30 re-probe, Claude Code 2.1.285; adaptations: see the replay fixture's source",
   "harness": "claude",
-  "session": {
-    "model": "haiku",
-    "resume": "22222222-2222-4222-8222-222222222222",
-    "instructions": "Always end every reply with the exact word MANGO."
+  "launches": 1,
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": "Always end every reply with the exact word MANGO.",
+      "cwd": "/work/project",
+      "resume": "22222222-2222-4222-8222-222222222222",
+      "close": null
+    }
   },
   "turns": [
     {
+      "session": "main",
+      "start_after": null,
       "params": {
         "prompt": "Use Read to read made.txt and reply with its content.",
         "effort": null,
+        "bound": "full",
         "output_schema": null,
-        "max_steps": null,
-        "bound": null
+        "max_steps": null
       },
+      "tool_grace_ms": null,
       "stop": null,
+      "steer": [],
       "expect": {
         "plan_refusal": null,
         "rejected": null,
@@ -23,18 +33,29 @@
         "terminal": {
           "status": "completed",
           "stop_reason": "end_turn",
-          "class_hint": null,
           "vendor_stop_reason": "end_turn",
-          "usage": {
-            "output": 156
-          },
+          "class_hint": null,
           "cost": {
-            "usd": 0.0109639,
             "scope": "session_cumulative"
           }
         },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 21765,
+          "cached_input_tokens": 21480,
+          "output_tokens": 156,
+          "scope": "turn"
+        },
+        "final_text": [
+          "The file contains: FILE_MARKER\n\nMANGO"
+        ],
         "error": null,
         "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285"
+        },
         "observations_include": [
           "session.vendor_identity_confirmed",
           "turn.accepted",
@@ -42,16 +63,20 @@
           "final_text"
         ],
         "observations_exclude": [],
-        "steer": null,
-        "final_text": "The file contains: RECIPE\n\nMANGO",
-        "instance": {
-          "vendor_version": "2.1.285"
+        "observation_counts": {
+          "turn.accepted": 1
         },
-        "stdin_sequence": [
-          "user",
-          "eof"
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
         ],
-        "notes": "Resume of c9a's UUID: the frozen instructions are reapplied on every launch (packet §4 instructions; C2 §6.2 run_turn submission)."
+        "unasserted": [
+          {
+            "field": "stdin_sequence",
+            "why": "replay-format addition pending (replay-additions.md): await_eof/absent; expected user, eof"
+          }
+        ],
+        "notes": "The --resume argument is captured: the driver passes sessions.main.resume and asserts the fake's captured value equals it. Resume of c9a's session: the frozen instructions are reapplied on every launch (packet §4 instructions; C2 §6.2 run_turn submission)."
       }
     }
   ]
