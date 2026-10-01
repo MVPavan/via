@@ -4651,3 +4651,75 @@ fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
         assert_eq!(budget.available_permits(), 10_000);
     });
 }
+
+/// Sol r5 R8 (design §6.8 step 3): force's last queued cancellation that
+/// meets final shutdown while it waits for the lanes' actors, with an
+/// actor still holding a durable item past its drain's bound, commits no
+/// `session.closed`: the lane stays the session's until its actor ended.
+/// Shutdown is incomplete, and every item is committed once the actor
+/// goes on, none refused by a closed session.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_cancellation_during_the_lane_drain_wait_never_closes_the_session() {
+    let Some(root) = child("a_cancellation_during_the_lane_drain_wait_never_closes_the_session")
+    else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    arm_point(
+        &points,
+        "core.lane.drain_wait",
+        1,
+        &json!({"action":"pause"}),
+    );
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        send_denials(&sender, &budget, &["two"]).await;
+        resume(&engine, &session, None).await;
+        engine.request_stop(&force()).await.unwrap();
+        // The force's last queued cancellation holds before its close check.
+        engine
+            .faults
+            .hold_before_close
+            .store(true, Ordering::Release);
+        let dispatcher = tokio::spawn({
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            async move { dispatch(&engine, &session).await }
+        });
+        engine.faults.granted.notified().await;
+        let shutting = tokio::spawn({
+            let engine = std::sync::Arc::clone(&engine);
+            async move { shutdown(&engine).await }
+        });
+        // Final shutdown waits for the lanes' actors; the cancellation then
+        // decides its close and commits.
+        until(|| acked(&points, "core.lane.drain_wait", 1)).await;
+        engine.faults.release.notify_one();
+        dispatcher.await.unwrap();
+        release_point(&points, "core.lane.drain_wait", 1);
+        let report = shutting.await.unwrap();
+        assert!(!report.is_clean(), "{report:?}");
+        let snapshot = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.closed, "the session stays open for restart");
+        release_point(&points, "core.lane.dispose", 1);
+        until_denials(
+            &engine,
+            &session,
+            &[
+                (json!("one"), Value::Null, json!(false)),
+                (json!("two"), Value::Null, json!(false)),
+            ],
+        )
+        .await;
+    });
+}

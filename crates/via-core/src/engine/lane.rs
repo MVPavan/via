@@ -599,14 +599,15 @@ impl Lane {
     }
 
     /// The lane's actor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3, Sol r3
-    /// N1-N5, Sol r4 R2, R3), on the daemon's tracker for the lane's life:
-    /// it serves the lane until it ends ([`Self::serve`]). Then it closes
-    /// the driver, unless the drivers' cancellation ended the lane; closes
-    /// the channel's admission and disposes of everything admitted before,
-    /// to the channel's end, one item at a time (durable items committed,
-    /// the rest dropped); removes the lane from `lanes` when its session
-    /// closed; runs a turn handed over meanwhile, with no channel; and only
-    /// then publishes the lane's end. That one completion serves every
+    /// N1-N5, Sol r4 R2, R3, Sol r5 R8), on the daemon's tracker for the
+    /// lane's life: it serves the lane until it ends ([`Self::serve`]).
+    /// Then it closes the driver, unless the drivers' cancellation ended
+    /// the lane; closes the channel's admission and disposes of everything
+    /// admitted before, to the channel's end, one item at a time (durable
+    /// items committed, the rest dropped); runs a turn handed over
+    /// meanwhile, with no channel; marks the lane ended; only then removes
+    /// it from `lanes`, when its session closed or at the drivers'
+    /// cancellation; and publishes the lane's end. That one completion serves every
     /// waiter: close, retirement, replacement and final shutdown. Nothing
     /// cancels the actor but the runtime's own end.
     async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
@@ -635,32 +636,34 @@ impl Lane {
             ready_item(&mut handled).await;
         }
         drop(inbox);
-        let removed = lock(&self.core).removed;
-        if removed {
-            let mut lanes = lock(&lanes);
-            if lanes
-                .get(&session)
-                .is_some_and(|kept| std::ptr::eq(Arc::as_ptr(kept), Arc::as_ptr(&self)))
-            {
-                lanes.remove(&session);
-            }
-        }
         // A turn handed over meanwhile (only at the drivers' cancellation:
         // an ending lane is never claimed) runs to its end before the
         // lane's end is published (Sol r4 R2); a later handover finds the
         // lane ended under the same lock.
-        loop {
+        let removed = loop {
             let job = {
                 let mut core = lock(&self.core);
                 let job = core.job.take();
                 if job.is_none() {
                     core.life = Life::Ended;
                 }
-                job
+                job.ok_or(core.removed)
             };
             match job {
-                Some(job) => job(&mut Inbox::closed()).await,
-                None => break,
+                Ok(job) => job(&mut Inbox::closed()).await,
+                Err(removed) => break removed,
+            }
+        };
+        // Only an ended lane leaves the session's registration (Sol r5 R8),
+        // when its session closed or the daemon's drivers were cancelled;
+        // a retired one stays for its successor's state.
+        if removed || self.cancel.is_cancelled() {
+            let mut lanes = lock(&lanes);
+            if lanes
+                .get(&session)
+                .is_some_and(|kept| std::ptr::eq(Arc::as_ptr(kept), Arc::as_ptr(&self)))
+            {
+                lanes.remove(&session);
             }
         }
         self.changed.send_replace(());
@@ -1106,39 +1109,43 @@ impl Engine {
     }
 
     /// Whether `session`'s lane drain is complete (design §6.8 step 3, Sol
-    /// r4 R4): no lane of it is live, and none was left unfinished at
-    /// final shutdown. A session is never closed before then: its lane may
-    /// still commit what its channel had.
+    /// r4 R4, Sol r5 R8): no lane of it that has not ended is registered,
+    /// read under the registry's lock. A live lane stays registered until
+    /// its actor ended, so a session is never closed before then: its lane
+    /// may still commit what its channel had.
     pub(super) fn lane_drained(&self, session: &SessionId) -> bool {
-        !lock(&self.undrained).contains(session)
-            && lock(&self.lanes)
-                .get(session)
-                .is_none_or(|lane| lane.ended())
+        lock(&self.lanes)
+            .get(session)
+            .is_none_or(|lane| lane.ended())
     }
 
-    /// Final shutdown: every driver's owned work is cancelled and every
-    /// lane let go, before Host reconciliation. Each lane's actor finishes
-    /// what it is doing and disposes of what its channel still has (C2 §2
-    /// session drain; Sol r2 #3); this waits for them by `by` and within
-    /// [`SHUTDOWN_DRAIN`], after letting each see the cancellation once.
-    /// Returns how many actors have not ended by then (Sol r3 N5): each
-    /// still owns its work, which final shutdown reports as pending and
-    /// leaves to it, and its session stays open (Sol r4 R4).
+    /// Final shutdown: every driver's owned work is cancelled, before Host
+    /// reconciliation. Each lane's actor finishes what it is doing and
+    /// disposes of what its channel still has (C2 §2 session drain; Sol r2
+    /// #3), then leaves the registry; this waits for them by `by` and
+    /// within [`SHUTDOWN_DRAIN`], after letting each see the cancellation
+    /// once, and lets go of the lanes that ended. Returns how many actors
+    /// have not ended by then (Sol r3 N5): each still owns its work, which
+    /// final shutdown reports as pending and leaves to it, and its lane
+    /// stays registered, so its session stays open (Sol r5 R8).
     pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) -> usize {
         self.cancel.cancel();
         self.tracker.close();
-        let lanes: Vec<(SessionId, Arc<Lane>)> = lock(&self.lanes).drain().collect();
+        let lanes: Vec<Arc<Lane>> = lock(&self.lanes).values().cloned().collect();
         let by = by.min(tokio::time::Instant::now() + SHUTDOWN_DRAIN);
         // An actor with nothing left ends at its next poll.
         tokio::task::yield_now().await;
+        // Test builds: final shutdown waits for the lanes' actors.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.drain_wait").await;
         let mut undrained = 0;
-        for (session, lane) in lanes {
+        for lane in lanes {
             // A lane that ended is ready at its first poll, even past `by`.
             if tokio::time::timeout_at(by, lane.retired()).await.is_err() {
-                lock(&self.undrained).insert(session);
                 undrained += 1;
             }
         }
+        lock(&self.lanes).retain(|_, lane| !lane.ended());
         undrained
     }
 }

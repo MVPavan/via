@@ -80,9 +80,6 @@ pub struct Engine {
     /// Sessions' lanes on their drivers (C2 §2): opened at a session's
     /// first dispatch, kept while a live connection can be pinned.
     lanes: lane::Lanes,
-    /// Sessions whose lane drain had not finished by final shutdown's drain
-    /// bound (Sol r4 R4): none of them is closed in this daemon's life.
-    undrained: StdMutex<HashSet<SessionId>>,
     /// Owns every task the drivers start (C2 §2 `SessionCx`).
     tracker: TaskTracker,
     /// The drivers' cancellation; final shutdown cancels it.
@@ -368,7 +365,6 @@ impl Engine {
             adapter,
             cwd,
             lanes: Arc::new(StdMutex::new(HashMap::new())),
-            undrained: StdMutex::new(HashSet::new()),
             tracker: TaskTracker::new(),
             cancel: CancellationToken::new(),
             active: AtomicUsize::new(0),
