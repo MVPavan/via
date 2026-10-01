@@ -594,6 +594,32 @@ fn rerun_with_short_stall(name: &str) -> bool {
     true
 }
 
+/// A flood of `count` model marks for `turn`, in two halves: the second
+/// waits at gate `flood` until [`release_flood`] saw the first in the
+/// channel. Wire's 1024-message queue then never holds a channel's worth,
+/// whatever Route's reading pace under load (a full queue is `overflow`).
+fn staged_flood(turn: u32, count: usize) -> Vec<Value> {
+    let text = json!({"type":"text","vendor_turn_id":vendor_turn(turn)}).to_string() + "\n";
+    vec![
+        json!({"action":"flood","text":text,"count":count / 2}),
+        gate("flood"),
+        json!({"action":"flood","text":text,"count":count - count / 2}),
+    ]
+}
+
+/// Releases gate `flood` once the undrained `receiver` holds `items`.
+async fn release_flood(sync: &std::path::Path, receiver: &mpsc::Receiver<Admitted>, items: usize) {
+    let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+    while receiver.len() < items {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the flood's first half never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    release(sync, "flood");
+}
+
 /// (7) AD4: Core never drains the channel; the decoded terminal is retained
 /// in the turn's end although the delivery before it stalled (`overflow`).
 /// It runs again in a child with the stall bound lowered to 250 ms, which
@@ -603,21 +629,20 @@ fn conformance_terminal_retained_under_stalled_observations() {
     if rerun_with_short_stall("conformance_terminal_retained_under_stalled_observations") {
         return;
     }
-    let text = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
-    let rig = Rig::new(
-        &json!({}),
-        &[script(
-            1,
-            &[
-                accepted(1),
-                json!({"action":"flood","text":text,"count":OBSERVATION_ITEMS}),
-                terminal(1, "completed", "end_turn"),
-            ],
-        )],
-    );
-    let (driver, _receiver) = rig.session();
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS),
+        vec![terminal(1, "completed", "end_turn")],
+    ]
+    .concat();
+    let rig = Rig::new(&json!({}), &[script(1, &steps)]);
+    let (driver, receiver) = rig.session();
     let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
-    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + OBSERVATION_ITEMS / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
     let kept = end.terminal.as_ref().unwrap();
     assert_eq!(kept.status, VendorTerminalStatus::Completed);
     assert!(
@@ -1433,22 +1458,21 @@ fn a_helper_exit_does_not_end_the_p7_wait() {
 /// the wall plus 3 s; no step starts a fresh budget.
 #[test]
 fn the_persistent_wall_path_ends_by_one_cutoff_with_a_stalled_consumer() {
-    let text = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
-    let rig = Rig::new(
-        &persistent(),
-        &[script(
-            1,
-            &[
-                accepted(1),
-                json!({"action":"flood","text":text,"count":1024}),
-                hang(),
-            ],
-        )],
-    );
-    let (driver, _receiver) = rig.session();
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS),
+        vec![hang()],
+    ]
+    .concat();
+    let rig = Rig::new(&persistent(), &[script(1, &steps)]);
+    let (driver, receiver) = rig.session();
     let (cx, _controls) = turn_cx(1, driver.prepare(), SHORT_WALL);
     let cutoff = cx.wall.instant() + Duration::from_secs(3);
-    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + OBSERVATION_ITEMS / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
     let returned = tokio::time::Instant::now();
     assert!(
         matches!(
@@ -2008,11 +2032,6 @@ async fn until_failed(
     health.borrow().clone()
 }
 
-/// The text message a flood repeats: one `model` mark each.
-fn text_line() -> String {
-    json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n"
-}
-
 /// C2 §2 Close (persistent profile): a close whose deadline passes before
 /// the helper's retirement reports `Uncertain`, and the slot stays held
 /// until the retirement ended with the helper gone.
@@ -2062,21 +2081,21 @@ fn a_close_past_its_deadline_holds_the_slot_until_the_helper_retired() {
 /// overflows leaves nothing pinnable, and the slot is released.
 #[test]
 fn a_persistent_success_whose_delivery_overflows_keeps_no_pin() {
-    let rig = Rig::new(
-        &persistent(),
-        &[script(
-            1,
-            &[
-                accepted(1),
-                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS}),
-                terminal(1, "completed", "end_turn"),
-            ],
-        )],
-    );
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS),
+        vec![terminal(1, "completed", "end_turn")],
+    ]
+    .concat();
+    let rig = Rig::new(&persistent(), &[script(1, &steps)]);
     // Core never drains the channel.
-    let (driver, _receiver) = rig.session();
+    let (driver, receiver) = rig.session();
     let (cx, controls) = turn_cx(1, driver.prepare(), SHORT_WALL);
-    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + OBSERVATION_ITEMS / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
     assert!(
         matches!(
             failure(&end).cause,
@@ -2128,28 +2147,28 @@ fn a_persistent_protocol_failure_reports_logical_facts_only() {
 /// delivery's stall bound.
 #[test]
 fn health_fails_at_detection_with_a_stalled_consumer() {
-    let rig = Rig::new(
-        &json!({}),
-        &[script(
-            1,
-            &[
-                accepted(1),
-                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS}),
-                raw("not json\n"),
-                hang(),
-            ],
-        )],
-    );
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS),
+        vec![raw("not json\n"), hang()],
+    ]
+    .concat();
+    let rig = Rig::new(&json!({}), &[script(1, &steps)]);
     // Core never drains the channel.
-    let (driver, _receiver) = rig.session();
+    let (driver, receiver) = rig.session();
     let mut health = driver.health();
     let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
     let seen = rig.runtime.block_on(async {
         let run = driver.run_turn(prompt(), cx);
         tokio::pin!(run);
+        let failed = async {
+            release_flood(&sync, &receiver, 1 + OBSERVATION_ITEMS / 2).await;
+            until_failed(&mut health, Duration::from_secs(5)).await
+        };
         tokio::select! {
             end = &mut run => panic!("the turn ended first: {end:?}"),
-            seen = until_failed(&mut health, Duration::from_secs(5)) => seen,
+            seen = failed => seen,
         }
     });
     assert!(
@@ -2297,22 +2316,22 @@ fn an_idle_close_the_stalled_channel_cannot_take_latches_overflow() {
     let mut profile = persistent();
     profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
     // The accepted mark, 1022 model marks and the final text: a full channel.
-    let rig = Rig::new(
-        &profile,
-        &[script(
-            1,
-            &[
-                accepted(1),
-                json!({"action":"flood","text":text_line(),"count":OBSERVATION_ITEMS - 2}),
-                terminal(1, "completed", "end_turn"),
-            ],
-        )],
-    );
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS - 2),
+        vec![terminal(1, "completed", "end_turn")],
+    ]
+    .concat();
+    let rig = Rig::new(&profile, &[script(1, &steps)]);
     // Core never drains the channel.
     let (driver, receiver) = rig.session();
     let mut health = driver.health();
     let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
-    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + (OBSERVATION_ITEMS - 2) / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
     assert!(end.outcome.is_ok(), "{end:?}");
     assert_eq!(receiver.len(), OBSERVATION_ITEMS, "the channel is full");
     assert!(matches!(driver.prepare(), Prepared::Pinned(_)));
@@ -2402,21 +2421,17 @@ fn a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement() {
     {
         return;
     }
-    let text = json!({"type":"text","vendor_turn_id":vendor_turn(2)}).to_string() + "\n";
+    let second = [
+        vec![json!({"action":"report_pids"}), accepted(2)],
+        staged_flood(2, OBSERVATION_ITEMS),
+        vec![terminal(2, "completed", "end_turn"), gate("after")],
+    ]
+    .concat();
     let rig = Rig::new(
         &persistent(),
         &[
             script(1, &[accepted(1), terminal(1, "completed", "end_turn")]),
-            script(
-                2,
-                &[
-                    json!({"action":"report_pids"}),
-                    accepted(2),
-                    json!({"action":"flood","text":text,"count":OBSERVATION_ITEMS}),
-                    terminal(2, "completed", "end_turn"),
-                    gate("after"),
-                ],
-            ),
+            script(2, &second),
         ],
     );
     let (driver, mut receiver) = rig.session();
@@ -2427,7 +2442,11 @@ fn a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement() {
     assert!(matches!(pinned, Prepared::Pinned(_)));
     // Core stops draining: turn 2's delivery stalls.
     let (cx, _second) = turn_cx(2, pinned, WALL);
-    let end = checked(rig.runtime.block_on(driver.run_turn(prompt(), cx)));
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + OBSERVATION_ITEMS / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
     assert!(
         matches!(
             failure(&end).cause,
