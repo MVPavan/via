@@ -1470,6 +1470,7 @@ fn commit_session_event(
         )
         .map_err(sql_error)?;
     }
+    before_commit!("store.commit.session_event");
     commit(tx)
 }
 

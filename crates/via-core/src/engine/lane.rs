@@ -195,6 +195,9 @@ struct LaneState {
     /// A vendor turn's mapping expired with every tombstone taken (C2
     /// §4.1): the lane fails ([`Lane::failed`]).
     overflowed: bool,
+    /// An acceptance named a vendor turn already mapped to another turn,
+    /// or tombstoned (C2 §4.1, Sol r3 N6): a protocol failure of the lane.
+    collided: bool,
 }
 
 /// A confirmed vendor identity and its transcript hint (C1 §5, AD6).
@@ -266,10 +269,15 @@ impl LaneState {
     /// Records `vendor_turn` as `turn`'s, the newest (at its acceptance);
     /// the oldest mapping past the bound is tombstoned. With every
     /// tombstone taken, none is forgotten to make room: the lane overflows
-    /// and keeps the mapping (C2 §4.1, Sol r2 #5).
-    fn map(&mut self, vendor_turn: &str, turn: TurnNumber) {
-        if self.turns.iter().any(|(known, _)| known == vendor_turn) {
-            return;
+    /// and keeps the mapping (C2 §4.1, Sol r2 #5). Only a genuinely unseen
+    /// ID is taken (Sol r3 N6): false, mapping nothing, for one mapped to
+    /// another turn or tombstoned; true for one already `turn`'s.
+    fn map(&mut self, vendor_turn: &str, turn: TurnNumber) -> bool {
+        if self.tombstones.contains(&tombstone_of(vendor_turn)) {
+            return false;
+        }
+        if let Some((_, known)) = self.turns.iter().find(|(known, _)| known == vendor_turn) {
+            return *known == turn;
         }
         if self.turns.len() >= VENDOR_TURNS {
             if self.tombstones.len() >= TOMBSTONES {
@@ -279,6 +287,7 @@ impl LaneState {
             }
         }
         self.turns.push_back((vendor_turn.to_owned(), turn));
+        true
     }
 
     /// The turn an item naming `vendor_turn` belongs to while `running`
@@ -287,11 +296,15 @@ impl LaneState {
     /// one has expired. An unfamiliar one is session-level, even before
     /// the running turn's acceptance: only the acceptance, correlated with
     /// the turn's start, makes an explicit ID current (Sol r2 #5, F6). An
-    /// item naming none is the running turn's, else the session's.
+    /// item naming none is the running turn's, else the session's. A
+    /// tombstone is read first: no mapping overrides it (Sol r3 N6).
     fn attribute(&self, vendor_turn: Option<&str>, running: Option<TurnNumber>) -> Attribution {
         let Some(vendor_turn) = vendor_turn else {
             return running.map_or(Attribution::Session, |_| Attribution::Current);
         };
+        if self.tombstones.contains(&tombstone_of(vendor_turn)) {
+            return Attribution::Expired;
+        }
         let known = self
             .turns
             .iter()
@@ -300,7 +313,6 @@ impl LaneState {
         match known {
             Some(turn) if Some(turn) == running => Attribution::Current,
             Some(turn) => Attribution::Late(turn),
-            None if self.tombstones.contains(&tombstone_of(vendor_turn)) => Attribution::Expired,
             None => Attribution::Session,
         }
     }
@@ -360,9 +372,11 @@ impl Lane {
     }
 
     /// Whether the lane's vendor turns overflowed its tombstones (C2
-    /// §4.1, Sol r2 #5).
+    /// §4.1, Sol r2 #5) or an acceptance collided with one it keeps (Sol
+    /// r3 N6).
     fn overflowed(&self) -> bool {
-        lock(&self.state).overflowed
+        let state = lock(&self.state);
+        state.overflowed || state.collided
     }
 
     /// Whether the driver's health failed (C2 §2), the lane overflowed, or
@@ -607,7 +621,7 @@ impl Lane {
                             .first_cause
                             .get_or_insert(DriverFailure::ObservationOverflow);
                     }
-                    state.overflowed
+                    state.overflowed || state.collided
                 }
                 DriverHealth::Failed { first_cause } => {
                     lock(&self.state)
@@ -680,18 +694,22 @@ impl Lane {
         }
     }
 
-    /// Records `vendor_turn` as `turn`'s, the newest; an overflow wakes
-    /// the monitor, which retires the lane once its turn ends.
-    pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) {
-        let overflowed = {
+    /// Records `vendor_turn` as `turn`'s, the newest; false for one the
+    /// lane maps to another turn or tombstoned, which fails the lane (Sol
+    /// r3 N6). An overflow or that failure wakes the monitor, which
+    /// retires the lane once its turn ends.
+    pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) -> bool {
+        let (mapped, failed) = {
             let mut state = lock(&self.state);
-            let before = state.overflowed;
-            state.map(vendor_turn, turn);
-            state.overflowed && !before
+            let before = state.overflowed || state.collided;
+            let mapped = state.map(vendor_turn, turn);
+            state.collided |= !mapped;
+            (mapped, (state.overflowed || state.collided) && !before)
         };
-        if overflowed {
+        if failed {
             self.changed.send_replace(());
         }
+        mapped
     }
 
     /// The turn an item naming `vendor_turn` belongs to while `running`
@@ -1113,6 +1131,32 @@ mod tests {
         let successor = state.successor();
         assert!(successor.turns.is_empty() && successor.tombstones.is_empty());
         assert_eq!(successor.opened, state.opened);
+    }
+
+    /// Sol r3 N6 (C2 §2, §4.1): mapping establishes ownership only for a
+    /// genuinely unseen vendor turn ID. One already mapped to another turn
+    /// keeps that turn, and a tombstoned one stays expired: no new mapping
+    /// overrides either.
+    #[test]
+    fn a_mapped_or_tombstoned_vendor_turn_is_never_taken_again() {
+        let mut state = LaneState::default();
+        assert!(state.map("v1", turn(1)));
+        assert!(state.map("v1", turn(1)), "the same turn's again");
+        assert!(!state.map("v1", turn(2)), "another turn's is refused");
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(2))),
+            Attribution::Late(turn(1))
+        );
+        for number in 2..=u32::try_from(VENDOR_TURNS).expect("a small bound") + 1 {
+            let _ = state.map(&format!("v{number}"), turn(number));
+        }
+        assert_eq!(state.attribute(Some("v1"), None), Attribution::Expired);
+        assert!(!state.map("v1", turn(70)), "a tombstoned one is refused");
+        assert_eq!(
+            state.attribute(Some("v1"), Some(turn(70))),
+            Attribution::Expired,
+            "a tombstone is never reassigned"
+        );
     }
 
     /// Sol r2 #5 (C2 §4.1: retained tombstones cannot be reassigned): the

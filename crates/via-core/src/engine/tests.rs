@@ -2940,6 +2940,55 @@ fn an_unfamiliar_vendor_turn_becomes_current_only_through_the_acceptance() {
     });
 }
 
+/// Sol r3 N6 (C2 §4.1): an acceptance naming a vendor turn the lane maps
+/// to an earlier turn establishes nothing: no `turn.started` commits for
+/// the running turn, the lane fails, and the turn is stopped `protocol`.
+#[test]
+fn an_acceptance_naming_another_turns_vendor_turn_fails_protocol() {
+    let Some(root) = child("an_acceptance_naming_another_turns_vendor_turn_fails_protocol") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2_with(&engine, &root, false).await;
+        let probe = orders.clone();
+        let accepted = via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(
+                via_adapters::VendorTurnId::try_from("fake-turn-1".to_owned()).unwrap(),
+            ),
+            observation: via_adapters::Observation::Accepted(
+                via_adapters::observation::Acceptance {
+                    correlation: via_adapters::AcceptanceToken::FIRST,
+                    vendor_turn_id: Some(
+                        via_adapters::VendorTurnId::try_from("fake-turn-1".to_owned()).unwrap(),
+                    ),
+                },
+            ),
+        };
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                vec![accepted],
+            )
+            .await;
+        assert!(record.accepted.is_none(), "no ownership was established");
+        assert!(
+            !event_types(&engine, &session)
+                .await
+                .contains(&"turn.started".to_owned()),
+            "no turn.started"
+        );
+        assert!(lane.failed(), "the collision fails the lane");
+        let cause = probe.borrow().as_ref().map(|order| order.cause);
+        assert_eq!(cause, Some(via_adapters::StopCause::Protocol));
+    });
+}
+
 /// (14) AD4, C1 §6.1: a denial naming an earlier, ended turn's vendor turn
 /// arrives while turn 2 runs. It is committed `action.denied` with that
 /// turn's number and `late: true`, under the running turn, and stays out
@@ -3659,6 +3708,28 @@ fn a_between_turn_denial_followed_by_close_is_still_in_events() {
     });
 }
 
+/// Sol r3 N9 (design §7.5): a between-turn session write that did not
+/// commit is the session's failure: `store_failure.scope` is `session`,
+/// addressed to the session, and nothing latches.
+#[test]
+fn a_failed_between_turn_write_is_the_sessions_failure() {
+    let Some(root) = child("a_failed_between_turn_write_is_the_sessions_failure") else {
+        return;
+    };
+    let _points = fail_first(&root, "store.commit.session_event");
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, denied("lost")).await;
+        until(|| engine.store_failure_status().is_some()).await;
+        assert!(!engine.store_failed(), "not committed: nothing latches");
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "session", "{status}");
+        assert_eq!(status["affected"]["addresses"], json!([session.as_str()]));
+    });
+}
+
 /// Sol r2 #3: a turn dropped while it drains the session channel loses no
 /// durable item it did not handle: the receiver goes back to the lane with
 /// its claim, and the monitor commits the rest.
@@ -3806,6 +3877,15 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
             )
             .await;
         assert!(record.first_failure.is_none());
+        // Sol r3 N8: the record retains each listed warning already within
+        // its caps, not the adapter's data the envelope would drop.
+        let kept = serde_json::to_value(&record.vendor.warnings).unwrap();
+        assert!(
+            kept.as_array().unwrap().iter().all(|warning| warning
+                .get("data")
+                .is_none_or(|data| data.to_string().len() <= 4096)),
+            "{kept}"
+        );
         let page = events_page(&engine, &session).await;
         let events = page["events"].as_array().unwrap();
         let codes: Vec<&Value> = events

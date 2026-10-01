@@ -608,7 +608,7 @@ impl SessionWriter {
     fn report(&self, written: &journal::SessionWrite) {
         if let journal::SessionWrite::Failed(outcome) = written
             && self.signal.report(
-                FailureSite::Event,
+                FailureSite::SessionEvent,
                 *outcome,
                 latch::FailureScope::Session(&self.session),
             )

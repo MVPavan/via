@@ -136,8 +136,10 @@ struct Control<'a> {
     /// The turn's first failed write sent or upgraded its order to cause
     /// `store` (design §7.2 row 5).
     stored: bool,
-    /// An unrepresentable token count sent or upgraded its order to cause
-    /// `protocol` (review r1).
+    /// Core refused the vendor's evidence, an unrepresentable token count
+    /// (review r1) or an acceptance naming a vendor turn the lane keeps
+    /// for another (Sol r3 N6): its order was sent or upgraded to cause
+    /// `protocol`.
     refused: bool,
     /// When the idle deadline strikes; disarmed once any order exists.
     idle_at: Option<tokio::time::Instant>,
@@ -1669,8 +1671,16 @@ impl Engine {
             Observation::Accepted(acceptance) => {
                 if let (Some(lane), Some(vendor_turn)) =
                     (lane, acceptance_turn(&acceptance, vendor_turn.as_deref()))
+                    && !lane.map_vendor_turn(&vendor_turn, record.turn)
                 {
-                    lane.map_vendor_turn(&vendor_turn, record.turn);
+                    // Sol r3 N6 (C2 §4.1): an ID the lane maps to another
+                    // turn, or tombstoned, establishes nothing; the lane
+                    // failed, and the turn stops `protocol`, once.
+                    if !control.refused {
+                        control.refused = true;
+                        slot.protocol_order(control.turn, tokio::time::Instant::now());
+                    }
+                    return;
                 }
                 let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref())
                     .unwrap_or_else(|| {
@@ -1752,7 +1762,8 @@ impl Engine {
     /// ([`Warning::adapter`]).
     async fn own_warning(&self, record: &mut TurnRecord, warning: via_adapters::Warning) {
         let own = (Some(record.turn.get()), false);
-        let listed = Warning::adapter(warning.code, warning.data.clone());
+        // Sol r3 N8: retained within its caps, as the envelope reports it.
+        let listed = Warning::adapter(warning.code, warning.data.clone()).map(Warning::capped);
         let committed = self.commit_warning(record, own, warning).await;
         if let (Some(_), Some(listed)) = (committed, listed)
             && !record

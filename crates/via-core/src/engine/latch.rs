@@ -64,6 +64,9 @@ pub(super) enum FailureSite {
     Submission,
     /// Acceptance, a turn event or `cancel.requested` (row 5).
     Event,
+    /// An event or identity write of a session between its turns (C2 §2
+    /// session drain, Sol r3 N9): the session's.
+    SessionEvent,
     /// A running turn's natural terminal, which is retried once (row 7).
     Terminal,
     /// A turn's one resolution write after its first failure, or the one
@@ -111,6 +114,7 @@ impl FailureSite {
             | Self::ForcedTerminal
             | Self::Submission
             | Self::Event
+            | Self::SessionEvent
             | Self::Terminal
             | Self::QueuedCancel
             | Self::Evidence
@@ -124,12 +128,13 @@ impl FailureSite {
     }
 
     /// `store_failure.scope` of a scoped failure (design §7.5): a receipt, a
-    /// caller cancel and `Closing` are the request's; `Closed` and a closure
-    /// commit the session's; the rest the turn's.
+    /// caller cancel and `Closing` are the request's; `Closed`, a closure
+    /// commit and a between-turn session write the session's; the rest the
+    /// turn's.
     fn scope(self) -> &'static str {
         match self {
             Self::Receipt | Self::RequestCancel | Self::Closing => "request",
-            Self::Closed | Self::SessionClosed | Self::Absence => "session",
+            Self::Closed | Self::SessionClosed | Self::Absence | Self::SessionEvent => "session",
             Self::Submission
             | Self::Event
             | Self::Terminal
@@ -258,6 +263,7 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             FailureSite::Receipt
             | FailureSite::Submission
             | FailureSite::Event
+            | FailureSite::SessionEvent
             | FailureSite::Terminal
             | FailureSite::Resolution
             | FailureSite::RequestCancel
