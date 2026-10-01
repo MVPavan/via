@@ -132,9 +132,7 @@ enum InputEvent {
 }
 
 fn main() {
-    if let Some(fixture) = replay::fixture_path() {
-        replay::run(&fixture);
-    }
+    replay::run_if_selected();
     if env::args().nth(1).as_deref() == Some("--grandchild") {
         if let Err(error) = grandchild_main() {
             let _ = writeln!(io::stderr().lock(), "fake grandchild: {error}");

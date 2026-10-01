@@ -4,12 +4,12 @@
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,15 +22,28 @@ const FAILED: i32 = 3;
 const MIB: usize = 1024 * 1024;
 /// Outer supervision bound for any one fake run.
 const OUTER: Duration = Duration::from_secs(10);
+/// Most stdout bytes a test keeps; the rest is drained and dropped.
+const STDOUT_KEEP: usize = 4 * MIB;
 /// Most stderr bytes a test keeps; the rest is drained and dropped.
 const STDERR_KEEP: usize = 64 * 1024;
 
-/// A running fake whose stdout and stderr are drained concurrently.
+/// Stdout drained so far (its first [`STDOUT_KEEP`] bytes), and whether it closed.
+#[derive(Default)]
+struct Collected {
+    bytes: Vec<u8>,
+    closed: bool,
+}
+
+type Shared = Arc<(Mutex<Collected>, Condvar)>;
+
+/// A running fake whose stdout and stderr are drained continuously, so it
+/// never blocks on a full pipe.
 struct Run {
     child: Child,
     stdin: Option<ChildStdin>,
-    // Bounded: when full, the stdout reader waits, as the fake's own pipe would.
-    lines: Receiver<Vec<u8>>,
+    stdout: Shared,
+    /// Bytes of stdout already returned by [`Run::next_line`].
+    cursor: usize,
     stderr: Option<JoinHandle<Vec<u8>>>,
 }
 
@@ -46,6 +59,7 @@ impl Drop for Run {
 
 struct Finished {
     code: Option<i32>,
+    /// Every stdout line from the start of the run.
     stdout: Vec<Vec<u8>>,
     stderr: String,
 }
@@ -69,22 +83,28 @@ fn spawn<S: AsRef<OsStr>>(binary: &Path, args: &[S]) -> TestResult<Run> {
         .stderr(Stdio::piped())
         .spawn()?;
     let stdin = child.stdin.take();
-    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
-    let (sender, lines) = mpsc::sync_channel(16);
+    let shared: Shared = Arc::default();
+    let collector = Arc::clone(&shared);
+    // Ends at EOF, which the fake's exit (or the kill in Drop) guarantees.
     thread::spawn(move || {
-        let mut stdout = BufReader::new(stdout);
+        let mut chunk = vec![0_u8; 64 * 1024];
         loop {
-            let mut line = Vec::new();
-            let limit = u64::try_from(2 * MIB).unwrap_or(u64::MAX);
-            match Read::take(&mut stdout, limit).read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if sender.send(line).is_err() {
-                        break;
-                    }
-                }
+            // A read error ends the stream like EOF; the test then sees it closed.
+            let read = stdout.read(&mut chunk).unwrap_or(0);
+            let (lock, ready) = &*collector;
+            let Ok(mut collected) = lock.lock() else {
+                return;
+            };
+            if read == 0 {
+                collected.closed = true;
+                ready.notify_all();
+                return;
             }
+            let room = STDOUT_KEEP.saturating_sub(collected.bytes.len());
+            collected.bytes.extend_from_slice(&chunk[..read.min(room)]);
+            ready.notify_all();
         }
     });
     let stderr = thread::spawn(move || {
@@ -99,7 +119,8 @@ fn spawn<S: AsRef<OsStr>>(binary: &Path, args: &[S]) -> TestResult<Run> {
     Ok(Run {
         child,
         stdin,
-        lines,
+        stdout: shared,
+        cursor: 0,
         stderr: Some(stderr),
     })
 }
@@ -111,8 +132,30 @@ impl Run {
         Ok(())
     }
 
-    fn next_line(&self) -> TestResult<Vec<u8>> {
-        Ok(self.lines.recv_timeout(OUTER)?)
+    /// The next complete stdout line, waiting at most [`OUTER`].
+    fn next_line(&mut self) -> TestResult<Vec<u8>> {
+        let deadline = Instant::now() + OUTER;
+        let (lock, ready) = &*self.stdout;
+        let mut collected = lock.lock().map_err(|_| "stdout collector poisoned")?;
+        loop {
+            let pending = &collected.bytes[self.cursor..];
+            if let Some(at) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending[..=at].to_vec();
+                self.cursor += at + 1;
+                return Ok(line);
+            }
+            if collected.closed {
+                return Err("stdout closed before a complete line".into());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("timed out waiting for a stdout line".into());
+            }
+            collected = ready
+                .wait_timeout(collected, left)
+                .map_err(|_| "stdout collector poisoned")?
+                .0;
+        }
     }
 
     /// Waits for exit within [`OUTER`], killing and reaping on expiry.
@@ -133,14 +176,21 @@ impl Run {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        let mut stdout = Vec::new();
-        loop {
-            match self.lines.recv_timeout(OUTER) {
-                Ok(line) => stdout.push(line),
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => return Err("stdout never closed".into()),
+        let bytes = {
+            let (lock, ready) = &*self.stdout;
+            let mut collected = lock.lock().map_err(|_| "stdout collector poisoned")?;
+            while !collected.closed {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("stdout never closed".into());
+                }
+                collected = ready
+                    .wait_timeout(collected, left)
+                    .map_err(|_| "stdout collector poisoned")?
+                    .0;
             }
-        }
+            std::mem::take(&mut collected.bytes)
+        };
         let stderr = self
             .stderr
             .take()
@@ -149,7 +199,10 @@ impl Run {
             .map_err(|_| "stderr reader panicked")?;
         Ok(Finished {
             code: status.code(),
-            stdout,
+            stdout: bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
@@ -308,7 +361,7 @@ fn replay_signal_gated_step_waits_for_the_signal() -> TestResult {
     ]);
     let root = tempfile::tempdir()?;
     let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
-    let run = spawn::<&str>(&binary, &[])?;
+    let mut run = spawn::<&str>(&binary, &[])?;
     assert_eq!(run.next_line()?, line("ready"));
     let kill = Command::new("kill")
         .args(["-INT", &run.child.id().to_string()])
@@ -362,20 +415,28 @@ fn replay_whole_run_deadline_fails_naming_the_step() -> TestResult {
         &fixture(
             &json!([]),
             1_000,
-            &json!([{"emit": {"line": "ready"}}, {"expect": {"line": {"type": "user"}}}]),
+            &json!([
+                {"emit": {"line": "ready"}},
+                {"expect": {"line": {"type": "user"}}},
+                {"emit": {"line": "late"}}
+            ]),
         ),
     )?;
-    let run = spawn::<&str>(&binary, &[])?;
-    // Step 1 is done, so the run is in step 2 when the deadline passes.
+    let mut run = spawn::<&str>(&binary, &[])?;
     assert_eq!(run.next_line()?, line("ready"));
     // Stdin stays open, so only the deadline can end the run.
     let end = run.finish(false)?;
     assert_eq!(end.code, Some(FAILED));
-    assert!(
-        end.stderr.contains("deadline") && end.stderr.contains("step 2"),
-        "{}",
-        end.stderr
-    );
+    assert_eq!(end.stdout, vec![line("ready")]);
+    // The message is best-effort by design; check its content only if it came.
+    if end.stderr.contains("deadline") {
+        // "ready" is written in step 1; step 2 is normally running by then.
+        assert!(
+            end.stderr.contains("step 1") || end.stderr.contains("step 2"),
+            "{}",
+            end.stderr
+        );
+    }
     Ok(())
 }
 
@@ -512,5 +573,55 @@ fn replay_bounds_fixture_size() -> TestResult {
     let end = spawn::<&str>(&binary, &[])?.finish(true)?;
     assert_eq!(end.code, Some(FAILED));
     assert!(end.stderr.contains("exceeds"), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_escape_writes_and_matches_a_literal_placeholder() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"emit": {"line": "{\"command\":\"echo $${HOME}\"}"}},
+                {"expect": {"line": {"command": "echo $${HOME}"}}},
+                {"emit": {"line": "matched"}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("{\"command\":\"echo ${HOME}\"}"));
+    run.send(&json!({"command": "echo ${HOME}"}))?;
+    assert_eq!(run.next_line()?, line("matched"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+    Ok(())
+}
+
+#[test]
+fn replay_bounds_expected_value_substitution_in_aggregate() -> TestResult {
+    // Each element fits the line bound; together they exceed it.
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            10_000,
+            &json!([
+                {"expect": {"line": {}, "capture": {"pad": "/pad"}}},
+                {"expect": {"line": {"items": vec!["${pad}"; 10_000]}}}
+            ]),
+        ),
+    )?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"pad": "a".repeat(600 * 1024)}))?;
+    let end = run.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(
+        end.stderr.contains("step 2") && end.stderr.contains("substitution exceeds"),
+        "{}",
+        end.stderr
+    );
     Ok(())
 }

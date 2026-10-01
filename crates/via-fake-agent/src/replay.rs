@@ -12,6 +12,8 @@
 //! `${name}` is replaced by the capture's text: an argv capture's argument
 //! verbatim, a stdin capture's JSON text.
 //!
+//! `$${` writes a literal `${`.
+//!
 //! Lines, the fixture, the captures and the whole run are bounded. Any
 //! failure exits [`FAILED`], naming the 1-based step where one was running.
 
@@ -23,8 +25,9 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,8 +46,12 @@ const MAX_FIXTURE: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURES: usize = 64;
 /// Most bytes all captures retain together.
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-/// Longest diagnostic written to stderr; longer ones are truncated.
+/// Longest diagnostic written to stderr, prefix and newline included;
+/// longer messages are truncated.
 const MAX_DIAGNOSTIC: usize = 1024;
+const DIAGNOSTIC_PREFIX: &str = "fake replay: ";
+/// The watchdog's deadline from process start until the fixture is loaded.
+const LOAD_LIMIT: Duration = Duration::from_secs(5);
 /// How long the deadline's message may take before the process exits anyway.
 const MESSAGE_GRACE: Duration = Duration::from_millis(100);
 /// Exit code for any replay failure; distinct from the start-request mode's 2.
@@ -127,22 +134,31 @@ impl Captures {
     }
 }
 
-/// The sibling fixture of `argv[0]`, when the fake runs in replay mode.
-pub(crate) fn fixture_path() -> Option<PathBuf> {
-    let argv0 = PathBuf::from(env::args_os().next()?);
-    // A bare name was found through PATH; it has no directory to look beside.
-    argv0.parent().filter(|dir| !dir.as_os_str().is_empty())?;
-    let mut name = OsString::from(argv0.as_os_str());
-    name.push(".replay.json");
-    let fixture = PathBuf::from(name);
-    fixture.is_file().then_some(fixture)
+/// A message to the watchdog.
+enum Arm {
+    /// Replaces the deadline.
+    Deadline(Instant),
+    /// Not replay mode: the watchdog ends without acting.
+    Disarm,
 }
 
-/// Replays `fixture` and exits the process.
-pub(crate) fn run(fixture: &Path) -> ! {
+/// Runs replay mode and exits when a sibling fixture selects it; otherwise
+/// returns to the start-request mode.
+pub(crate) fn run_if_selected() {
     let started = Instant::now();
     let step = Arc::new(AtomicUsize::new(0));
-    let code = match replay(fixture, started, &step) {
+    // Armed before the fixture lookup, so lookup, loading and their errors
+    // are bounded by the load limit until the fixture names its deadline.
+    let Some(load_deadline) = started.checked_add(LOAD_LIMIT) else {
+        process::exit(FAILED)
+    };
+    let watchdog = arm(load_deadline, Arc::clone(&step));
+    let Some(fixture) = fixture_path() else {
+        // If the watchdog is gone it can no longer act; nothing to disarm.
+        let _ = watchdog.send(Arm::Disarm);
+        return;
+    };
+    let code = match replay(&fixture, started, &step, &watchdog) {
         Ok(()) => 0,
         Err(error) => {
             diagnostic(&error);
@@ -152,13 +168,30 @@ pub(crate) fn run(fixture: &Path) -> ! {
     process::exit(code)
 }
 
-fn replay(fixture: &Path, started: Instant, step: &Arc<AtomicUsize>) -> Result<(), String> {
-    // Loading runs before the deadline is known; the size cap bounds it.
+/// The sibling fixture of `argv[0]`, when the fake runs in replay mode.
+fn fixture_path() -> Option<PathBuf> {
+    let argv0 = PathBuf::from(env::args_os().next()?);
+    // A bare name was found through PATH; it has no directory to look beside.
+    argv0.parent().filter(|dir| !dir.as_os_str().is_empty())?;
+    let mut name = OsString::from(argv0.as_os_str());
+    name.push(".replay.json");
+    let fixture = PathBuf::from(name);
+    fixture.is_file().then_some(fixture)
+}
+
+fn replay(
+    fixture: &Path,
+    started: Instant,
+    step: &AtomicUsize,
+    watchdog: &SyncSender<Arm>,
+) -> Result<(), String> {
     let fixture = load(fixture)?;
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
         .ok_or("deadline_ms is out of range")?;
-    watchdog(deadline, Arc::clone(step));
+    watchdog
+        .send(Arm::Deadline(deadline))
+        .map_err(|_| "the watchdog is gone".to_owned())?;
     let mut captures = Captures::default();
     let args = check_argv(&fixture.argv, &mut captures)?;
     if args == ["--version"] {
@@ -258,32 +291,52 @@ fn check_argv(expected: &[Arg], captures: &mut Captures) -> Result<Vec<String>, 
     Ok(args)
 }
 
-/// Ends the whole run at `deadline`, whatever the other threads are doing.
-fn watchdog(deadline: Instant, step: Arc<AtomicUsize>) {
-    // Detached on purpose: it only ever ends the process.
-    thread::spawn(move || {
+/// Starts the watchdog, which ends the process at its current deadline,
+/// whatever the other threads are doing. If it cannot start, the process
+/// exits at once.
+fn arm(deadline: Instant, step: Arc<AtomicUsize>) -> SyncSender<Arm> {
+    // Capacity 1: the main thread sends at most one message, so it never waits.
+    let (sender, receiver) = mpsc::sync_channel(1);
+    // Detached on purpose: it only ever ends the process, or returns when disarmed.
+    let spawned = thread::Builder::new().spawn(move || {
+        let mut deadline = deadline;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
-            thread::sleep(left);
+            match receiver.recv_timeout(left) {
+                Ok(Arm::Deadline(next)) => deadline = next,
+                Ok(Arm::Disarm) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => thread::sleep(left),
+            }
         }
-        let step = step.load(Ordering::SeqCst);
-        // The message is written on its own thread: stderr may be locked by a
-        // blocked diagnostic or its pipe may be full, and neither may hold the
-        // exit back longer than MESSAGE_GRACE. The exit status alone reports
-        // the failure.
-        let (done, wait) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            diagnostic(&format!("deadline passed at step {step}"));
-            // The watchdog may already have stopped waiting; nothing to do.
-            let _ = done.send(());
-        });
+        expire(step.load(Ordering::SeqCst));
+    });
+    if spawned.is_err() {
+        process::exit(FAILED);
+    }
+    sender
+}
+
+/// Exits [`FAILED`] at the deadline. The message is written on its own
+/// thread: stderr may be locked by a blocked diagnostic or its pipe may be
+/// full, and neither may hold the exit back longer than [`MESSAGE_GRACE`].
+/// The exit status alone reports the failure, so a helper that cannot be
+/// created means exiting at once with no message.
+fn expire(step: usize) -> ! {
+    let (done, wait) = mpsc::sync_channel(1);
+    let helper = thread::Builder::new().spawn(move || {
+        diagnostic(&format!("deadline passed at step {step}"));
+        // The watchdog may already have stopped waiting; nothing to do.
+        let _ = done.send(());
+    });
+    if helper.is_ok() {
         // A timeout or a lost sender both mean: exit now.
         let _ = wait.recv_timeout(MESSAGE_GRACE);
-        process::exit(FAILED);
-    });
+    }
+    process::exit(FAILED)
 }
 
 fn run_step<R: BufRead>(
@@ -295,7 +348,9 @@ fn run_step<R: BufRead>(
 ) -> Result<(), String> {
     match step {
         Step::Expect { line, capture } => {
-            let expected = substitute_value(line, captures)?;
+            // One budget for the whole expected value, however many strings it has.
+            let mut budget = MAX_LINE;
+            let expected = substitute_value(line, captures, &mut budget)?;
             let actual = read_line(input)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
@@ -308,7 +363,10 @@ fn run_step<R: BufRead>(
             }
             Ok(())
         }
-        Step::Emit { line } => write_line(&substitute(&line, captures)?),
+        Step::Emit { line } => {
+            let mut budget = MAX_LINE;
+            write_line(&substitute(&line, captures, &mut budget)?)
+        }
         Step::Delay { ms } => {
             thread::sleep(Duration::from_millis(ms));
             Ok(())
@@ -339,46 +397,63 @@ fn read_line<R: BufRead>(input: &mut R) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("input line is not JSON: {error}"))
 }
 
-/// Replaces each `${name}` with its captured text, within [`MAX_LINE`].
-fn substitute(line: &str, captures: &Captures) -> Result<String, String> {
+/// Replaces each `${name}` with its captured text and each `$${` with a
+/// literal `${`. Every append is charged to `budget` before it is made.
+fn substitute(text: &str, captures: &Captures, budget: &mut usize) -> Result<String, String> {
     let mut out = String::new();
     let mut push = |piece: &str| {
-        if out.len() + piece.len() > MAX_LINE {
-            return Err(format!("substituted line exceeds {MAX_LINE} bytes"));
-        }
+        *budget = budget
+            .checked_sub(piece.len())
+            .ok_or_else(|| format!("substitution exceeds {MAX_LINE} bytes"))?;
         out.push_str(piece);
-        Ok(())
+        Ok::<(), String>(())
     };
-    let mut rest = line;
-    while let Some(start) = rest.find("${") {
+    let mut rest = text;
+    while let Some(start) = rest.find('$') {
         push(&rest[..start])?;
-        let end = rest[start..].find('}').ok_or("unterminated ${ in a line")?;
-        let name = &rest[start + 2..start + end];
-        push(
-            captures
-                .texts
-                .get(name)
-                .ok_or_else(|| format!("uses uncaptured ${{{name}}}"))?,
-        )?;
-        rest = &rest[start + end + 1..];
+        rest = &rest[start..];
+        if let Some(after) = rest.strip_prefix("$${") {
+            push("${")?;
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("${") {
+            let end = after.find('}').ok_or("unterminated ${ in a line")?;
+            let name = &after[..end];
+            push(
+                captures
+                    .texts
+                    .get(name)
+                    .ok_or_else(|| format!("uses uncaptured ${{{name}}}"))?,
+            )?;
+            rest = &after[end + 1..];
+        } else {
+            push("$")?;
+            rest = &rest[1..];
+        }
     }
     push(rest)?;
     Ok(out)
 }
 
-/// Substitutes captures into every string value of an expected line.
-fn substitute_value(value: Value, captures: &Captures) -> Result<Value, String> {
+/// Substitutes captures into every string value of an expected line, all
+/// charged to one `budget`.
+fn substitute_value(
+    value: Value,
+    captures: &Captures,
+    budget: &mut usize,
+) -> Result<Value, String> {
     Ok(match value {
-        Value::String(text) if text.contains("${") => Value::String(substitute(&text, captures)?),
+        Value::String(text) if text.contains("${") => {
+            Value::String(substitute(&text, captures, budget)?)
+        }
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| substitute_value(item, captures))
+                .map(|item| substitute_value(item, captures, budget))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .map(|(key, item)| Ok((key, substitute_value(item, captures)?)))
+                .map(|(key, item)| Ok((key, substitute_value(item, captures, budget)?)))
                 .collect::<Result<_, String>>()?,
         ),
         other @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)) => other,
@@ -397,12 +472,47 @@ fn write_line(line: &str) -> Result<(), String> {
         .map_err(|error| format!("cannot write stdout: {error}"))
 }
 
-/// Writes a failure message truncated to [`MAX_DIAGNOSTIC`] bytes.
+/// Writes a failure message as one line of at most [`MAX_DIAGNOSTIC`] bytes,
+/// prefix and newline included.
 fn diagnostic(message: &str) {
-    let mut end = message.len().min(MAX_DIAGNOSTIC);
+    // Best-effort: the exit status already reports the failure.
+    let _ = io::stderr()
+        .lock()
+        .write_all(diagnostic_line(message).as_bytes());
+}
+
+fn diagnostic_line(message: &str) -> String {
+    let mut end = message
+        .len()
+        .min(MAX_DIAGNOSTIC - DIAGNOSTIC_PREFIX.len() - 1);
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    // Best-effort: the exit status already reports the failure.
-    let _ = writeln!(io::stderr().lock(), "fake replay: {}", &message[..end]);
+    let mut line = String::with_capacity(MAX_DIAGNOSTIC);
+    line.push_str(DIAGNOSTIC_PREFIX);
+    line.push_str(&message[..end]);
+    line.push('\n');
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DIAGNOSTIC, diagnostic_line};
+
+    #[test]
+    fn diagnostic_is_at_most_its_bound_in_total() {
+        for message in [
+            "short",
+            &"é".repeat(MAX_DIAGNOSTIC),
+            &"x".repeat(4 * MAX_DIAGNOSTIC),
+        ] {
+            let line = diagnostic_line(message);
+            assert!(line.len() <= MAX_DIAGNOSTIC, "{} bytes", line.len());
+            assert!(line.ends_with('\n'));
+        }
+        assert_eq!(
+            diagnostic_line(&"x".repeat(4 * MAX_DIAGNOSTIC)).len(),
+            MAX_DIAGNOSTIC
+        );
+    }
 }
