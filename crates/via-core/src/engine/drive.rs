@@ -871,7 +871,6 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
-        self.check_output(&effective, &record, &mut terminal).await;
         if let Some((outcome, cleanup)) = disposed.stop {
             let requested_at = if let Some(order) = &order {
                 order.requested_at.clone()
@@ -897,6 +896,10 @@ impl Engine {
         if text_failed {
             terminal.fail(FailureClass::Store, "the final text could not be written");
         }
+        // Sol r2 #7 (C1 §5): validated after the final text, evidence and
+        // Store classification, as on the forced path: a failure found
+        // there stands, and the envelope warns.
+        self.check_output(&effective, &record, &mut terminal).await;
         let cause = disposed
             .cancel_cause
             .filter(|_| terminal.state == "cancelled");

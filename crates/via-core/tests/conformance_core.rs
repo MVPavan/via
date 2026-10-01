@@ -2106,6 +2106,65 @@ fn core_an_aborted_dispatcher_strands_no_turn_work() {
     });
 }
 
+/// Sol r2 #7 (C1 §5, §8.2): a structured output is validated after the
+/// turn's final text, evidence and Store classification. The vendor
+/// completes with an output the schema refuses and a final text past the
+/// inline limit, whose file then fails its sync (`final_text.sync.fail`)
+/// once the vendor's terminal is disposed: the turn fails `store`, which
+/// stands, and its envelope warns `structured_output_invalid` with
+/// `reason: "invalid"`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_structured_output_validated_after_a_store_failure() {
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no"},
+                   "output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no"},
+                   "max_steps":{"support":"unsupported","reason":"no"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    // Past the 256 KiB inline limit, so the text goes to its file.
+    let spilled = "a".repeat(256 * 1024);
+    let steps = [
+        accepted(1),
+        emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+                     "status":"completed","final_text":spilled,"stop_reason":"end_turn",
+                     "structured_output":{"b":1}})),
+    ];
+    let Some(root) = child(
+        "core_structured_output_validated_after_a_store_failure",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "final_text.sync.fail", "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let schema = json!({"type":"object","required":["a"]});
+        let session = daemon.spawn("p", &json!({"output_schema":schema})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(envelope["failure"]["class"], "store", "{envelope}");
+        assert!(envelope["final_text_file"].is_null(), "{envelope}");
+        let warned: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "structured_output_invalid")
+            .collect();
+        assert_eq!(warned.len(), 1, "{envelope}");
+        assert_eq!(warned[0]["data"], json!({"reason":"invalid"}), "{envelope}");
+        daemon.stop().await;
+    });
+}
+
 /// Idle session lanes the daemon keeps (runtime §8).
 #[cfg(feature = "test-failpoints")]
 const IDLE_LANES: usize = 32;
