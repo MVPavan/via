@@ -17,6 +17,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

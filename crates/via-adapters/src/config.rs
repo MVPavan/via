@@ -1,28 +1,39 @@
-//! Adapter configuration (adapter design §5.4): the bootstrap environment
-//! names, read once at daemon start, and the opaque `harnesses` section of
-//! `daemon.json`.
+//! Adapter configuration (adapter design §5.4): the bootstrap environment,
+//! read once at daemon start, and the `harnesses` section of `daemon.json`
+//! (runtime §8).
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::fake::FakeProfile;
+use crate::harness::{HARNESSES, Harness, HarnessRow};
+use crate::plan::{Category, Inherit, InheritState};
 
-/// The environment names adapters read at daemon start. Today only the fake
-/// fixture's three (runtime §11.1, decision H4).
+/// The environment names auto-start forwards and adapters read at daemon
+/// start (runtime §6.1, AR1); each adapter copies only its allow-list.
 pub const BOOTSTRAP_ENV: &[&str] = &[
+    "HOME",
+    "PATH",
+    "LANG",
+    "USER",
+    "LOGNAME",
+    "XDG_RUNTIME_DIR",
     "VIA_FAKE_AGENT_BINARY",
     "VIA_FAKE_SCENARIO",
     "VIA_FAKE_SYNC_DIR",
 ];
 
-/// The values of [`BOOTSTRAP_ENV`] names captured at daemon start.
-#[derive(Clone, Debug, Default)]
+/// The values of [`BOOTSTRAP_ENV`] names captured at daemon start. Its
+/// `Debug` shows the names only: the values are never logged (runtime §6.1).
+#[derive(Clone, Default)]
 pub struct BootstrapEnv {
     vars: Vec<(&'static str, OsString)>,
 }
@@ -63,12 +74,28 @@ impl BootstrapEnv {
             .map(|(name, value)| (*name, value.as_os_str()))
     }
 
-    fn get(&self, name: &str) -> Option<&Path> {
+    /// The captured value of `name`, the last one given.
+    pub fn var(&self, name: &str) -> Option<&OsStr> {
         self.vars
             .iter()
             .rev()
             .find(|(known, _)| *known == name)
-            .map(|(_, value)| Path::new(value))
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    fn get(&self, name: &str) -> Option<&Path> {
+        self.var(name).map(Path::new)
+    }
+}
+
+impl fmt::Debug for BootstrapEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootstrapEnv")
+            .field(
+                "names",
+                &self.vars.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -84,14 +111,47 @@ pub enum ConfigError {
     /// The scenario's `profile` does not parse.
     #[error("fake scenario profile is invalid: {0}")]
     Profile(serde_json::Error),
-    /// `harnesses` is not a JSON object.
-    #[error("harnesses must be an object")]
-    Harnesses,
+    /// `harnesses` is invalid (runtime §8).
+    #[error(transparent)]
+    Harnesses(#[from] HarnessesError),
+}
+
+/// Why `harnesses` is invalid: the member's full path, such as
+/// `harnesses.claude.binary`, and the rule it broke (runtime §8).
+#[derive(Debug, Error, Eq, PartialEq)]
+#[error("{key}: {rule}")]
+pub struct HarnessesError {
+    /// The member's path from `harnesses`.
+    pub key: String,
+    /// The rule it broke.
+    pub rule: HarnessesRule,
+}
+
+/// A rule of the `harnesses` section.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum HarnessesRule {
+    /// The member must be a JSON object.
+    #[error("must be an object")]
+    NotAnObject,
+    /// The key names no [`HARNESSES`] row.
+    #[error("unknown harness")]
+    UnknownHarness,
+    /// The key is not one this level allows.
+    #[error("unknown key")]
+    UnknownKey,
+    /// The key appears twice in its object.
+    #[error("duplicate key")]
+    DuplicateKey,
+    /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
+    #[error("must be an absolute path without `..`")]
+    Binary,
+    /// An `inherit` switch is not a boolean.
+    #[error("must be a boolean")]
+    NotBoolean,
 }
 
 /// The fake's validated fixture (runtime §11.1): its launch paths and the
 /// profile its scenario declares.
-#[derive(Debug)]
 pub struct FakeFixture {
     binary: PathBuf,
     scenario: PathBuf,
@@ -116,25 +176,91 @@ impl FakeFixture {
     }
 }
 
-/// Per-harness settings and the fake fixture, validated once.
+impl fmt::Debug for FakeFixture {
+    /// The paths are bootstrap values: their names only (runtime §6.1).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FakeFixture")
+            .field("binary", &"VIA_FAKE_AGENT_BINARY")
+            .field("scenario", &"VIA_FAKE_SCENARIO")
+            .field("sync_dir", &"VIA_FAKE_SYNC_DIR")
+            .field("profile", &self.profile)
+            .finish()
+    }
+}
+
+/// One vendor harness's `daemon.json` settings (design §5.4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessConfig {
+    binary: Option<PathBuf>,
+    inherit: Inherit,
+}
+
+/// A harness with no settings: a `PATH` lookup and the OD2 default.
+static DEFAULT_HARNESS: HarnessConfig = HarnessConfig {
+    binary: None,
+    inherit: Inherit::OD2_DEFAULT,
+};
+
+impl HarnessConfig {
+    /// The configured binary; `None` means a `PATH` lookup.
+    pub fn binary(&self) -> Option<&Path> {
+        self.binary.as_deref()
+    }
+
+    /// The requested inherited-configuration states.
+    pub fn inherit(&self) -> Inherit {
+        self.inherit
+    }
+}
+
+/// The validated `harnesses` section of `daemon.json` (runtime §8, design
+/// §5.4): one [`HarnessConfig`] per [`HARNESSES`] row, in table order. The
+/// default is every harness's defaults, an absent section's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessSettings(Vec<HarnessConfig>);
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        Self(vec![DEFAULT_HARNESS.clone(); HARNESSES.len()])
+    }
+}
+
+impl HarnessSettings {
+    /// Parses a `harnesses` section, purely: no I/O, so daemon start
+    /// refuses an invalid `daemon.json` before touching anything, and keeps
+    /// the result for [`AdapterConfig::with_harnesses`].
+    pub fn parse(raw: &RawValue) -> Result<Self, HarnessesError> {
+        parse_harnesses(raw).map(Self)
+    }
+}
+
+/// Per-harness settings, the bootstrap environment and the fake fixture,
+/// validated once at daemon start.
 #[derive(Debug)]
 pub struct AdapterConfig {
+    env: BootstrapEnv,
     fake: Option<FakeFixture>,
-    harnesses: Option<Box<RawValue>>,
+    harnesses: HarnessSettings,
 }
 
 impl AdapterConfig {
-    /// Validates the fixture environment (all three paths or none) and reads
-    /// the fake's profile from the scenario once (H2). `harnesses` stays
-    /// opaque in S-CORE: any object is accepted (H4).
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "design §3.2: the start-time environment is handed over once"
-    )]
+    /// [`HarnessSettings::parse`] of `harnesses`, when present, then
+    /// [`Self::with_harnesses`]: any invalid member is refused.
     pub fn load(env: BootstrapEnv, harnesses: Option<&RawValue>) -> Result<Self, ConfigError> {
-        if harnesses.is_some_and(|value| !value.get().trim_start().starts_with('{')) {
-            return Err(ConfigError::Harnesses);
-        }
+        let harnesses = match harnesses {
+            Some(raw) => HarnessSettings::parse(raw)?,
+            None => HarnessSettings::default(),
+        };
+        Self::with_harnesses(env, harnesses)
+    }
+
+    /// Validates the fixture environment (all three paths or none) and
+    /// reads the fake's profile from the scenario once (H2), keeping the
+    /// already validated `harnesses`.
+    pub fn with_harnesses(
+        env: BootstrapEnv,
+        harnesses: HarnessSettings,
+    ) -> Result<Self, ConfigError> {
         let paths = [
             env.get("VIA_FAKE_AGENT_BINARY"),
             env.get("VIA_FAKE_SCENARIO"),
@@ -158,9 +284,15 @@ impl AdapterConfig {
             }
         };
         Ok(Self {
+            env,
             fake,
-            harnesses: harnesses.map(ToOwned::to_owned),
+            harnesses,
         })
+    }
+
+    /// The bootstrap environment captured at daemon start.
+    pub fn env(&self) -> &BootstrapEnv {
+        &self.env
     }
 
     /// The fake's fixture, when configured.
@@ -168,15 +300,166 @@ impl AdapterConfig {
         self.fake.as_ref()
     }
 
-    /// The `harnesses` object as given, kept opaque (H4).
-    pub fn harnesses(&self) -> Option<&RawValue> {
-        self.harnesses.as_deref()
+    /// The settings of a [`HARNESSES`] row; the defaults for any other row.
+    pub fn harness(&self, row: &HarnessRow) -> &HarnessConfig {
+        HARNESSES
+            .iter()
+            .position(|known| known == row)
+            .and_then(|index| self.harnesses.0.get(index))
+            .unwrap_or(&DEFAULT_HARNESS)
     }
 
-    /// The fake's fixture, when configured.
-    pub(crate) fn into_fake(self) -> Option<FakeFixture> {
-        self.fake
+    /// The `inherit` a plan for `harness` requests: the configured one for a
+    /// vendor harness; the fake keeps the OD2 default (design §5.5).
+    pub fn inherit(&self, harness: Harness) -> Inherit {
+        match harness {
+            Harness::Vendor(row) => self.harness(row).inherit(),
+            Harness::Fake => Inherit::OD2_DEFAULT,
+        }
     }
+
+    /// Takes the fake's fixture, when configured.
+    pub(crate) fn take_fake(&mut self) -> Option<FakeFixture> {
+        self.fake.take()
+    }
+}
+
+/// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
+/// names; per harness only `binary` (an absolute path without `..`, never
+/// expanded) and `inherit` (the six category booleans, the OD2 default for
+/// each missing one). No key may repeat within its object. Pure: no I/O.
+fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
+    let mut harnesses = vec![DEFAULT_HARNESS.clone(); HARNESSES.len()];
+    for (name, entry) in members(raw, "harnesses")? {
+        let key = format!("harnesses.{name}");
+        let Some(index) = HARNESSES.iter().position(|row| row.name == name) else {
+            return Err(invalid(&key, HarnessesRule::UnknownHarness));
+        };
+        let config = &mut harnesses[index];
+        for (member, value) in members(&entry, &key)? {
+            let key = format!("{key}.{member}");
+            match member.as_str() {
+                "binary" => config.binary = Some(binary(&value, &key)?),
+                "inherit" => config.inherit = parse_inherit(&value, &key)?,
+                _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
+            }
+        }
+    }
+    Ok(harnesses)
+}
+
+/// The most bytes of a key a diagnostic shows: the rule after it always
+/// fits the auto-start client's 4 KiB stderr capture.
+const KEY_SHOWN: usize = 256;
+
+impl ConfigError {
+    /// A configuration key as a diagnostic shows it: control characters
+    /// escaped, cut at [`KEY_SHOWN`] bytes with `...`, so the diagnostic
+    /// stays one bounded line and the rule after it always survives.
+    pub fn shown_key(key: &str) -> String {
+        let mut shown = String::new();
+        for character in key.chars() {
+            let piece: String = if character.is_control() {
+                character.escape_default().collect()
+            } else {
+                character.to_string()
+            };
+            if shown.len() + piece.len() > KEY_SHOWN {
+                shown.push_str("...");
+                break;
+            }
+            shown.push_str(&piece);
+        }
+        shown
+    }
+}
+
+fn invalid(key: &str, rule: HarnessesRule) -> HarnessesError {
+    HarnessesError {
+        key: ConfigError::shown_key(key),
+        rule,
+    }
+}
+
+/// A JSON object's members in order, duplicates kept, so that a repeated
+/// key is refused rather than silently replaced.
+struct Members(Vec<(String, Box<RawValue>)>);
+
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> Visitor<'de> for Visit {
+            type Value = Members;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(Members(members))
+            }
+        }
+        deserializer.deserialize_map(Visit)
+    }
+}
+
+/// The members of the object at `key`; a non-object or a repeated key is
+/// refused.
+fn members(raw: &RawValue, key: &str) -> Result<Vec<(String, Box<RawValue>)>, HarnessesError> {
+    let Members(members) =
+        serde_json::from_str(raw.get()).map_err(|_| invalid(key, HarnessesRule::NotAnObject))?;
+    for (at, (name, _)) in members.iter().enumerate() {
+        if members[..at].iter().any(|(earlier, _)| earlier == name) {
+            return Err(invalid(
+                &format!("{key}.{name}"),
+                HarnessesRule::DuplicateKey,
+            ));
+        }
+    }
+    Ok(members)
+}
+
+/// Runtime §6.1's path rule: absolute, no `..`, no expansion; an embedded
+/// NUL names no file.
+fn binary(value: &RawValue, key: &str) -> Result<PathBuf, HarnessesError> {
+    match serde_json::from_str::<String>(value.get()) {
+        Ok(path)
+            if !path.contains('\0')
+                && Path::new(&path).is_absolute()
+                && !Path::new(&path)
+                    .components()
+                    .any(|part| part == Component::ParentDir) =>
+        {
+            Ok(PathBuf::from(path))
+        }
+        _ => Err(invalid(key, HarnessesRule::Binary)),
+    }
+}
+
+fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError> {
+    let mut states = Inherit::OD2_DEFAULT;
+    for (name, value) in members(value, key)? {
+        let key = format!("{key}.{name}");
+        let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
+            return Err(invalid(&key, HarnessesRule::UnknownKey));
+        };
+        let Ok(on) = serde_json::from_str::<bool>(value.get()) else {
+            return Err(invalid(&key, HarnessesRule::NotBoolean));
+        };
+        states.set(
+            category,
+            if on {
+                InheritState::On
+            } else {
+                InheritState::Off
+            },
+        );
+    }
+    Ok(states)
 }
 
 /// The fixture checks of runtime §11.1.

@@ -553,6 +553,40 @@ pub(crate) fn serving_pid(runtime: &Path) -> Option<u32> {
         .and_then(|pid| u32::try_from(pid).ok())
 }
 
+/// [`serving_pid`] by `deadline`: each write and read of the `hello` and
+/// `daemon/status` exchange is bounded by the time left, and a reply
+/// completed after `deadline` is not accepted.
+pub(crate) fn serving_pid_by(runtime: &Path, deadline: Instant) -> Option<u32> {
+    let left = || Some(outer_cleanup::left(deadline)).filter(|left| !left.is_zero());
+    let stream = UnixStream::connect(runtime.join("via.sock")).ok()?;
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut writer = stream;
+    let mut exchange = |line: &str| -> Option<Value> {
+        writer.set_write_timeout(left()).ok()?;
+        left()?;
+        writer.write_all(line.as_bytes()).ok()?;
+        writer.write_all(b"\n").ok()?;
+        writer.set_read_timeout(left()).ok()?;
+        left()?;
+        let mut reply = String::new();
+        if reader.read_line(&mut reply).ok()? == 0 {
+            return None;
+        }
+        serde_json::from_str(&reply).ok()
+    };
+    let params =
+        json!({"api_version":1,"client_version":env!("CARGO_PKG_VERSION"),"client":"s1-test"});
+    let hello = exchange(&request(0, "hello", &params))?;
+    if hello["result"]["api_version"] != 1 {
+        return None;
+    }
+    let status = exchange(&request(1, "daemon/status", &json!({})))?;
+    let pid = status["result"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())?;
+    (Instant::now() <= deadline).then_some(pid)
+}
+
 /// One JSON-RPC request line with `params` serialized exactly as the CLI does.
 pub(crate) fn request(id: u64, method: &str, params: &Value) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string()
