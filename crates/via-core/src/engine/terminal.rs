@@ -350,6 +350,11 @@ const STORE_STOP: &str = "a turn event could not be recorded";
 /// [`TOKENS_STOP`] replaces this once the turn's record shows it.
 pub(super) const PROTOCOL_STOP: &str = "Core refused the vendor's evidence for the turn";
 
+/// Message of a turn stopped because its acceptance found every vendor
+/// turn tombstone of its connection generation taken (C2 §4.1, critical
+/// r1 #6).
+pub(super) const OVERFLOW_STOP: &str = "the session's vendor turns exhausted their tombstones";
+
 /// Message of a turn whose vendor reported a token count past `i64::MAX`
 /// (review r1).
 pub(super) const TOKENS_STOP: &str = "the vendor reported a token count that cannot be represented";

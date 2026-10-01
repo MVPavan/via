@@ -54,7 +54,7 @@ pub(super) const VENDOR_TURNS: usize = 64;
 /// Tombstones a lane keeps of vendor turns whose mapping expired (C2 §2):
 /// 64-bit hashes, so the bound is small whatever the IDs' length. One more
 /// overflows the lane: a tombstone is never reassigned (C2 §4.1).
-const TOMBSTONES: usize = 1024;
+pub(super) const TOMBSTONES: usize = 1024;
 
 /// How long retiring a failed or replaced driver waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
@@ -824,16 +824,17 @@ impl Lane {
         }
     }
 
-    /// Records `vendor_turn` as `turn`'s, the newest; false for one the
-    /// lane maps to another turn or tombstoned, which fails the lane (Sol
-    /// r3 N6). An overflow or that failure wakes the lane's actor, which
-    /// retires the lane once its turn ends.
-    pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) -> bool {
+    /// Records `vendor_turn` as `turn`'s, the newest ([`LaneState::map`]):
+    /// [`Mapped::Collided`] for one the lane maps to another turn or
+    /// tombstoned, which fails the lane (Sol r3 N6), and
+    /// [`Mapped::Exhausted`] for an overflow (critical r1 #6). Either wakes
+    /// the lane's actor, which retires the lane once its turn ends.
+    pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) -> Mapped {
         let (mapped, failed) = {
             let mut state = lock(&self.state);
             let before = state.overflowed || state.collided;
-            let mapped = state.map(vendor_turn, turn) != Mapped::Collided;
-            state.collided |= !mapped;
+            let mapped = state.map(vendor_turn, turn);
+            state.collided |= mapped == Mapped::Collided;
             (mapped, (state.overflowed || state.collided) && !before)
         };
         if failed {
@@ -986,6 +987,9 @@ pub(super) struct VendorRecord {
     pub(super) instance: Option<(Option<String>, bool)>,
     /// The retained vendor terminal's envelope facts (AD4).
     pub(super) retained: Option<Retained>,
+    /// The turn's acceptance found every tombstone taken (C2 §4.1,
+    /// critical r1 #6): the lane overflowed, and the turn fails `overflow`.
+    pub(super) overflowed: bool,
 }
 
 /// The retained vendor terminal's envelope facts.

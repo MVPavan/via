@@ -20,7 +20,7 @@ use via_store::{
 use super::batch::AffectedTurn;
 use super::final_text::FinalText;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
-use super::lane::{Attribution, Inbox, Lane, LaneClaim, Retained, turn_job};
+use super::lane::{Attribution, Inbox, Lane, LaneClaim, Mapped, Retained, turn_job};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::progress::Progress;
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
@@ -837,10 +837,7 @@ impl Engine {
         let text_failed = self
             .settle_final_text(&mut control, &mut record, &mut terminal)
             .await;
-        if record.steps.unrepresentable() {
-            // Refused after `execute` returned, when no order could reach it.
-            terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
-        }
+        refused_evidence(&record, &mut terminal);
         if record.first_failure.is_some() {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
@@ -1838,17 +1835,10 @@ impl Engine {
         }
         match item.observation {
             Observation::Accepted(acceptance) => {
-                if let (Some(lane), Some(vendor_turn)) =
-                    (lane, acceptance_turn(&acceptance, vendor_turn.as_deref()))
-                    && !lane.map_vendor_turn(&vendor_turn, record.turn)
-                {
-                    // Sol r3 N6 (C2 §4.1): an ID the lane maps to another
-                    // turn, or tombstoned, establishes nothing; the lane
-                    // failed, and the turn stops `protocol`, once.
-                    if !control.refused {
-                        control.refused = true;
-                        slot.protocol_order(control.turn, tokio::time::Instant::now());
-                    }
+                let mapped = acceptance_turn(&acceptance, vendor_turn.as_deref());
+                if map_acceptance(record, lane, control, mapped) == Mapped::Collided {
+                    // An ID the lane maps to another turn, or tombstoned,
+                    // establishes nothing.
                     return;
                 }
                 let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref())
@@ -2628,6 +2618,42 @@ fn progress(observation: &Observation) -> bool {
 /// which resets the turn's idle deadline (critical r1 #7): its acceptance,
 /// the turn's by its correlation, or progress `lane` attributes to the
 /// turn. Late, expired and session-level progress never does.
+/// Maps an acceptance's vendor turn on the lane ([`Lane::map_vendor_turn`]).
+/// Sol r3 N6, critical r1 #6 (C2 §4.1): a collision or the tombstones'
+/// exhaustion failed the lane; the turn stops at once, once, and an
+/// exhausted one fails `overflow` ([`refused_evidence`]).
+fn map_acceptance(
+    record: &mut TurnRecord,
+    lane: Option<&Lane>,
+    control: &mut Control<'_>,
+    vendor_turn: Option<String>,
+) -> Mapped {
+    let mapped = match (lane, vendor_turn) {
+        (Some(lane), Some(vendor_turn)) => lane.map_vendor_turn(&vendor_turn, record.turn),
+        _ => Mapped::Taken,
+    };
+    if mapped != Mapped::Taken && !control.refused {
+        control.refused = true;
+        control
+            .slot
+            .protocol_order(control.turn, tokio::time::Instant::now());
+    }
+    record.vendor.overflowed |= mapped == Mapped::Exhausted;
+    mapped
+}
+
+/// The failure of vendor evidence Core refused, once the turn's record
+/// shows it: a token count (refused after `execute` returned, when no
+/// order could reach it), or an acceptance that exhausted the lane's
+/// tombstones, whose protocol order stopped the turn (critical r1 #6).
+fn refused_evidence(record: &TurnRecord, terminal: &mut Terminal) {
+    if record.steps.unrepresentable() {
+        terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
+    } else if record.vendor.overflowed {
+        terminal.fail(FailureClass::Overflow, super::terminal::OVERFLOW_STOP);
+    }
+}
+
 pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &ObservationItem) -> bool {
     progress(&item.observation)
         && (matches!(item.observation, Observation::Accepted(_))

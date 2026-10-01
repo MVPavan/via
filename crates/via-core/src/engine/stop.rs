@@ -423,6 +423,9 @@ impl Engine {
             // order, or a refusal after Route ended under the force); the
             // known failure outranks the idle and cancel rows.
             terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
+        } else if record.vendor.overflowed {
+            // Critical r1 #6: an acceptance exhausted the lane's tombstones.
+            terminal.fail(FailureClass::Overflow, super::terminal::OVERFLOW_STOP);
         } else if turn.cause == Some(StopCause::Protocol) {
             // Sol r4 R6: any other refusal of the vendor's evidence, as an
             // acceptance colliding with another turn's vendor turn.

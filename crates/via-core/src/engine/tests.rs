@@ -4920,3 +4920,49 @@ fn a_new_connection_generation_starts_with_no_old_ownership() {
         assert!(probe.borrow().is_none(), "no protocol stop");
     });
 }
+
+/// Critical r1 #6 (C2 §4.1: exhaustion escalates to connection failure):
+/// an acceptance whose mapping finds every tombstone of the generation
+/// taken is the turn's, but the lane overflowed, and the running turn is
+/// stopped at once, not when its vendor next reports or its deadline
+/// passes; its terminal reads `overflow`.
+#[test]
+fn tombstone_exhaustion_stops_the_running_turn_at_once() {
+    let Some(root) = child("tombstone_exhaustion_stops_the_running_turn_at_once") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (_session, slot, lane, mut record, effective, orders) =
+            running_turn_2_with(&engine, &root, false).await;
+        let probe = orders.clone();
+        // The helper left every mapping and one tombstone taken.
+        for filler in 1..super::lane::TOMBSTONES {
+            lane.map_vendor_turn(&format!("exhaust-{filler}"), turn(1));
+        }
+        assert!(!lane.failed(), "the bound itself is not exhausted");
+        let accepted = via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(via_adapters::VendorTurnId::try_from("fresh".to_owned()).unwrap()),
+            observation: via_adapters::Observation::Accepted(
+                via_adapters::observation::Acceptance {
+                    correlation: via_adapters::AcceptanceToken::FIRST,
+                    vendor_turn_id: None,
+                },
+            ),
+        };
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                vec![accepted],
+            )
+            .await;
+        assert!(record.accepted.is_some(), "the acceptance is the turn's");
+        let cause = probe.borrow().as_ref().map(|order| order.cause);
+        assert!(cause.is_some(), "the running turn is stopped at once");
+        assert!(record.vendor.overflowed, "its terminal reads overflow");
+    });
+}

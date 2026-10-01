@@ -284,7 +284,9 @@ async fn serve_bound(
         closing,
         failed,
     };
-    Ok(final_shutdown(engine, joins, exit.mode, window, entry).await)
+    // Boxed: final shutdown holds the drain of every turn, past Clippy's
+    // future-size bound in test builds.
+    Ok(Box::pin(final_shutdown(engine, joins, exit.mode, window, entry)).await)
 }
 
 /// Opens the Engine off the Tokio workers and commits crash recovery before
