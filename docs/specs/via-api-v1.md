@@ -3,8 +3,8 @@
 Status: draft 3, 2026-09-30; the owner approved the S1 set on 2026-09-26
 (see Decisions below). Draft 3 applies the adapter design's amendments
 AC1–AC10 ([adapter design](../workstreams/rust-foundation/adapters/design.md)
-§3.4, revision 9); leftover detection is pending an owner decision (adapter
-design, conflict 4). Public contract between
+§3.4, revision 9); leftover detection follows the owner's choice of option A
+on 2026-10-01 (adapter design, conflict 4). Public contract between
 callers and VIA; implemented by L1 (`via-cli`, server half) over L2
 (`via-core`). Inputs: `docs/brainstorms/README.md` §15
 (authoritative), review `docs/brainstorms/reviews/contract-specs-astra-r1.md`,
@@ -620,7 +620,7 @@ cut at a character boundary.
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
 | `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
-| `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Detection is pending an owner decision (adapter design, conflict 4); until it is decided, `leftovers` is `null` |
+| `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Produced best effort by Host's report-only scan for VIA's process marker (C2 §4.2, runtime §5) wherever these destinations apply; `null` when no scan ran. `incomplete: true` means the scan could not settle the full set (C2 §4.2); entries mean "observed during the scan", not "alive" |
 
 ## 6. Durable events
 
@@ -743,9 +743,14 @@ For a private process, Host uses only the persisted full **anchor** identity,
 generation and private socket to find and challenge a live anchor. It verifies
 the control peer and the anchor's own marker/identity before asking that same
 anchor to stop its own group. Vendor child identity is separate process
-evidence, never signalling authority. There is no scan of vendor environments,
-no vendor marker discovery and no daemon-side numeric TERM/KILL of a saved
-pid or pgid. If the anchor is absent or unverified, Host does not signal.
+evidence, never signalling authority. Cleanup and recovery perform no scan of
+vendor environments and no vendor marker discovery, and there is no
+daemon-side numeric TERM/KILL of a saved pid or pgid. The only environment
+read is the report-only leftover scan (C2 §4.2): it may read the environment
+of a same-uid process started at or after the vendor, through one
+`/proc/<pid>` descriptor, solely to match the exact `VIA_PROCESS_MARKER`
+entry; nothing from it is kept except the report, and the marker never
+authorizes a signal or proves ownership or liveness. If the anchor is absent or unverified, Host does not signal.
 Cleanup is `uncertain` unless a same-boot, same-PID-namespace, non-signalling
 group query proves `ESRCH` for a persisted Host-created group with full
 identity, generation and pgid > 1 (runtime contract §5.2). `Ok`, `EPERM`,
@@ -863,6 +868,14 @@ class; `submit_failed` is only before acceptance; HTTP 401/403 → `auth`. `max_
   listener exposure, credential reuse or the advertised trust boundary.
   OC01/OC02/OC12 control tests in `vendors/opencode.md` remain required;
   complete child-environment scrubbing is deferred to `via-4sw.4`.
+- One narrow, owner-approved exception (2026-10-01), separate from the
+  OpenCode password exception, which does not cover it: a report-only
+  leftover scan (C2 §4.2) may read the environment of a same-uid process
+  started at or after the vendor, through one `/proc/<pid>` descriptor,
+  solely to match the exact `VIA_PROCESS_MARKER` entry. Its buffer can
+  transiently hold credential values; it is compared in memory and dropped,
+  nothing from it is kept except the report, and the marker never authorizes
+  a signal or proves ownership or liveness.
 - Prompts and outputs are private local data; retention is daemon config
   (Proposed 30 days); vendor processes get a per-adapter environment
   allow-list, never the caller's environment.
