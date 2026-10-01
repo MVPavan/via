@@ -6,6 +6,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -54,6 +55,18 @@ enum Step {
         stream: Stream,
     },
     Gate {
+        name: String,
+    },
+    /// The version handshake (adapter design AD7): as a script's first
+    /// step it is written before the start request is read, and the first
+    /// script that leads with one decides it. Elsewhere it is a plain emit.
+    Hello {
+        message: Value,
+    },
+    /// Closes stdout while the process stays alive, as a vendor whose
+    /// transport was lost (decision H1): the process replaces itself with
+    /// its grandchild mode on gate `name`, keeping its pid and stdin.
+    CloseStdout {
         name: String,
     },
     ExpectRequest {
@@ -115,6 +128,18 @@ struct InterruptRequest {
     vendor_turn_id: String,
 }
 
+/// The driver's steer input (adapter design §3.2), ID 3.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    id: u64,
+    vendor_turn_id: String,
+    #[expect(dead_code, reason = "validated as a string; its text is not used")]
+    text: String,
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Stream {
@@ -161,20 +186,26 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = &held {
         gate(&sync_dir, name)?;
     }
+    let hello = leading_hello(&scripts)?;
     let (start, script) = read_start(&mut input, scripts)?;
     let (input_tx, input_rx) = mpsc::sync_channel(8);
     thread::spawn(move || read_remaining(input, &input_tx));
     let mut terminal_emitted = false;
     let mut interrupt_seen = false;
-    for step in script.steps {
+    let mut steps = script.steps.into_iter().peekable();
+    // The leading handshake was written before the start.
+    if hello.is_some() {
+        steps.next_if(|step| matches!(step, Step::Hello { .. }));
+    }
+    for step in steps {
         match step {
             Step::Emit { message, stream } => {
                 if matches!(stream, Stream::Stdout) && message["type"] == "terminal" {
                     terminal_emitted = true;
                 }
-                write_bytes(stream, serde_json::to_string(&message)?.as_bytes())?;
-                write_bytes(stream, b"\n")?;
+                emit_line(stream, &message)?;
             }
+            Step::Hello { message } => emit_line(Stream::Stdout, &message)?,
             Step::EmitRaw { text, stream } => write_bytes(stream, text.as_bytes())?,
             Step::EmitBytes { bytes, stream } => write_bytes(stream, &bytes)?,
             // A hold that ran before the start request was read is done.
@@ -184,9 +215,14 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
                 gate(&sync_dir, &name)?;
             }
             Step::Gate { .. } | Step::HoldStdin { .. } => {}
+            Step::CloseStdout { name } => return Err(close_stdout(&name)),
             Step::ExpectRequest { expected } => {
                 let message = next_input(&input_rx)?;
-                read_interrupt(message, &expected, start.turn, &mut interrupt_seen)?;
+                if message["type"] == "steer" {
+                    read_steer(message, &expected, start.turn)?;
+                } else {
+                    read_interrupt(message, &expected, start.turn, &mut interrupt_seen)?;
+                }
             }
             Step::Flood {
                 text,
@@ -228,6 +264,46 @@ fn agent_main() -> Result<(), Box<dyn std::error::Error>> {
         grandchild.wait()?;
     }
     Ok(())
+}
+
+/// The first script's leading handshake, written before the start request
+/// is read; `None` when no script leads with one.
+fn leading_hello(scripts: &[Script]) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    let hello = scripts
+        .iter()
+        .find_map(|script| match script.steps.first() {
+            Some(Step::Hello { message }) => Some(message.clone()),
+            _ => None,
+        });
+    if let Some(message) = &hello {
+        emit_line(Stream::Stdout, message)?;
+    }
+    Ok(hello)
+}
+
+/// Writes `message` as one JSON line.
+fn emit_line(stream: Stream, message: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    write_bytes(stream, serde_json::to_string(message)?.as_bytes())?;
+    write_bytes(stream, b"\n")?;
+    Ok(())
+}
+
+/// Replaces this process with its grandchild mode on gate `name`, stdout
+/// on `/dev/null`: the same live process, its stdout pipe closed. Returns
+/// only the failure.
+fn close_stdout(name: &str) -> Box<dyn std::error::Error> {
+    if let Err(error) = validate_name(name) {
+        return error.into();
+    }
+    match env::current_exe() {
+        Ok(exe) => Command::new(exe)
+            .arg("--grandchild")
+            .arg(name)
+            .stdout(Stdio::null())
+            .exec()
+            .into(),
+        Err(error) => error.into(),
+    }
 }
 
 fn read_message<R: BufRead>(input: &mut R) -> Result<Option<Value>, Box<dyn std::error::Error>> {
@@ -282,6 +358,24 @@ fn read_interrupt(
         return Err("invalid typed interrupt request".into());
     }
     *interrupt_seen = true;
+    Ok(())
+}
+
+fn read_steer(
+    actual: Value,
+    expected: &Value,
+    turn: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !contains_expected(&actual, expected) {
+        return Err("steer request does not match fixture".into());
+    }
+    let request: SteerRequest = serde_json::from_value(actual)?;
+    if request.kind != "steer"
+        || request.id != 3
+        || request.vendor_turn_id != format!("fake-turn-{turn}")
+    {
+        return Err("invalid typed steer request".into());
+    }
     Ok(())
 }
 
