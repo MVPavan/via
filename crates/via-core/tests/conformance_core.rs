@@ -2144,19 +2144,21 @@ async fn run_sessions(daemon: &Daemon, count: usize) {
     }
 }
 
-/// Waits until the daemon's lanes and tracked tasks are within the idle
+/// Waits until the daemon's lanes, their live actors and the tracked
+/// tasks (an actor and a journal consumer per lane) are within the idle
 /// lanes' bound, with nothing running.
 #[cfg(feature = "test-failpoints")]
 async fn until_bounded(daemon: &Daemon) {
     let by = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let (lanes, tasks) = daemon.engine.lane_census();
-        if lanes <= IDLE_LANES && tasks <= IDLE_LANES {
+        let (lanes, live, tasks) = daemon.engine.lane_census();
+        if lanes <= IDLE_LANES && live <= IDLE_LANES && tasks <= 2 * IDLE_LANES {
             return;
         }
         assert!(
             tokio::time::Instant::now() < by,
-            "(lanes, tracked tasks) ({lanes}, {tasks}) past the bound {IDLE_LANES}"
+            "(lanes, live actors, tracked tasks) ({lanes}, {live}, {tasks}) past the bound \
+             {IDLE_LANES}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

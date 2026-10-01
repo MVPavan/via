@@ -29,7 +29,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -246,9 +246,10 @@ pub(super) struct Lane {
     writer: SessionWriter,
     /// The drivers' cancellation: final shutdown ends the actor's serving.
     cancel: CancellationToken,
-    /// The driver's uncertain journal write latched Store failure
-    /// ([`Lane::journal_read`]).
-    journal_latched: AtomicBool,
+    /// The driver's uncertain journal write was reported to the latch,
+    /// once, by whichever of its consumers read it first ([`journal_watch`],
+    /// [`Lane::journal_read`]).
+    journal_reported: Arc<StdMutex<bool>>,
     /// The lane's last use, a tick of [`USES`]: its making, then each
     /// turn's claim released.
     used: AtomicU64,
@@ -455,6 +456,28 @@ impl LaneState {
     }
 }
 
+/// The driver's journal report's own consumer (critical r2 F3, C2 §2
+/// `journal_uncertain`), on the daemon's tracker apart from the lane's
+/// actor, so no turn job delays it: an uncertain Host journal write no
+/// turn reports latches Store failure as soon as it is published, once
+/// for the lane ([`SessionWriter::journal_uncertain`]). It ends once
+/// reported, or once the driver's last publisher is gone.
+async fn journal_watch(
+    mut journal: watch::Receiver<bool>,
+    writer: SessionWriter,
+    reported: Arc<StdMutex<bool>>,
+) {
+    loop {
+        if *journal.borrow_and_update() {
+            writer.journal_uncertain(&reported).await;
+            return;
+        }
+        if journal.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// The C2 §2 `SessionRef` of a session's stored route identity (decision
 /// H3). What the Store does not hold is left empty, never invented: no
 /// adapter serves an empty route.
@@ -502,7 +525,7 @@ impl Lane {
             state: StdMutex::new(state),
             writer,
             cancel,
-            journal_latched: AtomicBool::new(false),
+            journal_reported: Arc::new(StdMutex::new(false)),
             used: AtomicU64::new(use_tick()),
         }
     }
@@ -822,9 +845,8 @@ impl Lane {
     /// being handled is finished first: it is never cut off.
     async fn serve(&self, inbox: &mut Inbox) -> Option<Ending> {
         let mut health = self.driver.health();
-        let mut journal = self.driver.journal_uncertain();
         let mut changes = self.changed.subscribe();
-        let (mut open, mut watched, mut journaled) = (true, true, true);
+        let (mut open, mut watched) = (true, true);
         // Each item is taken only after the job, the cancellation, the
         // health and the lane's end were checked again (runtime §8).
         let mut handled = 0;
@@ -838,7 +860,6 @@ impl Lane {
             if self.cancel.is_cancelled() {
                 return None;
             }
-            self.journal_read(&mut journal).await;
             let failed = self.health_read(&mut health);
             // Test builds: the actor holds between its health read and the
             // lane's end (Sol r2 #1), until a dispatch asks for that end or
@@ -867,7 +888,6 @@ impl Lane {
                 biased;
                 () = self.cancel.cancelled() => return None,
                 moved = health.changed(), if watched => watched = moved.is_ok(),
-                moved = journal.changed(), if journaled => journaled = moved.is_ok(),
                 _bumped = changes.changed() => {}
                 admitted = inbox.recv(), if open => match admitted {
                     Some(admitted) => {
@@ -880,15 +900,14 @@ impl Lane {
         }
     }
 
-    /// Reads the driver's journal report (C2 §2): an uncertain Host journal
-    /// write no turn reports latches Store failure, once (critical r1 #4,
-    /// runtime §7).
+    /// Reads the driver's journal report once its close is done (C2 §2):
+    /// an uncertain Host journal write no turn reports latches Store
+    /// failure (critical r1 #4, runtime §7), its phase one published before
+    /// the lane's end ([`SessionWriter::journal_uncertain`]). The report's
+    /// own consumer reads it as it comes ([`journal_watch`]).
     async fn journal_read(&self, journal: &mut watch::Receiver<bool>) {
-        if !*journal.borrow_and_update() {
-            return;
-        }
-        if !self.journal_latched.swap(true, Ordering::AcqRel) {
-            self.writer.journal_uncertain().await;
+        if *journal.borrow_and_update() {
+            self.writer.journal_uncertain(&self.journal_reported).await;
         }
     }
 
@@ -1241,6 +1260,11 @@ impl Engine {
             (self.session_writer(session), self.cancel.child_token()),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
+        self.tracker.spawn(journal_watch(
+            lane.driver.journal_uncertain(),
+            self.session_writer(session),
+            Arc::clone(&lane.journal_reported),
+        ));
         self.tracker.spawn(Arc::clone(&lane).actor(
             Inbox(Some(receiver)),
             (Arc::clone(&self.lanes), session.clone()),
@@ -1319,12 +1343,15 @@ impl Engine {
         }
     }
 
-    /// Test builds: the lanes registered, and the tasks on the daemon's
-    /// tracker (the lanes' actors and their drivers' owned tasks).
+    /// Test builds: the lanes registered, those of them whose actor has
+    /// not ended, and the tasks on the daemon's tracker (each lane's actor
+    /// and journal consumer, and its driver's owned tasks).
     #[cfg(feature = "test-failpoints")]
     #[must_use]
-    pub fn lane_census(&self) -> (usize, usize) {
-        (lock(&self.lanes).len(), self.tracker.len())
+    pub fn lane_census(&self) -> (usize, usize, usize) {
+        let lanes = lock(&self.lanes);
+        let live = lanes.values().filter(|lane| !lane.ended()).count();
+        (lanes.len(), live, self.tracker.len())
     }
 
     /// Whether `session`'s lane drain is complete (design §6.8 step 3, Sol

@@ -524,6 +524,13 @@ impl SessionDriver {
     pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
         self.journal.subscribe()
     }
+
+    /// Test builds only: reports an uncertain Host journal write outside
+    /// any turn, as a persistent connection's retirement would.
+    #[cfg(feature = "test-failpoints")]
+    pub fn report_journal_uncertain(&self) {
+        self.journal.send_replace(true);
+    }
 }
 
 /// Route's refusal as the driver reports it.

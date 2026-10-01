@@ -622,15 +622,26 @@ impl SessionWriter {
 
     /// A Host journal write of the session's driver that no turn reports
     /// had an uncertain outcome (critical r1 #4): like every uncertain
-    /// write, it latches Store failure (runtime §7), under `admission`.
-    async fn journal_uncertain(&self) {
-        let _admission = self.admission.lock().await;
-        if self.signal.report(
-            FailureSite::Journal,
-            WriteOutcome::Uncertain,
-            latch::FailureScope::Session(&self.session),
-        ) {
-            // Phase two, under the `admission` held (design §7.4).
+    /// write, it latches Store failure (runtime §7), once per lane, as
+    /// `reported` records. Phase one (failure pending and the force) is
+    /// published before anything is awaited, under `reported`'s lock, so
+    /// a second reader returns only once it is published (critical r2
+    /// F3); phase two then waits for `admission` (design §7.4).
+    async fn journal_uncertain(&self, reported: &StdMutex<bool>) {
+        let latches = {
+            let mut reported = lock(reported);
+            if *reported {
+                return;
+            }
+            *reported = true;
+            self.signal.report(
+                FailureSite::Journal,
+                WriteOutcome::Uncertain,
+                latch::FailureScope::Session(&self.session),
+            )
+        };
+        if latches {
+            let _admission = self.admission.lock().await;
             self.store_failed.store(true, Ordering::Release);
         }
     }

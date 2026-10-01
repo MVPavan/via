@@ -5236,7 +5236,8 @@ fn an_undrained_lane_keeps_a_restart_closing_session_open() {
     });
 }
 
-/// The lanes registered and the tasks on the daemon's tracker.
+/// The lanes registered and the tasks on the daemon's tracker (each
+/// lane's actor and journal consumer, and its driver's owned tasks).
 fn lane_census(engine: &Engine) -> (usize, usize) {
     (super::lock(&engine.lanes).len(), engine.tracker.len())
 }
@@ -5264,7 +5265,7 @@ fn sequential_sessions_keep_the_idle_lanes_bounded() {
         }
         let census = || lane_census(&engine);
         let bounded = tokio::time::timeout(Duration::from_secs(10), async {
-            while census().0 > IDLE_LANES || census().1 > IDLE_LANES {
+            while census().0 > IDLE_LANES || census().1 > 2 * IDLE_LANES {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -5517,5 +5518,47 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
             "the idle deadline expired: {:?}",
             probe.borrow().as_ref().map(|order| order.cause)
         );
+    });
+}
+
+/// Critical r2 F3 (runtime §7, C2 §2 `journal_uncertain`): the driver's
+/// journal report has its own consumer, apart from the lane's turn jobs.
+/// Reported while a turn job runs, it latches Store failure before that
+/// job ends: phase one at once, even while `admission` is held, so no new
+/// receipt passes; phase two once `admission` is free.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_journal_report_latches_while_a_turn_job_runs() {
+    let Some(root) = child("a_journal_report_latches_while_a_turn_job_runs") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (_session, lane, _sender) = idle_session_with_lane(&engine, &root).await;
+        let claim = lane.claim().expect("an open lane is claimed");
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let job = super::lane::turn_job(move |_inbox| {
+            Box::pin(async move {
+                let _ = finished.await;
+                drop(claim);
+            })
+        });
+        assert!(lane.hand_over(job).is_ok());
+        let admission = engine.admission.lock().await;
+        lane.driver.report_journal_uncertain();
+        let latched = tokio::time::timeout(Duration::from_secs(5), async {
+            while !engine.store_failed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            latched.is_ok(),
+            "phase one waits for the turn job or for admission"
+        );
+        drop(admission);
+        until(|| engine.latch_finalized()).await;
+        assert!(spawn(&engine, None).await.is_err(), "no new receipt passes");
+        let _ = finish.send(());
     });
 }
