@@ -86,7 +86,7 @@ packets only where the evidence requires it.
 |---|---|---|
 | P1 | The turn lane is S1's single `run_turn` call. Acceptance is an observation. The end result carries the retained vendor terminal and the cleanup. Steer and close are driver methods. `open_session` is logical only, so vendor session creation happens in the first `run_turn`. | AD3 |
 | P2 | Codex's post-acknowledgement cleanup window, `min(ack + 60 s, wall)`, is applied by the driver from a Core-supplied grace. It is separate from the stop order's pre-acknowledgement bound. | AD4 |
-| P3 | Cleanup keeps its S1/C1 meaning (the agent's own group, or vendor-reported items on server routes). Leftovers are a separate best-effort report, delivered only where an existing surface ends the connection synchronously; detection is pending the owner (conflict 4). | AD9, AD20 |
+| P3 | Cleanup keeps its S1/C1 meaning (the agent's own group, or vendor-reported items on server routes). Leftovers are a separate best-effort report, delivered only where an existing surface ends the connection synchronously; detection is the report-only marker scan (owner chose A, conflict 4). | AD9, AD20 |
 | P11 | The wall deadline keeps S1's path unchanged (Route `Deadline` failure, Core `dispose`); only the cleanup step after the failure is per route, and the failure carries two new facts, `acknowledged` and `shared`. | AD4 |
 | P4 | Vendor version comes from the running instance's handshake. There is no separate version-probe process. | AD7 |
 | P5 | The fake is an ordinary `Adapter::Fake` variant, reachable only with the explicit fixture configuration. It owns its own version policy. | §5.5 |
@@ -145,7 +145,7 @@ OD2 per-category switches are in §5.4.1.
 | AD16 | C2 §3 and runtime §8 | Connection capacity per live connection, not per turn. |
 | AD17 | C2 A6; PK-CX §4; PK-OC §5 | One 5 s auto-decline deadline. |
 | AD19 | C2 §6.2 Interrupt and Close rows | Soft stop per harness; hard stop is S1's own-group stop. |
-| AD20 | C2 §2, §4 new result fact | Best-effort leftover report on per-turn ends, server-stopping closes and `server_lost` turns; detection pending (conflict 4). |
+| AD20 | C2 §2, §4 new result fact | Best-effort leftover report on per-turn ends, server-stopping closes and `server_lost` turns; detection by the report-only marker scan (owner chose A, conflict 4). |
 | AD18 | C2 §5 validation | Effort is validated in pure planning against the route's compiled values; discovered model-specific constraints are applied before vendor submission as a definite rejection. |
 | AC1–AC10 | C1 | Version rule and `allow_untested`; cleanup meaning; adapter-version refusal; usage note; class rule and `submit_failed` scope; `fake`; warning `config_switch_unverified`; effort refusal at submission; `failure.data`; `leftovers`. |
 | AR1–AR6 | runtime | Bootstrap environment; report-only marker scan (§5, §8, §10; option A); fake config ownership; per-connection admission; DTO placement; non-turn anchor owners for servers. |
@@ -717,7 +717,7 @@ own-group stop through the anchor, unchanged. VIA sends nothing else.
 Tests: fixture wire order per cell; the hard stop is S1's, unchanged.
 
 **AD20. Leftover report (C2 §2, §4 new result fact; OD3 decided; detection
-pending, conflict 4).** Processes the agent started that are observed after
+option A, conflict 4).** Processes the agent started that are observed after
 its own process exited are reported to the caller as left over by the coding
 agent. VIA never signals or manages them.
 
