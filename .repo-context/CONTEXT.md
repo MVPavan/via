@@ -114,7 +114,7 @@ L2, responsible for session and turn lifecycle, admission, deadlines, queues, ca
 _Avoid_: Run Core
 
 **Host**:
-L6, the only layer that starts and supervises vendor processes and servers. It reports survivors by VIA marker after a crash and never stops servers VIA did not start.
+L6, the only layer that starts and supervises vendor processes and servers. It reports survivors by VIA marker only where C2 §4.2 gives the report a destination (never after daemon-crash recovery) and never stops servers VIA did not start.
 _Avoid_: daemon as a synonym
 
 **Wire**:

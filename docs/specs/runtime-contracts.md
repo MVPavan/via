@@ -1245,8 +1245,9 @@ locations (C1 §3.12).
 
 The reviewed runtime clarifications below are incorporated into C1, C2 and
 the coding standard; this table retains their source-to-contract audit.
-The platform packet retains its own native proof and pending P-OWNER-1
-macOS linkage gate. No design text here claims those live gates have passed.
+The platform packet retains its own native proof and its deferred macOS
+linkage gate (P-OWNER-1 accepted; platform-packaging §1). No design text
+here claims those live gates have passed.
 
 | Source | Required clarification |
 |---|---|
