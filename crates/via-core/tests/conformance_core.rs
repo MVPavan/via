@@ -113,15 +113,13 @@ struct Daemon {
 
 impl Daemon {
     fn open(root: &Path) -> Self {
-        let engine = Arc::new(
-            Engine::open(
-                &root.join("state"),
-                &root.join("runtime"),
-                AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
-                binary("via"),
-            )
-            .unwrap(),
-        );
+        let engine = Engine::open(
+            &root.join("state"),
+            &root.join("runtime"),
+            AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
+            binary("via"),
+        )
+        .unwrap();
         let mut starts = engine.take_starts().unwrap();
         let starting = Arc::clone(&engine);
         let dispatchers = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -534,7 +532,13 @@ fn core_stop_reason_other_and_failed_max_steps_kept() {
 /// Arms Core's failpoint `point` in the child's controller.
 #[cfg(feature = "test-failpoints")]
 fn arm(root: &Path, point: &str, action: &str) {
-    let command = json!({"token":"conformance-core","occurrence":1,"action":action});
+    arm_at(root, point, 1, action);
+}
+
+/// Arms `point`'s hit `occurrence` with `action`.
+#[cfg(feature = "test-failpoints")]
+fn arm_at(root: &Path, point: &str, occurrence: u64, action: &str) {
+    let command = json!({"token":"conformance-core","occurrence":occurrence,"action":action});
     fs::write(
         root.join("points").join(format!("{point}.json")),
         command.to_string(),
@@ -1402,7 +1406,7 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
         let envelope = daemon.wait(&failed, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
-        // The monitor closes the failed driver: its slot is released
+        // The lane's actor closes the failed driver: its slot is released
         // without a dispatch.
         let released = tokio::time::Instant::now() + Duration::from_secs(5);
         while daemon.engine.connections().in_use != 0 {
@@ -1439,12 +1443,12 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
 
 /// Sol r1 F3, Sol r2 #1, #2 (C2 §2 health, AD16): four persistent
 /// sessions hold every connection slot, and one's driver fails between
-/// turns while its monitor is held between its health read and its
-/// retirement (`core.lane.retire`). That session's next turn, needing a
-/// fifth slot, is refused the failed lane's claim, retires it at dispatch
-/// (releasing its slot) and runs on a successor while the monitor is still
-/// held; the monitor, released, finds the retirement already started and
-/// the successor untouched.
+/// turns while its lane's actor is held between its health read and the
+/// lane's end (`core.lane.retire`). That session's next turn, needing a
+/// fifth slot, is refused the failed lane's claim and asks for its
+/// retirement at dispatch, which the held actor carries out (releasing
+/// the slot, Sol r3 N4); the turn runs on a successor, and the hold's
+/// later release finds nothing to retire: the successor is untouched.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
@@ -1485,7 +1489,7 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
         while !ack.exists() {
             assert!(
                 tokio::time::Instant::now() < by,
-                "the monitor never saw the failure"
+                "the lane's actor never saw the failure"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1500,12 +1504,12 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
             .wait(params)
             .await
             .map_err(|error| error.kind)
-            .expect("the successor turn ran while the monitor was held");
+            .expect("the successor turn ran after the held actor retired the lane");
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(daemon.engine.connections().in_use, 4);
         fs::write(root.join("points").join("core.lane.retire.1.release"), b"").unwrap();
-        // The released monitor retires nothing: the successor keeps its
+        // The released hold retires nothing: the successor keeps its
         // slot and serves the session's next turn.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(daemon.engine.connections().in_use, 4);
@@ -1826,5 +1830,84 @@ fn core_started_turns_record_the_running_adapter_version() {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.route.adapter_version.as_deref(), Some("9.9.9"));
+    });
+}
+
+/// Sol r3 N1, N2 (lane actor ruling): the turn's caller, its dispatcher,
+/// is aborted while the turn's final drain has a real Store commit in
+/// flight, with one more durable item behind it. The turn is the lane
+/// actor's, which runs it to completion: every denial is committed and
+/// the turn reaches its terminal; nothing is left without a consumer.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_an_aborted_dispatcher_strands_no_turn_work() {
+    let denial = |target: &str| {
+        emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                     "kind":"command","target":target,"reason":"policy"}))
+    };
+    let steps = [
+        accepted(1),
+        denial("a"),
+        denial("b"),
+        denial("c"),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_an_aborted_dispatcher_strands_no_turn_work",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // Core holds the acceptance, so the rest queues behind it and the
+    // driver's turn ends; then the second denial's commit is held (the
+    // acceptance's is the first, the first denial's the second).
+    arm(&root, "core.observations.pause", "pause");
+    arm_at(&root, "store.commit.event", 3, "pause");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let points = root.join("points");
+        let until = async |name: &str| {
+            let path = points.join(name);
+            let by = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !path.exists() {
+                assert!(tokio::time::Instant::now() < by, "{name} never reached");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        until("core.observations.pause.1.ack").await;
+        // The driver delivers the turn's items and returns.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fs::write(points.join("core.observations.pause.1.release"), b"").unwrap();
+        until("store.commit.event.3.ack").await;
+        let dispatchers = std::mem::take(&mut *daemon.dispatchers.lock().unwrap());
+        for dispatcher in dispatchers {
+            dispatcher.abort();
+            let _ = dispatcher.await;
+        }
+        fs::write(points.join("store.commit.event.3.release"), b"").unwrap();
+        let params = WaitParams {
+            address: format!("{session}/1"),
+            timeout_ms: Some(10_000),
+        };
+        let envelope = daemon.engine.wait(params).await.map_err(|error| error.kind);
+        let envelope: Value = serde_json::from_str(envelope.unwrap().get()).unwrap();
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        let denied: Vec<Value> = events(&daemon, &session)
+            .await
+            .into_iter()
+            .filter(|event| event["type"] == "action.denied")
+            .map(|event| event["target"].clone())
+            .collect();
+        assert_eq!(denied, [json!("a"), json!("b"), json!("c")]);
+        let _report = daemon
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
     });
 }

@@ -74,7 +74,7 @@ async fn events_page(engine: &Engine, session: &via_core::SessionId) -> Value {
     serde_json::from_str(page.get()).unwrap()
 }
 
-fn open(root: &Path) -> Engine {
+fn open(root: &Path) -> std::sync::Arc<Engine> {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),

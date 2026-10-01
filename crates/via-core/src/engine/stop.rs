@@ -495,7 +495,7 @@ impl Engine {
         let turns = self.unresolved.turns();
         // Every driver's owned work stops with the daemon (C2 §2
         // `SessionCx`); Host's reconciliation below owns their groups.
-        self.drop_lanes(host_by).await;
+        let undrained = self.drop_lanes(host_by).await;
         let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
         // The drivers' tasks end once Host stopped their groups; one still
         // running then counts as pending work.
@@ -544,7 +544,11 @@ impl Engine {
         EngineShutdown {
             anchors: report.anchors,
             uncertain_owners: report.uncertain_anchors,
-            pending_tasks: report.pending_tasks + usize::from(!drivers_joined),
+            // A lane whose actor has not ended by its drain's bound still
+            // owns what its channel has, and a turn it still runs (Sol r3
+            // N5): pending work, never dropped. A turn it runs is in no
+            // step above until its run hands it over.
+            pending_tasks: report.pending_tasks + usize::from(!drivers_joined) + undrained,
             failed_tasks: report.failed_tasks,
             failure: report.failure,
             uncommitted_turns,

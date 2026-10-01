@@ -6,19 +6,26 @@
 //!
 //! A lane outlives its dispatcher, so a later turn can pin the live
 //! connection its driver keeps (AD16) and the confirmed identity is kept;
-//! the session's close or final shutdown ends it. One lifecycle state,
-//! under one lock with the channel's receiver, orders a turn's claim
-//! against retirement (Sol r2 #1, #2). The lane's monitor (Sol r1 F2, F4)
-//! drains the channel whenever no turn holds it, committing each durable
-//! item as it arrives (C2 §2 session drain, decision H3 as narrowed), and
-//! watches the driver's health throughout: a driver whose health failed is
-//! retired once no turn holds the lane, and replaced at the session's next
-//! turn (C2 §2 health).
+//! the session's close, its driver's failure or final shutdown ends it.
+//! One task on the daemon's tracker, the lane's actor (Sol r3 N1-N5),
+//! owns the session channel's receiver and the lane's lifecycle for the
+//! lane's whole life, and runs each operation on them to completion: a
+//! submitted turn, the session drain between turns (C2 §2, decision H3 as
+//! narrowed: each durable item committed as it arrives, one at a time),
+//! the retirement of a driver whose health failed (C2 §2 health), the
+//! session's close and final shutdown's drain. Callers hand an operation
+//! over and await its completion; dropping a caller never cancels the
+//! operation or strands what it holds. Only a turn's stop order, the
+//! daemon's force and the drivers' cancellation stop work, inside the
+//! actor. However the lane ends, what its channel still has is disposed of
+//! before its end is published, and it stays the session's lane until then.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
+    future::Future,
     ops::Deref,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime},
 };
@@ -27,7 +34,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, DriverFailure, DriverHealth, Inherit, Observation,
-    ObservationBudget, SessionCx, SessionDriver, SessionRef, SessionSpec, TaskTracker, UsageSample,
+    ObservationBudget, SessionCx, SessionDriver, SessionRef, SessionSpec, UsageSample,
     VendorOptions, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
@@ -49,45 +56,78 @@ pub(super) const VENDOR_TURNS: usize = 64;
 /// overflows the lane: a tombstone is never reassigned (C2 §4.1).
 const TOMBSTONES: usize = 1024;
 
-/// How long retiring a failed driver waits for its close.
+/// How long retiring a failed or replaced driver waits for its close.
 const REPLACE_CLOSE: Duration = Duration::from_secs(3);
 
-/// How long final shutdown's session drain may take before Host
-/// reconciliation: the lanes' monitors joined and a few Store commits
-/// ([`Engine::drop_lanes`]).
+/// How long final shutdown waits for the lanes' actors to finish their
+/// drain before Host reconciliation ([`Engine::drop_lanes`]): a turn
+/// ending under the drivers' cancellation and a few Store commits.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(1);
 
-/// A lane's lifecycle (Sol r2 #1, #2). A turn claims the lane only from
-/// `Idle`, before its driver is prepared, and gives it back when its claim
-/// drops; retirement starts only from `Idle`, so it never closes a driver
-/// a turn holds, and `Retired` is set only once the close ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Life {
-    Idle,
-    Claimed,
-    Retiring,
-    Retired,
+/// The sessions' lanes, shared with each lane's actor, which removes its
+/// lane once its session's close ended it.
+pub(super) type Lanes = Arc<StdMutex<HashMap<SessionId, Arc<Lane>>>>;
+
+/// A turn handed to its lane's actor ([`Lane::hand_over`]), run on the
+/// actor's [`Inbox`] to its end.
+pub(super) type TurnJob = Box<dyn for<'a> FnOnce(&'a mut Inbox) -> TurnRun<'a> + Send>;
+
+/// A handed-over turn's run.
+pub(super) type TurnRun<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// `job` as a [`TurnJob`].
+pub(super) fn turn_job<F>(job: F) -> TurnJob
+where
+    F: for<'a> FnOnce(&'a mut Inbox) -> TurnRun<'a> + Send + 'static,
+{
+    Box::new(job)
 }
 
-/// The lifecycle and the session channel's receiver, under one lock.
+/// A lane's lifecycle, its actor's (Sol r2 #1, #2; Sol r3 N4): `Open`
+/// while it serves; `Ending` once its retirement or close was asked for,
+/// which the actor carries out once no turn holds a claim; `Ended` once
+/// the driver is closed and what the channel had is disposed of: the
+/// lane's end, the completion every caller awaits ([`Lane::retired`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Life {
+    Open,
+    Ending,
+    Ended,
+}
+
+/// How a lane ends.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// Its driver failed, or a successor replaces it: closed `Force`
+    /// within [`REPLACE_CLOSE`]. It stays the session's lane, so the
+    /// session's next turn opens its successor from it.
+    Retire,
+    /// The session's close (C2 §2 Close), by its mode and deadline.
+    Close(CloseMode, Deadline),
+}
+
+/// The lifecycle, a turn's claim and a turn handed over, under one lock.
 struct Core {
     life: Life,
-    /// Absent while the monitor or a turn holds it ([`Observed`]).
-    receiver: Option<mpsc::Receiver<Admitted>>,
-    /// A turn waits for the receiver: the monitor gives it up.
-    wanted: bool,
-    /// A turn holds the receiver.
-    turn_holds: bool,
+    ending: Option<Ending>,
+    /// A turn holds the lane, from before its driver is prepared until it
+    /// ends (Sol r2 #1): the lane does not end meanwhile.
+    claimed: bool,
+    /// The session's close asked for the lane's end: the lane leaves the
+    /// session's registration once it ended.
+    removed: bool,
+    /// The claimed turn handed to the actor, not yet started.
+    job: Option<TurnJob>,
 }
 
 /// A turn's claim on its lane (Sol r2 #1), taken before the driver is
-/// selected or prepared and held until the turn ends, however it ends; the
-/// lane is `Idle` again when it drops.
+/// selected or prepared and held until the turn ends, however it ends: it
+/// is handed to the actor with the turn, or dropped by a dispatch that
+/// does not run. The lane does not end while it is held.
 pub(super) struct LaneClaim(Arc<Lane>);
 
 impl LaneClaim {
     /// The claimed lane.
-    #[cfg(test)]
     pub(super) fn lane(&self) -> &Arc<Lane> {
         &self.0
     }
@@ -103,30 +143,30 @@ impl Deref for LaneClaim {
 
 impl Drop for LaneClaim {
     fn drop(&mut self) {
-        {
-            let mut core = lock(&self.0.core);
-            if core.life == Life::Claimed {
-                core.life = Life::Idle;
-            }
-        }
+        lock(&self.0.core).claimed = false;
         self.0.changed.send_replace(());
     }
 }
 
-/// The session channel's receiver, taken from its lane and given back
-/// when this drops, so what its holder did not receive stays for the
-/// lane's next holder (Sol r2 #3).
-pub(super) struct Observed<'a> {
-    lane: &'a Lane,
-    receiver: Option<mpsc::Receiver<Admitted>>,
-    /// A turn's, not the monitor's or a closer's.
-    turn: bool,
-}
+/// The session channel's receiver, its lane actor's own: a turn the actor
+/// runs borrows it, and nothing else ever holds it.
+pub(super) struct Inbox(Option<mpsc::Receiver<Admitted>>);
 
-impl Observed<'_> {
+impl Inbox {
+    /// No channel: a turn run after its lane ended.
+    pub(super) const fn closed() -> Self {
+        Self(None)
+    }
+
+    /// Test builds: an inbox on `receiver`.
+    #[cfg(test)]
+    pub(super) const fn of(receiver: mpsc::Receiver<Admitted>) -> Self {
+        Self(Some(receiver))
+    }
+
     /// The next item, `None` once every sender is gone (cancel-safe).
     pub(super) async fn recv(&mut self) -> Option<Admitted> {
-        match self.receiver.as_mut() {
+        match self.0.as_mut() {
             Some(receiver) => receiver.recv().await,
             None => None,
         }
@@ -134,22 +174,7 @@ impl Observed<'_> {
 
     /// An item already queued, if any.
     pub(super) fn try_recv(&mut self) -> Option<Admitted> {
-        self.receiver.as_mut()?.try_recv().ok()
-    }
-}
-
-impl Drop for Observed<'_> {
-    fn drop(&mut self) {
-        {
-            let mut core = lock(&self.lane.core);
-            if let Some(receiver) = self.receiver.take() {
-                core.receiver = Some(receiver);
-            }
-            if self.turn {
-                core.turn_holds = false;
-            }
-        }
-        self.lane.changed.send_replace(());
+        self.0.as_mut()?.try_recv().ok()
     }
 }
 
@@ -159,9 +184,9 @@ pub(super) struct Lane {
     /// The session's route identity the driver was opened with.
     pub(super) reference: SessionRef,
     core: StdMutex<Core>,
-    /// Marked at every change of `core` that a waiter needs: a claim and
-    /// its end, a turn wanting the receiver and its return, and the end of
-    /// retirement.
+    /// Marked at every change of `core` the actor or a waiter needs: a
+    /// turn handed over, a claim released, an end asked for and the end;
+    /// and when the lane's vendor turns fail it.
     changed: watch::Sender<()>,
     /// The session's observation byte budget, the same across replacement
     /// (Sol r2 #9).
@@ -169,11 +194,7 @@ pub(super) struct Lane {
     state: StdMutex<LaneState>,
     /// Commits what arrives outside a running turn.
     writer: SessionWriter,
-    /// Owns the retirement task.
-    tracker: TaskTracker,
-    /// The monitor's task, joined when the lane is replaced or removed.
-    monitor: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Ends the monitor.
+    /// The drivers' cancellation: final shutdown ends the actor's serving.
     cancel: CancellationToken,
 }
 
@@ -190,7 +211,7 @@ struct LaneState {
     opened: bool,
     /// The driver's connection generation whose identity is committed.
     committed: Option<String>,
-    /// The driver's first health failure, as the monitor saw it (C2 §2).
+    /// The driver's first health failure, as the lane's actor saw it (C2 §2).
     first_cause: Option<DriverFailure>,
     /// A vendor turn's mapping expired with every tombstone taken (C2
     /// §4.1): the lane fails ([`Lane::failed`]).
@@ -336,29 +357,28 @@ fn tombstone_of(vendor_turn: &str) -> u64 {
 }
 
 impl Lane {
-    /// A new lane on `driver`, with its channel's `receiver` on the
-    /// session's `budget`, in lifecycle `life`.
+    /// A new lane on `driver`, on the session's `budget`, claimed for a
+    /// turn when `claimed`.
     fn new(
         (driver, reference): (SessionDriver, SessionRef),
-        (receiver, budget): (mpsc::Receiver<Admitted>, ObservationBudget),
-        (state, life): (LaneState, Life),
-        (writer, tracker, cancel): (SessionWriter, TaskTracker, CancellationToken),
+        budget: ObservationBudget,
+        (state, claimed): (LaneState, bool),
+        (writer, cancel): (SessionWriter, CancellationToken),
     ) -> Self {
         Self {
             driver,
             reference,
             core: StdMutex::new(Core {
-                life,
-                receiver: Some(receiver),
-                wanted: false,
-                turn_holds: false,
+                life: Life::Open,
+                ending: None,
+                claimed,
+                removed: false,
+                job: None,
             }),
             changed: watch::Sender::new(()),
             budget,
             state: StdMutex::new(state),
             writer,
-            tracker,
-            monitor: StdMutex::new(None),
             cancel,
         }
     }
@@ -380,66 +400,74 @@ impl Lane {
     }
 
     /// Whether the driver's health failed (C2 §2), the lane overflowed, or
-    /// its retirement started: its connection is not used for another
-    /// turn.
+    /// its end was asked for: its connection is not used for another turn.
     pub(super) fn failed(&self) -> bool {
-        matches!(self.life(), Life::Retiring | Life::Retired)
-            || self.health_failed()
-            || self.overflowed()
+        self.life() != Life::Open || self.health_failed() || self.overflowed()
     }
 
-    /// Claims the lane for a turn (Sol r2 #1): only from `Idle`, with the
-    /// driver's health not failed and the lane not overflowed, all read
-    /// under the lifecycle lock.
+    /// Claims the lane for a turn (Sol r2 #1): only while it is open and
+    /// unclaimed, with the driver's health not failed and the lane not
+    /// overflowed, all read under the lifecycle lock.
     pub(super) fn claim(self: &Arc<Self>) -> Option<LaneClaim> {
         {
             let mut core = lock(&self.core);
-            if core.life != Life::Idle || self.health_failed() || self.overflowed() {
+            if core.life != Life::Open || core.claimed || self.health_failed() || self.overflowed()
+            {
                 return None;
             }
-            core.life = Life::Claimed;
+            core.claimed = true;
         }
-        self.changed.send_replace(());
         Some(LaneClaim(Arc::clone(self)))
     }
 
-    /// Starts the lane's retirement from `Idle` (C2 §2 health, Sol r2 #2):
-    /// a task the tracker owns closes the driver, releasing what it holds,
-    /// its connection slot included, and only then marks the lane
-    /// `Retired`. True once the lane is retiring or retired; false while a
-    /// turn holds its claim.
-    pub(super) fn begin_retire(self: &Arc<Self>) -> bool {
+    /// Asks for the lane's retirement (C2 §2 health, Sol r2 #2): its actor
+    /// closes the driver, releasing what it holds, its connection slot
+    /// included, disposes of what the channel still has, and only then
+    /// publishes the lane's end. True once the lane is ending or ended;
+    /// false while a turn holds its claim.
+    pub(super) fn begin_retire(&self) -> bool {
         {
             let mut core = lock(&self.core);
-            match core.life {
-                Life::Claimed => return false,
-                Life::Retiring | Life::Retired => return true,
-                Life::Idle => core.life = Life::Retiring,
+            if core.life == Life::Open {
+                if core.claimed {
+                    return false;
+                }
+                core.life = Life::Ending;
+                core.ending = Some(Ending::Retire);
             }
         }
-        let lane = Arc::clone(self);
-        self.tracker.spawn(async move {
-            let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
-            let _report = lane.driver.close(CloseMode::Force, deadline).await;
-            lock(&lane.core).life = Life::Retired;
-            lane.changed.send_replace(());
-        });
+        self.changed.send_replace(());
         true
     }
 
-    /// Waits for the end of the lane's retirement, whoever started it:
-    /// the shared completion every caller awaits.
+    /// Asks for the session's close (C2 §2 Close) by `mode` and
+    /// `deadline`, unless the lane is already ending; either way the lane
+    /// leaves the session's registration once it ended.
+    fn begin_close(&self, mode: CloseMode, deadline: Deadline) {
+        {
+            let mut core = lock(&self.core);
+            if core.life == Life::Open {
+                core.life = Life::Ending;
+                core.ending = Some(Ending::Close(mode, deadline));
+            }
+            core.removed = true;
+        }
+        self.changed.send_replace(());
+    }
+
+    /// Waits for the lane's end, whoever asked for it: the completion
+    /// every caller shares.
     pub(super) async fn retired(&self) {
         let mut changes = self.changed.subscribe();
-        while self.life() != Life::Retired {
+        while self.life() != Life::Ended {
             if changes.changed().await.is_err() {
                 return;
             }
         }
     }
 
-    /// Retires the lane once no turn holds it, and waits for the end.
-    async fn retire_now(self: &Arc<Self>) {
+    /// Retires the lane once no turn holds it, and waits for its end.
+    async fn retire_now(&self) {
         let mut changes = self.changed.subscribe();
         while !self.begin_retire() {
             if changes.changed().await.is_err() {
@@ -449,60 +477,24 @@ impl Lane {
         self.retired().await;
     }
 
-    /// The session channel's receiver for a running turn: the monitor
-    /// gives it up, and it comes back to the lane when the turn drops it.
-    pub(super) async fn observe(&self) -> Observed<'_> {
-        lock(&self.core).wanted = true;
+    /// Hands the claimed turn `job` to the lane's actor, which runs it to
+    /// its end (Sol r3 N1). A lane that already ended gives it back.
+    pub(super) fn hand_over(&self, job: TurnJob) -> Result<(), TurnJob> {
+        {
+            let mut core = lock(&self.core);
+            if core.life == Life::Ended {
+                return Err(job);
+            }
+            core.job = Some(job);
+        }
         self.changed.send_replace(());
-        let mut changes = self.changed.subscribe();
-        loop {
-            {
-                let mut core = lock(&self.core);
-                if let Some(receiver) = core.receiver.take() {
-                    core.wanted = false;
-                    core.turn_holds = true;
-                    return Observed {
-                        lane: self,
-                        receiver: Some(receiver),
-                        turn: true,
-                    };
-                }
-            }
-            if changes.changed().await.is_err() {
-                return Observed {
-                    lane: self,
-                    receiver: None,
-                    turn: false,
-                };
-            }
-        }
+        Ok(())
     }
 
-    /// The receiver for the monitor, unless a turn wants it or the lane is
-    /// retiring.
-    fn take_for_monitor(&self) -> Option<Observed<'_>> {
-        let mut core = lock(&self.core);
-        if core.wanted || matches!(core.life, Life::Retiring | Life::Retired) {
-            return None;
-        }
-        let receiver = core.receiver.take()?;
-        Some(Observed {
-            lane: self,
-            receiver: Some(receiver),
-            turn: false,
-        })
-    }
-
-    /// The driver's first health failure the monitor saw.
+    /// The driver's first health failure the actor saw.
     #[cfg(test)]
     pub(super) fn first_cause(&self) -> Option<DriverFailure> {
         lock(&self.state).first_cause.clone()
-    }
-
-    /// Whether a turn holds the session channel.
-    #[cfg(test)]
-    pub(super) fn turn_holds_channel(&self) -> bool {
-        lock(&self.core).turn_holds
     }
 
     /// The session's byte budget.
@@ -522,6 +514,9 @@ impl Lane {
     /// connection, and the next turn reopens it. Its budget returns once
     /// it is handled.
     pub(super) async fn dispose(&self, admitted: Admitted) {
+        // Test builds: the lane holds an item it has taken, unhandled.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.dispose").await;
         let Admitted { item, permit } = admitted;
         let at = rfc3339(SystemTime::now());
         match &item.observation {
@@ -576,117 +571,107 @@ impl Lane {
         drop(permit);
     }
 
-    /// Commits or drops what the channel still has, once the lane's
-    /// monitor is joined; a turn's holding of the receiver is left alone.
-    async fn drain_rest(&self) {
-        let receiver = lock(&self.core).receiver.take();
-        let mut observed = Observed {
-            lane: self,
-            receiver,
-            turn: false,
-        };
-        while let Some(admitted) = observed.try_recv() {
+    /// The lane's actor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3, Sol r3
+    /// N1-N5), on the daemon's tracker for the lane's life: it serves the
+    /// lane until it ends ([`Self::serve`]). Then it closes the driver,
+    /// unless the drivers' cancellation ended the lane, disposes of what
+    /// the channel still has, one item at a time (durable items committed,
+    /// the rest dropped), removes the lane from `lanes` when its session
+    /// closed, and only then publishes the lane's end. A turn handed over
+    /// meanwhile runs after, with no channel. Nothing cancels it but the
+    /// runtime's own end.
+    async fn actor(self: Arc<Self>, mut inbox: Inbox, (lanes, session): (Lanes, SessionId)) {
+        match self.serve(&mut inbox).await {
+            Some(Ending::Retire) => {
+                let deadline = Deadline::at(tokio::time::Instant::now() + REPLACE_CLOSE);
+                let _report = self.driver.close(CloseMode::Force, deadline).await;
+            }
+            Some(Ending::Close(mode, deadline)) => {
+                let _report = self.driver.close(mode, deadline).await;
+            }
+            // The drivers' cancellation ends their work; Host
+            // reconciliation owns their groups (final shutdown).
+            None => {}
+        }
+        while let Some(admitted) = inbox.try_recv() {
             self.dispose(admitted).await;
         }
-    }
-
-    /// Ends the monitor and waits for it: an item it is committing is
-    /// finished, and it gives the receiver back.
-    async fn stop_monitor(&self) {
-        self.cancel.cancel();
-        let monitor = lock(&self.monitor).take();
-        if let Some(monitor) = monitor {
-            let _joined = monitor.await;
+        // What the driver sends from now on is refused at its sink.
+        drop(inbox);
+        let removed = lock(&self.core).removed;
+        if removed {
+            let mut lanes = lock(&lanes);
+            if lanes
+                .get(&session)
+                .is_some_and(|kept| std::ptr::eq(Arc::as_ptr(kept), Arc::as_ptr(&self)))
+            {
+                lanes.remove(&session);
+            }
+        }
+        let job = {
+            let mut core = lock(&self.core);
+            core.life = Life::Ended;
+            core.job.take()
+        };
+        self.changed.send_replace(());
+        if let Some(job) = job {
+            job(&mut Inbox::closed()).await;
         }
     }
 
-    /// The lane's monitor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3), on the
-    /// daemon's tracker for the lane's life. Whenever no turn wants the
-    /// session channel it drains it, committing each durable item as it
-    /// arrives ([`Self::dispose`]). It is also the independent health
-    /// consumer: it keeps the driver's first failure and retires the failed
-    /// driver once no turn holds the lane (an abandoned turn's claim is
-    /// gone), without waiting for an observation or a dispatch. It ends
-    /// with the driver's close, the start of retirement, or the lane's or
-    /// the daemon's cancellation.
-    pub(super) async fn monitor(self: Arc<Self>) {
+    /// Serves the lane until it ends (Sol r3 N1-N3): runs each turn handed
+    /// over to its end and, between turns, disposes of each item the
+    /// channel receives, one at a time ([`Self::dispose`]). It is the
+    /// driver's independent health consumer: it keeps the first failure,
+    /// and a failed or overflowed lane ends once no turn holds its claim,
+    /// without waiting for an observation or a dispatch (C2 §2 health; an
+    /// abandoned turn's claim is gone). Returns how the lane ends; `None`
+    /// at the drivers' cancellation (final shutdown). A turn or an item
+    /// being handled is finished first: it is never cut off.
+    async fn serve(&self, inbox: &mut Inbox) -> Option<Ending> {
         let mut health = self.driver.health();
         let mut changes = self.changed.subscribe();
+        let (mut open, mut watched) = (true, true);
         loop {
-            let failed = match &*health.borrow_and_update() {
-                DriverHealth::Open => {
-                    let mut state = lock(&self.state);
-                    if state.overflowed {
-                        state
-                            .first_cause
-                            .get_or_insert(DriverFailure::ObservationOverflow);
-                    }
-                    state.overflowed || state.collided
-                }
-                DriverHealth::Failed { first_cause } => {
-                    lock(&self.state)
-                        .first_cause
-                        .get_or_insert_with(|| first_cause.clone());
-                    true
-                }
-                DriverHealth::Closed => return,
-            };
             changes.borrow_and_update();
-            if failed {
-                // Test builds: the monitor holds between its health read
-                // and its retirement (Sol r2 #1), until it is ended.
-                #[cfg(feature = "test-failpoints")]
-                tokio::select! {
-                    _held = via_store::failpoint::hit_async("core.lane.retire") => {}
-                    () = self.cancel.cancelled() => return,
-                }
-                if self.begin_retire() {
-                    return;
-                }
-            }
-            if let Some(observed) = self.take_for_monitor() {
-                if !self
-                    .drain_between(observed, failed, (&mut health, &mut changes))
-                    .await
-                {
-                    return;
-                }
+            let job = lock(&self.core).job.take();
+            if let Some(job) = job {
+                job(inbox).await;
                 continue;
             }
-            tokio::select! {
-                () = self.cancel.cancelled() => return,
-                moved = health.changed() => if moved.is_err() { return },
-                bumped = changes.changed() => if bumped.is_err() { return },
+            if self.cancel.is_cancelled() {
+                return None;
             }
-        }
-    }
-
-    /// Drains the session channel until a turn wants it, the driver's
-    /// health changes, or a failed driver's claim ends; `false` once the
-    /// monitor ends.
-    async fn drain_between(
-        &self,
-        mut observed: Observed<'_>,
-        failed: bool,
-        (health, changes): (&mut watch::Receiver<DriverHealth>, &mut watch::Receiver<()>),
-    ) -> bool {
-        let mut open = true;
-        loop {
-            tokio::select! {
-                biased;
-                () = self.cancel.cancelled() => return false,
-                moved = health.changed() => return moved.is_ok(),
-                bumped = changes.changed() => {
-                    if bumped.is_err() {
-                        return false;
+            let failed = self.health_read(&mut health);
+            // Test builds: the actor holds between its health read and the
+            // lane's end (Sol r2 #1), until a dispatch asks for that end or
+            // the drivers are cancelled.
+            #[cfg(feature = "test-failpoints")]
+            if failed {
+                tokio::select! {
+                    _held = via_store::failpoint::hit_async("core.lane.retire") => {}
+                    _asked = changes.changed() => {}
+                    () = self.cancel.cancelled() => return None,
+                }
+            }
+            {
+                let mut core = lock(&self.core);
+                if !core.claimed && core.job.is_none() {
+                    if failed && core.life == Life::Open {
+                        core.life = Life::Ending;
+                        core.ending = Some(Ending::Retire);
                     }
-                    let failed = failed || self.overflowed();
-                    let core = lock(&self.core);
-                    if core.wanted || (failed && core.life == Life::Idle) {
-                        return true;
+                    if let Some(ending) = core.ending {
+                        return Some(ending);
                     }
                 }
-                admitted = observed.recv(), if open => match admitted {
+            }
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return None,
+                moved = health.changed(), if watched => watched = moved.is_ok(),
+                _bumped = changes.changed() => {}
+                admitted = inbox.recv(), if open => match admitted {
                     Some(admitted) => self.dispose(admitted).await,
                     None => open = false,
                 },
@@ -694,9 +679,33 @@ impl Lane {
         }
     }
 
+    /// Reads the driver's health and keeps its first failure: whether the
+    /// lane failed, by its health, its driver's close or its vendor turns
+    /// (overflow, or a collision).
+    fn health_read(&self, health: &mut watch::Receiver<DriverHealth>) -> bool {
+        match &*health.borrow_and_update() {
+            DriverHealth::Open => {
+                let mut state = lock(&self.state);
+                if state.overflowed {
+                    state
+                        .first_cause
+                        .get_or_insert(DriverFailure::ObservationOverflow);
+                }
+                state.overflowed || state.collided
+            }
+            DriverHealth::Failed { first_cause } => {
+                lock(&self.state)
+                    .first_cause
+                    .get_or_insert_with(|| first_cause.clone());
+                true
+            }
+            DriverHealth::Closed => true,
+        }
+    }
+
     /// Records `vendor_turn` as `turn`'s, the newest; false for one the
     /// lane maps to another turn or tombstoned, which fails the lane (Sol
-    /// r3 N6). An overflow or that failure wakes the monitor, which
+    /// r3 N6). An overflow or that failure wakes the lane's actor, which
     /// retires the lane once its turn ends.
     pub(super) fn map_vendor_turn(&self, vendor_turn: &str, turn: TurnNumber) -> bool {
         let (mapped, failed) = {
@@ -904,7 +913,7 @@ impl Engine {
     /// driver is prepared (C2 §2 health, Sol r1 F3, Sol r2 #1). A lane
     /// whose driver failed is retired first, so its connection slot is
     /// free before the turn reserves one, and the turn opens a successor
-    /// ([`Self::open_lane`]). Retirement is shared: whoever started it,
+    /// ([`Self::open_lane`]). Retirement is shared: whoever asked for it,
     /// this waits for its end.
     pub(super) async fn claim_lane(&self, session: &SessionId) -> Option<LaneClaim> {
         let lane = lock(&self.lanes).get(session).cloned()?;
@@ -922,11 +931,11 @@ impl Engine {
     /// `open_session`, logical: no vendor I/O) from the session's stored
     /// route identity `route` (Sol r1 F12, decision H3), and claimed. A
     /// route identity the Store does not hold is not invented: the driver
-    /// then has no adapter and refuses the turn. A retired lane it
-    /// replaces is removed first (Sol r2 #3, #9): its monitor is joined,
-    /// what its channel still has is committed or dropped, and the
-    /// successor keeps its identity, its tombstones and the session's
-    /// byte budget.
+    /// then has no adapter and refuses the turn. A lane it replaces stays
+    /// the session's until its actor ended it (Sol r2 #3, #9; Sol r3 N4),
+    /// whether or not this caller still waits: its driver closed and what
+    /// its channel had committed or dropped. Only then is the successor
+    /// made, keeping its identity and the session's byte budget.
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
@@ -934,12 +943,10 @@ impl Engine {
         model: &str,
         cwd: PathBuf,
     ) -> LaneClaim {
-        let replaced = lock(&self.lanes).remove(session);
+        let replaced = lock(&self.lanes).get(session).cloned();
         let (state, budget) = match replaced {
             Some(lane) => {
                 lane.retire_now().await;
-                lane.stop_monitor().await;
-                lane.drain_rest().await;
                 let state = lock(&lane.state).successor();
                 (state, lane.budget.clone())
             }
@@ -970,7 +977,7 @@ impl Engine {
         let lane = self.install_lane(
             session,
             ((driver, reference), (receiver, budget)),
-            (state, Life::Claimed),
+            (state, true),
         );
         LaneClaim(lane)
     }
@@ -987,88 +994,81 @@ impl Engine {
         self.install_lane(
             session,
             ((driver, reference), (receiver, budget)),
-            (LaneState::recovered(route), Life::Idle),
+            (LaneState::recovered(route), false),
         );
     }
 
-    /// Makes a lane the session's and starts its monitor.
+    /// Makes a lane the session's, in place of any it had, and starts its
+    /// actor on the daemon's tracker.
     fn install_lane(
         &self,
         session: &SessionId,
-        (opened, channel): (
+        (opened, (receiver, budget)): (
             (SessionDriver, SessionRef),
             (mpsc::Receiver<Admitted>, ObservationBudget),
         ),
-        initial: (LaneState, Life),
+        initial: (LaneState, bool),
     ) -> Arc<Lane> {
         let lane = Arc::new(Lane::new(
             opened,
-            channel,
+            budget,
             initial,
-            (
-                self.session_writer(session),
-                self.tracker.clone(),
-                self.cancel.child_token(),
-            ),
+            (self.session_writer(session), self.cancel.child_token()),
         ));
         lock(&self.lanes).insert(session.clone(), Arc::clone(&lane));
-        let monitor = self.tracker.spawn(Arc::clone(&lane).monitor());
-        *lock(&lane.monitor) = Some(monitor);
+        self.tracker.spawn(Arc::clone(&lane).actor(
+            Inbox(Some(receiver)),
+            (Arc::clone(&self.lanes), session.clone()),
+        ));
         lane
     }
 
-    /// A session's close (C2 §2 Close): its driver is closed by
-    /// `deadline`, releasing any connection it holds, unless its
-    /// retirement already did, and the lane goes. Its monitor is joined
-    /// and what the channel still has is committed or dropped, before
-    /// `session.closed` (Sol r2 #3).
+    /// A session's close (C2 §2 Close): its lane's actor closes the driver
+    /// by `deadline`, releasing any connection it holds, unless the lane
+    /// is already ending, disposes of what the channel still has and
+    /// removes the lane, all before `session.closed` (Sol r2 #3); this
+    /// waits for that end. Dropping this future, as the close pass does
+    /// at the daemon's force, cancels none of it (Sol r3 N4).
     pub(super) async fn close_lane(
         &self,
         session: &SessionId,
         mode: CloseMode,
         deadline: Deadline,
     ) {
-        let Some(lane) = lock(&self.lanes).remove(session) else {
+        let Some(lane) = lock(&self.lanes).get(session).cloned() else {
             return;
         };
-        lane.stop_monitor().await;
-        let retiring = {
-            let mut core = lock(&lane.core);
-            match core.life {
-                Life::Retiring | Life::Retired => true,
-                Life::Idle | Life::Claimed => {
-                    core.life = Life::Retiring;
-                    false
-                }
-            }
-        };
-        if retiring {
-            lane.retired().await;
-        } else {
-            let _report = lane.driver.close(mode, deadline).await;
-            lock(&lane.core).life = Life::Retired;
-            lane.changed.send_replace(());
+        lane.begin_close(mode, deadline);
+        lane.retired().await;
+        let mut lanes = lock(&self.lanes);
+        if lanes
+            .get(session)
+            .is_some_and(|kept| Arc::ptr_eq(kept, &lane))
+        {
+            lanes.remove(session);
         }
-        lane.drain_rest().await;
     }
 
     /// Final shutdown: every driver's owned work is cancelled and every
-    /// lane dropped, before Host reconciliation. Each lane's monitor is
-    /// joined and what its channel still has is committed or dropped
-    /// first, by `by` and within [`SHUTDOWN_DRAIN`] (C2 §2 session drain;
-    /// Sol r2 #3).
-    pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) {
+    /// lane let go, before Host reconciliation. Each lane's actor finishes
+    /// what it is doing and disposes of what its channel still has (C2 §2
+    /// session drain; Sol r2 #3); this waits for them by `by` and within
+    /// [`SHUTDOWN_DRAIN`]. Returns how many actors have not ended by then
+    /// (Sol r3 N5): each still owns its work, which final shutdown reports
+    /// as pending and leaves to it.
+    pub(super) async fn drop_lanes(&self, by: tokio::time::Instant) -> usize {
         self.cancel.cancel();
         self.tracker.close();
         let lanes: Vec<Arc<Lane>> = lock(&self.lanes).drain().map(|(_, lane)| lane).collect();
         let by = by.min(tokio::time::Instant::now() + SHUTDOWN_DRAIN);
-        let _bounded = tokio::time::timeout_at(by, async {
-            for lane in &lanes {
-                lane.stop_monitor().await;
-                lane.drain_rest().await;
+        let mut undrained = 0;
+        for lane in lanes {
+            // A lane that ended is ready at its first poll, even past `by`.
+            if tokio::time::timeout_at(by, lane.retired()).await.is_err() {
+                undrained += 1;
             }
-        })
-        .await;
+        }
+        undrained
     }
 }
 

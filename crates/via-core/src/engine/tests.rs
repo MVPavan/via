@@ -67,11 +67,11 @@ fn run(body: impl Future<Output = ()>) {
         .block_on(body);
 }
 
-fn open(root: &Path) -> Engine {
+fn open(root: &Path) -> std::sync::Arc<Engine> {
     open_with(root, super::DAEMON_QUEUE_LIMIT)
 }
 
-fn open_with(root: &Path, start_capacity: usize) -> Engine {
+fn open_with(root: &Path, start_capacity: usize) -> std::sync::Arc<Engine> {
     Engine::open_with(
         &root.join("state"),
         &root.join("runtime"),
@@ -2817,6 +2817,41 @@ async fn running_turn_2_with(
     let session = new_session(engine).await;
     // Turn 1 ends: the absent anchor fails its launch.
     dispatch(engine, &session).await;
+    let (slot, record, effective, orders) = turn_2_running(engine, &session).await;
+    let route = engine
+        .store
+        .session_snapshot(&session)
+        .await
+        .unwrap()
+        .unwrap()
+        .route;
+    let lane = engine
+        .open_lane(&session, &route, "fake", root.to_path_buf())
+        .await;
+    // `gone` is evicted by the bound's worth of later vendor turns.
+    lane.map_vendor_turn("gone", turn(1));
+    for filler in 1..super::lane::VENDOR_TURNS {
+        lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
+    }
+    lane.map_vendor_turn("fake-turn-1", turn(1));
+    if accepted {
+        lane.map_vendor_turn("fake-turn-2", turn(2));
+    }
+    (session, slot, lane, record, effective, orders)
+}
+
+/// After turn 1 of `session` ended, turn 2 is submitted and running on
+/// its slot, with its record, its effective values and its order receiver.
+async fn turn_2_running(
+    engine: &Engine,
+    session: &SessionId,
+) -> (
+    std::sync::Arc<super::Slot>,
+    super::TurnRecord,
+    crate::api::Effective,
+    tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
+) {
+    let session = session.clone();
     assert!(engine.result(&format!("{session}/1")).await.is_ok());
     resume(engine, &session, None).await;
     // Turn 2 is running.
@@ -2848,25 +2883,6 @@ async fn running_turn_2_with(
     let wall = tokio::time::Instant::now() + Duration::from_secs(3600);
     let (_route, orders) =
         slot.start_running(turn(2), wall, super::progress::Progress::starting(2));
-    let route = engine
-        .store
-        .session_snapshot(&session)
-        .await
-        .unwrap()
-        .unwrap()
-        .route;
-    let lane = engine
-        .open_lane(&session, &route, "fake", root.to_path_buf())
-        .await;
-    // `gone` is evicted by the bound's worth of later vendor turns.
-    lane.map_vendor_turn("gone", turn(1));
-    for filler in 1..super::lane::VENDOR_TURNS {
-        lane.map_vendor_turn(&format!("filler-{filler}"), turn(1));
-    }
-    lane.map_vendor_turn("fake-turn-1", turn(1));
-    if accepted {
-        lane.map_vendor_turn("fake-turn-2", turn(2));
-    }
     let record = super::TurnRecord {
         session: session.clone(),
         turn: turn(2),
@@ -2882,7 +2898,7 @@ async fn running_turn_2_with(
         "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
     }))
     .unwrap();
-    (session, slot, lane, record, effective, orders)
+    (slot, record, effective, orders)
 }
 
 /// Sol r2 #5, r1 F6 (C2 §2, §4.1): before the running turn's acceptance an
@@ -3137,14 +3153,14 @@ fn recovery_asks_the_adapter_per_session_with_the_reconciled_facts() {
 }
 
 /// Sol r1 F2, F13, Sol r2 F13 (C2 §2 health, `TurnAbandoned`): a turn
-/// whose run is dropped while pending, after Core's run loop took the
-/// session channel from the monitor, abandons its `run_turn`, which fails
-/// the driver's health. Its claim and the channel go back to the lane; the
-/// lane's monitor, with no observation and no dispatch, keeps that first
-/// cause and retires the failed driver.
+/// whose run is dropped while pending abandons its `run_turn`, which fails
+/// the driver's health. Under the lane actor only a test drops a turn's
+/// run (Sol r3 N1). Once its claim is gone, the lane's actor, with no
+/// observation and no dispatch, keeps that first cause and retires the
+/// failed driver.
 #[test]
-fn the_lane_monitor_retires_a_driver_whose_turn_was_abandoned() {
-    let Some(root) = child("the_lane_monitor_retires_a_driver_whose_turn_was_abandoned") else {
+fn the_lane_actor_retires_a_driver_whose_turn_was_abandoned() {
+    let Some(root) = child("the_lane_actor_retires_a_driver_whose_turn_was_abandoned") else {
         return;
     };
     run(async {
@@ -3170,32 +3186,22 @@ fn the_lane_monitor_retires_a_driver_whose_turn_was_abandoned() {
             prompt: "p".to_owned(),
             ..TurnSpec::default()
         };
+        let (_sender, receiver) = tokio::sync::mpsc::channel(4);
+        let mut inbox = super::lane::Inbox::of(receiver);
         {
             let mut running = Box::pin(engine.execute_turn(
                 (&slot, &claim),
                 (&mut record, &effective),
-                orders,
+                (orders, &mut inbox),
                 (spec, cx),
             ));
-            // Poll until the run loop holds the channel: the same poll goes
-            // on to start `run_turn`. Dropping the run then abandons it.
-            for _ in 0..1_000 {
-                tokio::select! {
-                    biased;
-                    () = &mut running => panic!("the turn ended before it was abandoned"),
-                    () = std::future::ready(()) => {}
-                }
-                if lane.turn_holds_channel() {
-                    break;
-                }
-                tokio::task::yield_now().await;
+            // One poll starts `run_turn`; dropping the run abandons it.
+            tokio::select! {
+                biased;
+                () = &mut running => panic!("the turn ended before it was abandoned"),
+                () = std::future::ready(()) => {}
             }
-            assert!(lane.turn_holds_channel(), "the run loop took the channel");
         }
-        assert!(
-            !lane.turn_holds_channel(),
-            "the channel went back to the lane"
-        );
         drop(claim);
         let mut health = lane.driver.health();
         tokio::time::timeout(
@@ -3203,7 +3209,7 @@ fn the_lane_monitor_retires_a_driver_whose_turn_was_abandoned() {
             health.wait_for(|health| matches!(health, DriverHealth::Closed)),
         )
         .await
-        .expect("the monitor retires the failed driver")
+        .expect("the lane's actor retires the failed driver")
         .unwrap();
         assert_eq!(lane.first_cause(), Some(DriverFailure::TurnAbandoned));
         assert!(lane.claim().is_none(), "a retired lane is never claimed");
@@ -3211,7 +3217,7 @@ fn the_lane_monitor_retires_a_driver_whose_turn_was_abandoned() {
 }
 
 /// Sol r1 F4 (C2 §2 observations before turns): between turns the lane's
-/// monitor owns the session channel: non-durable items (progress, a vendor
+/// actor drains the session channel: non-durable items (progress, a vendor
 /// close) are dropped at once, returning their budget, and a durable one
 /// is committed as it arrives, session-level, never the next turn's
 /// (decision H3 as narrowed).
@@ -3321,7 +3327,7 @@ async fn send_held(
         sender.send(via_adapters::Admitted { item, permit }),
     )
     .await
-    .expect("the monitor drains the channel between turns")
+    .expect("the lane's actor drains the channel between turns")
     .unwrap();
 }
 
@@ -3527,7 +3533,7 @@ async fn identity_columns(
 /// Sol r2 #5 (C2 §4.1: retained tombstones cannot be reassigned;
 /// exhaustion escalates to connection failure): a lane whose vendor turns
 /// overflow its tombstones fails. The running turn keeps its claim; once
-/// it ends, the monitor retires the lane (`ObservationOverflow`), and the
+/// it ends, the lane's actor retires it (`ObservationOverflow`), and the
 /// session's next turn opens a successor with no inherited vendor turns.
 #[test]
 fn tombstone_exhaustion_fails_and_retires_the_lane() {
@@ -3554,7 +3560,7 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
         drop(claim);
         tokio::time::timeout(Duration::from_secs(5), lane.retired())
             .await
-            .expect("the monitor retires the overflowed lane");
+            .expect("the lane's actor retires the overflowed lane");
         assert_eq!(
             lane.first_cause(),
             Some(via_adapters::DriverFailure::ObservationOverflow)
@@ -3650,8 +3656,8 @@ fn identity_counts_only_for_the_current_connection_generation() {
     });
 }
 
-/// S-CORE c4 r2 item 1b: final shutdown joins each lane's monitor and
-/// commits what its channel still has before the lanes go; a denial
+/// S-CORE c4 r2 item 1b: final shutdown waits for each lane's actor,
+/// which commits what its channel still has before the lane goes; a denial
 /// received after the final-shutdown fence is still committed.
 #[test]
 fn a_between_turn_denial_at_final_shutdown_is_committed() {
@@ -3730,12 +3736,13 @@ fn a_failed_between_turn_write_is_the_sessions_failure() {
     });
 }
 
-/// Sol r2 #3: a turn dropped while it drains the session channel loses no
-/// durable item it did not handle: the receiver goes back to the lane with
-/// its claim, and the monitor commits the rest.
+/// Sol r2 #3, Sol r3 N1: a turn's claim never takes the session channel
+/// from the lane's actor, which keeps draining it until the turn is
+/// handed over: a dispatch that claims the lane and never runs strands no
+/// durable item.
 #[test]
-fn a_dropped_turn_mid_drain_loses_no_durable_item() {
-    let Some(root) = child("a_dropped_turn_mid_drain_loses_no_durable_item") else {
+fn a_claimed_lane_keeps_draining_its_channel() {
+    let Some(root) = child("a_claimed_lane_keeps_draining_its_channel") else {
         return;
     };
     run(async {
@@ -3743,15 +3750,9 @@ fn a_dropped_turn_mid_drain_loses_no_durable_item() {
         let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
         let claim = lane.claim().expect("an idle lane is claimed");
-        let mut observed = claim.observe().await;
         for target in ["first", "second", "third"] {
             send_held(&sender, &budget, None, denied(target)).await;
         }
-        let first = observed.recv().await.unwrap();
-        claim.dispose(first).await;
-        // The turn is dropped mid-drain.
-        drop(observed);
-        drop(claim);
         until_denials(
             &engine,
             &session,
@@ -3763,12 +3764,13 @@ fn a_dropped_turn_mid_drain_loses_no_durable_item() {
         )
         .await;
         until(|| budget.available_permits() == 1_000).await;
+        drop(claim);
     });
 }
 
-/// Sol r2 #2, #3, #9: replacing a retired lane joins its monitor, commits
-/// what its channel still has before the successor exists, and keeps the
-/// session's one byte budget for the successor's channel.
+/// Sol r2 #2, #3, #9: replacing a retired lane waits for its actor's end,
+/// which commits what its channel still has, before the successor exists,
+/// and keeps the session's one byte budget for the successor's channel.
 #[test]
 fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
     let Some(root) = child("replacing_a_retired_lane_keeps_its_items_and_the_budget") else {
@@ -3778,11 +3780,11 @@ fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
         let engine = open(&root);
         let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
-        assert!(lane.begin_retire(), "an idle lane retires");
-        assert!(lane.claim().is_none(), "a retiring lane is never claimed");
         for target in ["one", "two"] {
             send_held(&sender, &budget, None, denied(target)).await;
         }
+        assert!(lane.begin_retire(), "an idle lane retires");
+        assert!(lane.claim().is_none(), "a retiring lane is never claimed");
         let route = engine
             .store
             .session_snapshot(&session)
@@ -4013,5 +4015,344 @@ fn adapter_warnings_commit_warning_events_within_the_caps() {
         );
         assert_eq!(warnings[2]["message"], "w".repeat(1022));
         assert!(warnings[2].get("data").is_none(), "{}", warnings[2]);
+    });
+}
+
+/// The session's `action.denied` targets, in commit order.
+#[cfg(feature = "test-failpoints")]
+async fn denied_targets(engine: &Engine, session: &SessionId) -> Vec<String> {
+    denials(engine, session)
+        .await
+        .into_iter()
+        .map(|(target, _, _)| target.as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// Sends the denials `targets`, session-level, into a test lane's channel
+/// with permits of `budget`.
+#[cfg(feature = "test-failpoints")]
+async fn send_denials(
+    sender: &tokio::sync::mpsc::Sender<via_adapters::Admitted>,
+    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+    targets: &[&str],
+) {
+    for target in targets {
+        send_held(sender, budget, None, denied(target)).await;
+    }
+}
+
+/// Releases the paused hit `n` of `point` in `dir`.
+#[cfg(feature = "test-failpoints")]
+fn release_point(dir: &Path, point: &str, n: u64) {
+    fs::write(dir.join(format!("{point}.{n}.release")), b"").unwrap();
+}
+
+/// Waits for the lane's completion, failing after 10 s.
+#[cfg(feature = "test-failpoints")]
+async fn retired_within(lane: &super::lane::Lane) {
+    tokio::time::timeout(Duration::from_secs(10), lane.retired())
+        .await
+        .expect("the lane's completion is published");
+}
+
+/// Sol r3 N4 (lane actor ruling): a session close whose caller is dropped
+/// mid-close, while the lane commits a between-turn item and two more
+/// wait, still closes the driver and commits every one; the lane's
+/// completion is published only after.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_dropped_close_still_closes_and_drains_the_lane() {
+    let Some(root) = child("a_dropped_close_still_closes_and_drains_the_lane") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one", "two", "three"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(5));
+        // The close is under way, then its caller is dropped.
+        let closing = engine.close_lane(&session, via_adapters::CloseMode::Graceful, deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), closing)
+                .await
+                .is_err(),
+            "the close waits for the commit in flight"
+        );
+        release_point(&points, "core.lane.dispose", 1);
+        retired_within(&lane).await;
+        assert_eq!(
+            denied_targets(&engine, &session).await,
+            ["one", "two", "three"]
+        );
+        assert!(matches!(
+            *lane.driver.health().borrow(),
+            via_adapters::DriverHealth::Closed
+        ));
+        assert_eq!(budget.available_permits(), 1_000);
+    });
+}
+
+/// Sol r3 N4 (lane actor ruling): a daemon force while the close pass
+/// closes the lane ends the close pass, never the close: the driver
+/// closes and every durable item the lane had is committed.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_force_during_close_still_closes_and_drains_the_lane() {
+    let Some(root) = child("a_force_during_close_still_closes_and_drains_the_lane") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one", "two", "three"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        let forcing = async {
+            // The close pass reaches the lane's close, which waits for the
+            // item in flight; then the daemon is forced.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            engine.request_stop(&force()).await.unwrap();
+        };
+        let (_closed, (), ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session),
+            forcing
+        );
+        release_point(&points, "core.lane.dispose", 1);
+        retired_within(&lane).await;
+        assert_eq!(
+            denied_targets(&engine, &session).await,
+            ["one", "two", "three"]
+        );
+        assert!(matches!(
+            *lane.driver.health().borrow(),
+            via_adapters::DriverHealth::Closed
+        ));
+    });
+}
+
+/// Sol r3 N4 (lane actor ruling): a replacement whose caller is dropped
+/// while the old lane is still disposing leaves that lane registered and
+/// owning its work: it retires and commits every durable item it had.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_dropped_replacement_leaves_the_old_lane_owning_its_work() {
+    let Some(root) = child("a_dropped_replacement_leaves_the_old_lane_owning_its_work") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one", "two", "three"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        let route = engine
+            .store
+            .session_snapshot(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .route;
+        {
+            let replacing = engine.open_lane(&session, &route, "fake", root.clone());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), replacing)
+                    .await
+                    .is_err(),
+                "the replacement waits for the old lane's disposal"
+            );
+        }
+        let registered = super::lock(&engine.lanes).get(&session).cloned();
+        assert!(
+            registered.is_some_and(|kept| std::sync::Arc::ptr_eq(&kept, &lane)),
+            "the old lane stays registered until its disposal completes"
+        );
+        release_point(&points, "core.lane.dispose", 1);
+        retired_within(&lane).await;
+        assert_eq!(
+            denied_targets(&engine, &session).await,
+            ["one", "two", "three"]
+        );
+        assert_eq!(budget.available_permits(), 1_000);
+    });
+}
+
+/// Sol r3 N5 (lane actor ruling): final shutdown whose lane drain does not
+/// finish within its bound reports the shutdown incomplete, and the lane
+/// keeps owning what it had: once its commit in flight returns, the rest
+/// is committed, never silently dropped.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_shutdown_with_an_unfinished_drain_is_incomplete_and_loses_nothing() {
+    let Some(root) = child("a_shutdown_with_an_unfinished_drain_is_incomplete_and_loses_nothing")
+    else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one", "two", "three"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        let report = shutdown(&engine).await;
+        assert!(!report.is_clean(), "{report:?}");
+        assert!(report.pending_tasks >= 1, "{report:?}");
+        release_point(&points, "core.lane.dispose", 1);
+        until_denials(
+            &engine,
+            &session,
+            &[
+                (json!("one"), Value::Null, json!(false)),
+                (json!("two"), Value::Null, json!(false)),
+                (json!("three"), Value::Null, json!(false)),
+            ],
+        )
+        .await;
+    });
+}
+
+/// Sol r3 N3 (lane actor ruling): a driver whose health fails between
+/// turns, with durable items still in the lane's channel, is retired only
+/// after every one is committed: the lane's completion follows them.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn health_retirement_commits_the_items_it_finds_first() {
+    let Some(root) = child("health_retirement_commits_the_items_it_finds_first") else {
+        return;
+    };
+    let points = pause_first(&root, "core.lane.dispose");
+    run(async {
+        use via_adapters::{Prepared, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_denials(&sender, &budget, &["one"]).await;
+        until(|| acked(&points, "core.lane.dispose", 1)).await;
+        send_denials(&sender, &budget, &["two", "three"]).await;
+        // An abandoned `run_turn` fails the driver's health.
+        let now = tokio::time::Instant::now();
+        let (_stop, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(2),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        {
+            let mut running = Box::pin(lane.driver.run_turn(spec, cx));
+            tokio::select! {
+                biased;
+                _ = &mut running => panic!("the turn ended before it was abandoned"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        let mut health = lane.driver.health();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            health.wait_for(|health| !matches!(health, via_adapters::DriverHealth::Open)),
+        )
+        .await
+        .expect("the abandoned turn fails the driver")
+        .unwrap();
+        release_point(&points, "core.lane.dispose", 1);
+        retired_within(&lane).await;
+        assert_eq!(
+            denied_targets(&engine, &session).await,
+            ["one", "two", "three"],
+            "committed before the completion"
+        );
+        assert_eq!(budget.available_permits(), 1_000);
+    });
+}
+
+/// Sol r3 N7 (C2 §2 delayed identity, C1 §5): an identity the session
+/// channel still has when a turn begins is committed by the turn's
+/// pre-turn drain, and the turn's record takes it: its envelope reports
+/// the identity Store has, not the one the lane had before the drain.
+#[test]
+fn an_identity_drained_before_a_turn_is_the_turns() {
+    let Some(root) = child("an_identity_drained_before_a_turn_is_the_turns") else {
+        return;
+    };
+    run(async {
+        use via_adapters::{Prepared, TurnActivity, TurnCx, TurnSpec};
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        // Turn 1's dispatch opens the lane, whose driver connects
+        // (generation 1) before the absent anchor fails its launch.
+        dispatch(&engine, &session).await;
+        let claim = super::lock(&engine.lanes).get(&session).cloned().unwrap();
+        let (slot, mut record, effective, orders) = turn_2_running(&engine, &session).await;
+        // The test committed turn 2's submission past the slot's head.
+        slot.head
+            .lock(&engine.store, &session)
+            .await
+            .unwrap()
+            .lost();
+        assert!(claim.identity().is_none());
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let identity = via_adapters::observation::Identity {
+            vendor_session_id: "vs-n7".to_owned(),
+            connection_id: claim.driver.connection_id().expect("turn 1 connected"),
+            transcript: Some(PathBuf::from("/t/vs-n7.jsonl")),
+            vendor_version: None,
+        };
+        let confirmed = via_adapters::Observation::IdentityConfirmed(identity);
+        send_held(&sender, &budget, None, confirmed).await;
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let now = tokio::time::Instant::now();
+        let (_stop, stop) = tokio::sync::watch::channel(None);
+        let (_force, force) = tokio::sync::watch::channel(None);
+        let cx = TurnCx {
+            turn: turn(2),
+            prepared: Prepared::NeedsConnection,
+            capacity: None,
+            activity: TurnActivity::new(now),
+            wall: Deadline::at(now + Duration::from_secs(60)),
+            tool_grace: Duration::from_secs(60),
+            stop,
+            force,
+        };
+        let spec = TurnSpec {
+            prompt: "p".to_owned(),
+            ..TurnSpec::default()
+        };
+        engine
+            .execute_turn(
+                (&slot, &claim),
+                (&mut record, &effective),
+                (orders, &mut inbox),
+                (spec, cx),
+            )
+            .await;
+        assert_eq!(
+            identity_columns(&engine, &session).await,
+            (Some("vs-n7".to_owned()), Some("/t/vs-n7.jsonl".to_owned())),
+            "the pre-turn drain committed it"
+        );
+        let kept = record
+            .vendor
+            .identity
+            .as_ref()
+            .expect("the turn's identity");
+        assert_eq!(kept.vendor_session_id, "vs-n7");
+        assert_eq!(kept.transcript.as_deref(), Some("/t/vs-n7.jsonl"));
+        assert_eq!(budget.available_permits(), 1_000);
     });
 }

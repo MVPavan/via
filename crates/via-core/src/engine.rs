@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, PoisonError,
+        Arc, Mutex as StdMutex, PoisonError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -67,6 +67,10 @@ pub struct Receipted {
 
 /// One daemon's durable state and opaque vendor runtime.
 pub struct Engine {
+    /// This Engine's own `Arc`, which every Engine is made in
+    /// ([`Engine::open`]): a turn handed to its lane's actor holds the
+    /// Engine until it ends.
+    me: Weak<Engine>,
     _store_owner: Store,
     store: StoreClient,
     adapter: AdapterSet,
@@ -75,7 +79,7 @@ pub struct Engine {
     cwd: PathBuf,
     /// Sessions' lanes on their drivers (C2 §2): opened at a session's
     /// first dispatch, kept while a live connection can be pinned.
-    lanes: StdMutex<HashMap<SessionId, Arc<lane::Lane>>>,
+    lanes: lane::Lanes,
     /// Owns every task the drivers start (C2 §2 `SessionCx`).
     tracker: TaskTracker,
     /// The drivers' cancellation; final shutdown cancels it.
@@ -279,13 +283,15 @@ fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
 
 impl Engine {
     /// Opens the sole Store owner and passes unopened lower resources to
-    /// Adapter/Wire, with the adapters' validated configuration.
+    /// Adapter/Wire, with the adapters' validated configuration. The
+    /// Engine is made in its `Arc`: a session's lane actor runs its turns
+    /// on it (Sol r3 N1).
     pub fn open(
         state: &Path,
         runtime: &Path,
         adapters: AdapterConfig,
         binary: PathBuf,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         Self::open_with(state, runtime, adapters, binary, DAEMON_QUEUE_LIMIT, None)
     }
 
@@ -298,7 +304,7 @@ impl Engine {
         adapters: AdapterConfig,
         binary: PathBuf,
         (lock, limits): (StoreLock, Limits),
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         Self::open_with(
             state,
             runtime,
@@ -319,7 +325,7 @@ impl Engine {
         binary: PathBuf,
         start_capacity: usize,
         locked: Option<(StoreLock, Limits)>,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         // Test builds only: the named failpoints activate before any Store write.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::activate_from_environment()?;
@@ -352,12 +358,13 @@ impl Engine {
         .map_err(|error| error.to_string())?;
         let (starts, start_receiver) = mpsc::channel(start_capacity);
         let (slots, slot_limit) = connection_slots();
-        Ok(Self {
+        Ok(Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             _store_owner: owner,
             store,
             adapter,
             cwd,
-            lanes: StdMutex::new(HashMap::new()),
+            lanes: Arc::new(StdMutex::new(HashMap::new())),
             tracker: TaskTracker::new(),
             cancel: CancellationToken::new(),
             active: AtomicUsize::new(0),
@@ -388,7 +395,7 @@ impl Engine {
             diagnostics: Arc::new(tokio::sync::Semaphore::new(DIAGNOSTIC_STEPS)),
             #[cfg(test)]
             faults: Faults::default(),
-        })
+        }))
     }
 
     /// Test hook: once `flag` is armed, signals `granted` and waits for `release`.

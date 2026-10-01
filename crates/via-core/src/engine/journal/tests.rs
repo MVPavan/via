@@ -443,7 +443,7 @@ fn unpersisted_data(session: &str, durable_state: &str) -> Value {
 }
 
 /// A daemon Engine over a fresh private state and runtime directory.
-fn engine(root: &tempfile::TempDir) -> Engine {
+fn engine(root: &tempfile::TempDir) -> std::sync::Arc<Engine> {
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let [state, runtime, _anchors] = ["state", "runtime", "runtime/anchors"].map(|part| {
         let path = root.path().join(part);

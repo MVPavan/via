@@ -20,7 +20,7 @@ use via_store::{
 use super::batch::AffectedTurn;
 use super::final_text::FinalText;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
-use super::lane::{Attribution, Lane, Retained};
+use super::lane::{Attribution, Inbox, Lane, LaneClaim, Retained, turn_job};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::progress::Progress;
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
@@ -376,7 +376,7 @@ impl Engine {
     /// keeps its queued count until Store confirms the submission. A failed
     /// submission is [`Engine::submit_failure`]'s (design §7.2, §7.3).
     /// Every other path that does not submit rolls the claim back.
-    async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
+    async fn dispatch(&self, slot: &Arc<Slot>, session: &SessionId, turn: TurnNumber) -> Step {
         // AD16: a pinned live connection of the session's driver needs no
         // slot; a session without a usable driver needs one. Otherwise
         // design §11: a connection slot before the grant. It is dropped at
@@ -458,10 +458,55 @@ impl Engine {
             }
         };
         self.queued.fetch_sub(1, Ordering::AcqRel);
-        self.run(slot, submission, (&*claim, prepared, connection))
+        self.run_on_lane(slot, submission, (claim, prepared, connection))
             .await;
-        self.active.fetch_sub(1, Ordering::AcqRel);
         Step::Next
+    }
+
+    /// Hands the submitted turn, with its lane's claim, to the lane's
+    /// actor, which runs it to its end (Sol r3 N1), and waits for that
+    /// end. Dropping this future, as aborting the dispatcher does (design
+    /// §6.8 step 3), neither cancels the turn nor strands what it holds:
+    /// its stop order, the daemon's force and the drivers' cancellation
+    /// stop it, inside the actor. A lane that already ended, at final
+    /// shutdown's cancellation, gives the turn back, and it runs here with
+    /// no session channel.
+    #[expect(
+        clippy::expect_used,
+        reason = "every Engine is made in its Arc (Engine::open_with), which a borrowed Engine keeps alive"
+    )]
+    async fn run_on_lane(
+        &self,
+        slot: &Arc<Slot>,
+        submission: Submission,
+        (claim, prepared, connection): (
+            LaneClaim,
+            Prepared,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        ),
+    ) {
+        let engine = self.me.upgrade().expect("the Engine's own Arc");
+        let slot = Arc::clone(slot);
+        let lane = Arc::clone(claim.lane());
+        let (done, ended) = tokio::sync::oneshot::channel::<()>();
+        let job = turn_job(move |inbox| {
+            Box::pin(async move {
+                let held: &Lane = &claim;
+                engine
+                    .run(&slot, submission, (held, prepared, connection), inbox)
+                    .await;
+                engine.active.fetch_sub(1, Ordering::AcqRel);
+                drop(claim);
+                // The dispatcher may be gone: nothing waits for the end.
+                let _ = done.send(());
+            })
+        });
+        if let Err(job) = lane.hand_over(job) {
+            job(&mut Inbox::closed()).await;
+        }
+        // The job always runs to its end, which sends; a runtime ending
+        // under it ends this future too.
+        let _ = ended.await;
     }
 
     /// Waits for a connection slot, FIFO daemon-wide (design §3.1 capacity
@@ -688,6 +733,7 @@ impl Engine {
         slot: &Slot,
         submission: Submission,
         (lane, prepared, capacity): (&Lane, Prepared, Option<tokio::sync::OwnedSemaphorePermit>),
+        inbox: &mut Inbox,
     ) {
         let Submission {
             session,
@@ -704,7 +750,6 @@ impl Engine {
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
         let (mut record, activity, (route_stop, orders)) =
             start_turn(slot, &session, turn, deadline.instant());
-        record.vendor.identity = lane.identity();
         let mut control = Control {
             slot,
             turn,
@@ -723,7 +768,12 @@ impl Engine {
         };
         let cx = self.turn_cx(turn, (prepared, capacity), activity, (deadline, route_stop));
         let driven = self
-            .execute(&mut record, (lane, &effective), (spec, cx), &mut control)
+            .execute(
+                &mut record,
+                (lane, &effective),
+                (spec, cx),
+                (&mut control, inbox),
+            )
             .await;
         let (cause, journal_uncertain) = driven.store_facts();
         self.route_failed(slot, &mut record, cause, journal_uncertain)
@@ -1414,14 +1464,17 @@ impl Engine {
     }
 
     /// Runs the turn on the session's driver under the turn deadline,
-    /// handling each observation on the session channel in decode order
-    /// before its result is acted on. The turn takes the channel from the
-    /// lane's monitor; what arrived before the turn is handled first, as
-    /// the session drain handles it (C2 §2): durable items commit with
-    /// their own attribution, late ones of earlier turns `late: true`
-    /// (AD4), session-level ones with no turn. A force stop reaches Route, which
-    /// force-closes the group and drains its output first: messages it read
-    /// are still handled.
+    /// handling each observation on the session channel, the lane actor's
+    /// `inbox`, in decode order before its result is acted on. What
+    /// arrived before the turn is handled first, as the session drain
+    /// handles it (C2 §2): durable items commit with their own
+    /// attribution, late ones of earlier turns `late: true` (AD4),
+    /// session-level ones with no turn; the turn's record then takes the
+    /// identity that drain may have committed (Sol r3 N7). A force stop
+    /// reaches Route, which force-closes the group and drains its output
+    /// first: messages it read are still handled. What the driver
+    /// delivered before it returned is handled one item at a time, each
+    /// taken only once the one before it is done (Sol r3 N2).
     ///
     /// The turn's stop order reaches Route through its `TurnCx`; this loop
     /// observes it once (design §2), and orders the idle deadline itself
@@ -1431,16 +1484,15 @@ impl Engine {
         record: &mut TurnRecord,
         (lane, effective): (&Lane, &Effective),
         (spec, cx): (TurnSpec, TurnCx),
-        control: &mut Control<'_>,
+        (control, inbox): (&mut Control<'_>, &mut Inbox),
     ) -> Driven {
         // The session channel (C2 A1): 1,024 items and a 4 MiB byte
-        // budget; an item's permit is held until it is handled. The lane's
-        // monitor gives it up; what arrived before the turn is the session
-        // drain's (C2 §2).
-        let mut observed = lane.observe().await;
-        while let Some(admitted) = observed.try_recv() {
+        // budget; an item's permit is held until it is handled. What
+        // arrived before the turn is the session drain's (C2 §2).
+        while let Some(admitted) = inbox.try_recv() {
             lane.dispose(admitted).await;
         }
+        record.vendor.identity = lane.identity();
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
         // driver keeps servicing its controls; a result it returns early is
@@ -1452,7 +1504,7 @@ impl Engine {
             }
             let idle_at = control.idle_at;
             tokio::select! {
-                Some(admitted) = observed.recv() => {
+                Some(admitted) = inbox.recv() => {
                     let Admitted { item, permit } = admitted;
                     if let Some(idle_at) = control.idle_at.as_mut()
                         && progress(&item.observation)
@@ -1496,9 +1548,10 @@ impl Engine {
             }
         };
         // The driver delivered the turn's items before it returned.
-        let queued: Vec<Admitted> = std::iter::from_fn(|| observed.try_recv()).collect();
-        self.drain(record, Some(lane), effective, control, queued)
-            .await;
+        while let Some(admitted) = inbox.try_recv() {
+            self.drain_one(record, Some(lane), effective, control, admitted)
+                .await;
+        }
         let TurnEnd {
             terminal,
             instance,
@@ -1535,32 +1588,32 @@ impl Engine {
         }
     }
 
-    /// Handles the observations queued on the session channel, in decode
-    /// order. A failed write sends or upgrades the turn's order to cause
-    /// `store`, as in the observation branch (design §7.2 row 5).
-    async fn drain(
+    /// Handles one observation queued on the session channel, in decode
+    /// order, and returns its budget. A failed write sends or upgrades the
+    /// turn's order to cause `store`, as in the observation branch (design
+    /// §7.2 row 5).
+    async fn drain_one(
         &self,
         record: &mut TurnRecord,
         lane: Option<&Lane>,
         effective: &Effective,
         control: &mut Control<'_>,
-        queued: impl IntoIterator<Item = Admitted>,
+        Admitted { item, permit }: Admitted,
     ) {
-        for Admitted { item, permit } in queued {
-            self.observe(record, lane, effective, control, item).await;
-            drop(permit);
-            stop_for_store(record, control);
-        }
+        self.observe(record, lane, effective, control, item).await;
+        drop(permit);
+        stop_for_store(record, control);
     }
 
     /// Test builds: runs the running turn of `slot` on `lane` as `run`
-    /// does, with the run loop's own order receiver.
+    /// does, with the run loop's own order receiver and `inbox` for the
+    /// session channel.
     #[cfg(test)]
     pub(super) async fn execute_turn(
         &self,
         (slot, lane): (&Slot, &Lane),
         (record, effective): (&mut TurnRecord, &Effective),
-        orders: watch::Receiver<Option<StopOrder>>,
+        (orders, inbox): (watch::Receiver<Option<StopOrder>>, &mut Inbox),
         (spec, cx): (TurnSpec, TurnCx),
     ) {
         let mut control = Control {
@@ -1575,7 +1628,7 @@ impl Engine {
             final_text: FinalText::new(),
         };
         let _driven = self
-            .execute(record, (lane, effective), (spec, cx), &mut control)
+            .execute(record, (lane, effective), (spec, cx), (&mut control, inbox))
             .await;
     }
 
@@ -1613,8 +1666,10 @@ impl Engine {
             idle: Duration::ZERO,
             final_text: FinalText::new(),
         };
-        self.drain(record, lane, effective, &mut control, queued)
-            .await;
+        for admitted in queued {
+            self.drain_one(record, lane, effective, &mut control, admitted)
+                .await;
+        }
     }
 
     /// Handles one observation in decode order (C2 §4): commits the

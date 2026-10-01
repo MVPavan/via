@@ -303,13 +303,11 @@ async fn open_engine(
     let state = paths.state.clone();
     let runtime = paths.runtime.clone();
     let binary = std::env::current_exe()?;
-    let engine = Arc::new(
-        tokio::task::spawn_blocking(move || {
-            Engine::open_locked(&state, &runtime, adapters, binary, locked)
-        })
-        .await?
-        .map_err(anyhow::Error::msg)?,
-    );
+    let engine = tokio::task::spawn_blocking(move || {
+        Engine::open_locked(&state, &runtime, adapters, binary, locked)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
     match recover(&engine).await {
         Ok(()) => Ok(engine),
         Err(error) => {

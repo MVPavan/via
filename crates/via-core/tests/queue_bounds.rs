@@ -50,7 +50,7 @@ fn run_child(name: &str) {
     assert!(status.success(), "{name} child failed: {status}");
 }
 
-fn open(root: &Path) -> Engine {
+fn open(root: &Path) -> std::sync::Arc<Engine> {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),

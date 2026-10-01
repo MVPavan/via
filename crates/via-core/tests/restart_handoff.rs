@@ -69,7 +69,7 @@ fn run_child(name: &str) {
     assert!(status.success(), "{name} child failed: {status}");
 }
 
-fn open(root: &Path) -> Engine {
+fn open(root: &Path) -> std::sync::Arc<Engine> {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),
@@ -120,7 +120,7 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
         // Each earlier Engine stays within its own 128 bound.
         let mut sessions = leave_queued(&root, 9, TURNS).await;
         sessions.extend(leave_queued(&root, SESSIONS - 9, TURNS).await);
-        let engine = std::sync::Arc::new(open(&root));
+        let engine = open(&root);
         assert_eq!(engine.recover().await.unwrap(), 0);
         let handoff = engine.hand_off_queued().await.unwrap();
         assert_eq!((handoff.enqueued, handoff.cancelled), (SESSIONS * 8, 0));
@@ -193,7 +193,7 @@ fn starts_beyond_the_channel_spill_into_the_pending_set_and_all_run() {
     runtime.block_on(async {
         let mut sessions = leave_queued(&root, 65, 1).await;
         sessions.extend(leave_queued(&root, MANY - 65, 1).await);
-        let engine = std::sync::Arc::new(open(&root));
+        let engine = open(&root);
         engine.recover().await.unwrap();
         let handoff = engine.hand_off_queued().await.unwrap();
         assert_eq!(handoff.enqueued, MANY);
