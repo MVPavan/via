@@ -351,7 +351,8 @@ system writes it; no VIA task reads it. When Route cannot decode a
 message, and when a message exceeds 1 MiB or ends unterminated, Wire
 writes its first 64 KiB to `undecoded.bin`, and the turn's failure names
 the file and the message's length. A final text too long for the
-envelope is written there as `final_text.txt` (C1 §5). The vendor's stderr
+envelope is written there as `final_text.txt`, and a structured output too
+long for it as `structured_output.json` (C1 §5). The vendor's stderr
 is not capped. The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
 
@@ -888,6 +889,9 @@ mismatch the daemon is never stopped (amendment A13 in the Task 3 design). Expli
 choose a socket and can inspect status themselves. No new handshake field is
 needed. Diagnostics may contain paths but no handles or vendor payloads.
 
+The daemon refuses to start when the state directory's path is over 1 KiB
+encoded, which bounds every evidence path an envelope names (C1 §5).
+
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
@@ -896,7 +900,7 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
-  evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt
+  evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt, structured_output.json
   blobs/<blob-id>.blob       bounded immutable request/effective data
 <runtime>/
   daemon.lock                persistent daemon/socket-owner lock inode
@@ -923,7 +927,7 @@ socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder under it; Host opens the turn's `stderr.log` for
-the child; `final_text.txt` is written through `StoreClient`. Host owns
+the child; `final_text.txt` and `structured_output.json` are written through `StoreClient`. Host owns
 anchor sockets; daemon main owns the singleton/socket lock.
 
 Acquire nonblocking `daemon.lock` first, then nonblocking `store.lock`; hold

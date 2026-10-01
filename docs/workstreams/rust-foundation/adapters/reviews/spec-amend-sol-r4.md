@@ -1,0 +1,13 @@
+**UNSOUND**
+
+| Severity | File:line | Finding | Smallest fix |
+|---|---|---|---|
+| Important | [via-api-v1.md:570](../../../../../docs/specs/via-api-v1.md#L570), [warnings:628](../../../../../docs/specs/via-api-v1.md#L628) | **The complete envelope budget remains unspecified.** C1 lacks the warning count/message/data caps assumed by the design’s maximum fixture. That fixture also leaves `leftovers` null and omits warning data. A read-only serialization check produced **1,149,792 bytes** for just a subset of envelope fields, respecting the listed field caps but including one 200 KiB warning; that warning fits C2’s 256 KiB observation cap. | Publish or explicitly reference complete **encoded-byte** maxima, including warning metadata, paths, resolved fields, failure, vendor and leftovers. Demonstrate the combined maximum with 64 KiB structured output and all JSON overhead. |
+| Important | [via-api-v1.md:577](../../../../../docs/specs/via-api-v1.md#L577) | **Spill failure has no defined disposition.** Creation, partial-write or sync failure can leave `structured_output:null` without a usable value. `{path, bytes}` cannot indicate incomplete JSON. Q2 does not classify an I/O failure, and the final-text truncation rule does not cover this file. | Specify `failed(store)` handling through the existing resolution path; leave the file reference null on failure. Never advertise a partial JSON file as structured output or classify storage failure as missing/invalid vendor output. |
+| Important | [runtime-contracts.md:927](../../../../../docs/specs/runtime-contracts.md#L927) | **Ownership is specified, publication ordering is not.** Writing through `StoreClient` alone does not require complete JSON, file sync and directory sync before the initial or revised envelope references it. A committed result could therefore point to incomplete or crash-lost output. | Require complete UTF-8 JSON and successful file/directory sync before committing either envelope or revision. Keep published files immutable. |
+
+Validation can occur on the in-memory value before spilling, consistent with §3.12’s no-read rule. A spilled value must count as present for `structured_output_missing`.
+
+**Could not verify:** A complete maximum under intended but unpublished caps, runtime spill behavior, or crash/revision handling. No implementation tests were run.
+
+The saved delta matches the live diff; `git diff --check` passed. No edits, Git mutations, `bd`, vendor CLI or model runs were performed.
