@@ -714,6 +714,8 @@ impl Engine {
                 Steering::Ended => return Err(ApiError::NO_ACTIVE_TURN),
                 Steering::Submitting => {}
             }
+            #[cfg(test)]
+            self.faults.steer_waiting.notify_one();
             // The turn ended without an acceptance.
             if steering.changed().await.is_err() {
                 return Err(ApiError::NO_ACTIVE_TURN);

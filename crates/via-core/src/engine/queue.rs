@@ -315,6 +315,10 @@ struct State {
     queue: VecDeque<Entry>,
     dispatcher: Dispatcher,
     running: Option<Running>,
+    /// Sol r1 #7 (C1 §3.4): a turn whose submission committed and that
+    /// does not run yet (its lane opening, its actor starting), with the
+    /// acceptance watch `Running` takes over.
+    submitting: Option<(TurnNumber, watch::Sender<Steering>)>,
     close: Option<CloseOrder>,
 }
 
@@ -388,6 +392,7 @@ impl Slot {
                 queue: VecDeque::new(),
                 dispatcher: Dispatcher::None,
                 running: None,
+                submitting: None,
                 close: None,
             }),
             wake: Notify::new(),
@@ -519,15 +524,29 @@ impl Slot {
             .and_then(|mut entry| entry.stop.take())
             .unwrap_or_else(TurnStop::new);
         let receivers = (stop.order.subscribe(), stop.order.subscribe());
+        let steering = state
+            .submitting
+            .take_if(|(submitting, _)| *submitting == turn)
+            .map_or_else(
+                || watch::Sender::new(Steering::Submitting),
+                |(_, steering)| steering,
+            );
         state.running = Some(Running {
             turn,
             settling: false,
             stop,
             wall,
             progress,
-            steering: watch::Sender::new(Steering::Submitting),
+            steering,
         });
         receivers
+    }
+
+    /// `turn`'s submission committed (Sol r1 #7): from here a `steer`
+    /// addresses it and waits for its acceptance, through its lane's
+    /// opening and its actor's start, until it runs.
+    pub(super) fn submitted(&self, turn: TurnNumber) {
+        lock(&self.state).submitting = Some((turn, watch::Sender::new(Steering::Submitting)));
     }
 
     /// Applies one step-tracker delta to the running turn's published
@@ -648,12 +667,16 @@ impl Slot {
         running.stop.order.borrow().clone()
     }
 
-    /// The running turn, not yet settling, and its acceptance watch: the
-    /// turn a `steer` addresses (C1 §3.4).
+    /// The running turn, not yet settling, else the submitted turn that
+    /// does not run yet, and its acceptance watch: the turn a `steer`
+    /// addresses (C1 §3.4).
     pub(super) fn steering(&self) -> Option<(TurnNumber, watch::Receiver<Steering>)> {
         let state = lock(&self.state);
-        let running = state.running.as_ref().filter(|running| !running.settling)?;
-        Some((running.turn, running.steering.subscribe()))
+        if let Some(running) = state.running.as_ref() {
+            return (!running.settling).then(|| (running.turn, running.steering.subscribe()));
+        }
+        let (turn, steering) = state.submitting.as_ref()?;
+        Some((*turn, steering.subscribe()))
     }
 
     /// The running turn's acceptance committed, naming `vendor_turn`.
@@ -681,6 +704,13 @@ impl Slot {
                 .is_some_and(|running| running.turn == turn)
             {
                 state.running = None;
+            }
+            // A submitted turn that never ran ends its steer waits too.
+            if let Some((_, steering)) = state
+                .submitting
+                .take_if(|(submitting, _)| *submitting == turn)
+            {
+                steering.send_replace(Steering::Ended);
             }
         }
         self.wake();

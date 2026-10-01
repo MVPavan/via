@@ -3510,6 +3510,69 @@ async fn until_denials(engine: &Engine, session: &SessionId, expected: &[(Value,
     .expect("the denials are committed");
 }
 
+/// Sol r1 #7 (C1 §3.4): a steer that arrives once its turn's submission
+/// committed, while the lane opens and before the turn runs, waits for
+/// the acceptance; here the launch fails (no anchor), so it ends
+/// `no_active_turn` once the turn ended, never before.
+#[test]
+fn a_steer_in_the_submitting_window_waits_for_the_acceptance() {
+    let Some(root) = child("a_steer_in_the_submitting_window_waits_for_the_acceptance") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":unsupported,"output_schema":unsupported,
+                   "effort":unsupported,"max_steps":unsupported},
+        "bounds": [], "network_control": false, "recover": unsupported,
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_submit
+            .store(true, Ordering::Release);
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), engine.faults.granted.notified())
+            .await
+            .expect("the submission committed and holds");
+        assert!(
+            event_types(&engine, &session)
+                .await
+                .contains(&"turn.submitted".to_owned())
+        );
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer waits for the acceptance");
+        assert!(!steering.is_finished(), "the steer waits");
+        engine.faults.release.notify_one();
+        let error = steering.await.unwrap().unwrap_err();
+        assert_eq!(error.kind, "no_active_turn", "{error:?}");
+        dispatching.await.unwrap();
+    });
+}
+
 /// A steer report (C2 §4 `steer.delivered`).
 fn steered() -> via_adapters::Observation {
     via_adapters::Observation::SteerDelivered(via_adapters::observation::SteerDelivery::Injected)

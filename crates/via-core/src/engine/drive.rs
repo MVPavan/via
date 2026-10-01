@@ -465,6 +465,8 @@ impl Engine {
                     .await;
             }
         };
+        #[cfg(test)]
+        self.hold(&self.faults.hold_after_submit).await;
         // C2 §2: the session's driver, opened at its first dispatch, or
         // replaced when its health failed. A pin that went stale meanwhile
         // is the driver's to refuse (AD16 rule 4).
@@ -2435,6 +2437,10 @@ impl Engine {
             slot.finish_running(turn);
             self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(SubmitFailure::Failed(WriteOutcome::Uncertain));
+        }
+        if submitted.is_ok() {
+            // Sol r1 #7: a steer addresses the turn from its durable submission.
+            slot.submitted(turn);
         }
         submitted
     }

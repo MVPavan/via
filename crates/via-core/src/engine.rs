@@ -223,6 +223,11 @@ struct Faults {
     >,
     /// The next recovered turn waits for `release` after its history read.
     hold_after_history: AtomicBool,
+    /// The next submitted turn waits for `release` after its submission
+    /// commit, before its lane opens and it runs.
+    hold_after_submit: AtomicBool,
+    /// Notified when a `steer` starts waiting for its turn's acceptance.
+    steer_waiting: tokio::sync::Notify,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
