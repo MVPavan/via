@@ -1711,6 +1711,53 @@ fn a_mismatch_after_the_terminal_keeps_the_turn_and_latches_health() {
     );
 }
 
+/// C2 §2 Reopen, second case (Sol r1 F13, Sol r2 F13): a mismatching
+/// identity after the turn's acceptance, before any terminal is retained,
+/// fails the turn with the typed `AdapterError::ResumeMismatch`, whose
+/// evidence is the per-turn process's: its confirmed exit, cleanup proved
+/// `Quiescent` from its group's absence, and a complete Host journal. The
+/// later terminal is not retained.
+#[test]
+fn a_mismatch_after_acceptance_fails_typed_with_the_process_evidence() {
+    let rig = Rig::new(
+        &json!({}),
+        &[script(
+            1,
+            &[
+                identity("v1"),
+                accepted(1),
+                identity("v2"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    let Err(AdapterError::ResumeMismatch { evidence }) = &end.outcome else {
+        panic!("a typed resume mismatch: {end:?}");
+    };
+    let exit = evidence.exit.expect("the process's confirmed exit");
+    assert!(exit.code.is_some() || exit.signal.is_some(), "{exit:?}");
+    assert_eq!(evidence.cleanup, Cleanup::Quiescent, "{evidence:?}");
+    assert!(!evidence.journal_uncertain, "{evidence:?}");
+    assert!(end.terminal.is_none(), "{end:?}");
+    let observed = observations(&items);
+    assert!(
+        observed
+            .iter()
+            .any(|observation| matches!(observation, Observation::Accepted(_))),
+        "{observed:?}"
+    );
+    assert!(
+        observed.iter().any(|observation| matches!(
+            observation,
+            Observation::ResumeMismatch { requested, returned } if requested == "v1" && returned == "v2"
+        )),
+        "{observed:?}"
+    );
+}
+
 /// `v2` against a confirmed `v1`: a mismatch observation, a failed turn,
 /// no acceptance and no confirmation of `v2`.
 fn assert_resume_mismatch(end: &TurnEnd, items: &[ObservationItem]) {
