@@ -497,11 +497,14 @@ fn paired_vendor_turn(actual: &str, turn: TurnNumber) -> bool {
 }
 
 /// Whether `actual` names `turn`'s vendor turn or an earlier turn's: a
-/// denial may be reported late, for a turn that already ended (AD4).
+/// denial may be reported late, for a turn that already ended (AD4). Only
+/// the canonical `fake-turn-{n}` counts: Core maps that exact string, so
+/// an alias such as `fake-turn-01` is refused (Sol r2 #10).
 fn earlier_or_own_vendor_turn(actual: &str, turn: TurnNumber) -> bool {
     actual
         .strip_prefix("fake-turn-")
         .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| actual == format!("fake-turn-{number}"))
         .is_some_and(|number| number >= 1 && number <= turn.get())
 }
 

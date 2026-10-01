@@ -157,7 +157,8 @@ fn retained_payloads_over_256_kib_fail_protocol() {
 
 /// AD4 (Sol r1 F13): a denial may name the running turn's vendor turn or
 /// an earlier turn's, which Core commits `late`; a later turn's, or an ID
-/// that is no fake vendor turn, is protocol.
+/// that is no canonical fake vendor turn (Sol r2 #10: `fake-turn-01` and
+/// `fake-turn-+1` alias `fake-turn-1`), is protocol.
 #[test]
 fn a_denial_may_name_an_earlier_turn() {
     let denial = |vendor_turn: &str| {
@@ -168,7 +169,14 @@ fn a_denial_may_name_an_earlier_turn() {
     };
     assert!(denial("fake-turn-1").is_ok());
     assert!(denial("fake-turn-2").is_ok());
-    for refused in ["fake-turn-3", "fake-turn-0", "other"] {
+    for refused in [
+        "fake-turn-3",
+        "fake-turn-0",
+        "other",
+        "fake-turn-01",
+        "fake-turn-+1",
+        "fake-turn- 1",
+    ] {
         assert!(
             matches!(denial(refused), Err(RouteError::Protocol { .. })),
             "{refused}"
