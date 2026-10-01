@@ -1366,8 +1366,10 @@ impl Engine {
 
     /// Keeps the idle lanes within [`IDLE_LANES`] (runtime §8, C2 §3 idle
     /// lanes), whenever a lane may have become idle: a turn released its
-    /// claim, a lane was adopted, or an actor drained its channel between
-    /// turns. Afterwards exactly the bound's worth of idle lanes, or fewer
+    /// claim, a lane was adopted, an actor drained its channel between
+    /// turns, or its session's slot became unoccupied (a queued turn
+    /// cancelled or failed, a run or a close attempt finished;
+    /// `Slot::emptied`). Afterwards exactly the bound's worth of idle lanes, or fewer
     /// when fewer are idle, remain; an evicting lane is no longer idle.
     /// Lanes that ended, such as retired ones, leave the registry: their
     /// channel was drained to its end, and the session's next dispatch

@@ -321,7 +321,7 @@ impl Engine {
             return Err(self.receipt_failed(&error, &admission));
         }
         self.session_opened();
-        let slot = Slot::new(Head::new(Some(2)));
+        let slot = Slot::new(Head::new(Some(2)), std::sync::Weak::new());
         lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
         self.receipted(&session, turn, &slot);
         Ok(Receipted {

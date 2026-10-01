@@ -9,7 +9,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 
@@ -19,8 +19,8 @@ use via_adapters::{StopCause, StopOrder};
 use via_store::{CancelCause, CloseIntent};
 
 use super::journal::Head;
-use super::lock;
 use super::progress::{Progress, ProgressDelta};
+use super::{Engine, lock};
 use crate::api::{CloseMode, rfc3339};
 use crate::{ApiError, Deadline, TurnNumber};
 /// Most queued turns one session holds (C1 P6), also enforced by Store.
@@ -359,11 +359,15 @@ pub(super) struct Slot {
     pub(super) head: Arc<Head>,
     state: StdMutex<State>,
     wake: Notify,
+    /// The engine whose idle-lane bound the slot's emptying enforces
+    /// ([`Self::emptied`]); none for a write-only slot.
+    engine: Weak<Engine>,
 }
 
 impl Slot {
-    pub(super) fn new(head: Arc<Head>) -> Arc<Self> {
+    pub(super) fn new(head: Arc<Head>, engine: Weak<Engine>) -> Arc<Self> {
         Arc::new(Self {
+            engine,
             head,
             state: StdMutex::new(State {
                 queue: VecDeque::new(),
@@ -641,6 +645,7 @@ impl Slot {
             }
         }
         self.wake();
+        self.emptied();
     }
 
     /// Whether the session has a queue entry (`Waiting`, `Claimed` or
@@ -852,6 +857,7 @@ impl Slot {
             }
         }
         self.wake();
+        self.emptied();
     }
 
     /// Sets the close order (design §4 step 7) and attaches a `close` stop
@@ -940,6 +946,19 @@ impl Slot {
             }
         }
         self.wake();
+        self.emptied();
+    }
+
+    /// After a change that may have left the slot unoccupied: its session's
+    /// lane may now count as idle, so the idle-lane bound is enforced
+    /// (runtime §8, [`Engine::evict_idle`]). Called with no slot state,
+    /// `sessions` or `lanes` lock held.
+    fn emptied(&self) {
+        if self.unoccupied()
+            && let Some(engine) = self.engine.upgrade()
+        {
+            engine.evict_idle();
+        }
     }
 
     /// Marks the dispatcher gone if nothing is queued, running or closing;

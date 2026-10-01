@@ -2035,7 +2035,8 @@ fn a_later_uncertain_route_failure_latches_after_a_clean_first_failure() {
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
-        let slot = super::queue::Slot::new(super::journal::Head::new(Some(2)));
+        let slot =
+            super::queue::Slot::new(super::journal::Head::new(Some(2)), std::sync::Weak::new());
         let mut record = super::TurnRecord {
             session: session.clone(),
             turn: turn(1),
@@ -2269,7 +2270,7 @@ fn a_corrupt_head_read_before_a_submit_failed_write_is_corrupt() {
             engine.cwd.to_str(),
             "the rebuilt queueing lost the frozen cwd"
         );
-        let slot = super::queue::Slot::new(super::journal::Head::new(None));
+        let slot = super::queue::Slot::new(super::journal::Head::new(None), std::sync::Weak::new());
         engine
             .submit_failed(&slot, &session, turn(1), queueing, "row unreadable")
             .await;
@@ -5648,6 +5649,54 @@ fn lanes_idle_only_by_draining_come_back_to_the_bound() {
             senders.push(sender);
         }
         assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 2);
+        let bounded = tokio::time::timeout(Duration::from_secs(10), async {
+            while super::lock(&engine.lanes).len() > IDLE_LANES {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let lanes = super::lock(&engine.lanes).len();
+        assert!(bounded.is_ok(), "{lanes} lanes stay registered");
+        assert_eq!(lanes, IDLE_LANES, "exactly the bound remains");
+        drop(senders);
+    });
+}
+
+/// Critical r2b (runtime §8 idle session lanes): the bound is enforced
+/// where a session's slot becomes unoccupied, not only at a claim's
+/// release, an adoption or a drain. Lanes past the bound are adopted
+/// while each session holds a queued turn, so none counts at its
+/// adoption's check; cancelling those queued turns, with no claim, drain
+/// or adoption after, leaves exactly `IDLE_LANES` idle lanes.
+#[test]
+fn lanes_idle_only_by_a_queued_cancel_come_back_to_the_bound() {
+    use super::lane::IDLE_LANES;
+    let Some(root) = child("lanes_idle_only_by_a_queued_cancel_come_back_to_the_bound") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let mut sessions = Vec::new();
+        let mut senders = Vec::new();
+        for _ in 0..IDLE_LANES + 2 {
+            let session = new_session(&engine).await;
+            dispatch(&engine, &session).await;
+            let (driver, reference, route) = open_test_driver(&engine, &root, &session).await;
+            // Queued, with no dispatcher to claim it.
+            resume(&engine, &session, None).await;
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            engine.adopt_lane(
+                &session,
+                (driver, receiver, via_adapters::ObservationBudget::new()),
+                (reference, &route),
+            );
+            senders.push(sender);
+            sessions.push(session);
+        }
+        assert_eq!(super::lock(&engine.lanes).len(), IDLE_LANES + 2);
+        for session in &sessions {
+            cancel(&engine, session, 2).await.unwrap();
+        }
         let bounded = tokio::time::timeout(Duration::from_secs(10), async {
             while super::lock(&engine.lanes).len() > IDLE_LANES {
                 tokio::time::sleep(Duration::from_millis(1)).await;

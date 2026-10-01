@@ -532,7 +532,7 @@ impl Engine {
         Arc::clone(
             lock(&self.sessions)
                 .entry(session.clone())
-                .or_insert_with(|| Slot::new(Head::new(None))),
+                .or_insert_with(|| Slot::new(Head::new(None), Weak::clone(&self.me))),
         )
     }
 }
@@ -575,7 +575,8 @@ impl SessionWriter {
             if let Some(slot) = sessions.get(&self.session) {
                 (Arc::clone(slot), false)
             } else {
-                let slot = Slot::new(Head::new(None));
+                // Write-only: no turn meets it, so it bounds no lane.
+                let slot = Slot::new(Head::new(None), Weak::new());
                 sessions.insert(self.session.clone(), Arc::clone(&slot));
                 (slot, true)
             }
