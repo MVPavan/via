@@ -1050,3 +1050,202 @@ fn replay_expect_then_close_at_once_passes_await_eof() -> TestResult {
     assert_eq!(end.stdout, vec![line("done")]);
     Ok(())
 }
+
+#[test]
+fn replay_reply_before_its_request_fails_unless_pipelined() -> TestResult {
+    // The request is emitted 300 ms in; a reply sent at once arrived before
+    // it was written, which no adapter answering the request can do.
+    let steps = |pipelined: bool| {
+        let mut expect = json!({"line": {"type": "reply"}});
+        if pipelined {
+            expect["pipelined"] = json!(true);
+        }
+        json!([
+            {"delay": {"ms": 300}},
+            {"emit": {"line": "request"}},
+            {"expect": expect},
+            {"emit": {"line": "done"}}
+        ])
+    };
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps(false)))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "reply"}))?;
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(FAILED), "{}", end.stderr);
+    assert!(
+        end.stderr
+            .contains("step 3: the line arrived before step 2's emit was written"),
+        "{}",
+        end.stderr
+    );
+
+    // Answered after the request is read, it passes.
+    let mut run = spawn::<&str>(&binary, &[])?;
+    assert_eq!(run.next_line()?, line("request"));
+    run.send(&json!({"type": "reply"}))?;
+    assert_eq!(run.next_line()?, line("done"));
+    assert_eq!(run.finish(true)?.code, Some(0));
+
+    // A pipelined step opts out.
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps(true)))?;
+    let mut run = spawn::<&str>(&binary, &[])?;
+    run.send(&json!({"type": "reply"}))?;
+    let end = run.finish(false)?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    Ok(())
+}
+
+#[test]
+fn replay_await_signal_completes_at_the_signal_arrival() -> TestResult {
+    // via-jm4.33: the adapter signals and closes stdin at once while the
+    // fake is still in an earlier step. The signal arrived before the EOF,
+    // so the ordered EOF holds, however late the step handles it.
+    let steps = json!([
+        {"emit": {"line": "ready"}},
+        {"delay": {"ms": 500}},
+        {"await_signal": {"signal": "SIGINT"}},
+        {"await_eof": {}},
+        {"emit": {"line": "done"}}
+    ]);
+    let root = tempfile::tempdir()?;
+    let binary = install(root.path(), &fixture(&json!([]), 10_000, &steps))?;
+    for _ in 0..5 {
+        let mut run = spawn::<&str>(&binary, &[])?;
+        assert_eq!(run.next_line()?, line("ready"));
+        let kill = Command::new("kill")
+            .args(["-INT", &run.child.id().to_string()])
+            .status()?;
+        assert!(kill.success());
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(0), "{}", end.stderr);
+        assert_eq!(end.stdout, vec![line("ready"), line("done")]);
+    }
+    Ok(())
+}
+
+#[test]
+fn replay_a_cached_eof_satisfies_consecutive_await_eof_steps() -> TestResult {
+    let end = run_closed(
+        &json!([{"await_eof": {}}, {"await_eof": {}}, {"emit": {"line": "done"}}]),
+        10_000,
+    )?;
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+    assert_eq!(end.stdout, vec![line("done")]);
+    Ok(())
+}
+
+#[test]
+fn replay_lifetimes_run_in_launch_order() -> TestResult {
+    const LIVES: usize = 6;
+    let lifetime = |n: usize| json!({"argv": [], "deadline_ms": 10_000, "steps": [{"emit": {"line": format!("life {n}")}}]});
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &json!({"source": "test", "lifetimes": (1..=LIVES).map(lifetime).collect::<Vec<_>>()}),
+    )?;
+    // Concurrent starts: each gets the lifetime of its line in the launch log.
+    let runs = (0..LIVES)
+        .map(|_| spawn::<&str>(&binary, &[]))
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut by_pid = Vec::new();
+    for run in runs {
+        let pid = run.child.id().to_string();
+        let end = run.finish(true)?;
+        assert_eq!(end.code, Some(0), "{}", end.stderr);
+        assert_eq!(end.stdout.len(), 1, "{:?}", end.stdout);
+        by_pid.push((pid, String::from_utf8(end.stdout[0].clone())?));
+    }
+    let log = fs::read_to_string(root.path().join("vendor.launches"))?;
+    for (ordinal, pid) in log.lines().enumerate() {
+        let (_, emitted) = by_pid
+            .iter()
+            .find(|(seen, _)| seen == pid)
+            .ok_or("a logged pid did not run")?;
+        assert_eq!(*emitted, format!("life {}\n", ordinal + 1));
+    }
+    assert_eq!(log.lines().count(), LIVES);
+
+    // A launch past the last lifetime fails.
+    let end = spawn::<&str>(&binary, &[])?.finish(true)?;
+    assert_eq!(end.code, Some(FAILED));
+    assert!(end.stderr.contains("lifetime"), "{}", end.stderr);
+    Ok(())
+}
+
+/// The pids whose process group is `group`, read from `/proc`.
+fn group_members(group: u32) -> Vec<u32> {
+    let mut members = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return members;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Fields after the parenthesized command: state, ppid, pgrp, ...
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.first().is_some_and(|state| *state != "Z")
+            && fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()) == Some(group)
+        {
+            members.push(pid);
+        }
+    }
+    members
+}
+
+#[test]
+fn replay_survivor_outlives_the_fake_and_ends_by_itself() -> TestResult {
+    use std::os::unix::process::CommandExt;
+
+    let root = tempfile::tempdir()?;
+    let binary = install(
+        root.path(),
+        &fixture(
+            &json!([]),
+            5_000,
+            &json!([{"spawn_survivor": {"ms": 1_500}}, {"emit": {"line": "done"}}]),
+        ),
+    )?;
+    // In its own group, so the survivor is the only other member.
+    let mut child = Command::new(&binary)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let group = child.id();
+    let output = {
+        let status = child.wait()?;
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .ok_or("no stderr")?
+            .read_to_string(&mut stderr)?;
+        (status, stderr)
+    };
+    assert_eq!(output.0.code(), Some(0), "{}", output.1);
+    assert!(
+        !group_members(group).is_empty(),
+        "no survivor in the fake's group after it exited"
+    );
+    // The survivor ends on its own, within the fixture's deadline.
+    let limit = Instant::now() + Duration::from_secs(5);
+    while !group_members(group).is_empty() {
+        assert!(Instant::now() < limit, "the survivor outlived its bound");
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}

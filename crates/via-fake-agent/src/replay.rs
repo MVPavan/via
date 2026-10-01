@@ -5,13 +5,39 @@
 //! - `expect` takes one stdin line and matches a JSON subset, capturing
 //!   values by JSON pointer; its `absent` pointers must not resolve in the
 //!   line, and with `within_ms` the line must arrive within that many
-//!   milliseconds of the previous step's completion;
+//!   milliseconds of the previous step's completion. By default the line
+//!   must also arrive after the most recent preceding `emit` was written
+//!   (causal arrival): an adapter answers what it has read. An expect with
+//!   no earlier emit is unconstrained. `"pipelined": true` opts a step out,
+//!   only where the recording shows the adapter writing the line
+//!   independently of that emit; the fixture's `notes` give the reason,
+//!   naming the step;
 //! - `emit` writes one verbatim line;
-//! - `delay` sleeps; `await_signal` waits for a signal;
-//! - `await_eof` waits for stdin to end; an input line instead fails, and so
-//!   does an EOF that arrived before the previous step completed;
+//! - `delay` sleeps;
+//! - `await_signal` waits for `SIGINT`, `SIGTERM` or `SIGUSR1` (a test
+//!   driver's gate, never a vendor signal) and completes at the signal's
+//!   arrival (see [`signals`]);
+//! - `await_eof` waits for stdin to end and completes at the EOF's arrival;
+//!   an input line instead fails, and so does an EOF that arrived before the
+//!   previous step completed. After an `await_signal` it allows
+//!   [`SIGNAL_SKEW`], since two threads stamp the two arrivals. A cached EOF
+//!   satisfies a later `await_eof`;
+//! - `spawn_survivor` starts a child in the fake's process group that
+//!   outlives the fake and exits on its own after `ms` milliseconds, capped
+//!   by the run deadline: a process left in the group after the vendor's
+//!   leader exited. It runs `sleep` from `PATH` with stdio detached;
 //! - `exit`, only as the last step, writes its `stderr` text (at most 1 KiB)
-//!   verbatim and exits with its `code`, which may not be [`FAILED`].
+//!   verbatim and exits with its `code`, which may not be [`FAILED`]. Its
+//!   trailing-input check is best effort (below), so every fixture that does
+//!   not model a crash seals its input with `await_eof`: as its last step, or
+//!   right before its `exit`.
+//!
+//! `within_ms` is measured at the fake: from the previous step's completion
+//! to the line's arrival as this process's reader publishes it, so it
+//! includes pipe transfer and scheduling on both sides. A fixture that
+//! stands for a C2 deadline uses the deadline plus 250 ms and says so in its
+//! source; the deadline itself is the adapter's obligation, checked by the
+//! adapter's own tests with controlled time.
 //!
 //! Stdin is read by one thread (see [`input`]), which stamps each line, EOF
 //! or input error with its arrival: the instant it publishes the event. A
@@ -20,14 +46,15 @@
 //! deadline. An expect completes at its line's arrival, since the adapter
 //! may close stdin as soon as it has written the line. An emit completes
 //! just before its write, since the adapter may react as soon as the line
-//! is visible.
+//! is visible; the same instant is the causal bound for later expects.
 //!
 //! Put `await_eof` right after the step the adapter must wait for (for
 //! example the terminal emit), and vendor output that follows the close
 //! after it; a correct adapter then cannot fail it. An early close that the
-//! reader sees late is missed, never falsely failed. A partial line with
-//! stdin held open is never a line: `await_eof` then fails at the run
-//! deadline, or at EOF as a partial line.
+//! reader sees late is missed, never falsely failed; so is a premature line
+//! the reader publishes late. A partial line with stdin held open is never
+//! a line: `await_eof` then fails at the run deadline, or at EOF as a
+//! partial line.
 //!
 //! Before an `exit` step, and after the last step otherwise, any input line
 //! or input error already read fails. This is best effort: input that comes
@@ -41,19 +68,23 @@
 //! `$${` writes a literal `${`.
 //!
 //! Each start appends its pid as one line to `<dir>/<name>.launches`, so a
-//! test can count launches.
+//! test can count launches. A `<name>.replay.json` may instead be
+//! `{"source", "lifetimes": [fixture, …]}`: launch *n*, the *n*th line of
+//! the launch log (`--version` probes included), runs lifetime *n*, and a
+//! launch past the last lifetime fails. The ordinal is the line's position,
+//! read back after the single append, so concurrent launches each get their
+//! own.
 //!
 //! Lines, the fixture, the captures and the whole run are bounded. Any
 //! failure exits [`FAILED`], naming the 1-based step where one was running.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
@@ -62,12 +93,13 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::contains_expected;
 use input::Input;
+use signals::Signals;
 
 mod input;
+mod signals;
 
 /// Longest line, read or written, in bytes (newline excluded).
 const MAX_LINE: usize = 1024 * 1024;
@@ -90,6 +122,15 @@ const LOAD_LIMIT: Duration = Duration::from_secs(5);
 const MESSAGE_GRACE: Duration = Duration::from_millis(100);
 /// Exit code for any replay failure; distinct from the start-request mode's 2.
 const FAILED: i32 = 3;
+/// Most lifetimes in one fixture file.
+const MAX_LIFETIMES: usize = 64;
+/// Most `spawn_survivor` steps in one lifetime.
+const MAX_SURVIVORS: usize = 8;
+/// How much earlier than the signal it follows an EOF may be stamped and
+/// still count as after it: the signal watcher and the stdin reader are
+/// different threads, and a handler that ran late can stamp a signal after
+/// an EOF the adapter wrote later.
+const SIGNAL_SKEW: Duration = Duration::from_millis(50);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +139,10 @@ struct Fixture {
     #[serde(default)]
     #[expect(dead_code, reason = "provenance is for readers of the fixture")]
     source: Option<String>,
+    /// Free text for readers, such as the reason for each pipelined step.
+    #[serde(default)]
+    #[expect(dead_code, reason = "notes are for readers of the fixture")]
+    notes: Option<String>,
     argv: Vec<Arg>,
     #[serde(default)]
     version: Option<String>,
@@ -132,6 +177,9 @@ enum Step {
         /// Most milliseconds the line may take, from the previous step's end.
         #[serde(default)]
         within_ms: Option<u64>,
+        /// The line may arrive before the most recent preceding emit.
+        #[serde(default)]
+        pipelined: bool,
     },
     Emit {
         line: String,
@@ -143,6 +191,10 @@ enum Step {
         signal: SignalName,
     },
     AwaitEof {},
+    /// Leaves a child in the fake's group that exits by itself after `ms`.
+    SpawnSurvivor {
+        ms: u64,
+    },
     /// The last step: writes `stderr` verbatim and exits with `code`.
     Exit {
         code: u8,
@@ -150,13 +202,29 @@ enum Step {
     },
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 enum SignalName {
     #[serde(rename = "SIGINT")]
     Int,
     #[serde(rename = "SIGTERM")]
     Term,
+    #[serde(rename = "SIGUSR1")]
+    Usr1,
 }
+
+impl SignalName {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Int => "SIGINT",
+            Self::Term => "SIGTERM",
+            Self::Usr1 => "SIGUSR1",
+        }
+    }
+}
+
+/// The most recent emit before a step: its number and the instant just
+/// before its write.
+type LastEmit = Option<(usize, Instant)>;
 
 /// Captured texts, bounded in aggregate bytes.
 #[derive(Default)]
@@ -204,14 +272,15 @@ pub(crate) fn run_if_selected() {
         let _ = watchdog.send(Arm::Disarm);
         return;
     };
-    let code =
-        match log_launch(&launches).and_then(|()| replay(&fixture, started, &step, &watchdog)) {
-            Ok(code) => code,
-            Err(error) => {
-                diagnostic(&error);
-                FAILED
-            }
-        };
+    let code = match log_launch(&launches)
+        .and_then(|launch| replay(&fixture, launch, started, &step, &watchdog))
+    {
+        Ok(code) => code,
+        Err(error) => {
+            diagnostic(&error);
+            FAILED
+        }
+    };
     process::exit(code)
 }
 
@@ -231,28 +300,47 @@ fn fixture_paths() -> Option<(PathBuf, PathBuf)> {
 }
 
 /// Appends this process's pid as one line, in a single `O_APPEND` write so
-/// that concurrent starts never interleave.
-fn log_launch(path: &Path) -> Result<(), String> {
+/// that concurrent starts never interleave, and returns the line's 1-based
+/// position: the lines that end at or before the write's own end offset.
+fn log_launch(path: &Path) -> Result<usize, String> {
     let line = format!("{}\n", process::id());
-    let written = File::options()
+    let fail = |error: io::Error| format!("cannot write the launch log: {error}");
+    let mut file = File::options()
+        .read(true)
         .append(true)
         .create(true)
         .open(path)
-        .and_then(|mut file| file.write(line.as_bytes()))
-        .map_err(|error| format!("cannot write the launch log: {error}"))?;
+        .map_err(fail)?;
+    let written = file.write(line.as_bytes()).map_err(fail)?;
     if written != line.len() {
         return Err("short write to the launch log".to_owned());
     }
-    Ok(())
+    // An append leaves this description's offset at the end of its own
+    // write, whatever other starts appended since.
+    let end = file.stream_position().map_err(fail)?;
+    file.seek(SeekFrom::Start(0)).map_err(fail)?;
+    let mut ordinal = 0;
+    let mut reader = BufReader::new(file.take(end));
+    loop {
+        let buffer = reader.fill_buf().map_err(fail)?;
+        if buffer.is_empty() {
+            break;
+        }
+        ordinal += buffer.split(|byte| *byte == b'\n').count() - 1;
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+    Ok(ordinal)
 }
 
 fn replay(
     fixture: &Path,
+    launch: usize,
     started: Instant,
     step: &AtomicUsize,
     watchdog: &SyncSender<Arm>,
 ) -> Result<i32, String> {
-    let fixture = load(fixture)?;
+    let fixture = load(fixture, launch)?;
     let deadline = started
         .checked_add(Duration::from_millis(fixture.deadline_ms))
         .ok_or("deadline_ms is out of range")?;
@@ -267,30 +355,22 @@ fn replay(
             .ok_or("fixture has no version for --version")?;
         return write_line(&version).map(|()| 0);
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
     // Handlers are installed before the first step so an early signal is held
     // for its step instead of killing the process.
-    let mut signals = BTreeMap::new();
-    for name in fixture.steps.iter().filter_map(|step| match step {
-        Step::AwaitSignal { signal } => Some(*signal),
-        Step::Expect { .. }
-        | Step::Emit { .. }
-        | Step::Delay { .. }
-        | Step::AwaitEof {}
-        | Step::Exit { .. } => None,
-    }) {
-        if let Entry::Vacant(entry) = signals.entry(name) {
-            let kind = match name {
-                SignalName::Int => SignalKind::interrupt(),
-                SignalName::Term => SignalKind::terminate(),
-            };
-            let _guard = runtime.enter();
-            entry.insert(signal(kind).map_err(|error| error.to_string())?);
-        }
-    }
+    let names: BTreeSet<SignalName> = fixture
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::AwaitSignal { signal } => Some(*signal),
+            Step::Expect { .. }
+            | Step::Emit { .. }
+            | Step::Delay { .. }
+            | Step::AwaitEof {}
+            | Step::SpawnSurvivor { .. }
+            | Step::Exit { .. } => None,
+        })
+        .collect();
+    let signals = Signals::start(names, deadline)?;
     // Load allows an exit step only as the last step.
     let exit = match fixture.steps.last() {
         Some(Step::Exit { code, .. }) => Some(i32::from(*code)),
@@ -299,6 +379,8 @@ fn replay(
     let count = fixture.steps.len();
     // Taken before the reader starts, so no input can arrive before it.
     let mut previous = Instant::now();
+    let mut last_emit: LastEmit = None;
+    let mut after_signal = false;
     let mut input = Input::start(deadline)?;
     for (index, current) in fixture.steps.into_iter().enumerate() {
         let number = index + 1;
@@ -308,16 +390,26 @@ fn replay(
                 .check_trailing()
                 .map_err(|error| format!("step {number}: {error}"))?;
         }
+        let emits = matches!(current, Step::Emit { .. });
+        let signals_next = matches!(current, Step::AwaitSignal { .. });
         previous = run_step(
             current,
-            number,
-            previous,
+            &Context {
+                number,
+                previous,
+                after_signal,
+                last_emit,
+                deadline,
+            },
             &mut input,
             &mut captures,
-            &runtime,
-            &mut signals,
+            &signals,
         )
         .map_err(|error| format!("step {number}: {error}"))?;
+        if emits {
+            last_emit = Some((number, previous));
+        }
+        after_signal = signals_next;
     }
     if exit.is_none() {
         input
@@ -327,7 +419,19 @@ fn replay(
     Ok(exit.unwrap_or(0))
 }
 
-fn load(path: &Path) -> Result<Fixture, String> {
+/// The other fixture file shape: one fixture per launch, in launch order.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lifetimes {
+    #[serde(default)]
+    #[expect(dead_code, reason = "provenance is for readers of the fixture")]
+    source: Option<String>,
+    lifetimes: Vec<Fixture>,
+}
+
+/// Loads the fixture that launch `launch` (1-based) runs: the file's only
+/// fixture, or its lifetime `launch`.
+fn load(path: &Path, launch: usize) -> Result<Fixture, String> {
     let file = File::open(path).map_err(|error| format!("cannot open fixture: {error}"))?;
     let mut bytes = Vec::new();
     file.take(MAX_FIXTURE + 1)
@@ -336,8 +440,27 @@ fn load(path: &Path) -> Result<Fixture, String> {
     if bytes.len() as u64 > MAX_FIXTURE {
         return Err(format!("fixture exceeds {MAX_FIXTURE} bytes"));
     }
-    let fixture: Fixture =
+    let value: Value =
         serde_json::from_slice(&bytes).map_err(|error| format!("invalid fixture: {error}"))?;
+    let invalid = |error: serde_json::Error| format!("invalid fixture: {error}");
+    let fixture = if value.get("lifetimes").is_some() {
+        let Lifetimes { lifetimes, .. } = Lifetimes::deserialize(value).map_err(invalid)?;
+        if lifetimes.len() > MAX_LIFETIMES {
+            return Err(format!("fixture has more than {MAX_LIFETIMES} lifetimes"));
+        }
+        let count = lifetimes.len();
+        lifetimes
+            .into_iter()
+            .nth(launch.saturating_sub(1))
+            .ok_or_else(|| format!("launch {launch} has no lifetime: the fixture has {count}"))?
+    } else {
+        Fixture::deserialize(value).map_err(invalid)?
+    };
+    check(fixture)
+}
+
+/// Checks one fixture's bounds and step placement.
+fn check(fixture: Fixture) -> Result<Fixture, String> {
     if fixture.steps.len() > MAX_STEPS {
         return Err(format!("fixture has more than {MAX_STEPS} steps"));
     }
@@ -369,11 +492,29 @@ fn load(path: &Path) -> Result<Fixture, String> {
                     ));
                 }
             }
+            Step::SpawnSurvivor { ms } => {
+                if *ms > fixture.deadline_ms {
+                    return Err(format!(
+                        "step {}: a survivor must end within deadline_ms",
+                        index + 1
+                    ));
+                }
+            }
             Step::Emit { .. }
             | Step::Delay { .. }
             | Step::AwaitSignal { .. }
             | Step::AwaitEof {} => {}
         }
+    }
+    let survivors = fixture
+        .steps
+        .iter()
+        .filter(|step| matches!(step, Step::SpawnSurvivor { .. }))
+        .count();
+    if survivors > MAX_SURVIVORS {
+        return Err(format!(
+            "fixture has more than {MAX_SURVIVORS} survivor steps"
+        ));
     }
     names.sort_unstable();
     names.dedup();
@@ -469,19 +610,29 @@ fn expire(step: usize) -> ! {
     process::exit(FAILED)
 }
 
+/// Where a step runs: its number, the previous step's completion, the most
+/// recent emit before it and the run deadline.
+struct Context {
+    number: usize,
+    previous: Instant,
+    /// The previous step was an `await_signal`.
+    after_signal: bool,
+    last_emit: LastEmit,
+    deadline: Instant,
+}
+
 /// Runs one step and returns the instant it completed, from which later
 /// steps measure `within_ms` and order EOF. An expect completes at its
 /// line's arrival: the adapter may close stdin as soon as it has written
 /// the line. An emit completes just before its write: a reader may react as
-/// soon as the line is visible.
+/// soon as the line is visible. An `await_signal` completes at the signal's
+/// arrival and an `await_eof` at the EOF's, however late the step ran.
 fn run_step(
     step: Step,
-    number: usize,
-    previous: Instant,
+    at: &Context,
     input: &mut Input,
     captures: &mut Captures,
-    runtime: &tokio::runtime::Runtime,
-    signals: &mut BTreeMap<SignalName, Signal>,
+    signals: &Signals,
 ) -> Result<Instant, String> {
     match step {
         Step::Expect {
@@ -489,11 +640,12 @@ fn run_step(
             capture,
             absent,
             within_ms,
+            pipelined,
         } => {
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
-            let (arrived, actual) = input.expect_line(previous, within_ms)?;
+            let (arrived, actual) = input.expect_line(at.previous, within_ms)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
             }
@@ -503,37 +655,73 @@ fn run_step(
             {
                 return Err(format!("{pointer} must be absent in {actual}"));
             }
+            if let Some((emit, written)) = at.last_emit
+                && !pipelined
+                && arrived < written
+            {
+                return Err(format!(
+                    "the line arrived before step {emit}'s emit was written"
+                ));
+            }
             for (name, pointer) in capture {
                 let value = actual
                     .pointer(&pointer)
                     .ok_or_else(|| format!("capture {name}: {pointer} is absent in {actual}"))?;
                 captures.insert(&name, value.to_string())?;
             }
-            return Ok(arrived);
+            Ok(arrived)
         }
         Step::Emit { line } => {
             let mut budget = MAX_LINE;
             let line = substitute(&line, captures, &mut budget)?;
             let completed = Instant::now();
             write_line(&line)?;
-            return Ok(completed);
+            Ok(completed)
         }
-        Step::Delay { ms } => thread::sleep(Duration::from_millis(ms)),
-        Step::AwaitSignal { signal } => {
-            let stream = signals.get_mut(&signal).ok_or("signal handler missing")?;
-            runtime
-                .block_on(stream.recv())
-                .ok_or("signal stream closed")?;
+        Step::Delay { ms } => {
+            thread::sleep(Duration::from_millis(ms));
+            Ok(Instant::now())
         }
-        Step::AwaitEof {} => input.await_eof(previous, number)?,
+        Step::AwaitSignal { signal } => signals.take(signal),
+        Step::AwaitEof {} => {
+            let floor = if at.after_signal {
+                at.previous.checked_sub(SIGNAL_SKEW).unwrap_or(at.previous)
+            } else {
+                at.previous
+            };
+            input.await_eof(floor, at.number)
+        }
+        Step::SpawnSurvivor { ms } => {
+            spawn_survivor(ms, at.deadline)?;
+            Ok(Instant::now())
+        }
         Step::Exit { code: _, stderr } => {
             let mut out = io::stderr().lock();
             out.write_all(stderr.as_bytes())
                 .and_then(|()| out.flush())
                 .map_err(|error| format!("cannot write stderr: {error}"))?;
+            Ok(Instant::now())
         }
     }
-    Ok(Instant::now())
+}
+
+/// Starts `sleep` in this process's group for `ms`, capped by the time left
+/// before `deadline`, with its stdio detached so it holds no pipe of the
+/// adapter's. It is never waited for: it outlives the fake by design and
+/// exits on its own.
+fn spawn_survivor(ms: u64, deadline: Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let life = Duration::from_millis(ms).min(left);
+    let survivor = Command::new("sleep")
+        .arg(format!("{}.{:03}", life.as_secs(), life.subsec_millis()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot start the survivor: {error}"))?;
+    // Not reaped here: the fake exits first and the survivor is reparented.
+    drop(survivor);
+    Ok(())
 }
 
 /// Replaces each `${name}` with its captured text and each `$${` with a

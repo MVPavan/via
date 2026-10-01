@@ -171,8 +171,14 @@ impl Input {
     }
 
     /// Waits for EOF, which must not arrive before `previous`, the
-    /// completion of step `number - 1`.
-    pub(super) fn await_eof(&mut self, previous: Instant, number: usize) -> Result<(), String> {
+    /// completion of step `number - 1`, and returns its arrival: the
+    /// step's completion. A cached EOF is returned again, so consecutive
+    /// `await_eof` steps all pass.
+    pub(super) fn await_eof(
+        &mut self,
+        previous: Instant,
+        number: usize,
+    ) -> Result<Instant, String> {
         match self.next(self.deadline) {
             Some((at, Event::Eof)) if at > self.deadline => {
                 Err("deadline passed while awaiting EOF".to_owned())
@@ -180,7 +186,7 @@ impl Input {
             Some((at, Event::Eof)) if at < previous => {
                 Err(format!("stdin closed before step {} completed", number - 1))
             }
-            Some((_, Event::Eof)) => Ok(()),
+            Some((at, Event::Eof)) => Ok(at),
             Some((_, Event::Line(_))) => Err("unexpected input while awaiting EOF".to_owned()),
             Some((_, Event::Error(error))) => Err(error),
             None => Err("deadline passed while awaiting EOF".to_owned()),
@@ -379,7 +385,9 @@ mod tests {
             Err("stdin closed before step 3 completed".to_owned())
         );
         let mut equal = queued(vec![(previous, Event::Eof)], deadline);
-        assert_eq!(equal.await_eof(previous, 4), Ok(()));
+        assert_eq!(equal.await_eof(previous, 4), Ok(previous));
+        // The cached EOF completes a second wait at the same instant.
+        assert_eq!(equal.await_eof(previous, 5), Ok(previous));
     }
 
     #[test]
@@ -394,6 +402,6 @@ mod tests {
         );
         let (completed, _) = input.expect_line(previous, None).expect("the line");
         assert_eq!(completed, arrival);
-        assert_eq!(input.await_eof(completed, 2), Ok(()));
+        assert_eq!(input.await_eof(completed, 2), Ok(arrival + MS));
     }
 }
