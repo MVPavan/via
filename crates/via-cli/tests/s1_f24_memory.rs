@@ -58,6 +58,16 @@ const WARM_LINES: u64 = 16;
 /// A control's reply bound (design §13.2, A52): a starved control fails it;
 /// each round's slowest reply is recorded against the 100 ms target.
 const CONTROL: Duration = Duration::from_secs(1);
+/// glibc's malloc arenas for the daemon (runtime §8): with the default
+/// per-thread arenas, growth after 64 MiB failed about half of measured
+/// runs, consistent with allocator retention; two arenas are an empirical
+/// development proxy. Unset on musl, whose run is the authoritative memory
+/// gate.
+const GLIBC_ARENAS: Option<&str> = if cfg!(target_env = "gnu") {
+    Some("2")
+} else {
+    None
+};
 
 fn check(condition: bool, detail: impl FnOnce() -> String) -> Result<(), ScenarioError> {
     if condition {
@@ -400,6 +410,9 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
         |evidence| {
             let daemon = Daemon::start_with(&sandbox, evidence, |command| {
                 failpoints.activate(command);
+                if let Some(arenas) = GLIBC_ARENAS {
+                    command.env("MALLOC_ARENA_MAX", arenas);
+                }
             })?;
             // The child's own pid, which readiness confirmed serves the socket.
             let pid = daemon.pid();
@@ -538,6 +551,7 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 "anchor_peak_kib": anchor_peak,
                 "maximal_lines": lines, "slowest_control_ms": slowest.as_millis(),
                 "slowest_control_held_ms": held_round.as_millis(),
+                "malloc_arena_max": GLIBC_ARENAS,
             });
             evidence
                 .write("rss.json", metrics.to_string().as_bytes())

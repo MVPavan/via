@@ -48,6 +48,17 @@ cargo build --locked --release -p via-cli --no-default-features
 python3 scripts/check-release-features.py target/release/via
 ```
 
+F24 on the shipped allocator is the authoritative memory gate (runtime §8):
+the glibc runs above use a two-arena development proxy. It needs `musl-tools`
+(`musl-gcc`) and the `x86_64-unknown-linux-musl` Rust target; build the whole
+workspace so the musl fake agent exists, run a nonempty selection, and require
+a successful exit with complete scenario evidence:
+
+```bash
+CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --workspace --features via-cli/test-failpoints --target x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc cargo nextest run --locked -p via-cli --features test-failpoints --target x86_64-unknown-linux-musl -E 'test(/^s1_f24_/)'
+```
+
 The `s1_(f05|f2[47]|bounds|store|blob|wire|c1|progress|evidence|config|daemon_log)_`
 selection is Task 4's scenario set (`via-jm4.7.8`). It runs across the
 workspace because the Store and Wire tests live in their crates. F25, F26 and
