@@ -9,7 +9,17 @@
 //! `expect.unasserted` lists fields deliberately skipped, each with a reason.
 //!
 //! `drive()` obligations the checker relies on:
-//! - `launches` counts vendor process starts over the whole case;
+//! - `launches` counts vendor process starts over the whole case, read from
+//!   the fixture's launch log `<name>.launches` beside the replay (one line
+//!   per start of the replaying fake, `--version` probes included), never
+//!   from the driver's own count; each case starts with no log;
+//! - the replay's own verdict is part of the case: a fake that exits 3
+//!   (unmatched or unexpected input, an absent field that was sent, a line
+//!   that came late, stdin closed early) fails the case whatever the
+//!   outcome. A replay that ends with `await_eof` requires the case to end
+//!   the way the route ends its vendor input (Codex: idle retirement closes
+//!   the server's stdin after the last session closed; a per-turn process:
+//!   EOF after the result), and no line after the step before it;
 //! - `cleanup_settles` is measured with controlled time: `at_terminal` when
 //!   the turn settled with its terminal, `at_p7_bound` when it was still
 //!   pending just before `min(ack + tool_grace, wall)` and settled at it,
@@ -25,7 +35,8 @@ use serde_json::{Map, Value, json};
 
 /// What a driver produced for a whole case.
 pub(crate) struct Outcome {
-    /// Vendor process launches over the case.
+    /// Vendor process launches over the case: the lines of the fixture's
+    /// `<name>.launches` log.
     pub(crate) launches: u64,
     /// The refusal kind of each `plan_checks` entry, in order; `None` when
     /// the check passed.

@@ -24,7 +24,9 @@ fn fixtures() -> PathBuf {
 
 /// Runs the case's sessions and turns through the Codex C2 driver against
 /// the fake agent replaying `<case>.replay.json`, with controlled time, and
-/// collects the outcome (see the checker's module docs for its obligations).
+/// collects the outcome (see the checker's module docs for its obligations:
+/// `launches` from `<case>.launches`, the replay's exit status, and the
+/// server's stdin close at an `await_eof` step).
 /// Replaced by `via-5lr.3.2`.
 fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
     Err(format!(
