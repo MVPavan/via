@@ -36,7 +36,7 @@
 //! to the line's arrival as this process's reader publishes it, so it
 //! includes pipe transfer and scheduling on both sides. A fixture that
 //! stands for a C2 deadline uses the deadline plus 250 ms and says so in its
-//! source; the deadline itself is the adapter's obligation, checked by the
+//! notes; the deadline itself is the adapter's obligation, checked by the
 //! adapter's own tests with controlled time.
 //!
 //! Stdin is read by one thread (see [`input`]), which stamps each line, EOF

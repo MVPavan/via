@@ -5,9 +5,10 @@
 //! - Every `*.replay.json` loads in replay mode and names its source run.
 //! - A generic driver that answers each expect step with that step's own
 //!   line (a subset matches itself), reads back each emitted line, delivers
-//!   each `await_signal` and closes stdin at each `await_eof`, completes the
-//!   fixture with the exit code and stderr of its `exit` step (0 and none
-//!   without one), with one launch logged per start. Ordered EOF and strict
+//!   each `await_signal` once the fake catches that signal and closes stdin
+//!   at each `await_eof`, completes the fixture with the exit code and
+//!   stderr of its `exit` step (0 and none without one), with one launch
+//!   logged per start. Ordered EOF and strict
 //!   trailing input hold: a line resent before an `await_eof`, or an EOF
 //!   right after the first line, fails replay.
 //! - No fixture file contains a home path (`/home/`, `/Users/`, `/root/`,
@@ -347,7 +348,11 @@ fn lifetimes_of(file: &Value) -> Vec<&Value> {
 
 /// Every pipelined expect step names its reason in the fixture's notes.
 fn pipelined_have_reasons(fixture: &Value) -> Result<(), String> {
-    let notes = fixture.get("notes").and_then(Value::as_str).unwrap_or("");
+    let notes = fixture
+        .get("notes")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
     for (index, step) in fixture["steps"]
         .as_array()
         .into_iter()
@@ -536,14 +541,15 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
                 drop(run.stdin.take());
             }
         } else if let Some(wait) = step.get("await_signal") {
-            let signal = match wait["signal"].as_str() {
-                Some("SIGINT") => "-INT",
-                Some("SIGTERM") => "-TERM",
-                Some("SIGUSR1") => "-USR1",
+            let (signal, number) = match wait["signal"].as_str() {
+                Some("SIGINT") => ("-INT", 2),
+                Some("SIGTERM") => ("-TERM", 15),
+                Some("SIGUSR1") => ("-USR1", 10),
                 other => return Err(fail(format!("unknown signal {other:?}")).into()),
             };
-            // Handlers are installed before the first step, and any earlier
-            // emit was already read, so the fake is past its setup.
+            // A gate before any emit can come before the fake's setup, so
+            // wait until the fake catches the signal instead of dying of it.
+            wait_until_caught(run.pid, number, run.deadline).map_err(fail)?;
             let status = Command::new("kill")
                 .args([signal, &run.pid.to_string()])
                 .status()?;
@@ -571,6 +577,28 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
         }
     }
     Ok(end)
+}
+
+/// Waits until process `pid` catches signal `number` (Linux: its bit in
+/// `SigCgt` of `/proc/<pid>/status`), polling until `deadline`.
+fn wait_until_caught(pid: u32, number: u32, deadline: Instant) -> Result<(), String> {
+    let bit = 1_u64 << (number - 1);
+    loop {
+        let status = fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|error| format!("cannot read the fake's status: {error}"))?;
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .ok_or("no SigCgt in the fake's status")?;
+        if caught & bit != 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("the fake never caught signal {number}"));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]

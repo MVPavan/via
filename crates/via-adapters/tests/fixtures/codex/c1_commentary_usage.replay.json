@@ -1,5 +1,6 @@
 {
   "source": "Codex re-probe c1 (two turns on one thread), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); model text neutralized; rate-limit notifications dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
+  "notes": "Step 10 (turn/start) is pipelined: VIA writes it on the thread/start reply (step 8), independently of the thread/started notification the server wrote after that reply.",
   "argv": [
     "app-server",
     "--disable",
@@ -115,7 +116,8 @@
         },
         "capture": {
           "turn1": "/id"
-        }
+        },
+        "pipelined": true
       }
     },
     {
