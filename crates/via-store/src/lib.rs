@@ -151,6 +151,7 @@ mod final_text;
 pub mod json_limits;
 mod lanes;
 mod runtime;
+mod structured_output;
 
 pub use blob::{
     BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX, PROMPT_MAX, PromptFileError,
@@ -158,6 +159,7 @@ pub use blob::{
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
 pub use final_text::{FINAL_TEXT_FILE_MAX, FinalTextFile, FinalTextRef};
 pub use lanes::{Lane, Lanes};
+pub use structured_output::StructuredOutputRef;
 
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, ActiveTurn, AnchorCohort, AnchorIdentity, AnchorIntent,
@@ -167,8 +169,9 @@ pub use runtime::{
     GroupAbsenceRecord, KeyedOperation, ListPage, ListQuery, OperationRecord, OperationVerb,
     PAGE_BYTES, PAGE_MAX, Predecessors, ProcessJournal, Prompt, QueuedSummary, QueuedTurn,
     ReceiptRecord, ResumeRecord, RuntimeResources, SESSION_QUEUE_LIMIT, STATUS_ANCHORS,
-    STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS, SessionSnapshot, SessionStatus, SessionSummary,
-    SpawnKey, SpawnRecord, StepRow, StepsRecord, Store, StoreClient, StoreError, StoreLock,
-    StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel,
-    TerminalExtras, TerminalFacts, TerminalRecord, UnfinishedTurn, WalLimits, at_ms,
+    STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS, SessionEventRecord, SessionIdentity, SessionRoute,
+    SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StepRow, StepsRecord,
+    Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    UnfinishedTurn, WalLimits, at_ms,
 };

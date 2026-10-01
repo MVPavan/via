@@ -26,16 +26,16 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 use via_adapters::observation::{
-    Admitted, Observation, ObservationItem, SteerDelivery, StopReason, TurnEnd, TurnError,
+    AdapterError, Admitted, Observation, ObservationItem, SteerDelivery, StopReason, TurnEnd,
     observation_channel,
 };
 use via_adapters::{
     AdapterConfig, AdapterSet, AnchorRecovery, BootstrapEnv, CancellationToken, Cleanup, CloseMode,
     Deadline, DriverFailure, DriverHealth, Inherit, OBSERVATION_ITEMS, Prepared, Recovery,
-    RouteError, RuntimeConfig, SessionCx, SessionDriver, SessionId, SessionRef, SessionSpec,
-    StartRejected, SteerError, SteerInput, StopCause, StopOrder, TaskTracker, TurnActivity,
-    TurnCause, TurnCx, TurnFailure, TurnNumber, TurnSpec, VendorTerminalStatus, VendorTurnId,
-    VersionStatus, WireCleanup,
+    RouteError, RouteFailure, RuntimeConfig, SessionCx, SessionDriver, SessionId, SessionRef,
+    SessionSpec, StartRejected, SteerError, SteerInput, StopCause, StopOrder, TaskTracker,
+    TurnActivity, TurnCx, TurnNumber, TurnSpec, VendorTerminalStatus, VendorTurnId, VersionStatus,
+    WireCleanup,
 };
 use via_store::{ResumeRecord, SpawnRecord, Store};
 
@@ -68,6 +68,19 @@ impl Seen {
             self.tool = true;
         }
     }
+}
+
+/// The failpoint token of [`Rig::points`].
+#[cfg(feature = "test-failpoints")]
+const POINTS_TOKEN: &str = "conformance-driver";
+
+/// Arms `point`'s first hit to be acknowledged only. A `value` command at
+/// a point that reads none continues at once, without yielding: by the
+/// time its task is next idle, it waits past the point.
+#[cfg(feature = "test-failpoints")]
+fn acknowledge(points: &std::path::Path, point: &str) {
+    let command = json!({"token":POINTS_TOKEN,"occurrence":1,"action":"value","value":0});
+    fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
 }
 
 /// Waits until `path` exists, within [`FIXTURE_WAIT`].
@@ -384,6 +397,16 @@ impl Rig {
         self.dir.path().join("sync")
     }
 
+    /// This process's failpoint directory, the controller activated on it
+    /// (once per process: each test runs in its own).
+    #[cfg(feature = "test-failpoints")]
+    fn points(&self) -> PathBuf {
+        let points = self.dir.path().join("points");
+        fs::DirBuilder::new().mode(0o700).create(&points).unwrap();
+        via_store::failpoint::activate(&points, POINTS_TOKEN).unwrap();
+        points
+    }
+
     /// A logical session with its observation channel (AD3: no vendor I/O).
     fn session(&self) -> (SessionDriver, mpsc::Receiver<Admitted>) {
         self.session_with(|_| {})
@@ -523,8 +546,8 @@ fn checked(end: TurnEnd) -> TurnEnd {
     end
 }
 
-fn failure(end: &TurnEnd) -> &TurnFailure {
-    let failure = if let Err(TurnError::Route(failure)) = &end.outcome {
+fn failure(end: &TurnEnd) -> &RouteFailure {
+    let failure = if let Err(AdapterError::Route(failure)) = &end.outcome {
         Some(failure)
     } else {
         None
@@ -646,10 +669,7 @@ fn conformance_terminal_retained_under_stalled_observations() {
     let kept = end.terminal.as_ref().unwrap();
     assert_eq!(kept.status, VendorTerminalStatus::Completed);
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Overflow { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Overflow { .. }),
         "{end:?}"
     );
 }
@@ -820,18 +840,9 @@ fn conformance_instance_set_after_handshake_on_failures() {
         assert_eq!(instance.version_status, VersionStatus::Tested);
         failure(&end).cause.clone()
     };
-    assert!(matches!(
-        cause(1),
-        TurnCause::Route(RouteError::Protocol { .. })
-    ));
-    assert!(matches!(
-        cause(2),
-        TurnCause::Route(RouteError::Overflow { .. })
-    ));
-    assert!(matches!(
-        cause(3),
-        TurnCause::Route(RouteError::ForceStopped { .. })
-    ));
+    assert!(matches!(cause(1), RouteError::Protocol { .. }));
+    assert!(matches!(cause(2), RouteError::Overflow { .. }));
+    assert!(matches!(cause(3), RouteError::ForceStopped { .. }));
 
     // No handshake ever arrives: the wall ends the turn with none read.
     let rig = Rig::new(&handshake(), &[script(1, &[json!({"action":"hang"})])]);
@@ -839,10 +850,7 @@ fn conformance_instance_set_after_handshake_on_failures() {
     let (cx, _controls) = turn_cx(1, driver.prepare(), SHORT_WALL);
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(end.instance.is_none(), "{end:?}");
-    assert!(matches!(
-        failure(&end).cause,
-        TurnCause::Route(RouteError::Deadline { .. })
-    ));
+    assert!(matches!(failure(&end).cause, RouteError::Deadline { .. }));
 }
 
 /// (16), (17) Persistent profile: the server's exit before a terminal is
@@ -874,7 +882,7 @@ fn conformance_server_lost_versus_transport_lost() {
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     let lost = failure(&end);
     assert!(
-        matches!(lost.cause, TurnCause::ServerLost { .. }),
+        matches!(lost.cause, RouteError::ServerLost { .. }),
         "{end:?}"
     );
     assert!(lost.shared);
@@ -888,10 +896,7 @@ fn conformance_server_lost_versus_transport_lost() {
     let (cx, controls) = turn_cx(2, driver.prepare(), WALL);
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::TransportLost { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::TransportLost { .. }),
         "{end:?}"
     );
     assert!(end.instance.is_some());
@@ -919,9 +924,10 @@ fn conformance_invalid_effort_and_handshake_refused_submit_nothing() {
     assert!(
         matches!(
             end.outcome,
-            Err(TurnError::Rejected(StartRejected::InvalidParam {
-                field: "effort"
-            }))
+            Err(AdapterError::Rejected {
+                reason: StartRejected::InvalidParam { field: "effort" },
+                ..
+            })
         ),
         "{end:?}"
     );
@@ -939,7 +945,7 @@ fn conformance_invalid_effort_and_handshake_refused_submit_nothing() {
     let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
     let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(
-        matches!(failure(&end).cause, TurnCause::HandshakeRefused { .. }),
+        matches!(failure(&end).cause, RouteError::HandshakeRefused { .. }),
         "{end:?}"
     );
     let instance = end.instance.as_ref().unwrap();
@@ -977,7 +983,7 @@ fn conformance_wall_soft_stop_interrupt_acknowledged() {
         let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
         let failure = failure(&end);
         assert!(
-            matches!(failure.cause, TurnCause::Route(RouteError::Deadline { .. })),
+            matches!(failure.cause, RouteError::Deadline { .. }),
             "{end:?}"
         );
         assert_eq!(failure.acknowledged, acknowledged, "turn {turn}");
@@ -1023,7 +1029,10 @@ fn conformance_persistent_slot_pinned_between_turns() {
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(matches!(
         end.outcome,
-        Err(TurnError::Rejected(StartRejected::SessionGone))
+        Err(AdapterError::Rejected {
+            reason: StartRejected::SessionGone,
+            ..
+        })
     ));
 }
 
@@ -1108,10 +1117,7 @@ fn close_during(steps: &[Value], moment: Moment, no_input: bool, mode: CloseMode
         let case = format!("persistent={persistent}");
         assert!(held, "{case}: the slot is held while the turn runs");
         assert!(
-            matches!(
-                failure(&end).cause,
-                TurnCause::Route(RouteError::Stopped { .. })
-            ),
+            matches!(failure(&end).cause, RouteError::Stopped { .. }),
             "{case}: {end:?}"
         );
         assert!(
@@ -1261,7 +1267,7 @@ fn unlaunched_and_refused_persistent_generations_release_their_slot() {
     let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(
-        matches!(failure(&end).cause, TurnCause::HandshakeRefused { .. }),
+        matches!(failure(&end).cause, RouteError::HandshakeRefused { .. }),
         "{end:?}"
     );
     assert!(controls.released(), "a refused handshake releases the slot");
@@ -1327,10 +1333,7 @@ fn a_stop_during_the_handshake_writes_no_start() {
         release(&sync, "h");
     });
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Stopped { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Stopped { .. }),
         "{end:?}"
     );
     assert!(!rig.synced("first-input"), "nothing reached the vendor");
@@ -1475,10 +1478,7 @@ fn the_persistent_wall_path_ends_by_one_cutoff_with_a_stalled_consumer() {
     }));
     let returned = tokio::time::Instant::now();
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Deadline { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Deadline { .. }),
         "{end:?}"
     );
     assert!(
@@ -1513,7 +1513,7 @@ fn an_interrupted_terminal_before_acceptance_is_not_an_acknowledgement() {
     });
     let failure = failure(&end);
     assert!(
-        matches!(failure.cause, TurnCause::Route(RouteError::Protocol { .. })),
+        matches!(failure.cause, RouteError::Protocol { .. }),
         "{end:?}"
     );
     assert!(!failure.acknowledged, "{end:?}");
@@ -1539,7 +1539,7 @@ fn the_wall_soft_stop_validates_the_terminal_phase() {
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     let failure = failure(&end);
     assert!(
-        matches!(failure.cause, TurnCause::Route(RouteError::Deadline { .. })),
+        matches!(failure.cause, RouteError::Deadline { .. }),
         "{end:?}"
     );
     assert!(!failure.acknowledged, "{end:?}");
@@ -1564,7 +1564,7 @@ fn a_persistent_stop_before_launch_keeps_its_no_launch_evidence() {
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     let failure = failure(&end);
     assert!(
-        matches!(failure.cause, TurnCause::Route(RouteError::Stopped { .. })),
+        matches!(failure.cause, RouteError::Stopped { .. }),
         "{end:?}"
     );
     assert!(!failure.launched && !failure.forced, "{end:?}");
@@ -1591,7 +1591,7 @@ fn a_shared_stop_unacknowledged_at_force_at_requests_no_kill() {
     );
     let failure = failure(&end);
     assert!(
-        matches!(failure.cause, TurnCause::Route(RouteError::Stopped { .. })),
+        matches!(failure.cause, RouteError::Stopped { .. }),
         "{end:?}"
     );
     assert!(!failure.forced && !failure.acknowledged && failure.shared);
@@ -1690,6 +1690,97 @@ fn two_identities_in_one_turn_fail_resume_mismatch() {
     assert_resume_mismatch(&end, &items);
 }
 
+/// C2 §2 Reopen, third case (spec amendment r3): a mismatching identity
+/// after the turn's retained terminal does not fail the turn. The turn
+/// keeps its result; the mismatch is reported on the session channel and
+/// latches health `ResumeMismatch`, which ends the connection.
+#[test]
+fn a_mismatch_after_the_terminal_keeps_the_turn_and_latches_health() {
+    let rig = Rig::new(
+        &json!({}),
+        &[script(
+            1,
+            &[
+                identity("v1"),
+                accepted(1),
+                terminal(1, "completed", "end_turn"),
+                identity("v2"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "the turn keeps its result: {end:?}");
+    let kept = end.terminal.as_ref().unwrap();
+    assert_eq!(kept.status, VendorTerminalStatus::Completed);
+    let observed = observations(&items);
+    assert!(
+        observed.iter().any(|observation| matches!(
+            observation,
+            Observation::ResumeMismatch { requested, returned } if requested == "v1" && returned == "v2"
+        )),
+        "{observed:?}"
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|observation| matches!(observation, Observation::Accepted(_))),
+        "{observed:?}"
+    );
+    assert_eq!(
+        format!("{:?}", *driver.health().borrow()),
+        "Failed { first_cause: ResumeMismatch }"
+    );
+}
+
+/// C2 §2 Reopen, second case (Sol r1 F13, Sol r2 F13): a mismatching
+/// identity after the turn's acceptance, before any terminal is retained,
+/// fails the turn with the typed `AdapterError::ResumeMismatch`, whose
+/// evidence is the per-turn process's: its confirmed exit, cleanup proved
+/// `Quiescent` from its group's absence, and a complete Host journal. The
+/// later terminal is not retained.
+#[test]
+fn a_mismatch_after_acceptance_fails_typed_with_the_process_evidence() {
+    let rig = Rig::new(
+        &json!({}),
+        &[script(
+            1,
+            &[
+                identity("v1"),
+                accepted(1),
+                identity("v2"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    let Err(AdapterError::ResumeMismatch { evidence }) = &end.outcome else {
+        panic!("a typed resume mismatch: {end:?}");
+    };
+    let exit = evidence.exit.expect("the process's confirmed exit");
+    assert!(exit.code.is_some() || exit.signal.is_some(), "{exit:?}");
+    assert_eq!(evidence.cleanup, Cleanup::Quiescent, "{evidence:?}");
+    assert!(!evidence.journal_uncertain, "{evidence:?}");
+    assert!(end.terminal.is_none(), "{end:?}");
+    let observed = observations(&items);
+    assert!(
+        observed
+            .iter()
+            .any(|observation| matches!(observation, Observation::Accepted(_))),
+        "{observed:?}"
+    );
+    assert!(
+        observed.iter().any(|observation| matches!(
+            observation,
+            Observation::ResumeMismatch { requested, returned } if requested == "v1" && returned == "v2"
+        )),
+        "{observed:?}"
+    );
+}
+
 /// `v2` against a confirmed `v1`: a mismatch observation, a failed turn,
 /// no acceptance and no confirmation of `v2`.
 fn assert_resume_mismatch(end: &TurnEnd, items: &[ObservationItem]) {
@@ -1757,7 +1848,10 @@ fn an_idle_vendor_close_releases_the_slot_and_invalidates_the_pin() {
     assert!(
         matches!(
             end.outcome,
-            Err(TurnError::Rejected(StartRejected::SessionGone))
+            Err(AdapterError::Rejected {
+                reason: StartRejected::SessionGone,
+                ..
+            })
         ),
         "{end:?}"
     );
@@ -1842,9 +1936,10 @@ fn a_catalog_only_effort_mismatch_is_rejected_without_submission() {
     assert!(
         matches!(
             end.outcome,
-            Err(TurnError::Rejected(StartRejected::InvalidParam {
-                field: "effort"
-            }))
+            Err(AdapterError::Rejected {
+                reason: StartRejected::InvalidParam { field: "effort" },
+                ..
+            })
         ),
         "{end:?}"
     );
@@ -2097,10 +2192,7 @@ fn a_persistent_success_whose_delivery_overflows_keeps_no_pin() {
         tokio::join!(driver.run_turn(prompt(), cx), release).0
     }));
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Overflow { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Overflow { .. }),
         "{end:?}"
     );
     assert!(
@@ -2134,7 +2226,7 @@ fn a_persistent_protocol_failure_reports_logical_facts_only() {
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     let failure = failure(&end);
     assert!(
-        matches!(failure.cause, TurnCause::Route(RouteError::Protocol { .. })),
+        matches!(failure.cause, RouteError::Protocol { .. }),
         "{end:?}"
     );
     assert!(failure.exit.is_none(), "no helper exit: {end:?}");
@@ -2223,7 +2315,7 @@ fn server_loss_and_resume_mismatch_latch_health() {
     let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
     let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
     assert!(
-        matches!(failure(&end).cause, TurnCause::ServerLost { .. }),
+        matches!(failure(&end).cause, RouteError::ServerLost { .. }),
         "{end:?}"
     );
     assert_eq!(
@@ -2349,6 +2441,264 @@ fn an_idle_close_the_stalled_channel_cannot_take_latches_overflow() {
     assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
 }
 
+/// A persistent session whose turn 1 filled the channel and whose idle
+/// close then ran: its `VendorClosed` waits on the full channel, and the
+/// next turn needs a new connection. Turn 2 runs `second`.
+fn idle_close_in_flight(second: &[Value]) -> (Rig, SessionDriver, mpsc::Receiver<Admitted>) {
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    // The accepted mark, 1022 model marks and the final text: a full channel.
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS - 2),
+        vec![terminal(1, "completed", "end_turn")],
+    ]
+    .concat();
+    let rig = Rig::new(&profile, &[script(1, &steps), script(2, second)]);
+    let (driver, receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let end = checked(rig.runtime.block_on(async {
+        let release = release_flood(&sync, &receiver, 1 + (OBSERVATION_ITEMS - 2) / 2);
+        tokio::join!(driver.run_turn(prompt(), cx), release).0
+    }));
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(receiver.len(), OBSERVATION_ITEMS, "the channel is full");
+    assert!(matches!(driver.prepare(), Prepared::Pinned(_)));
+    assert!(!controls.released());
+    release(&sync, "idle");
+    // The slot goes before the close's item is offered: once it is released
+    // the `VendorClosed` waits on the full channel.
+    rig.runtime.block_on(async {
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !controls.released() {
+            assert!(tokio::time::Instant::now() < by, "the idle close never ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    assert!(matches!(driver.prepare(), Prepared::NeedsConnection));
+    (rig, driver, receiver)
+}
+
+/// C2 §4 generation barrier (persistent profile): a driver admits a new
+/// generation's first observation only after the previous generation's
+/// last. The old generation's idle `VendorClosed` is in flight, blocked on
+/// the full channel, when the next turn opens a new connection. Nothing is
+/// drained until that turn is acknowledged either waiting on the barrier
+/// (`adapter.connection.barrier_wait`) or offering its first observation
+/// to the full channel (`adapter.observation.blocked`); draining then
+/// reads every old item before the new generation's first. A driver
+/// without the barrier always reaches the second, and fails.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_new_generation_is_admitted_only_after_the_old_generations_traffic() {
+    let (rig, driver, mut receiver) =
+        idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
+    // Activated once the old close is parked: occurrences count from here.
+    let points = rig.points();
+    for point in [
+        "adapter.connection.barrier_wait",
+        "adapter.observation.blocked",
+    ] {
+        acknowledge(&points, point);
+    }
+    let prepared = driver.prepare();
+    assert!(matches!(prepared, Prepared::NeedsConnection));
+    let (cx, _controls) = turn_cx(2, prepared, WALL);
+    let (end, items) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while ![
+            "adapter.connection.barrier_wait",
+            "adapter.observation.blocked",
+        ]
+        .iter()
+        .any(|point| points.join(format!("{point}.1.ack")).exists())
+        {
+            assert!(tokio::time::Instant::now() < by, "turn 2 never waited");
+            tokio::select! {
+                end = &mut run => panic!("turn 2 ended undelivered: {end:?}"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        let mut items = Vec::new();
+        let end = loop {
+            tokio::select! {
+                Some(admitted) = receiver.recv() => items.push(admitted.item),
+                end = &mut run => break end,
+            }
+        };
+        while let Ok(admitted) = receiver.try_recv() {
+            items.push(admitted.item);
+        }
+        (checked(end), items)
+    });
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let new = |item: &ObservationItem| {
+        item.vendor_turn
+            .as_ref()
+            .is_some_and(|id| id.as_str() == vendor_turn(2))
+    };
+    let first_new = items.iter().position(new).unwrap();
+    let old = &items[..first_new];
+    assert!(
+        old.len() == OBSERVATION_ITEMS + 1
+            && matches!(
+                old[OBSERVATION_ITEMS].observation,
+                Observation::VendorClosed(_)
+            ),
+        "the old generation's close was not read before the new generation's first item: {:?}",
+        items[OBSERVATION_ITEMS - 1..]
+            .iter()
+            .map(|item| (&item.vendor_turn, &item.observation))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        items[first_new..].iter().all(new),
+        "no old item after the new generation's first"
+    );
+}
+
+/// C2 D4 (persistent profile): a session's observations reach the channel
+/// in decode order across all of the driver's producers, `at` never
+/// earlier than the previous one's. A pinned turn's progress is stamped and
+/// held before its delivery (`adapter.fake.stamped`) while the scenario's
+/// idle close is released and decides (`adapter.fake.idle_decided`): the
+/// idle close never runs during a turn, so nothing overtakes the progress.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_pinned_turns_stamped_progress_is_not_overtaken_by_the_idle_close() {
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    let text = emit(&json!({"type":"text","vendor_turn_id":vendor_turn(2)}));
+    let rig = Rig::new(
+        &profile,
+        &[
+            script(1, &[accepted(1), terminal(1, "completed", "end_turn")]),
+            script(
+                2,
+                &[accepted(2), text, terminal(2, "completed", "end_turn")],
+            ),
+        ],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _first) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    // Counted from here: turn 2's second message, its progress, is held.
+    let points = rig.points();
+    let held = json!({"token":POINTS_TOKEN,"occurrence":2,"action":"pause"});
+    fs::write(points.join("adapter.fake.stamped.json"), held.to_string()).unwrap();
+    acknowledge(&points, "adapter.fake.idle_decided");
+    let pin = driver.prepare();
+    assert!(matches!(pin, Prepared::Pinned(_)));
+    let (cx, _second) = turn_cx(2, pin, WALL);
+    let sync = rig.sync();
+    let (end, items, ()) = rig.run_beside(&driver, &mut receiver, (prompt(), cx), |_| {
+        let points = points.clone();
+        async move {
+            until_file(points.join("adapter.fake.stamped.2.ack")).await;
+            release(&sync, "idle");
+            until_file(points.join("adapter.fake.idle_decided.1.ack")).await;
+            fs::write(points.join("adapter.fake.stamped.2.release"), b"").unwrap();
+        }
+    });
+    assert!(
+        items.windows(2).all(|pair| pair[0].at <= pair[1].at),
+        "out of decode order: {:?}",
+        items
+            .iter()
+            .map(|item| (&item.observation, item.at))
+            .collect::<Vec<_>>()
+    );
+    assert!(end.outcome.is_ok(), "{end:?}");
+}
+
+/// C2 §4 generation barrier: a turn waiting on it has not launched, so a
+/// stop, the daemon force or its wall (turn `wall`) ends it there as before
+/// any launch, promptly and well within the stall bound that holds the old
+/// close. The old close is still read, and nothing of the ended turn.
+fn a_turn_waiting_on_the_barrier_ends_on(
+    (wall, order): (Duration, fn(&Controls)),
+    cause: fn(&RouteError) -> bool,
+) {
+    let (rig, driver, mut receiver) =
+        idle_close_in_flight(&[accepted(2), terminal(2, "completed", "end_turn")]);
+    let (cx, controls) = turn_cx(2, driver.prepare(), wall);
+    let (end, waited) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        // Polled first: the turn reaches the barrier and waits there.
+        tokio::select! {
+            biased;
+            end = &mut run => panic!("turn 2 did not wait on the barrier: {end:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        let sent = tokio::time::Instant::now();
+        order(&controls);
+        let end = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
+        assert!(end.is_ok(), "the order did not end the waiting turn");
+        let end = end.unwrap();
+        (checked(end), sent.elapsed())
+    });
+    let failure = failure(&end);
+    assert!(cause(&failure.cause), "{end:?}");
+    assert!(!failure.launched && !failure.forced, "{end:?}");
+    assert_eq!(failure.cleanup, None, "{end:?}");
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    let items = rig.runtime.block_on(async {
+        let mut items = Vec::new();
+        while items.len() <= OBSERVATION_ITEMS {
+            let admitted = tokio::time::timeout(FIXTURE_WAIT, receiver.recv()).await;
+            items.push(admitted.unwrap().unwrap().item);
+        }
+        items
+    });
+    assert!(
+        matches!(
+            items[OBSERVATION_ITEMS].observation,
+            Observation::VendorClosed(_)
+        ),
+        "{:?}",
+        items[OBSERVATION_ITEMS]
+    );
+    assert!(receiver.try_recv().is_err(), "nothing of the stopped turn");
+}
+
+#[test]
+fn a_stop_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on(
+        (WALL, |controls| {
+            controls
+                .stop
+                .send_replace(Some(order(Duration::from_secs(10))));
+        }),
+        |cause| matches!(cause, RouteError::Stopped { .. }),
+    );
+}
+
+#[test]
+fn the_daemon_force_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on(
+        (WALL, |controls| {
+            controls
+                .force
+                .send_replace(Some(tokio::time::Instant::now()));
+        }),
+        |cause| matches!(cause, RouteError::ForceStopped { .. }),
+    );
+}
+
+/// C2 §4.1 wall path: a wall passing while the turn waits on the barrier
+/// ends it unlaunched with the deadline, long before the old close's stall.
+#[test]
+fn the_wall_ends_a_turn_waiting_on_the_generation_barrier() {
+    a_turn_waiting_on_the_barrier_ends_on((Duration::from_millis(300), |_| {}), |cause| {
+        matches!(cause, RouteError::Deadline { .. })
+    });
+}
+
 /// C2 §2 Close: a `close()` dropped before it was polled leaves the driver
 /// untouched; a later close stops the running turn.
 #[test]
@@ -2372,10 +2722,7 @@ fn a_dropped_unpolled_close_leaves_the_driver_open() {
     );
     assert!(open, "the dropped close changed nothing");
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Stopped { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Stopped { .. }),
         "{end:?}"
     );
     assert_eq!(report.cleanup, Cleanup::Quiescent, "{report:?}");
@@ -2402,10 +2749,7 @@ fn a_persistent_daemon_force_reports_host_facts() {
     );
     let failure = failure(&end);
     assert!(
-        matches!(
-            failure.cause,
-            TurnCause::Route(RouteError::ForceStopped { .. })
-        ),
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
         "{end:?}"
     );
     assert!(failure.forced, "{end:?}");
@@ -2448,10 +2792,7 @@ fn a_pinned_turn_whose_delivery_fails_holds_the_slot_until_retirement() {
         tokio::join!(driver.run_turn(prompt(), cx), release).0
     }));
     assert!(
-        matches!(
-            failure(&end).cause,
-            TurnCause::Route(RouteError::Overflow { .. })
-        ),
+        matches!(failure(&end).cause, RouteError::Overflow { .. }),
         "{end:?}"
     );
     assert!(

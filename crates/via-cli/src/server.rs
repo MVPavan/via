@@ -15,7 +15,8 @@ use tokio::{
     task::JoinSet,
 };
 
-use via_core::{ApiError, Engine, FakeConfig, Limits, SessionId, StoreLock};
+use serde_json::value::RawValue;
+use via_core::{AdapterConfig, ApiError, BootstrapEnv, Engine, Limits, SessionId, StoreLock};
 
 mod config;
 mod dispatch;
@@ -48,6 +49,20 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
         DirBuilder::new().mode(0o700).create(path)?;
     }
     validate_dir(path)
+}
+
+/// Longest state directory path, JSON-encoded with its quotes (runtime
+/// §6.1): it bounds every evidence path an envelope names (C1 §5).
+const STATE_PATH_MAX: usize = 1024;
+
+/// Refuses a state directory whose path is over [`STATE_PATH_MAX`]
+/// encoded, as the envelope names it.
+fn check_state_path(state: &Path) -> anyhow::Result<()> {
+    let encoded = serde_json::to_vec(&state.display().to_string())?.len();
+    if encoded > STATE_PATH_MAX {
+        bail!("the state directory path is {encoded} bytes encoded, over 1 KiB");
+    }
+    Ok(())
 }
 
 /// Exit status of a daemon that found `daemon.lock` held (runtime §6.1,
@@ -107,9 +122,10 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         .init();
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     let paths = super::client::paths()?;
+    check_state_path(&paths.state)?;
     // Task 4 design §5.5: read once, before any Store or socket change.
-    let limits = match config::read(&paths.state) {
-        Ok(limits) => limits,
+    let config::Config { limits, harnesses } = match config::read(&paths.state) {
+        Ok(config) => config,
         Err(invalid) => {
             let _ = writeln!(io::stderr().lock(), "via: {invalid}");
             return Ok(CONFIG_INVALID);
@@ -159,7 +175,15 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
-    let served = serve_bound(listener, &socket, &paths, (store_lock, limits)).await;
+    // Boxed: the serving future, Core's included, is large and runs once.
+    let served = Box::pin(serve_bound(
+        listener,
+        &socket,
+        &paths,
+        (store_lock, limits),
+        harnesses.as_deref(),
+    ))
+    .await;
     if served.is_err() {
         // A failure after bind unlinks the socket before the locks are
         // released (design §6.1). Best effort: a stale socket refuses
@@ -176,10 +200,11 @@ async fn serve_bound(
     socket: &Path,
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
+    harnesses: Option<&RawValue>,
 ) -> anyhow::Result<i32> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .context("chmod daemon socket")?;
-    let engine = open_engine(paths, locked).await?;
+    let engine = open_engine(paths, locked, harnesses).await?;
     // Sessions whose dispatcher daemon main starts; the Engine gives this out once.
     let starts = engine
         .take_starts()
@@ -259,7 +284,9 @@ async fn serve_bound(
         closing,
         failed,
     };
-    Ok(final_shutdown(engine, joins, exit.mode, window, entry).await)
+    // Boxed: final shutdown holds the drain of every turn, past Clippy's
+    // future-size bound in test builds.
+    Ok(Box::pin(final_shutdown(engine, joins, exit.mode, window, entry)).await)
 }
 
 /// Opens the Engine off the Tokio workers and commits crash recovery before
@@ -269,18 +296,20 @@ async fn serve_bound(
 async fn open_engine(
     paths: &super::client::Paths,
     locked: (StoreLock, Limits),
+    harnesses: Option<&RawValue>,
 ) -> anyhow::Result<Arc<Engine>> {
-    let fake = FakeConfig::from_environment().map_err(anyhow::Error::msg)?;
+    // Design §5.1 #42: the bootstrap names the client forwarded, and the
+    // config's `harnesses`.
+    let adapters =
+        AdapterConfig::load(BootstrapEnv::capture(), harnesses).map_err(anyhow::Error::msg)?;
     let state = paths.state.clone();
     let runtime = paths.runtime.clone();
     let binary = std::env::current_exe()?;
-    let engine = Arc::new(
-        tokio::task::spawn_blocking(move || {
-            Engine::open_locked(&state, &runtime, fake, binary, locked)
-        })
-        .await?
-        .map_err(anyhow::Error::msg)?,
-    );
+    let engine = tokio::task::spawn_blocking(move || {
+        Engine::open_locked(&state, &runtime, adapters, binary, locked)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
     match recover(&engine).await {
         Ok(()) => Ok(engine),
         Err(error) => {
@@ -388,3 +417,23 @@ struct Client {
 
 /// Design §10.1: connected clients served at once.
 const SOCKET_SLOTS: usize = 32;
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    /// Runtime §6.1 (C1 §5 spill amendment): a state directory path of
+    /// 1 KiB encoded starts; one byte more, or a shorter path whose
+    /// escaped characters encode past 1 KiB, is refused.
+    #[test]
+    fn a_state_directory_path_over_1_kib_encoded_is_refused() {
+        // `"` + `/` + 1,021 bytes + `"`.
+        let at_cap = PathBuf::from(format!("/{}", "s".repeat(1021)));
+        assert!(super::check_state_path(&at_cap).is_ok());
+        let over = PathBuf::from(format!("/{}", "s".repeat(1022)));
+        assert!(super::check_state_path(&over).is_err());
+        // 200 bytes, each control character encoded as `\u0001`.
+        let escaped = PathBuf::from(format!("/{}", "\u{1}".repeat(199)));
+        assert!(super::check_state_path(&escaped).is_err());
+    }
+}

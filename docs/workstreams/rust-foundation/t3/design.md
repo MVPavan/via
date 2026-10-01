@@ -893,7 +893,11 @@ policy.
    dispatchers are then aborted and joined until
    `deadline − FINALIZE_RESERVE`. A session whose dispatcher still has not
    joined is left out of steps 4–6: its turns stay for restart recovery,
-   and shutdown is incomplete (exit 4) [s3.2];
+   and shutdown is incomplete (exit 4) [s3.2]. Step 3 joins dispatchers
+   and submitted-turn owners, or collects complete handoffs. Unfinished
+   lane drains make shutdown incomplete. Finalization uses only complete
+   handoffs, and no session is closed before its lane drain completes;
+   late handoffs remain for restart recovery;
 4. **Host reconciliation** over the collected turns (`adapter.shutdown`),
    gathering its evidence: proved absence and `forced` [r4.2]. It connects,
    challenges and sends `Stop` only to an anchor whose durable phase is

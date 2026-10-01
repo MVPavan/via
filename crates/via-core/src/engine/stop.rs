@@ -259,7 +259,7 @@ impl Engine {
     async fn finalize_forced(
         &self,
         turn: super::ForcedTurn,
-        report: &via_adapters::FakeShutdown,
+        report: &via_adapters::AdapterShutdown,
         deadline: Deadline,
         batches: &mut FailureBatches,
     ) -> bool {
@@ -273,7 +273,15 @@ impl Engine {
         let by = deadline
             .instant()
             .min(tokio::time::Instant::now() + FINALIZE_WRITE);
-        if batch::affected(&turn.record) {
+        let mut turn = turn;
+        // C1 §5, §7.6: a spilled structured output's write is part of the
+        // terminal's commit; when it fails, the turn resolves through the
+        // failure-resolution batch, as a terminal that did not commit.
+        let spilled = matches!(
+            tokio::time::timeout_at(by, self.spill(&mut turn.record, false)).await,
+            Ok(Some(_))
+        );
+        if batch::affected(&turn.record) || !spilled {
             // After the first failure `cancel.settled` is not written: no I/O.
             let (started, record, terminal) = self.forced_terminal(turn, facts).await;
             let affected = AffectedTurn {
@@ -293,8 +301,11 @@ impl Engine {
             // transaction while any other turn is queued or running, which
             // covers a turn an uncertain receipt committed unregistered.
             let admission = self.admission.lock().await;
-            let close =
-                !self.store_failed() && !self.unresolved.others(&started.session, started.turn);
+            // Design §6.8 step 3 (Sol r4 R4): never before the session's
+            // lane drain completes.
+            let close = !self.store_failed()
+                && !self.unresolved.others(&started.session, started.turn)
+                && self.lane_drained(&started.session);
             self.finish(&started, record, terminal, close, Some(&admission))
                 .await
         };
@@ -327,7 +338,7 @@ impl Engine {
     )]
     async fn forced_facts(
         turn: &super::ForcedTurn,
-        report: &via_adapters::FakeShutdown,
+        report: &via_adapters::AdapterShutdown,
     ) -> (bool, bool) {
         let evidence = report.recovery.iter().find(|record| {
             record.session_id == turn.started.session && record.turn == turn.started.turn
@@ -366,7 +377,8 @@ impl Engine {
         } else {
             "unknown"
         };
-        let (outcome, cleanup) = stop_outcome(quiescent, forced);
+        // A private route's own close: no vendor acknowledgement.
+        let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let mut record = turn.record;
         let cancel = self
             .settle_on(
@@ -385,7 +397,13 @@ impl Engine {
             } else {
                 "error"
             },
-            vendor_stop_reason: None,
+            // AD4: a terminal decoded before the force keeps its vendor
+            // stop reason.
+            vendor_stop_reason: record
+                .vendor
+                .retained
+                .as_ref()
+                .map(|retained| retained.vendor_stop_reason.clone()),
             final_text: Some(String::new()),
             final_text_file: None,
             exit: None,
@@ -400,11 +418,18 @@ impl Engine {
             );
             terminal.stop_reason = "deadline";
         }
-        if turn.cause == Some(StopCause::Protocol) || record.steps.unrepresentable() {
+        if record.steps.unrepresentable() {
             // Review r2: the tracker refused a token count (a `protocol`
             // order, or a refusal after Route ended under the force); the
             // known failure outranks the idle and cancel rows.
             terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
+        } else if record.vendor.overflowed {
+            // Critical r1 #6: an acceptance exhausted the lane's tombstones.
+            terminal.fail(FailureClass::Overflow, super::terminal::OVERFLOW_STOP);
+        } else if turn.cause == Some(StopCause::Protocol) {
+            // Sol r4 R6: any other refusal of the vendor's evidence, as an
+            // acceptance colliding with another turn's vendor turn.
+            terminal.fail(FailureClass::Protocol, super::terminal::PROTOCOL_STOP);
         }
         if record.first_failure.is_some() {
             // C1 §8.2: the durable stream already lost an event; a
@@ -478,7 +503,18 @@ impl Engine {
         // Host keeps evidence only for receipted, unresolved turns (at most
         // the unresolved cap), which include every force-stopped turn.
         let turns = self.unresolved.turns();
+        // Every driver's owned work stops with the daemon (C2 §2
+        // `SessionCx`); Host's reconciliation below owns their groups.
+        let undrained = self.drop_lanes(host_by).await;
         let report = self.adapter.shutdown(Deadline::at(host_by), &turns).await;
+        // The drivers' tasks end once Host stopped their groups; one still
+        // running then counts as pending work.
+        let drivers_joined = tokio::time::timeout_at(
+            host_by.max(tokio::time::Instant::now()),
+            self.tracker.wait(),
+        )
+        .await
+        .is_ok();
         // A dispatcher that has not joined still owns its session: none of
         // its turns is settled here, and they stay unresolved for restart
         // recovery (design §6.8 step 3).
@@ -518,7 +554,11 @@ impl Engine {
         EngineShutdown {
             anchors: report.anchors,
             uncertain_owners: report.uncertain_anchors,
-            pending_tasks: report.pending_tasks,
+            // A lane whose actor has not ended by its drain's bound still
+            // owns what its channel has, and a turn it still runs (Sol r3
+            // N5): pending work, never dropped. A turn it runs is in no
+            // step above until its run hands it over.
+            pending_tasks: report.pending_tasks + usize::from(!drivers_joined) + undrained,
             failed_tasks: report.failed_tasks,
             failure: report.failure,
             uncommitted_turns,
@@ -543,13 +583,16 @@ impl Engine {
     /// already closed in-path is read as closed and never closed twice. A
     /// session in `unjoined`, whose dispatcher still owns it, is not closed:
     /// it is counted by the same read, with or without a Store failure
-    /// (round 3, decision 14; round 4, decision 16).
+    /// (round 3, decision 14; round 4, decision 16), as is a session whose
+    /// lane drain has not completed (design §6.8 step 3, Sol r4 R4).
     async fn close_forced_sessions(&self, unjoined: &HashSet<SessionId>) -> usize {
         let sessions = lock(&self.force_sessions).clone().unwrap_or_default();
         let mut unclosed = 0;
         let mut unvisited = Vec::new();
         for (index, session) in sessions.iter().enumerate() {
-            if unjoined.contains(session) {
+            // Design §6.8 step 3 (Sol r4 R4): a session whose lane drain
+            // has not completed is not closed either.
+            if unjoined.contains(session) || !self.lane_drained(session) {
                 unvisited.push(session);
                 continue;
             }
@@ -670,12 +713,24 @@ impl Engine {
 }
 
 /// C1 §7.4 outcome and §3.5 cleanup of a stop Core ordered, as independent
-/// facts: `forced` needs Host's evidence that its stop found the vendor live,
-/// otherwise the cancel was only `requested`; cleanup is `quiescent` only with
-/// proved group absence.
-pub(super) fn stop_outcome(quiescent: bool, forced: bool) -> (&'static str, &'static str) {
+/// facts: `forced` needs Host's evidence that its stop found the vendor
+/// live; else `acknowledged` needs the vendor's acknowledgement within the
+/// cutoff (AD4); otherwise the cancel was only `requested`. Cleanup is
+/// `quiescent` only with proved group absence, or on a server route every
+/// reported tool ended (AD9).
+pub(super) fn stop_outcome(
+    quiescent: bool,
+    forced: bool,
+    acknowledged: bool,
+) -> (&'static str, &'static str) {
     (
-        if forced { "forced" } else { "requested" },
+        if forced {
+            "forced"
+        } else if acknowledged {
+            "acknowledged"
+        } else {
+            "requested"
+        },
         if quiescent { "quiescent" } else { "uncertain" },
     )
 }

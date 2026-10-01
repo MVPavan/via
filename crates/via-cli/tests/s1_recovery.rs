@@ -1777,7 +1777,7 @@ fn s1_restart_keeps_nondefault_frozen_values() -> TestResult {
 /// classified first, and the lost write is attached beside it.
 #[test]
 fn s1_recovery_harness_exit_failure_survives_a_lost_output_write() -> TestResult {
-    let mut paths = Paths::new(&json!({}))?;
+    let mut paths = Paths::new(&json!({"scripts": []}))?;
     paths.via = PathBuf::from("/bin/false");
     let evidence = Evidence::new("s1_recovery_lost_output", &paths.fake, &paths.fixture)?;
     fs::create_dir(evidence.dir.join("probe.stdout"))?;

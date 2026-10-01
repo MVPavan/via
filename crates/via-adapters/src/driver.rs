@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::fake::FakeAdapter;
-use crate::observation::{ObservationSink, SteerDelivery, TurnEnd, TurnError};
+use crate::observation::{AdapterError, ObservationSink, SteerDelivery, TurnEnd, TurnEvidence};
 use crate::plan::{Bound, Inherit, VendorOptions};
 use crate::{
     CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
@@ -198,6 +198,25 @@ pub(crate) struct DriverState {
     pub(crate) vendor_closed: bool,
     /// The session was closed.
     pub(crate) closed: bool,
+    /// The generation a turn holds and may still deliver on
+    /// ([`Delivering`]).
+    pub(crate) delivering: Option<u64>,
+    /// Test builds: the daemon adapter's nth-retirement fault (Sol r3 N10).
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) retirement_fault: Option<Arc<crate::fake::RetirementFault>>,
+}
+
+/// A turn that took the connection and may still deliver (C2 D4): set
+/// under the state lock that pinning takes ([`SessionDriver::connect`]),
+/// cleared when its `run_turn` returns or is dropped. The persistent idle
+/// close never runs meanwhile, so the turn's observations and the idle
+/// close's never interleave out of decode order.
+pub(crate) struct Delivering(Arc<Mutex<DriverState>>);
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        lock(&self.0).delivering = None;
+    }
 }
 
 /// The running turn's driver-side lanes.
@@ -240,7 +259,15 @@ pub struct SessionDriver {
     /// The session's cancellation, also cancelled by this driver's close.
     pub(crate) cancel: CancellationToken,
     pub(crate) health: Arc<watch::Sender<DriverHealth>>,
+    /// Sticky: a Host journal write no turn reports had an uncertain
+    /// outcome ([`Self::journal_uncertain`]).
+    pub(crate) journal: Arc<watch::Sender<bool>>,
     pub(crate) state: Arc<Mutex<DriverState>>,
+    /// The C2 §4 generation barrier: an idle close holds it from its
+    /// generation check until its `VendorClosed` was delivered, and a new
+    /// connection takes it to advance the generation. So a new
+    /// generation's first observation follows the previous one's last.
+    pub(crate) barrier: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionDriver {
@@ -252,6 +279,10 @@ impl SessionDriver {
     ) -> Self {
         let state = DriverState {
             identity: spec.confirmed_vendor_session_id.clone(),
+            #[cfg(feature = "test-failpoints")]
+            retirement_fault: adapter
+                .as_ref()
+                .and_then(|adapter| adapter.retirement_fault.clone()),
             ..DriverState::default()
         };
         Self {
@@ -262,7 +293,9 @@ impl SessionDriver {
             tracker: cx.tracker,
             cancel: cx.cancel.child_token(),
             health: Arc::new(watch::Sender::new(DriverHealth::Open)),
+            journal: Arc::new(watch::Sender::new(false)),
             state: Arc::new(Mutex::new(state)),
+            barrier: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -274,6 +307,22 @@ impl SessionDriver {
         self.adapter
             .as_ref()
             .is_some_and(|adapter| adapter.profile().persistent)
+    }
+
+    /// The running adapter's version (AD12), which each turn the driver
+    /// starts records as the session's (C1 §3.3); `None` without one.
+    pub fn adapter_version(&self) -> Option<String> {
+        self.adapter
+            .as_ref()
+            .map(|adapter| adapter.profile().adapter_version.clone())
+    }
+
+    /// The ID identity confirmations name for the driver's current
+    /// connection generation, the latest it opened (C2 §2 delayed identity:
+    /// Core checks the current generation); `None` before the first.
+    pub fn connection_id(&self) -> Option<String> {
+        let generation = self.state().generation;
+        (generation > 0).then(|| crate::fake::connection_id(generation))
     }
 
     /// AD16: a live persistent connection is pinned; otherwise the turn
@@ -292,7 +341,7 @@ impl SessionDriver {
     /// Runs one submitted turn to its one result (C2 §4.1).
     pub async fn run_turn(&self, spec: TurnSpec, cx: TurnCx) -> TurnEnd {
         let Some(adapter) = self.adapter.clone() else {
-            return rejected(TurnError::Unavailable);
+            return rejected(AdapterError::Unavailable);
         };
         crate::fake::run_turn(self, &adapter, spec, cx).await
     }
@@ -301,16 +350,37 @@ impl SessionDriver {
     /// (AD16 rule 4), and a new connection advances the generation and
     /// replaces any earlier one. On the persistent profile the slot stays
     /// with the turn's [`Reservation`] until its handshake succeeded;
-    /// otherwise it goes to Host with the process, and is returned.
-    pub(crate) fn connect(
+    /// otherwise it goes to Host with the process, and is returned. A new
+    /// connection first waits for an older generation's idle close in
+    /// flight (C2 §4 generation barrier) unless `ordered`, the turn's stop,
+    /// force or wall, resolves first: a turn so ordered launches nothing, as
+    /// before any launch (Route's entry check), so it offers no observation
+    /// for the barrier to order.
+    pub(crate) async fn connect(
         &self,
-        prepared: Prepared,
-        capacity: Option<CapacityToken>,
-    ) -> Result<(u64, Option<CapacityToken>, Reservation), TurnError> {
+        (prepared, capacity): (Prepared, Option<CapacityToken>),
+        ordered: impl Future<Output = ()>,
+    ) -> Result<(u64, Option<CapacityToken>, Reservation, Delivering), AdapterError> {
+        let _barrier = match prepared {
+            Prepared::NeedsConnection => {
+                // Test builds: `adapter.connection.barrier_wait` acknowledges
+                // a new connection that finds the barrier held.
+                #[cfg(feature = "test-failpoints")]
+                if self.barrier.try_lock().is_err() {
+                    let _ =
+                        via_routes::failpoint::hit_async("adapter.connection.barrier_wait").await;
+                }
+                tokio::select! {
+                    barrier = self.barrier.lock() => Some(barrier),
+                    () = ordered => None,
+                }
+            }
+            Prepared::Pinned(_) => None,
+        };
         let persistent = self.persistent();
         let mut state = self.state();
         if state.closed {
-            return Err(TurnError::Rejected(crate::StartRejected::SessionGone));
+            return Err(session_gone());
         }
         let reservation = |generation, slot| Reservation {
             state: Arc::clone(&self.state),
@@ -319,27 +389,45 @@ impl SessionDriver {
             persistent,
             committed: false,
         };
+        let delivering = || Delivering(Arc::clone(&self.state));
         match prepared {
             Prepared::Pinned(pin)
                 if persistent && state.live && pin.generation == state.generation =>
             {
-                Ok((state.generation, None, reservation(state.generation, None)))
+                state.delivering = Some(state.generation);
+                Ok((
+                    state.generation,
+                    None,
+                    reservation(state.generation, None),
+                    delivering(),
+                ))
             }
             // The pinned connection died before submission: nothing sent.
-            Prepared::Pinned(_) => Err(TurnError::Rejected(crate::StartRejected::SessionGone)),
+            Prepared::Pinned(_) => Err(session_gone()),
             Prepared::NeedsConnection => {
                 state.generation += 1;
                 state.live = false;
                 state.vendor_closed = false;
+                state.delivering = Some(state.generation);
                 let generation = state.generation;
                 // A new connection replaces the earlier one, whose slot goes.
                 let replaced = state.capacity.take();
                 drop(state);
                 drop(replaced);
                 if persistent {
-                    Ok((generation, None, reservation(generation, capacity)))
+                    Ok((
+                        generation,
+                        None,
+                        reservation(generation, capacity),
+                        delivering(),
+                    ))
                 } else {
-                    Ok((generation, capacity, reservation(generation, None)))
+                    Ok((
+                        generation,
+                        capacity,
+                        reservation(generation, None),
+                        delivering(),
+                    ))
                 }
             }
         }
@@ -487,6 +575,23 @@ impl SessionDriver {
     pub fn health(&self) -> watch::Receiver<DriverHealth> {
         self.health.subscribe()
     }
+
+    /// Sticky: true once a Host journal write the driver made outside any
+    /// turn's report had an uncertain outcome, as a persistent connection's
+    /// retirement after its logical turn ended (critical r1 #4). It is kept
+    /// apart from the retirement's cleanup in `RetirementUncertain`, and
+    /// from the health lane's first cause, which an earlier failure may
+    /// hold: Core latches Store failure on it (runtime §7).
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.journal.subscribe()
+    }
+
+    /// Test builds only: reports an uncertain Host journal write outside
+    /// any turn, as a persistent connection's retirement would.
+    #[cfg(feature = "test-failpoints")]
+    pub fn report_journal_uncertain(&self) {
+        self.journal.send_replace(true);
+    }
 }
 
 /// Route's refusal as the driver reports it.
@@ -583,8 +688,16 @@ impl Drop for Reservation {
     }
 }
 
+/// The session or its pinned connection is gone: nothing launched.
+fn session_gone() -> AdapterError {
+    AdapterError::Rejected {
+        reason: crate::StartRejected::SessionGone,
+        evidence: TurnEvidence::no_launch(false),
+    }
+}
+
 /// A turn rejected before anything ran.
-pub(crate) fn rejected(error: TurnError) -> TurnEnd {
+pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
     TurnEnd {
         terminal: None,
         instance: None,

@@ -5,7 +5,9 @@
 mod driver;
 mod profile;
 
-pub(crate) use driver::run_turn;
+#[cfg(feature = "test-failpoints")]
+pub(crate) use driver::RetirementFault;
+pub(crate) use driver::{connection_id, run_turn};
 pub(crate) use profile::FakeProfile;
 
 use crate::config::FakeFixture;
@@ -18,6 +20,10 @@ use crate::plan::{
 /// The fake adapter's planning half.
 pub(crate) struct FakeAdapter {
     fixture: FakeFixture,
+    /// Test builds: this daemon's nth-retirement fault, with its own count
+    /// (Sol r3 N10).
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) retirement_fault: Option<std::sync::Arc<driver::RetirementFault>>,
 }
 
 /// The values a turn sets that the route must accept.
@@ -31,7 +37,11 @@ struct PerTurn<'a> {
 
 impl FakeAdapter {
     pub(crate) fn new(fixture: FakeFixture) -> Self {
-        Self { fixture }
+        Self {
+            fixture,
+            #[cfg(feature = "test-failpoints")]
+            retirement_fault: driver::RetirementFault::from_environment(),
+        }
     }
 
     /// The scenario's profile.

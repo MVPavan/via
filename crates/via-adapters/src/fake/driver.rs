@@ -17,25 +17,25 @@ use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
 use crate::driver::{
-    Active, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx, TurnSpec, latch,
-    lock, rejected,
+    Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx,
+    TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::observation::{
-    Acceptance, ClassHint, CostReport, Decline, Denial, DenialKind, Identity, InstanceReport,
-    Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery, StopReason,
-    TurnEnd, TurnError, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
+    Acceptance, AdapterError, ClassHint, CostReport, Decline, Denial, DenialKind, Identity,
+    InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
+    StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
 };
 use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
 use crate::{
     AcceptanceToken, Deadline, DriverFailure, DriverHealth, PrivateProcessSpec, ProcessOwner,
-    RouteError, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus, VendorTurnId,
-    final_text_pieces,
+    RouteError, RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus,
+    VendorTurnId, final_text_pieces,
 };
 use via_routes::{
     FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage, Lane,
-    Retirement, RouteMessage, TerminalStatus, TurnCause, TurnFailure, TurnStart, WireCleanup,
+    Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -79,6 +79,11 @@ impl Drop for Abandonment<'_> {
     }
 }
 
+/// The ID identity confirmations name for connection `generation`.
+pub(crate) fn connection_id(generation: u64) -> String {
+    format!("fake-{generation}")
+}
+
 /// Runs one submitted turn (C2 §4.1): per-turn values are checked before
 /// anything launches (AD18, C2 §7 item 13); then the turn's process runs
 /// through Route on a tracker-owned task while each decoded message is
@@ -107,7 +112,9 @@ pub(crate) async fn run_turn(
         force,
     } = cx;
     let first = matches!(prepared, Prepared::NeedsConnection);
-    let (generation, capacity, reservation) = match driver.connect(prepared, capacity) {
+    let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
+    let connected = driver.connect((prepared, capacity), ordered).await;
+    let (generation, capacity, reservation, delivering) = match connected {
         Ok(connection) => connection,
         Err(error) => return rejected(error),
     };
@@ -152,7 +159,7 @@ pub(crate) async fn run_turn(
         logical,
         reservation: Arc::clone(&reservation),
         state: Arc::clone(&driver.state),
-        health: Arc::clone(&driver.health),
+        reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
         done,
     }));
     let mut normalizer = Normalizer {
@@ -180,28 +187,26 @@ pub(crate) async fn run_turn(
     let Some(result) = result else {
         // The task ended without its turn: it failed (C2 §2 health).
         driver.fail(DriverFailure::OwnedTask);
-        return rejected(TurnError::TaskFailed);
+        return rejected(AdapterError::TaskFailed);
     };
     settle(driver, &reservation, &result, &rest, &normalizer);
     drop(reservation);
     report_mismatch(driver, &result, cutoff).await;
     let end = turn_end(adapter, turn, result, &rest, persistent);
-    if persistent {
-        after_persistent_turn(
-            driver,
-            adapter,
-            (turn, generation),
-            &end,
-            normalizer.vendor_closed,
-        );
-    }
+    after_persistent_turn(
+        driver,
+        adapter,
+        (turn, generation, delivering),
+        &end,
+        normalizer.vendor_closed,
+    );
     end
 }
 
 /// After the final delivery: one that failed latches `overflow` (C2 §2),
 /// and a kept server stays the session's only once its whole logical turn
-/// was delivered and the vendor did not close it (AD16); otherwise its
-/// generation is invalid.
+/// was delivered, the vendor did not close it and it reported no other
+/// session (AD16, C2 §2 Reopen); otherwise its generation is invalid.
 fn settle(
     driver: &SessionDriver,
     reservation: &Shared,
@@ -216,7 +221,10 @@ fn settle(
         return;
     }
     let mut share = held(reservation);
-    if matches!(rest, Rest::Delivered) && !normalizer.vendor_closed {
+    if matches!(rest, Rest::Delivered)
+        && !normalizer.vendor_closed
+        && result.late_mismatch.is_none()
+    {
         share.commit(driver.cancel.is_cancelled());
     } else {
         share.release();
@@ -237,7 +245,10 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         .check_turn(Harness::Fake.route(), &params)
         .into_iter()
         .next()?;
-    Some(rejected(TurnError::Rejected(start_rejected(refusal))))
+    Some(rejected(AdapterError::Rejected {
+        reason: start_rejected(refusal),
+        evidence: TurnEvidence::no_launch(false),
+    }))
 }
 
 /// The turn's process and its C2 start. Per-turn profile: Host holds the
@@ -256,7 +267,7 @@ fn launch_inputs(
         turn,
     };
     let Ok(mut process) = adapter.process_spec(owner, &driver.spec.cwd) else {
-        return Err(Box::new(rejected(TurnError::Unavailable)));
+        return Err(Box::new(rejected(AdapterError::Unavailable)));
     };
     process.capacity = capacity;
     let prompt = std::mem::take(&mut spec.prompt);
@@ -265,24 +276,30 @@ fn launch_inputs(
     });
     match start {
         Ok(start) => Ok((process, start)),
-        Err(_) => Err(Box::new(rejected(TurnError::Rejected(
-            StartRejected::Protocol("the fake start cannot be built".to_owned()),
-        )))),
+        Err(_) => Err(Box::new(rejected(AdapterError::Rejected {
+            reason: StartRejected::Protocol("the fake start cannot be built".to_owned()),
+            evidence: TurnEvidence::no_launch(false),
+        }))),
     }
 }
 
-/// C2 §2 Reopen: a `resume_mismatch` failure is reported on the session
-/// channel by the wall's cutoff; one that cannot be is an overflow.
+/// C2 §2 Reopen: a mismatching identity, the turn's failure or one after
+/// its terminal, is reported on the session channel by the wall's cutoff;
+/// one that cannot be is an overflow.
 async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Deadline) {
-    let Err(TurnFailure {
-        cause:
-            TurnCause::ResumeMismatch {
-                requested,
-                returned,
-                ..
-            },
-        ..
-    }) = &result.outcome
+    let ((
+        Err(RouteFailure {
+            cause:
+                RouteError::ResumeMismatch {
+                    requested,
+                    returned,
+                    ..
+                },
+            ..
+        }),
+        _,
+    )
+    | (_, Some((requested, returned)))) = (&result.outcome, &result.late_mismatch)
     else {
         return;
     };
@@ -306,13 +323,19 @@ async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Dead
 
 /// The persistent profile after a turn returned: a vendor close in the
 /// turn ends its connection, and the scenario's idle close starts now.
+/// Nothing on the per-turn profile. The turn's last delivery is done: it
+/// no longer holds off an idle close (`delivering`, C2 D4).
 fn after_persistent_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
-    (turn, generation): (crate::TurnNumber, u64),
+    (turn, generation, delivering): (crate::TurnNumber, u64, Delivering),
     end: &TurnEnd,
     vendor_closed: bool,
 ) {
+    drop(delivering);
+    if !adapter.profile().persistent {
+        return;
+    }
     if vendor_closed {
         driver.state().vendor_closed = true;
         driver.disconnect(generation);
@@ -322,7 +345,7 @@ fn after_persistent_turn(
         && end.outcome.is_ok()
     {
         driver.tracker.spawn(idle_source(
-            Arc::clone(&driver.state),
+            (Arc::clone(&driver.state), Arc::clone(&driver.barrier)),
             generation,
             (driver.observations.clone(), Arc::clone(&driver.health)),
             (
@@ -331,6 +354,31 @@ fn after_persistent_turn(
             ),
             driver.cancel.clone(),
         ));
+    }
+}
+
+/// Resolves once the turn is ordered to end: Core's stop order, the
+/// daemon force, its wall, or the session's cancellation, which a driver
+/// close includes.
+async fn ordered(
+    (mut stop, mut force, wall): (StopWatch, ForceWatch, Deadline),
+    cancel: CancellationToken,
+) {
+    let stopped = async {
+        if stop.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let forced = async {
+        if force.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = stopped => {}
+        () = forced => {}
+        () = tokio::time::sleep_until(wall.instant()) => {}
+        () = cancel.cancelled() => {}
     }
 }
 
@@ -402,36 +450,83 @@ fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
 
 /// The failure a Route result latches in the health lane (C2 §2):
 /// protocol, transport loss, overflow, a Store failure, the server's loss
-/// or a resume mismatch.
+/// or a resume mismatch, the turn's own or one after its terminal.
 fn route_failure(turn: &FakeTurn) -> Option<DriverFailure> {
     let Err(failure) = &turn.outcome else {
-        return None;
+        return turn
+            .late_mismatch
+            .as_ref()
+            .map(|_| DriverFailure::ResumeMismatch);
     };
     match &failure.cause {
-        TurnCause::Route(
-            cause @ (RouteError::Protocol { .. }
-            | RouteError::TransportLost { .. }
-            | RouteError::Overflow { .. }
-            | RouteError::Store { .. }),
-        ) => Some(DriverFailure::Route(cause.clone())),
-        TurnCause::ServerLost { .. } => Some(DriverFailure::ServerLost),
-        TurnCause::ResumeMismatch { .. } => Some(DriverFailure::ResumeMismatch),
-        TurnCause::Route(
-            RouteError::ProcessExited { .. }
-            | RouteError::Stopped { .. }
-            | RouteError::Deadline { .. }
-            | RouteError::ForceStopped { .. },
-        )
-        | TurnCause::HandshakeRefused { .. }
-        | TurnCause::InvalidParam { .. } => None,
+        cause @ (RouteError::Protocol { .. }
+        | RouteError::TransportLost { .. }
+        | RouteError::Overflow { .. }
+        | RouteError::Store { .. }) => Some(DriverFailure::Route(cause.clone())),
+        RouteError::ServerLost { .. } => Some(DriverFailure::ServerLost),
+        RouteError::ResumeMismatch { .. } => Some(DriverFailure::ResumeMismatch),
+        RouteError::ProcessExited { .. }
+        | RouteError::Stopped { .. }
+        | RouteError::Deadline { .. }
+        | RouteError::ForceStopped { .. }
+        | RouteError::HandshakeRefused { .. }
+        | RouteError::InvalidParam { .. } => turn
+            .late_mismatch
+            .as_ref()
+            .map(|_| DriverFailure::ResumeMismatch),
+    }
+}
+
+/// Test builds only: `VIA_TEST_FAKE_RETIREMENT_UNCERTAIN=<n>`, read once
+/// per daemon's adapter, makes that daemon's `n`th launched persistent
+/// retirement unproven, as no fake profile can (Sol r3 N10).
+#[cfg(feature = "test-failpoints")]
+pub(crate) struct RetirementFault {
+    nth: u64,
+    launched: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl RetirementFault {
+    fn new(nth: u64) -> Self {
+        Self {
+            nth,
+            launched: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The fault the environment names, if any.
+    pub(crate) fn from_environment() -> Option<Arc<Self>> {
+        std::env::var("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|nth| Arc::new(Self::new(nth)))
+    }
+
+    /// Counts one launched retirement; true for the `n`th.
+    fn injects(&self) -> bool {
+        self.launched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+            == self.nth
     }
 }
 
 /// Whether a persistent connection's helper retirement left its cleanup
-/// unproven (decision H1): a health failure, as no turn reports it.
-fn retirement_uncertain(retirement: &Retirement) -> bool {
-    retirement.launched
-        && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
+/// unproven (decision H1): a health failure, as no turn reports it. In
+/// test builds a [`RetirementFault`] adds its injected one; it never
+/// hides a real one (Sol r3 N10).
+fn retirement_uncertain(
+    retirement: &Retirement,
+    #[cfg(feature = "test-failpoints")] fault: Option<&RetirementFault>,
+) -> bool {
+    #[cfg(feature = "test-failpoints")]
+    let injected = retirement.launched && fault.is_some_and(RetirementFault::injects);
+    #[cfg(not(feature = "test-failpoints"))]
+    let injected = false;
+    injected
+        || retirement.launched
+            && (retirement.cleanup != Some(WireCleanup::Quiescent) || retirement.journal_uncertain)
 }
 
 /// One turn's route work, owned by the session's tracker.
@@ -447,7 +542,8 @@ struct TurnTask {
     logical: oneshot::Sender<FakeTurn>,
     reservation: Shared,
     state: Arc<Mutex<DriverState>>,
-    health: Arc<watch::Sender<DriverHealth>>,
+    /// The driver's health lane and its journal report.
+    reports: (Arc<watch::Sender<DriverHealth>>, Arc<watch::Sender<bool>>),
     done: watch::Sender<bool>,
 }
 
@@ -470,15 +566,24 @@ async fn turn_task(task: TurnTask) {
         logical,
         reservation,
         state,
-        health,
+        reports: (health, journal),
         done,
     } = task;
     let turn = start.turn();
     let persistent = lane.persistent;
     let (merged, merged_rx) =
         watch::channel(earliest(core_stop.borrow().clone(), close.borrow().clone()));
+    // Route reads the sources too where the relay below may lag: an order
+    // set before the pre-ARM launch gate wins there (design §2 rule 1).
+    let sources: StopSources = {
+        let (core, close, cancel) = (core_stop.clone(), close.clone(), cancel.clone());
+        Arc::new(move || {
+            core.borrow().is_some() || close.borrow().is_some() || cancel.is_cancelled()
+        })
+    };
     let (inner, inner_rx) = oneshot::channel();
-    let route_turn = route.turn(process, start, hop, (wall, force, merged_rx), lane, inner);
+    let stop = (merged_rx, sources);
+    let route_turn = route.turn(process, start, hop, (wall, force, stop), lane, inner);
     let relay = async {
         let Ok(turn_result) = inner_rx.await else {
             return;
@@ -497,7 +602,19 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
-    if persistent && retirement_uncertain(&retirement) {
+    // A persistent connection's retirement journal is no turn's: its
+    // uncertainty is reported apart from the cleanup's, before the health
+    // failure that retires the lane (critical r1 #4).
+    if persistent && retirement.launched && retirement.journal_uncertain {
+        journal.send_replace(true);
+    }
+    if persistent
+        && retirement_uncertain(
+            &retirement,
+            #[cfg(feature = "test-failpoints")]
+            lock(&state).retirement_fault.as_deref(),
+        )
+    {
         latch(&health, DriverFailure::RetirementUncertain);
     }
     held(&reservation).retired(retirement);
@@ -584,10 +701,13 @@ fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
 /// scenario's gate `release` exists, the emulated server closes its idle
 /// session: the slot is released, the pin invalidated, and a session-level
 /// `VendorClosed` sent; one the channel does not take latches `overflow`.
-/// Started only after the turn before it returned; a later connection or
-/// the session's cancellation ends it.
+/// Started only after the turn before it returned; a later connection, a
+/// turn holding the connection when it decides, or the session's
+/// cancellation ends it. It holds the generation barrier
+/// from its check until its item was delivered or given up, so the next
+/// connection's first observation follows it.
 async fn idle_source(
-    state: Arc<Mutex<DriverState>>,
+    (state, barrier): (Arc<Mutex<DriverState>>, Arc<tokio::sync::Mutex<()>>),
     generation: u64,
     (sink, health): (ObservationSink, Arc<watch::Sender<DriverHealth>>),
     (release, reason): (PathBuf, String),
@@ -603,14 +723,32 @@ async fn idle_source(
             () = tokio::time::sleep(IDLE_POLL) => {}
         }
     }
+    // Held until the close's item was delivered (C2 §4 generation barrier).
+    let _barrier = tokio::select! {
+        () = cancel.cancelled() => return,
+        barrier = barrier.lock() => barrier,
+    };
     let released = {
         let mut state = lock(&state);
-        if state.generation != generation || !state.live || state.closed {
-            return;
+        // Never during a turn (C2 D4): a vendor does not idle-close a
+        // session it is serving, and the turn's observations stay in order.
+        if state.generation != generation
+            || !state.live
+            || state.closed
+            || state.delivering.is_some()
+        {
+            None
+        } else {
+            state.live = false;
+            state.vendor_closed = true;
+            Some(state.capacity.take())
         }
-        state.live = false;
-        state.vendor_closed = true;
-        state.capacity.take()
+    };
+    // Test builds: the idle close decided whether to close.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.idle_decided").await;
+    let Some(released) = released else {
+        return;
     };
     drop(released);
     let closed = ObservationItem {
@@ -738,11 +876,24 @@ fn turn_end(
         }
     });
     let outcome = match outcome {
-        Err(TurnFailure {
-            cause: TurnCause::InvalidParam { field, .. },
-            ..
-        }) => Err(TurnError::Rejected(StartRejected::InvalidParam { field })),
-        Err(failure) => Err(TurnError::Route(failure)),
+        Err(
+            ref failure @ RouteFailure {
+                cause: RouteError::InvalidParam { field, .. },
+                ..
+            },
+        ) => Err(AdapterError::Rejected {
+            reason: StartRejected::InvalidParam { field },
+            evidence: TurnEvidence::of_failure(failure),
+        }),
+        Err(
+            ref failure @ RouteFailure {
+                cause: RouteError::ResumeMismatch { .. },
+                ..
+            },
+        ) => Err(AdapterError::ResumeMismatch {
+            evidence: TurnEvidence::of_failure(failure),
+        }),
+        Err(failure) => Err(AdapterError::Route(failure)),
         Ok(result) => {
             let exit =
                 (result.exit.code.is_some() || result.exit.signal.is_some()).then_some(result.exit);
@@ -757,8 +908,8 @@ fn turn_end(
                     cleanup: cleanup(result.cleanup),
                     journal_uncertain: result.journal_uncertain,
                 }),
-                Some(cause) => Err(TurnError::Route(TurnFailure {
-                    cause: TurnCause::Route(cause),
+                Some(cause) => Err(AdapterError::Route(RouteFailure {
+                    cause,
                     undecoded: None,
                     exit,
                     launched: true,
@@ -1001,14 +1152,17 @@ impl Normalizer {
     }
 
     /// C2 §2 "Reopen": Route fails a turn on an identity that differs from
-    /// the session's (`resume_mismatch`), so every one handed over confirms
-    /// it for this connection generation, and the session keeps it.
+    /// the session's before its terminal, and drops one after it
+    /// (`resume_mismatch`), so every one handed over confirms it for this
+    /// connection generation, and the session keeps it.
     fn identity(&self, vendor_session_id: String, transcript: Option<String>) -> Observation {
         lock(&self.state).identity = Some(vendor_session_id.clone());
         Observation::IdentityConfirmed(Identity {
             vendor_session_id,
-            connection_id: format!("fake-{}", self.generation),
+            connection_id: connection_id(self.generation),
             transcript: transcript.map(PathBuf::from),
+            // The fake's handshake carries none at confirmation.
+            vendor_version: None,
         })
     }
 }
@@ -1028,6 +1182,9 @@ async fn send_all(
     sink: ObservationSink,
     stall: Duration,
 ) -> Result<(), Undelivered> {
+    // Test builds: one message's items are stamped, not yet delivered.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.stamped").await;
     for item in items {
         sink.send(item, stall).await?;
     }
@@ -1052,5 +1209,49 @@ async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<Rou
 async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
     if force.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-failpoints"))]
+mod tests {
+    use super::{Retirement, RetirementFault, WireCleanup, retirement_uncertain};
+
+    fn retirement(cleanup: WireCleanup) -> Retirement {
+        Retirement {
+            launched: true,
+            exit: None,
+            cleanup: Some(cleanup),
+            forced: false,
+            journal_uncertain: false,
+        }
+    }
+
+    /// Sol r3 N10: the nth-retirement fault adds its injected uncertainty
+    /// to the real one and never hides it, and each daemon's adapter
+    /// counts its own launched retirements.
+    #[test]
+    fn the_retirement_fault_adds_to_real_uncertainty_per_adapter() {
+        let fault = RetirementFault::new(2);
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Uncertain), Some(&fault)),
+            "a real uncertainty the fault does not inject stays"
+        );
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Quiescent), Some(&fault)),
+            "the second launched retirement is injected"
+        );
+        assert!(!retirement_uncertain(
+            &retirement(WireCleanup::Quiescent),
+            Some(&fault)
+        ));
+        let other = RetirementFault::new(1);
+        assert!(
+            retirement_uncertain(&retirement(WireCleanup::Quiescent), Some(&other)),
+            "another daemon's adapter counts from its own first"
+        );
+        assert!(!retirement_uncertain(
+            &retirement(WireCleanup::Quiescent),
+            None
+        ));
     }
 }

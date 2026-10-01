@@ -6,10 +6,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, AdmittedObservation, FakeAcceptanceObservation, FakeObservation,
-    FakeTerminalEvidence, Observation, RouteError, StopOrder, StopWatch, TurnActivity, WireCleanup,
+    AdapterError, Admitted, Decline, Denial, DenialKind, Observation, ObservationItem, Prepared,
+    RouteError, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd, TurnEvidence, TurnSpec,
+    VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
@@ -19,22 +20,37 @@ use via_store::{
 use super::batch::AffectedTurn;
 use super::final_text::FinalText;
 use super::journal::{self, Durable, Head, TurnJournal, UncertainEvent, Unended, Unresolved};
+use super::lane::{Attribution, Inbox, Lane, LaneClaim, Mapped, Retained, turn_job};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::progress::Progress;
 use super::queue::{Ack, Backoff, Claim, Front, Owner, QueuedOutcome, Slot};
 use super::resolve::{Queueing, ReadStreak};
 use super::stop::StopMode;
-use super::terminal::{dispose, terminal_envelope};
+use super::terminal::{dispose, turn_envelope};
 use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
 use crate::api::{
-    Cancel, Effective, Event, EventBody, FailureClass, FinalTextFile, Timestamps, Usage, rfc3339,
+    AutoDeclined, Cancel, DeniedAction, Effective, Event, EventBody, FailureClass, FinalTextFile,
+    STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, Warning, rfc3339,
 };
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
 pub(super) const FORCE_CLOSE_REASON: &str = "daemon_stop_force";
+
+/// The Store correlation tag of an acceptance with no vendor turn ID: the
+/// acceptance token follows it. Recovery reports no vendor turn ID for
+/// such an acceptance.
+pub(super) const TOKEN_CORRELATION: &str = "t:";
+
+/// The Store correlation tag of an acceptance's vendor turn ID, which
+/// follows it verbatim. Every correlation is tagged, so no vendor ID reads
+/// as a token (critical r1 #10: C2 reserves no prefix of its own).
+pub(super) const VENDOR_CORRELATION: &str = "v:";
+
+/// C1 P7's tool-grace window.
+const TOOL_GRACE: Duration = Duration::from_secs(60);
 
 /// A committed submission: the queued turn's facts, its loaded prompt, its
 /// frozen effective values and the submission time.
@@ -125,8 +141,10 @@ struct Control<'a> {
     /// The turn's first failed write sent or upgraded its order to cause
     /// `store` (design §7.2 row 5).
     stored: bool,
-    /// An unrepresentable token count sent or upgraded its order to cause
-    /// `protocol` (review r1).
+    /// Core refused the vendor's evidence, an unrepresentable token count
+    /// (review r1) or an acceptance naming a vendor turn the lane keeps
+    /// for another (Sol r3 N6): its order was sent or upgraded to cause
+    /// `protocol`.
     refused: bool,
     /// When the idle deadline strikes; disarmed once any order exists.
     idle_at: Option<tokio::time::Instant>,
@@ -169,8 +187,9 @@ impl TurnText {
 
 /// How a drive's execution ended.
 enum Driven {
-    /// The adapter returned its outcome.
-    Finished(Result<FakeTerminalEvidence, AdapterError>),
+    /// The driver returned the turn's one result (C2 §4.1, AD4): its
+    /// retained vendor terminal, if any, and its evidence or failure.
+    Finished(Box<(Option<VendorTerminal>, Result<TurnEvidence, AdapterError>)>),
     /// A force stop closed the execution through Route.
     Forced(Forced),
 }
@@ -181,11 +200,11 @@ impl Driven {
     /// §7.1, §7.2 rows 3, 4 and 6).
     fn store_facts(&self) -> (Option<&RouteError>, bool) {
         match self {
-            Self::Finished(Ok(evidence)) => (None, evidence.journal_uncertain),
-            Self::Finished(Err(AdapterError::Route(route))) => {
-                (Some(&route.cause), route.journal_uncertain)
-            }
-            Self::Finished(Err(_)) => (None, false),
+            Self::Finished(finished) => match &finished.1 {
+                Ok(evidence) => (None, evidence.journal_uncertain),
+                Err(AdapterError::Route(route)) => (Some(&route.cause), route.journal_uncertain),
+                Err(error) => (None, error.journal_uncertain()),
+            },
             Self::Forced(forced) => (None, forced.journal_uncertain),
         }
     }
@@ -362,13 +381,36 @@ impl Engine {
     /// keeps its queued count until Store confirms the submission. A failed
     /// submission is [`Engine::submit_failure`]'s (design §7.2, §7.3).
     /// Every other path that does not submit rolls the claim back.
-    async fn dispatch(&self, slot: &Slot, session: &SessionId, turn: TurnNumber) -> Step {
-        // Design §11: a connection slot before the grant. It is dropped at
+    async fn dispatch(&self, slot: &Arc<Slot>, session: &SessionId, turn: TurnNumber) -> Step {
+        // AD16: a pinned live connection of the session's driver needs no
+        // slot; a session without a usable driver needs one. Otherwise
+        // design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
         // life. Force, the latch or a change of the head gives up the wait:
-        // the queued path, never submitted.
-        let Some(connection) = self.reserve_connection(slot, turn).await else {
-            return Step::Next;
+        // the queued path, never submitted. The session's lane is claimed
+        // before its driver is prepared, and a failed driver is retired
+        // first, so its own slot is free for its successor (C2 §2, Sol r2
+        // #1). The claim is given back on every path that does not run.
+        // The claimed lane, or the resident permit of the lane this
+        // dispatch opens: one that needs a new lane first waits for a
+        // resident one (runtime §8, critical r3 #3), before any connection
+        // slot, its turn still queued.
+        let claim = match self.claim_lane(session).await {
+            Some(claim) => Ok(claim),
+            None => match self.reserve_resident(slot, turn).await {
+                Some(resident) => Err(resident),
+                None => return Step::Next,
+            },
+        };
+        let prepared = claim
+            .as_ref()
+            .map_or(Prepared::NeedsConnection, |claim| claim.driver.prepare());
+        let connection = match prepared {
+            Prepared::Pinned(_) => None,
+            Prepared::NeedsConnection => match self.reserve_connection(slot, turn).await {
+                Some(permit) => Some(permit),
+                None => return Step::Next,
+            },
         };
         if !slot.claim(turn) {
             return Step::Next;
@@ -406,6 +448,14 @@ impl Engine {
             self.faults.granted.notify_one();
             self.faults.release.notified().await;
         }
+        // Accepted limit (Sol r4, before actor ownership): dropping this
+        // future (the dispatcher aborted) from the claim through submission
+        // and the lane's replacement below, before `run_on_lane` hands the
+        // turn to the lane's actor, can leave a claimed queued turn, or a
+        // durably running one, with no actor job. No vendor I/O has
+        // happened yet; bounded shutdown reports the turn unresolved, and
+        // restart recovery settles it. It is a limit before the actor owns
+        // the turn, not a cancellation guarantee.
         let submission = match self.submit(slot, session, turn).await {
             Ok(submission) => submission,
             Err(failure) => {
@@ -414,29 +464,130 @@ impl Engine {
                     .await;
             }
         };
+        // C2 §2: the session's driver, opened at its first dispatch, or
+        // replaced when its health failed. A pin that went stale meanwhile
+        // is the driver's to refuse (AD16 rule 4).
+        let cwd = submission
+            .queued
+            .cwd
+            .as_ref()
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
+        let route = submission.queued.route.clone();
+        let claim = match claim {
+            Ok(claim) => claim,
+            Err(resident) => {
+                self.open_lane(
+                    session,
+                    (&route, submission.effective.model(), cwd),
+                    resident,
+                )
+                .await
+            }
+        };
         self.queued.fetch_sub(1, Ordering::AcqRel);
-        self.run(slot, submission, connection).await;
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.run_on_lane(slot, submission, (claim, prepared, connection))
+            .await;
         Step::Next
     }
 
+    /// Hands the submitted turn, with its lane's claim, to the lane's
+    /// actor, which runs it to its end (Sol r3 N1), and waits for that
+    /// end. Dropping this future, as aborting the dispatcher does (design
+    /// §6.8 step 3), neither cancels the turn nor strands what it holds:
+    /// its stop order, the daemon's force and the drivers' cancellation
+    /// stop it, inside the actor. A lane that already ended, at final
+    /// shutdown's cancellation, gives the turn back, and it runs on the
+    /// daemon's tracker with no session channel, never in this future.
+    #[expect(
+        clippy::expect_used,
+        reason = "every Engine is made in its Arc (Engine::open_with), which a borrowed Engine keeps alive"
+    )]
+    async fn run_on_lane(
+        &self,
+        slot: &Arc<Slot>,
+        submission: Submission,
+        (claim, prepared, connection): (
+            LaneClaim,
+            Prepared,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        ),
+    ) {
+        let engine = self.me.upgrade().expect("the Engine's own Arc");
+        let slot = Arc::clone(slot);
+        let lane = Arc::clone(claim.lane());
+        let (done, ended) = tokio::sync::oneshot::channel::<()>();
+        let job = turn_job(move |inbox| {
+            Box::pin(async move {
+                let held: &Lane = &claim;
+                engine
+                    .run(&slot, submission, (held, prepared, connection), inbox)
+                    .await;
+                engine.active.fetch_sub(1, Ordering::AcqRel);
+                drop(claim);
+                // The dispatcher may be gone: nothing waits for the end.
+                let _ = done.send(());
+            })
+        });
+        if let Err(job) = lane.hand_over(job) {
+            // Never the caller's to run (Sol r4 R1): the daemon's tracker
+            // owns it, with its record, run and claim.
+            self.tracker.spawn(async move {
+                let mut inbox = Inbox::closed();
+                job(&mut inbox).await;
+            });
+        }
+        // The job always runs to its end, which sends; a runtime ending
+        // under it ends this future too.
+        let _ = ended.await;
+    }
+
     /// Waits for a connection slot, FIFO daemon-wide (design §3.1 capacity
-    /// wait). The acquire future stays pinned across slot wakes, so the turn
-    /// keeps its place; each wake re-checks that `turn` is still the
-    /// `Waiting` head with no close order. `None` once force is accepted or
-    /// Store failure is pending (the force signal carries both), or once the
-    /// head changed: the permit, if any, is dropped and the dispatcher
-    /// decides again.
+    /// wait; [`Self::reserve`] at `core.dispatch.awaiting_slot`).
     async fn reserve_connection(
         &self,
         slot: &Slot,
         turn: TurnNumber,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+        self.reserve(&self.slots, (slot, turn), Pool::Slots).await
+    }
+
+    /// Waits for a resident lane, FIFO daemon-wide, for a dispatch that
+    /// needs a new lane (runtime §8 session lanes, critical r3 #3): the
+    /// lane holds it until it has ended ([`Self::reserve`] at
+    /// `core.dispatch.awaiting_lane`). Blocked, it has the least recently
+    /// used idle lane retired for it (critical r4 #2,
+    /// [`Self::press_resident`]).
+    async fn reserve_resident(
+        &self,
+        slot: &Slot,
+        turn: TurnNumber,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.reserve(&self.resident, (slot, turn), Pool::Resident)
+            .await
+    }
+
+    /// Waits for a permit of `pool`, FIFO daemon-wide, the turn still
+    /// queued (design §3.1 capacity wait). The acquire future stays pinned
+    /// across slot wakes, so the turn keeps its place; each wake re-checks
+    /// that `turn` is still the `Waiting` head with no close order (a
+    /// cancel or a close order changes it). `None` once force is accepted
+    /// or Store failure is pending (the force signal carries both), or once
+    /// the head changed: the permit, if any, is dropped and the dispatcher
+    /// decides again. Test builds: `kind`'s point acknowledges the
+    /// registered wait.
+    async fn reserve(
+        &self,
+        pool: &Arc<tokio::sync::Semaphore>,
+        (slot, turn): (&Slot, TurnNumber),
+        kind: Pool,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = kind;
+        if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
             return Some(permit);
         }
         let mut force = self.signal.force.subscribe();
-        let acquire = Arc::clone(&self.slots).acquire_owned();
+        let acquire = Arc::clone(pool).acquire_owned();
         tokio::pin!(acquire);
         // One poll registers the waiter in the semaphore's FIFO queue.
         tokio::select! {
@@ -444,12 +595,12 @@ impl Engine {
             permit = &mut acquire => return permit.ok().filter(|_| slot.waiting_head(turn)),
             () = std::future::ready(()) => {}
         }
+        // A resident wait is owed an idle lane's retirement (critical r4
+        // #2): the lane's end frees the permit this waiter takes in turn.
+        let _pressed = matches!(kind, Pool::Resident).then(|| self.press_resident());
         // The reservation is pending and registered (design §10).
         #[cfg(feature = "test-failpoints")]
-        if via_store::failpoint::hit_async("core.dispatch.awaiting_slot")
-            .await
-            .is_err()
-        {
+        if via_store::failpoint::hit_async(kind.point()).await.is_err() {
             return None;
         }
         loop {
@@ -617,20 +768,18 @@ impl Engine {
     /// after a force stop. The turn's stop channels move from its claim into
     /// this loop, which observes its order, keeps its idle deadline and marks
     /// it `settling` once `execute` returned (design §2, §5).
-    /// A submitted turn's start facts, and the directory it runs in: the
-    /// session's frozen `cwd` (design §11.1), or the fake's default for a
-    /// session frozen without one.
+    /// A submitted turn's start facts: the session's frozen `cwd` (design
+    /// §11.1), or the daemon's startup directory for a session frozen
+    /// without one (§5.1 #22).
     fn started(
         &self,
         session: &SessionId,
         turn: TurnNumber,
         queued: QueuedTurn,
         (submitted, clock): (SystemTime, Instant),
-    ) -> (Started, PathBuf) {
-        let cwd = queued
-            .cwd
-            .map_or_else(|| self.adapter.fake_cwd().to_path_buf(), PathBuf::from);
-        let started = Started {
+    ) -> Started {
+        let cwd = queued.cwd.map_or_else(|| self.cwd.clone(), PathBuf::from);
+        Started {
             session: session.clone(),
             turn,
             queued_at: queued.queued_at,
@@ -638,15 +787,15 @@ impl Engine {
             cwd: cwd.to_str().map(str::to_owned),
             submitted: Some((rfc3339(submitted), clock)),
             folder: Some(self.evidence_folder(session, turn)),
-        };
-        (started, cwd)
+        }
     }
 
     async fn run(
         &self,
         slot: &Slot,
         submission: Submission,
-        capacity: tokio::sync::OwnedSemaphorePermit,
+        (lane, prepared, capacity): (&Lane, Prepared, Option<tokio::sync::OwnedSemaphorePermit>),
+        inbox: &mut Inbox,
     ) {
         let Submission {
             session,
@@ -657,7 +806,7 @@ impl Engine {
             submitted,
             clock,
         } = submission;
-        let (started, cwd) = self.started(&session, turn, queued, (submitted, clock));
+        let started = self.started(&session, turn, queued, (submitted, clock));
         // Design §2 [r1.11]: both deadlines run from the submission clock.
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
@@ -674,13 +823,18 @@ impl Engine {
             idle: effective.idle(),
             final_text: FinalText::new(),
         };
+        // C2 §2 `TurnSpec`: the intake carries no other per-turn value yet.
+        let spec = TurnSpec {
+            prompt,
+            ..TurnSpec::default()
+        };
+        let cx = self.turn_cx(turn, (prepared, capacity), activity, (deadline, route_stop));
         let driven = self
             .execute(
                 &mut record,
-                (prompt, cwd, &effective, activity),
-                (deadline, route_stop),
-                Box::new(capacity),
-                &mut control,
+                (lane, &effective),
+                (spec, cx),
+                (&mut control, inbox),
             )
             .await;
         let (cause, journal_uncertain) = driven.store_facts();
@@ -695,8 +849,8 @@ impl Engine {
         }
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("core.run.settling").await;
-        let outcome = match driven {
-            Driven::Finished(outcome) => outcome,
+        let (vendor, outcome) = match driven {
+            Driven::Finished(finished) => *finished,
             Driven::Forced(forced) => {
                 // Task 4 design §2.3: the text Core holds is completed text;
                 // the forced terminal keeps it.
@@ -710,7 +864,7 @@ impl Engine {
         // evidence and the order.
         let disposed = dispose(
             record.accepted.is_some(),
-            outcome,
+            (vendor.as_ref(), outcome),
             order.as_ref(),
             deadline.instant(),
         );
@@ -732,10 +886,7 @@ impl Engine {
         let text_failed = self
             .settle_final_text(&mut control, &mut record, &mut terminal)
             .await;
-        if record.steps.unrepresentable() {
-            // Refused after `execute` returned, when no order could reach it.
-            terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
-        }
+        refused_evidence(&record, &mut terminal);
         if record.first_failure.is_some() {
             // Acceptance or an observation could not be recorded after dispatch.
             terminal.fail(FailureClass::Store, "a turn event could not be recorded");
@@ -926,7 +1077,9 @@ impl Engine {
             self.unresolved.fail(session, turn, TurnState::Queued);
             return Cancelled::Latched;
         }
-        let close = closing && !self.unresolved.others(session, turn);
+        // Design §6.8 step 3 (Sol r4 R4): never before the session's lane
+        // drain completes; the closure pass closes it after.
+        let close = closing && !self.unresolved.others(session, turn) && self.lane_drained(session);
         #[cfg(test)]
         if closing {
             self.hold(&self.faults.hold_after_close_check).await;
@@ -1085,21 +1238,44 @@ impl Engine {
         cancel_cause: Option<CancelCause>,
     ) -> Result<(), ApiError> {
         let extras = TerminalExtras { cancel_cause };
-        let mode = Commit {
-            retry: record.first_failure.is_none(),
-            latch: Some(&self.signal),
+        let mut record = record;
+        let retry = record.first_failure.is_none();
+        // C1 §5, §7.6 (Sol r2 #8): the spill write and the terminal are one
+        // logical commit with one retry; a spill that took it leaves the
+        // terminal none, and its first failure is reported as a retried
+        // commit's is.
+        let (finished, kept) = if let Some(spill_retried) = self.spill(&mut record, retry).await {
+            let kept = (record.clone(), terminal.clone());
+            let mode = Commit {
+                retry: retry && !spill_retried,
+                latch: Some(&self.signal),
+            };
+            let finished = Self::finish_turn_with(
+                &self.store,
+                &self.unresolved,
+                &started,
+                (record, terminal),
+                false,
+                extras,
+                mode,
+            )
+            .await
+            .map(|durable| Durable {
+                retried: durable.retried || spill_retried,
+                ..durable
+            });
+            (finished, kept)
+        } else {
+            // C1 §5, §7.6: the file write is part of the commit naming it,
+            // so that commit failed and nothing was written.
+            self.unresolved
+                .fail(&started.session, started.turn, TurnState::Running);
+            let unended = Unended {
+                error: ApiError::STORE,
+                outcome: WriteOutcome::NotCommitted,
+            };
+            (Err(unended), (record, terminal))
         };
-        let kept = (record.clone(), terminal.clone());
-        let finished = Self::finish_turn_with(
-            &self.store,
-            &self.unresolved,
-            &started,
-            (record, terminal),
-            false,
-            extras,
-            mode,
-        )
-        .await;
         if finished.is_err() {
             let (record, terminal) = kept;
             self.keep_affected(AffectedTurn {
@@ -1111,6 +1287,46 @@ impl Engine {
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
         self.finished(&started, &finished, None, sites).await;
         finished.map(drop).map_err(|unended| unended.error)
+    }
+
+    /// C1 §5: before the commit that names it, writes a structured output
+    /// over [`STRUCTURED_OUTPUT_INLINE`] encoded whole to the turn's
+    /// `structured_output.json`, synced with its folder, and puts the file
+    /// in its place; with `retry` a failed write is tried once more, taking
+    /// the commit's one retry. `Some(retried)` once written, or with
+    /// nothing to write: whether that took the retry. `None` when the
+    /// write failed: the commit that would name the file fails, and both
+    /// fields are `null`.
+    pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> Option<bool> {
+        let session = record.session.clone();
+        let turn = record.turn;
+        let Some(retained) = record.vendor.retained.as_mut() else {
+            return Some(false);
+        };
+        let Some(encoded) = retained
+            .structured_output
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .filter(|encoded| encoded.len() > STRUCTURED_OUTPUT_INLINE)
+        else {
+            return Some(false);
+        };
+        // Taken first: a write cut short by a caller's bound names nothing.
+        retained.structured_output = None;
+        for attempt in 0..=u8::from(retry) {
+            let written = self
+                .store
+                .write_structured_output(&session, turn, encoded.clone())
+                .await;
+            if let Ok(file) = written {
+                retained.structured_output_file = Some(StructuredOutputFile {
+                    path: file.path.display().to_string(),
+                    bytes: file.bytes,
+                });
+                return Some(attempt > 0);
+            }
+        }
+        None
     }
 
     /// Reports a terminal commit to the failure hook: a first attempt that
@@ -1286,72 +1502,111 @@ impl Engine {
         committed
     }
 
-    /// Drives the adapter under the turn deadline, handling each observation it
-    /// reports in decode order before the adapter outcome is returned. A force stop
-    /// reaches Route, which force-closes the group and drains its output first:
-    /// messages it read are still handled.
+    /// The turn's context (C2 §2 `TurnCx`): the connection slot Core
+    /// reserved, if any, the activity clock, the wall deadline, the stop
+    /// order and the daemon force.
+    fn turn_cx(
+        &self,
+        turn: TurnNumber,
+        (prepared, capacity): (Prepared, Option<tokio::sync::OwnedSemaphorePermit>),
+        activity: TurnActivity,
+        (wall, stop): (Deadline, StopWatch),
+    ) -> TurnCx {
+        TurnCx {
+            turn,
+            prepared,
+            capacity: capacity.map(|permit| Box::new(permit) as via_adapters::CapacityToken),
+            activity,
+            wall,
+            tool_grace: TOOL_GRACE,
+            stop,
+            force: self.signal.force.subscribe(),
+        }
+    }
+
+    /// The session channel (C2 A1): 1,024 items and a 4 MiB byte budget;
+    /// an item's permit is held until it is handled. What arrived before
+    /// the turn is the session drain's (C2 §2), which keeps servicing the
+    /// turn's order and idle deadline (runtime §8). It is finite (critical
+    /// r1 #1): only what the channel held at the handover; what arrives
+    /// later is the running turn's to attribute.
+    async fn pre_turn_drain(
+        &self,
+        record: &mut TurnRecord,
+        lane: &Lane,
+        control: &mut Control<'_>,
+        inbox: &mut Inbox,
+    ) {
+        let mut handled = 0;
+        for _ in 0..inbox.len() {
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
+            self.between_items(record, control, &mut handled, true)
+                .await;
+            lane.dispose(admitted).await;
+        }
+    }
+
+    /// Runs the turn on the session's driver under the turn deadline,
+    /// handling each observation on the session channel, the lane actor's
+    /// `inbox`, in decode order before its result is acted on. What
+    /// arrived before the turn is handled first, as the session drain
+    /// handles it (C2 §2): durable items commit with their own
+    /// attribution, late ones of earlier turns `late: true` (AD4),
+    /// session-level ones with no turn; the turn's record then takes the
+    /// identity that drain may have committed (Sol r3 N7). A force stop
+    /// reaches Route, which force-closes the group and drains its output
+    /// first: messages it read are still handled. What the driver
+    /// delivered before it returned is handled one item at a time, each
+    /// taken only once the one before it is done (Sol r3 N2).
     ///
-    /// The turn's stop order reaches Route through `stop`; this loop observes
-    /// it once (design §2), and orders the idle deadline itself when no
-    /// meaningful progress came within the idle budget (design §5).
+    /// The turn's stop order reaches Route through its `TurnCx`; this loop
+    /// observes it once (design §2), and orders the idle deadline itself
+    /// when no meaningful progress came within the idle budget (design §5).
     async fn execute(
         &self,
         record: &mut TurnRecord,
-        (prompt, cwd, effective, activity): (String, PathBuf, &Effective, TurnActivity),
-        (deadline, stop): (Deadline, StopWatch),
-        capacity: via_adapters::CapacityToken,
-        control: &mut Control<'_>,
+        (lane, effective): (&Lane, &Effective),
+        (spec, cx): (TurnSpec, TurnCx),
+        (control, inbox): (&mut Control<'_>, &mut Inbox),
     ) -> Driven {
-        // Design §2.3: 1,024 items and a 4 MiB byte budget; an item's permit
-        // is held until it is handled.
-        let (sink, mut observed_rx) = via_adapters::observation_channel();
-        let mut execute = Box::pin(self.adapter.execute(
-            record.session.clone(),
-            record.turn,
-            (prompt, cwd),
-            sink,
-            activity,
-            deadline,
-            self.signal.force.subscribe(),
-            stop,
-            capacity,
-        ));
+        self.pre_turn_drain(record, lane, control, inbox).await;
+        if matches!(cx.prepared, Prepared::NeedsConnection) {
+            // The turn opens a connection generation (C2 §2, critical r1
+            // #5): ownership is scoped to it, once the older generation's
+            // items above were disposed of.
+            lane.new_generation();
+        }
+        record.vendor.identity = lane.identity();
+        let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
-        // adapter keeps servicing its controls; a result it returns early is
-        // kept and acted on after the commit.
+        // driver keeps servicing its controls; a result it returns early is
+        // kept, with the channel's count at that return, and acted on after
+        // the commit.
         let mut early = None;
-        let result = loop {
-            if let Some(result) = early.take() {
-                break result;
+        // Items the fired idle deadline handled, for the control checks.
+        let mut frontier = 0;
+        let end = loop {
+            if let Some(end) = early.take() {
+                break end;
             }
             let idle_at = control.idle_at;
+            // Critical r1b #12 (runtime §8): biased, controls first. A ready
+            // order or idle deadline is serviced before the next data item,
+            // and the driver's return before it too: the final drain then
+            // takes what was delivered by the return (critical r1 #1), and
+            // a never-empty channel cannot hold the run's end.
             tokio::select! {
-                Some(admitted) = observed_rx.recv() => {
-                    let AdmittedObservation { observation, permit } = admitted;
-                    if let Some(idle_at) = control.idle_at.as_mut()
-                        && progress(&observation)
-                    {
-                        *idle_at = tokio::time::Instant::now() + control.idle;
-                    }
-                    while_polling(&mut execute, &mut early, async {
-                        // Test builds: Core holds before handling an observation.
-                        #[cfg(feature = "test-failpoints")]
-                        let _ = via_store::failpoint::hit_async("core.observations.pause").await;
-                        self.observe(record, effective, control, observation).await;
-                    })
-                    .await;
-                    // Handled: its bytes return to the budget.
-                    drop(permit);
-                    stop_for_store(record, control);
-                }
+                biased;
                 changed = control.orders.changed(), if !control.observed => {
                     let order = changed
                         .ok()
                         .and_then(|()| control.orders.borrow_and_update().clone());
                     if let Some(order) = order {
                         while_polling(
-                            &mut execute,
-                            &mut early,
+                            (&mut run, &mut early),
+                            || inbox.len(),
                             self.observe_order(record, control, &order),
                         )
                         .await;
@@ -1359,19 +1614,57 @@ impl Engine {
                     }
                 }
                 () = sleep_until_some(idle_at), if idle_at.is_some() => {
-                    // Design §5: no meaningful progress within the budget.
-                    control.idle_at = None;
-                    // The timer fired; its order is not issued yet (design §10).
-                    #[cfg(feature = "test-failpoints")]
-                    let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
-                    control.slot.idle_order(control.turn, tokio::time::Instant::now());
+                    // Design §5, decided at the item frontier (critical r3
+                    // #1).
+                    self.idle_fired(
+                        record,
+                        (lane, effective),
+                        control,
+                        (&mut run, &mut early),
+                        (inbox, idle_at),
+                    )
+                    .await;
+                    super::lane::ready_item(&mut frontier).await;
                 }
-                result = &mut execute => break result,
+                end = &mut run => {
+                    // What the driver delivered by its return (critical
+                    // r2 F2), counted at its first `Ready`.
+                    let delivered = inbox.len();
+                    // Test builds: the driver's turn returned.
+                    #[cfg(feature = "test-failpoints")]
+                    let _ = via_store::failpoint::hit_async("core.run.returned").await;
+                    break (end, delivered);
+                }
+                Some(admitted) = inbox.recv() => {
+                    self.run_item(
+                        record,
+                        (lane, effective),
+                        control,
+                        (&mut run, &mut early),
+                        (admitted, &*inbox),
+                    )
+                    .await;
+                }
             }
         };
-        self.drain(record, effective, control, &mut observed_rx)
+        // The driver delivered the turn's items before it returned.
+        let (end, delivered) = end;
+        self.final_drain(record, (Some(lane), effective), control, (inbox, delivered))
             .await;
-        match result {
+        let TurnEnd {
+            terminal,
+            instance,
+            leftovers: _,
+            outcome,
+        } = end;
+        // AD7: the version the turn's own instance reported, on every
+        // outcome once its handshake was read.
+        record.vendor.instance = instance.map(|instance| {
+            let tested = instance.version_status == VersionStatus::Tested;
+            (instance.vendor_version, tested)
+        });
+        record.vendor.retained = terminal.as_ref().map(Retained::of);
+        match outcome {
             Err(AdapterError::Route(route))
                 if matches!(route.cause, RouteError::ForceStopped { .. }) =>
             {
@@ -1390,53 +1683,224 @@ impl Engine {
                     journal_uncertain: route.journal_uncertain,
                 })
             }
-            result => Driven::Finished(result),
+            outcome => Driven::Finished(Box::new((terminal, outcome))),
         }
     }
 
-    /// Handles the observations still queued when `execute` completed, in
-    /// decode order. A failed write sends or upgrades the turn's order to
-    /// cause `store`, as in the observation branch (design §7.2 row 5).
-    async fn drain(
+    /// Handles one item the running turn's loop took, in decode order,
+    /// while the driver is polled (design §9); the driver's first `Ready`
+    /// keeps the channel's count then ([`while_polling`]). The turn's own
+    /// meaningful progress moves its idle deadline ([`note_progress`]).
+    async fn run_item<E>(
         &self,
         record: &mut TurnRecord,
+        (lane, effective): (&Lane, &Effective),
+        control: &mut Control<'_>,
+        run: (&mut E, &mut Option<(TurnEnd, usize)>),
+        (admitted, inbox): (Admitted, &Inbox),
+    ) where
+        E: std::future::Future<Output = TurnEnd> + Unpin,
+    {
+        let Admitted { item, permit } = admitted;
+        note_progress(lane, control, &item);
+        while_polling(run, || inbox.len(), async {
+            // Test builds: Core holds before handling an observation.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.observations.pause").await;
+            self.observe(record, Some(lane), effective, control, item)
+                .await;
+        })
+        .await;
+        // Handled: its bytes return to the budget.
+        drop(permit);
+        stop_for_store(record, control);
+    }
+
+    /// The turn's idle deadline fired (Task 4 design §5), decided at the
+    /// item frontier (critical r3 #1): the turn expires only when the
+    /// channel is empty or its next item was decoded after the deadline
+    /// (its own `at`). That item, taken to read it, is then handled after
+    /// the idle order, as ordinary late progress. Otherwise the next item
+    /// is handled now, in order, as the run loop handles it ([`Self::run_item`]):
+    /// the turn's own progress moves the deadline by its `at`, and the loop
+    /// fires again while the deadline stays passed, the turn's order
+    /// checked first each time (runtime §8). It is finite: only items
+    /// decoded before a deadline qualify, and the deadline moves only on
+    /// progress.
+    async fn idle_fired<E>(
+        &self,
+        record: &mut TurnRecord,
+        (lane, effective): (&Lane, &Effective),
+        control: &mut Control<'_>,
+        run: (&mut E, &mut Option<(TurnEnd, usize)>),
+        (inbox, deadline): (&mut Inbox, Option<tokio::time::Instant>),
+    ) where
+        E: std::future::Future<Output = TurnEnd> + Unpin,
+    {
+        let next = inbox.try_recv();
+        let expires = next
+            .as_ref()
+            .is_none_or(|admitted| deadline.is_none_or(|deadline| admitted.item.at > deadline));
+        if expires {
+            control.idle_at = None;
+            // The timer fired; its order is not issued yet (design §10).
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
+            control
+                .slot
+                .idle_order(control.turn, tokio::time::Instant::now());
+        }
+        if let Some(admitted) = next {
+            self.run_item(record, (lane, effective), control, run, (admitted, &*inbox))
+                .await;
+        }
+    }
+
+    /// The turn's final drain (Sol r3 N2): what the driver delivered
+    /// before it returned, the `delivered` items the channel held then,
+    /// handled one item at a time in decode order, each taken only once the
+    /// one before it is done, while the turn's order is still serviced
+    /// (runtime §8, Sol r4 R5). It is finite (critical r1 #1): the
+    /// terminal follows, and what arrives later is the lane actor's
+    /// between turns. The count is read at the driver's first `Ready`, even
+    /// when it returned during a commit (critical r2 F2).
+    async fn final_drain(
+        &self,
+        record: &mut TurnRecord,
+        (lane, effective): (Option<&Lane>, &Effective),
+        control: &mut Control<'_>,
+        (inbox, delivered): (&mut Inbox, usize),
+    ) {
+        let mut handled = 0;
+        for _ in 0..delivered {
+            let Some(admitted) = inbox.try_recv() else {
+                break;
+            };
+            self.between_items(record, control, &mut handled, false)
+                .await;
+            self.drain_one(record, lane, effective, control, admitted)
+                .await;
+        }
+    }
+
+    /// Services the turn's controls before each ready item of a drain
+    /// (runtime §8: at most 128 ready data items between checks; Sol r4
+    /// R5): an order not yet observed is observed, and, `before` the
+    /// turn's run, an idle deadline that passed issues its order, as the
+    /// run loop does. Every [`super::lane::READY_ITEMS`]th item yields. The
+    /// driver's health is its own during the run, and the lane's actor's
+    /// between turns. After the run returned no deadline is issued: the
+    /// turn already ended.
+    async fn between_items(
+        &self,
+        record: &mut TurnRecord,
+        control: &mut Control<'_>,
+        handled: &mut usize,
+        before: bool,
+    ) {
+        let now = tokio::time::Instant::now();
+        if before && control.idle_at.is_some_and(|idle_at| idle_at <= now) {
+            control.idle_at = None;
+            control.slot.idle_order(control.turn, now);
+        }
+        if !control.observed && control.orders.has_changed().unwrap_or(false) {
+            let order = control.orders.borrow_and_update().clone();
+            if let Some(order) = order {
+                self.observe_order(record, control, &order).await;
+                stop_for_store(record, control);
+            }
+        }
+        super::lane::ready_item(handled).await;
+    }
+
+    /// Handles one observation queued on the session channel, in decode
+    /// order, and returns its budget. A failed write sends or upgrades the
+    /// turn's order to cause `store`, as in the observation branch (design
+    /// §7.2 row 5).
+    async fn drain_one(
+        &self,
+        record: &mut TurnRecord,
+        lane: Option<&Lane>,
         effective: &Effective,
         control: &mut Control<'_>,
-        observed: &mut mpsc::Receiver<AdmittedObservation>,
+        Admitted { item, permit }: Admitted,
     ) {
-        while let Ok(AdmittedObservation {
-            observation,
-            permit,
-        }) = observed.try_recv()
-        {
-            self.observe(record, effective, control, observation).await;
-            drop(permit);
-            stop_for_store(record, control);
-        }
+        self.observe(record, lane, effective, control, item).await;
+        drop(permit);
+        stop_for_store(record, control);
+    }
+
+    /// Test builds: runs the running turn of `slot` on `lane` as `run`
+    /// does, with the run loop's own order receiver and `inbox` for the
+    /// session channel.
+    #[cfg(test)]
+    pub(super) async fn execute_turn(
+        &self,
+        (slot, lane): (&Slot, &Lane),
+        (record, effective): (&mut TurnRecord, &Effective),
+        (orders, inbox): (watch::Receiver<Option<StopOrder>>, &mut Inbox),
+        (spec, cx): (TurnSpec, TurnCx),
+    ) {
+        self.execute_turn_idle(
+            (slot, lane),
+            (record, effective),
+            (orders, inbox),
+            (spec, cx),
+            None,
+        )
+        .await;
+    }
+
+    /// Test builds: [`Self::execute_turn`] with an idle budget, its
+    /// deadline running from now.
+    #[cfg(test)]
+    pub(super) async fn execute_turn_idle(
+        &self,
+        (slot, lane): (&Slot, &Lane),
+        (record, effective): (&mut TurnRecord, &Effective),
+        (orders, inbox): (watch::Receiver<Option<StopOrder>>, &mut Inbox),
+        (spec, cx): (TurnSpec, TurnCx),
+        idle: Option<Duration>,
+    ) {
+        let mut control = Control {
+            slot,
+            turn: record.turn,
+            orders,
+            observed: false,
+            stored: false,
+            refused: false,
+            idle_at: idle.map(|idle| tokio::time::Instant::now() + idle),
+            idle: idle.unwrap_or_default(),
+            final_text: FinalText::new(),
+        };
+        let _driven = self
+            .execute(record, (lane, effective), (spec, cx), (&mut control, inbox))
+            .await;
     }
 
     /// Test builds: drains `queued` for the running `turn` of `slot` as
-    /// `execute`'s completion does, with the run loop's own order receiver.
+    /// `execute`'s completion does, with the run loop's own order receiver
+    /// and the session's `lane`; without one every item is the running
+    /// turn's.
     #[cfg(test)]
     pub(super) async fn drain_queued(
         &self,
-        slot: &Slot,
+        (slot, lane): (&Slot, Option<&Lane>),
         record: &mut TurnRecord,
         effective: &Effective,
         orders: watch::Receiver<Option<StopOrder>>,
-        queued: Vec<FakeObservation>,
+        queued: Vec<ObservationItem>,
     ) {
-        let (sender, mut observed) = mpsc::channel(queued.len().max(1));
         let budget = Arc::new(tokio::sync::Semaphore::new(queued.len()));
-        for observation in queued {
-            if let Ok(permit) = Arc::clone(&budget).try_acquire_owned() {
-                let _ = sender.try_send(AdmittedObservation {
-                    observation,
-                    permit,
-                });
-            }
-        }
-        drop(sender);
+        let queued: Vec<Admitted> = queued
+            .into_iter()
+            .map(|item| Admitted {
+                item,
+                permit: Arc::clone(&budget)
+                    .try_acquire_owned()
+                    .expect("one permit per item"),
+            })
+            .collect();
         let mut control = Control {
             slot,
             turn: record.turn,
@@ -1448,79 +1912,109 @@ impl Engine {
             idle: Duration::ZERO,
             final_text: FinalText::new(),
         };
-        self.drain(record, effective, &mut control, &mut observed)
-            .await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(queued.len().max(1));
+        for admitted in queued {
+            assert!(
+                sender.try_send(admitted).is_ok(),
+                "the channel holds every queued item"
+            );
+        }
+        drop(sender);
+        let mut inbox = Inbox::of(receiver);
+        let delivered = inbox.len();
+        self.final_drain(
+            record,
+            (lane, effective),
+            &mut control,
+            (&mut inbox, delivered),
+        )
+        .await;
     }
 
-    /// Handles one adapter observation in decode order: commits the
-    /// acceptance at the next sequence, and folds progress marks into the
-    /// step tracker, publishing each change to `slot` (Task 4 design §2.4).
-    /// After the first Store failure no event commits and the turn fails
-    /// `store`; progress still folds, and its rows ride in the terminal.
+    /// Handles one observation in decode order (C2 §4): commits the
+    /// acceptance at the next sequence; folds progress marks into the step
+    /// tracker, publishing each change to `slot` (Task 4 design §2.4), and
+    /// their usage into the turn's ledger (AD6); commits denials and
+    /// declines as events for the envelope's lists; and keeps a confirmed
+    /// identity. An item of an earlier, ended turn is late (AD4). After the
+    /// first Store failure no event commits and the turn fails `store`;
+    /// progress still folds, and its rows ride in the terminal.
     async fn observe(
         &self,
         record: &mut TurnRecord,
+        lane: Option<&Lane>,
         effective: &Effective,
         control: &mut Control<'_>,
-        observation: FakeObservation,
+        item: ObservationItem,
     ) {
         let slot = control.slot;
-        match observation {
-            FakeObservation::Accepted(observation) => {
-                if let Some(delta) = record.steps.accept() {
-                    slot.publish_progress(record.turn, &delta);
-                }
-                // Route admits one acceptance; a repeat would be deduplicated anyway.
-                if record.first_failure.is_some() || record.accepted.is_some() {
+        let vendor_turn = item
+            .vendor_turn
+            .as_ref()
+            .map(|turn| turn.as_str().to_owned());
+        // C2 §2: a confirmed identity is the session's, whichever vendor
+        // turn its message names.
+        if let Observation::IdentityConfirmed(identity) = item.observation {
+            self.confirm_identity(record, lane, identity).await;
+            return;
+        }
+        // The acceptance is the running turn's by its correlation with the
+        // turn's start (C2 §4.1): it maps the vendor turn it names, which
+        // only then is current (Sol r2 #5).
+        let attribution = match (&item.observation, lane) {
+            (Observation::Accepted(_), _) | (_, None) => Attribution::Current,
+            (_, Some(lane)) => lane.attribute(vendor_turn.as_deref(), Some(record.turn)),
+        };
+        match attribution {
+            Attribution::Current => {}
+            Attribution::Late(turn) => {
+                self.observe_other(record, (Some(turn.get()), true), item.observation)
+                    .await;
+                return;
+            }
+            Attribution::Session => {
+                self.observe_other(record, (None, false), item.observation)
+                    .await;
+                return;
+            }
+            // C2 §2: an expired vendor turn's traffic is dropped; it is
+            // never another turn's or the session's.
+            Attribution::Expired => return,
+        }
+        match item.observation {
+            Observation::Accepted(acceptance) => {
+                let mapped = acceptance_turn(&acceptance, vendor_turn.as_deref());
+                if map_acceptance(record, lane, control, mapped) == Mapped::Collided {
+                    // An ID the lane maps to another turn, or tombstoned,
+                    // establishes nothing.
                     return;
                 }
-                let shared = Arc::clone(&record.head);
-                let head = match shared.lock(&self.store, &record.session).await {
-                    Ok(head) => head,
-                    Err(error) => {
-                        // The head's read failed: nothing was written;
-                        // corruption latches (design §7.1).
-                        self.event_failed(record, WriteOutcome::of_read(&error))
-                            .await;
-                        return;
-                    }
-                };
-                let seq = head.next();
-                match self
-                    .accept(&record.session, record.turn, seq, effective, observation)
-                    .await
-                {
-                    Ok(accepted) => {
-                        head.committed(1);
-                        record.accepted = Some(accepted);
-                    }
-                    Err((outcome, sent)) => {
-                        if outcome.head_unknown() {
-                            head.lost();
-                            if let Some((accepted, event)) = sent {
-                                record.uncertain = Some(UncertainEvent {
-                                    seq,
-                                    event,
-                                    accepted: Some(accepted),
-                                });
-                            }
-                        } else {
-                            drop(head);
-                        }
-                        // The head lock is released before the latch takes
-                        // admission; corruption latches (design §7.1).
-                        self.event_failed(record, outcome).await;
-                    }
-                }
+                let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref()).map_or_else(
+                    || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
+                    |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
+                );
+                let vendor_turn_id = acceptance
+                    .vendor_turn_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned());
+                let running = lane.and_then(|lane| lane.driver.adapter_version());
+                self.observe_acceptance(
+                    record,
+                    slot,
+                    effective,
+                    (correlation, vendor_turn_id, running),
+                )
+                .await;
             }
-            FakeObservation::Data {
-                observation: Observation::Progress(marks),
-            } => {
+            Observation::Progress(marks) => {
                 // A refused item changes nothing; the run loop stops the
                 // turn `protocol` (review r1).
-                let Ok(folded) = record.steps.fold(&marks) else {
+                let Ok(folded) = record.steps.fold(&marks, item.at) else {
                     return;
                 };
+                if let Some(usage) = &marks.usage {
+                    record.vendor.ledger.add(usage);
+                }
                 if let Some(row) = folded.row {
                     // Design §3.2: a boundary publishes the new step first,
                     // then commits the ended step's row.
@@ -1532,9 +2026,7 @@ impl Engine {
                     slot.publish_progress(record.turn, &folded.delta);
                 }
             }
-            FakeObservation::Data {
-                observation: Observation::FinalText(piece),
-            } => {
+            Observation::FinalText(piece) => {
                 // Design §6.4: inline up to 256 KiB encoded, else the file;
                 // a failed file step fails the turn `store` as a known
                 // `NotCommitted` does (§3.2).
@@ -1548,6 +2040,277 @@ impl Engine {
                     self.final_text_failed(record).await;
                 }
             }
+            Observation::ActionDenied(denial) => {
+                let own = (Some(record.turn.get()), false);
+                self.commit_denial(record, own, denial).await;
+            }
+            Observation::RequestDeclined(decline) => {
+                let own = (Some(record.turn.get()), false);
+                self.commit_decline(record, own, decline).await;
+            }
+            Observation::Warning(warning) => self.own_warning(record, warning).await,
+            // C2 §4: a mismatch commits nothing itself; the turn is
+            // disposed from its end (r3). A vendor close has no C1 event:
+            // the driver ends the connection, and the turn's end carries
+            // what it did to the turn. Core routes no steer, so no steer
+            // report comes. An identity was handled before attribution.
+            Observation::IdentityConfirmed(_)
+            | Observation::ResumeMismatch { .. }
+            | Observation::VendorClosed(_)
+            | Observation::SteerDelivered(_)
+            // Discarded until via-jm4.35: a late terminal's revision
+            // write is not in the Store yet.
+            | Observation::LateTerminal(_) => {}
+        }
+    }
+
+    /// Commits the running turn's own adapter warning; one of C1 §5's
+    /// closed list, once committed, is also its envelope's, once per code
+    /// ([`Warning::adapter`]).
+    async fn own_warning(&self, record: &mut TurnRecord, warning: via_adapters::Warning) {
+        let own = (Some(record.turn.get()), false);
+        // Sol r3 N8: retained within its caps, as the envelope reports it.
+        let listed = Warning::adapter(warning.code, warning.data.clone()).map(Warning::capped);
+        let committed = self.commit_warning(record, own, warning).await;
+        if let (Some(_), Some(listed)) = (committed, listed)
+            && !record
+                .vendor
+                .warnings
+                .iter()
+                .any(|kept| kept.code() == listed.code())
+        {
+            record.vendor.warnings.push(listed);
+        }
+    }
+
+    /// Commits an adapter-reported `warning` event attributed to `(turn,
+    /// late)` (C1 §6.1), within C1 §5's caps: `message` cut to 1 KiB
+    /// encoded, `data` over 4 KiB encoded left out. Its sequence once it
+    /// committed.
+    async fn commit_warning(
+        &self,
+        record: &mut TurnRecord,
+        attributed: (Option<u32>, bool),
+        warning: via_adapters::Warning,
+    ) -> Option<u64> {
+        let at = rfc3339(SystemTime::now());
+        let body = EventBody::warning(warning.code, &warning.message, warning.data);
+        let failed = record.first_failure.is_some();
+        let seq = journal::commit_event_as(&self.store, record, body, &at, attributed).await;
+        self.report_first_failure(record, failed).await;
+        seq
+    }
+
+    /// Commits a confirmed identity (C2 §2 delayed identity, C1 §6.1):
+    /// the first confirmation of a connection generation commits exactly
+    /// one `session.opened` (the session's first) or `session.reopened`,
+    /// carrying the ID and transcript hint, before any acceptance of the
+    /// same message, which the driver sends after it. Only a committed
+    /// identity becomes the session's (decision H3: the journal holds it);
+    /// a failed commit is the turn's first failure. Only the driver's
+    /// current generation counts; that generation confirming again with a
+    /// new transcript hint writes the session's columns with no event (Sol
+    /// r2 #4).
+    async fn confirm_identity(
+        &self,
+        record: &mut TurnRecord,
+        lane: Option<&Lane>,
+        identity: via_adapters::observation::Identity,
+    ) {
+        let confirmed = Lane::confirmed(lane, &identity);
+        let Some(lane) = lane else {
+            record.vendor.identity = Some(confirmed);
+            return;
+        };
+        // A stale generation's confirmation counts nothing (C2 §2).
+        if !lane.current(&identity.connection_id) {
+            return;
+        }
+        let vendor_version = identity.vendor_version.clone();
+        let opened = lane.open_event(&identity.connection_id, &confirmed, vendor_version);
+        let opened_event = opened.is_some();
+        if opened.is_none() && !lane.changes(&confirmed) {
+            record.vendor.identity = Some(confirmed);
+            return;
+        }
+        if record.first_failure.is_some() {
+            return;
+        }
+        let written = match opened {
+            Some(body) => {
+                let at = rfc3339(SystemTime::now());
+                journal::commit_session_event(
+                    &self.store,
+                    (&record.head, &record.session),
+                    (body, &at, (None, false)),
+                    Some(confirmed.columns()),
+                )
+                .await
+            }
+            // The same generation again, naming more: its columns, with
+            // no event.
+            None => {
+                journal::commit_identity_columns(&self.store, &record.session, confirmed.columns())
+                    .await
+            }
+        };
+        match written {
+            journal::SessionWrite::Committed => {
+                if opened_event {
+                    lane.opened(identity.connection_id, confirmed.clone());
+                } else {
+                    lane.confirm(confirmed.clone());
+                }
+                record.vendor.identity = Some(confirmed);
+            }
+            journal::SessionWrite::Refused => {}
+            journal::SessionWrite::Failed(outcome) => {
+                record.first_failure = Some(FailureNote {
+                    site: FailureSite::Event,
+                    outcome,
+                });
+                self.report_first_failure(record, false).await;
+            }
+        }
+    }
+
+    /// Commits the turn's acceptance at the next sequence (C2 §4
+    /// `turn.accepted`), with its Store correlation, vendor turn ID and the
+    /// running adapter's version.
+    async fn observe_acceptance(
+        &self,
+        record: &mut TurnRecord,
+        slot: &Slot,
+        effective: &Effective,
+        evidence: (String, Option<String>, Option<String>),
+    ) {
+        if let Some(delta) = record.steps.accept() {
+            slot.publish_progress(record.turn, &delta);
+        }
+        // The driver admits one acceptance; a repeat would be deduplicated anyway.
+        if record.first_failure.is_some() || record.accepted.is_some() {
+            return;
+        }
+        let shared = Arc::clone(&record.head);
+        let head = match shared.lock(&self.store, &record.session).await {
+            Ok(head) => head,
+            Err(error) => {
+                // The head's read failed: nothing was written;
+                // corruption latches (design §7.1).
+                self.event_failed(record, WriteOutcome::of_read(&error))
+                    .await;
+                return;
+            }
+        };
+        let seq = head.next();
+        match self
+            .accept((&record.session, record.turn, seq), effective, evidence)
+            .await
+        {
+            Ok(accepted) => {
+                head.committed(1);
+                record.accepted = Some(accepted);
+            }
+            Err((outcome, sent)) => {
+                if outcome.head_unknown() {
+                    head.lost();
+                    if let Some((accepted, event)) = sent {
+                        record.uncertain = Some(UncertainEvent {
+                            seq,
+                            event,
+                            accepted: Some(accepted),
+                        });
+                    }
+                } else {
+                    drop(head);
+                }
+                // The head lock is released before the latch takes
+                // admission; corruption latches (design §7.1).
+                self.event_failed(record, outcome).await;
+            }
+        }
+    }
+
+    /// An observation that is not the running turn's (AD4, C1 §6.1, C2
+    /// §2), attributed to `(turn, late)`: of an earlier, ended turn with
+    /// `late: true`, or session-level with `turn: null`. A durable one, a
+    /// denial, a decline or a warning, is committed under the running
+    /// turn, the one the Store admits events for; it never changes an
+    /// envelope.
+    /// Non-durable ones are dropped, and so is a late terminal, until
+    /// via-jm4.35.
+    async fn observe_other(
+        &self,
+        record: &mut TurnRecord,
+        attributed: (Option<u32>, bool),
+        observation: Observation,
+    ) {
+        match observation {
+            Observation::ActionDenied(denial) => {
+                self.commit_denial(record, attributed, denial).await;
+            }
+            Observation::RequestDeclined(decline) => {
+                self.commit_decline(record, attributed, decline).await;
+            }
+            Observation::Warning(warning) => {
+                self.commit_warning(record, attributed, warning).await;
+            }
+            Observation::Accepted(_)
+            | Observation::IdentityConfirmed(_)
+            | Observation::Progress(_)
+            | Observation::FinalText(_)
+            | Observation::SteerDelivered(_)
+            | Observation::VendorClosed(_)
+            | Observation::ResumeMismatch { .. }
+            // Discarded until via-jm4.35: a late terminal's revision
+            // write is not in the Store yet.
+            | Observation::LateTerminal(_) => {}
+        }
+    }
+
+    /// Commits `action.denied` attributed to `(turn, late)`; the running
+    /// turn's own is kept for its envelope's `denied_actions`.
+    async fn commit_denial(
+        &self,
+        record: &mut TurnRecord,
+        (turn, late): (Option<u32>, bool),
+        denial: Denial,
+    ) {
+        let kind = denial_kind(denial.kind);
+        let at = rfc3339(SystemTime::now());
+        let body = denial_body(&denial);
+        let failed = record.first_failure.is_some();
+        let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
+        self.report_first_failure(record, failed).await;
+        let own = turn == Some(record.turn.get()) && !late;
+        if let (Some(seq), true) = (seq, own) {
+            let entry = DeniedAction::new((kind, denial.target, denial.reason), at, seq);
+            record.vendor.denied.push(entry);
+        }
+    }
+
+    /// Commits `vendor.request_declined` attributed to `(turn, late)`; the
+    /// running turn's own is kept for its envelope's
+    /// `auto_declined_requests`.
+    async fn commit_decline(
+        &self,
+        record: &mut TurnRecord,
+        (turn, late): (Option<u32>, bool),
+        decline: Decline,
+    ) {
+        let at = rfc3339(SystemTime::now());
+        let body = decline_body(&decline);
+        let failed = record.first_failure.is_some();
+        let seq = journal::commit_event_as(&self.store, record, body, &at, (turn, late)).await;
+        self.report_first_failure(record, failed).await;
+        let own = turn == Some(record.turn.get()) && !late;
+        if let (Some(seq), true) = (seq, own) {
+            let entry = AutoDeclined::new(
+                (decline.vendor_method, decline.summary, decline.blocking),
+                at,
+                seq,
+            );
+            record.vendor.declined.push(entry);
         }
     }
 
@@ -1790,13 +2553,15 @@ impl Engine {
     /// Commits vendor acceptance as C2 evidence and C1 `turn.started` together.
     /// A failure carries its classified outcome ([`WriteOutcome::of`]) and,
     /// when the head is unknown, the acceptance and the event sent.
+    /// `correlation` is the acceptance's tagged Store correlation: the
+    /// vendor turn ID, else the acceptance token. `adapter_version`, the running
+    /// adapter's, becomes the session's recorded one in the same commit
+    /// (C1 §3.3, decision H3).
     async fn accept(
         &self,
-        session: &SessionId,
-        turn: TurnNumber,
-        seq: u64,
+        (session, turn, seq): (&SessionId, TurnNumber, u64),
         effective: &Effective,
-        observation: FakeAcceptanceObservation,
+        (correlation, vendor_turn_id, adapter_version): (String, Option<String>, Option<String>),
     ) -> Result<Accepted, AcceptFailure> {
         let at = rfc3339(SystemTime::now());
         let event = Event {
@@ -1811,7 +2576,6 @@ impl Engine {
         }
         .to_value()
         .map_err(|_| (WriteOutcome::NotCommitted, None))?;
-        let vendor_turn_id = observation.vendor_turn_id.as_str().to_owned();
         // The vendor accepted; its acceptance is not yet recorded.
         #[cfg(feature = "test-failpoints")]
         if via_store::failpoint::hit_async("core.accept.before_commit")
@@ -1825,8 +2589,9 @@ impl Engine {
             .commit_acceptance(AcceptanceRecord {
                 session_id: session.clone(),
                 turn,
-                correlation: vendor_turn_id.clone(),
+                correlation,
                 event: event.clone(),
+                adapter_version,
             })
             .await;
         let accepted = Accepted { at, vendor_turn_id };
@@ -1856,7 +2621,6 @@ pub(super) fn ended_record(
     // Design §3.2: every terminal built from the record carries the rows it
     // could not commit and the open step's.
     let steps = record.steps.terminal_rows();
-    let usage = Usage::fake(record.steps.turn_tokens());
     let event = Event {
         seq,
         session_id: &started.session,
@@ -1882,16 +2646,14 @@ pub(super) fn ended_record(
         .submitted
         .as_ref()
         .and_then(|(_, clock)| u64::try_from(clock.elapsed().as_millis()).ok());
-    let envelope = terminal_envelope(
-        &started.session,
-        started.turn,
+    let envelope = turn_envelope(
+        (&started.session, started.turn),
         terminal,
         record.accepted,
         (started.cwd.clone(), started.folder.clone()),
-        timestamps,
-        duration_ms,
+        (timestamps, duration_ms),
         (started.first_seq, seq),
-        usage,
+        record.vendor,
     );
     let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
     Ok(TerminalRecord {
@@ -1928,6 +2690,27 @@ fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
     }
 }
 
+/// A daemon-wide pool a dispatch waits on with its turn queued
+/// ([`Engine::reserve`]).
+#[derive(Clone, Copy)]
+enum Pool {
+    /// Connection slots (design §11).
+    Slots,
+    /// Resident session lanes (runtime §8).
+    Resident,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Pool {
+    /// The point that acknowledges a registered wait on the pool.
+    fn point(self) -> &'static str {
+        match self {
+            Self::Slots => "core.dispatch.awaiting_slot",
+            Self::Resident => "core.dispatch.awaiting_lane",
+        }
+    }
+}
+
 /// The turn's absolute Core deadline from its own frozen wall budget (C1 §4)
 /// and that deadline's wall time, both from the submission clock (design §2
 /// [r1.11]). A budget too far off to represent never expires in practice.
@@ -1956,9 +2739,15 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
 }
 
 /// Awaits `commit` while polling the adapter's `execute` (design §9): a
-/// result it returns meanwhile is kept in `early`, and a completed
-/// `execute` is never polled again.
-async fn while_polling<E, F>(execute: &mut E, early: &mut Option<E::Output>, commit: F) -> F::Output
+/// result it returns meanwhile is kept in `early` with the session
+/// channel's count at that first `Ready`, read by `delivered` (critical r2
+/// F2: what the driver delivered by its return is the final drain's), and
+/// a completed `execute` is never polled again.
+async fn while_polling<E, F>(
+    (execute, early): (&mut E, &mut Option<(E::Output, usize)>),
+    delivered: impl Fn() -> usize,
+    commit: F,
+) -> F::Output
 where
     E: std::future::Future + Unpin,
     F: std::future::Future,
@@ -1968,24 +2757,160 @@ where
         tokio::select! {
             biased;
             output = &mut commit => return output,
-            result = &mut *execute => *early = Some(result),
+            result = &mut *execute => {
+                *early = Some((result, delivered()));
+                // Test builds: the driver's turn returned.
+                #[cfg(feature = "test-failpoints")]
+                let _ = via_store::failpoint::hit_async("core.run.returned").await;
+            }
         }
     }
     commit.await
 }
 
+/// Moves the running turn's idle deadline for `item`, the turn's own
+/// meaningful progress ([`current_progress`]) decoded before it, to the
+/// item's own `at` plus the idle budget (critical r2 F1): progress counts
+/// when it was decoded, not when Core reads it.
+fn note_progress(lane: &Lane, control: &mut Control<'_>, item: &ObservationItem) {
+    if let Some(idle_at) = control.idle_at.as_mut()
+        && item.at < *idle_at
+        && current_progress(lane, control.turn, item)
+    {
+        *idle_at = (*idle_at).max(item.at + control.idle);
+    }
+}
+
 /// Meaningful progress resets the idle deadline (Task 4 design §2.6):
 /// acceptance, and a `progress` item with a `model` mark or a tool start or
 /// end. Usage-only items never do; unknown messages send no item.
-fn progress(observation: &FakeObservation) -> bool {
+fn progress(observation: &Observation) -> bool {
     match observation {
-        FakeObservation::Accepted(_) => true,
-        FakeObservation::Data {
-            observation: Observation::Progress(marks),
-        } => marks.model || !marks.tools_started.is_empty() || !marks.tools_ended.is_empty(),
-        FakeObservation::Data {
-            observation: Observation::FinalText(_),
-        } => false,
+        Observation::Accepted(_) => true,
+        Observation::Progress(marks) => {
+            marks.model || !marks.tools_started.is_empty() || !marks.tools_ended.is_empty()
+        }
+        Observation::IdentityConfirmed(_)
+        | Observation::FinalText(_)
+        | Observation::ActionDenied(_)
+        | Observation::RequestDeclined(_)
+        | Observation::SteerDelivered(_)
+        | Observation::Warning(_)
+        | Observation::VendorClosed(_)
+        | Observation::ResumeMismatch { .. }
+        | Observation::LateTerminal(_) => false,
+    }
+}
+
+/// Maps an acceptance's vendor turn on the lane ([`Lane::map_vendor_turn`]).
+/// Sol r3 N6, critical r1 #6 (C2 §4.1): a collision or the tombstones'
+/// exhaustion failed the lane; the turn stops at once, once, and an
+/// exhausted one fails `overflow` ([`refused_evidence`]).
+fn map_acceptance(
+    record: &mut TurnRecord,
+    lane: Option<&Lane>,
+    control: &mut Control<'_>,
+    vendor_turn: Option<String>,
+) -> Mapped {
+    let mapped = match (lane, vendor_turn) {
+        (Some(lane), Some(vendor_turn)) => lane.map_vendor_turn(&vendor_turn, record.turn),
+        _ => Mapped::Taken,
+    };
+    if mapped != Mapped::Taken && !control.refused {
+        control.refused = true;
+        control
+            .slot
+            .protocol_order(control.turn, tokio::time::Instant::now());
+    }
+    record.vendor.overflowed |= mapped == Mapped::Exhausted;
+    mapped
+}
+
+/// The failure of vendor evidence Core refused, once the turn's record
+/// shows it: a token count (refused after `execute` returned, when no
+/// order could reach it), or an acceptance that exhausted the lane's
+/// tombstones, whose protocol order stopped the turn (critical r1 #6).
+fn refused_evidence(record: &TurnRecord, terminal: &mut Terminal) {
+    if record.steps.unrepresentable() {
+        terminal.fail(FailureClass::Protocol, super::terminal::TOKENS_STOP);
+    } else if record.vendor.overflowed {
+        terminal.fail(FailureClass::Overflow, super::terminal::OVERFLOW_STOP);
+    }
+}
+
+/// Whether `item` is meaningful progress of the running `turn` on `lane`,
+/// which resets the turn's idle deadline (critical r1 #7): its acceptance,
+/// the turn's by its correlation, or progress `lane` attributes to the
+/// turn. Late, expired and session-level progress never does.
+pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &ObservationItem) -> bool {
+    progress(&item.observation)
+        && (matches!(item.observation, Observation::Accepted(_))
+            || lane.attribute(
+                item.vendor_turn
+                    .as_ref()
+                    .map(via_adapters::VendorTurnId::as_str),
+                Some(turn),
+            ) == Attribution::Current)
+}
+
+/// The vendor turn an acceptance names: its own vendor turn ID, else the
+/// item's.
+fn acceptance_turn(acceptance: &Acceptance, item: Option<&str>) -> Option<String> {
+    acceptance
+        .vendor_turn_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned())
+        .or_else(|| item.map(str::to_owned))
+}
+
+/// `action.denied`'s body for `denial` (C1 §6.1).
+fn denial_body(denial: &Denial) -> EventBody {
+    EventBody::ActionDenied {
+        kind: denial_kind(denial.kind),
+        target: denial.target.clone(),
+        reason: denial.reason.clone(),
+    }
+}
+
+/// `vendor.request_declined`'s body for `decline` (C1 §6.1).
+fn decline_body(decline: &Decline) -> EventBody {
+    EventBody::RequestDeclined {
+        vendor_method: decline.vendor_method.clone(),
+        summary: decline.summary.clone(),
+        blocking: decline.blocking,
+    }
+}
+
+/// The event a durable session observation other than an identity
+/// commits (C1 §6.1): a denial, a decline or an adapter warning; else
+/// none.
+pub(super) fn held_body(observation: &Observation) -> Option<EventBody> {
+    match observation {
+        Observation::ActionDenied(denial) => Some(denial_body(denial)),
+        Observation::RequestDeclined(decline) => Some(decline_body(decline)),
+        Observation::Warning(warning) => Some(EventBody::warning(
+            warning.code,
+            &warning.message,
+            warning.data.clone(),
+        )),
+        Observation::Accepted(_)
+        | Observation::IdentityConfirmed(_)
+        | Observation::Progress(_)
+        | Observation::FinalText(_)
+        | Observation::SteerDelivered(_)
+        | Observation::VendorClosed(_)
+        | Observation::ResumeMismatch { .. }
+        | Observation::LateTerminal(_) => None,
+    }
+}
+
+/// C1 §5's `action.denied` kind word.
+const fn denial_kind(kind: DenialKind) -> &'static str {
+    match kind {
+        DenialKind::FileWrite => "file_write",
+        DenialKind::Command => "command",
+        DenialKind::Network => "network",
+        DenialKind::Other => "other",
     }
 }
 
@@ -2023,6 +2948,7 @@ fn new_record(slot: &Slot, session: &SessionId, turn: TurnNumber) -> TurnRecord 
         first_failure: None,
         uncertain: None,
         steps: super::progress::StepTracker::default(),
+        vendor: super::lane::VendorRecord::default(),
     }
 }
 

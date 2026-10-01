@@ -23,7 +23,7 @@ use crate::{
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -281,6 +281,28 @@ pub struct SessionSnapshot {
     pub latest_effective: Option<Value>,
     /// The session's frozen `cwd` (Task 4 design §11.1), if it has one.
     pub cwd: Option<String>,
+    /// The session's frozen route identity.
+    pub route: SessionRoute,
+}
+
+/// A session's frozen route identity (C2 §2 `SessionRef`): its harness, its
+/// receipt's route, and its recorded adapter version: the running adapter's
+/// at the latest `turn.started` commit (C1 §3.3, decision H3), else the
+/// receipt's when no turn has started; with the vendor identity it last
+/// confirmed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionRoute {
+    /// `sessions.harness`.
+    pub harness: String,
+    /// `receipt.route`.
+    pub route: Option<String>,
+    /// The recorded adapter version.
+    pub adapter_version: Option<String>,
+    /// The confirmed vendor session ID: the latest committed
+    /// `session.opened` or `session.reopened`'s (decision H3).
+    pub vendor_session_id: Option<String>,
+    /// That event's transcript hint.
+    pub transcript: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -305,6 +327,8 @@ pub struct QueuedTurn {
     pub queued_at: String,
     /// Sequence of `turn.queued`.
     pub queued_seq: u64,
+    /// The session's frozen route identity, which its driver opens from.
+    pub route: SessionRoute,
 }
 
 /// Core's submission intent and its canonical event, committed before agent I/O.
@@ -327,6 +351,10 @@ pub struct AcceptanceRecord {
     pub correlation: String,
     /// Canonical event with the session's next sequence; its `at` becomes `accepted_at`.
     pub event: Value,
+    /// The running adapter's version, which becomes the session's recorded
+    /// adapter version in the same transaction (C1 §3.3, decision H3);
+    /// `None` leaves the recorded value.
+    pub adapter_version: Option<String>,
 }
 
 /// One canonical event inside a running turn, such as an adapter observation.
@@ -337,6 +365,30 @@ pub struct EventRecord {
     pub turn: TurnNumber,
     /// Canonical event with the session's next sequence.
     pub event: Value,
+}
+
+/// A session-level event committed whether or not a turn of the session
+/// runs (C2 §2 session drain and delayed identity, decision H3 as narrowed):
+/// a durable observation between turns, or a confirmed identity's
+/// `session.opened`/`session.reopened`, or with no event a repeated
+/// confirmation's identity. Refused once the session is closed.
+pub struct SessionEventRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// Canonical event with the session's next sequence; `None` only for an
+    /// identity confirmed again by the same connection generation.
+    pub event: Option<Value>,
+    /// A confirmed identity, written into the session's `vendor_session_id`
+    /// and `transcript_hint` in the event's transaction (C1 §6.1).
+    pub identity: Option<SessionIdentity>,
+}
+
+/// A session's confirmed vendor identity, as its columns hold it.
+pub struct SessionIdentity {
+    /// The confirmed vendor session ID.
+    pub vendor_session_id: String,
+    /// The vendor's transcript hint, if any.
+    pub transcript: Option<String>,
 }
 
 /// Core's terminal state and final event, committed atomically.
@@ -956,6 +1008,7 @@ pub(crate) enum Command {
     Submission(SubmissionRecord, oneshot::Sender<Result<(), StoreError>>),
     Acceptance(AcceptanceRecord, oneshot::Sender<Result<(), StoreError>>),
     Event(EventRecord, oneshot::Sender<Result<(), StoreError>>),
+    SessionEvent(SessionEventRecord, oneshot::Sender<Result<(), StoreError>>),
     Steps(StepsRecord, oneshot::Sender<Result<(), StoreError>>),
     Status(
         StatusQuery,
@@ -1214,6 +1267,16 @@ impl Command {
             ),
             Self::Event(record, _) => (
                 record.session_id.as_str().len() + encoded(&record.event),
+                0,
+                1,
+            ),
+            Self::SessionEvent(record, _) => (
+                record.session_id.as_str().len()
+                    + record.event.as_ref().map_or(0, encoded)
+                    + record.identity.as_ref().map_or(0, |identity| {
+                        identity.vendor_session_id.len()
+                            + identity.transcript.as_ref().map_or(0, String::len)
+                    }),
                 0,
                 1,
             ),
@@ -1871,6 +1934,39 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
+    /// Commits a durable session observation at the session's next sequence,
+    /// whether or not a turn runs: between turns, the session drain's (C2
+    /// §2). The event keeps its own `turn` and `late`. A closed session
+    /// refuses it.
+    pub async fn commit_session_event(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        if record.identity.is_some() || record.event.is_none() {
+            return Err(StoreError::Constraint(
+                "a session event has its event and no identity",
+            ));
+        }
+        self.send_session_event(record).await
+    }
+
+    /// Commits a confirmed identity's `session.opened`/`session.reopened` at
+    /// the session's next sequence, and writes the identity into the
+    /// session's columns in the same transaction (C1 §6.1); with no event,
+    /// a repeated confirmation of the same connection generation, only the
+    /// columns. A closed session refuses it.
+    pub async fn commit_identity(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        if record.identity.is_none() {
+            return Err(StoreError::Constraint(
+                "an identity commit needs the identity",
+            ));
+        }
+        self.send_session_event(record).await
+    }
+
+    async fn send_session_event(&self, record: SessionEventRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SessionEvent(record, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
     /// Commits completed step rows of a turn that is still running (Task 4
     /// design §3.2). Test builds: `store.commit.step` acts before the rows
     /// are sent, so a pause leaves the writer free and `fail_io` is a
@@ -2237,6 +2333,19 @@ impl StoreClient {
         turn: TurnNumber,
     ) -> Result<crate::FinalTextFile, StoreError> {
         crate::FinalTextFile::create(&self.evidence, self.blobs.tasks.clone(), session, turn).await
+    }
+
+    /// Writes the turn's `structured_output.json` whole in its evidence
+    /// folder and syncs it and the folder (C1 §5), before the commit that
+    /// names it. A failure leaves no file to name.
+    pub async fn write_structured_output(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        encoded: Vec<u8>,
+    ) -> Result<crate::StructuredOutputRef, StoreError> {
+        crate::structured_output::write(&self.evidence, &self.blobs.tasks, session, turn, encoded)
+            .await
     }
 
     /// A stored relative evidence folder made absolute; no I/O. Core gets

@@ -16,7 +16,7 @@ use super::super::{
 use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
 use crate::{
     CloseRequest, Deadline, ExitReport, OutboundMessage, RouteError, RouteFailure, SendOutcome,
-    StopCause, TurnNumber, WireCleanup,
+    StopCause, WireCleanup,
 };
 use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 
@@ -39,7 +39,7 @@ const STEER_OVERHEAD: usize = 96;
 pub struct Lane {
     /// The persistent-connection profile (decision H1): the turn's process
     /// stands in for a shared server. Its confirmed death is
-    /// [`TurnCause::ServerLost`], a stdout closed by a live process is
+    /// [`RouteError::ServerLost`], a stdout closed by a live process is
     /// transport loss, the wall sends the interrupt instead of a force
     /// close, a stop order's `force_at` asks for no kill, a natural
     /// terminal ends the turn at once and an interrupted one when its
@@ -60,20 +60,6 @@ pub struct Lane {
     /// The turn's effort: an instance whose handshake reports its catalog
     /// must list it (AD18).
     pub effort: Option<String>,
-}
-
-impl Lane {
-    /// S1's per-turn lane: no handshake, no steer.
-    pub(super) fn legacy() -> Self {
-        Self {
-            persistent: false,
-            handshake: None,
-            tool_grace: Duration::ZERO,
-            steer: None,
-            identity: None,
-            effort: None,
-        }
-    }
 }
 
 /// One steer input for the running turn, admitted by [`SteerSender`];
@@ -229,74 +215,6 @@ pub struct FakeTerminal {
     pub details: Box<TerminalDetails>,
 }
 
-/// A C2-lane route cause: S1's, or one only this lane reports.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TurnCause {
-    /// An S1 route cause.
-    Route(RouteError),
-    /// Host confirmed the persistent connection's server died before any
-    /// terminal (C1 §7.6 `server_lost`).
-    ServerLost {
-        /// Affected turn.
-        turn: TurnNumber,
-    },
-    /// The handshake lacked a feature VIA relies on; the start was not
-    /// written (AD7 `handshake_refused`).
-    HandshakeRefused {
-        /// Affected turn.
-        turn: TurnNumber,
-    },
-    /// The catalog the instance reported at its handshake lacks the turn's
-    /// value; the start was not written (AD18 `invalid_params`).
-    InvalidParam {
-        /// Affected turn.
-        turn: TurnNumber,
-        /// The C1 parameter.
-        field: &'static str,
-    },
-    /// An identity the vendor reported differs from the session's (C2 §2
-    /// Reopen `resume_mismatch`); nothing was replaced or resent.
-    ResumeMismatch {
-        /// Affected turn.
-        turn: TurnNumber,
-        /// The vendor session ID VIA continues.
-        requested: String,
-        /// The one the vendor returned.
-        returned: String,
-    },
-}
-
-/// A failed C2-lane turn: its cause and the evidence Route holds, plus the
-/// two facts Core's stop outcome needs (AD4 Core handoff).
-#[derive(Clone, Debug)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is a distinct, independent fact of the evidence"
-)]
-pub struct TurnFailure {
-    /// First cause.
-    pub cause: TurnCause,
-    /// Where an undecodable message was kept, or why not.
-    pub undecoded: Option<String>,
-    /// Host-confirmed vendor exit, when observed.
-    pub exit: Option<ExitReport>,
-    /// A vendor may have launched.
-    pub launched: bool,
-    /// Cleanup certainty, when Route established one.
-    pub cleanup: Option<WireCleanup>,
-    /// Host stopped the group while its vendor was live. On the persistent
-    /// profile only the server's death or the daemon force says so: a
-    /// shared server is never killed for a turn (C2 §4.1).
-    pub forced: bool,
-    /// A Host journal write had an uncertain outcome: the daemon latches.
-    pub journal_uncertain: bool,
-    /// The vendor acknowledged Route's written interrupt with an
-    /// interrupted terminal within the cutoff.
-    pub acknowledged: bool,
-    /// The connection is a persistent server (the persistent profile).
-    pub shared: bool,
-}
-
 /// One C2-lane turn's result (C2 §4.1): the retained terminal and handshake
 /// on every outcome.
 pub struct FakeTurn {
@@ -307,10 +225,14 @@ pub struct FakeTurn {
     /// The vendor acknowledged Route's interrupt.
     pub acknowledged: bool,
     /// Process and cleanup facts, or the typed failure.
-    pub outcome: Result<FakeRouteResult, TurnFailure>,
+    pub outcome: Result<FakeRouteResult, RouteFailure>,
     /// The persistent profile's emulated server stays after this turn: its
     /// helper process is retired apart from it (C2 §4.1, decision H1).
     pub server_kept: bool,
+    /// An identity that differs from the session's, reported after the
+    /// turn's terminal was retained, as `(requested, returned)`: the turn's
+    /// result stands and only the connection fails (C2 §2 Reopen).
+    pub late_mismatch: Option<(String, String)>,
 }
 
 /// What Route learned in a turn besides its S1 result.
@@ -320,7 +242,9 @@ pub(super) struct Facts {
     pub(super) handshake: Option<Handshake>,
     /// The lane's own cause, which replaces the S1 protocol failure Route
     /// ended the turn with.
-    pub(super) cause: Option<TurnCause>,
+    pub(super) cause: Option<RouteError>,
+    /// A mismatching identity after the terminal (C2 §2 Reopen).
+    pub(super) late_mismatch: Option<(String, String)>,
     pub(super) acknowledged: bool,
     /// Every reported tool item ended (AD9).
     pub(super) tools_settled: bool,
@@ -432,9 +356,12 @@ impl LaneState {
 impl Serving<'_> {
     /// Records the lane facts one decoded, phase-valid message carries: tool
     /// items, the acceptance, the interrupt acknowledgement, the steer
-    /// delivery and the vendor identity.
-    pub(super) fn note(&mut self, message: &FakeMessage) -> Result<(), Failed> {
+    /// delivery and the vendor identity. Returns whether the message is
+    /// handed over: a mismatching identity after the turn's terminal is
+    /// recorded and dropped, so it confirms nothing (C2 §2 Reopen).
+    pub(super) fn note(&mut self, message: &FakeMessage) -> Result<bool, Failed> {
         let turn = self.turn;
+        let terminated = self.terminated;
         let lane = &mut self.lane;
         match message {
             FakeMessage::Accepted { .. } => lane.accepted = true,
@@ -467,8 +394,16 @@ impl Serving<'_> {
             FakeMessage::Identity {
                 vendor_session_id, ..
             } => match &lane.identity {
+                // The turn's terminal stands; the connection fails.
+                Some(requested) if requested != vendor_session_id && terminated => {
+                    if lane.facts.late_mismatch.is_none() {
+                        lane.facts.late_mismatch =
+                            Some((requested.clone(), vendor_session_id.clone()));
+                    }
+                    return Ok(false);
+                }
                 Some(requested) if requested != vendor_session_id => {
-                    lane.facts.cause = Some(TurnCause::ResumeMismatch {
+                    lane.facts.cause = Some(RouteError::ResumeMismatch {
                         turn,
                         requested: requested.clone(),
                         returned: vendor_session_id.clone(),
@@ -487,7 +422,7 @@ impl Serving<'_> {
             | FakeMessage::VendorClosed { .. }
             | FakeMessage::Unknown { .. } => {}
         }
-        Ok(())
+        Ok(true)
     }
 
     /// AD7: on a profile with a handshake, reads it before the start. A
@@ -514,11 +449,11 @@ impl Serving<'_> {
         };
         self.lane.facts.handshake = Some(handshake);
         if missing {
-            self.lane.facts.cause = Some(TurnCause::HandshakeRefused { turn });
+            self.lane.facts.cause = Some(RouteError::HandshakeRefused { turn });
             return Err(protocol(turn, "fake handshake refused").into());
         }
         if uncatalogued {
-            self.lane.facts.cause = Some(TurnCause::InvalidParam {
+            self.lane.facts.cause = Some(RouteError::InvalidParam {
                 turn,
                 field: "effort",
             });
@@ -766,10 +701,10 @@ impl Serving<'_> {
 
     /// The logical failure of a turn whose server stays: no kill, no exit;
     /// cleanup is the reported tools' once acknowledged, else `Uncertain`.
-    pub(super) fn kept_failure(&self, cause: RouteError) -> TurnFailure {
+    pub(super) fn kept_failure(&self, cause: RouteError) -> RouteFailure {
         let acknowledged = self.lane.acknowledged();
-        TurnFailure {
-            cause: TurnCause::Route(cause),
+        RouteFailure {
+            cause,
             undecoded: None,
             exit: None,
             launched: true,
@@ -786,7 +721,7 @@ impl Serving<'_> {
     }
 
     /// Sends the logical turn, once.
-    pub(super) fn send_logical(&mut self, outcome: Result<FakeRouteResult, TurnFailure>) {
+    pub(super) fn send_logical(&mut self, outcome: Result<FakeRouteResult, RouteFailure>) {
         if let Some(logical) = self.lane.facts.logical.take() {
             let turn = FakeTurn {
                 terminal: self.lane.facts.terminal.clone(),
@@ -794,6 +729,7 @@ impl Serving<'_> {
                 acknowledged: self.lane.acknowledged(),
                 outcome,
                 server_kept: true,
+                late_mismatch: self.lane.facts.late_mismatch.clone(),
             };
             // The driver's turn was dropped: the retirement that follows is
             // the cleanup it still owns.
@@ -845,6 +781,7 @@ pub(super) fn turn_result(
         terminal,
         handshake,
         cause: lane_cause,
+        late_mismatch,
         acknowledged,
         tools_settled,
         ..
@@ -854,16 +791,20 @@ pub(super) fn turn_result(
         Err(failure) => {
             let cause = match failure.cause {
                 RouteError::Protocol { turn, detail } => {
-                    lane_cause.unwrap_or(TurnCause::Route(RouteError::Protocol { turn, detail }))
+                    lane_cause.unwrap_or(RouteError::Protocol { turn, detail })
                 }
-                RouteError::ProcessExited { turn } if persistent => TurnCause::ServerLost { turn },
+                RouteError::ProcessExited { turn } if persistent => RouteError::ServerLost { turn },
                 cause @ (RouteError::TransportLost { .. }
                 | RouteError::ProcessExited { .. }
                 | RouteError::Overflow { .. }
                 | RouteError::Store { .. }
                 | RouteError::Stopped { .. }
                 | RouteError::Deadline { .. }
-                | RouteError::ForceStopped { .. }) => TurnCause::Route(cause),
+                | RouteError::ForceStopped { .. }
+                | RouteError::ServerLost { .. }
+                | RouteError::HandshakeRefused { .. }
+                | RouteError::InvalidParam { .. }
+                | RouteError::ResumeMismatch { .. }) => cause,
             };
             // The server's loss and the daemon force end the server itself
             // (Host's own lifecycle): their Host facts are the connection's.
@@ -871,8 +812,7 @@ pub(super) fn turn_result(
                 && failure.launched
                 && !matches!(
                     cause,
-                    TurnCause::ServerLost { .. }
-                        | TurnCause::Route(RouteError::ForceStopped { .. })
+                    RouteError::ServerLost { .. } | RouteError::ForceStopped { .. }
                 );
             let (exit, cleanup, forced) = if logical {
                 let cleanup = if tools_settled {
@@ -884,7 +824,7 @@ pub(super) fn turn_result(
             } else {
                 (failure.exit, failure.cleanup, failure.forced)
             };
-            Err(TurnFailure {
+            Err(RouteFailure {
                 cause,
                 undecoded: failure.undecoded,
                 exit,
@@ -903,6 +843,7 @@ pub(super) fn turn_result(
         acknowledged,
         outcome,
         server_kept: false,
+        late_mismatch,
     }
 }
 

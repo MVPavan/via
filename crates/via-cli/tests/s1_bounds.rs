@@ -468,6 +468,24 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
             );
         }
     }
+    // C1 §5 (spill amendment): the capped members are each at their cap.
+    let encoded = |value: &Value| serde_json::to_vec(value).map(|bytes| bytes.len());
+    assert_eq!(encoded(&envelope["structured_output"])?, 32 * 1024);
+    assert!(
+        envelope["structured_output_file"]["path"].is_string(),
+        "no structured_output_file"
+    );
+    let warnings = envelope["warnings"].as_array().ok_or("no warnings")?;
+    assert_eq!(warnings.len(), 8, "one warning per closed-list code");
+    for warning in warnings {
+        assert_eq!(encoded(&warning["message"])?, 1024, "{}", warning["code"]);
+        assert_eq!(encoded(&warning["data"])?, 4 * 1024, "{}", warning["code"]);
+    }
+    let processes = envelope["leftovers"]["processes"]
+        .as_array()
+        .ok_or("no leftovers")?;
+    assert_eq!(processes.len(), 16);
+    assert_eq!(encoded(&envelope["evidence"]["transcript"])?, 4 * 1024);
     let long_stop = "s".repeat(1025);
     let sandbox = Sandbox::new(&json!({"scripts":[
         script("short-field", "", &long_stop),
@@ -512,8 +530,17 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
                     format!("{member} of 1 byte over its maximum: {refused:?}")
                 })?;
                 let passed = spawn_error(&mut raw, id + 1, &json!({member: fits}))?;
-                check(passed.is_some() && !named(&passed, member), || {
-                    format!("{member} at its maximum was refused for its size: {passed:?}")
+                // Design §5.2 (S-CORE chunk 4, design-listed): an
+                // uncatalogued model with an explicit harness passes
+                // through, so the model at its maximum is receipted. The
+                // others keep S1's route refusal, never for their size.
+                let fits_rule = if member == "model" {
+                    passed.is_none()
+                } else {
+                    passed.is_some() && !named(&passed, member)
+                };
+                check(fits_rule, || {
+                    format!("{member} at its maximum was not handled as fitting: {passed:?}")
                 })?;
             }
             let receipt = cli(

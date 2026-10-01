@@ -698,7 +698,7 @@ fn s1_evidence_harness_readiness_never_starts_a_daemon() -> TestResult {
 /// generation's report cannot be written, and collection fails.
 #[test]
 fn s1_evidence_every_daemon_generation_is_validated() -> TestResult {
-    let sandbox = Sandbox::new(&json!({}))?;
+    let sandbox = Sandbox::new(&json!({"scripts": []}))?;
     let evidence = Evidence::new("s1_evidence_generations", &sandbox.fake, &sandbox.fixture)?;
     let first = Daemon::start(&sandbox, &evidence)?;
     let first_pid = first.pid();

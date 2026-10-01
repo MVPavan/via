@@ -1,6 +1,9 @@
 //! Daemon config `daemon.json` (Task 4 design §5.5, amendment A37): read
 //! once at start, before any Store or socket change; absent means every
 //! default. An invalid file names its key and the rule it broke.
+//!
+//! `harnesses` is kept opaque here: an object is passed to the adapter
+//! layer, anything else is refused (S-CORE H4).
 
 use std::{
     fmt,
@@ -58,6 +61,8 @@ struct File {
     #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
+    harnesses: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
     wal: Option<Box<RawValue>>,
 }
 
@@ -91,10 +96,18 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+/// What `daemon.json` configures: the validated limits and the opaque
+/// `harnesses` object, if present.
+#[derive(Debug, Default)]
+pub(super) struct Config {
+    pub(super) limits: Limits,
+    pub(super) harnesses: Option<Box<RawValue>>,
+}
+
 /// Reads `<state>/daemon.json`: defaults when it is absent, else the
-/// validated limits. It follows no symbolic link, and opens without
+/// validated config. It follows no symbolic link, and opens without
 /// blocking so a FIFO is refused by its type, never waited on.
-pub(super) fn read(state: &Path) -> Result<Limits, Invalid> {
+pub(super) fn read(state: &Path) -> Result<Config, Invalid> {
     let path = state.join(FILE);
     let file = OpenOptions::new()
         .read(true)
@@ -106,7 +119,7 @@ pub(super) fn read(state: &Path) -> Result<Limits, Invalid> {
         .open(&path);
     let mut file = match file {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Limits::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
             return Err(Invalid::new(FILE, "must not be a symbolic link"));
         }
@@ -139,8 +152,15 @@ pub(super) fn read(state: &Path) -> Result<Limits, Invalid> {
 }
 
 /// Parses and validates the file's text (§5.5).
-fn parse(text: &[u8]) -> Result<Limits, Invalid> {
+fn parse(text: &[u8]) -> Result<Config, Invalid> {
     let file: File = serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
+    if file
+        .harnesses
+        .as_ref()
+        .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
+    {
+        return Err(Invalid::new("harnesses", "must be an object"));
+    }
     let mut limits = Limits::default();
     if let Some(raw) = file.disk {
         let disk: Disk =
@@ -195,7 +215,10 @@ fn parse(text: &[u8]) -> Result<Limits, Invalid> {
             "must be above wal.checkpoint_bytes",
         ));
     }
-    Ok(limits)
+    Ok(Config {
+        limits,
+        harnesses: file.harnesses,
+    })
 }
 
 /// A value in bytes: a non-negative integer at most 2^62.
@@ -243,7 +266,7 @@ mod tests {
 
     #[test]
     fn keys_and_rules_are_named() {
-        assert_eq!(parse(b"{}").expect("empty"), Limits::default());
+        assert_eq!(parse(b"{}").expect("empty").limits, Limits::default());
         assert_eq!(
             invalid(r#"{"memory":1}"#),
             "daemon config invalid: memory: unknown key"
@@ -258,7 +281,9 @@ mod tests {
         );
         assert!(invalid("[").starts_with("daemon config invalid: daemon.json: not JSON"));
         assert!(invalid(r#"{"disk":{"free_floor":1.5}}"#).contains("disk.free_floor"));
-        let limits = parse(br#"{"wal":{"checkpoint_bytes":8191}}"#).expect("pages");
+        let limits = parse(br#"{"wal":{"checkpoint_bytes":8191}}"#)
+            .expect("pages")
+            .limits;
         assert_eq!(limits.wal.checkpoint_bytes, 4096);
         assert_eq!(
             invalid(r#"{"disk":{"warn_size":null}}"#),
@@ -268,5 +293,27 @@ mod tests {
             invalid(r#"{"disk":null}"#),
             "daemon config invalid: disk: must be an object"
         );
+    }
+
+    /// S-CORE H4: `harnesses` is accepted as an opaque object and refused
+    /// otherwise.
+    #[test]
+    fn harnesses_is_an_opaque_object() {
+        let config = parse(br#"{"harnesses":{"claude":{"binary":"/x"}}}"#).expect("object");
+        assert_eq!(
+            config.harnesses.expect("kept").get(),
+            r#"{"claude":{"binary":"/x"}}"#
+        );
+        assert!(parse(b"{}").expect("empty").harnesses.is_none());
+        for refused in [
+            r#"{"harnesses":[]}"#,
+            r#"{"harnesses":null}"#,
+            r#"{"harnesses":1}"#,
+        ] {
+            assert_eq!(
+                invalid(refused),
+                "daemon config invalid: harnesses: must be an object"
+            );
+        }
     }
 }

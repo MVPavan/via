@@ -1,7 +1,6 @@
 //! C2 §4 observation and turn-end types (adapter design §3.2, AD4, AD6,
 //! AD7, AD20) and the per-session observation channel the driver lane
-//! sends them on. Kept in this module, not re-exported at the crate root,
-//! because the legacy `Observation` and channel still live there.
+//! sends them on.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -15,11 +14,12 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::plan::{VersionStatus, Warning};
 use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
-use crate::{AcceptanceToken, Cleanup, StartRejected, VendorTerminalStatus, VendorTurnId};
+use crate::{
+    AcceptanceToken, Cleanup, RouteFailure, StartRejected, VendorTerminalStatus, VendorTurnId,
+};
 
 /// A vendor message's progress marks (C2 §4 `progress`); the arrival time
-/// is the item's `at`. Replaces the legacy root `ProgressMarks` once Core
-/// moves to this surface.
+/// is the item's `at`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProgressMarks {
     /// Model output: text, reasoning or a tool request.
@@ -93,6 +93,9 @@ pub struct Identity {
     pub connection_id: String,
     /// The vendor transcript, when known.
     pub transcript: Option<PathBuf>,
+    /// The vendor version the confirming handshake carried, if it carried
+    /// one (C2 §4): `session.opened`/`session.reopened`'s `vendor_version`.
+    pub vendor_version: Option<String>,
 }
 
 /// An action class the vendor's own bound denied (C1 §5).
@@ -275,8 +278,9 @@ pub struct LeftoverReport {
     pub incomplete: bool,
 }
 
-/// Process and cleanup facts of a turn that ran to its end.
-#[derive(Debug)]
+/// Process and cleanup facts of a turn (C2 §4.1), on every outcome: the
+/// cleanup gate always has facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnEvidence {
     /// The confirmed process exit, when there is one.
     pub exit: Option<via_routes::ExitReport>,
@@ -284,6 +288,38 @@ pub struct TurnEvidence {
     pub cleanup: Cleanup,
     /// A Host journal write had an uncertain outcome.
     pub journal_uncertain: bool,
+}
+
+impl TurnEvidence {
+    /// A failure before any vendor launch (C2 §2, AD9 no-launch row): no
+    /// exit, and `Quiescent` only when Host's journal is complete.
+    pub fn no_launch(journal_uncertain: bool) -> Self {
+        Self {
+            exit: None,
+            cleanup: if journal_uncertain {
+                Cleanup::Uncertain
+            } else {
+                Cleanup::Quiescent
+            },
+            journal_uncertain,
+        }
+    }
+
+    /// Route's evidence of a failed turn: a launched one's exit and
+    /// cleanup, unproven when Route established none; otherwise the
+    /// no-launch evidence.
+    pub fn of_failure(failure: &RouteFailure) -> Self {
+        if !failure.launched {
+            return Self::no_launch(failure.journal_uncertain);
+        }
+        Self {
+            exit: failure.exit,
+            cleanup: failure
+                .cleanup
+                .map_or(Cleanup::Uncertain, crate::runtime::cleanup),
+            journal_uncertain: failure.journal_uncertain,
+        }
+    }
 }
 
 /// The one result of `run_turn` (C2 §4.1).
@@ -297,26 +333,80 @@ pub struct TurnEnd {
     /// Per-turn routes on every outcome, and server loss (AD20).
     pub leftovers: Option<LeftoverReport>,
     /// Process and cleanup facts, or a typed failure.
-    pub outcome: Result<TurnEvidence, TurnError>,
+    pub outcome: Result<TurnEvidence, AdapterError>,
 }
 
-/// A failed driver-lane turn (C2 §2 `AdapterError` for the lane; the legacy
-/// `AdapterError` stays for the legacy path until Core moves).
+/// A failed turn or adapter construction (C2 §2 `AdapterError`). Every turn
+/// failure carries its evidence ([`Self::evidence`]).
 #[derive(Debug, Error)]
-pub enum TurnError {
+pub enum AdapterError {
     /// A route cause with Route's evidence: S1's causes, `ServerLost` and
     /// transport loss on the persistent profile, and `HandshakeRefused`.
-    #[error("fake route failed: {0:?}")]
-    Route(via_routes::TurnFailure),
-    /// A definite rejection before submission; nothing was sent.
-    #[error("the turn was rejected before submission: {0:?}")]
-    Rejected(StartRejected),
-    /// No adapter serves the session's harness in this daemon.
+    #[error("fake route failed: {0}")]
+    Route(RouteFailure),
+    /// A definite rejection before acceptance; nothing was resent.
+    #[error("the turn was rejected before submission: {reason:?}")]
+    Rejected {
+        /// Why.
+        reason: StartRejected,
+        /// The turn's process facts, or the no-launch evidence.
+        evidence: TurnEvidence,
+    },
+    /// The vendor returned another session than the one VIA continues,
+    /// before the turn's terminal (C2 §2 Reopen); never `Rejected`.
+    #[error("the vendor returned another session")]
+    ResumeMismatch {
+        /// The turn's process facts.
+        evidence: TurnEvidence,
+    },
+    /// No adapter serves the session's harness in this daemon; nothing
+    /// launched.
     #[error("the harness is not available in this daemon")]
     Unavailable,
     /// The driver's task for the turn ended without its result.
     #[error("the driver's turn task failed")]
     TaskFailed,
+    /// The lower runtime could not initialize, or a Host-fact operation
+    /// failed.
+    #[error("adapter runtime failed: {0}")]
+    Open(#[from] via_routes::WireError),
+}
+
+impl AdapterError {
+    /// The failure's process and cleanup facts (C2 §4.1): Route's for a
+    /// route cause, the no-launch evidence where nothing launched, and an
+    /// unproven cleanup where the driver lost the turn's task.
+    pub fn evidence(&self) -> TurnEvidence {
+        match self {
+            Self::Route(failure) => TurnEvidence::of_failure(failure),
+            Self::Rejected { evidence, .. } | Self::ResumeMismatch { evidence } => evidence.clone(),
+            Self::Unavailable | Self::Open(_) => TurnEvidence::no_launch(false),
+            Self::TaskFailed => TurnEvidence {
+                exit: None,
+                cleanup: Cleanup::Uncertain,
+                journal_uncertain: false,
+            },
+        }
+    }
+
+    /// Durable Store state could not be read or written; other failures leave
+    /// evidence unproven without making Store unusable.
+    pub fn is_store_failure(&self) -> bool {
+        matches!(self, Self::Open(error) if error.is_store_failure())
+    }
+
+    /// A Host journal write had an uncertain outcome: the daemon latches
+    /// (design §7.2 row 12).
+    pub fn journal_uncertain(&self) -> bool {
+        match self {
+            Self::Open(error) => error.journal_uncertain(),
+            Self::Route(failure) => failure.journal_uncertain,
+            Self::Rejected { evidence, .. } | Self::ResumeMismatch { evidence } => {
+                evidence.journal_uncertain
+            }
+            Self::Unavailable | Self::TaskFailed => false,
+        }
+    }
 }
 
 /// One observation in the session channel with its share of the session's
@@ -338,52 +428,133 @@ pub struct ObservationSink {
 
 /// One session's observation channel (C2 §2 `SessionCx`).
 pub fn observation_channel() -> (ObservationSink, mpsc::Receiver<Admitted>) {
+    observation_channel_in(&ObservationBudget::new())
+}
+
+/// One session's 4 MiB observation byte budget (C2 A1), which a session
+/// keeps across its channels: a replaced driver's channel and its
+/// successor's share it, so the admitted payloads of both stay within it.
+#[derive(Clone, Debug)]
+pub struct ObservationBudget(Arc<Semaphore>);
+
+impl ObservationBudget {
+    /// A full budget.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Semaphore::new(OBSERVATION_BYTES)))
+    }
+
+    /// The bytes not held by an admitted item.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+
+    /// Whether `other` is a handle on this same budget.
+    #[must_use]
+    pub fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Test builds only: `bytes` of the budget, as an admitted item holds
+    /// them; `None` when they are not free.
+    #[cfg(feature = "test-failpoints")]
+    #[must_use]
+    pub fn charge(&self, bytes: u32) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0).try_acquire_many_owned(bytes).ok()
+    }
+}
+
+impl Default for ObservationBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A session channel on the session's `budget` (C2 §2 `SessionCx`).
+pub fn observation_channel_in(
+    budget: &ObservationBudget,
+) -> (ObservationSink, mpsc::Receiver<Admitted>) {
     // Full: the driver waits, up to the stall bound, then fails the turn
     // `overflow` (C2 §7 item 12).
     let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
-    let budget = Arc::new(Semaphore::new(OBSERVATION_BYTES));
+    let budget = Arc::clone(&budget.0);
     (ObservationSink { sender, budget }, receiver)
 }
 
-/// An item the channel did not take within the stall bound, or whose
-/// receiver is gone.
+/// An item the channel did not take.
 #[derive(Debug)]
-pub(crate) struct Undelivered;
+pub(crate) enum Undelivered {
+    /// Not within the stall bound, or past what the budget can ever admit.
+    Stalled,
+    /// The receiver is gone.
+    Closed,
+}
 
 impl ObservationSink {
     /// Sends `item`: acquires its byte cost, then a slot. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
+    /// Test builds: `adapter.observation.admitted` acknowledges each item
+    /// the channel took, `adapter.observation.stalled` a send that gave
+    /// up at its stall deadline, and `adapter.observation.blocked` each
+    /// block, before its wait.
     pub(crate) async fn send(
         &self,
         item: ObservationItem,
         stall: Duration,
     ) -> Result<(), Undelivered> {
+        let sent = self.admit(item, stall).await;
+        #[cfg(feature = "test-failpoints")]
+        {
+            let point = match &sent {
+                Ok(()) => Some("adapter.observation.admitted"),
+                Err(Undelivered::Stalled) => Some("adapter.observation.stalled"),
+                Err(Undelivered::Closed) => None,
+            };
+            if let Some(point) = point {
+                let _ = via_routes::failpoint::hit_async(point).await;
+            }
+        }
+        sent
+    }
+
+    async fn admit(&self, item: ObservationItem, stall: Duration) -> Result<(), Undelivered> {
         let mut stall_at = None;
-        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered)?;
+        let wanted = u32::try_from(item_cost(&item)).map_err(|_| Undelivered::Stalled)?;
         let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
                     .await
-                    .map_err(|_| Undelivered)?
-                    .map_err(|_| Undelivered)?
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
             }
-            Err(TryAcquireError::Closed) => return Err(Undelivered),
+            Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
         };
         let admitted = Admitted { item, permit };
         match self.sender.try_send(admitted) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(admitted)) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
                 timeout_at(at, self.sender.send(admitted))
                     .await
-                    .map_err(|_| Undelivered)?
-                    .map_err(|_| Undelivered)
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
         }
     }
+}
+
+/// A send blocked on the budget or the channel, before its wait.
+#[cfg(feature = "test-failpoints")]
+async fn blocked() {
+    let _ = via_routes::failpoint::hit_async("adapter.observation.blocked").await;
 }
 
 /// An item's cost against the byte budget: `512 + Σ(64 + len)` over every
@@ -394,7 +565,12 @@ fn item_cost(item: &ObservationItem) -> usize {
         lengths.push(vendor_turn.as_str().len());
     }
     match &item.observation {
-        Observation::Accepted(_) => {}
+        // The acceptance keeps its own copy of the vendor turn ID.
+        Observation::Accepted(acceptance) => {
+            if let Some(vendor_turn_id) = &acceptance.vendor_turn_id {
+                lengths.push(vendor_turn_id.as_str().len());
+            }
+        }
         Observation::SteerDelivered(delivery) => match delivery {
             SteerDelivery::Injected => {}
             SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
@@ -404,6 +580,9 @@ fn item_cost(item: &ObservationItem) -> usize {
             lengths.push(identity.connection_id.len());
             if let Some(transcript) = &identity.transcript {
                 lengths.push(transcript.as_os_str().len());
+            }
+            if let Some(version) = &identity.vendor_version {
+                lengths.push(version.len());
             }
         }
         Observation::Progress(marks) => {
@@ -486,10 +665,55 @@ fn encoded_len(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Identity, Instant, Observation, ObservationItem, StopReason, VendorTerminal, item_cost,
+        Identity, Instant, Observation, ObservationItem, ProgressMarks, StopReason, VendorTerminal,
+        item_cost, observation_channel,
     };
     use crate::VendorTerminalStatus;
     use crate::plan::Warning;
+    use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
+    use std::time::Duration;
+
+    fn tool(name: &str) -> ObservationItem {
+        ObservationItem {
+            at: Instant::now(),
+            vendor_turn: None,
+            observation: Observation::Progress(ProgressMarks {
+                tools_started: vec![("t".to_owned(), name.to_owned())],
+                ..ProgressMarks::default()
+            }),
+        }
+    }
+
+    /// Design §2.3 Bounds: an item costs `512 + Σ(64 + len)` of the
+    /// session's 4 MiB; with the receiver never drained, large items fill
+    /// the budget well before 1,024 items and the next send stays blocked
+    /// until the stall. The fake route's short fields (at most 1 KiB)
+    /// cannot reach 4 MiB within 1,024 items, so the byte bound is checked
+    /// here.
+    #[test]
+    fn the_byte_budget_admits_items_to_4_mib_then_the_next_stalls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let name = "n".repeat(100 * 1024);
+        let cost = 512 + (64 + 1) + (64 + name.len());
+        let fits = OBSERVATION_BYTES / cost;
+        assert!(fits < OBSERVATION_ITEMS);
+        let (sink, receiver) = observation_channel();
+        runtime.block_on(async {
+            let stall = Duration::from_millis(50);
+            for _ in 0..fits {
+                assert!(sink.send(tool(&name), stall).await.is_ok());
+            }
+            assert_eq!(receiver.len(), fits);
+            assert!(sink.send(tool(&name), stall).await.is_err());
+            assert_eq!(receiver.len(), fits);
+            // A small item still fits what is left.
+            assert!(sink.send(tool("n"), stall).await.is_ok());
+            assert_eq!(receiver.len(), fits + 1);
+        });
+    }
 
     fn cost(observation: Observation) -> usize {
         item_cost(&ObservationItem {
@@ -509,6 +733,7 @@ mod tests {
                 vendor_session_id: "v".to_owned(),
                 connection_id: "c".to_owned(),
                 transcript: transcript.map(Into::into),
+                vendor_version: None,
             })
         };
         let path = "p".repeat(4096);
@@ -543,5 +768,15 @@ mod tests {
             })
         };
         assert!(cost(late(&"b".repeat(1024))) >= cost(late("")) + 4 * 1024);
+
+        // Critical r1 #13: the acceptance keeps its own copy of the ID.
+        let accepted = |id: Option<&str>| {
+            Observation::Accepted(super::Acceptance {
+                correlation: crate::AcceptanceToken::FIRST,
+                vendor_turn_id: id.map(|id| crate::VendorTurnId::try_from(id.to_owned()).unwrap()),
+            })
+        };
+        let id = "i".repeat(4096);
+        assert!(cost(accepted(Some(&id))) >= cost(accepted(None)) + 4096);
     }
 }

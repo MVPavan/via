@@ -15,7 +15,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use via_core::{Engine, FakeConfig, ResumeParams, SpawnParams};
+use via_core::{AdapterConfig, BootstrapEnv, Engine, ResumeParams, SpawnParams};
 
 const CHILD: &str = "VIA_QUEUE_BOUNDS_CHILD";
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -38,7 +38,7 @@ fn run_child(name: &str) {
     fs::write(&vendor, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&vendor, fs::Permissions::from_mode(0o700)).unwrap();
     let scenario = root.path().join("scenario.json");
-    fs::write(&scenario, b"{}").unwrap();
+    fs::write(&scenario, br#"{"scripts":[]}"#).unwrap();
     let status = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, root.path())
@@ -50,11 +50,11 @@ fn run_child(name: &str) {
     assert!(status.success(), "{name} child failed: {status}");
 }
 
-fn open(root: &Path) -> Engine {
+fn open(root: &Path) -> std::sync::Arc<Engine> {
     Engine::open(
         &root.join("state"),
         &root.join("runtime"),
-        FakeConfig::from_environment().unwrap(),
+        AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
         root.join("via"),
     )
     .unwrap()

@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, PoisonError,
+        Arc, Mutex as StdMutex, PoisonError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -14,9 +14,12 @@ use std::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::api::{Cancel, Exit, Failure, FailureClass, Warning};
-use crate::{FakeConfig, SessionId, TurnNumber};
-use via_adapters::{AdapterRuntime, AdapterRuntimeConfig, RuntimeConfig};
+use crate::api::{Cancel, EventBody, Exit, Failure, FailureClass, Warning};
+use crate::{SessionId, TurnNumber};
+use via_adapters::{
+    AdapterConfig, AdapterSet, CancellationToken, DescribeRequest, RefusalKind, RuntimeConfig,
+    TaskTracker,
+};
 use via_store::{Store, StoreClient, StoreLock};
 
 mod batch;
@@ -25,6 +28,7 @@ mod control;
 mod drive;
 mod final_text;
 mod journal;
+mod lane;
 mod latch;
 mod progress;
 mod queue;
@@ -63,11 +67,25 @@ pub struct Receipted {
 
 /// One daemon's durable state and opaque vendor runtime.
 pub struct Engine {
+    /// This Engine's own `Arc`, which every Engine is made in
+    /// ([`Engine::open`]): a turn handed to its lane's actor holds the
+    /// Engine until it ends.
+    me: Weak<Engine>,
     _store_owner: Store,
     store: StoreClient,
-    adapter: AdapterRuntime,
+    adapter: AdapterSet,
+    /// The daemon's working directory at startup: a session that names no
+    /// `cwd` is frozen with it (design §11.1, §5.1 #22).
+    cwd: PathBuf,
+    /// Sessions' lanes on their drivers (C2 §2): opened at a session's
+    /// first dispatch, kept while a live connection can be pinned.
+    lanes: lane::Lanes,
+    /// Owns every task the drivers start (C2 §2 `SessionCx`).
+    tracker: TaskTracker,
+    /// The drivers' cancellation; final shutdown cancels it.
+    cancel: CancellationToken,
     active: AtomicUsize,
-    admission: tokio::sync::Mutex<()>,
+    admission: Arc<tokio::sync::Mutex<()>>,
     /// The stop mode, the force watch and the latch's phase one with the
     /// failure record, shared with Store's read-corruption observer.
     signal: Arc<latch::Signal>,
@@ -83,12 +101,13 @@ pub struct Engine {
     finalized: AtomicBool,
     /// Sessions with dispatch state: queue, dispatcher and event head. A slot
     /// is retired when its dispatcher exits with nothing left (design §2).
-    sessions: StdMutex<HashMap<SessionId, Arc<Slot>>>,
+    /// Shared with each lane's [`SessionWriter`].
+    sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
     /// Receipted turns without a confirmed submission or durable cancellation.
     queued: AtomicUsize,
     /// Phase two of the latch, set under `admission` after `failure_pending`
     /// (runtime §7): the latch is ordered after every receipt inside it.
-    store_failed: AtomicBool,
+    store_failed: Arc<AtomicBool>,
     /// Sessions with dispatch state when force was accepted, for final
     /// shutdown's closure pass.
     force_sessions: StdMutex<Option<Vec<SessionId>>>,
@@ -106,6 +125,12 @@ pub struct Engine {
     slots: Arc<tokio::sync::Semaphore>,
     /// The pool's size: `connections.limit` (design §6.6).
     slot_limit: usize,
+    /// Resident session lanes (runtime §8, [`lane::RESIDENT_LANES`]): each
+    /// lane holds one from its creation until it has ended. FIFO waiters.
+    resident: Arc<tokio::sync::Semaphore>,
+    /// Dispatches waiting for a resident lane (critical r4 #2): each is
+    /// owed the retirement of an idle lane ([`Self::evict_idle`]).
+    pressed: AtomicUsize,
     /// Slots held for groups an earlier daemon left unproven (design §11).
     recovered: slots::RecoveredSlots,
     /// Sessions durably `closing`, or treated so after an uncertain
@@ -186,6 +211,20 @@ struct Faults {
     release: tokio::sync::Notify,
     /// Re-probe passes begun.
     reprobe_passes: AtomicUsize,
+    /// Each restart recovery the adapter set was asked for (C2 §2
+    /// Recover): the session, how many Host facts it was given, and its
+    /// answer (`resumed`, `unknown` or `dead`).
+    recoveries: std::sync::Mutex<Vec<(SessionId, usize, &'static str)>>,
+    /// The next restart recovery of a session answers `Resumed` with this
+    /// driver and session channel: the fake never resumes.
+    resume: std::sync::Mutex<
+        Option<(
+            via_adapters::SessionDriver,
+            tokio::sync::mpsc::Receiver<via_adapters::Admitted>,
+        )>,
+    >,
+    /// The next recovered turn waits for `release` after its history read.
+    hold_after_history: AtomicBool,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -259,14 +298,17 @@ fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
 }
 
 impl Engine {
-    /// Opens the sole Store owner and passes unopened lower resources to Adapter/Wire.
+    /// Opens the sole Store owner and passes unopened lower resources to
+    /// Adapter/Wire, with the adapters' validated configuration. The
+    /// Engine is made in its `Arc`: a session's lane actor runs its turns
+    /// on it (Sol r3 N1).
     pub fn open(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
-    ) -> Result<Self, String> {
-        Self::open_with(state, runtime, fake, binary, DAEMON_QUEUE_LIMIT, None)
+    ) -> Result<Arc<Self>, String> {
+        Self::open_with(state, runtime, adapters, binary, DAEMON_QUEUE_LIMIT, None)
     }
 
     /// [`Engine::open`] under `lock`, the `store.lock` daemon main took
@@ -275,14 +317,14 @@ impl Engine {
     pub fn open_locked(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
         (lock, limits): (StoreLock, Limits),
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         Self::open_with(
             state,
             runtime,
-            fake,
+            adapters,
             binary,
             DAEMON_QUEUE_LIMIT,
             Some((lock, limits)),
@@ -295,14 +337,16 @@ impl Engine {
     fn open_with(
         state: &Path,
         runtime: &Path,
-        fake: FakeConfig,
+        adapters: AdapterConfig,
         binary: PathBuf,
         start_capacity: usize,
         locked: Option<(StoreLock, Limits)>,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         // Test builds only: the named failpoints activate before any Store write.
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::activate_from_environment()?;
+        let cwd = std::env::current_dir()
+            .map_err(|_| "daemon working directory is unavailable".to_owned())?;
         let limits = locked
             .as_ref()
             .map_or_else(Limits::default, |(_, limits)| *limits);
@@ -319,33 +363,36 @@ impl Engine {
         let observer = Arc::clone(&signal);
         owner.on_read_corruption(move || observer.read_corrupt());
         let store = owner.client();
-        let adapter = AdapterRuntime::new(
-            AdapterRuntimeConfig {
-                runtime: RuntimeConfig {
-                    anchor_binary: binary,
-                    anchor_dir: runtime.join("anchors"),
-                },
-                fake,
+        let adapter = AdapterSet::new(
+            adapters,
+            RuntimeConfig {
+                anchor_binary: binary,
+                anchor_dir: runtime.join("anchors"),
             },
             owner.runtime_resources(),
         )
         .map_err(|error| error.to_string())?;
         let (starts, start_receiver) = mpsc::channel(start_capacity);
         let (slots, slot_limit) = connection_slots();
-        Ok(Self {
+        Ok(Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             _store_owner: owner,
             store,
             adapter,
+            cwd,
+            lanes: Arc::new(StdMutex::new(HashMap::new())),
+            tracker: TaskTracker::new(),
+            cancel: CancellationToken::new(),
             active: AtomicUsize::new(0),
-            admission: tokio::sync::Mutex::new(()),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
             signal,
             forced: StdMutex::new(Vec::new()),
             affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
             finalized: AtomicBool::new(false),
-            sessions: StdMutex::new(HashMap::new()),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
             queued: AtomicUsize::new(0),
-            store_failed: AtomicBool::new(false),
+            store_failed: Arc::new(AtomicBool::new(false)),
             force_sessions: StdMutex::new(None),
             read_retries_until: watch::Sender::new(None),
             starts,
@@ -353,6 +400,8 @@ impl Engine {
             pending_starts: StdMutex::new(HashSet::new()),
             slots,
             slot_limit,
+            resident: Arc::new(tokio::sync::Semaphore::new(lane::RESIDENT_LANES)),
+            pressed: AtomicUsize::new(0),
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
             final_shutdown: watch::Sender::new(false),
@@ -364,7 +413,7 @@ impl Engine {
             diagnostics: Arc::new(tokio::sync::Semaphore::new(DIAGNOSTIC_STEPS)),
             #[cfg(test)]
             faults: Faults::default(),
-        })
+        }))
     }
 
     /// Test hook: once `flag` is armed, signals `granted` and waits for `release`.
@@ -398,6 +447,18 @@ impl Engine {
         let mut pending = lock(&self.pending_starts);
         if let Err(mpsc::error::TrySendError::Full(session)) = self.starts.try_send(session) {
             pending.insert(session);
+        }
+    }
+
+    /// The session's [`SessionWriter`], for its lane.
+    fn session_writer(&self, session: &SessionId) -> SessionWriter {
+        SessionWriter {
+            store: self.store.clone(),
+            sessions: Arc::clone(&self.sessions),
+            admission: Arc::clone(&self.admission),
+            signal: Arc::clone(&self.signal),
+            store_failed: Arc::clone(&self.store_failed),
+            session: session.clone(),
         }
     }
 
@@ -460,14 +521,153 @@ impl Engine {
         self.adapter.pending_cleanup()
     }
 
+    /// Whether an adapter of this daemon serves `harness`: planning it is
+    /// not refused `harness_unavailable` (C2 §2 `plan`; pure).
+    fn harness_available(&self, harness: &str) -> bool {
+        let request = DescribeRequest {
+            harness: Some(harness.to_owned()),
+            ..DescribeRequest::default()
+        };
+        !matches!(
+            self.adapter.plan(&request),
+            Err(refusal) if refusal.kind == RefusalKind::HarnessUnavailable
+        )
+    }
+
     /// The session's dispatch slot, created when it has none. Whether a new
     /// turn may run behind earlier ones is decided from their durable state.
     fn slot_for(&self, session: &SessionId) -> Arc<Slot> {
         Arc::clone(
             lock(&self.sessions)
                 .entry(session.clone())
-                .or_insert_with(|| Slot::new(Head::new(None))),
+                .or_insert_with(|| Slot::new(Head::new(None), Weak::clone(&self.me))),
         )
+    }
+}
+
+/// What a lane needs to commit the session-level event of an observation
+/// received outside a running turn (C2 §2 session drain; decision H3 as
+/// narrowed), as it arrives.
+struct SessionWriter {
+    store: StoreClient,
+    sessions: Arc<StdMutex<HashMap<SessionId, Arc<Slot>>>>,
+    admission: Arc<tokio::sync::Mutex<()>>,
+    signal: Arc<latch::Signal>,
+    store_failed: Arc<AtomicBool>,
+    session: SessionId,
+}
+
+impl SessionWriter {
+    /// Commits `body`, attributed `(turn, late)`, at the session's next
+    /// sequence, with `identity` the session's identity columns in the same
+    /// transaction ([`journal::commit_session_event`]). Under `admission`,
+    /// on the session's slot head: a slot made for the write when the
+    /// session has none, and removed after it, so no receipt or dispatcher
+    /// meets it. The Store refuses it once the session is closed. A failed
+    /// commit is the session's Store failure (design §7: phase one, and
+    /// phase two under the `admission` held); nothing is written once Store
+    /// failure is pending.
+    async fn commit(
+        &self,
+        (body, at, attributed): (EventBody, &str, (Option<u32>, bool)),
+        identity: Option<via_store::SessionIdentity>,
+    ) -> journal::SessionWrite {
+        let _admission = self.admission.lock().await;
+        if self.signal.failure_pending.load(Ordering::Acquire)
+            || self.store_failed.load(Ordering::Acquire)
+        {
+            return journal::SessionWrite::Refused;
+        }
+        let (slot, made) = {
+            let mut sessions = lock(&self.sessions);
+            if let Some(slot) = sessions.get(&self.session) {
+                (Arc::clone(slot), false)
+            } else {
+                // Write-only: no turn meets it, so it bounds no lane.
+                let slot = Slot::new(Head::new(None), Weak::new());
+                sessions.insert(self.session.clone(), Arc::clone(&slot));
+                (slot, true)
+            }
+        };
+        let head = Arc::clone(&slot.head);
+        let written = journal::commit_session_event(
+            &self.store,
+            (&head, &self.session),
+            (body, at, attributed),
+            identity,
+        )
+        .await;
+        drop(head);
+        if made {
+            let mut sessions = lock(&self.sessions);
+            if slot.idle()
+                && slot.unleased()
+                && sessions
+                    .get(&self.session)
+                    .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
+            {
+                sessions.remove(&self.session);
+            }
+        }
+        self.report(&written);
+        written
+    }
+
+    /// Writes `identity`, confirmed again by the connection generation
+    /// that committed the session's open event, into the session's
+    /// identity columns, with no event ([`journal::commit_identity_columns`]),
+    /// as [`Self::commit`] writes.
+    async fn commit_columns(&self, identity: via_store::SessionIdentity) -> journal::SessionWrite {
+        let _admission = self.admission.lock().await;
+        if self.signal.failure_pending.load(Ordering::Acquire)
+            || self.store_failed.load(Ordering::Acquire)
+        {
+            return journal::SessionWrite::Refused;
+        }
+        let written = journal::commit_identity_columns(&self.store, &self.session, identity).await;
+        self.report(&written);
+        written
+    }
+
+    /// A Host journal write of the session's driver that no turn reports
+    /// had an uncertain outcome (critical r1 #4): like every uncertain
+    /// write, it latches Store failure (runtime §7), once per lane, as
+    /// `reported` records. Phase one (failure pending and the force) is
+    /// published before anything is awaited, under `reported`'s lock, so
+    /// a second reader returns only once it is published (critical r2
+    /// F3); phase two then waits for `admission` (design §7.4).
+    async fn journal_uncertain(&self, reported: &StdMutex<bool>) {
+        let latches = {
+            let mut reported = lock(reported);
+            if *reported {
+                return;
+            }
+            *reported = true;
+            self.signal.report(
+                FailureSite::Journal,
+                WriteOutcome::Uncertain,
+                latch::FailureScope::Session(&self.session),
+            )
+        };
+        if latches {
+            let _admission = self.admission.lock().await;
+            self.store_failed.store(true, Ordering::Release);
+        }
+    }
+
+    /// A failed write is the session's Store failure; the caller holds
+    /// `admission`.
+    fn report(&self, written: &journal::SessionWrite) {
+        if let journal::SessionWrite::Failed(outcome) = written
+            && self.signal.report(
+                FailureSite::SessionEvent,
+                *outcome,
+                latch::FailureScope::Session(&self.session),
+            )
+        {
+            // Phase two, under the `admission` held (design §7.4).
+            self.store_failed.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -475,7 +675,8 @@ impl Engine {
 #[derive(Clone)]
 struct Accepted {
     at: String,
-    vendor_turn_id: String,
+    /// The vendor's turn ID, when the route has one.
+    vendor_turn_id: Option<String>,
 }
 
 /// Durable progress of a running turn: the session's shared event head and
@@ -496,6 +697,8 @@ struct TurnRecord {
     /// The step tracker (Task 4 design §2.4) and the rows the terminal
     /// carries (§3.2).
     steps: progress::StepTracker,
+    /// What the turn's observations and end established for its envelope.
+    vendor: lane::VendorRecord,
 }
 
 /// A turn's first failed Store write: where it failed and whether it may
@@ -540,5 +743,6 @@ fn failure(class: FailureClass, message: String, vendor_code: Option<String>) ->
         message: crate::api::failure_message(message),
         vendor_code,
         retryable: false,
+        data: None,
     }
 }

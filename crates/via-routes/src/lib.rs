@@ -78,6 +78,41 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
+    /// Host confirmed the persistent connection's server died before any
+    /// terminal (C1 §7.6 `server_lost`).
+    #[error("fake server lost in turn {turn:?}")]
+    ServerLost {
+        /// Affected turn.
+        turn: TurnNumber,
+    },
+    /// The handshake lacked a feature VIA relies on; the start was not
+    /// written (AD7 `handshake_refused`).
+    #[error("fake handshake refused in turn {turn:?}")]
+    HandshakeRefused {
+        /// Affected turn.
+        turn: TurnNumber,
+    },
+    /// The catalog the instance reported at its handshake lacks the turn's
+    /// value; the start was not written (AD18 `invalid_params`).
+    #[error("fake instance catalog lacks the turn's {field} in turn {turn:?}")]
+    InvalidParam {
+        /// Affected turn.
+        turn: TurnNumber,
+        /// The C1 parameter.
+        field: &'static str,
+    },
+    /// An identity the vendor reported before the turn's terminal differs
+    /// from the session's (C2 §2 Reopen `resume_mismatch`); nothing was
+    /// replaced or resent.
+    #[error("fake resume mismatch in turn {turn:?}")]
+    ResumeMismatch {
+        /// Affected turn.
+        turn: TurnNumber,
+        /// The vendor session ID VIA continues.
+        requested: String,
+        /// The one the vendor returned.
+        returned: String,
+    },
 }
 
 /// The classified Store failure behind [`RouteError::Store`] (design §7.1,
@@ -137,10 +172,20 @@ pub struct StopOrder {
 /// The turn's stop-order watch: `None` until Core orders a stop.
 pub type StopWatch = tokio::sync::watch::Receiver<Option<StopOrder>>;
 
+/// Whether an order is already set at the sources a relayed [`StopWatch`]
+/// merges, read where the relay may not have caught up: Route's entry
+/// check and the pre-ARM launch gate (design §2 rule 1).
+pub type StopSources = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// A failed route turn: the first typed cause plus the evidence Route still holds
-/// after its forced cleanup and bounded drain.
+/// after its forced cleanup and bounded drain, and the two facts Core's stop
+/// outcome needs (AD4 Core handoff).
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{cause}{}", undecoded_note(.undecoded.as_deref()))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a distinct, independent fact of the evidence"
+)]
 pub struct RouteFailure {
     /// First cause; later cleanup failures never replace it.
     pub cause: RouteError,
@@ -153,11 +198,19 @@ pub struct RouteFailure {
     pub launched: bool,
     /// Cleanup certainty of Route's forced group close, when it ran one.
     pub cleanup: Option<WireCleanup>,
-    /// Host stopped the group while its vendor was live (Host force evidence).
+    /// Host stopped the group while its vendor was live (Host force
+    /// evidence). On the persistent profile only the server's death or the
+    /// daemon force says so: a shared server is never killed for a turn
+    /// (C2 §4.1).
     pub forced: bool,
     /// A Host journal write in the turn's cleanup had an uncertain outcome:
     /// the daemon must latch (design §7.2 row 12).
     pub journal_uncertain: bool,
+    /// The vendor acknowledged Route's written interrupt with an
+    /// interrupted terminal within the cutoff.
+    pub acknowledged: bool,
+    /// The connection is a persistent server (the persistent profile).
+    pub shared: bool,
 }
 
 /// `; <note>` when an undecoded message was kept, else nothing.
@@ -171,9 +224,12 @@ pub use fake::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeClassHint, FakeCost, FakeDenialKind, FakeMessage,
     FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake, Lane, Retirement,
     RouteMessage, SteerRefused, SteerRequest, SteerSender, TerminalDetails, TerminalStatus,
-    TurnCause, TurnFailure, TurnStart, VENDOR_DATA_MAX, steer_lane,
+    TurnStart, VENDOR_DATA_MAX, steer_lane,
 };
 pub use via_wire::StoreError;
+/// Test builds only: the failpoint controller, for the layers above.
+#[cfg(feature = "test-failpoints")]
+pub use via_wire::failpoint;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
     RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,

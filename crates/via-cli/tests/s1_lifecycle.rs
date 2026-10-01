@@ -825,7 +825,7 @@ fn socket_identity(runtime: &Path) -> TestResult<(u64, u64)> {
 fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
     evidenced(|| {
         // `daemon.lock` held by a live daemon.
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // An idle owner: no turn by design.
         sandbox.no_launch();
         let owner = sandbox.start()?;
@@ -846,7 +846,7 @@ fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
         owner.finish()?;
         // `store.lock` held by another process, no `daemon.lock` holder: the
         // socket is one the harness listens on.
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // No daemon ever opens this Store.
         sandbox.no_store();
         let listener = UnixListener::bind(sandbox.runtime.join("via.sock"))?;
@@ -886,7 +886,7 @@ fn s1_f02_losing_daemon_leaves_live_socket_untouched() -> TestResult {
 #[test]
 fn s1_f03_unsafe_runtime_dir_refused() -> TestResult {
     evidenced(|| {
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // The CLI refuses before any daemon or Store.
         sandbox.no_store();
         let target = sandbox.root.path().join("target");
@@ -1035,7 +1035,7 @@ fn s1_f11_newer_store_in_a_wal_without_shm_refused() -> TestResult {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?
         .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        check(main == 6, || format!("the main file says v{main}"))?;
+        check(main == 7, || format!("the main file says v{main}"))?;
         let before = snapshot(&sandbox.state)?;
         let mut command = sandbox.command();
         command.arg("daemon");
@@ -1129,7 +1129,7 @@ fn s1_f29_ctrl_c_foreground_spawn_exits_130() -> TestResult {
 #[test]
 fn s1_f01_concurrent_auto_start_one_daemon() -> TestResult {
     evidenced(|| {
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // Daemon startup only: no turn by design.
         sandbox.no_launch();
         sandbox.arm("daemon.startup.after_lock", 1, "pause")?;
@@ -1188,7 +1188,7 @@ fn s1_f01_concurrent_auto_start_one_daemon() -> TestResult {
 fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
     evidenced(|| {
         const OTHER: &str = "0.0.0-f04";
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // Idle daemons only: no turn by design.
         sandbox.no_launch();
         let mut daemon = sandbox.start()?;
@@ -1278,7 +1278,7 @@ fn s1_f04_version_mismatch_stops_only_matching_idle_daemon() -> TestResult {
 fn s1_f04_explicit_stop_from_mismatched_version_stops_idle_daemon_only() -> TestResult {
     evidenced(|| {
         const OTHER: &str = "0.0.0-f04-stop";
-        let sandbox = Sandbox::new(&json!({}))?;
+        let sandbox = Sandbox::new(&json!({"scripts": []}))?;
         // Idle daemons only: no turn by design.
         sandbox.no_launch();
         let mut daemon = sandbox.start()?;

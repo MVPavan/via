@@ -74,27 +74,6 @@ pub enum StartRejected {
     Protocol(String),
 }
 
-/// Evidence returned by C2's start operation.
-#[derive(Clone, Debug)]
-pub enum StartOutcome {
-    /// Vendor evidence confirms acceptance of this one submission.
-    Accepted {
-        /// Same token used in the matching observation.
-        correlation: AcceptanceToken,
-        /// Vendor turn identifier when the route provides one.
-        vendor_turn_id: Option<VendorTurnId>,
-        /// Monotonic acceptance time; wall time is recorded separately.
-        accepted_at: tokio::time::Instant,
-    },
-    /// Vendor definitively refused the submitted turn.
-    Rejected(StartRejected),
-    /// Input may have reached the vendor; never resend automatically.
-    Unknown {
-        /// Bounded diagnostic without prompt or handle.
-        reason: String,
-    },
-}
-
 /// Whether the turn's side effects are known to have stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cleanup {
@@ -166,7 +145,6 @@ mod capabilities;
 mod config;
 mod driver;
 mod fake;
-mod fake_config;
 mod harness;
 pub mod observation;
 mod plan;
@@ -181,53 +159,36 @@ pub use driver::{
     CloseMode, CloseReport, ConnectionPin, ForceWatch, Prepared, Recovery, SessionCx,
     SessionDriver, SessionSpec, SteerError, SteerInput, TurnCx, TurnSpec,
 };
-pub use fake_config::FakeConfig;
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
+pub use observation::{
+    AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
+    LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,
+    ProgressMarks, SteerDelivery, StopReason, TurnEnd, TurnEvidence, UsageSample, VendorTerminal,
+    observation_channel, observation_channel_in,
+};
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,
     InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan, ServerKey,
     SessionRef, Switch, TurnParams, VendorOptions, VersionStatus, Warning, resolve_model,
 };
 pub use runtime::{
-    AdapterError, AdapterRuntime, AdapterRuntimeConfig, AdapterShutdown, AdmittedObservation,
-    AnchorRecovery, AnchorTurnRecovery, FakeRecovery, FakeShutdown, FakeTurnRecovery,
-    OBSERVATION_BYTES, OBSERVATION_ITEMS, ObservationSink, observation_channel,
+    AdapterShutdown, AnchorRecovery, AnchorTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS,
 };
 pub use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub use via_routes::{
     AnchorCohort, CapacityToken, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner,
-    RuntimeConfig, RuntimeResources, SessionId, TurnCause, TurnFailure, WireCleanup,
+    RuntimeConfig, RuntimeResources, SessionId, WireCleanup,
 };
 
-/// Fake terminal status as vendor evidence; Core chooses the C1 disposition.
+/// A vendor terminal's status as evidence; Core chooses the C1 disposition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VendorTerminalStatus {
-    /// Fake reported normal completion.
+    /// The vendor reported normal completion.
     Completed,
-    /// Fake reported interruption.
+    /// The vendor reported interruption.
     Interrupted,
-    /// Fake reported failure.
+    /// The vendor reported failure.
     Failed,
-}
-
-/// A paired fake acceptance observation.
-pub struct FakeAcceptanceObservation {
-    /// Correlation ID shared with start outcome.
-    pub correlation: AcceptanceToken,
-    /// Vendor-scoped turn ID.
-    pub vendor_turn_id: VendorTurnId,
-}
-
-/// One normalized C2 data observation (C2 A1 after Task 4 design §2.3).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Observation {
-    /// The marks of one vendor message; Core folds them into the step
-    /// tracker (design §2.4). Sent only when the message carries a mark.
-    Progress(ProgressMarks),
-    /// One piece of the completed final text (design §2.3): the pieces, in
-    /// order, concatenate to it, each at most [`MAX_OBSERVATION_BYTES`]
-    /// encoded; all come before the vendor terminal, which carries none.
-    FinalText(String),
 }
 
 /// `{"type":"final_text","text":""}`: an observation's bytes besides its
@@ -274,22 +235,6 @@ pub fn final_text_pieces(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// A vendor message's progress marks (design §2.4, §2.5).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgressMarks {
-    /// When the message arrived.
-    pub at: tokio::time::Instant,
-    /// Model output: text, reasoning or a tool request. Applies before
-    /// the message's tool starts.
-    pub model: bool,
-    /// Tools started, as `(id, name)`.
-    pub tools_started: Vec<(String, String)>,
-    /// Ids of tools ended.
-    pub tools_ended: Vec<String>,
-    /// An interval usage sample `(key?, total)`.
-    pub usage: Option<(Option<String>, u64)>,
-}
-
 /// The turn's activity clock (design §2.4): the arrival of the last vendor
 /// message attributed to the turn, unknown types included, as milliseconds
 /// since the clock's base instant. The Adapter stores; Core reads.
@@ -319,35 +264,6 @@ impl TurnActivity {
     pub fn last_ms(&self) -> u64 {
         self.last_ms.load(Ordering::Relaxed)
     }
-}
-
-/// Adapter output to Core, in the order the driver decoded it (C2 §4).
-pub enum FakeObservation {
-    /// The paired acceptance, always before any other observation of the turn.
-    Accepted(FakeAcceptanceObservation),
-    /// A data observation.
-    Data {
-        /// Normalized payload.
-        observation: Observation,
-    },
-}
-
-/// Final fake evidence after the vendor exited; no Core state is chosen here.
-pub struct FakeTerminalEvidence {
-    /// Vendor terminal status. The final text came before it, as
-    /// [`Observation::FinalText`] pieces.
-    pub status: VendorTerminalStatus,
-    /// Raw vendor stop reason.
-    pub stop_reason: String,
-    /// Optional vendor failure code.
-    pub vendor_code: Option<String>,
-    /// Independently confirmed vendor exit.
-    pub exit: via_routes::ExitReport,
-    /// Private-group cleanup certainty after vendor exit.
-    pub cleanup: Cleanup,
-    /// A Host journal write in the turn's cleanup had an uncertain outcome:
-    /// the daemon must latch (design §7.2 row 12).
-    pub journal_uncertain: bool,
 }
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.

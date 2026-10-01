@@ -1,6 +1,6 @@
 //! Adapter configuration (adapter design §5.4): the bootstrap environment
 //! names, read once at daemon start, and the opaque `harnesses` section of
-//! `daemon.json`. It replaces `FakeConfig` once Core moves to it.
+//! `daemon.json`.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -179,7 +179,7 @@ impl AdapterConfig {
     }
 }
 
-/// The checks `FakeConfig` makes today, unchanged.
+/// The fixture checks of runtime §11.1.
 fn check_fixture(binary: &Path, scenario: &Path, sync_dir: &Path) -> Result<(), ConfigError> {
     if !binary.is_absolute() || !scenario.is_absolute() || !sync_dir.is_absolute() {
         return Err(ConfigError::Fixture("fake fixture paths must be absolute"));

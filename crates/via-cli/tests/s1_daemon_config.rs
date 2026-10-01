@@ -1463,9 +1463,18 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
                 "spawn",
                 &json!({"harness":"fake","model":"nope","prompt":"p","handle":HANDLE}),
             )?;
-            check(is_error(&spawn, -32010, "unknown_model"), || {
-                format!("spawn of an unknown model: {spawn}")
-            })?;
+            // Design §5.2 (S-CORE chunk 4, design-listed): an uncatalogued
+            // model with an explicit harness passes through to the vendor.
+            check(
+                spawn["result"]["state"] == "queued"
+                    && spawn["result"]["effective"]["model"] == "nope",
+                || format!("spawn of an uncatalogued model: {spawn}"),
+            )?;
+            let passed = spawn["result"]["session_id"]
+                .as_str()
+                .ok_or_else(|| infra(format!("no session in {spawn}")))?
+                .to_owned();
+            setup.wait(evidence, "wait_passed", &format!("{passed}/1"))?;
             let models = cli(&setup.sandbox, evidence, "models", &["models", "--json"])?;
             check(
                 models["models"]
@@ -1477,7 +1486,7 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
                 format!("models of another harness: {other}")
             })?;
             check(
-                setup.count("SELECT COUNT(*) FROM sessions")? == sessions,
+                setup.count("SELECT COUNT(*) FROM sessions")? == sessions + 1,
                 || "describe or models wrote".to_owned(),
             )?;
             drop(conn);
@@ -1488,7 +1497,7 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
             let _daemon = setup.start(evidence)?;
             let restarted = setup.daemon_status(evidence, "status_restarted")?;
             check(
-                restarted["sessions"] == json!({"idle":2,"active":0,"closing":0})
+                restarted["sessions"] == json!({"idle":3,"active":0,"closing":0})
                     && restarted["started_at"] != started,
                 || format!("after a restart: {restarted}"),
             )

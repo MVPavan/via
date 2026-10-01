@@ -4,19 +4,24 @@
 //! uncertain cleanup. Nothing is resent: the prompt may have reached the
 //! vendor, and process exit proves neither non-submission nor inaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
-use via_adapters::FakeRecovery;
+use via_adapters::{
+    Admitted, AnchorRecovery, ObservationBudget, Recovery, SessionCx, SessionDriver, SessionRef,
+    observation_channel_in,
+};
 use via_store::{
-    ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, StoreError, TerminalRecord, UnfinishedTurn,
+    ANCHOR_PAGE_LIMIT, AnchorOwner, CancelCause, SessionRoute, StoreError, TerminalRecord,
+    UnfinishedTurn,
 };
 
 use std::sync::atomic::Ordering;
 
 use super::drive::{Cancelled, Commit, queued_cancellation};
 use super::journal::Head;
+use super::lane::Identity;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
@@ -39,7 +44,9 @@ pub struct Handoff {
     /// Committed `queued → cancelled` behind an `unknown` predecessor, or
     /// for a durably `closing` session.
     pub cancelled: usize,
-    /// Durably `closing` sessions the restart closed (design §4).
+    /// Durably `closing` sessions the restart closed (design §4); one
+    /// whose lane did not end within the close allowance stays `closing`
+    /// (critical r1 #3).
     pub closed: usize,
     /// Failed `failed(store)` without agent I/O because a frozen value in
     /// the queued row is unparseable (design §7.3, O1.D8).
@@ -72,6 +79,12 @@ impl Engine {
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;
+        let mut asked = HashSet::new();
+        // Critical r1 #2: a resumed driver's lane becomes the session's
+        // only once recovery committed every write of its own, so one owner
+        // writes the session's sequence at a time; until then the driver's
+        // channel holds what it delivers.
+        let mut resumed = Vec::new();
         loop {
             let turns = self
                 .store
@@ -79,11 +92,22 @@ impl Engine {
                 .await
                 .map_err(|error| format!("store_error: {error}"))?;
             if turns.is_empty() {
+                for (session, resumed) in resumed {
+                    Resumed::adopt(resumed, self, &session)?;
+                }
                 return Ok(recovered);
             }
             // Each resolution commits or fails recovery, so the next read
             // never returns the same turn again.
             for turn in turns {
+                if asked.insert(turn.session_id.clone())
+                    && let Some(driver) = self
+                        .recover_session(&turn.session_id, &reconciled)
+                        .await
+                        .map_err(|error| format!("store_error: {}", error.kind))?
+                {
+                    resumed.push((turn.session_id.clone(), driver));
+                }
                 on_turn(&turn.session_id, turn.turn);
                 self.recover_turn(turn, &reconciled)
                     .await
@@ -106,7 +130,8 @@ impl Engine {
     ///
     /// A durably `closing` session is finished before admission (design §4
     /// "Restart"): its queued turns are cancelled with cause `close`, then
-    /// `Closed` commits after one bounded absence check.
+    /// `Closed` commits after its lane ended and one bounded absence check
+    /// ([`Engine::finish_restart_close`]).
     ///
     /// Design §7.3 (O1.D8): a turn the handoff would enqueue, at its
     /// session's head, whose frozen row is present but unparseable fails
@@ -201,8 +226,9 @@ impl Engine {
         }
         let bound = tokio::time::Instant::now() + CLOSE_ALLOWANCE;
         for session in closing {
-            self.finish_restart_close(&session, bound).await?;
-            handoff.closed += 1;
+            if self.finish_restart_close(&session, bound).await? {
+                handoff.closed += 1;
+            }
         }
         Ok(handoff)
     }
@@ -316,8 +342,8 @@ impl Engine {
             queued_seq,
             ..
         } = self.history(session, turn).await?;
-        let cwd = self
-            .frozen_cwd(session)
+        let (cwd, _) = self
+            .frozen(session)
             .await
             .map_err(|error| WriteOutcome::of_read(&error))?;
         Ok(Queueing {
@@ -335,14 +361,20 @@ impl Engine {
             .to_string()
     }
 
-    /// The session's frozen `cwd` (design §11.1), which a rebuilt envelope
-    /// reports as the live drive would.
-    async fn frozen_cwd(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
+    /// The session's frozen `cwd` (design §11.1) and its stored identity
+    /// (decision H3), which a rebuilt envelope reports as the live drive
+    /// and `logs` would (C1 §5, critical r1 #11).
+    async fn frozen(
+        &self,
+        session: &SessionId,
+    ) -> Result<(Option<String>, Option<Identity>), StoreError> {
         Ok(self
             .store
             .session_snapshot(session)
             .await?
-            .and_then(|snapshot| snapshot.cwd))
+            .map_or((None, None), |snapshot| {
+                (snapshot.cwd, Identity::stored(&snapshot.route))
+            }))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -350,7 +382,18 @@ impl Engine {
     /// stays uncertain; only a Store read or write failure is fatal
     /// (runtime-contracts §7).
     async fn reconcile(&self, deadline: Deadline) -> Result<Reconciled, String> {
-        let mut reconciled = Reconciled::default();
+        // Critical r1 #9: facts are kept only for the sessions recovery
+        // asks about. Store lists at most 1,000 unfinished turns at once
+        // (one running per session); past a full list a session it did not
+        // name has no kept facts, which are then incomplete.
+        let unfinished = self
+            .store
+            .unfinished_turns()
+            .await
+            .map_err(|error| format!("store_error: {error}"))?;
+        let every = unfinished.len() < UNFINISHED_LIST;
+        let relevant = unfinished.into_iter().map(|turn| turn.session_id).collect();
+        let mut reconciled = Reconciled::for_sessions(relevant, every);
         let mut after = None;
         loop {
             // At expiry paging stops: the unread rest of the inventory leaves
@@ -406,11 +449,64 @@ impl Engine {
         }
     }
 
+    /// C2 §2 Recover (AD9, Sol r1 F12): asks the adapter set about
+    /// `session` from its stored route identity, with Host's reconciled
+    /// facts for it; nothing is submitted. A resumed driver is returned, to
+    /// become the session's lane once its unfinished turn is recovered
+    /// (critical r1 #2). The session's unfinished turns still end `unknown`
+    /// (C1 §7.5), with the cleanup Host's facts prove.
+    async fn recover_session(
+        &self,
+        session: &SessionId,
+        reconciled: &Reconciled,
+    ) -> Result<Option<Resumed>, ApiError> {
+        let snapshot = self
+            .store
+            .session_snapshot(session)
+            .await
+            .map_err(|_| ApiError::STORE)?
+            .ok_or(ApiError::STORE)?;
+        let (facts, complete) = reconciled.session_facts(session);
+        let budget = ObservationBudget::new();
+        let (sink, receiver) = observation_channel_in(&budget);
+        let cx = SessionCx {
+            observations: sink,
+            tracker: self.tracker.clone(),
+            cancel: self.cancel.child_token(),
+        };
+        let reference = super::lane::session_ref(&snapshot.route);
+        let recovery = bounded(self.adapter.recover(&reference, facts, cx).await, complete);
+        #[cfg(test)]
+        let (recovery, receiver) = match super::lock(&self.faults.resume).take() {
+            Some((driver, receiver)) => (Recovery::Resumed(Box::new(driver)), receiver),
+            None => (recovery, receiver),
+        };
+        #[cfg(test)]
+        {
+            let answer = match &recovery {
+                Recovery::Resumed(_) => "resumed",
+                Recovery::Unknown { .. } => "unknown",
+                Recovery::Dead { .. } => "dead",
+            };
+            super::lock(&self.faults.recoveries).push((session.clone(), facts.len(), answer));
+        }
+        Ok(match recovery {
+            Recovery::Resumed(driver) => Some(Resumed {
+                driver: *driver,
+                receiver,
+                budget,
+                reference,
+                route: snapshot.route,
+            }),
+            Recovery::Unknown { .. } | Recovery::Dead { .. } => None,
+        })
+    }
+
     /// Design §11: a group an earlier daemon left, whose absence recovery did
     /// not prove, holds a connection slot until a later Host absence proof
     /// drops its token. Past the pool the groups share the permits held, so
     /// no new child starts until cleanup proves room.
-    fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
+    fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
@@ -456,10 +552,9 @@ impl Engine {
             .history(&session, turn)
             .await
             .map_err(|_| ApiError::STORE)?;
-        let cwd = self
-            .frozen_cwd(&session)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        #[cfg(test)]
+        self.hold(&self.faults.hold_after_history).await;
+        let (cwd, identity) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -471,6 +566,7 @@ impl Engine {
             first_failure: None,
             uncertain: None,
             steps: super::progress::StepTracker::default(),
+            vendor: super::lane::VendorRecord::default(),
         };
         let cancel = self
             .settle_recovered(&mut record, reconciled, requested_at, settled)
@@ -515,6 +611,7 @@ impl Engine {
             (queued_seq, seq),
             // The crashed daemon's samples are gone with it.
             Usage::UNAVAILABLE,
+            identity,
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(
@@ -570,7 +667,7 @@ impl Engine {
             });
         }
         let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn);
-        let (outcome, cleanup) = stop_outcome(quiescent, forced);
+        let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let requested_at = if let Some(at) = requested {
             at
         } else {
@@ -672,11 +769,39 @@ fn recovered_terminal(cancel: Cancel) -> Terminal {
     }
 }
 
-/// Acceptance is reported only when both its evidence and its event committed.
+/// Acceptance is reported only when both its evidence and its event
+/// committed. Its vendor turn ID is the tagged correlation's (critical r1
+/// #10); a token names none.
 fn recovered_acceptance(correlation: Option<String>, started: Option<String>) -> Option<Accepted> {
     match (correlation, started) {
-        (Some(vendor_turn_id), Some(at)) => Some(Accepted { at, vendor_turn_id }),
+        (Some(correlation), Some(at)) => Some(Accepted {
+            at,
+            vendor_turn_id: correlation
+                .strip_prefix(super::drive::VENDOR_CORRELATION)
+                .map(str::to_owned),
+        }),
         _ => None,
+    }
+}
+
+/// A driver recovery resumed, with its session channel, not yet the
+/// session's lane ([`Engine::recover_session`], [`Engine::recover_logged`]).
+struct Resumed {
+    driver: SessionDriver,
+    receiver: tokio::sync::mpsc::Receiver<Admitted>,
+    budget: ObservationBudget,
+    reference: SessionRef,
+    route: SessionRoute,
+}
+
+impl Resumed {
+    /// Makes the driver `session`'s lane: its actor starts consuming.
+    fn adopt(self, engine: &Engine, session: &SessionId) -> Result<(), String> {
+        engine.adopt_lane(
+            session,
+            (self.driver, self.receiver, self.budget),
+            (self.reference, &self.route),
+        )
     }
 }
 
@@ -731,15 +856,47 @@ impl DurableSettlement {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
+    /// Host's reports for every committed anchor of each session with an
+    /// unfinished turn, one an earlier, ended turn owns included: the facts
+    /// its adapter recovery is given (C2 §2 Recover, Sol r2 #7). At most
+    /// [`RECOVERY_FACTS`] in all (critical r1 #9).
+    facts: HashMap<SessionId, Vec<AnchorRecovery>>,
+    /// Sessions with unfinished turns and a committed anchor Host returned
+    /// no report for, or one past the cap.
+    unreported: HashSet<SessionId>,
     /// Committed anchors Host returned no report for; each stays uncertain.
     missing: usize,
     /// The deadline stopped paging before the whole inventory was read.
     incomplete: bool,
+    /// The sessions with unfinished turns, whose recovery asks for facts.
+    relevant: HashSet<SessionId>,
+    /// [`Self::relevant`] lists every session with an unfinished turn.
+    every: bool,
+    /// Facts kept, against [`RECOVERY_FACTS`].
+    kept: usize,
 }
 
+/// Host facts recovery keeps across sessions (critical r1 #9): past it a
+/// session's facts are incomplete, so its answer is never `Dead`.
+const RECOVERY_FACTS: usize = 1024;
+
+/// The most unfinished turns one Store list returns
+/// (`Store::unfinished_turns`, `LIMIT 1000`).
+const UNFINISHED_LIST: usize = 1000;
+
 impl Reconciled {
+    /// Facts for `relevant`'s sessions only, `every` one with an
+    /// unfinished turn when true.
+    fn for_sessions(relevant: HashSet<SessionId>, every: bool) -> Self {
+        Self {
+            relevant,
+            every,
+            ..Self::default()
+        }
+    }
+
     /// Folds one inventory page and Host's reports for the same id range.
-    fn add(&mut self, owners: &[AnchorOwner], reports: &[FakeRecovery]) {
+    fn add(&mut self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
             let report = reports.iter().find(|report| {
                 report.anchor_id == owner.anchor_id
@@ -748,6 +905,29 @@ impl Reconciled {
             });
             if report.is_none() {
                 self.missing += 1;
+            }
+            // Critical r1 #9: only a session recovery asks about keeps its
+            // facts, within the cap; past it the session's are incomplete.
+            if self.relevant.contains(&owner.session_id) {
+                match report {
+                    Some(report) if self.kept < RECOVERY_FACTS => {
+                        self.kept += 1;
+                        self.facts
+                            .entry(owner.session_id.clone())
+                            .or_default()
+                            .push(AnchorRecovery {
+                                session_id: report.session_id.clone(),
+                                anchor_id: report.anchor_id.clone(),
+                                generation: report.generation.clone(),
+                                turn: report.turn,
+                                cleanup: report.cleanup,
+                                forced: report.forced,
+                            });
+                    }
+                    Some(_) | None => {
+                        self.unreported.insert(owner.session_id.clone());
+                    }
+                }
             }
             if !owner.turn_running {
                 continue;
@@ -766,6 +946,19 @@ impl Reconciled {
         }
     }
 
+    /// Host's reports for every committed anchor of `session` (C2 §2
+    /// Recover), and whether they are complete: the whole inventory was
+    /// read, `session` was among those whose facts were kept, and every
+    /// anchor of the session has a kept report.
+    fn session_facts(&self, session: &SessionId) -> (&[AnchorRecovery], bool) {
+        let facts = self.facts.get(session).map_or(&[][..], Vec::as_slice);
+        let known = self.every || self.relevant.contains(session);
+        (
+            facts,
+            known && !self.incomplete && !self.unreported.contains(session),
+        )
+    }
+
     /// `(quiescent, forced)` for a turn. With a complete inventory and no
     /// committed anchor intent no process could exist, so nothing needs
     /// cleaning; an incomplete inventory proves nothing for any turn.
@@ -779,12 +972,36 @@ impl Reconciled {
     }
 }
 
+/// An adapter's recovery answer on facts that are `complete` or not:
+/// incomplete Host evidence never proves every process of the session gone
+/// (C2 §2 Recover rows, Sol r2 #7), so `Dead` becomes `Unknown`.
+fn bounded(recovery: Recovery, complete: bool) -> Recovery {
+    match recovery {
+        Recovery::Dead { .. } if !complete => Recovery::Unknown {
+            reason: "Host's evidence for the session is incomplete".to_owned(),
+        },
+        recovery @ (Recovery::Resumed(_) | Recovery::Unknown { .. } | Recovery::Dead { .. }) => {
+            recovery
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorOwner, Cleanup, DurableSettlement, FakeRecovery, Reconciled, SessionId, TurnNumber,
+        AnchorOwner, AnchorRecovery, Cleanup, DurableSettlement, Reconciled, Recovery, SessionId,
+        TurnNumber, bounded,
     };
     use via_store::AnchorPhase;
+
+    /// Reconciliation for every session `sessions` names, the sessions
+    /// with unfinished turns.
+    fn relevant(sessions: &[&SessionId]) -> Reconciled {
+        Reconciled::for_sessions(
+            sessions.iter().map(|&session| session.clone()).collect(),
+            true,
+        )
+    }
 
     fn owner(anchor_id: &str, session: &SessionId, turn_running: bool) -> AnchorOwner {
         at_phase(
@@ -810,8 +1027,8 @@ mod tests {
         }
     }
 
-    fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> FakeRecovery {
-        FakeRecovery {
+    fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> AnchorRecovery {
+        AnchorRecovery {
             session_id: session.clone(),
             anchor_id: anchor_id.to_owned(),
             generation: "g".to_owned(),
@@ -825,7 +1042,7 @@ mod tests {
     fn an_anchor_without_a_report_is_never_quiescent_and_is_counted_missing() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session]);
         reconciled.add(
             &[owner("a1", &session, true), owner("a2", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -838,7 +1055,7 @@ mod tests {
     fn a_page_without_reports_after_the_deadline_stays_uncertain() {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session]);
         reconciled.add(
             &[owner("a1", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -853,7 +1070,7 @@ mod tests {
         let session = SessionId::try_from("s_000000000000").expect("session");
         let unseen = SessionId::try_from("s_000000000001").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session, &unseen]);
         reconciled.add(
             &[owner("a1", &session, true)],
             &[report("a1", &session, Cleanup::Quiescent)],
@@ -869,7 +1086,7 @@ mod tests {
         let other = SessionId::try_from("s_000000000001").expect("session");
         let ended = SessionId::try_from("s_000000000002").expect("session");
         let turn = TurnNumber::try_from(1).expect("turn");
-        let mut reconciled = Reconciled::default();
+        let mut reconciled = relevant(&[&session, &other, &ended]);
         reconciled.add(
             &[
                 owner("a1", &session, true),
@@ -886,6 +1103,47 @@ mod tests {
         assert_eq!(reconciled.cleanup(&session, turn), (false, false));
         assert_eq!(reconciled.cleanup(&other, turn), (true, false));
         assert_eq!(reconciled.turns.len(), 2);
+    }
+
+    /// Sol r2 #7 (C2 §2 Recover): a session's recovery facts are Host's
+    /// reports for every committed anchor of the session, a persistent
+    /// anchor an earlier, ended turn owns included; a committed anchor
+    /// without a report, or an inventory the deadline cut, makes them
+    /// incomplete, and incomplete facts never give `Dead`.
+    #[test]
+    fn recovery_facts_cover_every_session_anchor_and_incomplete_ones_never_give_dead() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let unreported = SessionId::try_from("s_000000000001").expect("session");
+        let mut reconciled = relevant(&[&session, &unreported]);
+        reconciled.add(
+            &[
+                owner("a1", &session, true),
+                // An earlier turn's persistent anchor survives.
+                owner("a0", &session, false),
+                owner("b1", &unreported, true),
+                owner("b0", &unreported, false),
+            ],
+            &[
+                report("a1", &session, Cleanup::Quiescent),
+                report("a0", &session, Cleanup::Uncertain),
+                report("b1", &unreported, Cleanup::Quiescent),
+            ],
+        );
+        let (facts, complete) = reconciled.session_facts(&session);
+        let mut anchors: Vec<&str> = facts.iter().map(|fact| fact.anchor_id.as_str()).collect();
+        anchors.sort_unstable();
+        assert_eq!(anchors, ["a0", "a1"]);
+        assert!(complete);
+        let (facts, complete) = reconciled.session_facts(&unreported);
+        assert_eq!(facts.len(), 1);
+        assert!(!complete, "b0 has no report");
+        let dead = || Recovery::Dead {
+            evidence: "e".to_owned(),
+        };
+        assert!(matches!(bounded(dead(), false), Recovery::Unknown { .. }));
+        assert!(matches!(bounded(dead(), true), Recovery::Dead { .. }));
+        reconciled.incomplete = true;
+        assert!(!reconciled.session_facts(&session).1, "a cut inventory");
     }
 
     /// A durable `cancel.settled` is read back as committed; a value outside
@@ -907,5 +1165,55 @@ mod tests {
             DurableSettlement::read(&serde_json::json!({"outcome":"forced","cleanup":"quiescent"}))
                 .is_err()
         );
+    }
+
+    /// Critical r1 #9 (runtime §8: bounded holders): recovery keeps Host's
+    /// facts only for sessions with unfinished turns, a persistent anchor
+    /// of an earlier turn included (Sol r2 #7), and at most
+    /// [`RECOVERY_FACTS`] in all; past the cap a session's facts are
+    /// incomplete, so they never give `Dead`. A session the unfinished list
+    /// may have missed is never complete either.
+    #[test]
+    fn recovery_keeps_bounded_facts_of_sessions_with_unfinished_turns() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let historical = SessionId::try_from("s_000000000001").expect("session");
+        let mut reconciled = relevant(&[&session]);
+        let mut owners = vec![owner("a1", &session, true), owner("a0", &session, false)];
+        let mut reports = vec![
+            report("a1", &session, Cleanup::Quiescent),
+            report("a0", &session, Cleanup::Quiescent),
+        ];
+        for anchor in 0..10 {
+            let anchor = format!("h{anchor}");
+            owners.push(owner(&anchor, &historical, false));
+            reports.push(report(&anchor, &historical, Cleanup::Quiescent));
+        }
+        // A historical anchor without a report.
+        owners.push(owner("hx", &historical, false));
+        reconciled.add(&owners, &reports);
+        assert_eq!(reconciled.session_facts(&session).0.len(), 2);
+        assert!(reconciled.session_facts(&session).1);
+        assert!(
+            !reconciled.facts.contains_key(&historical) && reconciled.unreported.is_empty(),
+            "nothing is kept of a session with no unfinished turn"
+        );
+        // The cap.
+        let mut capped = relevant(&[&session]);
+        let (owners, reports): (Vec<_>, Vec<_>) = (0..=super::RECOVERY_FACTS)
+            .map(|anchor| {
+                let anchor = format!("c{anchor}");
+                (
+                    owner(&anchor, &session, false),
+                    report(&anchor, &session, Cleanup::Quiescent),
+                )
+            })
+            .unzip();
+        capped.add(&owners, &reports);
+        let (facts, complete) = capped.session_facts(&session);
+        assert!(facts.len() <= super::RECOVERY_FACTS);
+        assert!(!complete, "past the cap the facts are incomplete");
+        // A list that may have missed sessions proves nothing for them.
+        let partial = Reconciled::for_sessions(std::iter::once(session.clone()).collect(), false);
+        assert!(!partial.session_facts(&historical).1);
     }
 }

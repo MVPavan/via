@@ -119,7 +119,8 @@ impl Engine {
 
     /// Design §11.1: the session's `cwd`, checked by an owned blocking step
     /// with no lock held: at most 4096 bytes, absolute and an existing
-    /// directory. An omitted `cwd` is the fake's configured default.
+    /// directory. An omitted `cwd` is the daemon's working directory at
+    /// startup (§5.1 #22).
     async fn session_cwd(&self, cwd: Option<String>) -> Result<String, ApiError> {
         let invalid = |message| {
             ApiError::naming(
@@ -130,8 +131,7 @@ impl Engine {
         };
         let Some(cwd) = cwd else {
             return self
-                .adapter
-                .fake_cwd()
+                .cwd
                 .to_str()
                 .map(str::to_owned)
                 .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"));
@@ -254,13 +254,11 @@ impl Engine {
         }
         // Bounds the turns retained for their `store_error` reads.
         journal::admission(&self.store, &self.unresolved).await?;
-        if params.harness != "fake" || !self.adapter.fake_available() {
+        if params.harness != "fake" || !self.harness_available(&params.harness) {
             return Err(ApiError::HARNESS_UNAVAILABLE);
         }
-        // Task 4 design §4.6: the fake offers one model.
-        if params.model != "fake" {
-            return Err(ApiError::UNKNOWN_MODEL);
-        }
+        // Design §5.2: with its harness named, a model the catalog lacks
+        // passes through for the vendor to judge.
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
@@ -302,7 +300,7 @@ impl Engine {
                     handle_hash: hash,
                     receipt: receipt.clone(),
                     // Design §11.1 (A14): the frozen session parameters.
-                    params: json!({"harness":"fake","model":"fake","cwd":cwd,
+                    params: json!({"harness":"fake","model":&params.model,"cwd":cwd,
                         "allow_untested":params.allow_untested}),
                     label: params.label,
                     effective: receipt["effective"].clone(),
@@ -323,7 +321,7 @@ impl Engine {
             return Err(self.receipt_failed(&error, &admission));
         }
         self.session_opened();
-        let slot = Slot::new(Head::new(Some(2)));
+        let slot = Slot::new(Head::new(Some(2)), std::sync::Weak::clone(&self.me));
         lock(&self.sessions).insert(session.clone(), Arc::clone(&slot));
         self.receipted(&session, turn, &slot);
         Ok(Receipted {

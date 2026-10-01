@@ -1784,6 +1784,11 @@ pub(crate) struct Effective {
 }
 
 impl Effective {
+    /// The turn's frozen model.
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Turn 1 of a fake session: its own values, else the fake route's defaults.
     pub(crate) fn fake(model: &str, overrides: &Overrides) -> Self {
         Self {
@@ -1843,14 +1848,27 @@ impl RoutePlan {
         }
     }
 
+    /// The version the turn's own instance reported at its handshake
+    /// (AD7): `tested` only when the adapter checked it.
+    pub(crate) fn instance(mut self, vendor_version: Option<String>, tested: bool) -> Self {
+        self.vendor_version = vendor_version;
+        self.version_status = if tested { "tested" } else { "untested" };
+        self
+    }
+
     pub(crate) fn warnings(&self) -> Vec<Warning> {
-        if self.version_status == "untested" {
-            vec![Warning {
-                code: "vendor_version_untested",
-                message: "the fake agent reports no version",
-            }]
-        } else {
+        if self.version_status != "untested" {
             Vec::new()
+        } else if self.vendor_version.is_none() {
+            vec![Warning::new(
+                "vendor_version_untested",
+                "the fake agent reports no version",
+            )]
+        } else {
+            vec![Warning::new(
+                "vendor_version_untested",
+                "the vendor version is not one the adapter checked",
+            )]
         }
     }
 }
@@ -1859,19 +1877,107 @@ impl RoutePlan {
 pub(crate) struct Warning {
     code: &'static str,
     message: &'static str,
+    /// C1 §5: a code's structured detail, where it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 impl Warning {
+    /// A warning without `data`.
+    pub(crate) const fn new(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            data: None,
+        }
+    }
+
+    /// This warning with `data`. No warning Core raises carries data yet.
+    #[cfg(any(test, feature = "test-failpoints"))]
+    pub(crate) fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// This warning within its C1 §5 caps: `message` cut to 1 KiB encoded
+    /// at a character boundary, `data` over 4 KiB encoded left out.
+    pub(crate) fn capped(mut self) -> Self {
+        self.message = cut_encoded(self.message, WARNING_MESSAGE_MAX - 2);
+        if self
+            .data
+            .as_ref()
+            .is_some_and(|data| !encodes_within(data, WARNING_DATA_MAX))
+        {
+            self.data = None;
+        }
+        self
+    }
+
     /// The warning's stable code.
     pub(crate) fn code(&self) -> &'static str {
         self.code
     }
 
     /// C1 §3.5: a settled cancel whose group absence is unproved.
-    pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self {
-        code: "cancel_cleanup_uncertain",
-        message: "process group cleanup after cancellation is unconfirmed",
-    };
+    pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self::new(
+        "cancel_cleanup_uncertain",
+        "process group cleanup after cancellation is unconfirmed",
+    );
+
+    /// C1 §5, AD6: the turn's usage ledger overflowed its keys, so the
+    /// reported numbers cover an interval VIA did not verify.
+    pub(crate) const USAGE_INTERVAL_UNVERIFIED: Self = Self::new(
+        "usage_interval_unverified",
+        "the reported usage covers an interval VIA could not verify",
+    );
+
+    /// An adapter-reported warning as the envelope's (C1 §5: adapter
+    /// warnings "reach the envelope only as these codes"): a code of the
+    /// closed list with VIA's own message and the adapter's `data`, which
+    /// [`Self::capped`] bounds; `None` for any other code, which stays a
+    /// `warning` event only.
+    pub(crate) fn adapter(code: &str, data: Option<Value>) -> Option<Self> {
+        let (code, message) = match code {
+            "instructions_partial" => (
+                "instructions_partial",
+                "the vendor applied the turn's instructions only in part",
+            ),
+            "vendor_version_untested" => (
+                "vendor_version_untested",
+                "the vendor version is not one the adapter checked",
+            ),
+            "usage_interval_unverified" => (
+                "usage_interval_unverified",
+                Self::USAGE_INTERVAL_UNVERIFIED.message,
+            ),
+            "structured_output_missing" => (
+                "structured_output_missing",
+                "the vendor returned no structured output",
+            ),
+            "cancel_cleanup_uncertain" => (
+                "cancel_cleanup_uncertain",
+                Self::CANCEL_CLEANUP_UNCERTAIN.message,
+            ),
+            "predecessor_cleanup_uncertain" => (
+                "predecessor_cleanup_uncertain",
+                "cleanup of the session's previous process group is unconfirmed",
+            ),
+            "config_switch_unverified" => (
+                "config_switch_unverified",
+                "VIA could not apply or verify a requested inheritance setting",
+            ),
+            "deprecated" => (
+                "deprecated",
+                "the vendor reported a deprecated feature or setting",
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            code,
+            message,
+            data,
+        })
+    }
 }
 
 /// C1 §3.5/§7.4 cancel outcome with separate cleanup certainty.
@@ -1919,7 +2025,7 @@ pub(crate) struct Bound {
     inherited: bool,
 }
 
-/// C1 §8.2 `failure.class` values Core commits for the fake route.
+/// C1 §8.2 `failure.class` values Core commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureClass {
@@ -1927,7 +2033,16 @@ pub(crate) enum FailureClass {
     /// C1 §8.2: no meaningful progress within `idle_ms` (design §5).
     DeadlineIdle,
     SubmitFailed,
+    /// C1 §8.2: the vendor returned a different or fresh session.
+    ResumeMismatch,
     VendorError,
+    /// C1 §8.2's specific vendor classes, from the adapter's class hint.
+    RateLimit,
+    Auth,
+    ContextExceeded,
+    BudgetExceeded,
+    /// C1 §8.2: Host-confirmed death of a persistent server.
+    ServerLost,
     ProcessExited,
     Protocol,
     Overflow,
@@ -1944,6 +2059,10 @@ pub(crate) struct Failure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) vendor_code: Option<String>,
     pub(crate) retryable: bool,
+    /// C1 §5: an adapter-side `submit_failed`'s reason, and with
+    /// `invalid_param` its field; never vendor text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data: Option<Value>,
 }
 
 /// C1 §5 `usage`: every count `null` while provenance is `unavailable`;
@@ -1959,6 +2078,17 @@ pub(crate) struct Usage {
     provenance: &'static str,
 }
 
+/// One usage figure's components (AD6), each `None` when a contributing
+/// sample lacked it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Tokens {
+    pub(crate) input: Option<u64>,
+    pub(crate) cached_input: Option<u64>,
+    pub(crate) output: Option<u64>,
+    pub(crate) reasoning_output: Option<u64>,
+    pub(crate) total: Option<u64>,
+}
+
 impl Usage {
     pub(crate) const UNAVAILABLE: Self = Self {
         input_tokens: None,
@@ -1970,15 +2100,23 @@ impl Usage {
         provenance: "unavailable",
     };
 
-    /// The fake route's figure: the turn's summed samples under its declared
-    /// scope, reported; unavailable without a sample.
-    pub(crate) fn fake(total: Option<u64>) -> Self {
-        match total {
-            Some(total) => Self {
-                total_tokens: Some(total),
-                scope: FAKE_TOKEN_SCOPE,
+    /// The turn's reported figure (AD6) under the route's declared scope,
+    /// or `vendor_interval` once its ledger overflowed; unavailable without
+    /// a sample.
+    pub(crate) fn reported(tokens: Option<Tokens>, interval: bool) -> Self {
+        match tokens {
+            Some(tokens) => Self {
+                input_tokens: tokens.input,
+                cached_input_tokens: tokens.cached_input,
+                output_tokens: tokens.output,
+                reasoning_output_tokens: tokens.reasoning_output,
+                total_tokens: tokens.total,
+                scope: if interval {
+                    "vendor_interval"
+                } else {
+                    FAKE_TOKEN_SCOPE
+                },
                 provenance: "reported",
-                ..Self::UNAVAILABLE
             },
             None => Self::UNAVAILABLE,
         }
@@ -1998,6 +2136,26 @@ impl Cost {
         scope: "turn",
         provenance: "unavailable",
     };
+
+    /// A vendor-reported cost (AD6) under one of C1 §5's scopes; a scope
+    /// C1 does not define, or an amount that is not a finite number, is
+    /// unavailable.
+    pub(crate) fn reported(usd: f64, scope: &str) -> Self {
+        let scope = match scope {
+            "turn" => "turn",
+            "session_cumulative" => "session_cumulative",
+            "vendor_interval" => "vendor_interval",
+            _ => return Self::UNAVAILABLE,
+        };
+        if !usd.is_finite() {
+            return Self::UNAVAILABLE;
+        }
+        Self {
+            usd: Some(usd),
+            scope,
+            provenance: "reported",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2030,9 +2188,13 @@ pub(crate) struct EvidenceRef {
     pub(crate) transcript: Option<String>,
 }
 
+/// C1 §5 `vendor`: the vendor turn ID and the members of the terminal's
+/// bounded vendor data object (AD6).
 #[derive(Serialize)]
 pub(crate) struct VendorFields {
     pub(crate) turn_id: Option<String>,
+    #[serde(flatten)]
+    pub(crate) data: serde_json::Map<String, Value>,
 }
 
 /// Longest inline `final_text`, encoded with its quotes (Task 4 design
@@ -2079,6 +2241,33 @@ pub(crate) struct FinalTextFile {
     pub(crate) truncated: bool,
 }
 
+/// Longest inline `structured_output`, encoded (C1 §5): a larger value
+/// goes to `structured_output.json`.
+pub(crate) const STRUCTURED_OUTPUT_INLINE: usize = 32 * 1024;
+
+/// C1 §5 `structured_output_file`: the durable `structured_output.json`
+/// holding a structured output larger than [`STRUCTURED_OUTPUT_INLINE`].
+#[derive(Clone, Serialize)]
+pub(crate) struct StructuredOutputFile {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+}
+
+/// Longest warning `message`, encoded with its quotes (C1 §5).
+const WARNING_MESSAGE_MAX: usize = 1024;
+
+/// Longest warning `data`, encoded (C1 §5).
+const WARNING_DATA_MAX: usize = 4 * 1024;
+
+/// Longest evidence `transcript` hint, encoded with its quotes (C1 §5);
+/// a longer one is `null`.
+pub(crate) const TRANSCRIPT_MAX: usize = 4 * 1024;
+
+/// Whether `value`'s encoding is at most `max` bytes.
+pub(crate) fn encodes_within(value: &impl Serialize, max: usize) -> bool {
+    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max)
+}
+
 /// C1 §5 `denied_actions` entry: an action the vendor's own bound denied.
 #[derive(Clone, Serialize)]
 pub(crate) struct DeniedAction {
@@ -2089,6 +2278,23 @@ pub(crate) struct DeniedAction {
     event_seq: u64,
 }
 
+impl DeniedAction {
+    /// The entry citing the committed `action.denied` at `event_seq`.
+    pub(crate) fn new(
+        (kind, target, reason): (&'static str, String, String),
+        at: String,
+        event_seq: u64,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            reason,
+            at,
+            event_seq,
+        }
+    }
+}
+
 /// C1 §5 `auto_declined_requests` entry: a vendor request VIA declined.
 #[derive(Clone, Serialize)]
 pub(crate) struct AutoDeclined {
@@ -2097,6 +2303,24 @@ pub(crate) struct AutoDeclined {
     blocking: bool,
     at: String,
     event_seq: u64,
+}
+
+impl AutoDeclined {
+    /// The entry citing the committed `vendor.request_declined` at
+    /// `event_seq`.
+    pub(crate) fn new(
+        (vendor_method, summary, blocking): (String, String, bool),
+        at: String,
+        event_seq: u64,
+    ) -> Self {
+        Self {
+            vendor_method,
+            summary,
+            blocking,
+            at,
+            event_seq,
+        }
+    }
 }
 
 /// An envelope list entry whose two free strings are cut to fit
@@ -2119,6 +2343,7 @@ impl ListEntry for AutoDeclined {
 
 /// One envelope list (design §6.4): the first 1,000 entries, each at most
 /// 256 bytes encoded, and the count of all.
+#[derive(Clone)]
 pub(crate) struct Kept<T> {
     entries: Vec<T>,
     total: u64,
@@ -2136,10 +2361,6 @@ impl<T> Default for Kept<T> {
 impl<T: ListEntry> Kept<T> {
     /// Counts `entry` and keeps it, cut to fit, while fewer than 1,000 are
     /// kept.
-    #[cfg_attr(
-        not(feature = "test-failpoints"),
-        expect(dead_code, reason = "the fake route reports no denials or declines")
-    )]
     pub(crate) fn push(&mut self, mut entry: T) {
         self.total += 1;
         if self.entries.len() >= LIST_KEPT {
@@ -2186,12 +2407,39 @@ pub(crate) mod maxima {
         }
     }
 
-    /// A warning with a 1 KiB message; its strings live for the process.
-    pub(crate) fn warning(code: String) -> Warning {
-        Warning {
-            code: Box::leak(code.into_boxed_str()),
-            message: Box::leak("w".repeat(1024).into_boxed_str()),
-        }
+    /// C1 §5's closed list of warning codes.
+    pub(crate) const WARNING_CODES: [&str; 8] = [
+        "instructions_partial",
+        "vendor_version_untested",
+        "usage_interval_unverified",
+        "structured_output_missing",
+        "cancel_cleanup_uncertain",
+        "predecessor_cleanup_uncertain",
+        "config_switch_unverified",
+        "deprecated",
+    ];
+
+    /// A string whose encoding, quotes included, is `bytes` long, made of
+    /// escaped control characters as far as they fit.
+    pub(crate) fn escaped(bytes: usize) -> String {
+        let room = bytes - 2;
+        let mut text = "\u{1}".repeat(room / 6);
+        text.push_str(&"a".repeat(room % 6));
+        text
+    }
+
+    /// A warning whose `message` is 1 KiB and `data` 4 KiB encoded, both
+    /// escaped; its message lives for the process.
+    pub(crate) fn warning(code: &'static str) -> Warning {
+        let data = json!({"pad": escaped(4 * 1024 - r#"{"pad":}"#.len())});
+        Warning::new(code, Box::leak(escaped(1024).into_boxed_str())).with_data(data)
+    }
+
+    /// `leftovers` with 16 processes, each `comm` 15 escaped bytes.
+    pub(crate) fn leftovers(at: &str) -> Value {
+        let process = json!({"pid": i32::MAX, "comm": "\u{1}".repeat(15), "started_at": at});
+        json!({"scope": "server", "processes": vec![process; 16], "total": u64::MAX,
+               "incomplete": true, "best_effort": true})
     }
 
     /// A denial whose free strings are `bytes` long each.
@@ -2243,7 +2491,12 @@ pub(crate) struct Envelope {
     /// in `final_text_file`.
     pub(crate) final_text: Option<String>,
     pub(crate) final_text_file: Option<FinalTextFile>,
+    /// Inline up to [`STRUCTURED_OUTPUT_INLINE`] encoded; `null` when the
+    /// value is in `structured_output_file`.
     pub(crate) structured_output: Option<Value>,
+    pub(crate) structured_output_file: Option<StructuredOutputFile>,
+    /// C1 §5 (H5): always present; S-LEFTOVER owns the report, so `null`.
+    pub(crate) leftovers: Option<Value>,
     pub(crate) denied_actions: Vec<DeniedAction>,
     pub(crate) auto_declined_requests: Vec<AutoDeclined>,
     pub(crate) denied_actions_total: u64,
@@ -2289,6 +2542,18 @@ pub(crate) enum EventBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         cancel: Option<Cancel>,
     },
+    #[serde(rename = "action.denied")]
+    ActionDenied {
+        kind: &'static str,
+        target: String,
+        reason: String,
+    },
+    #[serde(rename = "vendor.request_declined")]
+    RequestDeclined {
+        vendor_method: String,
+        summary: String,
+        blocking: bool,
+    },
     #[serde(rename = "cancel.requested")]
     CancelRequested {},
     #[serde(rename = "cancel.settled")]
@@ -2298,6 +2563,42 @@ pub(crate) enum EventBody {
     },
     #[serde(rename = "session.closed")]
     SessionClosed { reason: &'static str },
+    /// C1 §6.1, C2 §2: the session's first confirmed connection
+    /// generation. Its transcript hint goes to the session's columns.
+    #[serde(rename = "session.opened")]
+    SessionOpened {
+        route: String,
+        vendor_session_id: String,
+        vendor_version: Option<String>,
+    },
+    /// C1 §6.1: an adapter-reported warning, within C1 §5's caps.
+    #[serde(rename = "warning")]
+    Warning {
+        code: &'static str,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
+    /// C1 §6.1, C2 §2: a later confirmed connection generation.
+    #[serde(rename = "session.reopened")]
+    SessionReopened {
+        route: String,
+        vendor_session_id: String,
+        vendor_version: Option<String>,
+        reason: &'static str,
+    },
+}
+
+impl EventBody {
+    /// A `warning` event within C1 §5's caps: `message` cut to 1 KiB
+    /// encoded at a character boundary, `data` over 4 KiB encoded left out.
+    pub(crate) fn warning(code: &'static str, message: &str, data: Option<Value>) -> Self {
+        Self::Warning {
+            code,
+            message: cut_encoded(message, WARNING_MESSAGE_MAX - 2).to_owned(),
+            data: data.filter(|data| encodes_within(data, WARNING_DATA_MAX)),
+        }
+    }
 }
 
 /// C1 §6.1 event with every common field.

@@ -319,12 +319,17 @@ impl Engine {
             .and_then(|(turn, _)| self.slot(&params.session)?.progress(*turn))
             .map(|progress| progress.to_value(FAKE_TOKEN_SCOPE));
         let alive = self.adapter.live_armed(&status.unproven_anchors);
+        // Decision H3: verified once this daemon committed the open of the
+        // lane's current connection generation.
+        let verified = self
+            .kept_lane(&params.session)
+            .is_some_and(|lane| lane.verified());
         let value = status_value(
             &params.session,
             status,
             after_step,
             progress.as_ref(),
-            alive,
+            (alive, verified),
         );
         debug_assert!(
             serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= STATUS_MAX),
@@ -351,7 +356,7 @@ fn status_value(
     status: via_store::SessionStatus,
     after_step: u32,
     progress: Option<&Value>,
-    alive: bool,
+    (alive, verified): (bool, bool),
 ) -> Value {
     let active_turn = status.active.map(|active| {
         json!({
@@ -404,7 +409,7 @@ fn status_value(
         "model": status.model,
         "route": status.route,
         "vendor_session_id": status.vendor_session_id,
-        "vendor_identity_verified": false,
+        "vendor_identity_verified": verified,
         "cwd": status.cwd,
         "process": {
             "alive": alive,

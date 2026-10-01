@@ -95,31 +95,32 @@ fn read_db(root: &TempDir) -> rusqlite::Connection {
     rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap()
 }
 
-/// Task 4 design §6.6: a fresh Store is schema v6; a v5 Store is an
-/// unreleased format refused with the recreate instruction, bytes untouched.
+/// Task 4 design §6.6, runtime §6: a fresh Store is schema v7; a v6 Store,
+/// older than the build, is an unreleased format refused with the named
+/// recreate instruction, bytes untouched.
 #[test]
-fn fresh_store_is_v6_and_a_v5_store_is_refused() {
+fn fresh_store_is_v7_and_a_v6_store_is_refused() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let version: i64 = read_db(&root)
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
+    // A full Store stamped v6, as a v6 build left it but for the column.
     let old = private_dir();
+    drop(Store::open(old.path()).unwrap());
     let db = old.path().join("store.sqlite3");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
     }
-    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
     let before = fs::read(&db).unwrap();
     let Err(error) = Store::open(old.path()) else {
-        panic!("a v5 Store opened");
+        panic!("a v6 Store opened");
     };
-    assert!(error.to_string().contains("schema v5"), "{error}");
+    assert!(error.to_string().contains("schema v6"), "{error}");
     assert!(error.to_string().contains("recreate"), "{error}");
     assert_eq!(fs::read(&db).unwrap(), before);
 }

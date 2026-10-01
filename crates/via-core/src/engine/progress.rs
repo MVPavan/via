@@ -6,13 +6,14 @@
 //! entry under the slot state mutex, and at a step boundary the row of the
 //! step that ended.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use via_adapters::{ProgressMarks, TurnActivity};
+use via_adapters::{ProgressMarks, TurnActivity, UsageSample};
 use via_store::StepRow;
 
-use crate::api::rfc3339;
+use crate::api::{Tokens, rfc3339};
 
 /// At most this many open tools are tracked and published per step.
 const OPEN_MAX: usize = 64;
@@ -158,22 +159,29 @@ impl StepTracker {
         })
     }
 
-    /// Rules 2–4 for one message's marks: its `model` mark applies before
-    /// its tool starts, then ends; usage folds into the step. A sample that
-    /// would take a count past [`TOKENS_MAX`] refuses the whole item before
-    /// any change, so no row is built from it.
-    pub(super) fn fold(&mut self, marks: &ProgressMarks) -> Result<Folded, Unrepresentable> {
+    /// Rules 2–4 for one message's marks, decoded at `at`: its `model`
+    /// mark applies before its tool starts, then ends; usage folds into the
+    /// step by its sample's total (a sample without one adds nothing to the
+    /// step). A sample that would take a count past [`TOKENS_MAX`] refuses
+    /// the whole item before any change, so no row is built from it.
+    pub(super) fn fold(
+        &mut self,
+        marks: &ProgressMarks,
+        at: tokio::time::Instant,
+    ) -> Result<Folded, Unrepresentable> {
         let boundary = marks.model && self.results_since_output && self.current >= 1;
-        let sampled = self
-            .sample(boundary, marks.usage.as_ref())
-            .inspect_err(|_| {
-                self.unrepresentable = true;
-            })?;
+        let sample = marks
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.total.map(|total| (usage.key.clone(), total)));
+        let sampled = self.sample(boundary, sample.as_ref()).inspect_err(|_| {
+            self.unrepresentable = true;
+        })?;
         let mut delta = ProgressDelta::default();
         let mut row = None;
         if boundary {
             // A step boundary: the step ends now and the next starts.
-            let now = self.clock.unix_ms(marks.at);
+            let now = self.clock.unix_ms(at);
             let step = self.step_tokens();
             row = Some(StepRow {
                 step: self.current,
@@ -267,8 +275,9 @@ impl StepTracker {
         }
     }
 
-    /// The turn's tokens for the envelope (C1 §5 `usage`): completed steps
-    /// and the open one, `None` without a sample.
+    /// The turn's tokens by the step rule: completed steps and the open
+    /// one, `None` without a sample.
+    #[cfg(test)]
     pub(super) fn turn_tokens(&self) -> Option<u64> {
         self.completed_after(true)
     }
@@ -304,6 +313,110 @@ impl StepTracker {
             });
         }
         rows
+    }
+}
+
+/// Most usage keys the turn-wide ledger holds (AD6); a sample under a
+/// further new key adds as keyless.
+const LEDGER_KEYS: usize = 1024;
+
+/// One component's sum over the samples that contributed to it; `None`
+/// once any contributing sample lacked it (AD6), or once the sum no
+/// longer fits: an overflowing component is unavailable, never a
+/// saturated count reported as exact (C1 §5 per-field usage).
+#[derive(Clone, Copy, Debug, Default)]
+struct Sum {
+    value: u64,
+    missing: bool,
+}
+
+impl Sum {
+    fn add(&mut self, component: Option<u64>) {
+        match component.and_then(|value| self.value.checked_add(value)) {
+            Some(value) => self.value = value,
+            None => self.missing = true,
+        }
+    }
+
+    fn get(self) -> Option<u64> {
+        (!self.missing).then_some(self.value)
+    }
+}
+
+/// Component sums of a set of samples.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sums([Sum; 5]);
+
+impl Sums {
+    fn add(&mut self, sample: &UsageSample) {
+        let components = [
+            sample.input,
+            sample.cached_input,
+            sample.output,
+            sample.reasoning_output,
+            sample.total,
+        ];
+        for (sum, component) in self.0.iter_mut().zip(components) {
+            sum.add(component);
+        }
+    }
+
+    fn tokens(self) -> Tokens {
+        let [input, cached_input, output, reasoning_output, total] = self.0.map(Sum::get);
+        Tokens {
+            input,
+            cached_input,
+            output,
+            reasoning_output,
+            total,
+        }
+    }
+}
+
+/// The turn-wide usage ledger (AD6), apart from step accounting: a keyed
+/// sample supersedes the key's earlier one across the whole turn, a
+/// keyless one adds. Past 1,024 keys a new key adds as keyless, and the
+/// ledger has overflowed: the envelope then reports `vendor_interval`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct UsageLedger {
+    keyed: HashMap<String, UsageSample>,
+    keyless: Sums,
+    sampled: bool,
+    overflow: bool,
+}
+
+impl UsageLedger {
+    /// Folds one per-call sample.
+    pub(super) fn add(&mut self, sample: &UsageSample) {
+        self.sampled = true;
+        match &sample.key {
+            Some(key) if self.keyed.contains_key(key) || self.keyed.len() < LEDGER_KEYS => {
+                self.keyed.insert(key.clone(), sample.clone());
+            }
+            Some(_) => {
+                self.overflow = true;
+                self.keyless.add(sample);
+            }
+            None => self.keyless.add(sample),
+        }
+    }
+
+    /// The turn's figure and whether its interval is unverified: a turn
+    /// aggregate supersedes every call sample; `None` without a sample.
+    pub(super) fn figure(&self, aggregate: Option<&UsageSample>) -> Option<(Tokens, bool)> {
+        if let Some(aggregate) = aggregate {
+            let mut sums = Sums::default();
+            sums.add(aggregate);
+            return Some((sums.tokens(), false));
+        }
+        if !self.sampled {
+            return None;
+        }
+        let mut sums = self.keyless;
+        for sample in self.keyed.values() {
+            sums.add(sample);
+        }
+        Some((sums.tokens(), self.overflow))
     }
 }
 
@@ -383,13 +496,12 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
-    use via_adapters::{ProgressMarks, TurnActivity};
+    use via_adapters::{ProgressMarks, TurnActivity, UsageSample};
 
-    use super::{Clock, OPEN_MAX, Progress, StepTracker};
+    use super::{Clock, OPEN_MAX, Progress, StepTracker, UsageLedger};
 
     fn marks(model: bool, started: &[&str], ended: &[&str]) -> ProgressMarks {
         ProgressMarks {
-            at: tokio::time::Instant::now(),
             model,
             tools_started: started
                 .iter()
@@ -400,11 +512,26 @@ mod tests {
         }
     }
 
+    fn sample(key: Option<&str>, total: u64) -> UsageSample {
+        UsageSample {
+            key: key.map(str::to_owned),
+            total: Some(total),
+            ..UsageSample::default()
+        }
+    }
+
     fn usage(key: Option<&str>, total: u64) -> ProgressMarks {
         ProgressMarks {
-            usage: Some((key.map(str::to_owned), total)),
+            usage: Some(sample(key, total)),
             ..marks(false, &[], &[])
         }
+    }
+
+    fn fold(
+        tracker: &mut StepTracker,
+        item: &ProgressMarks,
+    ) -> Result<super::Folded, super::Unrepresentable> {
+        tracker.fold(item, tokio::time::Instant::now())
     }
 
     /// Folds `items` into a tracker and its published copy; returns the
@@ -416,7 +543,7 @@ mod tests {
     ) -> Vec<u32> {
         let mut rows = Vec::new();
         for item in items {
-            let folded = tracker.fold(item).unwrap();
+            let folded = fold(tracker, item).unwrap();
             progress.apply(&folded.delta);
             rows.extend(folded.row.map(|row| row.step));
         }
@@ -511,26 +638,124 @@ mod tests {
     async fn unrepresentable_tokens_are_refused_before_any_row() {
         let (mut tracker, _) = fresh();
         let max = u64::try_from(i64::MAX).unwrap();
-        assert!(tracker.fold(&usage(None, max + 1)).is_err());
+        assert!(fold(&mut tracker, &usage(None, max + 1)).is_err());
         assert!(tracker.unrepresentable());
         assert_eq!(tracker.step_tokens(), None);
-        assert!(tracker.fold(&usage(None, max)).is_ok());
+        assert!(fold(&mut tracker, &usage(None, max)).is_ok());
         // A second key would take the step's sum past `i64::MAX`.
-        assert!(tracker.fold(&usage(Some("m"), 1)).is_err());
+        assert!(fold(&mut tracker, &usage(Some("m"), 1)).is_err());
         assert_eq!(tracker.step_tokens(), Some(max));
-        assert!(tracker.fold(&marks(false, &[], &["x"])).is_ok());
+        assert!(fold(&mut tracker, &marks(false, &[], &["x"])).is_ok());
         // Output after results with a sample: step 2's sample would take
         // the turn past `i64::MAX`, so step 1's row is not built.
         let over = ProgressMarks {
             model: true,
-            usage: Some((None, 1)),
+            usage: Some(sample(None, 1)),
             ..marks(false, &[], &[])
         };
-        assert!(tracker.fold(&over).is_err());
+        assert!(fold(&mut tracker, &over).is_err());
         assert_eq!(tracker.current, 1);
         assert_eq!(tracker.turn_tokens(), Some(max));
         // Without the sample the boundary still folds.
-        assert!(tracker.fold(&marks(true, &[], &[])).unwrap().row.is_some());
+        assert!(
+            fold(&mut tracker, &marks(true, &[], &[]))
+                .unwrap()
+                .row
+                .is_some()
+        );
         assert_eq!(tracker.turn_tokens(), Some(max));
+    }
+
+    fn call(key: Option<&str>, input: u64, cached: Option<u64>, total: u64) -> UsageSample {
+        UsageSample {
+            key: key.map(str::to_owned),
+            input: Some(input),
+            cached_input: cached,
+            output: Some(1),
+            reasoning_output: Some(0),
+            total: Some(total),
+        }
+    }
+
+    /// AD6: key `a` repeated after a step boundary is counted once; a
+    /// keyless sample adds.
+    #[test]
+    fn a_key_repeated_across_steps_counts_once_in_the_ledger() {
+        let mut ledger = UsageLedger::default();
+        ledger.add(&call(Some("a"), 10, Some(1), 11));
+        ledger.add(&call(None, 5, Some(1), 6));
+        // A later step reports `a` again: it supersedes, never adds.
+        ledger.add(&call(Some("a"), 20, Some(2), 22));
+        let (tokens, interval) = ledger.figure(None).unwrap();
+        assert_eq!(tokens.input, Some(25));
+        assert_eq!(tokens.cached_input, Some(3));
+        assert_eq!(tokens.output, Some(2));
+        assert_eq!(tokens.total, Some(28));
+        assert!(!interval);
+    }
+
+    /// AD6: past 1,024 keys a new key adds as keyless, and the interval is
+    /// unverified.
+    #[test]
+    fn key_1025_overflows_the_ledger() {
+        let mut ledger = UsageLedger::default();
+        for index in 0..1024 {
+            ledger.add(&call(Some(&format!("k{index}")), 1, Some(0), 1));
+        }
+        assert!(!ledger.figure(None).unwrap().1, "1,024 keys fit");
+        ledger.add(&call(Some("k1024"), 1, Some(0), 1));
+        ledger.add(&call(Some("k1024"), 1, Some(0), 1));
+        let (tokens, interval) = ledger.figure(None).unwrap();
+        assert!(interval, "the 1,025th key overflowed");
+        // The overflowing key's two samples both added.
+        assert_eq!(tokens.total, Some(1026));
+        // A known key still supersedes after the overflow.
+        ledger.add(&call(Some("k0"), 1, Some(0), 5));
+        assert_eq!(ledger.figure(None).unwrap().0.total, Some(1030));
+    }
+
+    /// AD6: a component is `null` if any contributing sample lacks it.
+    #[test]
+    fn a_missing_component_is_null() {
+        let mut ledger = UsageLedger::default();
+        ledger.add(&call(Some("a"), 10, Some(1), 11));
+        ledger.add(&call(Some("b"), 10, None, 11));
+        let (tokens, _) = ledger.figure(None).unwrap();
+        assert_eq!(tokens.cached_input, None);
+        assert_eq!(tokens.input, Some(20));
+        // A superseded sample no longer contributes.
+        ledger.add(&call(Some("b"), 10, Some(4), 11));
+        assert_eq!(ledger.figure(None).unwrap().0.cached_input, Some(5));
+    }
+
+    /// Sol r1 F10: a component whose sum does not fit `u64` is reported
+    /// unavailable (`null`), never saturated as an exact count; the other
+    /// components keep their sums.
+    #[test]
+    fn an_overflowing_component_is_unavailable() {
+        let mut ledger = UsageLedger::default();
+        ledger.add(&call(Some("a"), u64::MAX - 1, Some(1), 11));
+        ledger.add(&call(None, 5, Some(1), 6));
+        let (tokens, _) = ledger.figure(None).unwrap();
+        assert_eq!(tokens.input, None);
+        assert_eq!(tokens.cached_input, Some(2));
+        assert_eq!(tokens.total, Some(17));
+    }
+
+    /// AD6: a turn aggregate supersedes every call sample; no sample and no
+    /// aggregate gives no figure.
+    #[test]
+    fn a_turn_aggregate_supersedes_the_samples() {
+        let mut ledger = UsageLedger::default();
+        assert!(ledger.figure(None).is_none());
+        for index in 0..1100 {
+            ledger.add(&call(Some(&format!("k{index}")), 1, Some(0), 1));
+        }
+        let aggregate = call(None, 156, None, 300);
+        let (tokens, interval) = ledger.figure(Some(&aggregate)).unwrap();
+        assert_eq!(tokens.input, Some(156));
+        assert_eq!(tokens.cached_input, None);
+        assert_eq!(tokens.total, Some(300));
+        assert!(!interval, "the aggregate is the turn's own figure");
     }
 }
