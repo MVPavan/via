@@ -17,8 +17,10 @@
 //! or input error with its arrival: the instant it publishes the event. A
 //! line is on time if and only if it arrived at or before its limit:
 //! `within_ms` after the previous step's completion, capped by the run
-//! deadline. An emit completes just before its write, since the adapter may
-//! react as soon as the line is visible.
+//! deadline. An expect completes at its line's arrival, since the adapter
+//! may close stdin as soon as it has written the line. An emit completes
+//! just before its write, since the adapter may react as soon as the line
+//! is visible.
 //!
 //! Put `await_eof` right after the step the adapter must wait for (for
 //! example the terminal emit), and vendor output that follows the close
@@ -468,8 +470,10 @@ fn expire(step: usize) -> ! {
 }
 
 /// Runs one step and returns the instant it completed, from which later
-/// steps measure `within_ms` and order EOF. An emit completes just before
-/// its write: a reader may react as soon as the line is visible.
+/// steps measure `within_ms` and order EOF. An expect completes at its
+/// line's arrival: the adapter may close stdin as soon as it has written
+/// the line. An emit completes just before its write: a reader may react as
+/// soon as the line is visible.
 fn run_step(
     step: Step,
     number: usize,
@@ -489,7 +493,7 @@ fn run_step(
             // One budget for the whole expected value, however many strings it has.
             let mut budget = MAX_LINE;
             let expected = substitute_value(line, captures, &mut budget)?;
-            let actual = input.expect_line(previous, within_ms)?;
+            let (arrived, actual) = input.expect_line(previous, within_ms)?;
             if !contains_expected(&actual, &expected) {
                 return Err(format!("expected line {expected} does not match {actual}"));
             }
@@ -505,6 +509,7 @@ fn run_step(
                     .ok_or_else(|| format!("capture {name}: {pointer} is absent in {actual}"))?;
                 captures.insert(&name, value.to_string())?;
             }
+            return Ok(arrived);
         }
         Step::Emit { line } => {
             let mut budget = MAX_LINE;
