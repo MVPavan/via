@@ -12,8 +12,8 @@ Revision 7 answered Sol review r6 and the coordinator's decisions on report
 destinations and persistence; revision 8 answers Sol review r7 (AD20's scan
 and tests); revision 9 applies the coordinator's fixes for Sol review r8. The lifecycle research is cited as `LH`
 ([harnesses](lifecycle-harnesses.md)) and `LM` ([mechanisms](lifecycle-mechanisms.md)).
-OD3's policy is decided; the owner's choice of leftover detection (conflict 4:
-A, B or C) is pending.
+OD3's policy is decided, and on 2026-10-01 the owner chose leftover detection
+A (conflict 4): the report-only marker scan.
 
 Inputs:
 - the live re-probes of 2026-09-30: [Claude Code](reprobe-claude-code.md),
@@ -165,7 +165,7 @@ OD2 per-category switches are in §5.4.1.
 3. **C2 §2's StartTurn reply lane and `tool.quiescent`** are resolved toward the
    approved S1 shape (AD3, AD4). The terminal stays in the end result, so
    `[s1c.r2]` is unchanged.
-4. **No environment marker scan (owner choice pending: A, B or C).** AR2's
+4. **No environment marker scan (owner chose A, 2026-10-01).** AR2's
    runtime targets and the §3.7 rows marked "conflict 4" forbid reading
    vendor environments or credentials, and `/proc/<pid>/environ` can hold
    credential values, so a scan touches invariant 1 through a transient
@@ -1384,8 +1384,8 @@ C1 change, not a routine addition.
 - OD2's default is approved; S-LAUNCH sets it.
 - The invariant 2 edit is approved; S-SPEC applies AD12's wording.
 - OD3 is decided; there is no OD3 gate.
-- Leftover detection (conflict 4) is pending the owner's A, B or C, decided
-  in S-SPEC. A: S-LEFTOVER as below. B: S-LEFTOVER first designs
+- Leftover detection (conflict 4): the owner chose A on 2026-10-01; its rows
+  are applied in `via-jm4.30` (S-SPEC-C4). A: S-LEFTOVER as below. B: S-LEFTOVER first designs
   anchor-subreaper detection. C: S-LEFTOVER is dropped and every `leftovers`
   stays `null`.
 
