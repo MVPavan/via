@@ -17,7 +17,7 @@
       "session": "main",
       "start_after": null,
       "params": {
-        "prompt": "Remember token NONCE0001. Return JSON with kind alpha and token equal to it.",
+        "prompt": "Remember nonce NONCE0001. Return JSON with kind alpha and nonce equal to it.",
         "effort": null,
         "bound": "full",
         "output_schema": {
@@ -26,13 +26,13 @@
             "kind": {
               "const": "alpha"
             },
-            "token": {
+            "nonce": {
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "token"
+            "nonce"
           ]
         },
         "max_steps": null
@@ -51,7 +51,7 @@
           "class_hint": null,
           "structured_output": {
             "kind": "alpha",
-            "token": "NONCE0001"
+            "nonce": "NONCE0001"
           },
           "cost": {
             "scope": "session_cumulative"
@@ -65,7 +65,7 @@
           "scope": "turn"
         },
         "final_text": [
-          "{\"kind\":\"alpha\",\"token\":\"NONCE0001\"}"
+          "{\"kind\":\"alpha\",\"nonce\":\"NONCE0001\"}"
         ],
         "error": null,
         "cleanup": "quiescent",

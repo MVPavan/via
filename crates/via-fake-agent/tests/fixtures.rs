@@ -10,10 +10,27 @@
 //!   without one), with one launch logged per start. Ordered EOF and strict
 //!   trailing input hold: a line resent before an `await_eof`, or an EOF
 //!   right after the first line, fails replay.
-//! - No fixture file contains a home path, an email address, a token-like
-//!   value or a credential field with a real value. Every key and string is
-//!   scanned, the new step fields (`exit.stderr`, `absent` pointers)
-//!   included; a credential assigned in free text (`api_key=…`) is a finding.
+//! - No fixture file contains a home path (`/home/`, `/Users/`, `/root/`,
+//!   `X:\Users\` on any drive), an email address, a token-like value
+//!   (`sk-`, `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`, `github_pat_`, `xox?-`,
+//!   `AKIA…`, `glpat-`, `AIza…`, `Bearer `, JWT `eyJ…`), a credential field
+//!   with a real value, or an identity-bearing field (`user`, `username`,
+//!   `login`, `email`, `account`) whose string value is not a placeholder.
+//!   Credential names are normalized for case and `_`/`-` (`password`,
+//!   `passwd`, `secret`, `client_secret`, `token`, `auth_token`, `api_key`,
+//!   `ANTHROPIC_AUTH_TOKEN`, …: any name ending in one of
+//!   [`CREDENTIAL_SUFFIXES`]). JSON `\u` escapes are decoded before matching,
+//!   including inside prefixed stderr. Every key and string is scanned, the
+//!   step fields (`exit.stderr`, `absent` pointers) included; a credential
+//!   assigned in free text (`api_key=…`) is a finding.
+//! - Every file under the fixtures root is scanned, nested directories
+//!   included. Test sources are outside the scan: they are covered by normal
+//!   review.
+//! - Every fixture that does not model a crash seals its input with a final
+//!   `await_eof` (alone, or right before its `exit`); the exceptions are
+//!   listed with their reasons.
+//! - The outer supervisor bounds the whole run of each fake, the
+//!   `--version` probe and the driver's stdin writes included.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -21,9 +38,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -34,32 +52,72 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const OUTER: Duration = Duration::from_secs(30);
 /// The value the driver passes for every argv capture.
 const CAPTURED_ARG: &str = "0f1de11e-0000-4000-8000-000000000001";
-/// Credential fields that may hold only a placeholder.
-const SECRET_KEYS: [&str; 3] = ["access_token", "refresh_token", "api_key"];
-/// The only values a credential field may hold.
+/// A field or word whose normalized name (lowercase, no `_` or `-`) ends
+/// with one of these is a credential: it may hold only a placeholder.
+const CREDENTIAL_SUFFIXES: [&str; 10] = [
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "privatekey",
+    "accesskey",
+    "credential",
+    "credentials",
+];
+/// Identity-bearing fields, normalized: a string value is a placeholder.
+const IDENTITY_FIELDS: [&str; 5] = ["user", "username", "login", "email", "account"];
+/// The only values a credential or identity field may hold.
 const PLACEHOLDERS: [&str; 4] = ["", "<redacted>", "REDACTED", "PLACEHOLDER"];
+/// Fixtures whose input is not sealed by a final `await_eof` (alone, or
+/// right before the closing `exit`), each with its reason.
+const ENDS_WITHOUT_EOF: [(&str, &str); 4] = [
+    (
+        "claude/c10_early_eof.replay.json",
+        "a vendor record of stdin EOF right after the prompt: its await_eof is step 2 and the \
+         vendor output follows it",
+    ),
+    (
+        "codex/c0_server_lost.replay.json",
+        "models a crash: the server exits mid-turn, so no input is sealed; the exit step's \
+         trailing-input check is best effort",
+    ),
+    (
+        "codex/c10_read_only_refused.replay.json",
+        "no launch: the bound is refused before any vendor I/O, so the fixture has no steps",
+    ),
+    (
+        "codex/c4b_workspace_write_refused.replay.json",
+        "no launch: the bound is refused before any vendor I/O, so the fixture has no steps",
+    ),
+];
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../via-adapters/tests/fixtures")
 }
 
-/// Every file under `fixtures/<harness>/`, sorted.
-fn fixture_files() -> TestResult<Vec<PathBuf>> {
+/// Every file under `root`, nested directories included, sorted.
+fn files_under(root: &Path) -> TestResult<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for harness in fs::read_dir(fixtures_root())? {
-        let harness = harness?.path();
-        if !harness.is_dir() {
-            continue;
-        }
-        for file in fs::read_dir(&harness)? {
-            let file = file?.path();
-            if file.is_file() {
-                files.push(file);
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.is_file() {
+                files.push(path);
             }
         }
     }
     files.sort();
     Ok(files)
+}
+
+/// Every file under the fixtures root.
+fn fixture_files() -> TestResult<Vec<PathBuf>> {
+    files_under(&fixtures_root())
 }
 
 fn replay_fixtures() -> TestResult<Vec<PathBuf>> {
@@ -150,15 +208,66 @@ fn install(root: &Path, fixture: &Path) -> TestResult<PathBuf> {
     Ok(binary)
 }
 
-/// Kills and reaps the fake if the drive fails part way.
-struct Guard(Child);
+/// A child shared with its supervisor, which kills it at the deadline.
+type Shared = Arc<Mutex<Child>>;
 
-impl Drop for Guard {
+fn lock(child: &Shared) -> std::sync::MutexGuard<'_, Child> {
+    // Each holder only kills or polls; a panic cannot leave it inconsistent.
+    child.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Kills its child at the deadline unless dropped first, so no step of a
+/// run (a `--version` probe, a blocked stdin write, a read) outlives the
+/// outer bound. Dropping it stops the watch and, if the child still runs,
+/// kills and reaps it.
+struct Supervisor {
+    child: Shared,
+    stop: Option<SyncSender<()>>,
+    watch: Option<JoinHandle<()>>,
+}
+
+impl Supervisor {
+    fn start(child: Child, deadline: Instant) -> Self {
+        let child = Arc::new(Mutex::new(child));
+        let watched = Arc::clone(&child);
+        let (stop, stopped) = mpsc::sync_channel(1);
+        let watch = thread::spawn(move || {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if matches!(stopped.recv_timeout(left), Err(RecvTimeoutError::Timeout)) {
+                // Best effort: the run then fails on its closed pipes.
+                let _ = lock(&watched).kill();
+            }
+        });
+        Self {
+            child,
+            stop: Some(stop),
+            watch: Some(watch),
+        }
+    }
+
+    /// Waits for the child's exit, polling until the supervisor kills it.
+    fn wait(&self) -> TestResult<ExitStatus> {
+        loop {
+            if let Some(status) = lock(&self.child).try_wait()? {
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for Supervisor {
     fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+        drop(self.stop.take());
+        if let Some(watch) = self.watch.take() {
+            // A panicked watch has nothing left to clean up.
+            let _ = watch.join();
+        }
+        let mut child = lock(&self.child);
+        if !matches!(child.try_wait(), Ok(Some(_))) {
             // Cleanup is best-effort; the test has already failed.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -227,27 +336,92 @@ enum Deviation {
 /// What the fake must end with: its exit code and stderr.
 type End = (i64, String);
 
-/// Runs one fixture with the generic driver.
+/// The fixtures one file holds, in launch order: the file itself, or each
+/// of its `lifetimes`.
+fn lifetimes_of(file: &Value) -> Vec<&Value> {
+    match file.get("lifetimes").and_then(Value::as_array) {
+        Some(lifetimes) => lifetimes.iter().collect(),
+        None => vec![file],
+    }
+}
+
+/// Every pipelined expect step names its reason in the fixture's notes.
+fn pipelined_have_reasons(fixture: &Value) -> Result<(), String> {
+    let notes = fixture.get("notes").and_then(Value::as_str).unwrap_or("");
+    for (index, step) in fixture["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let number = index + 1;
+        if step["expect"]["pipelined"] == Value::Bool(true)
+            && !notes.contains(&format!("step {number}"))
+        {
+            return Err(format!(
+                "step {number} is pipelined with no reason in notes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs one fixture file with the generic driver: each lifetime as its own
+/// launch, in order. A single fixture's `--version` is probed first; a
+/// lifetime's is not, since a probe would take a lifetime's launch.
 fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
-    let fixture: Value = serde_json::from_slice(&fs::read(fixture_path)?)?;
-    let source = fixture.get("source").and_then(Value::as_str).unwrap_or("");
+    let file: Value = serde_json::from_slice(&fs::read(fixture_path)?)?;
+    let source = file.get("source").and_then(Value::as_str).unwrap_or("");
     if source.trim().is_empty() {
         return Err("the fixture names no source run".into());
     }
     let root = tempfile::tempdir()?;
     let binary = install(root.path(), fixture_path)?;
-
-    if let Some(version) = fixture.get("version").and_then(Value::as_str) {
-        let output = Command::new(&binary).arg("--version").output()?;
-        if output.status.code() != Some(0) || output.stdout != format!("{version}\n").as_bytes() {
-            return Err(format!("--version gave {output:?}").into());
-        }
+    let lifetimes = lifetimes_of(&file);
+    let single = file.get("lifetimes").is_none();
+    let mut starts = 0;
+    if single && let Some(version) = file.get("version").and_then(Value::as_str) {
+        probe_version(&binary, version)?;
+        starts += 1;
     }
+    for (index, fixture) in lifetimes.into_iter().enumerate() {
+        pipelined_have_reasons(fixture)?;
+        run_lifetime(&binary, fixture, deviation)
+            .map_err(|error| format!("lifetime {}: {error}", index + 1))?;
+        starts += 1;
+    }
+    let launches = fs::read_to_string(root.path().join("vendor.launches"))?;
+    if launches.lines().count() != starts {
+        return Err(format!("launch log has {launches:?}, expected {starts} starts").into());
+    }
+    Ok(())
+}
 
+/// Runs `--version` under the outer bound and checks its line.
+fn probe_version(binary: &Path, version: &str) -> TestResult {
+    let mut child = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let supervisor = Supervisor::start(child, Instant::now() + OUTER);
+    let mut out = Vec::new();
+    // Ends at the fake's exit, or when the supervisor kills it.
+    stdout.read_to_end(&mut out)?;
+    let status = supervisor.wait()?;
+    if status.code() != Some(0) || out != format!("{version}\n").as_bytes() {
+        return Err(format!("--version gave {status} with {out:?}").into());
+    }
+    Ok(())
+}
+
+/// Runs one launch of the fake against `fixture`'s steps.
+fn run_lifetime(binary: &Path, fixture: &Value, deviation: Deviation) -> TestResult {
     let mut captures = BTreeMap::new();
-    let args = args_of(&fixture, &mut captures)?;
-
-    let mut child = Command::new(&binary)
+    let args = args_of(fixture, &mut captures)?;
+    let mut child = Command::new(binary)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,30 +436,28 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    let mut guard = Guard(child);
+    let pid = child.id();
     let deadline = Instant::now() + OUTER;
+    // From here every blocking step is bounded: at the deadline the
+    // supervisor kills the fake, which ends writes, reads and the wait.
+    let supervisor = Supervisor::start(child, deadline);
 
     let steps = run_steps(
-        &fixture,
+        fixture,
         &mut Run {
             stdin: &mut stdin,
             stdout: &stdout,
-            pid: guard.0.id(),
+            pid,
             deadline,
             captures,
             deviation,
         },
     );
     drop(stdin);
-    let status = loop {
-        if let Some(status) = guard.0.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            return Err("the fake outlived the outer bound".into());
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
+    let status = supervisor.wait()?;
+    if Instant::now() >= deadline {
+        return Err("the fake outlived the outer bound".into());
+    }
     let stderr = stderr.join().map_err(|_| "stderr reader panicked")?;
     let (code, text) =
         steps.map_err(|error| format!("{error}; the fake ended {status}: {stderr}"))?;
@@ -296,12 +468,6 @@ fn drive(fixture_path: &Path, deviation: Deviation) -> TestResult {
     }
     if let Ok(Ok(extra)) = stdout.recv_timeout(Duration::from_millis(100)) {
         return Err(format!("unexpected extra output {extra}").into());
-    }
-    // One start for `--version`, if the fixture has one, and one for the run.
-    let starts = 1 + usize::from(fixture.get("version").is_some_and(Value::is_string));
-    let launches = fs::read_to_string(root.path().join("vendor.launches"))?;
-    if launches.lines().count() != starts {
-        return Err(format!("launch log has {launches:?}, expected {starts} starts").into());
     }
     Ok(())
 }
@@ -373,6 +539,7 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
             let signal = match wait["signal"].as_str() {
                 Some("SIGINT") => "-INT",
                 Some("SIGTERM") => "-TERM",
+                Some("SIGUSR1") => "-USR1",
                 other => return Err(fail(format!("unknown signal {other:?}")).into()),
             };
             // Handlers are installed before the first step, and any earlier
@@ -399,7 +566,7 @@ fn run_steps(fixture: &Value, run: &mut Run<'_>) -> TestResult<End> {
                 .as_str()
                 .ok_or_else(|| fail("exit stderr".to_owned()))?;
             end = (code, text.to_owned());
-        } else if step.get("delay").is_none() {
+        } else if step.get("delay").is_none() && step.get("spawn_survivor").is_none() {
             return Err(fail(format!("unknown step {step}")).into());
         }
     }
@@ -434,21 +601,43 @@ fn fixtures_replay_with_a_generic_driver_to_exit_zero() -> TestResult {
 }
 
 /// Undoes the escapes a sensitive value could hide behind in text that is
-/// not itself parsed: backslash-escaped slashes, doubled backslashes and
-/// `\u` escapes of `/`, `\` and `@`.
+/// not itself parsed: every JSON `\u` escape (surrogate pairs included),
+/// then backslash-escaped slashes and doubled backslashes.
 fn unescape(text: &str) -> String {
-    let mut text = text.to_owned();
-    for (escaped, plain) in [
-        ("\\u002f", "/"),
-        ("\\u002F", "/"),
-        ("\\u005c", "\\"),
-        ("\\u005C", "\\"),
-        ("\\u0040", "@"),
-    ] {
-        text = text.replace(escaped, plain);
+    let unit = |hex: &str| {
+        hex.get(..4)
+            .filter(|digits| digits.chars().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+    };
+    // The character an escape body (after `\u`) stands for, and the bytes
+    // of the body it used.
+    let escape = |body: &str| -> Option<(char, usize)> {
+        let high = unit(body)?;
+        if !(0xD800..=0xDBFF).contains(&high) {
+            return char::from_u32(high).map(|c| (c, 4));
+        }
+        let low = unit(body.get(4..)?.strip_prefix("\\u")?)?;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return None;
+        }
+        char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)).map(|c| (c, 10))
+    };
+    let mut decoded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("\\u") {
+        decoded.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        if let Some((c, used)) = escape(body) {
+            decoded.push(c);
+            rest = &body[used..];
+        } else {
+            decoded.push_str("\\u");
+            rest = body;
+        }
     }
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+    decoded.push_str(rest);
+    let mut out = String::with_capacity(decoded.len());
+    let mut chars = decoded.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             // Drop a backslash that escapes a slash or another backslash.
@@ -461,18 +650,82 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// A name lowercased with `_` and `-` removed: `Client-Secret`,
+/// `client_secret` and `clientSecret` are one name.
+fn normalized(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The credential suffix a name ends with, normalized, if any.
+fn credential(name: &str) -> Option<&'static str> {
+    let name = normalized(name);
+    CREDENTIAL_SUFFIXES
+        .into_iter()
+        .find(|suffix| name.ends_with(suffix))
+}
+
+fn identity(name: &str) -> bool {
+    IDENTITY_FIELDS.contains(&normalized(name).as_str())
+}
+
+/// Whether `prefix` occurs at `at` followed by `len` characters that
+/// satisfy `body`.
+fn followed_by(text: &str, at: usize, prefix: &str, len: usize, body: fn(char) -> bool) -> bool {
+    let tail = &text[at + prefix.len()..];
+    tail.chars().take(len).filter(|c| body(*c)).count() == len
+}
+
 /// What a hygiene finding is in one (decoded) string, or `None`.
 fn hygiene_finding(text: &str) -> Option<String> {
     let text = unescape(text);
     let lower = text.to_ascii_lowercase();
-    for needle in ["/home/", "/users/", "c:\\users", "bearer "] {
+    for needle in ["/home/", "/users/", "/root/", "bearer "] {
         if lower.contains(needle) {
             return Some(format!("contains {needle:?}"));
         }
     }
-    for needle in ["eyJ", "ghp_", "gho_"] {
+    for (at, _) in lower.match_indices(":\\users") {
+        if lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|drive| drive.is_ascii_alphabetic())
+        {
+            return Some("contains a drive's Users folder".to_owned());
+        }
+    }
+    for needle in [
+        "eyJ",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+    ] {
         if text.contains(needle) {
             return Some(format!("contains {needle:?}"));
+        }
+    }
+    for (at, _) in text.match_indices("xox") {
+        let kind = text[at + 3..].chars().next();
+        if kind.is_some_and(|kind| "abprs".contains(kind)) && text[at + 4..].starts_with('-') {
+            return Some("contains a Slack-like xox?- token".to_owned());
+        }
+    }
+    let upper_alnum = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit();
+    let key_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    for (at, _) in text.match_indices("AKIA") {
+        if followed_by(&text, at, "AKIA", 16, upper_alnum) {
+            return Some("contains an AKIA access key".to_owned());
+        }
+    }
+    for (at, _) in text.match_indices("AIza") {
+        if followed_by(&text, at, "AIza", 35, key_char) {
+            return Some("contains an AIza API key".to_owned());
         }
     }
     for (at, _) in text.match_indices("sk-") {
@@ -551,14 +804,19 @@ fn neutralize_captures(text: &str) -> String {
 }
 
 /// The first finding anywhere in `value`: every key and decoded string leaf
-/// is scanned, credential fields must hold an exact placeholder, and a
-/// string that is itself JSON (an emit line, templated or not) is decoded
-/// and scanned recursively.
+/// is scanned, credential fields must hold an exact placeholder, identity
+/// fields a placeholder when they hold a string, and a string that is
+/// itself JSON (an emit line, templated or not) is decoded and scanned
+/// recursively.
 fn value_finding(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => map.iter().find_map(|(key, item)| {
-            if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str()) && !placeholder(item) {
+            let key_text = unescape(key);
+            if credential(&key_text).is_some() && !placeholder(item) {
                 return Some(format!("{key} has a non-placeholder value"));
+            }
+            if identity(&key_text) && item.is_string() && !placeholder(item) {
+                return Some(format!("identity field {key} has a non-placeholder value"));
             }
             hygiene_finding(key).or_else(|| value_finding(item))
         }),
@@ -595,54 +853,76 @@ fn file_finding(text: &str) -> Option<String> {
     }
 }
 
-/// A credential field assigned a value in free text, such as stderr: the
-/// name, an optional quote, `=` or `:`, then a value that is not exactly a
-/// placeholder (or a bare `null`). A quoted value is taken whole, through
-/// its closing quote, so whitespace inside it hides nothing.
-fn secret_assignment(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    let quote = |c: char| c == '"' || c == '\'';
-    for key in SECRET_KEYS {
-        for (at, _) in lower.match_indices(key) {
-            let rest = text[at + key.len()..]
-                .trim_start_matches(quote)
-                .trim_start();
-            let Some(rest) = rest.strip_prefix(['=', ':']) else {
-                continue;
-            };
-            let rest = rest.trim_start();
-            // A quoted value runs through its closing quote (or to the end),
-            // whitespace included; a bare one stops at a delimiter.
-            let (value, quoted) = match rest.chars().next() {
-                Some(open) if quote(open) => {
-                    let inner = &rest[1..];
-                    (&inner[..inner.find(open).unwrap_or(inner.len())], true)
-                }
-                _ => {
-                    let end = rest
-                        .find(|c: char| c.is_whitespace() || quote(c) || ",;&}".contains(c))
-                        .unwrap_or(rest.len());
-                    (&rest[..end], false)
-                }
-            };
-            // `PLACEHOLDERS` includes the empty value; a bare `null` is JSON's.
-            let placeholder =
-                PLACEHOLDERS.contains(&value) || (!quoted && (value.is_empty() || value == "null"));
-            if !placeholder {
-                return Some(format!("{key} is assigned a non-placeholder value"));
+/// The words of `text`: maximal runs of ASCII letters, digits, `_` and
+/// `-`, each with its byte offset.
+fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut start = None;
+    text.char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+        .filter_map(move |(at, c)| match (start, word(c)) {
+            (None, true) => {
+                start = Some(at);
+                None
             }
+            (Some(from), false) => {
+                start = None;
+                Some((from, &text[from..at]))
+            }
+            (None, false) | (Some(_), true) => None,
+        })
+}
+
+/// A credential assigned a value in free text, such as stderr: a credential
+/// name (normalized), an optional quote, `=` or `:`, then a value that is
+/// not exactly a placeholder (or a bare `null`). A quoted value is taken
+/// whole, through its closing quote, so whitespace inside it hides nothing.
+/// `\u` escapes are decoded first.
+fn secret_assignment(text: &str) -> Option<String> {
+    let text = unescape(text);
+    let quote = |c: char| c == '"' || c == '\'';
+    for (at, name) in words(&text) {
+        if credential(name).is_none() {
+            continue;
+        }
+        let rest = text[at + name.len()..]
+            .trim_start_matches(quote)
+            .trim_start();
+        let Some(rest) = rest.strip_prefix(['=', ':']) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // A quoted value runs through its closing quote (or to the end),
+        // whitespace included; a bare one stops at a delimiter.
+        let (value, quoted) = match rest.chars().next() {
+            Some(open) if quote(open) => {
+                let inner = &rest[1..];
+                (&inner[..inner.find(open).unwrap_or(inner.len())], true)
+            }
+            _ => {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || quote(c) || ",;&}".contains(c))
+                    .unwrap_or(rest.len());
+                (&rest[..end], false)
+            }
+        };
+        // `PLACEHOLDERS` includes the empty value; a bare `null` is JSON's.
+        let placeholder =
+            PLACEHOLDERS.contains(&value) || (!quoted && (value.is_empty() || value == "null"));
+        if !placeholder {
+            return Some(format!("{name} is assigned a non-placeholder value"));
         }
     }
     None
 }
 
-/// A credential field name in text that is not JSON.
+/// A compound credential name (`access_token`, `client-secret`, not a bare
+/// `token`) in text that is not JSON.
 fn secret_mention(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    SECRET_KEYS
-        .iter()
-        .find(|key| lower.contains(**key))
-        .map(|key| format!("non-JSON text mentions {key}"))
+    let text = unescape(text);
+    words(&text)
+        .find(|(_, name)| credential(name).is_some_and(|suffix| normalized(name) != suffix))
+        .map(|(_, name)| format!("non-JSON text mentions {name}"))
 }
 
 #[test]
@@ -710,6 +990,73 @@ fn fixtures_hygiene_scan_detects_each_pattern() {
         r#"{"line":"{\"request_id\":${rid},\"session_id\":\"${sid}\",\"cmd\":\"echo $${HOME}\"}"}"#,
         r#"{"capabilities":["msg_lifecycle_v1"]}"#,
         r#"{"text":"[Request interrupted by user for tool use]"}"#,
+    ];
+    for text in clean {
+        assert_eq!(file_finding(text), None, "flagged {text}");
+    }
+}
+
+/// The critical review's probes (F21): credential names in any case or
+/// `_`/`-` spelling, more token families, more home roots and drives,
+/// identity-bearing fields, and a `\u`-escaped credential in prefixed
+/// stderr. Each family has a negative witness.
+#[test]
+fn fixtures_hygiene_scan_detects_the_review_probes() {
+    let bad = [
+        // Credential names, normalized for case and `_`/`-`.
+        r#"{"password":"hunter2"}"#,
+        r#"{"passwd":"hunter2"}"#,
+        r#"{"secret":"abc"}"#,
+        r#"{"client_secret":"abc"}"#,
+        r#"{"clientSecret":"abc"}"#,
+        r#"{"token":"abc"}"#,
+        r#"{"auth_token":"abc"}"#,
+        r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"abc"}}"#,
+        r#"{"Api-Key":"abc"}"#,
+        r#"{"apiKey":"abc"}"#,
+        r#"{"t":"export ANTHROPIC_AUTH_TOKEN=abc"}"#,
+        r#"{"t":"client-secret: abc"}"#,
+        r#"{"t":"Password = hunter2"}"#,
+        // Token families.
+        r#"{"t":"github_pat_11ABCDEFG0123456789"}"#,
+        r#"{"t":"ghs_abc123"}"#,
+        r#"{"t":"ghu_abc123"}"#,
+        r#"{"t":"sk-ant-api03-abc"}"#,
+        r#"{"t":"xoxb-1234-abcd"}"#,
+        r#"{"t":"xoxp-1234-abcd"}"#,
+        r#"{"t":"AKIAABCDEFGHIJKLMNOP"}"#,
+        r#"{"t":"glpat-abc123def456"}"#,
+        r#"{"t":"AIzaSyA0123456789abcdefghijklmnopqrstuv"}"#,
+        // Home roots, every drive letter, either slash.
+        r#"{"p":"/root/.config/vendor"}"#,
+        r#"{"p":"D:\\Users\\someone"}"#,
+        r#"{"p":"e:\\users\\someone"}"#,
+        r#"{"p":"Z:/Users/someone"}"#,
+        // Identity-bearing fields hold placeholders only.
+        r#"{"user":"jdoe"}"#,
+        r#"{"username":"jdoe"}"#,
+        r#"{"login":"jdoe"}"#,
+        r#"{"email":"jdoe"}"#,
+        r#"{"account":"acme-corp"}"#,
+        r#"{"nested":{"User_Name":"jdoe"}}"#,
+        // A `\u`-escaped credential in prefixed stderr.
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[auth] {\"\\u0070assword\":\"abc\"}\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[warn] \\u0061pi_key=abc\n"}}]}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[cfg] ANTHROPIC\\u005fAUTH\\u005fTOKEN=abc\n"}}]}"#,
+    ];
+    let missed: Vec<&str> = bad
+        .into_iter()
+        .filter(|text| file_finding(text).is_none())
+        .collect();
+    assert!(missed.is_empty(), "missed:\n{}", missed.join("\n"));
+    let clean = [
+        r#"{"input_tokens":5,"cached_input_tokens":0,"thinkingTokens":3,"estimated_tokens":50,"maxOutputTokens":9}"#,
+        r#"{"apiKeySource":"none","authMode":"chatgpt","tokenUsage":{"total":{"totalTokens":1}}}"#,
+        r#"{"type":"user","message":{"role":"user"},"killed":{"parent":0,"user":0,"system":0}}"#,
+        r#"{"text":"Remember token NONCE0001 and say the secret word."}"#,
+        r#"{"user":"<redacted>","account":null,"password":"REDACTED"}"#,
+        r#"{"cwd":"/work/project","home":"/state/codex-home","p":"/rootless/x"}"#,
+        r#"{"steps":[{"exit":{"code":1,"stderr":"[auth] token expired; run login again\n"}}]}"#,
     ];
     for text in clean {
         assert_eq!(file_finding(text), None, "flagged {text}");
@@ -825,5 +1172,67 @@ fn fixtures_fail_replay_on_trailing_input_or_early_eof() -> TestResult {
     }
     assert!(exercised > 0, "no fixture exercised a deviation");
     assert!(misses.is_empty(), "{}", misses.join("\n"));
+    Ok(())
+}
+
+/// Every fixture that does not model a crash seals its input with a final
+/// `await_eof`, alone or right before the closing `exit`; the rest are
+/// listed in [`ENDS_WITHOUT_EOF`] with their reasons (review F24).
+#[test]
+fn fixtures_end_with_await_eof_unless_declared() -> TestResult {
+    let root = fixtures_root();
+    let mut undeclared = Vec::new();
+    let mut seen = Vec::new();
+    for path in replay_fixtures()? {
+        let file: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let name = path
+            .strip_prefix(&root)?
+            .to_str()
+            .ok_or("path is not UTF-8")?
+            .to_owned();
+        for fixture in lifetimes_of(&file) {
+            let steps: &[Value] = fixture["steps"].as_array().map_or(&[], Vec::as_slice);
+            let eof =
+                |step: Option<&Value>| step.is_some_and(|step| step.get("await_eof").is_some());
+            let sealed = match steps.split_last() {
+                Some((last, before)) if last.get("exit").is_some() => eof(before.last()),
+                Some((last, _)) => eof(Some(last)),
+                None => false,
+            };
+            if !sealed {
+                if ENDS_WITHOUT_EOF.iter().any(|(listed, _)| *listed == name) {
+                    seen.push(name.clone());
+                } else {
+                    undeclared.push(name.clone());
+                }
+            }
+        }
+    }
+    for (listed, why) in ENDS_WITHOUT_EOF {
+        assert!(!why.is_empty(), "{listed}: no reason");
+        assert!(
+            seen.iter().any(|name| name == listed),
+            "{listed}: not an exception"
+        );
+    }
+    assert!(undeclared.is_empty(), "{}", undeclared.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn fixtures_scan_reaches_nested_directories() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let nested = root.path().join("claude").join("chain");
+    fs::create_dir_all(&nested)?;
+    fs::write(root.path().join("top.json"), "{}")?;
+    fs::write(nested.join("deep.replay.json"), "{}")?;
+    let files = files_under(root.path())?;
+    assert_eq!(
+        files,
+        vec![
+            nested.join("deep.replay.json"),
+            root.path().join("top.json")
+        ]
+    );
     Ok(())
 }

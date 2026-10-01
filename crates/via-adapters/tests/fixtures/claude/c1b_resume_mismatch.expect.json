@@ -17,7 +17,7 @@
       "session": "main",
       "start_after": null,
       "params": {
-        "prompt": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn.",
+        "prompt": "Return JSON with kind beta and nonce equal to the nonce I asked you to remember in the previous turn.",
         "effort": null,
         "bound": "full",
         "output_schema": {
@@ -26,13 +26,13 @@
             "kind": {
               "const": "beta"
             },
-            "token": {
+            "nonce": {
               "type": "string"
             }
           },
           "required": [
             "kind",
-            "token"
+            "nonce"
           ]
         },
         "max_steps": null

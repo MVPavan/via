@@ -1,5 +1,5 @@
 {
-  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 595 ms). The probe closed stdin after the result, so await_eof follows it. The recorded exit code (1) and sanitized stderr are replayed by the exit step. SYNTHETIC ADAPTATION under the recipe (as c4 and c11b), not recorded: c1b's prompt and init with every vendor session_id replaced by a fixed different UUID, so the init does not match the captured --resume value; the adapter stops the vendor at the mismatched init with the AD19 sequence. After the init come c7_interrupt's recorded interrupt request, control response and interrupted result (content kept, session id replaced, c7's tool-result messages dropped) and c7's recorded exit. No mismatch was observed live.",
+  "source": "CC c1b, 2026-09-30 re-probe, Claude Code 2.1.285. Sanitized: session, message, request, tool and item ids, paths, skills, socket path and rate-limit data. argv is the adapter recipe (vendor packet §4), not the probe's flags; the init's tools and permissionMode match it. Probe-file contents and their quotations, if any, are the marker FILE_MARKER. Gaps over 1 s became 100 ms (longest recorded gap 595 ms). The probe closed stdin after the result, so await_eof follows it. The recorded exit code (1) and sanitized stderr are replayed by the exit step. SYNTHETIC ADAPTATION under the recipe (as c4 and c11b), not recorded: c1b's prompt and init with every vendor session_id replaced by a fixed different UUID, so the init does not match the captured --resume value; the adapter stops the vendor at the mismatched init with the AD19 sequence. After the init come c7_interrupt's recorded interrupt request, control response and interrupted result (content kept, session id replaced, c7's tool-result messages dropped) and c7's recorded exit. No mismatch was observed live. The schema field and prompt word token became nonce: token is a credential name for the hygiene scan.",
   "argv": [
     "-p",
     "--input-format",
@@ -24,7 +24,7 @@
     "--allowedTools",
     "Read,Write,Edit,Glob,Grep,Bash",
     "--json-schema",
-    "{\"properties\":{\"kind\":{\"const\":\"beta\"},\"token\":{\"type\":\"string\"}},\"required\":[\"kind\",\"token\"],\"type\":\"object\"}"
+    "{\"properties\":{\"kind\":{\"const\":\"beta\"},\"nonce\":{\"type\":\"string\"}},\"required\":[\"kind\",\"nonce\"],\"type\":\"object\"}"
   ],
   "version": "2.1.285 (Claude Code)",
   "deadline_ms": 15000,
@@ -38,7 +38,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Return JSON with kind beta and token equal to the token I asked you to remember in the previous turn."
+                "text": "Return JSON with kind beta and nonce equal to the nonce I asked you to remember in the previous turn."
               }
             ]
           }
