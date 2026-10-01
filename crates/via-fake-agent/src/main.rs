@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
+mod replay;
+
 const SCRIPT_ENV: &str = "VIA_FAKE_SCENARIO";
 const SYNC_ENV: &str = "VIA_FAKE_SYNC_DIR";
 const MAX_INPUT_MESSAGE: u64 = 32 * 1024 * 1024;
@@ -130,6 +132,7 @@ enum InputEvent {
 }
 
 fn main() {
+    replay::run_if_selected();
     if env::args().nth(1).as_deref() == Some("--grandchild") {
         if let Err(error) = grandchild_main() {
             let _ = writeln!(io::stderr().lock(), "fake grandchild: {error}");
