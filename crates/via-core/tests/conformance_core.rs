@@ -666,6 +666,53 @@ fn core_cleanup_follows_ad9_on_fake_profiles() {
     });
 }
 
+/// Sol r1 F13 (AD4 two deadlines, AD9 server route), end to end: after a
+/// cancel's acknowledgement the stop order's `close_by` (here 13 s after
+/// the request) no longer bounds the wait; P7's window does. A reported
+/// tool that ends 20 s after acknowledgement, past `close_by` and before
+/// the 60 s grace, settles the cancel `quiescent`.
+#[test]
+fn core_tool_ending_20_s_after_acknowledgement_settles_quiescent() {
+    let steps = [
+        accepted(1),
+        tool_started(1, "t1"),
+        expect_interrupt(1),
+        terminal(1, "interrupted", "interrupted"),
+        gate("tool_ends"),
+        tool_ended(1, "t1"),
+    ];
+    let Some(root) = child(
+        "core_tool_ending_20_s_after_acknowledgement_settles_quiescent",
+        &scenario(&persistent(), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon
+            .spawn("p", &json!({"deadlines":{"wall_ms":120_000}}))
+            .await;
+        wait_for_tool(&daemon, &session).await;
+        let requested = tokio::time::Instant::now();
+        cancel(&daemon, &session, 1, 10_000).await;
+        daemon.entered("tool_ends").await;
+        let acknowledged = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            requested.elapsed() > Duration::from_secs(13),
+            "past close_by"
+        );
+        daemon.release("tool_ends");
+        let envelope = daemon.wait(&session, 1).await;
+        assert!(acknowledged.elapsed() >= Duration::from_secs(20));
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "acknowledged", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
 /// Selects a test's second child case.
 const CASE: &str = "VIA_CONFORMANCE_CORE_CASE";
 
@@ -881,7 +928,8 @@ fn core_server_lost_versus_transport_lost() {
 /// `deadline_wall`; an interrupted terminal after the interrupt gives
 /// `{acknowledged, quiescent}`, no answer `{requested, uncertain}`. A
 /// cancel whose force is capped at the wall, unanswered, on the shared
-/// server that is never killed, ends `unknown` with outcome `unknown`.
+/// server that is never killed, ends `unknown` with outcome `unknown`; so
+/// does one whose `force_at` passes long before the wall, at its force.
 #[test]
 fn core_wall_soft_stop_on_the_persistent_profile() {
     let scripts = [
@@ -895,6 +943,7 @@ fn core_wall_soft_stop_on_the_persistent_profile() {
         ),
         script("silent", &[accepted(1), hang()]),
         script("capped", &[accepted(1), gate("capped")]),
+        script("early", &[accepted(1), gate("early")]),
     ];
     let Some(root) = child(
         "core_wall_soft_stop_on_the_persistent_profile",
@@ -929,6 +978,23 @@ fn core_wall_soft_stop_on_the_persistent_profile() {
         let envelope = daemon.wait(&session, 1).await;
         assert_eq!(envelope["state"], "unknown", "{envelope}");
         assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+        let session = daemon
+            .spawn("early", &json!({"deadlines":{"wall_ms":30_000}}))
+            .await;
+        daemon.entered("early").await;
+        cancel(&daemon, &session, 1, 500).await;
+        let envelope = daemon.wait(&session, 1).await;
+        // Sol r1 F13: the order's `force_at` passed long before the wall,
+        // unanswered on the shared server: the order's row, `unknown`
+        // with outcome `unknown`, settled at the force, never the wall's
+        // `deadline_wall`.
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+        assert!(
+            envelope["duration_ms"].as_u64().unwrap() < 10_000,
+            "settled at the force, not the wall: {envelope}"
+        );
         daemon.shutdown().await;
     });
 }
@@ -976,7 +1042,8 @@ fn core_handshake_refused_is_submit_failed() {
 /// Before acceptance, a turn whose connection returns `v2` fails
 /// `resume_mismatch`. After a retained terminal, a mismatch keeps the
 /// turn's result and fails only the driver: the session's next turn runs
-/// on a replaced one, which resumes `v1`.
+/// on a replaced one, which resumes `v1`. After acceptance and before a
+/// terminal, it fails `resume_mismatch` with the turn's evidence.
 #[test]
 fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
     let scripts = [
@@ -1013,6 +1080,15 @@ fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
                 terminal(4, "completed", "end_turn"),
             ],
         ),
+        script(
+            "during",
+            &[
+                identity("v1"),
+                accepted(5),
+                identity("v2"),
+                terminal(5, "completed", "end_turn"),
+            ],
+        ),
     ];
     let Some(root) = child(
         "core_resume_mismatch_before_acceptance_and_after_the_terminal",
@@ -1045,6 +1121,25 @@ fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
         let envelope = daemon.wait(&session, 4).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
         assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+
+        daemon.resume(&session, "during").await;
+        let envelope = daemon.wait(&session, 5).await;
+        // Sol r1 F13: after acceptance, before any terminal is retained,
+        // the turn fails `resume_mismatch` (`Err(ResumeMismatch {
+        // evidence })`): the later terminal is not retained, the confirmed
+        // ID is not replaced, and the per-turn process's exit is the
+        // turn's evidence.
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "resume_mismatch", "{envelope}");
+        assert!(
+            envelope["timestamps"]["accepted_at"].is_string(),
+            "{envelope}"
+        );
+        assert!(envelope["vendor_stop_reason"].is_null(), "{envelope}");
+        assert_eq!(envelope["final_text"], "", "{envelope}");
+        assert_eq!(envelope["vendor_session_id"], "v1", "{envelope}");
+        assert!(envelope["exit"].is_object(), "{envelope}");
+        assert!(envelope["evidence"]["folder"].is_string(), "{envelope}");
         daemon.shutdown().await;
     });
 }
@@ -1289,6 +1384,63 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
             ))
             .await;
         daemon.starter.abort();
+    });
+}
+
+/// (14) AD4, C1 §6.1, end to end (Sol r1 F13): while turn 2 runs, the
+/// vendor reports a denial for turn 1's vendor turn. Core commits it
+/// `action.denied` with `turn: 1` and `late: true`, and it stays out of
+/// turn 2's `denied_actions`; turn 2's own denial is kept there.
+#[test]
+fn core_late_denial_is_committed_late_end_to_end() {
+    let denial = |turn: u32, target: &str| {
+        emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(turn),
+                     "kind":"command","target":target,"reason":"policy"}))
+    };
+    let scripts = [
+        script("first", &completed(1)),
+        script(
+            "second",
+            &[
+                accepted(2),
+                denial(1, "late"),
+                denial(2, "own"),
+                terminal(2, "completed", "end_turn"),
+            ],
+        ),
+    ];
+    let Some(root) = child(
+        "core_late_denial_is_committed_late_end_to_end",
+        &scenario(&json!({}), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.resume(&session, "second").await;
+        let envelope = daemon.wait(&session, 2).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["denied_actions_total"], 1, "{envelope}");
+        assert_eq!(envelope["denied_actions"][0]["target"], "own", "{envelope}");
+        let events = events(&daemon, &session).await;
+        let denied: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 2, "{events:?}");
+        assert_eq!(
+            (&denied[0]["turn"], &denied[0]["late"], &denied[0]["target"]),
+            (&json!(1), &json!(true), &json!("late")),
+        );
+        assert_eq!(
+            (&denied[1]["turn"], &denied[1]["late"], &denied[1]["target"]),
+            (&json!(2), &json!(false), &json!("own")),
+        );
+        daemon.shutdown().await;
     });
 }
 

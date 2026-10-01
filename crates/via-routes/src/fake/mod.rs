@@ -496,6 +496,15 @@ fn paired_vendor_turn(actual: &str, turn: TurnNumber) -> bool {
     actual == format!("fake-turn-{}", turn.get())
 }
 
+/// Whether `actual` names `turn`'s vendor turn or an earlier turn's: a
+/// denial may be reported late, for a turn that already ended (AD4).
+fn earlier_or_own_vendor_turn(actual: &str, turn: TurnNumber) -> bool {
+    actual
+        .strip_prefix("fake-turn-")
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| number >= 1 && number <= turn.get())
+}
+
 fn require_vendor_turn(
     actual: &str,
     turn: TurnNumber,
@@ -683,11 +692,9 @@ impl FakeMessage {
                     &[&fields.vendor_turn_id, &fields.target, &fields.reason],
                     turn,
                 )?;
-                require_vendor_turn(
-                    &fields.vendor_turn_id,
-                    turn,
-                    "denial belongs to another turn",
-                )?;
+                if !earlier_or_own_vendor_turn(&fields.vendor_turn_id, turn) {
+                    return Err(protocol(turn, "denial belongs to a later turn"));
+                }
                 Self::Denial {
                     vendor_turn_id: fields.vendor_turn_id,
                     kind: fields.kind,

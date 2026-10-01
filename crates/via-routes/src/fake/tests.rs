@@ -154,3 +154,24 @@ fn retained_payloads_over_256_kib_fail_protocol() {
         Some("fake retained payload exceeds 256 KiB")
     );
 }
+
+/// AD4 (Sol r1 F13): a denial may name the running turn's vendor turn or
+/// an earlier turn's, which Core commits `late`; a later turn's, or an ID
+/// that is no fake vendor turn, is protocol.
+#[test]
+fn a_denial_may_name_an_earlier_turn() {
+    let denial = |vendor_turn: &str| {
+        let json = format!(
+            r#"{{"type":"denial","vendor_turn_id":"{vendor_turn}","kind":"command","target":"t","reason":"r"}}"#
+        );
+        FakeMessage::decode(json.as_bytes(), TurnNumber::try_from(2).unwrap())
+    };
+    assert!(denial("fake-turn-1").is_ok());
+    assert!(denial("fake-turn-2").is_ok());
+    for refused in ["fake-turn-3", "fake-turn-0", "other"] {
+        assert!(
+            matches!(denial(refused), Err(RouteError::Protocol { .. })),
+            "{refused}"
+        );
+    }
+}
