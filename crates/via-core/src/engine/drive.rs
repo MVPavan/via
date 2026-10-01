@@ -32,7 +32,7 @@ use super::{
 };
 use crate::api::{
     AutoDeclined, Cancel, DeniedAction, Effective, Event, EventBody, FailureClass, FinalTextFile,
-    Timestamps, rfc3339,
+    STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, rfc3339,
 };
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
@@ -1114,21 +1114,35 @@ impl Engine {
         cancel_cause: Option<CancelCause>,
     ) -> Result<(), ApiError> {
         let extras = TerminalExtras { cancel_cause };
+        let mut record = record;
         let mode = Commit {
             retry: record.first_failure.is_none(),
             latch: Some(&self.signal),
         };
-        let kept = (record.clone(), terminal.clone());
-        let finished = Self::finish_turn_with(
-            &self.store,
-            &self.unresolved,
-            &started,
-            (record, terminal),
-            false,
-            extras,
-            mode,
-        )
-        .await;
+        let (finished, kept) = if self.spill(&mut record, mode.retry).await {
+            let kept = (record.clone(), terminal.clone());
+            let finished = Self::finish_turn_with(
+                &self.store,
+                &self.unresolved,
+                &started,
+                (record, terminal),
+                false,
+                extras,
+                mode,
+            )
+            .await;
+            (finished, kept)
+        } else {
+            // C1 §5, §7.6: the file write is part of the commit naming it,
+            // so that commit failed and nothing was written.
+            self.unresolved
+                .fail(&started.session, started.turn, TurnState::Running);
+            let unended = Unended {
+                error: ApiError::STORE,
+                outcome: WriteOutcome::NotCommitted,
+            };
+            (Err(unended), (record, terminal))
+        };
         if finished.is_err() {
             let (record, terminal) = kept;
             self.keep_affected(AffectedTurn {
@@ -1140,6 +1154,45 @@ impl Engine {
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
         self.finished(&started, &finished, None, sites).await;
         finished.map(drop).map_err(|unended| unended.error)
+    }
+
+    /// C1 §5: before the commit that names it, writes a structured output
+    /// over [`STRUCTURED_OUTPUT_INLINE`] encoded whole to the turn's
+    /// `structured_output.json`, synced with its folder, and puts the file
+    /// in its place; with `retry` a failed write is tried once more, as the
+    /// commit itself is. `false` when the write failed: the commit that
+    /// would name the file fails, and both fields are `null`. A value
+    /// already spilled or within the limit writes nothing.
+    pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> bool {
+        let session = record.session.clone();
+        let turn = record.turn;
+        let Some(retained) = record.vendor.retained.as_mut() else {
+            return true;
+        };
+        let Some(encoded) = retained
+            .structured_output
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .filter(|encoded| encoded.len() > STRUCTURED_OUTPUT_INLINE)
+        else {
+            return true;
+        };
+        // Taken first: a write cut short by a caller's bound names nothing.
+        retained.structured_output = None;
+        for _ in 0..=u8::from(retry) {
+            let written = self
+                .store
+                .write_structured_output(&session, turn, encoded.clone())
+                .await;
+            if let Ok(file) = written {
+                retained.structured_output_file = Some(StructuredOutputFile {
+                    path: file.path.display().to_string(),
+                    bytes: file.bytes,
+                });
+                return true;
+            }
+        }
+        false
     }
 
     /// Reports a terminal commit to the failure hook: a first attempt that

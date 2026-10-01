@@ -2239,6 +2239,19 @@ impl StoreClient {
         crate::FinalTextFile::create(&self.evidence, self.blobs.tasks.clone(), session, turn).await
     }
 
+    /// Writes the turn's `structured_output.json` whole in its evidence
+    /// folder and syncs it and the folder (C1 §5), before the commit that
+    /// names it. A failure leaves no file to name.
+    pub async fn write_structured_output(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        encoded: Vec<u8>,
+    ) -> Result<crate::StructuredOutputRef, StoreError> {
+        crate::structured_output::write(&self.evidence, &self.blobs.tasks, session, turn, encoded)
+            .await
+    }
+
     /// A stored relative evidence folder made absolute; no I/O. Core gets
     /// the path only, not the evidence capability.
     pub fn evidence_path(&self, relative: &str) -> PathBuf {

@@ -151,6 +151,7 @@ mod final_text;
 pub mod json_limits;
 mod lanes;
 mod runtime;
+mod structured_output;
 
 pub use blob::{
     BLOB_CHUNK, BlobReader, BlobRef, BlobTasks, BlobWriter, INLINE_MAX, PROMPT_MAX, PromptFileError,
@@ -158,6 +159,7 @@ pub use blob::{
 pub use evidence::{EVIDENCE_FILES, EvidenceRoot};
 pub use final_text::{FINAL_TEXT_FILE_MAX, FinalTextFile, FinalTextRef};
 pub use lanes::{Lane, Lanes};
+pub use structured_output::StructuredOutputRef;
 
 pub use runtime::{
     ANCHOR_PAGE_LIMIT, AcceptanceRecord, ActiveTurn, AnchorCohort, AnchorIdentity, AnchorIntent,

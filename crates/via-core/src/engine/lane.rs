@@ -26,7 +26,7 @@ use via_adapters::{
 
 use super::progress::UsageLedger;
 use super::{Engine, lock};
-use crate::api::{AutoDeclined, DeniedAction, Kept};
+use crate::api::{AutoDeclined, DeniedAction, Kept, StructuredOutputFile};
 use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
@@ -145,7 +145,10 @@ pub(super) struct VendorRecord {
 pub(super) struct Retained {
     /// The vendor's own stop reason, kept on every outcome (AD4, #36).
     pub(super) vendor_stop_reason: String,
+    /// Inline; `None` once it spilled to `structured_output_file`.
     pub(super) structured_output: Option<Value>,
+    /// The durable `structured_output.json` of a spilled value (C1 §5).
+    pub(super) structured_output_file: Option<StructuredOutputFile>,
     pub(super) steps: Option<u64>,
     pub(super) usage: Option<UsageSample>,
     pub(super) cost: Option<(f64, String)>,
@@ -164,6 +167,7 @@ impl Retained {
         Self {
             vendor_stop_reason: terminal.vendor_stop_reason.clone(),
             structured_output: terminal.structured_output.as_deref().and_then(parse),
+            structured_output_file: None,
             steps: terminal.steps,
             usage: terminal.usage.clone(),
             cost: terminal

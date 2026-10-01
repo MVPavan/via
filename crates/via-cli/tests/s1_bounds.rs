@@ -468,6 +468,24 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
             );
         }
     }
+    // C1 §5 (spill amendment): the capped members are each at their cap.
+    let encoded = |value: &Value| serde_json::to_vec(value).map(|bytes| bytes.len());
+    assert_eq!(encoded(&envelope["structured_output"])?, 32 * 1024);
+    assert!(
+        envelope["structured_output_file"]["path"].is_string(),
+        "no structured_output_file"
+    );
+    let warnings = envelope["warnings"].as_array().ok_or("no warnings")?;
+    assert_eq!(warnings.len(), 8, "one warning per closed-list code");
+    for warning in warnings {
+        assert_eq!(encoded(&warning["message"])?, 1024, "{}", warning["code"]);
+        assert_eq!(encoded(&warning["data"])?, 4 * 1024, "{}", warning["code"]);
+    }
+    let processes = envelope["leftovers"]["processes"]
+        .as_array()
+        .ok_or("no leftovers")?;
+    assert_eq!(processes.len(), 16);
+    assert_eq!(encoded(&envelope["evidence"]["transcript"])?, 4 * 1024);
     let long_stop = "s".repeat(1025);
     let sandbox = Sandbox::new(&json!({"scripts":[
         script("short-field", "", &long_stop),

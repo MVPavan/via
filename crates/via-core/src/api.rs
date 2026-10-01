@@ -1860,15 +1860,15 @@ impl RoutePlan {
         if self.version_status != "untested" {
             Vec::new()
         } else if self.vendor_version.is_none() {
-            vec![Warning {
-                code: "vendor_version_untested",
-                message: "the fake agent reports no version",
-            }]
+            vec![Warning::new(
+                "vendor_version_untested",
+                "the fake agent reports no version",
+            )]
         } else {
-            vec![Warning {
-                code: "vendor_version_untested",
-                message: "the vendor version is not one the adapter checked",
-            }]
+            vec![Warning::new(
+                "vendor_version_untested",
+                "the vendor version is not one the adapter checked",
+            )]
         }
     }
 }
@@ -1877,26 +1877,59 @@ impl RoutePlan {
 pub(crate) struct Warning {
     code: &'static str,
     message: &'static str,
+    /// C1 §5: a code's structured detail, where it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 impl Warning {
+    /// A warning without `data`.
+    pub(crate) const fn new(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            data: None,
+        }
+    }
+
+    /// This warning with `data`. No warning Core raises carries data yet.
+    #[cfg(any(test, feature = "test-failpoints"))]
+    pub(crate) fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// This warning within its C1 §5 caps: `message` cut to 1 KiB encoded
+    /// at a character boundary, `data` over 4 KiB encoded left out.
+    pub(crate) fn capped(mut self) -> Self {
+        self.message = cut_encoded(self.message, WARNING_MESSAGE_MAX - 2);
+        if self
+            .data
+            .as_ref()
+            .is_some_and(|data| !encodes_within(data, WARNING_DATA_MAX))
+        {
+            self.data = None;
+        }
+        self
+    }
+
     /// The warning's stable code.
     pub(crate) fn code(&self) -> &'static str {
         self.code
     }
 
     /// C1 §3.5: a settled cancel whose group absence is unproved.
-    pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self {
-        code: "cancel_cleanup_uncertain",
-        message: "process group cleanup after cancellation is unconfirmed",
-    };
+    pub(crate) const CANCEL_CLEANUP_UNCERTAIN: Self = Self::new(
+        "cancel_cleanup_uncertain",
+        "process group cleanup after cancellation is unconfirmed",
+    );
 
     /// C1 §5, AD6: the turn's usage ledger overflowed its keys, so the
     /// reported numbers cover an interval VIA did not verify.
-    pub(crate) const USAGE_INTERVAL_UNVERIFIED: Self = Self {
-        code: "usage_interval_unverified",
-        message: "the reported usage covers an interval VIA could not verify",
-    };
+    pub(crate) const USAGE_INTERVAL_UNVERIFIED: Self = Self::new(
+        "usage_interval_unverified",
+        "the reported usage covers an interval VIA could not verify",
+    );
 }
 
 /// C1 §3.5/§7.4 cancel outcome with separate cleanup certainty.
@@ -2160,6 +2193,33 @@ pub(crate) struct FinalTextFile {
     pub(crate) truncated: bool,
 }
 
+/// Longest inline `structured_output`, encoded (C1 §5): a larger value
+/// goes to `structured_output.json`.
+pub(crate) const STRUCTURED_OUTPUT_INLINE: usize = 32 * 1024;
+
+/// C1 §5 `structured_output_file`: the durable `structured_output.json`
+/// holding a structured output larger than [`STRUCTURED_OUTPUT_INLINE`].
+#[derive(Clone, Serialize)]
+pub(crate) struct StructuredOutputFile {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+}
+
+/// Longest warning `message`, encoded with its quotes (C1 §5).
+const WARNING_MESSAGE_MAX: usize = 1024;
+
+/// Longest warning `data`, encoded (C1 §5).
+const WARNING_DATA_MAX: usize = 4 * 1024;
+
+/// Longest evidence `transcript` hint, encoded with its quotes (C1 §5);
+/// a longer one is `null`.
+pub(crate) const TRANSCRIPT_MAX: usize = 4 * 1024;
+
+/// Whether `value`'s encoding is at most `max` bytes.
+pub(crate) fn encodes_within(value: &impl Serialize, max: usize) -> bool {
+    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max)
+}
+
 /// C1 §5 `denied_actions` entry: an action the vendor's own bound denied.
 #[derive(Clone, Serialize)]
 pub(crate) struct DeniedAction {
@@ -2299,12 +2359,39 @@ pub(crate) mod maxima {
         }
     }
 
-    /// A warning with a 1 KiB message; its strings live for the process.
-    pub(crate) fn warning(code: String) -> Warning {
-        Warning {
-            code: Box::leak(code.into_boxed_str()),
-            message: Box::leak("w".repeat(1024).into_boxed_str()),
-        }
+    /// C1 §5's closed list of warning codes.
+    pub(crate) const WARNING_CODES: [&str; 8] = [
+        "instructions_partial",
+        "vendor_version_untested",
+        "usage_interval_unverified",
+        "structured_output_missing",
+        "cancel_cleanup_uncertain",
+        "predecessor_cleanup_uncertain",
+        "config_switch_unverified",
+        "deprecated",
+    ];
+
+    /// A string whose encoding, quotes included, is `bytes` long, made of
+    /// escaped control characters as far as they fit.
+    pub(crate) fn escaped(bytes: usize) -> String {
+        let room = bytes - 2;
+        let mut text = "\u{1}".repeat(room / 6);
+        text.push_str(&"a".repeat(room % 6));
+        text
+    }
+
+    /// A warning whose `message` is 1 KiB and `data` 4 KiB encoded, both
+    /// escaped; its message lives for the process.
+    pub(crate) fn warning(code: &'static str) -> Warning {
+        let data = json!({"pad": escaped(4 * 1024 - r#"{"pad":}"#.len())});
+        Warning::new(code, Box::leak(escaped(1024).into_boxed_str())).with_data(data)
+    }
+
+    /// `leftovers` with 16 processes, each `comm` 15 escaped bytes.
+    pub(crate) fn leftovers(at: &str) -> Value {
+        let process = json!({"pid": i32::MAX, "comm": "\u{1}".repeat(15), "started_at": at});
+        json!({"scope": "server", "processes": vec![process; 16], "total": u64::MAX,
+               "incomplete": true, "best_effort": true})
     }
 
     /// A denial whose free strings are `bytes` long each.
@@ -2356,7 +2443,10 @@ pub(crate) struct Envelope {
     /// in `final_text_file`.
     pub(crate) final_text: Option<String>,
     pub(crate) final_text_file: Option<FinalTextFile>,
+    /// Inline up to [`STRUCTURED_OUTPUT_INLINE`] encoded; `null` when the
+    /// value is in `structured_output_file`.
     pub(crate) structured_output: Option<Value>,
+    pub(crate) structured_output_file: Option<StructuredOutputFile>,
     /// C1 §5 (H5): always present; S-LEFTOVER owns the report, so `null`.
     pub(crate) leftovers: Option<Value>,
     pub(crate) denied_actions: Vec<DeniedAction>,

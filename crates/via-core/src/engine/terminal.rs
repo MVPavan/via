@@ -12,7 +12,7 @@ use super::stop::stop_outcome;
 use super::{Accepted, Terminal, failure};
 use crate::api::{
     Bound, Cost, Envelope, EventRange, EvidenceRef, Exit, FailureClass, Requested, RoutePlan,
-    Timestamps, Usage, VendorFields, Warning,
+    TRANSCRIPT_MAX, Timestamps, Usage, VendorFields, Warning, encodes_within,
 };
 use crate::{SessionId, TurnNumber};
 
@@ -117,6 +117,8 @@ fn assemble(
     // Design §6.4: one entry per code; a repeated code keeps its first.
     let mut codes = std::collections::HashSet::new();
     warnings.retain(|warning| codes.insert(warning.code()));
+    // C1 §5: each within its message and data caps.
+    let warnings = warnings.into_iter().map(Warning::capped).collect();
     let (denied_actions, denied_actions_total) = vendor.denied.into_parts();
     let (auto_declined_requests, auto_declined_requests_total) = vendor.declined.into_parts();
     let retained = vendor.retained.unwrap_or_default();
@@ -126,6 +128,8 @@ fn assemble(
     let (vendor_session_id, transcript) = vendor.identity.map_or((None, None), |identity| {
         (Some(identity.vendor_session_id), identity.transcript)
     });
+    // C1 §5: a transcript hint over 4 KiB encoded is `null`.
+    let transcript = transcript.filter(|hint| encodes_within(hint, TRANSCRIPT_MAX));
     let envelope = Envelope {
         api_version: 1,
         session_id: session.clone(),
@@ -155,6 +159,7 @@ fn assemble(
         final_text_file: terminal.final_text_file,
         // Passed through; validation against the frozen schema is #37's.
         structured_output: retained.structured_output,
+        structured_output_file: retained.structured_output_file,
         leftovers: None,
         denied_actions,
         auto_declined_requests,
@@ -630,37 +635,51 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
     terminal
 }
 
-/// Test builds only (Task 4 design §6.4, §13.2): the encoded envelope with
-/// every member at its maximum, through the same assembly as a turn's:
-/// `denied` denials and `declined` declines whose free strings are
-/// `entry_bytes` long, the failure message twice its maximum and every
-/// warning code repeated.
+/// Test builds only (Task 4 design §6.4, §13.2; C1 §5): the encoded
+/// envelope with every member at its maximum and worst-case JSON escaping,
+/// through the same assembly as a turn's: `denied` denials and `declined`
+/// declines whose free strings are `entry_bytes` long, the failure message
+/// twice its maximum, every warning code twice with its `message` at
+/// 1 KiB and its `data` at 4 KiB encoded, the inline structured output at
+/// 32 KiB and a spill file named as well, 16 leftovers, evidence paths at
+/// 2 KiB, `cwd` and the transcript hint at 4 KiB encoded, and every ID at
+/// 1 KiB of escaped characters.
 #[cfg(feature = "test-failpoints")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one maximal envelope, member by member"
+)]
 pub fn envelope_at_maximum(
     denied: u64,
     declined: u64,
     entry_bytes: usize,
 ) -> Result<String, crate::ApiError> {
-    use crate::api::{Cancel, FINAL_TEXT_INLINE, FinalTextFile, maxima};
+    use super::lane::{Identity, Retained};
+    use crate::api::{
+        Cancel, FINAL_TEXT_INLINE, FinalTextFile, Kept, STRUCTURED_OUTPUT_INLINE,
+        StructuredOutputFile, Tokens, maxima,
+    };
     let bad = |_| crate::ApiError::STORE;
     let session = SessionId::try_from("s_zzzzzzzzzzzz").map_err(bad)?;
     let turn = TurnNumber::try_from(u32::MAX).map_err(bad)?;
     let at = "9999-12-31T23:59:59.999Z";
-    let short = |fill: &str| fill.repeat(1024);
-    let path = "/".repeat(4096);
+    // C2 A1: IDs, versions, stop reasons and codes are 1 KiB of UTF-8,
+    // each byte here a control character encoded as `\u00XX`.
+    let id = || "\u{1}".repeat(1024);
+    let path = maxima::escaped(2 * 1024);
     let mut warnings = Vec::new();
-    for code in (0..9).chain(0..9) {
-        warnings.push(maxima::warning(format!("warning_code_{code}")));
+    for code in maxima::WARNING_CODES.iter().chain(&maxima::WARNING_CODES) {
+        warnings.push(maxima::warning(code));
     }
     let terminal = Terminal {
         state: "cancelled",
         failure: Some(failure(
             FailureClass::VendorError,
             "\u{1}".repeat(4096),
-            Some(short("c")),
+            Some(id()),
         )),
         stop_reason: "interrupted",
-        vendor_stop_reason: Some(short("v")),
+        vendor_stop_reason: Some(id()),
         // Both the inline text and a named file: more than a turn carries.
         final_text: Some("a".repeat(FINAL_TEXT_INLINE - 2)),
         final_text_file: Some(FinalTextFile {
@@ -682,7 +701,7 @@ pub fn envelope_at_maximum(
     };
     let accepted = Accepted {
         at: at.to_owned(),
-        vendor_turn_id: Some(short("t")),
+        vendor_turn_id: Some(id()),
     };
     let timestamps = Timestamps {
         queued_at: at.to_owned(),
@@ -690,57 +709,74 @@ pub fn envelope_at_maximum(
         accepted_at: Some(at.to_owned()),
         ended_at: at.to_owned(),
     };
-    let mut envelope = terminal_envelope(
-        &session,
-        turn,
-        terminal,
-        Some(accepted),
-        (Some(path.clone()), Some(path)),
-        timestamps,
-        Some(u64::MAX),
-        (1, u64::MAX - 1),
-        Usage::reported(
-            Some(crate::api::Tokens {
-                input: Some(u64::MAX),
-                cached_input: Some(u64::MAX),
-                output: Some(u64::MAX),
-                reasoning_output: Some(u64::MAX),
-                total: Some(u64::MAX),
-            }),
-            true,
-        ),
-    );
-    envelope.model = Requested {
-        requested: "m".repeat(1022),
-        resolved: "m".repeat(1022),
-    };
-    envelope.effort = Requested {
-        requested: Some("e".repeat(1022)),
-        resolved: Some("e".repeat(1022)),
-    };
-    envelope.bound = maxima::bound();
-    envelope.vendor_options = maxima::object_of(16 * 1024);
-    envelope.vendor_session_id = Some(short("s"));
-    envelope.evidence.transcript = Some("/".repeat(4096));
-    // AD6: the terminal's vendor data, at most 16 KiB encoded.
-    if let serde_json::Value::Object(data) = maxima::object_of(16 * 1024) {
-        envelope.vendor.data = data;
-    }
-    envelope.steps = Some(u64::MAX);
-    envelope.cost = Cost::reported(f64::MAX, "session_cumulative");
-    let mut denied_list = crate::api::Kept::default();
+    let mut denied_list = Kept::default();
     for index in 0..denied {
         denied_list.push(maxima::denied(entry_bytes, at, index + 1));
     }
-    let mut declined_list = crate::api::Kept::default();
+    let mut declined_list = Kept::default();
     for index in 0..declined {
         declined_list.push(maxima::declined(entry_bytes, at, index + 1));
     }
-    (envelope.denied_actions, envelope.denied_actions_total) = denied_list.into_parts();
-    (
-        envelope.auto_declined_requests,
-        envelope.auto_declined_requests_total,
-    ) = declined_list.into_parts();
+    let serde_json::Value::Object(data) = maxima::object_of(16 * 1024) else {
+        return Err(crate::ApiError::STORE);
+    };
+    let vendor = VendorRecord {
+        identity: Some(Identity {
+            vendor_session_id: id(),
+            transcript: Some(maxima::escaped(4 * 1024)),
+        }),
+        denied: denied_list,
+        declined: declined_list,
+        instance: Some((Some(id()), true)),
+        retained: Some(Retained {
+            vendor_stop_reason: id(),
+            // Both the inline value and a named file: more than a turn carries.
+            structured_output: Some(maxima::object_of(STRUCTURED_OUTPUT_INLINE)),
+            structured_output_file: Some(StructuredOutputFile {
+                path: path.clone(),
+                bytes: u64::MAX,
+            }),
+            steps: Some(u64::MAX),
+            usage: None,
+            cost: Some((f64::MAX, "session_cumulative".to_owned())),
+            // AD6: the terminal's vendor data, at most 16 KiB encoded.
+            vendor: data,
+        }),
+        ..VendorRecord::default()
+    };
+    let max = Some(u64::MAX);
+    let usage = Usage::reported(
+        Some(Tokens {
+            input: max,
+            cached_input: max,
+            output: max,
+            reasoning_output: max,
+            total: max,
+        }),
+        true,
+    );
+    let mut envelope = assemble(
+        (&session, turn),
+        terminal,
+        Some(accepted),
+        (Some(maxima::escaped(4 * 1024)), Some(path)),
+        (timestamps, Some(u64::MAX)),
+        (1, u64::MAX - 1),
+        (usage, true),
+        vendor,
+    );
+    envelope.model = Requested {
+        requested: maxima::escaped(1024),
+        resolved: maxima::escaped(1024),
+    };
+    envelope.effort = Requested {
+        requested: Some(maxima::escaped(1024)),
+        resolved: Some(maxima::escaped(1024)),
+    };
+    envelope.bound = maxima::bound();
+    envelope.vendor_options = maxima::object_of(16 * 1024);
+    // S-LEFTOVER's report at its maximum (C1 §5).
+    envelope.leftovers = Some(maxima::leftovers(at));
     serde_json::to_string(&envelope).map_err(|_| crate::ApiError::STORE)
 }
 
@@ -861,5 +897,74 @@ mod tests {
         assert_eq!(failure.class, FailureClass::SubmitFailed);
         assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
         assert_eq!(failure.message, "quota exhausted");
+    }
+
+    /// C1 §5 (spill amendment): a warning keeps a `message` of at most
+    /// 1 KiB, cut at a character boundary, and `data` of at most 4 KiB
+    /// encoded, else none; an evidence `transcript` hint over 4 KiB encoded
+    /// is `null`, one at 4 KiB is kept.
+    #[test]
+    fn the_envelope_caps_warning_members_and_the_transcript() {
+        use crate::api::{Timestamps, Warning};
+        use crate::engine::lane::{Identity, VendorRecord};
+        let session = crate::SessionId::try_from("s_aaaaaaaaaaaa").expect("a session ID");
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+        let envelope = |transcript: String| {
+            let mut terminal = super::blank("completed", "end_turn", None);
+            // A message 1 KiB + 1 encoded, its last character escaped.
+            let long = leak(format!("{}\u{1}", "w".repeat(1017)));
+            terminal.warnings = vec![
+                Warning::new("cancel_cleanup_uncertain", long)
+                    .with_data(serde_json::json!({"pad":"p".repeat(4 * 1024 - 9)})),
+                Warning::new("deprecated", "short")
+                    .with_data(serde_json::json!({"pad":"p".repeat(4 * 1024 - 10)})),
+            ];
+            let vendor = VendorRecord {
+                identity: Some(Identity {
+                    vendor_session_id: "v".to_owned(),
+                    transcript: Some(transcript),
+                }),
+                instance: Some((Some("1".to_owned()), true)),
+                ..VendorRecord::default()
+            };
+            let envelope = super::turn_envelope(
+                (&session, TurnNumber::try_from(1).expect("a turn")),
+                terminal,
+                None,
+                (None, None),
+                (
+                    Timestamps {
+                        queued_at: at.clone(),
+                        submitted_at: None,
+                        accepted_at: None,
+                        ended_at: at.clone(),
+                    },
+                    None,
+                ),
+                (1, 1),
+                vendor,
+            );
+            serde_json::to_value(&envelope).expect("an envelope encodes")
+        };
+        // `"` + 4,094 bytes of `\u0001` and `a` + `"`: 4 KiB encoded.
+        let at_cap = format!("{}aa", "\u{1}".repeat(682));
+        let kept = envelope(at_cap.clone());
+        assert_eq!(kept["evidence"]["transcript"], at_cap.as_str());
+        let over = envelope(format!("{at_cap}a"));
+        assert!(
+            over["evidence"]["transcript"].is_null(),
+            "{}",
+            over["evidence"]
+        );
+        let warnings = kept["warnings"].as_array().expect("warnings");
+        assert_eq!(warnings[0]["message"], "w".repeat(1017));
+        assert!(warnings[0].get("data").is_none(), "{}", warnings[0]);
+        assert_eq!(
+            serde_json::to_vec(&warnings[1]["data"])
+                .expect("data")
+                .len(),
+            4 * 1024
+        );
     }
 }

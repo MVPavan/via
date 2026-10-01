@@ -1034,11 +1034,9 @@ fn core_resume_mismatch_before_acceptance_and_after_the_terminal() {
 /// vendor stop reason in the forced envelope (AD4).
 #[test]
 fn core_terminal_then_daemon_force_keeps_the_vendor_stop_reason() {
-    let steps = [
-        accepted(1),
-        terminal(1, "completed", "end_turn"),
-        gate("after_terminal"),
-    ];
+    // The terminal's structured output spills on the forced path too.
+    let (terminal, spilled) = structured(1, 32 * 1024 + 1);
+    let steps = [accepted(1), terminal, gate("after_terminal")];
     let Some(root) = child(
         "core_terminal_then_daemon_force_keeps_the_vendor_stop_reason",
         &scenario(&json!({}), &[script("p", &steps)]),
@@ -1058,5 +1056,141 @@ fn core_terminal_then_daemon_force_keeps_the_vendor_stop_reason() {
         let envelope = engine.result(&format!("{session}/1")).await.unwrap();
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["vendor_stop_reason"], "end_turn", "{envelope}");
+        assert!(envelope["structured_output"].is_null(), "{envelope}");
+        let path = envelope["structured_output_file"]["path"].as_str().unwrap();
+        let written = fs::read(path).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), spilled);
+    });
+}
+
+/// A completed terminal of `turn` whose structured output is an object
+/// encoding to exactly `bytes`.
+fn structured(turn: u32, bytes: usize) -> (Value, Value) {
+    let output = json!({"pad":"p".repeat(bytes - r#"{"pad":""}"#.len())});
+    let step = emit(
+        &json!({"type":"terminal","vendor_turn_id":vendor_turn(turn),
+                            "status":"completed","final_text":"done",
+                            "stop_reason":"end_turn","structured_output":output}),
+    );
+    (step, output)
+}
+
+/// C1 §5 (spill amendment): a structured output is inline up to 32 KiB
+/// encoded; one byte more goes to `structured_output.json` in the turn's
+/// evidence folder, the envelope naming it with `{path, bytes}` and
+/// carrying `structured_output: null`.
+#[test]
+fn core_structured_output_spills_past_32_kib() {
+    let (inline_step, inline) = structured(1, 32 * 1024);
+    let (spilled_step, spilled) = structured(2, 32 * 1024 + 1);
+    let Some(root) = child(
+        "core_structured_output_spills_past_32_kib",
+        &scenario(
+            &json!({}),
+            &[
+                script("a", &[accepted(1), inline_step]),
+                script("b", &[accepted(2), spilled_step]),
+            ],
+        ),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("a", &json!({})).await;
+        let first = daemon.wait(&session, 1).await;
+        assert_eq!(first["state"], "completed", "{first}");
+        assert_eq!(first["structured_output"], inline);
+        assert!(first["structured_output_file"].is_null(), "{first}");
+        daemon.resume(&session, "b").await;
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        assert!(second["structured_output"].is_null(), "{second}");
+        let file = &second["structured_output_file"];
+        assert_eq!(file["bytes"], 32 * 1024 + 1, "{file}");
+        let path = PathBuf::from(file["path"].as_str().unwrap());
+        assert_eq!(
+            path.parent().unwrap(),
+            Path::new(second["evidence"]["folder"].as_str().unwrap())
+        );
+        assert_eq!(path.file_name().unwrap(), "structured_output.json");
+        let written = fs::read(&path).unwrap();
+        assert_eq!(written.len(), 32 * 1024 + 1);
+        assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), spilled);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Arms `point` to fail every hit from its first (`persist`) or only the
+/// first.
+#[cfg(feature = "test-failpoints")]
+fn arm_failing(root: &Path, point: &str, persist: bool) {
+    let command = json!({"token":"conformance-core","occurrence":1,"action":"fail_io",
+                         "persist":persist});
+    fs::write(
+        root.join("points").join(format!("{point}.json")),
+        command.to_string(),
+    )
+    .unwrap();
+}
+
+/// C1 §5, §7.6 (spill amendment): the spill write is part of the commit
+/// that names it, retried with it. A first failed write is retried and the
+/// turn keeps its result and file; when the retry fails too, the commit
+/// failed: reads report `store_error`, and final shutdown's resolution
+/// batch ends the turn `failed(store)` with both fields `null`, no partial
+/// file left in its folder.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_structured_output_write_failure_fails_the_commit() {
+    const NAME: &str = "core_structured_output_write_failure_fails_the_commit";
+    let (step, spilled) = structured(1, 32 * 1024 + 1);
+    let persist = case().as_deref() == Some("persist");
+    let scenario = scenario(&json!({}), &[script("p", &[accepted(1), step])]);
+    let Some(root) = child(NAME, &scenario, &[]) else {
+        child_case(NAME, &scenario, "persist");
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_failing(&root, "structured_output.write.fail", persist);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        if !persist {
+            let envelope = daemon.wait(&session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            let path = envelope["structured_output_file"]["path"].as_str().unwrap();
+            let written = fs::read(path).unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), spilled);
+            daemon.shutdown().await;
+            return;
+        }
+        let params = WaitParams {
+            address: format!("{session}/1"),
+            timeout_ms: Some(WAIT_MS),
+        };
+        let error = daemon.engine.wait(params).await.unwrap_err();
+        assert_eq!(error.kind, "store_error");
+        let engine = Arc::clone(&daemon.engine);
+        let report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+        assert_eq!(report.failure_batches.committed, 1, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "store", "{envelope}");
+        assert!(envelope["structured_output"].is_null(), "{envelope}");
+        assert!(envelope["structured_output_file"].is_null(), "{envelope}");
+        let folder = PathBuf::from(envelope["evidence"]["folder"].as_str().unwrap());
+        assert!(!folder.join("structured_output.json").exists());
     });
 }

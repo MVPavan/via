@@ -51,6 +51,20 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     validate_dir(path)
 }
 
+/// Longest state directory path, JSON-encoded with its quotes (runtime
+/// §6.1): it bounds every evidence path an envelope names (C1 §5).
+const STATE_PATH_MAX: usize = 1024;
+
+/// Refuses a state directory whose path is over [`STATE_PATH_MAX`]
+/// encoded, as the envelope names it.
+fn check_state_path(state: &Path) -> anyhow::Result<()> {
+    let encoded = serde_json::to_vec(&state.display().to_string())?.len();
+    if encoded > STATE_PATH_MAX {
+        bail!("the state directory path is {encoded} bytes encoded, over 1 KiB");
+    }
+    Ok(())
+}
+
 /// Exit status of a daemon that found `daemon.lock` held (runtime §6.1,
 /// amendment A3): the CLI polls the socket and respawns within its budget.
 pub(crate) const LOCK_CONTENDED: i32 = 75;
@@ -108,6 +122,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         .init();
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     let paths = super::client::paths()?;
+    check_state_path(&paths.state)?;
     // Task 4 design §5.5: read once, before any Store or socket change.
     let config::Config { limits, harnesses } = match config::read(&paths.state) {
         Ok(config) => config,
@@ -160,13 +175,14 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket).context("bind daemon socket")?;
-    let served = serve_bound(
+    // Boxed: the serving future, Core's included, is large and runs once.
+    let served = Box::pin(serve_bound(
         listener,
         &socket,
         &paths,
         (store_lock, limits),
         harnesses.as_deref(),
-    )
+    ))
     .await;
     if served.is_err() {
         // A failure after bind unlinks the socket before the locks are
@@ -401,3 +417,23 @@ struct Client {
 
 /// Design §10.1: connected clients served at once.
 const SOCKET_SLOTS: usize = 32;
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    /// Runtime §6.1 (C1 §5 spill amendment): a state directory path of
+    /// 1 KiB encoded starts; one byte more, or a shorter path whose
+    /// escaped characters encode past 1 KiB, is refused.
+    #[test]
+    fn a_state_directory_path_over_1_kib_encoded_is_refused() {
+        // `"` + `/` + 1,021 bytes + `"`.
+        let at_cap = PathBuf::from(format!("/{}", "s".repeat(1021)));
+        assert!(super::check_state_path(&at_cap).is_ok());
+        let over = PathBuf::from(format!("/{}", "s".repeat(1022)));
+        assert!(super::check_state_path(&over).is_err());
+        // 200 bytes, each control character encoded as `\u0001`.
+        let escaped = PathBuf::from(format!("/{}", "\u{1}".repeat(199)));
+        assert!(super::check_state_path(&escaped).is_err());
+    }
+}
