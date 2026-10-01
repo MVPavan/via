@@ -27,6 +27,7 @@ mod final_text;
 mod journal;
 mod lane;
 mod latch;
+mod output;
 mod progress;
 mod queue;
 mod read;

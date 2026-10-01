@@ -31,11 +31,10 @@ use super::{
     Accepted, Engine, FailureNote, ForcedTurn, RouteClose, Started, Terminal, TurnRecord, lock,
 };
 use crate::api::{
-    AutoDeclined, Cancel, DeniedAction, Event, EventBody, FailureClass, FinalTextFile,
-    STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Timestamps, Warning, rfc3339,
+    AutoDeclined, Cancel, DeniedAction, Event, EventBody, FailureClass, FinalTextFile, Timestamps,
+    Warning, rfc3339,
 };
 use crate::intake::{Effective, Frozen, TurnPlan};
-use crate::schema::Validator;
 use crate::{ApiError, Deadline, SessionId, TurnNumber, TurnState};
 
 /// Reason recorded on `session.closed` for a `daemon/stop --force` (C1 §7.1).
@@ -870,7 +869,7 @@ impl Engine {
             deadline.instant(),
         );
         let mut terminal = disposed.terminal;
-        validate_output(&effective, &record, &mut terminal);
+        self.check_output(&effective, &record, &mut terminal).await;
         if let Some((outcome, cleanup)) = disposed.stop {
             let requested_at = if let Some(order) = &order {
                 order.requested_at.clone()
@@ -1289,46 +1288,6 @@ impl Engine {
         let sites = (FailureSite::Terminal, FailureSite::Resolution);
         self.finished(&started, &finished, None, sites).await;
         finished.map(drop).map_err(|unended| unended.error)
-    }
-
-    /// C1 §5: before the commit that names it, writes a structured output
-    /// over [`STRUCTURED_OUTPUT_INLINE`] encoded whole to the turn's
-    /// `structured_output.json`, synced with its folder, and puts the file
-    /// in its place; with `retry` a failed write is tried once more, taking
-    /// the commit's one retry. `Some(retried)` once written, or with
-    /// nothing to write: whether that took the retry. `None` when the
-    /// write failed: the commit that would name the file fails, and both
-    /// fields are `null`.
-    pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> Option<bool> {
-        let session = record.session.clone();
-        let turn = record.turn;
-        let Some(retained) = record.vendor.retained.as_mut() else {
-            return Some(false);
-        };
-        let Some(encoded) = retained
-            .structured_output
-            .as_ref()
-            .and_then(|value| serde_json::to_vec(value).ok())
-            .filter(|encoded| encoded.len() > STRUCTURED_OUTPUT_INLINE)
-        else {
-            return Some(false);
-        };
-        // Taken first: a write cut short by a caller's bound names nothing.
-        retained.structured_output = None;
-        for attempt in 0..=u8::from(retry) {
-            let written = self
-                .store
-                .write_structured_output(&session, turn, encoded.clone())
-                .await;
-            if let Ok(file) = written {
-                retained.structured_output_file = Some(StructuredOutputFile {
-                    path: file.path.display().to_string(),
-                    bytes: file.bytes,
-                });
-                return Some(attempt > 0);
-            }
-        }
-        None
     }
 
     /// Reports a terminal commit to the failure hook: a first attempt that
@@ -3012,35 +2971,5 @@ pub(super) fn steer_delivery(delivery: &SteerDelivery) -> &str {
     match delivery {
         SteerDelivery::Injected => "injected",
         SteerDelivery::Partial(semantics) => semantics,
-    }
-}
-
-/// C1 Q2, §5 (adapter design §5.1 #37): a completed turn whose frozen
-/// `output_schema` its structured output does not satisfy fails
-/// `structured_output_invalid`, the output kept; one with no structured
-/// output keeps its state and warns `structured_output_missing`. The value
-/// is validated before it is stored, inline or spilled.
-fn validate_output(effective: &Effective, record: &TurnRecord, terminal: &mut Terminal) {
-    let Some(schema) = effective.output_schema() else {
-        return;
-    };
-    if terminal.state != "completed" {
-        return;
-    }
-    let output = record
-        .vendor
-        .retained
-        .as_ref()
-        .and_then(|retained| retained.structured_output.as_ref());
-    match output {
-        Some(output) => {
-            if !Validator::compile(schema).is_some_and(|validator| validator.accepts(output)) {
-                terminal.fail(
-                    FailureClass::StructuredOutputInvalid,
-                    "the structured output does not satisfy output_schema",
-                );
-            }
-        }
-        None => terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING),
     }
 }

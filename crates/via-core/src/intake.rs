@@ -20,7 +20,6 @@ use crate::api::{
     self, ApiError, DEFAULT_IDLE_MS, DEFAULT_WALL_MS, DescribeParams, ModelsParams, Named,
     Nullable, PerTurn, Requested, SpawnParams, Warning,
 };
-use crate::schema::Validator;
 
 /// Longest `output_schema`, encoded (C1 §4).
 const OUTPUT_SCHEMA_MAX: usize = 256 * 1024;
@@ -174,8 +173,7 @@ impl PerTurn<'_> {
 }
 
 /// `output_schema` (C1 §4, Q2): `null` clears; a value is an object of at
-/// most 256 KiB encoded that compiles as draft 2020-12 with nothing loaded
-/// from outside it.
+/// most 256 KiB encoded (whether it compiles is the caller's check).
 fn schema_member(raw: Option<&RawValue>) -> Result<Member<Value>, ApiError> {
     let refuse = |message| {
         ApiError::naming(
@@ -199,12 +197,25 @@ fn schema_member(raw: Option<&RawValue>) -> Result<Member<Value>, ApiError> {
     }
     let schema: Value = serde_json::from_str(raw.get())
         .map_err(|_| refuse("output_schema is a JSON Schema object or null"))?;
-    if Validator::compile(&schema).is_none() {
-        return Err(refuse(
-            "output_schema is not a self-contained draft 2020-12 JSON Schema",
-        ));
-    }
+    // Whether it compiles is checked off the executor: [`schema_refused`].
     Ok(Member::Given(schema))
+}
+
+/// The C1 error of an `output_schema` that does not compile as a
+/// self-contained draft 2020-12 schema within the compile limits.
+pub(crate) fn schema_refused() -> ApiError {
+    ApiError::naming(
+        ApiError::INVALID_PARAMS,
+        Named::field("output_schema"),
+        "output_schema is not a self-contained draft 2020-12 JSON Schema within VIA's limits",
+    )
+}
+
+impl Overrides {
+    /// The `output_schema` this turn gives, if any.
+    pub(crate) fn schema(&self) -> Option<&Value> {
+        self.output_schema.given()
+    }
 }
 
 /// C1 §4.1 `require` (design §11.1): a list of verb names, each optionally
@@ -822,7 +833,7 @@ mod tests {
     /// The per-turn type rules (C1 §4): an empty options object per
     /// harness passes; a null `bound`, `effort`, `vendor` or `deadlines`
     /// is `invalid_params` naming it; nullable `output_schema` and
-    /// `max_steps` accept null; a schema that does not compile, a zero
+    /// `max_steps` accept null; a schema that is not an object, a zero
     /// step limit and a zero wall budget are refused.
     #[test]
     fn per_turn_type_rules() {
@@ -852,7 +863,6 @@ mod tests {
             Ok(None)
         );
         for (field, value) in [
-            ("output_schema", json!({"type":5})),
             ("output_schema", json!([])),
             ("max_steps", json!(0)),
             ("vendor", json!({"a":1})),

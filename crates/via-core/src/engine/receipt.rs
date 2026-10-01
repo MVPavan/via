@@ -121,6 +121,26 @@ impl Engine {
         }
     }
 
+    /// C1 §4 `output_schema` (Q2): a given schema must compile as a
+    /// self-contained draft 2020-12 schema within VIA's compile limits.
+    /// Compiling is bounded, and runs as a Store blocking step, off the
+    /// executor and owned until it ends (fix round 1 #1).
+    async fn check_schema(&self, schema: Option<&serde_json::Value>) -> Result<(), ApiError> {
+        let Some(schema) = schema.cloned() else {
+            return Ok(());
+        };
+        let compiles = self
+            .store
+            .blocking_step(move || Ok(crate::schema::compiles(&schema)))
+            .await
+            .map_err(|_| WriteOutcome::NotCommitted.api_error())?;
+        if compiles {
+            Ok(())
+        } else {
+            Err(intake::schema_refused())
+        }
+    }
+
     /// Design §11.1: the session's `cwd`, checked by an owned blocking step
     /// with no lock held: at most 4 KiB encoded (C1 §5), absolute and an
     /// existing directory. An omitted `cwd` is the daemon's working directory at
@@ -173,6 +193,9 @@ impl Engine {
     ) -> Result<Receipted, ApiError> {
         let source = params.take_prompt()?;
         let members = params.session_members()?;
+        // Fix round 1 #1: the schema compiles off the executor, no lock held.
+        self.check_schema(params.per_turn().overrides()?.schema())
+            .await?;
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.idempotency_key.as_deref())?.map(str::to_owned);
         // Checked with no lock held, applied only to new work: a keyed
@@ -380,6 +403,10 @@ impl Engine {
         (operation, free): (Option<(String, via_store::Identity)>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
+        params.refuse_session_scope()?;
+        let overrides = params.per_turn().overrides()?;
+        // Fix round 1 #1: the schema compiles off the executor, no lock held.
+        self.check_schema(overrides.schema()).await?;
         let admission = self.admission.lock().await;
         if self.store_failed() {
             return Err(ApiError::STORE);
@@ -387,8 +414,6 @@ impl Engine {
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
-        params.refuse_session_scope()?;
-        let overrides = params.per_turn().overrides()?;
         let session = params.session;
         let snapshot = self
             .store

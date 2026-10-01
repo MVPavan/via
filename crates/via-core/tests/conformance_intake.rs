@@ -889,6 +889,88 @@ fn conformance_intake_structured_output_validation() {
     });
 }
 
+/// Sol r1 #16, #1, #2: every present structured output is validated
+/// before it is stored. On a turn that ends other than completed, its
+/// state and failure stand and the envelope warns
+/// `structured_output_invalid` with `data.reason: "invalid"`; a completed
+/// one whose validation reaches the bound fails `structured_output_invalid`
+/// with `failure.data.reason: "validation_limit"`, the value kept. A schema
+/// declaring another draft is `invalid_params` naming `output_schema`.
+#[test]
+fn conformance_intake_structured_output_validated_whatever_the_state() {
+    let root = Root::new();
+    let profile = json!({"capabilities": capabilities(&[("/params/output_schema", native())])});
+    let failed = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+        "status":"failed","final_text":"","stop_reason":"error","vendor_code":"E1",
+        "structured_output":{"b":1}}));
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &profile,
+            &[
+                script("failed", &[accepted(1), failed]),
+                script("limit", &[accepted(2), structured(2, &json!(1))]),
+            ],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let draft07 = json!({"$schema":"http://json-schema.org/draft-07/schema#",
+                             "dependentRequired":{"a":["b"]}});
+        let error = daemon
+            .try_spawn(&json!({"harness":"fake","model":"fake","prompt":"failed",
+                               "output_schema":draft07}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, "invalid_params", "{error:?}");
+        assert_eq!(error.data()["field"], "output_schema", "{error:?}");
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"failed",
+                           "output_schema":schema()}))
+            .await;
+        let failed = daemon.wait(&session, 1).await;
+        assert_eq!(failed["state"], "failed", "{failed}");
+        assert_ne!(
+            failed["failure"]["class"], "structured_output_invalid",
+            "{failed}"
+        );
+        assert_eq!(failed["structured_output"], json!({"b":1}), "{failed}");
+        let warned = with_code(&failed, "structured_output_invalid");
+        assert_eq!(warned.len(), 1, "{failed}");
+        assert_eq!(warned[0]["data"], json!({"reason":"invalid"}), "{failed}");
+        // Sol's reference-doubling chain: exponential work for any integer.
+        let mut defs = serde_json::Map::new();
+        defs.insert("d0".into(), json!({"type":"string"}));
+        for i in 1..=40 {
+            let previous = json!({"$ref": format!("#/$defs/d{}", i - 1)});
+            defs.insert(
+                format!("d{i}"),
+                json!({"anyOf":[previous.clone(), previous]}),
+            );
+        }
+        daemon
+            .try_resume(
+                &session,
+                &json!({"prompt":"limit","output_schema":{"$ref":"#/$defs/d40","$defs":defs}}),
+            )
+            .await
+            .unwrap();
+        let limited = daemon.wait(&session, 2).await;
+        assert_eq!(limited["state"], "failed", "{limited}");
+        assert_eq!(
+            limited["failure"]["class"], "structured_output_invalid",
+            "{limited}"
+        );
+        assert_eq!(
+            limited["failure"]["data"],
+            json!({"reason":"validation_limit"}),
+            "{limited}"
+        );
+        assert_eq!(limited["structured_output"], json!(1), "{limited}");
+        daemon.stop().await;
+    });
+}
+
 /// (18) AD18 Core half: an effort the plan does not know is
 /// `invalid_params` naming it and the route, with nothing launched; one the
 /// plan knows but the instance's catalog lacks is `failed(submit_failed)`

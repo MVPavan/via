@@ -442,6 +442,11 @@ impl Engine {
         if turn.text.apply(&mut terminal) {
             terminal.fail(FailureClass::Store, "the final text could not be written");
         }
+        // C1 §5 (fix round 1 #16): a kept structured output is validated
+        // before it is stored, whatever the state.
+        if let Some(effective) = turn.started.plan.effective.as_ref() {
+            self.check_output(effective, &record, &mut terminal).await;
+        }
         (turn.started, record, terminal)
     }
 

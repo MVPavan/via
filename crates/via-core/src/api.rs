@@ -1564,6 +1564,17 @@ impl Warning {
         "the vendor returned no structured output",
     );
 
+    /// C1 §5, Q2 (fix round 1 #16): a turn that did not complete kept a
+    /// structured output that does not satisfy its `output_schema`;
+    /// `reason` is `"invalid"` or `"validation_limit"`.
+    pub(crate) fn structured_output_invalid(reason: &'static str) -> Self {
+        Self {
+            code: "structured_output_invalid",
+            message: "the structured output does not satisfy output_schema",
+            data: Some(serde_json::json!({ "reason": reason })),
+        }
+    }
+
     /// C1 §5, AD7: no instance reported the vendor's version.
     pub(crate) const VENDOR_VERSION_UNREPORTED: Self =
         Self::new("vendor_version_untested", "the vendor reported no version");
