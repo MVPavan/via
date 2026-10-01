@@ -433,6 +433,14 @@ impl Engine {
             self.faults.granted.notify_one();
             self.faults.release.notified().await;
         }
+        // Accepted limit (Sol r4, before actor ownership): dropping this
+        // future (the dispatcher aborted) from the claim through submission
+        // and the lane's replacement below, before `run_on_lane` hands the
+        // turn to the lane's actor, can leave a claimed queued turn, or a
+        // durably running one, with no actor job. No vendor I/O has
+        // happened yet; bounded shutdown reports the turn unresolved, and
+        // restart recovery settles it. It is a limit before the actor owns
+        // the turn, not a cancellation guarantee.
         let submission = match self.submit(slot, session, turn).await {
             Ok(submission) => submission,
             Err(failure) => {
@@ -469,8 +477,8 @@ impl Engine {
     /// §6.8 step 3), neither cancels the turn nor strands what it holds:
     /// its stop order, the daemon's force and the drivers' cancellation
     /// stop it, inside the actor. A lane that already ended, at final
-    /// shutdown's cancellation, gives the turn back, and it runs here with
-    /// no session channel.
+    /// shutdown's cancellation, gives the turn back, and it runs on the
+    /// daemon's tracker with no session channel, never in this future.
     #[expect(
         clippy::expect_used,
         reason = "every Engine is made in its Arc (Engine::open_with), which a borrowed Engine keeps alive"
@@ -502,7 +510,12 @@ impl Engine {
             })
         });
         if let Err(job) = lane.hand_over(job) {
-            job(&mut Inbox::closed()).await;
+            // Never the caller's to run (Sol r4 R1): the daemon's tracker
+            // owns it, with its record, run and claim.
+            self.tracker.spawn(async move {
+                let mut inbox = Inbox::closed();
+                job(&mut inbox).await;
+            });
         }
         // The job always runs to its end, which sends; a runtime ending
         // under it ends this future too.

@@ -4356,3 +4356,50 @@ fn an_identity_drained_before_a_turn_is_the_turns() {
         assert_eq!(budget.available_permits(), 1_000);
     });
 }
+
+/// Sol r4 R1 (lane actor ruling): a turn whose lane ended before the
+/// handover, at the drivers' cancellation, is never run by its caller:
+/// aborting the dispatcher while the turn runs leaves it running to its
+/// terminal.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_turn_its_ended_lane_gave_back_outlives_its_aborted_dispatcher() {
+    let Some(root) = child("a_turn_its_ended_lane_gave_back_outlives_its_aborted_dispatcher")
+    else {
+        return;
+    };
+    let points = pause_first(&root, "core.run.settling");
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let (lane, _sender) = adopt_test_lane(&engine, &root, &session).await;
+        engine
+            .faults
+            .hold_before_grant
+            .store(true, Ordering::Release);
+        let dispatcher = tokio::spawn({
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            async move {
+                let _ = engine.dispatcher(session).await;
+            }
+        });
+        engine.faults.grant_paused.notified().await;
+        // The turn holds the lane's claim; the drivers' cancellation ends
+        // the lane before the turn is handed over.
+        engine.cancel.cancel();
+        retired_within(&lane).await;
+        engine.faults.grant_release.notify_one();
+        until(|| acked(&points, "core.run.settling", 1)).await;
+        dispatcher.abort();
+        let _ = dispatcher.await;
+        release_point(&points, "core.run.settling", 1);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while engine.result(&format!("{session}/1")).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the turn reaches its terminal");
+    });
+}
