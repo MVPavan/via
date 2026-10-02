@@ -2293,8 +2293,9 @@ fn an_unrecorded_steer_report_is_not_recorded() {
 }
 
 /// Critical r2 #1: a steer whose future is dropped retires its own entry:
-/// one cancelled after it was admitted, which Route then refuses (another
-/// vendor turn), leaves no steer waiting.
+/// one cancelled after it was admitted (Route refuses it later, as it
+/// names another vendor turn, with nobody waiting) leaves no steer
+/// waiting.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_cancelled_steer_leaves_no_entry() {
@@ -2325,9 +2326,8 @@ fn a_cancelled_steer_leaves_no_entry() {
                 poll_once(&mut steer).await.is_none(),
                 "admitted, unanswered"
             );
+            // Cancelling it retires its entry at once.
             drop(steer);
-            // Route refuses it meanwhile, with nobody waiting.
-            tokio::time::sleep(Duration::from_millis(200)).await;
             let waiting = driver_ref.steers_waiting();
             release(&sync, "g");
             waiting
