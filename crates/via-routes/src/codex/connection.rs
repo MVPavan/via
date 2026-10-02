@@ -753,6 +753,8 @@ impl Connection {
     /// to its registration's lane. An unattributable message is the
     /// connection's failure; its bytes are kept for the server folder.
     fn demux(&self, message: VendorMessage) -> Result<(), ConnectionFailure> {
+        // The read instant (C2 §4): the routed message's, whatever it waits.
+        let at = Instant::now();
         let seq = {
             let mut state = self.state();
             state.seq = state.seq.saturating_add(1);
@@ -772,7 +774,7 @@ impl Connection {
                 paired
             }
             Ok(Routing::Request) => match decode(message.bytes()) {
-                Ok(Incoming::Request(request)) => self.decline(request, message, seq),
+                Ok(Incoming::Request(request)) => self.decline(request, message, (seq, at)),
                 Ok(Incoming::Response(_) | Incoming::Notification(_)) | Err(_) => {
                     self.keep_evidence(message.bytes());
                     Err(ConnectionFailure::Protocol)
@@ -791,6 +793,8 @@ impl Connection {
                         seq,
                         turn,
                         owner,
+                        at,
+                        mark: None,
                     });
                     push(&lane, signal.as_ref(), item, bytes, seq);
                 }
@@ -820,9 +824,8 @@ impl Connection {
         &self,
         request: ServerRequest,
         message: VendorMessage,
-        seq: u64,
+        (seq, decoded_at): (u64, Instant),
     ) -> Result<(), ConnectionFailure> {
-        let decoded_at = Instant::now();
         let line = self.declines.reply(&request.id, &request.method);
         let bytes = line.len();
         {
@@ -868,6 +871,8 @@ impl Connection {
                     seq,
                     turn: request.turn_id.clone(),
                     owner,
+                    at: decoded_at,
+                    mark: None,
                 },
                 request,
                 decoded_at,

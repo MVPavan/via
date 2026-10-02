@@ -184,6 +184,13 @@ impl Delivery {
         true
     }
 
+    /// Whether message `seq` went out whole: its observations, or its
+    /// retained terminal, were all handed on.
+    fn whole(&self, seq: u64) -> bool {
+        let seal = self.lock();
+        seal.current == seq && seal.complete
+    }
+
     /// The message went out whole with no (further) output.
     fn complete(&self, tools_open: bool) -> bool {
         let mut seal = self.lock();
@@ -318,6 +325,9 @@ pub(crate) struct Normalizing {
     pub(crate) acceptance: Option<Acceptance>,
     pub(crate) evidence: Evidence,
     pub(crate) activity: TurnActivity,
+    /// The turn's fence on the lane ([`Lane::fence`]): a message counted
+    /// under it is reported delivered against the turn's watermark.
+    pub(crate) fence: u64,
     pub(crate) cancel: CancellationToken,
     pub(crate) health: Arc<watch::Sender<DriverHealth>>,
 }
@@ -327,7 +337,9 @@ impl Normalizing {
     /// the seal, the lane's end or the session's cancellation.
     pub(crate) async fn run(mut self) {
         if let Some(acceptance) = self.acceptance.take()
-            && !self.output(Observation::Accepted(acceptance), None).await
+            && !self
+                .output(Observation::Accepted(acceptance), None, Instant::now())
+                .await
         {
             return;
         }
@@ -361,12 +373,29 @@ impl Normalizing {
         }
     }
 
-    /// One lane item, decoded now; its staging permit goes with it.
+    /// One lane item, decoded now; its staging permit goes with it. Once
+    /// it went out whole, the turn's decode fence counts it delivered
+    /// (x.3.2 critical r2 #2, runtime §8).
     async fn message(&mut self, item: LaneItem) -> Flow {
+        let (seq, mark) = (item.routed().seq, item.routed().mark);
+        let flow = self.handle(item).await;
+        if let Some(mark) = mark
+            && mark.fence == self.fence
+            && self.delivery.whole(seq)
+        {
+            self.activity.delivered_through(mark.seq);
+        }
+        flow
+    }
+
+    /// [`Self::message`]'s handling: the item's observations, at the
+    /// instant the connection read it.
+    async fn handle(&mut self, item: LaneItem) -> Flow {
         let owner = self.owner(item.routed());
         if !self.delivery.take(item.routed().seq) {
             return Flow::Done;
         }
+        let at = item.routed().at;
         match item {
             LaneItem::Message(routed) => {
                 let notification = match decode(routed.staged.bytes()) {
@@ -376,7 +405,7 @@ impl Normalizing {
                     }
                 };
                 drop(routed);
-                self.notification(owner, &notification).await
+                self.notification(owner, &notification, at).await
             }
             LaneItem::Declined {
                 routed,
@@ -438,13 +467,18 @@ impl Normalizing {
 
     /// A decoded notification: the turn's, or thread-level, is
     /// normalized; another turn's gives the turn nothing.
-    async fn notification(&mut self, owner: Owner, notification: &Notification) -> Flow {
+    async fn notification(
+        &mut self,
+        owner: Owner,
+        notification: &Notification,
+        at: Instant,
+    ) -> Flow {
         if matches!(owner, Owner::Earlier(_) | Owner::Unknown) {
             return flow(self.delivery.complete(self.normalizer.tools_open()));
         }
-        let now = Instant::now();
-        self.activity.record(now);
-        let step = match self.normalizer.observe(notification, now) {
+        // Its read instant, not now (C2 §4): time in the lane moves nothing.
+        self.activity.record(at);
+        let step = match self.normalizer.observe(notification, at) {
             Ok(step) => step,
             Err(NormalizeError::Protocol(detail)) => {
                 self.delivery.stop(Stop::Protocol {
@@ -468,7 +502,7 @@ impl Normalizing {
                 }
                 for (index, observation) in observations.into_iter().enumerate() {
                     let last = (index + 1 == count).then_some(tools_open);
-                    if !self.output(observation, last).await {
+                    if !self.output(observation, last, at).await {
                         return Flow::Done;
                     }
                 }
@@ -501,7 +535,7 @@ impl Normalizing {
         if owner != Owner::This {
             return flow(self.delivery.complete(self.normalizer.tools_open()));
         }
-        self.activity.record(Instant::now());
+        self.activity.record(decoded_at);
         if self.normalizer.note_decline(request).is_err() {
             self.delivery.stop(Stop::Overflow);
             return Flow::Done;
@@ -519,7 +553,7 @@ impl Normalizing {
             return flow(self.delivery.complete(tools_open));
         }
         let declined = Observation::RequestDeclined(normalize::decline(request));
-        if self.output(declined, Some(tools_open)).await {
+        if self.output(declined, Some(tools_open), decoded_at).await {
             Flow::Next
         } else {
             Flow::Done
@@ -530,9 +564,9 @@ impl Normalizing {
     /// outside the seal, the send made under it. `last` (with the open
     /// tools) completes the message. A stall latches the observation
     /// overflow and stops delivery; false once nothing more goes out.
-    async fn output(&self, observation: Observation, last: Option<bool>) -> bool {
+    async fn output(&self, observation: Observation, last: Option<bool>, at: Instant) -> bool {
         let item = ObservationItem {
-            at: Instant::now(),
+            at,
             vendor_turn: VendorTurnId::try_from(self.accepted.clone()).ok(),
             observation,
         };

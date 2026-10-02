@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use via_wire::{ExitReport, TurnNumber, VendorMessage, WireCleanup};
 
 use super::ServerRequest;
+use crate::{DecodeWatermark, Hop};
 
 /// The most messages a lane holds.
 pub const LANE_MESSAGES: usize = 16;
@@ -36,6 +37,22 @@ pub struct Routed {
     /// The VIA turn that vendor turn was accepted as, when the connection
     /// had mapped it at routing (packet §5).
     pub owner: Option<TurnNumber>,
+    /// When the connection read it (C2 §4, runtime §8): its observations'
+    /// instant, so time it waits in the lane moves no idle deadline.
+    pub at: Instant,
+    /// Its position under the lane's decode fence when the lane took it;
+    /// `None` when no turn had fenced the lane. Set by [`Lane::push`].
+    pub mark: Option<Mark>,
+}
+
+/// A routed message's position under its lane's decode fence (x.3.2
+/// critical r2 #2, runtime §8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mark {
+    /// Which fence of the lane counted it ([`Lane::fence`]'s return).
+    pub fence: u64,
+    /// Its position in that fence's turn decode watermark.
+    pub seq: u64,
 }
 
 /// One message routed to a thread.
@@ -61,6 +78,12 @@ pub enum LaneItem {
 impl LaneItem {
     /// The routing facts of the item.
     pub fn routed(&self) -> &Routed {
+        match self {
+            Self::Message(routed) | Self::Declined { routed, .. } => routed,
+        }
+    }
+
+    fn routed_mut(&mut self) -> &mut Routed {
         match self {
             Self::Message(routed) | Self::Declined { routed, .. } => routed,
         }
@@ -169,12 +192,23 @@ struct Queue {
     dropped: u64,
 }
 
+/// The running turn's decode fence on a lane.
+#[derive(Default)]
+struct Fence {
+    /// The fences set so far: the current one's number.
+    count: u64,
+    /// The running turn's watermark, advanced through Route's [`Hop`],
+    /// the one place a route advances one; its channel is never used.
+    hop: Option<Hop<()>>,
+}
+
 /// One thread's ingress lane: the connection task pushes, one driver
 /// takes.
 #[derive(Default)]
 pub struct Lane {
     queue: Mutex<Queue>,
     ready: Notify,
+    fence: Mutex<Fence>,
 }
 
 impl Lane {
@@ -183,11 +217,25 @@ impl Lane {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Fences the lane for a turn whose decode watermark is `decoded`
+    /// (x.3.2 critical r2 #2, runtime §8): each message the lane takes
+    /// from now on advances it and carries its position, under the
+    /// returned fence number, until the next turn's fence replaces it.
+    pub fn fence(&self, decoded: DecodeWatermark) -> u64 {
+        let (unused, _) = tokio::sync::mpsc::channel(1);
+        let mut fence = self.fence.lock().unwrap_or_else(PoisonError::into_inner);
+        fence.count = fence.count.saturating_add(1);
+        fence.hop = Some(Hop::new(unused, decoded));
+        fence.count
+    }
+
     /// Routes `item`, charged `bytes`. A lane already ended drops it
     /// (counted); one that would pass [`LANE_MESSAGES`] or [`LANE_BYTES`]
-    /// ends `Overflow` and drops it: the connection task never waits.
+    /// ends `Overflow` and drops it: the connection task never waits. A
+    /// message it takes advances the running turn's decode watermark, if
+    /// a turn fenced the lane, and carries its position.
     /// Whether the lane took it.
-    pub fn push(&self, item: LaneItem, bytes: usize) -> bool {
+    pub fn push(&self, mut item: LaneItem, bytes: usize) -> bool {
         let mut queue = self.queue();
         if queue.end.is_some() {
             queue.dropped = queue.dropped.saturating_add(1);
@@ -200,6 +248,14 @@ impl Lane {
             self.ready.notify_one();
             return false;
         }
+        let routed = item.routed_mut();
+        routed.mark = {
+            let fence = self.fence.lock().unwrap_or_else(PoisonError::into_inner);
+            fence.hop.as_ref().map(|hop| Mark {
+                fence: fence.count,
+                seq: hop.read((), routed.at).seq,
+            })
+        };
         queue.bytes = queue.bytes.saturating_add(bytes);
         queue.items.push_back((item, bytes));
         drop(queue);
@@ -277,6 +333,8 @@ mod tests {
             seq: 1,
             turn: None,
             owner: None,
+            at: tokio::time::Instant::now(),
+            mark: None,
         })
     }
 

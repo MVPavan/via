@@ -581,11 +581,12 @@ impl<'a> Run<'a> {
         let prepared = session.driver.prepare();
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as via_adapters::CapacityToken);
+        let activity = TurnActivity::new(now);
         let cx = TurnCx {
             turn: number,
             prepared,
             capacity,
-            activity: TurnActivity::new(now),
+            activity: activity.clone(),
             wall: Deadline::at(now + wall),
             tool_grace,
             stop: stop_rx,
@@ -646,6 +647,8 @@ impl<'a> Run<'a> {
         let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
         let end = end?;
+        let fence = (activity.decoded(), activity.delivered());
+        self.pure.fences.borrow_mut().insert(index, fence);
         let mut outcome = Self::outcome(&end, session, &observed.borrow());
         outcome.group_absent = self.group_absent(&session.id, number).await?;
         outcome.steer = steer;

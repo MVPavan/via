@@ -632,6 +632,67 @@ async fn closed_lane_unregisters() {
     assert_eq!(taken(again.lane()).len(), 1);
 }
 
+/// x.3.2 critical r2 #2, adopted by Codex (runtime §8): a fenced lane
+/// counts each message the connection reads for its thread against the
+/// running turn's decode watermark as it takes it, and the message carries
+/// its position under that fence and the instant the connection read it.
+/// A message taken before any fence carries none, another thread's counts
+/// nothing, and the next turn's fence counts afresh on its own watermark.
+#[tokio::test]
+async fn a_fenced_lane_counts_what_the_connection_reads() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let other = registered(&mut vendor, "o").await;
+    vendor.emit(&item_completed("t", "u", "before")).await;
+    vendor.settle().await;
+    let first = crate::DecodeWatermark::default();
+    let fence = lane.lane().fence(first.clone());
+    let fenced_at = tokio::time::Instant::now();
+    vendor.emit(&item_completed("t", "u", "one")).await;
+    vendor.emit(&item_completed("o", "u", "elsewhere")).await;
+    vendor.emit(&item_completed("t", "u", "two")).await;
+    vendor.settle().await;
+    let settled_at = tokio::time::Instant::now();
+    assert_eq!(first.get(), 2);
+    let routed = marked(lane.lane());
+    let marks: Vec<_> = routed.iter().map(|(mark, _)| *mark).collect();
+    assert_eq!(
+        marks,
+        [
+            None,
+            Some(Mark { fence, seq: 1 }),
+            Some(Mark { fence, seq: 2 })
+        ]
+    );
+    for (_, at) in &routed[1..] {
+        assert!(fenced_at <= *at && *at <= settled_at);
+    }
+    assert_eq!(marked(other.lane()).len(), 1);
+    let second = crate::DecodeWatermark::default();
+    let next = lane.lane().fence(second.clone());
+    assert_ne!(next, fence);
+    vendor.emit(&item_completed("t", "u2", "three")).await;
+    vendor.settle().await;
+    assert_eq!((first.get(), second.get()), (2, 1));
+    let marks: Vec<_> = marked(lane.lane()).iter().map(|(mark, _)| *mark).collect();
+    assert_eq!(
+        marks,
+        [Some(Mark {
+            fence: next,
+            seq: 1
+        })]
+    );
+}
+
+/// The routed items of `lane` now: each one's fence mark and read instant.
+fn marked(lane: &Lane) -> Vec<(Option<Mark>, tokio::time::Instant)> {
+    let mut items = Vec::new();
+    while let Some(LaneEvent::Item(item)) = lane.try_next() {
+        items.push((item.routed().mark, item.routed().at));
+    }
+    items
+}
+
 /// Item 9.1: records, mappings and closed threads share one budget of
 /// 1,024 entries; past it the connection fails `overflow` (a retirement
 /// on exhaustion, not an admission refusal).

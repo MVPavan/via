@@ -1394,6 +1394,10 @@ async fn run_started(
         start_by: orders.wall,
         finish_by: Deadline::at(Instant::now() + FINISH_BY),
     };
+    // Before the start is written: every message the connection reads for
+    // the thread from now on counts against the turn's decode fence (x.3.2
+    // critical r2 #2, runtime §8).
+    let fence = start.thread.lease.lane().fence(activity.decode_watermark());
     let requested = start.connection.request(
         |id| turn_start(id, &values, prompt),
         bounds,
@@ -1453,7 +1457,7 @@ async fn run_started(
         vendor_turn_id: VendorTurnId::try_from(accepted.clone()).ok(),
         instance: facts.instance.clone(),
     };
-    let delivery = normalize_on_tracker(facts, start, (&accepted, acceptance), activity);
+    let delivery = normalize_on_tracker(facts, start, (&accepted, acceptance), (activity, fence));
     let accepted_turn = Accepted {
         id: accepted,
         start: start_id,
@@ -1471,7 +1475,7 @@ fn normalize_on_tracker(
     facts: &Turn<'_>,
     start: &Started<'_>,
     (accepted, acceptance): (&str, Acceptance),
-    activity: &crate::TurnActivity,
+    (activity, fence): (&crate::TurnActivity, u64),
 ) -> Arc<Delivery> {
     let driver = facts.driver;
     let lane = start.thread.lease.lane();
@@ -1495,6 +1499,7 @@ fn normalize_on_tracker(
                 earlier: Arc::clone(start.folders),
             },
             activity: activity.clone(),
+            fence,
             cancel: driver.cancel.clone(),
             health: Arc::clone(&driver.health),
         }

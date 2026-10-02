@@ -22,7 +22,7 @@ pub use crash::{CrashOnPanic, RegistryGuard, crash_on_panic, lock};
 pub use encode::*;
 pub use lane::{
     AbnormalEnd, ConnectionLoss, LANE_BYTES, LANE_MESSAGES, Lane, LaneEnd, LaneEvent, LaneItem,
-    LeaseSignal, LossCause, Routed,
+    LeaseSignal, LossCause, Mark, Routed,
 };
 pub use messages::*;
 pub use servers::{

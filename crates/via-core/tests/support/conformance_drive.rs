@@ -67,6 +67,10 @@ pub(crate) struct Pure {
     /// The Store the adapter set runs on; the run half commits turns to it.
     pub(crate) _store: Store,
     pub(crate) name: String,
+    /// Each run turn's decode fence once it settled, by index: Route's
+    /// decode watermark and the position the Adapter delivered through
+    /// (runtime §8; x.3.2 critical r2 #2).
+    pub(crate) fences: std::cell::RefCell<BTreeMap<usize, (u64, u64)>>,
     /// The fixture directory, listed with the case and state directories.
     fixtures: PathBuf,
     /// The listing before the pure steps: where `pure_writes` starts.
@@ -104,6 +108,7 @@ impl Pure {
             _store: store,
             name: name.to_owned(),
             before: Listing::new(),
+            fences: std::cell::RefCell::default(),
             fixtures,
         };
         pure.before = pure.listing()?;

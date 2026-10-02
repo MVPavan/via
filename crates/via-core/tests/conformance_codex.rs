@@ -2109,6 +2109,37 @@ fn codex_structured_output_not_json() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// x.3.2 critical r2 #2, adopted by Codex (runtime §8): the connection
+/// counts each message it reads for the session's thread against the
+/// running turn's decode watermark, from before the turn's `turn/start` is
+/// written, and the normalizer reports each one delivered once it went
+/// out whole, so Core's idle deadline waits for timely progress held in
+/// the lane. In c9's two turns, each ending at its `turn/completed`, every
+/// message Route read for a turn was delivered by its settle. The first
+/// turn counts its ten messages and, when the connection reads it after
+/// the fence, `thread/started`; the second counts only its own ten.
+#[test]
+fn codex_turns_keep_a_decode_fence() {
+    let name = "codex_turns_keep_a_decode_fence";
+    let replay = replay_of("c9_output_schema").unwrap();
+    let mut expect = expect_of("c9_output_schema").unwrap();
+    expect["source"] = json!(format!("{name}: c9_output_schema as recorded"));
+    check_variant_then(name, &replay, &expect, |pure| {
+        let fences = pure.fences.borrow();
+        match (fences.get(&0), fences.get(&1)) {
+            (Some(&(first, through)), Some(&second))
+                if (10..=11).contains(&first) && through == first && second == (10, 10) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "decode fences (watermark, delivered) by turn: {fences:?}"
+            )),
+        }
+    })
+    .unwrap();
+}
+
 /// Arms `codex.connection.message` to fail the connection task when it
 /// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
 #[cfg(feature = "test-failpoints")]
