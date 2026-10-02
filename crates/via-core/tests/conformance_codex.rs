@@ -1650,6 +1650,27 @@ fn codex_start_order() {
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant("codex_start_order_stopped_unanswered", &replay, &expect).unwrap();
 
+    // The start's reply is lost while the server lives (x.3.2 X3 fix r1,
+    // test strength): nothing proves the vendor's turn absent, so the
+    // turn ends at its wall unaccepted with its cleanup unproven, and the
+    // close keeps that uncertainty.
+    let name = "codex_start_order_lost_reply_live_server";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    let close = step_with(&replay, "\"method\":\"thread/unsubscribe\"").unwrap();
+    let tail: Vec<Value> = replay["steps"].as_array().unwrap()[close..].to_vec();
+    cut_after(&mut replay, start, &tail).unwrap();
+    unaccepted(&mut expect, "deadline", tested());
+    let turn = turn_mut(&mut expect, 0);
+    turn["deadlines"] = json!({"wall_ms": 1500, "idle_ms": 600_000});
+    turn["expect"]["cleanup"] = json!("uncertain");
+    turn["expect"]["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    variant(name, &replay, &expect).unwrap();
+
     // A malformed turn/completed of the turn, its correlation intact (X0
     // item 5 step 5): the turn fails `protocol`, the connection lives.
     let (mut replay, mut expect) = plain("codex_start_order_malformed").unwrap();
