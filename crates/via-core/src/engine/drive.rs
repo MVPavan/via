@@ -1780,6 +1780,11 @@ impl Engine {
         let (end, delivered) = end;
         self.final_drain(record, (Some(lane), effective), control, (inbox, delivered))
             .await;
+        // K2 r4 #1 (C2 `SteerInput`): the driver emits a steer's report
+        // before it answers it, and answers every steer of the turn by the
+        // turn's end; drained, no report can resolve a keyed steer of the
+        // turn now, and one whose request went away is released.
+        lane.settle_steers(record.turn);
         let TurnEnd {
             terminal,
             instance,

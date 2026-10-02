@@ -5,11 +5,12 @@
 //! refusal, and every repeat replays it. The steer has one owner at a time
 //! (K2 r3): the request until it hands the steer to the session's lane,
 //! then the lane, whose ticket book keeps the key with the input's token
-//! until the lane commits the delivery with the outcome, or ends without
-//! one. A repeat while an owner remains waits for it. An intent whose
-//! owner ended without recording an outcome gets the daemon's uncertain
-//! outcome, from the next repeat or restart recovery; the input is never
-//! sent again.
+//! until no delivery can resolve it: the lane consumed the steer's report,
+//! the request took it back on the driver's refusal, its turn settled with
+//! the request gone (K2 r4), or the lane ended. A repeat while an owner
+//! remains waits for it. An intent whose owner ended without recording an
+//! outcome gets the daemon's uncertain outcome, from the next repeat or
+//! restart recovery; the input is never sent again.
 
 use std::{
     borrow::Cow,
@@ -104,12 +105,12 @@ type OwnerMap = HashMap<(SessionId, String), watch::Receiver<()>>;
 
 impl KeyedSteers {
     /// The owner of the steer under `key`, if any.
-    fn in_flight(&self, key: &(SessionId, String)) -> Option<watch::Receiver<()>> {
+    pub(super) fn in_flight(&self, key: &(SessionId, String)) -> Option<watch::Receiver<()>> {
         lock(&self.0).get(key).cloned()
     }
 
     /// Registers the first attempt under `key`; its owner ends when dropped.
-    fn begin(&self, key: (SessionId, String)) -> Owner {
+    pub(super) fn begin(&self, key: (SessionId, String)) -> Owner {
         let (done, waiting) = watch::channel(());
         lock(&self.0).insert(key.clone(), waiting);
         Owner {

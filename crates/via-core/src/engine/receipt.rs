@@ -784,13 +784,15 @@ impl Engine {
         // Critical r2 #2: the request's completion ticket, registered
         // before the driver can emit its report; dropped with the request,
         // whichever way it ends, an unkeyed one retires itself, and a keyed
-        // one stays the lane's to resolve (K2 r3).
+        // one stays the lane's to resolve (K2 r3) until its turn settles (K2
+        // r4).
         let address = format!("{}/{}", params.session.as_str(), turn.get());
         let (key, owner) = match keyed {
             Some((op_key, owner)) => (
                 owner.take().map(|handed| SteerKey {
                     op_key: op_key.to_owned(),
                     turn: address.clone(),
+                    number: turn,
                     owner: handed,
                 }),
                 Some(owner),

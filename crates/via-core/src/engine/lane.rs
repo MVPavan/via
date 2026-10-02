@@ -313,6 +313,16 @@ struct TicketBook {
     tickets: HashMap<SteerToken, (tokio::sync::oneshot::Sender<bool>, Option<SteerKey>)>,
     /// The lane ended: a later request's ticket is resolved at once.
     closed: bool,
+    /// The last turn the lane settled, its observations drained: no
+    /// delivery resolves a keyed steer of it or an earlier turn (K2 r4).
+    settled: Option<TurnNumber>,
+}
+
+impl TicketBook {
+    /// Whether no delivery can resolve `key` any more: its turn settled.
+    fn settled(&self, key: &SteerKey) -> bool {
+        self.settled.is_some_and(|settled| key.number <= settled)
+    }
 }
 
 impl SteerTickets {
@@ -327,6 +337,32 @@ impl SteerTickets {
             // The request ended meanwhile: nobody waits for the answer.
             let _ = ticket.send(committed);
         }
+    }
+
+    /// Turn `turn` settled, its admitted observations drained (K2 r4 #1):
+    /// a keyed steer of it whose request went away is released, its
+    /// ownership with it, since no delivery can resolve it now. One whose
+    /// request still waits stays for that request, which takes it back on
+    /// the driver's refusal or releases it when it goes away
+    /// ([`SteerTicket`]).
+    fn settle(&self, turn: TurnNumber) {
+        let released: Vec<_> = {
+            let mut book = self.book();
+            book.settled = Some(turn);
+            let orphaned: Vec<_> = book
+                .tickets
+                .iter()
+                .filter(|(_, (request, key))| {
+                    request.is_closed() && key.as_ref().is_some_and(|key| key.number <= turn)
+                })
+                .map(|(token, _)| *token)
+                .collect();
+            orphaned
+                .into_iter()
+                .filter_map(|token| book.tickets.remove(&token))
+                .collect()
+        };
+        drop(released);
     }
 
     /// The lane ended: every ticket left is not committed.
@@ -345,15 +381,20 @@ impl SteerTickets {
 /// A keyed steer's key, the turn it steers and its ownership, which the
 /// lane's ticket book holds under the input's token once the request
 /// handed the steer over, so the commit of its `steer.delivered` records
-/// its outcome (C1 §3.4, K2 r3). Only the lane removes it: when it
-/// consumes the token's report, committed or not, or ends; the request's
-/// ticket leaving does not, unless the request takes the steer back after
-/// the driver refused it ([`SteerTicket::reclaim`]).
+/// its outcome (C1 §3.4, K2 r3). It is released, its ownership with it,
+/// when no delivery can resolve it any more: the lane consumed the token's
+/// report, committed or not; the request took the steer back after the
+/// driver refused it ([`SteerTicket::reclaim`]); its turn settled, the
+/// turn's observations drained, with its request gone, or its request went
+/// away after that (K2 r4); or the lane ended, drained. The request's
+/// ticket leaving before its turn settled does not release it.
 pub(super) struct SteerKey {
     /// The steer's `op_key`.
     pub(super) op_key: String,
     /// The steered turn's address.
     pub(super) turn: String,
+    /// The steered turn, whose settlement releases the steer (K2 r4).
+    pub(super) number: TurnNumber,
     /// The steer's ownership, released when the lane resolves it.
     pub(super) owner: super::steer::Owner,
 }
@@ -392,18 +433,19 @@ impl SteerTicket {
 }
 
 impl Drop for SteerTicket {
-    /// Retires an unkeyed ticket. A keyed one stays: the lane owns it
+    /// Retires an unkeyed ticket, and a keyed one whose turn settled (K2
+    /// r4). A keyed one of a turn not yet settled stays: the lane owns it
     /// until it resolves it (K2 r3).
     fn drop(&mut self) {
         if let Some(tickets) = self.tickets.upgrade() {
             let mut book = tickets.book();
-            if book
+            let retired = book
                 .tickets
                 .get(&self.token)
-                .is_some_and(|(_, key)| key.is_none())
-            {
-                book.tickets.remove(&self.token);
-            }
+                .is_some_and(|(_, key)| key.as_ref().is_none_or(|key| book.settled(key)));
+            let released = retired.then(|| book.tickets.remove(&self.token));
+            drop(book);
+            drop(released);
         }
     }
 }
@@ -870,6 +912,13 @@ impl Lane {
             op_key: key.op_key.clone(),
             result: super::steer::delivered(&key.turn, delivery),
         })
+    }
+
+    /// Turn `turn` settled, the lane having drained its admitted
+    /// observations: its keyed steers no delivery can resolve now are
+    /// released (K2 r4 #1).
+    pub(super) fn settle_steers(&self, turn: TurnNumber) {
+        self.steers.settle(turn);
     }
 
     /// Records whether the `steer.delivered` observation of `token`

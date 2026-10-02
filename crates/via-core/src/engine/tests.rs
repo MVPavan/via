@@ -4634,6 +4634,48 @@ fn a_suspended_steer_keeps_its_outcome() {
     });
 }
 
+/// K2 r4 #1: a keyed steer's ticket whose request still waits when its turn
+/// settles stays that request's, which may yet take it back on the
+/// driver's refusal; the request going away after the settlement releases
+/// it, its ownership with it. One of a turn not settled stays the lane's
+/// when its request goes away, and the settlement of its turn releases it.
+#[test]
+fn a_settled_turn_releases_its_keyed_steers_once_their_requests_are_gone() {
+    let Some(root) = child("a_settled_turn_releases_its_keyed_steers_once_their_requests_are_gone")
+    else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, lane, _sender) = idle_session_with_lane(&engine, &root).await;
+        let keyed = |op_key: &str, number: u32| {
+            let key = (session.clone(), op_key.to_owned());
+            let owner = engine.keyed_steers.begin(key.clone());
+            let ticket = lane.keyed_steer_ticket(Some(super::lane::SteerKey {
+                op_key: op_key.to_owned(),
+                turn: format!("{session}/{number}"),
+                number: turn(number),
+                owner,
+            }));
+            (key, ticket)
+        };
+        let (waiting, ticket) = keyed("k-1", 1);
+        lane.settle_steers(turn(1));
+        assert_eq!(lane.steer_tickets(), 1, "its request still waits");
+        assert!(engine.keyed_steers.in_flight(&waiting).is_some());
+        drop(ticket);
+        assert_eq!(lane.steer_tickets(), 0, "its request went away");
+        assert!(engine.keyed_steers.in_flight(&waiting).is_none());
+        let (later, ticket) = keyed("k-2", 2);
+        drop(ticket);
+        assert_eq!(lane.steer_tickets(), 1, "its turn has not settled");
+        assert!(engine.keyed_steers.in_flight(&later).is_some());
+        lane.settle_steers(turn(2));
+        assert_eq!(lane.steer_tickets(), 0, "its turn settled");
+        assert!(engine.keyed_steers.in_flight(&later).is_none());
+    });
+}
+
 /// `steer` with the members `raw`, its retry identity their bytes.
 async fn steer(engine: &Engine, raw: &Value) -> Result<Value, ApiError> {
     engine
@@ -9421,5 +9463,57 @@ fn a_keyed_steer_dropped_before_its_hand_off_is_uncertain() {
         fs::write(sync.join("starting.release"), b"").unwrap();
         dispatching.await.unwrap();
         assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+    });
+}
+
+/// K2 r4 #1 (C1 §3.4): a keyed steer whose caller goes away while its input
+/// is with the driver, which then never acknowledges it, is released when
+/// its turn settles, with the lane still open. The turn's end answers the
+/// steer with a refusal nobody receives; once the turn's observations are
+/// drained no delivery can resolve the key, so the lane releases it, and a
+/// repeat promptly stores and replays the uncertain outcome. The driver is
+/// asked once, and the lane keeps no ticket.
+#[test]
+fn a_keyed_steer_orphaned_by_its_caller_is_released_when_its_turn_settles() {
+    let Some(root) =
+        child("a_keyed_steer_orphaned_by_its_caller_is_released_when_its_turn_settles")
+    else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let [expect, _report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn, &[expect, json!({"action":"gate","name":"delivering"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let caller = steer_task(&engine, &raw);
+        until(|| sync.join("delivering.entered").exists()).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        fs::write(sync.join("delivering.release"), b"").unwrap();
+        dispatching.await.unwrap();
+        let lane = engine
+            .kept_lane(&session)
+            .expect("the lane stays open after its turn");
+        let repeat = tokio::time::timeout(Duration::from_secs(5), steer(&engine, &raw))
+            .await
+            .expect("the settled turn released the key")
+            .unwrap_err();
+        assert_eq!(
+            repeat.message,
+            ApiError::steer_unrecorded().message,
+            "{repeat:?}"
+        );
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(super::steer::uncertain()))
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(lane.steer_tickets(), 0);
+        assert!(steers(&engine, &session).await.is_empty());
     });
 }
