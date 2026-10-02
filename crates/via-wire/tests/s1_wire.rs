@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 use via_wire::testing::{TestPipes, pipes};
 use via_wire::{
@@ -825,7 +825,6 @@ async fn s1_wire_control_messages_are_distinct_and_bounded()
 -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::AsyncReadExt;
     let folder = Scratch::new("control")?;
-    let control = |bytes: &[u8]| OutboundMessage::Control(bytes.to_vec());
 
     // Two distinct controls, then the coalesced interrupt, all written in order.
     let (stdout, vendor) = tokio::io::duplex(1024);
@@ -925,15 +924,64 @@ async fn s1_wire_control_messages_are_distinct_and_bounded()
     Ok(())
 }
 
+/// A vendor stdin that signals the first byte written to it, so a test
+/// knows a message started without sleeping.
+struct FirstByte<W> {
+    inner: W,
+    first: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn first_byte<W>(inner: W) -> (FirstByte<W>, tokio::sync::oneshot::Receiver<()>) {
+    let (first, started) = tokio::sync::oneshot::channel();
+    (
+        FirstByte {
+            inner,
+            first: Some(first),
+        },
+        started,
+    )
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for FirstByte<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(count)) = polled
+            && count > 0
+            && let Some(first) = this.first.take()
+        {
+            let _ = first.send(());
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A control message of `bytes`.
+fn control(bytes: &[u8]) -> OutboundMessage {
+    OutboundMessage::Control(bytes.to_vec())
+}
+
 /// x.3.2 J0 (shared connections): a control message's deadline bounds only
 /// the wait for its first byte. One cut before any byte is refused
-/// `NotWritten` and stdin stays open; one already started is written whole,
-/// so no deadline leaves a partial line or closes a shared stdin.
+/// `NotWritten` and stdin stays open; one that started before its deadline
+/// is written whole, so no deadline leaves a partial line or closes a
+/// shared stdin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s1_wire_control_deadline_never_closes_stdin() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::AsyncReadExt;
     let folder = Scratch::new("control-deadline")?;
-    let control = |bytes: &[u8]| OutboundMessage::Control(bytes.to_vec());
     let (stdout, vendor) = tokio::io::duplex(1024);
     let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
     let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
@@ -946,26 +994,169 @@ async fn s1_wire_control_deadline_never_closes_stdin() -> Result<(), Box<dyn std
         .write(control(b"cut\n"), after(Duration::from_millis(100)))
         .await?;
     assert_eq!(cut, SendOutcome::NotWritten, "nothing of it was written");
+    let next = input.write(control(b"next\n"), long);
+    let mut read = vec![0_u8; 16 + 5];
+    let (next, filled) = tokio::join!(next, vendor_stdin.read_exact(&mut read));
+    filled?;
+    assert_eq!(next?, SendOutcome::Written, "stdin stayed open");
+    assert_eq!(read, [&[b'a'; 16][..], b"next\n"].concat());
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
 
-    // Started, then held past its deadline: it completes once the vendor reads.
-    let mut filled = [0_u8; 16];
-    vendor_stdin.read_exact(&mut filled).await?;
-    assert_eq!(filled, [b'a'; 16]);
-    let mut started = [input.write(control(&[b'b'; 48]), after(Duration::from_millis(100)))];
-    enqueue_all(&mut started).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Its first byte written before its deadline, then held past it: the
+    // message is written whole once the vendor reads.
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let (stdin, started) = first_byte(stdin);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let deadline = after(Duration::from_millis(500));
+    let mut held = [input.write(control(&[b'b'; 48]), deadline)];
+    enqueue_all(&mut held).await;
+    tokio::time::timeout_at(deadline.instant(), started).await??;
+    tokio::time::sleep_until(deadline.instant() + Duration::from_millis(50)).await;
+    let mut read = vec![0_u8; 48];
+    let [held] = held;
+    let (held, whole) = tokio::join!(held, vendor_stdin.read_exact(&mut read));
+    whole?;
+    assert_eq!(held?, SendOutcome::Written, "written whole");
+    assert_eq!(read, [b'b'; 48]);
+    let next = input.write(control(b"next\n"), long);
+    let mut read = vec![0_u8; 5];
+    let (next, read_next) = tokio::join!(next, vendor_stdin.read_exact(&mut read));
+    read_next?;
+    assert_eq!(next?, SendOutcome::Written, "stdin stayed open");
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    Ok(())
+}
+
+/// x.3.2 J0 r1 #1: an expired control message never starts, though stdin
+/// is writable: alone, or queued behind a message held until after its
+/// deadline. It answers `NotWritten` and nothing of it reaches the vendor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_expired_control_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control-expired")?;
+    let long = after(Duration::from_secs(10));
+
+    // Writable stdin, a deadline already reached.
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let expired = input
+        .write(control(b"expired\n"), Deadline::at(Instant::now()))
+        .await?;
+    assert_eq!(expired, SendOutcome::NotWritten);
+    assert_eq!(
+        input.write(control(b"next\n"), long).await?,
+        SendOutcome::Written
+    );
+    input.close_input(long).await?;
+    let mut written = Vec::new();
+    vendor_stdin.read_to_end(&mut written).await?;
+    assert_eq!(written, b"next\n", "nothing of the expired control");
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    Ok(())
+}
+
+/// x.3.2 J0 r1 #1: a control queued behind a started predecessor and left
+/// unpolled past its deadline is not written once the writer reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_expired_successor_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control-successor")?;
+    let long = after(Duration::from_secs(10));
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let (stdin, started) = first_byte(stdin);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let late = after(Duration::from_millis(20));
+    let mut held = [
+        input.write(control(&[b'p'; 48]), long),
+        input.write(control(b"late\n"), late),
+    ];
+    enqueue_all(&mut held).await;
+    tokio::time::timeout(Duration::from_secs(5), started).await??;
+    tokio::time::sleep_until(late.instant() + Duration::from_millis(50)).await;
     let reading = tokio::spawn(async move {
         let mut bytes = vec![0_u8; 48 + 5];
         vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
     });
-    let [started] = started;
-    assert_eq!(started.await?, SendOutcome::Written, "written whole");
-    let next = input.write(control(b"next\n"), long).await?;
-    assert_eq!(next, SendOutcome::Written, "stdin stayed open");
+    let [predecessor, successor] = held;
+    assert_eq!(predecessor.await?, SendOutcome::Written);
+    assert_eq!(
+        successor.await?,
+        SendOutcome::NotWritten,
+        "expired in the queue"
+    );
+    assert_eq!(
+        input.write(control(b"next\n"), long).await?,
+        SendOutcome::Written
+    );
     let read = reading.await??;
-    let mut expected = vec![b'b'; 48];
-    expected.extend(b"next\n");
-    assert_eq!(read, expected);
+    assert_eq!(read, [&[b'p'; 48][..], b"next\n"].concat());
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    Ok(())
+}
+
+/// x.3.2 J0 r1 #2: a queued control expires on its own deadline while a
+/// started message is blocked on stdin: it answers `NotWritten` promptly,
+/// returns its share of the budget once, and is never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_queued_control_expires_behind_a_blocked_message()
+-> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control-queued")?;
+    let long = after(Duration::from_secs(10));
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let (stdin, started) = first_byte(stdin);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let mut predecessor = [input.write(control(&[b'p'; 48]), long)];
+    enqueue_all(&mut predecessor).await;
+    tokio::time::timeout(Duration::from_secs(5), started).await??;
+
+    let successor = tokio::time::timeout(
+        Duration::from_secs(2),
+        input.write(control(b"late\n"), after(Duration::from_millis(20))),
+    )
+    .await;
+    assert!(
+        matches!(successor, Ok(Ok(SendOutcome::NotWritten))),
+        "the queued control expired while the predecessor was blocked: {successor:?}"
+    );
+
+    // Its share returned: seven more fit beside the predecessor, a ninth not.
+    let mut held: Vec<_> = (0..7_u8)
+        .map(|n| input.write(control(&[b'0' + n; 4]), long))
+        .collect();
+    enqueue_all(&mut held).await;
+    let ninth = tokio::time::timeout(
+        Duration::from_secs(2),
+        input.write(control(b"ninth\n"), long),
+    )
+    .await?;
+    assert_eq!(ninth?, SendOutcome::NotWritten);
+
+    let reading = tokio::spawn(async move {
+        let mut bytes = vec![0_u8; 48 + 7 * 4];
+        vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
+    });
+    let [predecessor] = predecessor;
+    assert_eq!(predecessor.await?, SendOutcome::Written);
+    for write in held {
+        assert_eq!(write.await?, SendOutcome::Written);
+    }
+    let read = reading.await??;
+    let mut expected = vec![b'p'; 48];
+    expected.extend((0..7_u8).flat_map(|n| [b'0' + n; 4]));
+    assert_eq!(read, expected, "the expired control was never written");
     drop(vendor);
     messages.finish(after(Duration::from_secs(2))).await;
     assert_eq!(input.stragglers(), 0);
