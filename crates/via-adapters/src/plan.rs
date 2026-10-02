@@ -619,7 +619,7 @@ pub fn resolve_model<'a>(
 pub(crate) enum Adapter<'a> {
     /// The fake test double.
     Fake(&'a Arc<FakeAdapter>),
-    /// Claude Code (a stub until via-p98.3.2).
+    /// Claude Code (plans; runs turns from via-p98.3.2's C2).
     Claude(&'a Arc<ClaudeAdapter>),
     /// Codex (`codex-app-server`).
     Codex(&'a Arc<CodexAdapter>),
@@ -635,11 +635,12 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    /// Its bundled catalog; the vendor stubs have none yet.
+    /// Its bundled catalog; the Codex stub has none yet.
     fn catalog(self) -> &'a [CatalogModel] {
         match self {
             Self::Fake(fake) => fake.catalog(),
-            Self::Claude(_) | Self::Codex(_) => &[],
+            Self::Claude(claude) => claude.catalog(),
+            Self::Codex(_) => &[],
         }
     }
 
@@ -690,8 +691,13 @@ impl AdapterSet {
                 config.env().var("PATH"),
             )
         };
-        let claude = binary(claude::HARNESS)
-            .map(|binary| Arc::new(ClaudeAdapter::new(binary, Arc::clone(&instances))));
+        let claude = binary(claude::HARNESS).map(|binary| {
+            Arc::new(ClaudeAdapter::new(
+                binary,
+                Arc::clone(&instances),
+                config.env(),
+            ))
+        });
         let codex = binary(codex::HARNESS)
             .map(|binary| Arc::new(CodexAdapter::new(binary, Arc::clone(&instances))));
         Ok(Self {
@@ -788,11 +794,17 @@ impl AdapterSet {
         let route = harness.route();
         let adapter = match self.adapter(harness) {
             Some(Adapter::Fake(fake)) => fake,
+            Some(Adapter::Claude(claude)) => {
+                let model = ModelChoice {
+                    requested: req.model.clone(),
+                    resolved: claude.resolve(req.model.as_deref()),
+                };
+                return Ok(claude.plan(harness, req, model, self.config.inherit(harness)));
+            }
             Some(Adapter::Codex(codex)) => {
                 return codex.plan(harness, req, self.config.inherit(harness));
             }
-            // The Claude stub plans nothing yet (via-p98.3.2).
-            Some(Adapter::Claude(_)) | None => {
+            None => {
                 return Err(unavailable(Some(route)));
             }
         };
@@ -830,11 +842,20 @@ impl AdapterSet {
         let route = harness.route();
         let adapter = match self.adapter(harness).filter(|_| session.route == route) {
             Some(Adapter::Fake(fake)) => fake,
+            Some(Adapter::Claude(_)) => {
+                ClaudeAdapter::check_version(route, &session.adapter_version)?;
+                return match ClaudeAdapter::check_turn(route, turn).into_iter().next() {
+                    Some(refusal) => Err(refusal),
+                    // The route applies a supported bound as requested.
+                    None => Ok(TurnCheck {
+                        effective_bound: turn.bound.clone(),
+                    }),
+                };
+            }
             Some(Adapter::Codex(_)) => {
                 return CodexAdapter::check_turn(route, &session.adapter_version, turn);
             }
-            // The Claude stub runs no turn yet (via-p98.3.2).
-            Some(Adapter::Claude(_)) | None => {
+            None => {
                 return Err(unavailable(Some(route)));
             }
         };

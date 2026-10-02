@@ -1475,7 +1475,15 @@ fn s1_c1_daemon_status_counts_describe_and_models() -> TestResult {
                 .ok_or_else(|| infra(format!("no session in {spawn}")))?
                 .to_owned();
             setup.wait(evidence, "wait_passed", &format!("{passed}/1"))?;
-            let models = cli(&setup.sandbox, evidence, "models", &["models", "--json"])?;
+            // Filtered to `fake`: the unfiltered list also carries Claude's
+            // bundled catalog whenever `claude` resolves on the host's PATH
+            // (x.3.2 C1); `s_launch` checks that catalog with a pinned binary.
+            let models = cli(
+                &setup.sandbox,
+                evidence,
+                "models",
+                &["models", "--harness", "fake", "--json"],
+            )?;
             // S-CORE chunk 5: `models` answers through `AdapterSet::models`,
             // whose bundled entries are `source: bundled` (C2 §2 `ModelEntry`).
             check(

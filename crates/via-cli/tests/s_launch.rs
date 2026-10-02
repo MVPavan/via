@@ -545,8 +545,9 @@ struct LaunchRow {
 
 /// The per-harness expectations. A vendor adapter that does not plan yet
 /// refuses `describe` with `harness_unavailable` and lists no models. Each
-/// adapter track flips its own row: Codex (x.3.2 X1) plans a named model,
-/// and lists none before discovery, since it has no bundled catalog.
+/// adapter track flips its own row: Claude (x.3.2 C1) plans from its
+/// bundled catalog; Codex (x.3.2 X1) plans a named model, and lists none
+/// before discovery, since it has no bundled catalog.
 fn launch_rows() -> [LaunchRow; 3] {
     let row = |harness| LaunchRow {
         harness,
@@ -554,8 +555,14 @@ fn launch_rows() -> [LaunchRow; 3] {
         refused: Some("harness_unavailable"),
         models: json!([]),
     };
+    let bundled = |model| json!({"model":model,"harness":"claude","aliases":[],"source":"bundled"});
     [
-        row("claude"),
+        LaunchRow {
+            harness: "claude",
+            model: None,
+            refused: None,
+            models: json!([bundled("sonnet"), bundled("opus"), bundled("haiku")]),
+        },
         LaunchRow {
             harness: "codex",
             model: Some("gpt-6-sol"),

@@ -72,10 +72,22 @@ fn s_launch_plan_inherit_per_harness() {
         requested: Inherit::OD2_DEFAULT,
         effective: Inherit::OD2_DEFAULT,
     };
+    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
+    // Claude plans (x.3.2 C1) with its configured request, hooks and MCP
+    // servers on; neither has a verified switch to on, so both are
+    // `unknown`, as are instruction files (no inventory). Plugins, skills
+    // and agents are on by the init inventory.
+    let claude = InheritPlan {
+        requested: inherit(json!({"hooks":"on","mcp_servers":"on","plugins":"on",
+            "skills":"on","agents":"on","instruction_files":"on"})),
+        effective: inherit(
+            json!({"hooks":"unknown","mcp_servers":"unknown","plugins":"on",
+            "skills":"on","agents":"on","instruction_files":"unknown"}),
+        ),
+    };
     // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
     // only its hooks switch is verified (packet §4), so every other
     // category is effectively `unknown`.
-    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
     let codex = InheritPlan {
         requested: inherit(
             json!({"hooks": "off", "mcp_servers": "off", "plugins": "on",
@@ -89,7 +101,7 @@ fn s_launch_plan_inherit_per_harness() {
     // or the refusal. Nothing here runs a binary. Each adapter track flips
     // its own row; Codex has no bundled catalog, so it plans a named model.
     let rows: [(&str, Option<&str>, Result<InheritPlan, RefusalKind>); 3] = [
-        ("claude", None, Err(RefusalKind::HarnessUnavailable)),
+        ("claude", None, Ok(claude)),
         ("codex", Some("gpt-6-sol"), Ok(codex)),
         ("fake", None, Ok(od2)),
     ];

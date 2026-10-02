@@ -5,9 +5,11 @@
 //! (the recorded vendor side, replayed by `via-fake-agent`) with
 //! `<case>.expect.json` (what the C2 driver must produce, in the unified
 //! expectation schema checked by the shared `support/conformance_expect.rs`).
-//! [`drive`] is the one seam: today it returns `adapter not implemented`, so
-//! every case is ignored; `via-p98.3.2` replaces it with a driver over the
-//! real adapter and removes the `ignore`s.
+//! [`drive`] is the one seam. Its pure half (the shared
+//! `support/conformance_drive.rs`: describe, plan checks and spawn plans) is
+//! in place, so the cases every plan refuses run ([`PURE_CASES`]); the
+//! driver half lands with `via-p98.3.2`'s C2 chunk, which removes the other
+//! cases' `ignore`s.
 //!
 //! [`VENDOR_RECORDS`] are fixtures with an expectation that are not adapter
 //! conformance cases: they have no case test, but their expectation still
@@ -34,6 +36,8 @@
 //! the fixture version (the live re-probes of 2026-09-30). The synthetic
 //! untested case is `via-p98.3.2`'s `claude_preflight_pure_version`.
 
+#[path = "support/conformance_drive.rs"]
+mod conformance_drive;
 #[path = "support/conformance_expect.rs"]
 mod conformance_expect;
 
@@ -63,29 +67,42 @@ fn fixtures() -> PathBuf {
 /// (see the checker's module docs for its obligations: `launches` from
 /// `<case>.launches`, the replay's end judged by
 /// [`conformance_expect::replay_exit`] for every launch, and stdin EOF after the
-/// result at an `await_eof` step). Replaced by `via-p98.3.2`.
-fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
-    Err(format!(
-        "adapter not implemented: {ADAPTER_BEAD} (case {name})"
-    ))
+/// result at an `await_eof` step). The pure half runs; a case with a
+/// planned session needs the driver half (`via-p98.3.2` C2).
+fn drive(name: &str, expect: &Value) -> Result<Outcome, String> {
+    let replay = fixtures().join(format!("{name}.replay.json"));
+    conformance_drive::Pure::run("claude", name, expect, &replay)?
+        .planned_only()
+        .map_err(|why| format!("{why}: the driver half is {ADAPTER_BEAD} C2 (case {name})"))
+}
+
+fn check_expect(name: &str, expect: &Value) -> Result<(), String> {
+    let outcome = drive(name, expect)?;
+    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
 }
 
 fn check(name: &str) -> Result<(), String> {
-    let dir = fixtures();
-    let expect = conformance_expect::load(&dir, name)?;
-    let outcome = drive(name, &expect, &dir.join(format!("{name}.replay.json")))?;
-    conformance_expect::check(&expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+    check_expect(name, &conformance_expect::load(&fixtures(), name)?)
 }
 
 macro_rules! cases {
-    ($($name:ident),* $(,)?) => {
+    (pure: [$($pure:ident),* $(,)?], driven: [$($name:ident),* $(,)?] $(,)?) => {
         /// Every case with a test below.
-        const CASES: &[&str] = &[$(stringify!($name)),*];
+        const CASES: &[&str] = &[$(stringify!($pure),)* $(stringify!($name)),*];
+
+        /// The cases the pure half settles: every plan refuses.
+        const PURE_CASES: &[&str] = &[$(stringify!($pure)),*];
 
         mod conformance_claude_cases {
             $(
                 #[test]
-                #[ignore = "red until via-p98.3.2"]
+                fn $pure() {
+                    super::check(stringify!($pure)).unwrap();
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "red until via-p98.3.2 C2"]
                 fn $name() {
                     super::check(stringify!($name)).unwrap();
                 }
@@ -95,9 +112,10 @@ macro_rules! cases {
 }
 
 cases! {
+    pure: [c0_bad_effort, c5_read_only],
+    driven: [
     c0_isolated,
     c0_bad_model,
-    c0_bad_effort,
     c0_invalid_resume,
     c1a,
     c1b,
@@ -105,16 +123,70 @@ cases! {
     c1b_resume_mismatch,
     c3_queue,
     c4_never_ask,
-    c5_read_only,
     c7_interrupt,
     c9a,
     c9b,
     c11b_stdio_prompt,
+    ],
 }
 
-/// Every case and vendor record, sorted.
+/// Packet §9's named tests that are fixture cases, each run by its own
+/// test below (`test(/^claude_/)` selects them).
+const NAMED: &[&str] = &["claude_reserved_options"];
+
+/// F8 (packet §9 `claude_reserved_options`): every normalized alias of a
+/// flag, setting or environment override the recipe owns is refused
+/// `vendor_option_conflict`, and any other Claude key `invalid_params`,
+/// before vendor I/O: no launch, no file written. The positive half (the
+/// canonical parameters give the exact argv) is the launch recipe's unit
+/// test against every fixture's argv.
+#[test]
+fn claude_reserved_options() {
+    check("claude_reserved_options").unwrap();
+}
+
+/// x.3.2 G8 (C2 §2 `ParamSizes`, ruling Q3): instructions or an
+/// `output_schema` past Linux's per-argument limit (128 KiB with its NUL)
+/// cannot travel as `--append-system-prompt` or `--json-schema`, so the
+/// plan refuses them `invalid_params` naming the member, before any
+/// receipt or launch; one byte less plans.
+#[test]
+fn claude_argv_budget_refused_before_launch() {
+    const ARG_MAX: usize = 128 * 1024 - 1;
+    let base = conformance_expect::load(&fixtures(), "c0_bad_effort").unwrap();
+    let schema_of = |len: usize| {
+        // `{"description":"…"}` encodes to 18 bytes besides the text.
+        json!({"description": "d".repeat(len - 18)})
+    };
+    for (member, instructions, schema) in [
+        ("instructions", json!("i".repeat(ARG_MAX + 1)), Value::Null),
+        ("output_schema", Value::Null, schema_of(ARG_MAX + 1)),
+    ] {
+        let mut expect = base.clone();
+        expect["sessions"]["main"]["instructions"] = instructions;
+        let turn = &mut expect["turns"][0];
+        turn["params"]["effort"] = json!("low");
+        turn["params"]["output_schema"] = schema;
+        turn["expect"]["plan_refusal"] = json!(format!("invalid_param:{member}"));
+        conformance_expect::validate(&expect).unwrap();
+        check_expect("c0_bad_effort", &expect).unwrap_or_else(|e| panic!("{member}: {e}"));
+    }
+    // At the limit, both plan: the case needs the driver half.
+    let mut expect = base;
+    expect["sessions"]["main"]["instructions"] = json!("i".repeat(ARG_MAX));
+    expect["turns"][0]["params"]["effort"] = json!("low");
+    expect["turns"][0]["params"]["output_schema"] = schema_of(ARG_MAX);
+    let planned = drive("c0_bad_effort", &expect).err().unwrap_or_default();
+    assert!(
+        planned.contains("plans, and running it needs the route's driver"),
+        "{planned}"
+    );
+}
+
+/// Every case, named fixture and vendor record, sorted.
 fn listed() -> Vec<&'static str> {
     let mut listed: Vec<&str> = CASES.to_vec();
+    listed.extend(NAMED);
     listed.extend(VENDOR_RECORDS.iter().map(|(name, _)| *name));
     listed.sort_unstable();
     listed
@@ -133,6 +205,7 @@ fn conformance_claude_cases_match_fixture_files() {
             "{name}: both a case and a vendor record"
         );
     }
+    assert!(PURE_CASES.iter().all(|name| CASES.contains(name)));
     let dir = fixtures();
     assert_eq!(conformance_expect::case_names(&dir).unwrap(), listed());
     for name in listed() {
@@ -155,7 +228,7 @@ type Mutation = (&'static str, fn(&mut Outcome));
 #[test]
 fn conformance_claude_checker_detects_each_difference() {
     let dir = fixtures();
-    for name in CASES {
+    for name in CASES.iter().chain(NAMED) {
         let expect = conformance_expect::load(&dir, name).unwrap();
         conformance_expect::check(&expect, &conformance_expect::ideal(&expect))
             .unwrap_or_else(|e| panic!("{name}: ideal outcome refused:\n{e}"));

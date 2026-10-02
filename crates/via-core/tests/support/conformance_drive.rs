@@ -5,8 +5,9 @@
 //! The harness binary is the replaying fake: `via-fake-agent` linked as
 //! `<case dir>/<case>` beside a copy of `<case>.replay.json`, so its launch
 //! log `<case>.launches` (one line per start) lands in the case's own scratch
-//! directory and every case starts with none. The Store lives in a separate
-//! state directory that `pure_writes` does not scan.
+//! directory and every case starts with none. The Store and the runtime
+//! directory live in a separate state directory; `pure_writes` scans it
+//! too, beside the fixture and case directories.
 //!
 //! In the checker's order (see `conformance_expect.rs`, `drive()`
 //! obligations), [`Pure::run`]:
@@ -18,7 +19,8 @@
 //!    of the turn-1 values; a refusal is that turn's `plan_refusal`, in the
 //!    C2 name of its `RefusalKind`;
 //! 3. records `launches`, the checkpoints and `pure_writes` from the case's
-//!    directories; `pure_writes` spans steps 1 and 2.
+//!    directories; `pure_writes` spans steps 1 and 2, and a directory that
+//!    cannot be read fails the case.
 //!
 //! The turns that plan run in the run half (the route's driver), which
 //! [`Pure::planned_only`] does not have: it finishes only a case whose
@@ -56,7 +58,8 @@ pub(crate) struct Pure {
     pub(crate) case_dir: tempfile::TempDir,
     /// The adapter set under test.
     pub(crate) set: AdapterSet,
-    _state: tempfile::TempDir,
+    /// The Store's and the runtime directory's parent.
+    state: tempfile::TempDir,
     _store: Store,
     name: String,
 }
@@ -88,7 +91,7 @@ impl Pure {
             pending: Vec::new(),
             case_dir,
             set,
-            _state: state,
+            state,
             _store: store,
             name: name.to_owned(),
         };
@@ -261,10 +264,11 @@ impl Pure {
         }
     }
 
-    /// Every file of the fixture and case directories but the launch log.
+    /// Every file of the fixture, case and state directories (the Store
+    /// and the runtime directory) but the launch log.
     fn listing(&self, fixtures: &Path) -> Result<Listing, String> {
         let mut listing = Listing::new();
-        for dir in [fixtures, self.case_dir.path()] {
+        for dir in [fixtures, self.case_dir.path(), self.state.path()] {
             list(dir, &mut listing).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         listing.remove(&self.case_dir.path().join(format!("{}.launches", self.name)));
