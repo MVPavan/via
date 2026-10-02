@@ -518,6 +518,40 @@ fn conformance_intake_model_only_spawn() {
     });
 }
 
+/// Critical r2 #6 (C1 §4, design §6.4): the resolved model is held to the
+/// 1 KiB encoded cap, as the requested one is: a short alias resolving to
+/// a 2,048-byte model is `invalid_params` naming `model`, and no receipt
+/// commits.
+#[test]
+fn conformance_intake_resolved_model_is_capped() {
+    let root = Root::new();
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &json!({"models":[{"model":"m".repeat(2048),"aliases":["pro"]}]}),
+            &[],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let error = daemon
+            .try_spawn(&json!({"model":"pro","prompt":"p"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.kind, &error.data()["field"]),
+            ("invalid_params", &json!("model")),
+            "{error:?}"
+        );
+        daemon.stop().await;
+    });
+    let db = rusqlite::Connection::open(root.path().join("state").join("store.sqlite3")).unwrap();
+    let sessions: i64 = db
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0, "no receipt commits");
+}
+
 /// (11) Steer on a native profile (C1 §3.4): a steer naming another turn is
 /// `turn_mismatch`; one issued while the turn is submitting is answered
 /// once it is accepted, is delivered through the driver and commits

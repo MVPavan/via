@@ -470,6 +470,15 @@ pub(crate) fn plan_spawn(
     let plan = adapter
         .plan(&request)
         .map_err(|refusal| refused(&refusal))?;
+    // Critical r2 #6 (C1 §4, design §6.4): the resolved model is held to
+    // the requested one's cap before any receipt.
+    if !crate::api::short_member(&plan.model.resolved) {
+        return Err(ApiError::naming(
+            ApiError::INVALID_PARAMS,
+            Named::field("model"),
+            "the resolved model is longer than 1 KiB encoded",
+        ));
+    }
     // Sol r1 #5 (C1 §4.1): a route that cannot spawn refuses before any receipt.
     if matches!(plan.capabilities.verbs.spawn, Support::Unsupported { .. }) {
         return Err(unsupported_verb(Verb::Spawn, plan.route));

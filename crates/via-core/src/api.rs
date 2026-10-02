@@ -201,6 +201,11 @@ const VENDOR_MAX: usize = 16 * 1024;
 /// Longest `model` or `effort`, encoded (design §6.4).
 const SHORT_MEMBER_MAX: usize = 1024;
 
+/// Whether `text`, encoded with its quotes, is within [`SHORT_MEMBER_MAX`].
+pub(crate) fn short_member(text: &str) -> bool {
+    via_adapters::encoded_text_len(text) + 2 <= SHORT_MEMBER_MAX
+}
+
 /// Longest `cwd` or `prompt_file` path (design §10.4, §11.1), in bytes.
 pub(crate) const PATH_MAX: usize = 4096;
 
@@ -254,7 +259,7 @@ impl SpawnParams {
     pub(crate) fn check_session_members(&self) -> Result<(), ApiError> {
         // Design §6.4: the envelope's members a caller sizes, refused at
         // receipt over their maxima.
-        if via_adapters::encoded_text_len(&self.model) + 2 > SHORT_MEMBER_MAX {
+        if !short_member(&self.model) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
                 Named::field("model"),
