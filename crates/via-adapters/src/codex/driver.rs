@@ -31,7 +31,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionLoss, FINISH_BY,
-    LOSS_EVIDENCE, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Mark, Purpose,
+    LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Mark, Purpose,
     RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin, Subscription,
     ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds,
     crash_on_panic, data, result, thread_resume, thread_start, turn_start,
@@ -881,7 +881,7 @@ async fn turn(
     )
     .await;
     drop(writes);
-    if quarantines(&end) || !usable(&connection) {
+    if quarantines(&end) || !usable(&connection) || thread.lease.lane().overflowed_now() {
         session.quarantine(&connection);
     }
     drop(pin);
@@ -1174,7 +1174,7 @@ async fn open_thread(
     facts.launch();
     let reply = await_reply(
         (requested.written, requested.reply),
-        (orders, force),
+        (orders, force, None),
         &mut |_ending| {},
     )
     .await;
@@ -1357,6 +1357,8 @@ enum Unanswered {
     Forced,
     /// The turn's own order reached its end.
     Ended(EndCause),
+    /// The registration's lane overflowed (x.3.2 X3 fix r3 #1).
+    Overflow,
 }
 
 /// A turn whose request went unanswered.
@@ -1385,18 +1387,32 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
         Unanswered::Ended(EndCause::Wall) => {
             facts.failure(RouteError::Deadline { turn }, None, None)
         }
+        // What was dropped proves nothing: the cleanup is unproven.
+        Unanswered::Overflow => facts.failure(
+            RouteError::Overflow { turn },
+            None,
+            Some(WireCleanup::Uncertain),
+        ),
     }
 }
 
-/// Awaits a queued request's paired reply, bounded by the force and the
+/// Awaits a queued request's paired reply, bounded by the force, the
+/// overflow of `lane` (the turn's registration, once it has one) and the
 /// end of the turn's own order; `on_order` runs once, at the order.
 async fn await_reply(
     (written, reply): (oneshot::Receiver<SendOutcome>, oneshot::Receiver<Response>),
-    (orders, force): (&mut Orders, &mut ForceWatch),
+    (orders, force, lane): (&mut Orders, &mut ForceWatch, Option<&Lane>),
     on_order: &mut (dyn FnMut(&Ending) + Send),
 ) -> Result<Response, Unanswered> {
     tokio::pin!(written);
     tokio::pin!(reply);
+    let overflowed = async {
+        match lane {
+            Some(lane) => lane.overflowed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(overflowed);
     let mut answered = false;
     let mut ending: Option<Ending> = None;
     loop {
@@ -1404,6 +1420,8 @@ async fn await_reply(
         tokio::select! {
             biased;
             () = forced(force) => return Err(Unanswered::Forced),
+            // Vendor §5: a quarantined generation's turns end at once.
+            () = &mut overflowed => return Err(Unanswered::Overflow),
             outcome = &mut written, if !answered => match outcome {
                 Ok(SendOutcome::Written) => answered = true,
                 Ok(other) => return Err(Unanswered::NotWritten(other)),
@@ -1498,7 +1516,7 @@ async fn run_started(
         .unwrap_or(AcceptanceToken::FIRST);
     let reply = await_reply(
         (requested.written, requested.reply),
-        (orders, force),
+        (orders, force, Some(start.thread.lease.lane())),
         &mut |ending: &Ending| {
             // Before acceptance the intent waits on the start's reply.
             start
@@ -1509,7 +1527,7 @@ async fn run_started(
     .await;
     let reply = match reply {
         Ok(reply) => reply,
-        Err(cause) => return lost(facts, start.connection, cause),
+        Err(cause) => return unanswered(facts, start, start_id, cause),
     };
     let accepted = match reply.outcome {
         Ok(raw) => match result::<TurnStartResult>(&raw) {
@@ -1556,7 +1574,26 @@ async fn run_started(
         delivery: &delivery,
     };
     let cut = wait(start, &accepted_turn, (orders, force)).await;
+    cut_seam().await;
     settle_turn(facts, start, &accepted_turn, cut)
+}
+
+/// A started turn whose reply never came; at an overflow the
+/// generation's cleanup interrupt is posted, waiting on that reply (x.3.2
+/// X3 fix r3 #1).
+fn unanswered(
+    facts: &Turn<'_>,
+    start: &Started<'_>,
+    start_id: ClientId,
+    cause: Unanswered,
+) -> TurnEnd {
+    if matches!(cause, Unanswered::Overflow) {
+        let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
+        start
+            .connection
+            .cleanup_interrupt(&start.thread.lease, start_id, None, by);
+    }
+    lost(facts, start.connection, cause)
 }
 
 /// Starts the accepted turn's delivery: its normalizer, on the session's
@@ -1599,6 +1636,20 @@ fn normalize_on_tracker(
         .run(),
     ));
     delivery
+}
+
+/// Test builds: a seam between an accepted turn's cutoff and its
+/// settlement (x.3.2 X3 fix r3 #2), where a test holds the turn while its
+/// normalizer runs on.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn cut_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.cut").await;
+    }
 }
 
 /// An accepted turn's facts.
@@ -1706,14 +1757,25 @@ fn settle_turn(
 ) -> TurnEnd {
     let turn = facts.number;
     let sealed = accepted.delivery.seal();
+    let lane = start.thread.lease.lane();
     let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
-    let undelivered = sealed.partial || start.thread.lease.lane().front_seq().is_some();
+    let undelivered = sealed.partial || lane.front_seq().is_some();
     let abnormal = matches!(sealed.stop, Some(Stop::Lane(LaneEnd::Abnormal)));
     let overflowed = cut == Cut::Overflow
+        || lane.overflowed_now()
         || matches!(
             sealed.stop,
             Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)
         );
+    let cleanup_interrupt = || {
+        let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
+        start.connection.cleanup_interrupt(
+            &start.thread.lease,
+            accepted.start,
+            Some(&accepted.id),
+            by,
+        );
+    };
     if !terminal_decided && (undelivered || abnormal || overflowed || cut == Cut::LossDeadline) {
         lock_losses(&facts.session.losses).note(start.generation, sealed.position, UNKNOWN);
     }
@@ -1727,17 +1789,17 @@ fn settle_turn(
         return uncertain(RouteError::ForceStopped { turn });
     }
     if let Some(retained) = sealed.terminal {
-        return terminal_end(facts, retained, sealed.tools_open);
+        // The terminal stands, but an overflow beside it, however the two
+        // were ready, still leaves the cleanup unproven (x.3.2 X3 fix r3
+        // #2).
+        if overflowed {
+            cleanup_interrupt();
+        }
+        return terminal_end(facts, retained, sealed.tools_open || overflowed);
     }
     match (cut, sealed.stop) {
         (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)) => {
-            let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
-            start.connection.cleanup_interrupt(
-                &start.thread.lease,
-                accepted.start,
-                Some(&accepted.id),
-                by,
-            );
+            cleanup_interrupt();
             facts.failure(
                 RouteError::Overflow { turn },
                 None,

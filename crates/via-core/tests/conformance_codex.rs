@@ -2210,6 +2210,12 @@ fn codex_stale_fence_counts_nothing() {
 /// for this test process; the folder lives as long as the returned guard.
 #[cfg(feature = "test-failpoints")]
 fn armed(point: &str, command: Value) -> Result<tempfile::TempDir, String> {
+    armed_all(&[(point, command)])
+}
+
+/// [`armed`] for several failpoints at once.
+#[cfg(feature = "test-failpoints")]
+fn armed_all(points_armed: &[(&str, Value)]) -> Result<tempfile::TempDir, String> {
     use std::os::unix::fs::DirBuilderExt;
     let points = tempfile::tempdir().map_err(|e| e.to_string())?;
     let dir = points.path().join("points");
@@ -2218,10 +2224,12 @@ fn armed(point: &str, command: Value) -> Result<tempfile::TempDir, String> {
         .create(&dir)
         .map_err(|e| e.to_string())?;
     let token = "x3-armed-failpoint";
-    let mut command = command;
-    command["token"] = json!(token);
-    std::fs::write(dir.join(format!("{point}.json")), command.to_string())
-        .map_err(|e| e.to_string())?;
+    for (point, command) in points_armed {
+        let mut command = command.clone();
+        command["token"] = json!(token);
+        std::fs::write(dir.join(format!("{point}.json")), command.to_string())
+            .map_err(|e| e.to_string())?;
+    }
     via_store::failpoint::activate(&dir, token)?;
     Ok(points)
 }
@@ -2686,4 +2694,106 @@ fn codex_launch_ordinal_counts_processes() {
     expect["launch_checkpoints"] = json!({"after_pure": 0,
         "after_open": {"first": 0, "main": 0}, "after_turn": [0, 1]});
     check_variant(name, &replay, &expect, conformance_run::Knobs::default()).unwrap();
+}
+
+/// x.3.2 X3 fix r3 #1 (vendors/codex.md §5): main's lane overflows after
+/// its `turn/start` was written and before the reply. Its turn ends
+/// `overflow` at once, unaccepted, its cleanup uncertain: the fake answers
+/// only once the next session's `thread/resume` shows main's turn settled
+/// (a keeper session holds the server across main's quarantine), and then
+/// expects main's delayed cleanup interrupt, written on that reply.
+#[test]
+fn codex_overflow_before_acceptance() {
+    let name = "codex_overflow_before_acceptance";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let missing = replay_of("c5_resume_missing").unwrap();
+    let missing_expect = expect_of("c5_resume_missing").unwrap();
+    let refused_expect = expect_of("c7_effort_catalog").unwrap();
+    let reopen = step_with(&missing, "\"method\":\"thread/resume\"").unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    let answer = replay["steps"][start + 1].clone();
+    let mut resumed = missing["steps"][reopen].clone();
+    resumed["expect"]["within_ms"] = json!(2000);
+    let mut tail = status_burst(20);
+    tail.push(resumed);
+    tail.push(answer);
+    tail.push(json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": TURN}},
+        "within_ms": 2000,
+    }}));
+    tail.push(missing["steps"][reopen + 1].clone());
+    tail.push(json!({"await_eof": {}}));
+    cut_after(&mut replay, start, &tail).unwrap();
+    unaccepted(&mut expect, "overflow", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("uncertain");
+    turn["warnings"] = json!(["config_switch_unverified"]);
+    let mut keeper = refused_expect["turns"][0].clone();
+    keeper["session"] = json!("keeper");
+    let mut probe = missing_expect["turns"][0].clone();
+    probe["session"] = json!("probe");
+    let main = expect["turns"][0].clone();
+    expect["turns"] = json!([keeper, main, probe]);
+    expect["sessions"]["keeper"] = refused_expect["sessions"]["main"].clone();
+    expect["sessions"]["keeper"]["close"] = Value::Null;
+    expect["sessions"]["probe"] = missing_expect["sessions"]["main"].clone();
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    expect["launch_checkpoints"] = json!({"after_pure": 0,
+        "after_open": {"keeper": 0, "main": 0, "probe": 0}, "after_turn": [1, 1, 1]});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// x.3.2 X3 fix r3 #2, through the driver: the turn's normalizer is held
+/// delivering a delta while `turn/completed` and sixteen thread messages
+/// arrive, so the lane overflows and the turn's wait cuts at the overflow;
+/// its settlement is held (a failpoint) until the normalizer retained the
+/// terminal. The terminal stands (C1 §7.6), but the overflow still makes
+/// the cleanup uncertain and writes the generation's cleanup interrupt
+/// (the fake expects it).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_overflow_beside_a_retained_terminal() {
+    let name = "codex_overflow_beside_a_retained_terminal";
+    // The identity's send, the acceptance's, then the delta's.
+    let _points = armed_all(&[
+        (
+            "adapter.observation.admitted",
+            json!({"occurrence": 3, "action": "delay", "value": 1000}),
+        ),
+        (
+            "adapter.codex.cut",
+            json!({"occurrence": 1, "action": "delay", "value": 3000}),
+        ),
+    ])
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let delta = step_with(&replay, "\"method\":\"item/agentMessage/delta\"").unwrap();
+    let completed = step_with(&replay, "\"method\":\"turn/completed\"").unwrap();
+    let mut tail = vec![
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+        replay["steps"][delta].clone(),
+        replay["steps"][completed].clone(),
+    ];
+    tail.extend(status_burst(16));
+    tail.push(json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": TURN}},
+        "within_ms": 6000,
+    }}));
+    tail.push(json!({"await_eof": {}}));
+    cut_after(&mut replay, started, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("uncertain");
+    turn["usage"] = Value::Null;
+    // The final answer's item was cut: the terminal carries no text.
+    turn["final_text"] = Value::Null;
+    turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": TURN}]);
+    turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+    // Steps count from 1: the gate is the step after `turn/started`.
+    turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 2,
+        "expect": {"accepted": true, "terminal": null, "error": null}}]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
 }
