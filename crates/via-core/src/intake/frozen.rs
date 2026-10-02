@@ -103,15 +103,27 @@ impl Frozen {
     /// frozen parameters or capabilities value that is present but cannot
     /// be decoded is corruption, `None`; an absent one stays empty.
     pub(crate) fn decode(route: &SessionRoute) -> Option<Self> {
+        Self::decode_cause(route).ok()
+    }
+
+    /// [`Frozen::decode`], with the cause of a value that does not decode
+    /// (critical r2 #10).
+    pub(crate) fn decode_cause(route: &SessionRoute) -> Result<Self, String> {
         let params = match route.params.as_deref() {
-            Some(params) => Some(serde_json::from_str::<Params>(params).ok()?),
+            Some(params) => Some(
+                serde_json::from_str::<Params>(params)
+                    .map_err(|error| format!("frozen session parameters do not decode: {error}"))?,
+            ),
             None => None,
         };
         let capabilities = match route.capabilities.as_deref() {
-            Some(capabilities) => Some(serde_json::from_str(capabilities).ok()?),
+            Some(capabilities) => Some(
+                serde_json::from_str(capabilities)
+                    .map_err(|error| format!("frozen capabilities do not decode: {error}"))?,
+            ),
             None => None,
         };
-        Some(Self::from_parts(route, params, capabilities))
+        Ok(Self::from_parts(route, params, capabilities))
     }
 
     fn from_parts(

@@ -2105,9 +2105,9 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             // A running turn always has its submission time.
             submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
             correlation,
-            // Critical r1 #10: frozen values that do not decode are
-            // corrupt evidence, never absence.
-            effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
+            // Critical r1 #10, r2 #10: the stored text, which Core
+            // decodes, never absence.
+            effective,
             instance,
         });
     }

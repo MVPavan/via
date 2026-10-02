@@ -3343,18 +3343,30 @@ fn a_recovered_envelope_reads_the_turns_own_frozen_values() {
 /// unknown `version_status`): startup fails `store_error`, and nothing is
 /// committed in their place, so the turn stays `running` with no
 /// fallback envelope. Each case: malformed JSON, valid JSON of the wrong
-/// shape, and the session's frozen parameters of the wrong shape.
+/// shape, and the session's frozen parameters of the wrong shape. Critical
+/// r2 #10: the startup error names the turn and the decode's cause.
 #[test]
 fn recovery_refuses_malformed_frozen_turn_values() {
     let Some(root) = child("recovery_refuses_malformed_frozen_turn_values") else {
         return;
     };
+    // Each corruption, and the cause its startup error names (critical r2
+    // #10): with the session and turn, never a bare `store_error`.
     let cases = [
-        "UPDATE turns SET effective='{\"model\":' WHERE session_id=?1",
-        "UPDATE turns SET effective='{\"model\":7}' WHERE session_id=?1",
-        "UPDATE sessions SET params=json_set(params,'$.allow_untested','yes') WHERE id=?1",
+        (
+            "UPDATE turns SET effective='{\"model\":' WHERE session_id=?1",
+            "frozen effective values do not decode: EOF while parsing",
+        ),
+        (
+            "UPDATE turns SET effective='{\"model\":7}' WHERE session_id=?1",
+            "frozen effective values do not decode: invalid type: integer `7`",
+        ),
+        (
+            "UPDATE sessions SET params=json_set(params,'$.allow_untested','yes') WHERE id=?1",
+            "frozen session parameters do not decode: invalid type: string \"yes\"",
+        ),
     ];
-    for (index, corruption) in cases.into_iter().enumerate() {
+    for (index, (corruption, cause)) in cases.into_iter().enumerate() {
         let case = root.join(format!("case-{index}"));
         for part in ["state", "runtime", "runtime/anchors"] {
             fs::DirBuilder::new()
@@ -3378,7 +3390,8 @@ fn recovery_refuses_malformed_frozen_turn_values() {
         );
         let recovered = run(async { open(&case).recover().await });
         let error = recovered.expect_err(corruption);
-        assert!(error.starts_with("store_error"), "{corruption}: {error}");
+        let named = format!("store_error: turn {session}/1: {cause}");
+        assert!(error.starts_with(&named), "{corruption}: {error}");
         let (state, envelope): (String, Option<String>) = db
             .query_row(
                 "SELECT state, envelope FROM turns WHERE session_id=?1 AND number=1",
