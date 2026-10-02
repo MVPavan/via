@@ -8,12 +8,14 @@
 //! connection generation the session subscribes to the connection task's
 //! abnormal end and opens its thread once, by `thread/start` or, when an
 //! identity was confirmed, by `thread/resume` of that exact thread; the
-//! reply's echoes are checked. Every turn is a `turn/start` with the full
-//! frozen policy, written under the turn's owning write guard and accepted
-//! on its paired reply; the turn's normalizer then delivers the thread's
-//! lane in decode order (`delivery`) while the turn waits for its
-//! terminal beside its own orders, sealing delivery at whichever comes
-//! first. A close detaches with `thread/unsubscribe` and releases the
+//! reply's echoes are checked, and the registration's normalizer is
+//! spawned: it delivers the thread's lane in decode order across the
+//! registration's turns (`delivery`). Every turn is a `turn/start` with
+//! the full frozen policy, written under the turn's owning write guard and
+//! accepted on its paired reply, then handed to the normalizer while the
+//! turn waits for its terminal beside its own orders, sealing its delivery
+//! at whichever comes first. A close passes the registration's delivery
+//! barrier, seals it, detaches with `thread/unsubscribe` and releases the
 //! lease; the last lease's release retires the server.
 //!
 //! A stop order posts the turn's one interrupt intent, owned by the
@@ -39,10 +41,10 @@ use via_routes::codex::{
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
-    Delivery, Evidence, Folders, Losses, Normalizing, Retained, Stop, UNKNOWN,
-    losses as lock_losses,
+    Current, Delivery, Evidence, Folders, Losses, Normalizing, Registration, Retained, Stop,
+    UNKNOWN, losses as lock_losses,
 };
-use super::normalize::{self, DiscoveredModel, StructuredOutput, TurnNormalizer};
+use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
@@ -108,10 +110,22 @@ struct Attached {
     lease: ServerPin,
 }
 
-/// An open thread: its ID and its registration on the connection.
+/// The close's delivery barrier ends this long before the close's
+/// deadline (X0 item 8.2).
+const DELIVERY_MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// An open thread: its ID, its registration on the connection, and the
+/// registration's delivery, sealed when the thread is released.
 pub(crate) struct Thread {
     id: String,
     lease: LaneLease,
+    registration: Arc<Registration>,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        let _sealed = self.registration.seal();
+    }
 }
 
 /// The facts a turn takes from the generation it runs on.
@@ -164,19 +178,31 @@ impl CodexSession {
         self.adapter.servers().epoch()
     }
 
-    /// The close's detach (packet §2): the thread's unsubscribe intent
-    /// (X0 item 8.3), its reply awaited by `deadline`; then the
-    /// registration closes and the lease is released. Never a stdin
-    /// close: the server is shared.
+    /// The close's detach (packet §2, X0 item 8.2): the registration's
+    /// delivery barrier, bounded by `deadline` less [`DELIVERY_MARGIN`],
+    /// then its seal (what it left undelivered joins the loss record),
+    /// then the thread's unsubscribe intent (X0 item 8.3), its reply
+    /// awaited by `deadline`; then the registration closes and the lease
+    /// is released. Never a stdin close: the server is shared.
     pub(crate) async fn detach(&self, deadline: Deadline) {
         let Some(attached) = self.attached().take() else {
             return;
         };
-        if let Some(thread) = &attached.thread
-            && usable(&attached.connection)
-            && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
-        {
-            let _answered = tokio::time::timeout_at(deadline.instant(), reply).await;
+        if let Some(thread) = &attached.thread {
+            let by = deadline
+                .instant()
+                .checked_sub(DELIVERY_MARGIN)
+                .unwrap_or_else(Instant::now);
+            let drained = thread.registration.drain(by).await;
+            let sealed = thread.registration.seal();
+            if !drained {
+                lock_losses(&self.losses).note(attached.generation, sealed.position, UNKNOWN);
+            }
+            if usable(&attached.connection)
+                && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
+            {
+                let _answered = tokio::time::timeout_at(deadline.instant(), reply).await;
+            }
         }
         drop(attached);
     }
@@ -750,8 +776,8 @@ fn ensure_home(home: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Runs one submitted turn (C2 §4.1), inline but for its normalizer,
-/// which the session's tracker owns. Its settlement runs however it ends.
+/// Runs one submitted turn (C2 §4.1), inline but for its registration's
+/// normalizer, which the session's tracker owns. Its settlement runs however it ends.
 pub(crate) async fn run_turn(
     driver: &SessionDriver,
     session: &CodexSession,
@@ -866,7 +892,6 @@ async fn turn(
         thread: &thread,
         connection: &connection,
         generation: generation.number,
-        folders: &generation.folders,
         signal: &generation.signal,
         sandbox: &sandbox,
         effort: effort.as_deref(),
@@ -1202,6 +1227,7 @@ async fn open_thread(
     confirm(facts, (&opened, mode), resume, &lease, (orders, force)).await?;
     let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
+        registration: normalize_on_tracker(driver, ids, &lease),
         lease,
     });
     facts.session.opened(ids.connection, &thread);
@@ -1452,7 +1478,6 @@ struct Started<'a> {
     thread: &'a Arc<Thread>,
     connection: &'a Arc<Connection>,
     generation: u64,
-    folders: &'a Folders,
     /// The generation's abnormal-end signal: its decode positions.
     signal: &'a LeaseSignal,
     sandbox: &'a Sandbox,
@@ -1463,8 +1488,8 @@ struct Started<'a> {
 
 /// Writes `turn/start` with the full frozen policy under the turn's guard;
 /// a stop before its reply posts the delayed interrupt intent. On the
-/// paired reply the turn's normalizer takes the lane (its acceptance
-/// first) and the turn waits for its decision beside its orders.
+/// paired reply the turn is handed to the registration's normalizer (its
+/// acceptance first) and waits for its decision beside its orders.
 async fn run_started(
     facts: &mut Turn<'_>,
     start: &Started<'_>,
@@ -1494,7 +1519,10 @@ async fn run_started(
     // Before the start is written: every message the connection reads for
     // the thread from now on counts against the turn's decode fence (x.3.2
     // critical r2 #2, runtime §8).
-    let fence = start.thread.lease.lane().fence(activity.decode_watermark());
+    start
+        .thread
+        .registration
+        .fence(start.thread.lease.lane(), turn, activity);
     let requested = start.connection.request(
         |id| turn_start(id, &values, prompt),
         bounds,
@@ -1562,11 +1590,11 @@ async fn run_started(
         .lane()
         .take_acceptance()
         .unwrap_or_else(|| (Instant::now(), None));
-    let delivery = normalize_on_tracker(
+    let delivery = hand_over(
         facts,
         start,
         (&accepted, (acceptance, read, mark)),
-        (activity, fence),
+        activity,
     );
     let accepted_turn = Accepted {
         id: accepted,
@@ -1596,45 +1624,54 @@ fn unanswered(
     lost(facts, start.connection, cause)
 }
 
-/// Starts the accepted turn's delivery: its normalizer, on the session's
-/// tracker under `crash_on_panic` (X0 item 13.2), takes the lane from the
-/// first message not yet taken, its acceptance first. The settlement
-/// seals it however the turn ends.
+/// Spawns the registration's normalizer on the session's tracker under
+/// `crash_on_panic` (X0 item 13.2): it delivers the lane of `lease`
+/// across the registration's turns (x.3.2 X3 fix r3 #3).
 fn normalize_on_tracker(
+    driver: &SessionDriver,
+    ids: &Ids<'_>,
+    lease: &LaneLease,
+) -> Arc<Registration> {
+    let registration = Registration::new(ids.generation.signal.enqueued());
+    driver.tracker.spawn(crash_on_panic(
+        Normalizing::new(
+            (Arc::clone(&registration), Arc::clone(lease.lane())),
+            driver.observations.clone(),
+            Evidence {
+                connection: Arc::clone(ids.connection),
+                earlier: Arc::clone(&ids.generation.folders),
+            },
+            (driver.cancel.clone(), Arc::clone(&driver.health)),
+        )
+        .run(),
+    ));
+    registration
+}
+
+/// Hands the accepted turn to the registration's normalizer, which takes
+/// the lane from the first message not yet taken, the turn's acceptance
+/// first. The settlement seals the turn's delivery however the turn ends.
+fn hand_over(
     facts: &Turn<'_>,
     start: &Started<'_>,
     (accepted, acceptance): (&str, (Acceptance, Instant, Option<Mark>)),
-    (activity, fence): (&crate::TurnActivity, u64),
+    activity: &crate::TurnActivity,
 ) -> Arc<Delivery> {
-    let driver = facts.driver;
     let lane = start.thread.lease.lane();
     let before = lane
         .front_seq()
         .map_or_else(|| start.signal.enqueued(), |seq| seq.saturating_sub(1));
     let delivery = Delivery::new(before);
     facts.settle.deliver(&delivery);
-    driver.tracker.spawn(crash_on_panic(
-        Normalizing {
-            delivery: Arc::clone(&delivery),
-            lane: Arc::clone(lane),
-            sink: driver.observations.clone(),
-            normalizer: TurnNormalizer::new(start.schema),
-            turn: facts.number,
-            accepted: accepted.to_owned(),
-            acceptance: Some(acceptance),
-            pending: None,
-            evidence: Evidence {
-                folder: Arc::clone(start.folder),
-                connection: Arc::clone(start.connection),
-                earlier: Arc::clone(start.folders),
-            },
-            activity: activity.clone(),
-            fence,
-            cancel: driver.cancel.clone(),
-            health: Arc::clone(&driver.health),
-        }
-        .run(),
-    ));
+    start.thread.registration.accept(Current {
+        delivery: Arc::clone(&delivery),
+        turn: facts.number,
+        accepted: accepted.to_owned(),
+        acceptance,
+        folder: Arc::clone(start.folder),
+        activity: activity.clone(),
+        schema: start.schema,
+    });
     delivery
 }
 

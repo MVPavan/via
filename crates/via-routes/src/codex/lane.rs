@@ -370,6 +370,28 @@ impl Lane {
         queue.end.map(LaneEvent::End)
     }
 
+    /// Takes the first message when `take` accepts it, without waiting;
+    /// the end once the lane holds no more; `None` when it is empty and
+    /// open, or `take` refused the first message (x.3.2 X3 fix r3 #3: an
+    /// idle registration takes only its earlier turns' messages).
+    pub fn try_next_if(&self, take: impl FnOnce(&LaneItem) -> bool) -> Option<LaneEvent> {
+        let mut queue = self.queue();
+        match queue.items.front() {
+            Some((item, _)) if take(item) => {}
+            Some(_) => return None,
+            None => return queue.end.map(LaneEvent::End),
+        }
+        let (item, bytes) = queue.items.pop_front()?;
+        queue.bytes = queue.bytes.saturating_sub(bytes);
+        Some(LaneEvent::Item(Box::new(item)))
+    }
+
+    /// Resolves at the lane's next push or end (one since the last wait is
+    /// kept). One taker waits at a time.
+    pub async fn pushed(&self) {
+        self.ready.notified().await;
+    }
+
     /// The next message, or the lane's end once it holds no more. Cancel
     /// safe: a message is taken only when this returns it.
     pub async fn next(&self) -> LaneEvent {
@@ -473,6 +495,21 @@ mod tests {
     }
 
     /// A taker waiting on an empty lane wakes for the next push.
+    /// x.3.2 X3 fix r3 #3: a refused first message stays first; the end
+    /// comes only once the lane is empty.
+    #[test]
+    fn lane_takes_only_an_accepted_front() {
+        let lane = Lane::default();
+        assert!(lane.push(item("held"), 1));
+        assert!(lane.push(item("next"), 1));
+        assert!(lane.try_next_if(|_| false).is_none());
+        assert!(note(lane.try_next_if(|_| true)).is_some_and(|line| line.contains("held")));
+        lane.end(LaneEnd::Retired);
+        assert!(lane.try_next_if(|_| false).is_none());
+        assert!(note(lane.try_next_if(|_| true)).is_some_and(|line| line.contains("next")));
+        assert_eq!(ended(lane.try_next_if(|_| false)), Some(LaneEnd::Retired));
+    }
+
     #[tokio::test]
     async fn lane_wakes_its_taker() {
         let lane = std::sync::Arc::new(Lane::default());

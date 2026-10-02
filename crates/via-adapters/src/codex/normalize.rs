@@ -372,6 +372,12 @@ impl TurnNormalizer {
         })
     }
 
+    /// Sheds what only the running turn needs, as the turn becomes a
+    /// registration's history (x.3.2 X3 fix r3 #4): its retained text.
+    pub(crate) fn shed(&mut self) {
+        self.answer = Answer::Text(String::new());
+    }
+
     /// Bytes of final text retained for structured output.
     #[cfg_attr(
         not(test),

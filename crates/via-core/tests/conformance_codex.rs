@@ -2050,6 +2050,187 @@ fn codex_decline_owner() {
     .unwrap();
 }
 
+/// `c1_commentary_usage`'s request for an approval of item `item` of
+/// turn 1, emitted with ID `id`, then VIA's decline reply.
+fn approval_declined(id: u64, item: &str) -> [Value; 2] {
+    [
+        emit(
+            &json!({"id": id, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": THREAD, "turnId": TURN, "itemId": item}}),
+        ),
+        json!({"expect": {
+            "line": {"id": id, "result": {"decision": "decline"}},
+            "absent": ["/error"],
+            "within_ms": 5250,
+        }}),
+    ]
+}
+
+/// Turn 1's command item `item` completed `declined`.
+fn completed_declined(item: &str) -> Value {
+    emit(&json!({"method": "item/completed", "params": {
+        "threadId": THREAD, "turnId": TURN,
+        "item": {"type": "commandExecution", "id": item, "command": "rm -rf build",
+            "cwd": "/work/project", "commandActions": [], "status": "declined"}}}))
+}
+
+/// The late observations, by turn and kind.
+fn late_kinds(pure: &conformance_drive::Pure) -> Vec<(usize, Value)> {
+    pure.late
+        .borrow()
+        .iter()
+        .map(|(turn, shaped)| (*turn, shaped["kind"].clone()))
+        .collect()
+}
+
+/// `c1_commentary_usage` with a late approval request naming turn 1
+/// right after its terminal, declined; with `two_turns` false turn 2 is
+/// not run and the session closes after turn 1.
+fn late_decline_after_turn1(name: &str, two_turns: bool) -> Result<(Value, Value), String> {
+    let mut replay = replay_of("c1_commentary_usage")?;
+    let mut expect = expect_of("c1_commentary_usage")?;
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    let completed = step_with(&replay, "\"turn/completed\"")?;
+    let end = if two_turns {
+        completed + 1
+    } else {
+        step_with(&replay, "thread/unsubscribe")?
+    };
+    steps(&mut replay)?.splice(completed + 1..end, approval_declined(90, "item-late"));
+    if two_turns {
+        // Turn 2's gate moves with the two steps inserted before it.
+        for gate in expect["turns"][1]["gates"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            let step = gate["step"].as_u64().ok_or("gate step")?;
+            gate["step"] = json!(step + 2);
+        }
+    } else {
+        expect["turns"].as_array_mut().ok_or("turns")?.truncate(1);
+        expect["launch_checkpoints"]["after_turn"] = json!([1]);
+    }
+    Ok((replay, expect))
+}
+
+/// Whether the only late observation is turn 1's decline.
+fn turn1_decline_only(pure: &conformance_drive::Pure) -> Result<(), String> {
+    if late_kinds(pure) == [(0, json!("vendor.request_declined"))] {
+        Ok(())
+    } else {
+        Err(format!("late observations: {:?}", pure.late.borrow()))
+    }
+}
+
+/// The fake read the late decline's reply: initialize, initialized,
+/// model/list, thread/start, turn/start, then the reply.
+const LATE_REPLY_READ: usize = 6;
+
+/// X0 items 8.2 and 13.2 (x.3.2 X3 fix r3 #3): the registration's
+/// normalizer lives across turns until the close's cutoff. Turn 1
+/// completes; a late approval request naming it is declined while no turn
+/// runs, and the session then closes with no second turn: the decline is
+/// turn 1's late observation, delivered before the close returned.
+#[test]
+fn codex_late_decline_reaches_a_closing_session() {
+    let name = "codex_late_decline_reaches_a_closing_session";
+    let (replay, expect) = late_decline_after_turn1(name, false).unwrap();
+    let knobs = conformance_run::Knobs {
+        close_after_read: Some(LATE_REPLY_READ),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// X0 item 13.2 (x.3.2 X3 fix r3 #3): while no turn runs, the
+/// registration's normalizer delivers an earlier turn's late decline at
+/// once: turn 2 is admitted only once Core's drain between the turns got
+/// it.
+#[test]
+fn codex_late_decline_between_turns() {
+    let name = "codex_late_decline_between_turns";
+    let (replay, expect) = late_decline_after_turn1(name, true).unwrap();
+    let knobs = conformance_run::Knobs {
+        admit_after_late: Some((1, 1)),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// X0 item 8.2 (x.3.2 X3 fix r3 #3): the close's delivery barrier
+/// carries what the idle normalizer holds. The normalizer is held at the
+/// seam with turn 1's late decline taken while the session closes: the
+/// close waits for it, and the decline is still turn 1's late
+/// observation.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_close_barrier_carries_a_held_decline() {
+    let name = "codex_close_barrier_carries_a_held_decline";
+    let (replay, expect) = late_decline_after_turn1(name, false).unwrap();
+    let _points = armed(
+        "adapter.codex.idle_item",
+        json!({"occurrence": 1, "action": "delay", "value": 1500}),
+    )
+    .unwrap();
+    let knobs = conformance_run::Knobs {
+        close_after_read: Some(LATE_REPLY_READ),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// X0 item 13.2 (x.3.2 X3 fix r3 #4): a late event is judged against its
+/// own turn's history. While turn 1 runs VIA declines its item
+/// `item-via`, and the vendor declines `item-vendor` (turn 1's denial).
+/// While turn 2 runs, both items complete `declined` again for turn 1:
+/// VIA's decline is no vendor denial, and the vendor's denial was already
+/// reported, so neither is a late observation.
+#[test]
+fn codex_late_denial_keeps_its_turn_history() {
+    let name = "codex_late_denial_keeps_its_turn_history";
+    // Kept apart from turn 2's own burst, so the lane's bound is not the
+    // test's.
+    let inserted = [
+        completed_declined("item-via"),
+        completed_declined("item-vendor"),
+        json!({"delay": {"ms": 300}}),
+    ];
+    let (mut replay, mut expect) = c1_turn2_with(name, &inserted, &[]).unwrap();
+    let started = step_with(
+        &replay,
+        &format!(
+            "\"turn/started\",\"params\":{{\"threadId\":\"{THREAD}\",\"turn\":{{\"id\":\"{TURN}\""
+        ),
+    )
+    .unwrap();
+    let mut turn1 = approval_declined(91, "item-via").to_vec();
+    turn1.extend([
+        completed_declined("item-via"),
+        completed_declined("item-vendor"),
+    ]);
+    let all = steps(&mut replay).unwrap();
+    for (offset, step) in turn1.into_iter().enumerate() {
+        all.insert(started + 1 + offset, step);
+    }
+    // Turn 1's gate moves with the steps inserted before it.
+    let gate = &mut turn_mut(&mut expect, 0)["gates"][0]["step"];
+    *gate = json!(gate.as_u64().unwrap() + 4);
+    turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 1, "action.denied": 1});
+    turn_mut(&mut expect, 1)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 0, "action.denied": 0});
+    check_variant_then(name, &replay, &expect, |pure| {
+        if pure.late.borrow().is_empty() {
+            Ok(())
+        } else {
+            Err(format!("late observations: {:?}", pure.late.borrow()))
+        }
+    })
+    .unwrap();
+}
+
 /// F8 remainder (packet §8 `codex_bound_gate`; the pure refusals are
 /// `codex_bound_gate_refusals`, c10 and c4b): every admitted start carries
 /// `never`, the user reviewer and the current bound, a turn naming none

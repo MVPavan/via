@@ -43,12 +43,12 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     AdapterError, AdapterSet, AdapterShutdown, Admitted, CancellationToken, ClassHint, Cleanup,
-    CloseMode, Deadline, DenialKind, DriverFailure, DriverHealth, InheritPlan, Observation,
-    ObservationItem, ParamSizes, Prepared, RouteError, RoutePlan, SessionCx, SessionDriver,
-    SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError, SteerInput, SteerToken,
-    StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd, TurnNumber,
-    TurnParams, TurnSpec, UnparsedOutput, VendorTerminal, VendorTerminalStatus, VendorTurnId,
-    observation_channel,
+    CloseMode, CloseReport, Deadline, DenialKind, DriverFailure, DriverHealth, InheritPlan,
+    Observation, ObservationItem, ParamSizes, Prepared, RouteError, RoutePlan, SessionCx,
+    SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError, SteerInput,
+    SteerToken, StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd,
+    TurnNumber, TurnParams, TurnSpec, UnparsedOutput, VendorTerminal, VendorTerminalStatus,
+    VendorTurnId, observation_channel,
 };
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
@@ -131,6 +131,15 @@ pub(crate) struct Knobs {
     /// once Route read, under turn `earlier`'s decode fence, a message it
     /// delivered for no turn (x.3.2 X3 fix r3 #7: a routing gate).
     pub(crate) admit_after_routed: Option<(usize, usize)>,
+    /// `(admitted, count)`: the turn at index `admitted` is admitted only
+    /// once its session's channel, drained between turns as Core drains
+    /// it, gave `count` late observations (x.3.2 X3 fix r3 #3).
+    pub(crate) admit_after_late: Option<(usize, usize)>,
+    /// A session's stated close waits until the fake read this input
+    /// line (`read <n> launch 1`): a late request's reply was written, so
+    /// its placeholder is in the lane before the close (x.3.2 X3 fix r3
+    /// #3).
+    pub(crate) close_after_read: Option<usize>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -418,8 +427,12 @@ impl<'a> Run<'a> {
                     Some("force") => CloseMode::Force,
                     _ => CloseMode::Graceful,
                 };
+                if let Some(read) = self.knobs.close_after_read {
+                    self.until_progress(&format!("read {read} launch 1"))
+                        .await?;
+                }
                 let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
-                let report = session.driver.close(mode, deadline).await;
+                let report = self.close_draining(session, mode, deadline).await;
                 ran.close = Some((
                     label.clone(),
                     json!({
@@ -463,7 +476,43 @@ impl<'a> Run<'a> {
         {
             self.routed_after(earlier).await?;
         }
+        if let Some((at, count)) = self.knobs.admit_after_late
+            && at == index
+        {
+            self.late_between_turns(turn, count).await?;
+        }
         Ok(())
+    }
+
+    /// Drains the session of `turn` between its turns, as Core does,
+    /// until [`Pure::late`] holds `count` observations, within
+    /// [`FIXTURE_WAIT`].
+    async fn late_between_turns(&self, turn: &Value, count: usize) -> Result<(), String> {
+        let label = session_of(turn);
+        let session = self
+            .sessions
+            .get(label)
+            .ok_or_else(|| format!("session {label} was not opened"))?;
+        let mut receiver = session
+            .receiver
+            .borrow_mut()
+            .take()
+            .ok_or("the session's channel is in use")?;
+        let started = tokio::time::Instant::now();
+        let mut outcome = Ok(());
+        while self.pure.late.borrow().len() < count {
+            let left = FIXTURE_WAIT.saturating_sub(started.elapsed());
+            let Ok(Some(admitted)) = tokio::time::timeout(left, receiver.recv()).await else {
+                outcome = Err(format!(
+                    "{} of {count} late observations between turns",
+                    self.pure.late.borrow().len()
+                ));
+                break;
+            };
+            self.observe_late(session, &admitted.item);
+        }
+        *session.receiver.borrow_mut() = Some(receiver);
+        outcome
     }
 
     /// Resolves once Route read, under settled turn `earlier`'s decode
@@ -808,6 +857,53 @@ impl<'a> Run<'a> {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Closes `session` as Core does, draining its channel beside the
+    /// close (X0 item 8.2, K1): what its driver delivers once no turn runs
+    /// is an earlier turn's late observation, kept in [`Pure::late`]
+    /// (x.3.2 X3 fix r3 #3).
+    async fn close_draining(
+        &self,
+        session: &Session,
+        mode: CloseMode,
+        deadline: Deadline,
+    ) -> CloseReport {
+        let mut receiver = session.receiver.borrow_mut().take();
+        let closing = session.driver.close(mode, deadline);
+        tokio::pin!(closing);
+        let report = loop {
+            let Some(channel) = receiver.as_mut() else {
+                break closing.await;
+            };
+            tokio::select! {
+                report = &mut closing => break report,
+                Some(admitted) = channel.recv() => self.observe_late(session, &admitted.item),
+            }
+        };
+        if let Some(channel) = receiver.as_mut() {
+            while let Ok(admitted) = channel.try_recv() {
+                self.observe_late(session, &admitted.item);
+            }
+        }
+        *session.receiver.borrow_mut() = receiver;
+        report
+    }
+
+    /// An observation delivered while no turn runs: one naming a vendor
+    /// turn of the session is that turn's late observation.
+    fn observe_late(&self, session: &Session, item: &ObservationItem) {
+        let earlier = item.vendor_turn.as_ref().and_then(|named| {
+            let turns = session.vendor_turns.borrow();
+            turns
+                .iter()
+                .find(|(known, _)| known.as_str() == named.as_str())
+                .map(|(_, at)| *at)
+        });
+        if let Some(earlier) = earlier {
+            let shaped = self.shape(&item.observation);
+            self.pure.late.borrow_mut().push((earlier, shaped));
+        }
     }
 
     /// Takes one observation: its checker shape, and the turn's events.
@@ -1235,7 +1331,9 @@ impl<'a> Run<'a> {
                     DriverHealth::Failed { .. }
                 );
                 let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
-                let report = session.driver.close(CloseMode::Graceful, deadline).await;
+                let report = self
+                    .close_draining(session, CloseMode::Graceful, deadline)
+                    .await;
                 // An unstated close of a healthy session must leave nothing
                 // uncertain; a case whose close does states it, and a failed
                 // session's uncertainty is its health's (x.3.2 X3 fix r1,
