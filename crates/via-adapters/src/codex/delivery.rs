@@ -28,6 +28,8 @@
 //! message it may have left undelivered, a conservative lower bound.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{Notify, watch};
@@ -38,13 +40,13 @@ use via_routes::codex::{
     Routed, ServerRequest, TurnFolder, decode,
 };
 
-use super::normalize::{self, NormalizeError, Step, StructuredOutput, TurnNormalizer};
+use super::normalize::{self, Metadata, NormalizeError, Step, StructuredOutput, TurnNormalizer};
 use crate::driver::latch;
 use crate::observation::{
     Acceptance, Observation, ObservationItem, ObservationSink, Reserved, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
-use crate::{DriverFailure, DriverHealth, TurnActivity, TurnNumber, VendorTurnId};
+use crate::{DriverFailure, DriverHealth, RouteError, TurnActivity, TurnNumber, VendorTurnId};
 
 /// `omitted` when the count of lost messages is unknown or saturated
 /// (X0 item 10).
@@ -95,6 +97,28 @@ impl Losses {
                 first_unqueued,
                 omitted,
             });
+        }
+    }
+}
+
+impl Losses {
+    /// What a close's seal of generation `generation` left (X0 item 8.2;
+    /// x.3.2 X3 fix r4 #4, #6): a prefix the barrier did not finish, or
+    /// a message delivered only in part, is lost from the seal's
+    /// position, its count unknown; the `dropped` messages the cutoff
+    /// refused are lost, counted.
+    pub(crate) fn note_close(
+        &mut self,
+        generation: u64,
+        drained: bool,
+        sealed: &Sealed,
+        dropped: u64,
+    ) {
+        if !drained || sealed.partial {
+            self.note(generation, sealed.position, UNKNOWN);
+        }
+        if dropped > 0 {
+            self.note(generation, sealed.position, dropped);
         }
     }
 }
@@ -286,14 +310,6 @@ impl Delivery {
     }
 }
 
-/// How many finished turns a registration keeps the history of (x.3.2 X3
-/// fix r3 #4): a late event of an older turn is judged with none.
-const HISTORY_TURNS: usize = 16;
-
-/// The most delivered fence positions kept ahead of one not yet
-/// delivered: past it, delivery is under-reported, never over.
-const MARKS_AHEAD: usize = 1024;
-
 /// Where a malformed message's evidence goes and which turn it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Owner {
@@ -325,8 +341,29 @@ pub(crate) type Folders = Arc<Mutex<BTreeMap<TurnNumber, Arc<TurnFolder>>>>;
 /// turn's folder, an earlier turn's of the generation, or the server
 /// folder.
 pub(crate) struct Evidence {
-    pub(crate) connection: Arc<Connection>,
+    pub(crate) server: Arc<dyn ServerEvidence>,
     pub(crate) earlier: Folders,
+}
+
+/// Where a message no turn owns keeps its evidence: the shared
+/// connection's server folder (X0 item 5).
+pub(crate) trait ServerEvidence: Send + Sync {
+    /// Keeps `bytes` as the server folder's undecoded message.
+    fn keep<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        what: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+impl ServerEvidence for Connection {
+    fn keep<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        what: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.keep_undecoded(bytes, what))
+    }
 }
 
 /// The latest turn that fenced the registration's lane.
@@ -335,6 +372,8 @@ struct Fenced {
     turn: TurnNumber,
     fence: u64,
     activity: TurnActivity,
+    /// The turn's `run_started` returned: nothing more runs under it.
+    finished: bool,
 }
 
 /// An accepted turn, handed to its registration's normalizer.
@@ -354,7 +393,6 @@ pub(crate) struct Current {
 struct Slot {
     fenced: Option<Fenced>,
     accepted: Option<Current>,
-    closing: bool,
 }
 
 /// One registration's state shared by its driver and its normalizer (X0
@@ -366,9 +404,10 @@ pub(crate) struct Registration {
     /// Wakes the normalizer when the slot changes.
     changed: Notify,
     /// The seal of what goes out while no turn runs: sealed at the close's
-    /// delivery barrier, or when the registration is released.
+    /// delivery barrier, at an idle failure, or when the registration is
+    /// released.
     idle: Arc<Delivery>,
-    /// True once a closing registration's normalizer holds nothing, or
+    /// True once the normalizer took everything of an ended lane, or
     /// returned.
     drained: watch::Sender<bool>,
 }
@@ -391,15 +430,26 @@ impl Registration {
 
     /// Fences `lane` for turn `turn` (x.3.2 critical r2 #2, runtime §8),
     /// under the slot, so the normalizer never reads a fence position the
-    /// slot does not name.
-    pub(crate) fn fence(&self, lane: &Lane, turn: TurnNumber, activity: &TurnActivity) {
+    /// slot does not name. From now until the returned guard drops a turn
+    /// runs: the normalizer leaves the lane to it (x.3.2 X3 fix r4 #1).
+    pub(crate) fn fence(
+        self: &Arc<Self>,
+        lane: &Lane,
+        turn: TurnNumber,
+        activity: &TurnActivity,
+    ) -> TurnFence {
         let mut slot = self.slot();
         let fence = lane.fence(activity.decode_watermark());
         slot.fenced = Some(Fenced {
             turn,
             fence,
             activity: activity.clone(),
+            finished: false,
         });
+        TurnFence {
+            registration: Arc::clone(self),
+            turn,
+        }
     }
 
     /// Hands the accepted turn to the normalizer.
@@ -408,12 +458,10 @@ impl Registration {
         self.changed.notify_one();
     }
 
-    /// The close's delivery barrier (X0 item 8.2): from now on the
-    /// normalizer takes every message, delivering what is late; true once
-    /// it holds nothing, by `by`. The caller seals next.
+    /// The close's delivery barrier (X0 item 8.2), once the caller ended
+    /// the lane at its cutoff: true once the normalizer took the admitted
+    /// prefix, by `by`. The caller seals next.
     pub(crate) async fn drain(&self, by: Instant) -> bool {
-        self.slot().closing = true;
-        self.changed.notify_one();
         let mut drained = self.drained.subscribe();
         tokio::time::timeout_at(by, drained.wait_for(|drained| *drained))
             .await
@@ -424,6 +472,28 @@ impl Registration {
     /// returns. The first call fixes the position.
     pub(crate) fn seal(&self) -> Sealed {
         self.idle.seal()
+    }
+}
+
+/// A turn that fenced its registration's lane; dropped once its
+/// `run_started` returned, accepted or not.
+pub(crate) struct TurnFence {
+    registration: Arc<Registration>,
+    turn: TurnNumber,
+}
+
+impl Drop for TurnFence {
+    fn drop(&mut self) {
+        let mut slot = self.registration.slot();
+        if let Some(fenced) = slot
+            .fenced
+            .as_mut()
+            .filter(|fenced| fenced.turn == self.turn)
+        {
+            fenced.finished = true;
+        }
+        drop(slot);
+        self.registration.changed.notify_one();
     }
 }
 
@@ -449,20 +519,28 @@ struct Running {
 /// Delivered positions under one turn's fence, reported in order.
 struct Marks {
     fence: u64,
-    turn: TurnNumber,
-    activity: TurnActivity,
-    /// Delivered positions past the first one not yet delivered.
+    /// Delivered positions past the first one not yet delivered: only the
+    /// acceptance's, while messages read before its reply are delivered
+    /// after it.
     ahead: BTreeSet<u64>,
 }
 
+/// The driver's loss record and the generation it names (x.3.2 X3 fix r4
+/// #6).
+pub(crate) struct LossRecord {
+    pub(crate) losses: Arc<Mutex<Losses>>,
+    pub(crate) generation: u64,
+}
+
 /// One registration's normalizer task (X0 item 13.2; x.3.2 X3 fix r3 #3,
-/// #4): it lives across the registration's turns until its lane ends at a
-/// close, the registration's seal or the session's cancellation. While a
-/// turn runs it delivers the lane under that turn's seal; while none runs
-/// it takes only an earlier turn's messages, so a late request or denial
-/// reaches Core without waiting for another turn; at a close it takes
-/// everything. Each finished turn keeps its history, against which its
-/// late requests and denials are judged.
+/// #4, r4 #1–#6): it lives across the registration's turns until its lane
+/// ends at a close's cutoff, the registration's seal or the session's
+/// cancellation. While a turn runs it delivers the lane under that turn's
+/// seal; while none runs it takes every message in order under the
+/// registration's seal: an earlier turn's request or denial is that
+/// turn's late observation, judged against the session's suppression
+/// table, and the rest gives nothing. A failure while no turn runs
+/// latches the driver's health at once and records the loss.
 pub(crate) struct Normalizing {
     registration: Arc<Registration>,
     lane: Arc<Lane>,
@@ -470,19 +548,24 @@ pub(crate) struct Normalizing {
     evidence: Evidence,
     cancel: CancellationToken,
     health: Arc<watch::Sender<DriverHealth>>,
+    loss: LossRecord,
     running: Option<Running>,
-    histories: BTreeMap<TurnNumber, TurnNormalizer>,
+    /// The session's metadata while no turn runs (a running turn holds
+    /// it).
+    metadata: Metadata,
+    /// The last turn whose delivery ended: its fence counts nothing more.
+    finished: Option<TurnNumber>,
     marks: Option<Marks>,
-    /// A failure found while no turn ran: the next turn's.
-    held: Option<Stop>,
+    /// Why delivery stopped while no turn ran.
+    failed: Option<Stop>,
 }
 
 impl Normalizing {
     pub(crate) fn new(
         (registration, lane): (Arc<Registration>, Arc<Lane>),
-        sink: ObservationSink,
-        evidence: Evidence,
+        (sink, evidence): (ObservationSink, Evidence),
         (cancel, health): (CancellationToken, Arc<watch::Sender<DriverHealth>>),
+        loss: LossRecord,
     ) -> Self {
         Self {
             registration,
@@ -491,10 +574,12 @@ impl Normalizing {
             evidence,
             cancel,
             health,
+            loss,
             running: None,
-            histories: BTreeMap::new(),
+            metadata: Metadata::default(),
+            finished: None,
             marks: None,
-            held: None,
+            failed: None,
         }
     }
 
@@ -518,54 +603,86 @@ impl Normalizing {
         self.cancel.is_cancelled() || self.registration.idle.sealed.is_cancelled()
     }
 
-    /// Takes an earlier turn's messages, or every message once closing,
-    /// until a turn is accepted (true) or the registration's delivery
-    /// ends (false). A lane that ended is left to the next turn.
+    /// While no turn runs, takes every message in order (x.3.2 X3 fix r4
+    /// #1); while a turn runs but is not yet accepted, leaves the lane to
+    /// it. Returns true once a turn is accepted, false once the
+    /// registration's delivery ended. A lane that ended is left to the
+    /// next turn, once everything before its end was taken.
     async fn idle(&mut self) -> bool {
         loop {
             if self.ended() {
                 return false;
             }
-            let closing = {
+            let running = {
                 let slot = self.registration.slot();
                 if slot.accepted.is_some() {
                     return true;
                 }
-                slot.closing
+                slot.fenced
+                    .as_ref()
+                    .is_some_and(|fenced| !fenced.finished && self.finished != Some(fenced.turn))
             };
-            let event = {
-                let (registration, histories) = (&self.registration, &self.histories);
-                let held = self.held.is_some();
-                self.lane
-                    .try_next_if(|item| closing || (!held && late(item, registration, histories)))
+            let event = if running {
+                None
+            } else {
+                self.lane.try_next_if(|_| true)
             };
             match event {
                 Some(LaneEvent::Item(item)) => {
-                    if !closing {
-                        idle_seam().await;
-                    }
+                    idle_seam().await;
                     self.message(*item).await;
-                }
-                Some(LaneEvent::End(_)) if closing => return false,
-                Some(LaneEvent::End(_)) | None => {
-                    if closing {
-                        self.registration.drained.send_replace(true);
-                    }
-                    tokio::select! {
-                        biased;
-                        () = self.registration.idle.sealed.cancelled() => return false,
-                        () = self.cancel.cancelled() => return false,
-                        () = self.registration.changed.notified() => {}
-                        () = self.lane.pushed() => {}
+                    if let Some(stop) = self.failed.take() {
+                        self.fail_idle(&stop);
+                        return false;
                     }
                 }
+                Some(LaneEvent::End(end)) => {
+                    self.registration.drained.send_replace(true);
+                    if end == LaneEnd::Closed {
+                        return false;
+                    }
+                    self.wait().await;
+                }
+                None => self.wait().await,
             }
         }
     }
 
+    /// Waits for the lane or the slot to change, or the registration's
+    /// delivery to end.
+    async fn wait(&self) {
+        tokio::select! {
+            biased;
+            () = self.registration.idle.sealed.cancelled() => {}
+            () = self.cancel.cancelled() => {}
+            () = self.registration.changed.notified() => {}
+            () = self.lane.pushed() => {}
+        }
+    }
+
+    /// X0 item 5 and item 10 while no turn runs (x.3.2 X3 fix r4 #5, #6):
+    /// the failure latches the driver's health at once, so no later
+    /// `turn/start` is written on the generation; what goes out is sealed
+    /// and the rest joins the loss record.
+    fn fail_idle(&self, stop: &Stop) {
+        let latest = losses(&self.loss.losses).latest;
+        let cause = match (stop, latest) {
+            (Stop::Protocol { detail, .. }, Some(turn)) => {
+                DriverFailure::Route(RouteError::Protocol { turn, detail })
+            }
+            (Stop::Overflow | Stop::Lane(LaneEnd::Overflow), Some(turn)) => {
+                DriverFailure::Route(RouteError::Overflow { turn })
+            }
+            _ => DriverFailure::ObservationOverflow,
+        };
+        latch(&self.health, cause);
+        let sealed = self.registration.seal();
+        losses(&self.loss.losses).note(self.loss.generation, sealed.position, UNKNOWN);
+    }
+
     /// Delivers the accepted turn until its terminal, its seal or the
-    /// registration's end, then keeps its history once it is sealed.
-    /// False once the registration's delivery ended.
+    /// registration's end; once it is sealed the session's metadata comes
+    /// back. False once the registration's delivery ended.
     async fn turn(&mut self, current: Current) -> bool {
         let Current {
             delivery,
@@ -577,13 +694,14 @@ impl Normalizing {
             schema,
         } = current;
         let sealed = Arc::clone(&delivery);
+        let metadata = std::mem::take(&mut self.metadata);
         self.running = Some(Running {
             delivery,
             turn,
             accepted,
             folder,
             activity,
-            normalizer: TurnNormalizer::new(schema),
+            normalizer: TurnNormalizer::on(schema, turn, metadata),
         });
         let mut open = self.deliver_turn(acceptance).await;
         if open {
@@ -595,12 +713,8 @@ impl Normalizing {
             };
         }
         if let Some(running) = self.running.take() {
-            let mut normalizer = running.normalizer;
-            normalizer.shed();
-            self.histories.insert(running.turn, normalizer);
-            while self.histories.len() > HISTORY_TURNS {
-                self.histories.pop_first();
-            }
+            self.metadata = running.normalizer.finish();
+            self.finished = Some(running.turn);
         }
         open
     }
@@ -621,10 +735,6 @@ impl Normalizing {
         // its position counts once they did.
         if let Some(mark) = mark {
             self.mark_delivered(mark);
-        }
-        if let Some(stop) = self.held.take() {
-            self.stop(stop);
-            return true;
         }
         let delivery = Arc::clone(self.delivery());
         loop {
@@ -667,61 +777,63 @@ impl Normalizing {
         self.delivery().complete(self.tools_open())
     }
 
-    /// Delivery stops: the running turn's, else the next turn's.
+    /// Delivery stops: the running turn's, else the registration's.
     fn stop(&mut self, stop: Stop) {
         match &self.running {
             Some(running) => running.delivery.stop(stop),
             None => {
-                self.held.get_or_insert(stop);
+                self.failed.get_or_insert(stop);
             }
         }
     }
 
-    /// Finished turn `turn`'s history.
-    fn history(&mut self, turn: TurnNumber) -> &mut TurnNormalizer {
-        if !self.histories.contains_key(&turn) && self.histories.len() >= HISTORY_TURNS {
-            self.histories.pop_first();
+    /// The session's metadata: the running turn holds it.
+    fn metadata(&mut self) -> &mut Metadata {
+        match self.running.as_mut() {
+            Some(running) => running.normalizer.metadata(),
+            None => &mut self.metadata,
         }
-        self.histories
-            .entry(turn)
-            .or_insert_with(|| TurnNormalizer::new(false))
     }
 
     /// Reports position `mark` delivered under its fence, in order, while
-    /// that fence's turn has not finished (x.3.2 critical r2 #2, runtime
-    /// §8): a stale message counts for no turn.
+    /// that fence's turn runs (x.3.2 critical r2 #2, runtime §8): a stale
+    /// message counts for no turn.
     fn mark_delivered(&mut self, mark: Mark) {
+        let fenced = self.registration.slot().fenced.clone();
+        let Some(fenced) = fenced.filter(|fenced| {
+            fenced.fence == mark.fence && !fenced.finished && self.finished != Some(fenced.turn)
+        }) else {
+            return;
+        };
         if self
             .marks
             .as_ref()
             .is_none_or(|marks| marks.fence != mark.fence)
         {
-            let fenced = self.registration.slot().fenced.clone();
-            self.marks = fenced
-                .filter(|fenced| fenced.fence == mark.fence)
-                .map(|fenced| Marks {
-                    fence: fenced.fence,
-                    turn: fenced.turn,
-                    activity: fenced.activity,
-                    ahead: BTreeSet::new(),
-                });
+            self.marks = Some(Marks {
+                fence: mark.fence,
+                ahead: BTreeSet::new(),
+            });
         }
         let Some(marks) = self.marks.as_mut() else {
             return;
         };
-        if self.histories.contains_key(&marks.turn) {
-            return;
-        }
-        if marks.ahead.len() < MARKS_AHEAD {
-            marks.ahead.insert(mark.seq);
-        }
+        marks.ahead.insert(mark.seq);
         while let Some(&next) = marks.ahead.first() {
-            if next > marks.activity.delivered().saturating_add(1) {
+            if next > fenced.activity.delivered().saturating_add(1) {
                 break;
             }
             marks.ahead.pop_first();
-            marks.activity.delivered_through(next);
+            fenced.activity.delivered_through(next);
         }
+        // Only the acceptance's position waits ahead: the lane is left to
+        // the running turn until its acceptance went out, and a message
+        // not delivered whole ends the turn's delivery.
+        debug_assert!(
+            marks.ahead.len() <= 1,
+            "fence positions ahead: {:?}",
+            marks.ahead
+        );
     }
 
     fn owner(&self, routed: &Routed) -> Owner {
@@ -813,8 +925,8 @@ impl Normalizing {
             (Owner::This | Owner::Earlier(_), None) => None,
             (Owner::Unknown | Owner::Thread, _) => {
                 self.evidence
-                    .connection
-                    .keep_undecoded(bytes, "the shared connection's message")
+                    .server
+                    .keep(bytes, "the shared connection's message")
                     .await;
                 Some(format!(
                     "{} bytes kept as the shared connection's evidence",
@@ -891,18 +1003,18 @@ impl Normalizing {
         }
     }
 
-    /// An earlier turn's notification (x.3.2 X3 fix r2 #3, r3 #4): a
+    /// An earlier turn's notification (x.3.2 X3 fix r2 #3, r4 #2): a
     /// denial of one of its items is that turn's late observation, named
     /// by its vendor turn `turn` (Core records it `late`, the turn's
-    /// envelope unchanged), judged against that turn's own history;
-    /// anything else of it gives nothing.
+    /// envelope unchanged), judged against the session's suppression
+    /// table; anything else of it gives nothing.
     async fn late(
         &mut self,
         notification: &Notification,
         (earlier, turn): (TurnNumber, &str),
         at: Instant,
     ) -> Flow {
-        let Ok(denial) = self.history(earlier).late_denial(notification) else {
+        let Ok(denial) = self.metadata().late_denial(earlier, notification) else {
             self.stop(Stop::Overflow);
             return Flow::Done;
         };
@@ -918,9 +1030,9 @@ impl Normalizing {
 
     /// X0 item 11: a placeholder of the running turn is reported once its
     /// reply was written whole by `decoded_at + 5 s`; an earlier turn's
-    /// likewise, as that turn's late observation, noted in its own history
-    /// (x.3.2 X3 fix r2 #3, r3 #4); one naming another turn, or none,
-    /// gives nothing.
+    /// likewise, as that turn's late observation, noted in the session's
+    /// suppression table (x.3.2 X3 fix r2 #3, r4 #2); one naming another
+    /// turn, or none, gives nothing.
     async fn declined(
         &mut self,
         owner: Owner,
@@ -938,7 +1050,9 @@ impl Normalizing {
             }
             (Owner::Earlier(earlier), Some(turn), _) => {
                 let turn = turn.to_owned();
-                self.history(earlier).note_decline(request).map(|()| turn)
+                self.metadata()
+                    .note_decline(earlier, request)
+                    .map(|()| turn)
             }
             (Owner::This | Owner::Earlier(_) | Owner::Unknown | Owner::Thread, _, _) => {
                 return flow(self.complete());
@@ -1020,9 +1134,9 @@ impl Normalizing {
     }
 }
 
-/// Test builds: a seam where an idle registration's normalizer holds an
-/// earlier turn's message it took (x.3.2 X3 fix r3 #3): a close's
-/// delivery barrier must then carry it.
+/// Test builds: a seam where an idle registration's normalizer holds a
+/// message it took (x.3.2 X3 fix r3 #3): a close's delivery barrier must
+/// then carry it, and its cutoff stops what comes after.
 #[cfg_attr(
     not(feature = "test-failpoints"),
     expect(clippy::unused_async, reason = "only test builds wait at the seam")
@@ -1034,28 +1148,21 @@ async fn idle_seam() {
     }
 }
 
-/// Whether an idle registration takes `item`: a message of a turn that
-/// is not the one fenced and still to run (an earlier turn's, late).
-fn late(
-    item: &LaneItem,
-    registration: &Registration,
-    histories: &BTreeMap<TurnNumber, TurnNormalizer>,
-) -> bool {
-    let Some(owner) = item.routed().owner else {
-        return false;
-    };
-    registration
-        .slot()
-        .fenced
-        .as_ref()
-        .is_none_or(|fenced| fenced.turn != owner || histories.contains_key(&owner))
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{Delivery, Losses, ObservationLoss, Retained, UNKNOWN};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::{BoundedBytes, Lane, LaneItem, Routed, VendorMessage};
+
+    use super::{
+        Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, ObservationLoss,
+        Registration, Retained, ServerEvidence, UNKNOWN,
+    };
+    use crate::DriverHealth;
     use crate::TurnNumber;
     use crate::VendorTerminalStatus;
     use crate::observation::{
@@ -1203,6 +1310,123 @@ mod tests {
         let drained: usize = std::iter::from_fn(|| received.try_recv().ok()).count();
         assert_eq!(drained, filled);
         assert!(received.try_recv().is_err());
+    }
+
+    /// Keeps nothing: a unit test's server folder.
+    struct NoEvidence;
+
+    impl ServerEvidence for NoEvidence {
+        fn keep<'a>(
+            &'a self,
+            _bytes: &'a [u8],
+            _what: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    fn turn(number: u32) -> TurnNumber {
+        TurnNumber::try_from(number).unwrap()
+    }
+
+    /// Message `seq`: turn `owner`'s command item completed `declined`,
+    /// as the lane holds it after that turn ended.
+    fn late_denial(seq: u64, owner: TurnNumber) -> LaneItem {
+        let line = serde_json::json!({"method": "item/completed", "params": {
+            "threadId": "thread-1", "turnId": "vendor-1",
+            "item": {"type": "commandExecution", "id": "item-1", "command": "rm -rf build",
+                "cwd": "/w", "commandActions": [], "status": "declined"}}})
+        .to_string()
+            + "\n";
+        LaneItem::Message(Routed {
+            staged: VendorMessage::new(BoundedBytes::try_from_message(line.into_bytes()).unwrap()),
+            seq,
+            turn: Some("vendor-1".to_owned()),
+            owner: Some(owner),
+            at: tokio::time::Instant::now(),
+            mark: None,
+        })
+    }
+
+    /// x.3.2 X3 fix r4 #5, #6: a late denial the sink refuses while no
+    /// turn runs fails the generation at once: the driver's health latches
+    /// and the loss is recorded from that message, its count unknown.
+    #[tokio::test]
+    async fn idle_sink_failure_records_its_loss() {
+        let (sink, received) = observation_channel();
+        drop(received);
+        let lane = Arc::new(Lane::default());
+        assert!(lane.push(late_denial(5, turn(1)), 64));
+        let losses = Arc::new(Mutex::new(Losses {
+            record: None,
+            latest: Some(turn(2)),
+        }));
+        let health = Arc::new(watch::Sender::new(DriverHealth::Open));
+        let normalizing = Normalizing::new(
+            (Registration::new(4), Arc::clone(&lane)),
+            (
+                sink,
+                Evidence {
+                    server: Arc::new(NoEvidence),
+                    earlier: Folders::default(),
+                },
+            ),
+            (CancellationToken::new(), Arc::clone(&health)),
+            LossRecord {
+                losses: Arc::clone(&losses),
+                generation: 3,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), normalizing.run())
+            .await
+            .unwrap();
+        assert!(matches!(*health.borrow(), DriverHealth::Failed { .. }));
+        assert_eq!(
+            losses.lock().unwrap().record,
+            Some(ObservationLoss {
+                trigger: turn(2),
+                generation: 3,
+                first_unqueued: 5,
+                omitted: UNKNOWN,
+            })
+        );
+    }
+
+    /// X0 item 8.2 (x.3.2 X3 fix r4 #4, #6): a close whose barrier
+    /// drained the lane still records the loss of a message its seal
+    /// found delivered in part, and counts what the cutoff dropped; a
+    /// whole, drained close records nothing.
+    #[tokio::test]
+    async fn close_records_a_partial_seal() {
+        let (sink, _received) = observation_channel();
+        let partial = Delivery::new(10);
+        assert!(partial.take(11));
+        assert!(send(&partial, &sink, "first of two", false).await);
+        let mut losses = Losses {
+            record: None,
+            latest: Some(turn(1)),
+        };
+        losses.note_close(2, true, &partial.seal(), 0);
+        assert_eq!(
+            losses
+                .record
+                .map(|record| (record.first_unqueued, record.omitted)),
+            Some((11, UNKNOWN))
+        );
+
+        let whole = Delivery::new(10);
+        let mut kept = Losses {
+            record: None,
+            latest: Some(turn(1)),
+        };
+        kept.note_close(2, true, &whole.seal(), 0);
+        assert!(kept.record.is_none());
+        kept.note_close(2, true, &whole.seal(), 3);
+        assert_eq!(
+            kept.record
+                .map(|record| (record.first_unqueued, record.omitted)),
+            Some((11, 3))
+        );
     }
 
     /// X0 item 10 (R6-8): a later loss keeps the record's trigger and

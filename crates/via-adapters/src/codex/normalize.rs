@@ -3,7 +3,7 @@
 //! one turn's notifications.
 
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::value::RawValue;
 use tokio::time::Instant;
@@ -18,7 +18,7 @@ use crate::observation::{
     VendorTerminal,
 };
 use crate::plan::VersionStatus;
-use crate::{VendorTerminalStatus, final_text_pieces};
+use crate::{TurnNumber, VendorTerminalStatus, final_text_pieces};
 
 /// The prefix VIA's own `clientInfo.name` puts on `userAgent`.
 const USER_AGENT_PREFIX: &str = "via/";
@@ -196,12 +196,14 @@ pub(crate) enum Step {
 /// qualified figure.
 const STRUCTURED_MAX: usize = 4 * 1024 * 1024;
 
-/// The most item IDs each per-turn set admits (packet §5: 1024 entries).
+/// The most item IDs a session's metadata holds (packet §5: 1024
+/// entries per session).
 const TRACKED_ITEMS_MAX: usize = 1024;
 
-/// The ID bytes all the sets together admit (packet §5: 256 KiB per
+/// The ID bytes a session's metadata holds (packet §5: 256 KiB per
 /// session). The first ID past either bound is an explicit overflow
-/// (review r2 #2): nothing continues with inaccurate correlation.
+/// (review r2 #2), for good: nothing continues with inaccurate
+/// correlation, and nothing is forgotten silently (x.3.2 X3 fix r4 #2).
 const TRACKED_BYTES_MAX: usize = 256 * 1024;
 
 /// Why the normalizer cannot take a notification.
@@ -239,38 +241,131 @@ enum CacheWrite {
     Unavailable,
 }
 
-/// A set of item IDs admitted by count ([`TRACKED_ITEMS_MAX`]) and by
-/// bytes, against the shared [`TRACKED_BYTES_MAX`].
-#[derive(Default)]
-struct Ids {
-    ids: HashSet<String>,
+/// What late judgement needs of one item of one turn (x.3.2 X3 fix r4
+/// #2, #3).
+#[derive(Clone, Copy, Default)]
+struct Suppressed {
+    /// VIA declined its approval request: its `declined` status is no
+    /// vendor denial.
+    declined_by_via: bool,
+    /// Its vendor denial was reported: it is not reported again.
+    denied: bool,
 }
 
-impl Ids {
-    /// Admits `id`, charging its bytes to `bytes`; an ID already held is
-    /// admitted free.
-    fn admit(&mut self, id: &str, bytes: &mut usize) -> Result<(), NormalizeError> {
-        if self.ids.contains(id) {
-            return Ok(());
-        }
-        let charged = bytes.saturating_add(id.len());
-        if self.ids.len() >= TRACKED_ITEMS_MAX || charged > TRACKED_BYTES_MAX {
+/// One session's item metadata on a registration (packet §5: 1024
+/// entries and 256 KiB per session; x.3.2 X3 fix r4 #2, #3): the running
+/// turn's open tools, and the suppression table, keyed by owning turn and
+/// item ID, that late requests and denials are judged against for as
+/// long as the registration lives. Its exhaustion is an overflow, for
+/// good: the generation fails rather than forgetting a fact.
+#[derive(Default)]
+pub(crate) struct Metadata {
+    entries: usize,
+    bytes: usize,
+    exhausted: bool,
+    suppressed: HashMap<(TurnNumber, String), Suppressed>,
+}
+
+impl Metadata {
+    /// Charges one entry of `id`; past either bound the metadata is
+    /// exhausted for good.
+    fn charge(&mut self, id: &str) -> Result<(), NormalizeError> {
+        let bytes = self.bytes.saturating_add(id.len());
+        if self.exhausted || self.entries >= TRACKED_ITEMS_MAX || bytes > TRACKED_BYTES_MAX {
+            self.exhausted = true;
             return Err(NormalizeError::Overflow);
         }
-        self.ids.insert(id.to_owned());
-        *bytes = charged;
+        self.entries += 1;
+        self.bytes = bytes;
         Ok(())
     }
 
-    /// Releases `id` and its bytes.
-    fn release(&mut self, id: &str, bytes: &mut usize) {
-        if self.ids.remove(id) {
-            *bytes = bytes.saturating_sub(id.len());
-        }
+    /// Releases one entry of `id`.
+    fn release(&mut self, id: &str) {
+        self.entries = self.entries.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(id.len());
     }
 
-    fn contains(&self, id: &str) -> bool {
-        self.ids.contains(id)
+    /// Item `item` of turn `turn`'s facts, charged once.
+    fn entry(&mut self, turn: TurnNumber, item: &str) -> Result<&mut Suppressed, NormalizeError> {
+        if self.exhausted {
+            return Err(NormalizeError::Overflow);
+        }
+        let key = (turn, item.to_owned());
+        if !self.suppressed.contains_key(&key) {
+            self.charge(item)?;
+        }
+        Ok(self.suppressed.entry(key).or_default())
+    }
+
+    /// Records a request [`DECLINES`] answered for turn `turn`, so the
+    /// item's declined status is not reported as a vendor denial (C2:
+    /// VIA's own decline is `vendor.request_declined` only).
+    pub(crate) fn note_decline(
+        &mut self,
+        turn: TurnNumber,
+        request: &ServerRequest,
+    ) -> Result<(), NormalizeError> {
+        if self.exhausted {
+            return Err(NormalizeError::Overflow);
+        }
+        if let Some(item) = &request.item_id {
+            self.entry(turn, item)?.declined_by_via = true;
+        }
+        Ok(())
+    }
+
+    /// Turn `turn`'s notification after it ended (x.3.2 X3 fix r2 #3, r4
+    /// #2): the denial of a tool item it completed declined, unless VIA
+    /// declined the item or it was reported.
+    pub(crate) fn late_denial(
+        &mut self,
+        turn: TurnNumber,
+        notification: &Notification,
+    ) -> Result<Option<Denial>, NormalizeError> {
+        if self.exhausted {
+            return Err(NormalizeError::Overflow);
+        }
+        let Notification::ItemCompleted(event) = notification else {
+            return Ok(None);
+        };
+        self.denial(turn, &event.item)
+    }
+
+    /// A command or file-change item of turn `turn` the vendor declined,
+    /// once per item, unless VIA's own decline caused it.
+    fn denial(&mut self, turn: TurnNumber, item: &Item) -> Result<Option<Denial>, NormalizeError> {
+        let kind = match item.kind {
+            ItemKind::CommandExecution => DenialKind::Command,
+            ItemKind::FileChange => DenialKind::FileWrite,
+            ItemKind::UserMessage
+            | ItemKind::AgentMessage
+            | ItemKind::Reasoning
+            | ItemKind::McpToolCall
+            | ItemKind::DynamicToolCall
+            | ItemKind::CollabAgentToolCall
+            | ItemKind::WebSearch
+            | ItemKind::ImageGeneration
+            | ItemKind::Sleep
+            | ItemKind::Other(_) => return Ok(None),
+        };
+        if item.status.as_deref() != Some("declined") {
+            return Ok(None);
+        }
+        let suppressed = self
+            .suppressed
+            .get(&(turn, item.id.clone()))
+            .copied()
+            .unwrap_or_default();
+        if suppressed.declined_by_via || suppressed.denied {
+            return Ok(None);
+        }
+        self.entry(turn, &item.id)?.denied = true;
+        Ok(Some(Denial {
+            kind,
+            target: item.target.clone().unwrap_or_default(),
+            reason: DENIAL_REASON.to_owned(),
+        }))
     }
 }
 
@@ -287,32 +382,55 @@ pub(crate) struct TurnNormalizer {
     cache_write: CacheWrite,
     /// The model's context window, as last reported.
     window: Option<u64>,
-    /// Tool items started and not completed.
-    open_tools: Ids,
-    /// Items whose approval request VIA declined.
-    declined_by_via: Ids,
-    /// Items already reported denied.
-    denied: Ids,
-    /// The ID bytes the three sets hold.
-    id_bytes: usize,
+    /// Tool items started and not completed, charged to `metadata`.
+    open_tools: HashSet<String>,
+    /// The turn the normalizer is for.
+    turn: TurnNumber,
+    /// The session's item metadata, held while the turn runs.
+    metadata: Metadata,
     /// An ID overflowed: the normalizer takes nothing more.
     overflowed: bool,
 }
 
 impl TurnNormalizer {
+    /// A normalizer of a session's only turn, with its own metadata.
+    #[cfg(test)]
     pub(crate) fn new(schema: bool) -> Self {
+        Self::on(
+            schema,
+            TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!()),
+            Metadata::default(),
+        )
+    }
+
+    /// Turn `turn`'s normalizer, holding the session's `metadata` while
+    /// the turn runs.
+    pub(crate) fn on(schema: bool, turn: TurnNumber, metadata: Metadata) -> Self {
         Self {
             schema,
             answer: Answer::Text(String::new()),
             total: None,
             cache_write: CacheWrite::None,
             window: None,
-            open_tools: Ids::default(),
-            declined_by_via: Ids::default(),
-            denied: Ids::default(),
-            id_bytes: 0,
+            open_tools: HashSet::new(),
+            turn,
+            metadata,
             overflowed: false,
         }
+    }
+
+    /// The session's metadata back as the turn ends: its open tools'
+    /// entries are released.
+    pub(crate) fn finish(mut self) -> Metadata {
+        for id in std::mem::take(&mut self.open_tools) {
+            self.metadata.release(&id);
+        }
+        self.metadata
+    }
+
+    /// The session's metadata, as the running turn holds it.
+    pub(crate) fn metadata(&mut self) -> &mut Metadata {
+        &mut self.metadata
     }
 
     /// The step `notification` is; an error for a known notification that
@@ -372,12 +490,6 @@ impl TurnNormalizer {
         })
     }
 
-    /// Sheds what only the running turn needs, as the turn becomes a
-    /// registration's history (x.3.2 X3 fix r3 #4): its retained text.
-    pub(crate) fn shed(&mut self) {
-        self.answer = Answer::Text(String::new());
-    }
-
     /// Bytes of final text retained for structured output.
     #[cfg_attr(
         not(test),
@@ -399,43 +511,23 @@ impl TurnNormalizer {
         if self.overflowed {
             return Err(NormalizeError::Overflow);
         }
-        if let Some(item) = &request.item_id {
-            let admitted = self.declined_by_via.admit(item, &mut self.id_bytes);
-            self.overflowed = admitted.is_err();
-            admitted?;
-        }
-        Ok(())
-    }
-
-    /// An earlier turn's notification (x.3.2 X3 fix r2 #3): the denial
-    /// of a tool item it completed declined, unless VIA declined the item
-    /// or it was reported; the running turn's state is untouched but for
-    /// that record. An ID past the bounds is an overflow, as in
-    /// [`Self::observe`].
-    pub(crate) fn late_denial(
-        &mut self,
-        notification: &Notification,
-    ) -> Result<Option<Denial>, NormalizeError> {
-        if self.overflowed {
-            return Err(NormalizeError::Overflow);
-        }
-        let Notification::ItemCompleted(event) = notification else {
-            return Ok(None);
-        };
-        let denial = self.denial(&event.item);
-        self.overflowed = denial.is_err();
-        denial
+        let noted = self.metadata.note_decline(self.turn, request);
+        self.overflowed = noted.is_err();
+        noted
     }
 
     /// Whether a tool item started and has not completed.
     pub(crate) fn tools_open(&self) -> bool {
-        !self.open_tools.ids.is_empty()
+        !self.open_tools.is_empty()
     }
 
     /// The marks of an item's start: model output, and a tool's ID and type.
     fn item_started(&mut self, item: &Item) -> Result<Option<ProgressMarks>, NormalizeError> {
         let tools_started = if item.kind.is_tool() {
-            self.open_tools.admit(&item.id, &mut self.id_bytes)?;
+            if !self.open_tools.contains(&item.id) {
+                self.metadata.charge(&item.id)?;
+                self.open_tools.insert(item.id.clone());
+            }
             vec![(item.id.clone(), item.kind.as_str().to_owned())]
         } else if matches!(item.kind, ItemKind::AgentMessage | ItemKind::Reasoning) {
             Vec::new()
@@ -451,12 +543,18 @@ impl TurnNormalizer {
 
     fn item_completed(&mut self, item: &Item) -> Result<Step, NormalizeError> {
         if item.kind.is_tool() {
-            self.open_tools.release(&item.id, &mut self.id_bytes);
+            if self.open_tools.remove(&item.id) {
+                self.metadata.release(&item.id);
+            }
             let mut observations = vec![Observation::Progress(ProgressMarks {
                 tools_ended: vec![item.id.clone()],
                 ..ProgressMarks::default()
             })];
-            observations.extend(self.denial(item)?.map(Observation::ActionDenied));
+            observations.extend(
+                self.metadata
+                    .denial(self.turn, item)?
+                    .map(Observation::ActionDenied),
+            );
             return Ok(Step::Observations(observations));
         }
         let (ItemKind::AgentMessage, Some(FINAL_ANSWER), Some(text)) =
@@ -483,37 +581,6 @@ impl TurnNormalizer {
                 answer.push_str(text);
             }
         }
-    }
-
-    /// A command or file-change item the vendor declined, once per item,
-    /// unless VIA's own decline caused it.
-    fn denial(&mut self, item: &Item) -> Result<Option<Denial>, NormalizeError> {
-        let kind = match item.kind {
-            ItemKind::CommandExecution => DenialKind::Command,
-            ItemKind::FileChange => DenialKind::FileWrite,
-            ItemKind::UserMessage
-            | ItemKind::AgentMessage
-            | ItemKind::Reasoning
-            | ItemKind::McpToolCall
-            | ItemKind::DynamicToolCall
-            | ItemKind::CollabAgentToolCall
-            | ItemKind::WebSearch
-            | ItemKind::ImageGeneration
-            | ItemKind::Sleep
-            | ItemKind::Other(_) => return Ok(None),
-        };
-        if item.status.as_deref() != Some("declined")
-            || self.declined_by_via.contains(&item.id)
-            || self.denied.contains(&item.id)
-        {
-            return Ok(None);
-        }
-        self.denied.admit(&item.id, &mut self.id_bytes)?;
-        Ok(Some(Denial {
-            kind,
-            target: item.target.clone().unwrap_or_default(),
-            reason: DENIAL_REASON.to_owned(),
-        }))
     }
 
     fn terminal(&mut self, turn: &Turn, at: Instant) -> Result<Step, NormalizeError> {

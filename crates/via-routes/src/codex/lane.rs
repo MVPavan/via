@@ -198,6 +198,10 @@ pub enum LaneEnd {
     /// The connection task itself failed (item 13.2): the lane ends with
     /// no boundary, and what was staged in the task is lost.
     Abnormal,
+    /// The driver's close cut the lane off (item 8.2): what the lane took
+    /// before is the admitted prefix; later messages are dropped and
+    /// counted ([`Lane::dropped`]).
+    Closed,
 }
 
 /// What [`Lane::next`] returns.

@@ -41,8 +41,8 @@ use via_routes::codex::{
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
-    Current, Delivery, Evidence, Folders, Losses, Normalizing, Registration, Retained, Stop,
-    UNKNOWN, losses as lock_losses,
+    Current, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, Registration, Retained,
+    ServerEvidence, Stop, UNKNOWN, losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Sandbox};
@@ -178,26 +178,35 @@ impl CodexSession {
         self.adapter.servers().epoch()
     }
 
-    /// The close's detach (packet §2, X0 item 8.2): the registration's
-    /// delivery barrier, bounded by `deadline` less [`DELIVERY_MARGIN`],
-    /// then its seal (what it left undelivered joins the loss record),
-    /// then the thread's unsubscribe intent (X0 item 8.3), its reply
-    /// awaited by `deadline`; then the registration closes and the lease
-    /// is released. Never a stdin close: the server is shared.
+    /// The close's detach (packet §2, X0 item 8.2): the cutoff ends the
+    /// registration's lane after the messages it took (its admitted
+    /// prefix; later ones are dropped and counted), the delivery barrier
+    /// waits for the prefix, bounded by `deadline` less
+    /// [`DELIVERY_MARGIN`], then the seal; what was left undelivered or
+    /// delivered in part, and what the cutoff dropped, joins the loss
+    /// record (x.3.2 X3 fix r4 #4, #6). Then the thread's unsubscribe
+    /// intent (X0 item 8.3), its reply awaited by `deadline`; then the
+    /// registration closes and the lease is released. Never a stdin
+    /// close: the server is shared.
     pub(crate) async fn detach(&self, deadline: Deadline) {
         let Some(attached) = self.attached().take() else {
             return;
         };
         if let Some(thread) = &attached.thread {
+            let lane = thread.lease.lane();
+            lane.end(LaneEnd::Closed);
             let by = deadline
                 .instant()
                 .checked_sub(DELIVERY_MARGIN)
                 .unwrap_or_else(Instant::now);
             let drained = thread.registration.drain(by).await;
             let sealed = thread.registration.seal();
-            if !drained {
-                lock_losses(&self.losses).note(attached.generation, sealed.position, UNKNOWN);
-            }
+            lock_losses(&self.losses).note_close(
+                attached.generation,
+                drained,
+                &sealed,
+                lane.dropped(),
+            );
             if usable(&attached.connection)
                 && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
             {
@@ -735,6 +744,8 @@ fn lane_end(
         LaneEnd::Overflow => (RouteError::Overflow { turn }, None),
         LaneEnd::Lost(loss) => (loss_cause(&loss, turn), Some(loss)),
         LaneEnd::Retired => (RouteError::TransportLost { turn }, None),
+        // Only a close cuts a lane off, after it stopped the turn.
+        LaneEnd::Closed => (RouteError::Stopped { turn }, None),
         LaneEnd::Abnormal => {
             let loss = connection_loss(connection).unwrap_or(ConnectionLoss {
                 cause: LossCause::TransportLost,
@@ -784,6 +795,14 @@ pub(crate) async fn run_turn(
     spec: TurnSpec,
     cx: TurnCx,
 ) -> TurnEnd {
+    // A failed driver writes no further turn (x.3.2 X3 fix r4 #5): Core
+    // retires it, and its generation is unfit.
+    if matches!(*driver.health.borrow(), DriverHealth::Failed { .. }) {
+        return rejected(AdapterError::Rejected {
+            reason: StartRejected::SessionGone,
+            evidence: TurnEvidence::no_launch(false),
+        });
+    }
     let sandbox = match admit(driver, session, &spec) {
         Ok(sandbox) => sandbox,
         Err(reason) => {
@@ -1227,7 +1246,7 @@ async fn open_thread(
     confirm(facts, (&opened, mode), resume, &lease, (orders, force)).await?;
     let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
-        registration: normalize_on_tracker(driver, ids, &lease),
+        registration: normalize_on_tracker(driver, facts.session, ids, &lease),
         lease,
     });
     facts.session.opened(ids.connection, &thread);
@@ -1519,7 +1538,9 @@ async fn run_started(
     // Before the start is written: every message the connection reads for
     // the thread from now on counts against the turn's decode fence (x.3.2
     // critical r2 #2, runtime §8).
-    start
+    // A turn runs on the registration until this returns, accepted or
+    // not (x.3.2 X3 fix r4 #1).
+    let _fence = start
         .thread
         .registration
         .fence(start.thread.lease.lane(), turn, activity);
@@ -1629,6 +1650,7 @@ fn unanswered(
 /// across the registration's turns (x.3.2 X3 fix r3 #3).
 fn normalize_on_tracker(
     driver: &SessionDriver,
+    session: &CodexSession,
     ids: &Ids<'_>,
     lease: &LaneLease,
 ) -> Arc<Registration> {
@@ -1636,12 +1658,18 @@ fn normalize_on_tracker(
     driver.tracker.spawn(crash_on_panic(
         Normalizing::new(
             (Arc::clone(&registration), Arc::clone(lease.lane())),
-            driver.observations.clone(),
-            Evidence {
-                connection: Arc::clone(ids.connection),
-                earlier: Arc::clone(&ids.generation.folders),
-            },
+            (
+                driver.observations.clone(),
+                Evidence {
+                    server: Arc::clone(ids.connection) as Arc<dyn ServerEvidence>,
+                    earlier: Arc::clone(&ids.generation.folders),
+                },
+            ),
             (driver.cancel.clone(), Arc::clone(&driver.health)),
+            LossRecord {
+                losses: Arc::clone(&session.losses),
+                generation: ids.generation.number,
+            },
         )
         .run(),
     ));

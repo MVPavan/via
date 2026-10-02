@@ -2087,6 +2087,16 @@ fn late_kinds(pure: &conformance_drive::Pure) -> Vec<(usize, Value)> {
 /// right after its terminal, declined; with `two_turns` false turn 2 is
 /// not run and the session closes after turn 1.
 fn late_decline_after_turn1(name: &str, two_turns: bool) -> Result<(Value, Value), String> {
+    late_decline_after_turn1_with(name, two_turns, &[])
+}
+
+/// [`late_decline_after_turn1`] with `before` emitted between turn 1's
+/// terminal and the late request.
+fn late_decline_after_turn1_with(
+    name: &str,
+    two_turns: bool,
+    before: &[Value],
+) -> Result<(Value, Value), String> {
     let mut replay = replay_of("c1_commentary_usage")?;
     let mut expect = expect_of("c1_commentary_usage")?;
     replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
@@ -2097,16 +2107,19 @@ fn late_decline_after_turn1(name: &str, two_turns: bool) -> Result<(Value, Value
     } else {
         step_with(&replay, "thread/unsubscribe")?
     };
-    steps(&mut replay)?.splice(completed + 1..end, approval_declined(90, "item-late"));
+    let mut inserted = before.to_vec();
+    inserted.extend(approval_declined(90, "item-late"));
+    let shift = inserted.len() as u64;
+    steps(&mut replay)?.splice(completed + 1..end, inserted);
     if two_turns {
-        // Turn 2's gate moves with the two steps inserted before it.
+        // Turn 2's gate moves with the steps inserted before it.
         for gate in expect["turns"][1]["gates"]
             .as_array_mut()
             .into_iter()
             .flatten()
         {
             let step = gate["step"].as_u64().ok_or("gate step")?;
-            gate["step"] = json!(step + 2);
+            gate["step"] = json!(step + shift);
         }
     } else {
         expect["turns"].as_array_mut().ok_or("turns")?.truncate(1);
@@ -2169,6 +2182,283 @@ fn codex_late_decline_between_turns() {
 fn codex_close_barrier_carries_a_held_decline() {
     let name = "codex_close_barrier_carries_a_held_decline";
     let (replay, expect) = late_decline_after_turn1(name, false).unwrap();
+    let _points = armed(
+        "adapter.codex.idle_item",
+        json!({"occurrence": 1, "action": "delay", "value": 1500}),
+    )
+    .unwrap();
+    let knobs = conformance_run::Knobs {
+        close_after_read: Some(LATE_REPLY_READ),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// X0 item 13.2 (x.3.2 X3 fix r4 #1): while no turn runs, the
+/// registration's normalizer takes every message in order. A thread
+/// status notification right after turn 1's terminal gives nothing, and
+/// the late decline behind it still reaches Core before turn 2.
+#[test]
+fn codex_idle_takes_a_thread_message_before_a_late_decline() {
+    let name = "codex_idle_takes_a_thread_message_before_a_late_decline";
+    let status = json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "idle"}}});
+    let (replay, expect) = late_decline_after_turn1_with(name, true, &[emit(&status)]).unwrap();
+    let knobs = conformance_run::Knobs {
+        admit_after_late: Some((1, 1)),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// X0 items 5 and 13.2 (x.3.2 X3 fix r4 #5): a malformed message while
+/// no turn runs fails the generation at once. After turn 1, a thread
+/// message that does not decode keeps its evidence in the server folder
+/// and latches the driver's health `protocol`; turn 2 is then refused
+/// before any `turn/start` is written.
+#[test]
+fn codex_idle_malformed_message_refuses_the_next_turn() {
+    let name = "codex_idle_malformed_message_refuses_the_next_turn";
+    let mut replay = replay_of("c1_commentary_usage").unwrap();
+    let mut expect = expect_of("c1_commentary_usage").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    // Past the full decode's nesting bound (64), within the peek's.
+    let malformed = json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "idle"},
+            "nested": serde_json::from_str::<Value>(
+                &format!("{}{}", "[".repeat(80), "]".repeat(80))).unwrap()}});
+    let completed = step_with(&replay, "\"turn/completed\"").unwrap();
+    let unsubscribe = step_with(&replay, "thread/unsubscribe").unwrap();
+    // Turn 2 writes nothing: its steps go.
+    steps(&mut replay)
+        .unwrap()
+        .splice(completed + 1..unsubscribe, [emit(&malformed)]);
+    let refused = &mut turn_mut(&mut expect, 1)["expect"];
+    for (key, value) in [
+        ("rejected", json!("session_gone")),
+        ("accepted", json!(false)),
+        ("terminal", Value::Null),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("instance", Value::Null),
+        ("observations_include", json!([])),
+        (
+            "observations_exclude",
+            json!(["turn.accepted", "final_text"]),
+        ),
+        ("observation_counts", json!({"turn.accepted": 0})),
+        ("observations_order", json!([])),
+    ] {
+        refused[key] = value;
+    }
+    turn_mut(&mut expect, 1)
+        .as_object_mut()
+        .unwrap()
+        .remove("gates");
+    // Its health is read before the shutdown's close.
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
+    let knobs = conformance_run::Knobs {
+        admit_after_failure: Some(1),
+        ..conformance_run::Knobs::default()
+    };
+    let mut kept = Vec::new();
+    check_variant_with(name, &replay, &expect, knobs, |run| {
+        kept = undecoded_under(run.state.path());
+        kept.extend(undecoded_under(run.case_dir.path()));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        kept.len() == 1 && kept[0].contains("evidence/servers/"),
+        "evidence kept at {kept:?}"
+    );
+}
+
+/// Turn `k` (from 0) of [`many_turns`]: its vendor turn ID.
+fn turn_id(k: usize) -> String {
+    format!("019a0000-0000-7000-8000-0000002000{:02}", k + 1)
+}
+
+/// The plain fixture run as `count` turns of one session on one thread,
+/// each a copy of its one turn under vendor turn [`turn_id`]; `inserted`
+/// gives the steps emitted right after turn `k`'s `turn/started`.
+fn many_turns(
+    name: &str,
+    count: usize,
+    inserted: impl Fn(usize) -> Vec<Value>,
+) -> Result<(Value, Value), String> {
+    let (mut replay, mut expect) = plain(name)?;
+    let start = step_with(&replay, "\"method\":\"turn/start\"")?;
+    let completed = step_with(&replay, "\"method\":\"turn/completed\"")?;
+    let started = step_with(&replay, "\"method\":\"turn/started\"")?;
+    let all = steps(&mut replay)?.clone();
+    let mut built: Vec<Value> = all[..start].to_vec();
+    for k in 0..count {
+        for (at, step) in all[start..=completed].iter().enumerate() {
+            let text = step.to_string().replace(TURN, &turn_id(k));
+            built.push(serde_json::from_str(&text).map_err(|e| e.to_string())?);
+            if start + at == started {
+                built.extend(inserted(k));
+            }
+        }
+    }
+    built.extend(all[completed + 1..].iter().cloned());
+    replay["steps"] = json!(built);
+    let first = expect["turns"][0].clone();
+    let mut turns = vec![first.clone()];
+    for k in 1..count {
+        let mut turn = first.clone();
+        let then = &mut turn["expect"];
+        then["observations_include"] = json!([
+            {"kind": "turn.accepted", "vendor_turn_id": turn_id(k)}, "progress", "final_text",
+        ]);
+        then["observations_order"] = json!(["turn.accepted", "final_text"]);
+        turns.push(turn);
+    }
+    expect["turns"] = json!(turns);
+    expect["launch_checkpoints"]["after_turn"] = json!(vec![1; count]);
+    Ok((replay, expect))
+}
+
+/// x.3.2 X3 fix r4 #2, #3: what late judgement needs is kept for as long
+/// as the registration lives, not for a number of turns. While turn 1
+/// runs VIA declines its item `item-via` and the vendor declines
+/// `item-vendor`; seventeen turns later both items complete `declined`
+/// again for turn 1: neither is a late observation.
+#[test]
+fn codex_late_denial_survives_seventeen_turns() {
+    let name = "codex_late_denial_survives_seventeen_turns";
+    let last = 17;
+    let (replay, mut expect) = many_turns(name, last + 1, |k| match k {
+        0 => {
+            let mut steps = approval_declined(91, "item-via").to_vec();
+            steps.extend([
+                completed_declined("item-via"),
+                completed_declined("item-vendor"),
+            ]);
+            steps
+        }
+        k if k == last => vec![
+            completed_declined("item-via"),
+            completed_declined("item-vendor"),
+            json!({"delay": {"ms": 300}}),
+        ],
+        _ => Vec::new(),
+    })
+    .unwrap();
+    turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 1, "action.denied": 1});
+    turn_mut(&mut expect, last)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 0, "action.denied": 0});
+    check_variant_then(name, &replay, &expect, |pure| {
+        if pure.late.borrow().is_empty() {
+            Ok(())
+        } else {
+            Err(format!("late observations: {:?}", pure.late.borrow()))
+        }
+    })
+    .unwrap();
+}
+
+/// The bytes of each [`long_denials`] ID.
+const LONG_ID: usize = 1022;
+
+/// `count` items of turn `k` completed `declined`, each ID [`LONG_ID`]
+/// bytes, paced so the lane's bound is not the test's.
+fn long_denials(k: usize, count: usize) -> Vec<Value> {
+    let mut steps = Vec::new();
+    for n in 0..count {
+        let id = format!("{k}-{n:0>1020}");
+        steps.push(emit(&json!({"method": "item/completed", "params": {
+            "threadId": THREAD, "turnId": turn_id(k),
+            "item": {"type": "commandExecution", "id": id, "command": "rm -rf build",
+                "cwd": "/work/project", "commandActions": [], "status": "declined"}}})));
+        if n % 8 == 7 {
+            steps.push(json!({"delay": {"ms": 30}}));
+        }
+    }
+    if steps.last().is_some_and(|step| step.get("delay").is_some()) {
+        steps.pop();
+    }
+    steps
+}
+
+/// x.3.2 X3 fix r4 #3: the suppression table is charged against the
+/// session's metadata bound (packet §5: 256 KiB), across turns. Turn 1
+/// reports 150 vendor denials of 1 KiB IDs, within it; turn 2's denials
+/// pass it at the first that does not fit: the generation fails
+/// `overflow` (its cleanup unproven, its cleanup interrupt written),
+/// never forgetting a fact.
+#[test]
+fn codex_suppression_exhaustion_fails_the_generation() {
+    let name = "codex_suppression_exhaustion_fails_the_generation";
+    let first = 150;
+    // Turn 2's IDs that still fit in 256 KiB; the next one does not.
+    let fit = (256 * 1024 - first * LONG_ID) / LONG_ID;
+    let count = |k: usize| if k == 0 { first } else { fit + 1 };
+    let (mut replay, mut expect) = many_turns(name, 2, |k| long_denials(k, count(k))).unwrap();
+    // Turn 2 ends at the overflow: its interrupt, then nothing more.
+    let second = step_with(
+        &replay,
+        &format!(
+            "\"method\":\"turn/started\",\"params\":{{\"threadId\":\"{THREAD}\",\"turn\":{{\"id\":\"{}\"",
+            turn_id(1)
+        ),
+    )
+    .unwrap();
+    let paced = long_denials(1, count(1)).len();
+    cut_after(
+        &mut replay,
+        second + paced,
+        &[
+            json!({"expect": {
+                "line": {"method": "turn/interrupt",
+                    "params": {"threadId": THREAD, "turnId": turn_id(1)}},
+                "within_ms": 5000,
+            }}),
+            json!({"await_eof": {}}),
+        ],
+    )
+    .unwrap();
+    turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "action.denied": first});
+    let turn = &mut turn_mut(&mut expect, 1)["expect"];
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["error"] = json!("overflow");
+    turn["cleanup"] = json!("uncertain");
+    turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": turn_id(1)}]);
+    turn["observations_exclude"] = json!(["final_text"]);
+    turn["observations_order"] = json!(["turn.accepted"]);
+    turn["unasserted"] = json!([]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode
+/// order. Turn 1's late decline is held at the idle seam as the session
+/// closes; the vendor keeps sending turn 1's denials after the cutoff:
+/// the close delivers the decline it held, and nothing after the cutoff.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_close_cutoff_stops_later_traffic() {
+    let name = "codex_close_cutoff_stops_later_traffic";
+    let mut later = vec![json!({"delay": {"ms": 300}})];
+    for n in 0..5 {
+        later.push(completed_declined(&format!("item-after-{n}")));
+        later.push(json!({"delay": {"ms": 100}}));
+    }
+    let (mut replay, expect) = late_decline_after_turn1(name, false).unwrap();
+    let unsubscribe = step_with(&replay, "thread/unsubscribe").unwrap();
+    for (offset, step) in later.into_iter().enumerate() {
+        steps(&mut replay)
+            .unwrap()
+            .insert(unsubscribe + offset, step);
+    }
     let _points = armed(
         "adapter.codex.idle_item",
         json!({"occurrence": 1, "action": "delay", "value": 1500}),
@@ -2613,14 +2903,21 @@ fn status_burst(count: usize) -> Vec<Value> {
 }
 
 /// x.3.2 X3 fix r2 #1: a lane that overflows while its driver is idle
-/// (its turn settled; no normalizer takes the lane) reaches the driver's
+/// (its turn settled; the idle normalizer is held at its seam on the
+/// burst's first message, x.3.2 X3 fix r4 #1) reaches the driver's
 /// health at once: it latches `overflow`, so Core retires the driver.
 /// The burst comes once a second session's `thread/resume` shows the
 /// first turn settled; that resume is refused (`session_gone`) after the
 /// burst, so the case reads the health only after the burst was routed.
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn codex_idle_overflow_latches_health() {
     let name = "codex_idle_overflow_latches_health";
+    let _points = armed(
+        "adapter.codex.idle_item",
+        json!({"occurrence": 1, "action": "delay", "value": 2000}),
+    )
+    .unwrap();
     let (mut replay, mut expect) = plain(name).unwrap();
     let missing = replay_of("c5_resume_missing").unwrap();
     let missing_expect = expect_of("c5_resume_missing").unwrap();

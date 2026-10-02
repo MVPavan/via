@@ -135,6 +135,9 @@ pub(crate) struct Knobs {
     /// once its session's channel, drained between turns as Core drains
     /// it, gave `count` late observations (x.3.2 X3 fix r3 #3).
     pub(crate) admit_after_late: Option<(usize, usize)>,
+    /// The turn at this index is admitted only once its session's health
+    /// failed (x.3.2 X3 fix r4 #5).
+    pub(crate) admit_after_failure: Option<usize>,
     /// A session's stated close waits until the fake read this input
     /// line (`read <n> launch 1`): a late request's reply was written, so
     /// its placeholder is in the lane before the close (x.3.2 X3 fix r3
@@ -481,7 +484,26 @@ impl<'a> Run<'a> {
         {
             self.late_between_turns(turn, count).await?;
         }
+        if self.knobs.admit_after_failure == Some(index) {
+            self.health_failed(turn).await?;
+        }
         Ok(())
+    }
+
+    /// Resolves once the health of the session of `turn` failed, within
+    /// [`FIXTURE_WAIT`].
+    async fn health_failed(&self, turn: &Value) -> Result<(), String> {
+        let label = session_of(turn);
+        let session = self
+            .sessions
+            .get(label)
+            .ok_or_else(|| format!("session {label} was not opened"))?;
+        let mut health = session.driver.health();
+        let failed = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. }));
+        match tokio::time::timeout(FIXTURE_WAIT, failed).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(format!("session {label}'s health never failed")),
+        }
     }
 
     /// Drains the session of `turn` between its turns, as Core does,
