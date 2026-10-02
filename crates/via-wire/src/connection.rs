@@ -39,8 +39,14 @@ const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 /// escaped into one reused buffer (design §8.3).
 const PROMPT_SLICE: usize = 16 * 1024;
 
-/// A control message (an interrupt) is at most 64 KiB (design §8.3).
+/// A control message is at most 64 KiB (design §8.3); the distinct
+/// control messages outstanding on a connection are at most this many
+/// bytes in total (runtime §8, C2 §2).
 const CONTROL_BYTES: usize = 64 * 1024;
+
+/// The distinct control messages outstanding on a connection, enqueued and
+/// not yet answered (runtime §8, C2 §2).
+const CONTROL_MESSAGES: usize = 8;
 
 /// `finish` drains until this long before its deadline, then aborts and
 /// joins until the deadline (design §8.6).
@@ -94,6 +100,11 @@ pub enum OutboundMessage {
     /// one is coalesced into the first: it is not written and answers
     /// `NotWritten`.
     Interrupt(Vec<u8>),
+    /// A distinct control message, written whole between messages and
+    /// never coalesced (runtime §8, C2 §2). At most [`CONTROL_MESSAGES`]
+    /// are outstanding, [`CONTROL_BYTES`] in total; one past either is
+    /// refused at once with `NotWritten`, nothing written.
+    Control(Vec<u8>),
 }
 
 /// A write enqueued to the stdin writer (design §8.3). It is cancel-safe:
@@ -119,6 +130,12 @@ struct DataWrite {
 /// A job on the writer's control queue.
 enum Control {
     Interrupt {
+        bytes: Vec<u8>,
+        deadline: Deadline,
+        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+    },
+    /// A distinct control message holding its share of the budget.
+    Message {
         bytes: Vec<u8>,
         deadline: Deadline,
         reply: oneshot::Sender<Result<SendOutcome, WireError>>,
@@ -152,7 +169,16 @@ struct Shared {
     interrupt_sent: AtomicBool,
     /// A close of stdin was enqueued (coalescing).
     close_sent: AtomicBool,
+    /// The distinct control messages outstanding and their bytes.
+    control_budget: StdMutex<ControlBudget>,
     undecoded: Undecoded,
+}
+
+/// What the outstanding distinct control messages hold of their bounds.
+#[derive(Default)]
+struct ControlBudget {
+    messages: usize,
+    bytes: usize,
 }
 
 impl Shared {
@@ -172,12 +198,38 @@ impl Shared {
         self.latch.borrow().first
     }
 
+    /// Takes one control message's share of the budget; false, taking
+    /// nothing, when it would pass [`CONTROL_MESSAGES`] or [`CONTROL_BYTES`].
+    fn reserve_control(&self, length: usize) -> bool {
+        let mut budget = self
+            .control_budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let bytes = budget.bytes.saturating_add(length);
+        if budget.messages >= CONTROL_MESSAGES || bytes > CONTROL_BYTES {
+            return false;
+        }
+        budget.messages += 1;
+        budget.bytes = bytes;
+        true
+    }
+
+    /// Returns one resolved control message's share.
+    fn release_control(&self, length: usize) {
+        let mut budget = self
+            .control_budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        budget.messages = budget.messages.saturating_sub(1);
+        budget.bytes = budget.bytes.saturating_sub(length);
+    }
+
     /// Enqueues a close of stdin once.
     fn request_close(&self, control: &mpsc::Sender<Control>) {
         if !self.close_sent.swap(true, Ordering::AcqRel) {
-            // At most one interrupt and one close are ever queued, so the
-            // queue of eight is never full; a closed one means the writer
-            // already ended and dropped stdin.
+            // At most the budgeted controls, one interrupt and one close
+            // are ever queued, so the queue is never full; a closed one
+            // means the writer already ended and dropped stdin.
             let _ = control.try_send(Control::Close);
         }
     }
@@ -260,6 +312,25 @@ impl Io {
                         })
                         .await
                         .is_ok()
+                }
+                OutboundMessage::Control(bytes) => {
+                    let length = bytes.len();
+                    if !io.shared.reserve_control(length) {
+                        return Ok(SendOutcome::NotWritten);
+                    }
+                    let message = Control::Message {
+                        bytes,
+                        deadline,
+                        reply,
+                    };
+                    // The queue holds every budgeted control besides one
+                    // interrupt and one close: only a writer that ended
+                    // refuses it.
+                    let enqueued = io.control.try_send(message).is_ok();
+                    if !enqueued {
+                        io.shared.release_control(length);
+                    }
+                    enqueued
                 }
             };
             if !enqueued {
@@ -674,6 +745,7 @@ where
         discarded: AtomicU64::new(0),
         interrupt_sent: AtomicBool::new(false),
         close_sent: AtomicBool::new(false),
+        control_budget: StdMutex::new(ControlBudget::default()),
         undecoded: Undecoded {
             folder,
             tasks,
@@ -683,7 +755,8 @@ where
     });
     let (queue_tx, queue) = mpsc::channel(QUEUE_MESSAGES);
     let (data_tx, data_rx) = mpsc::channel(1);
-    let (control_tx, control_rx) = mpsc::channel(8);
+    // Full is impossible: every budgeted control, one interrupt and one close.
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_MESSAGES + 2);
     let (stop, stop_rx) = watch::channel(false);
     let (closed_tx, closed) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -847,6 +920,9 @@ struct Job {
     deadline: Deadline,
     reply: oneshot::Sender<Result<SendOutcome, WireError>>,
     start: bool,
+    /// A distinct control message's budgeted bytes, returned before its
+    /// answer.
+    budgeted: Option<usize>,
 }
 
 /// The stdin writer (design §8.3): owns stdin and writes one message at a
@@ -872,6 +948,14 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                     deadline,
                     reply,
                     start: false,
+                    budgeted: None,
+                },
+                Some(Control::Message { bytes, deadline, reply }) => Job {
+                    budgeted: Some(bytes.len()),
+                    message: OutboundMessage::Control(bytes),
+                    deadline,
+                    reply,
+                    start: false,
                 },
                 Some(Control::Close) | None => break,
             },
@@ -885,6 +969,7 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                     deadline,
                     reply,
                     start: true,
+                    budgeted: None,
                 }
             }
         };
@@ -896,6 +981,11 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
         };
         let outcome = writing.message(&job.message, &mut piece).await;
         let written = writing.written;
+        // Resolved, whatever the outcome: its share returns before the
+        // answer, so a caller answered may enqueue the next at once.
+        if let Some(length) = job.budgeted {
+            shared.release_control(length);
+        }
         match outcome {
             Ok(true) => {
                 // The whole input message (in S1 first the start carrying the
@@ -931,8 +1021,15 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
     queues.control.close();
     queues.data.close();
     while let Ok(control) = queues.control.try_recv() {
-        if let Control::Interrupt { reply, .. } = control {
-            let _ = reply.send(Ok(SendOutcome::NotWritten));
+        match control {
+            Control::Interrupt { reply, .. } => {
+                let _ = reply.send(Ok(SendOutcome::NotWritten));
+            }
+            Control::Message { bytes, reply, .. } => {
+                shared.release_control(bytes.len());
+                let _ = reply.send(Ok(SendOutcome::NotWritten));
+            }
+            Control::Close => {}
         }
     }
     while let Ok(data) = queues.data.try_recv() {
@@ -959,7 +1056,9 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
         piece: &mut Vec<u8>,
     ) -> std::io::Result<bool> {
         match message {
-            OutboundMessage::Interrupt(bytes) => self.put(bytes).await,
+            OutboundMessage::Interrupt(bytes) | OutboundMessage::Control(bytes) => {
+                self.put(bytes).await
+            }
             OutboundMessage::Start {
                 prefix,
                 prompt,

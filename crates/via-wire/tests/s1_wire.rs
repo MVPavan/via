@@ -806,3 +806,121 @@ async fn s1_wire_reader_drains_while_the_prefix_save_is_held()
     drop(std::mem::ManuallyDrop::into_inner(points));
     Ok(())
 }
+
+/// Polls each write once, so each is enqueued in order and left pending.
+async fn enqueue_all(writes: &mut [via_wire::PendingWrite]) {
+    for write in writes.iter_mut() {
+        let early = futures_poll(write).await;
+        assert!(early.is_none(), "a held control write answered: {early:?}");
+    }
+}
+
+/// Runtime §8, C2 §2 (x.3.2 J0): distinct control messages on one
+/// connection are each written whole, in order, between messages; at most
+/// eight are outstanding and 64 KiB in total, so a ninth, or one past the
+/// bytes, is refused `NotWritten` with nothing written, and a resolved one
+/// returns its share. A second interrupt still coalesces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_control_messages_are_distinct_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control")?;
+    let control = |bytes: &[u8]| OutboundMessage::Control(bytes.to_vec());
+
+    // Two distinct controls, then the coalesced interrupt, all written in order.
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(64 * 1024);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let deadline = after(Duration::from_secs(5));
+    let (first, second) = tokio::join!(
+        input.write(control(b"one\n"), deadline),
+        input.write(control(b"two\n"), deadline)
+    );
+    assert_eq!(
+        (first?, second?),
+        (SendOutcome::Written, SendOutcome::Written)
+    );
+    let interrupt = input
+        .write(OutboundMessage::Interrupt(b"stop\n".to_vec()), deadline)
+        .await?;
+    let again = input
+        .write(
+            OutboundMessage::Interrupt(b"stop again\n".to_vec()),
+            deadline,
+        )
+        .await?;
+    assert_eq!(
+        (interrupt, again),
+        (SendOutcome::Written, SendOutcome::NotWritten)
+    );
+    input.close_input(deadline).await?;
+    let mut written = Vec::new();
+    vendor_stdin.read_to_end(&mut written).await?;
+    assert_eq!(written, b"one\ntwo\nstop\n");
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+
+    // Eight outstanding behind a vendor that does not read: the ninth is
+    // refused at once; once the vendor reads, all eight are written.
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let deadline = after(Duration::from_secs(10));
+    let mut held: Vec<_> = (0..8_u8)
+        .map(|n| input.write(control(&[b'a' + n; 64]), deadline))
+        .collect();
+    enqueue_all(&mut held).await;
+    let ninth = tokio::time::timeout(
+        Duration::from_secs(2),
+        input.write(control(b"ninth\n"), deadline),
+    )
+    .await?;
+    assert_eq!(ninth?, SendOutcome::NotWritten);
+    let reading = tokio::spawn(async move {
+        let mut bytes = vec![0_u8; 8 * 64];
+        vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
+    });
+    for write in held {
+        assert_eq!(write.await?, SendOutcome::Written);
+    }
+    let read = reading.await??;
+    let expected: Vec<u8> = (0..8_u8).flat_map(|n| [b'a' + n; 64]).collect();
+    assert_eq!(read, expected, "every control written whole, in order");
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+
+    // 64 KiB in total: one past the outstanding bytes, or alone past the
+    // cap, is refused; the bytes return once the held one is written.
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let deadline = after(Duration::from_secs(10));
+    let alone = input
+        .write(control(&vec![b'z'; 64 * 1024 + 1]), deadline)
+        .await?;
+    assert_eq!(alone, SendOutcome::NotWritten, "one control past 64 KiB");
+    let mut big = [input.write(control(&vec![b'b'; 60 * 1024]), deadline)];
+    enqueue_all(&mut big).await;
+    let over = input
+        .write(control(&vec![b'c'; 5 * 1024]), deadline)
+        .await?;
+    assert_eq!(over, SendOutcome::NotWritten, "65 KiB outstanding");
+    let reading = tokio::spawn(async move {
+        let mut bytes = vec![0_u8; 60 * 1024 + 5 * 1024];
+        vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
+    });
+    let [big] = big;
+    assert_eq!(big.await?, SendOutcome::Written);
+    let after_release = input
+        .write(control(&vec![b'c'; 5 * 1024]), deadline)
+        .await?;
+    assert_eq!(after_release, SendOutcome::Written, "the bytes returned");
+    let read = reading.await??;
+    assert!(read[..60 * 1024].iter().all(|byte| *byte == b'b'));
+    assert!(read[60 * 1024..].iter().all(|byte| *byte == b'c'));
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    assert_eq!(fallback_drops(), 0);
+    Ok(())
+}
