@@ -167,8 +167,8 @@ pub use driver::{
 };
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use instance::{
-    BinaryIdentity, Incompatibility, InstanceCache, RECIPE_KEY_MAX, REFUSAL_TTL, REFUSALS_KEPT,
-    VERSIONS_KEPT, resolve_binary,
+    Incompatibility, InstanceCache, RECIPE_KEY_MAX, REFUSAL_TTL, REFUSALS_KEPT, VERSIONS_KEPT,
+    resolve_binary,
 };
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,

@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::config::BootstrapEnv;
-use crate::instance::BinaryIdentity;
 use crate::plan::{Category, Inherit, InheritState};
 
 /// The environment names the server inherits from the daemon's bootstrap
@@ -82,13 +81,9 @@ impl ServerRecipe {
     }
 
     /// The server key: SHA-256 over the domain tag, the adapter version,
-    /// the program and its identity, the argv, the environment, the
-    /// working directory and the protocol pin, each length-prefixed.
-    pub(crate) fn config_hash(
-        &self,
-        adapter_version: &str,
-        identity: &BinaryIdentity,
-    ) -> ConfigHash {
+    /// the resolved program path, the argv, the environment, the working
+    /// directory and the protocol pin, each length-prefixed.
+    pub(crate) fn config_hash(&self, adapter_version: &str) -> ConfigHash {
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
@@ -97,7 +92,6 @@ impl ServerRecipe {
         field(DOMAIN.as_bytes());
         field(adapter_version.as_bytes());
         field(self.program.as_os_str().as_bytes());
-        field(&identity.to_bytes());
         field(&(self.args.len() as u64).to_le_bytes());
         for arg in &self.args {
             field(arg.as_bytes());

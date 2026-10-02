@@ -179,9 +179,10 @@ Params: `harness?`, `model?` (one required), `bound?`, `require?`,
 ```
 
 Never starts a process or server (Q5). `vendor_version` is the last version
-seen for the resolved binary identity, or `null`; `version_status` is
-`tested` (in the adapter's `checked` set), `untested` (not yet checked by the
-maintainers, warning `vendor_version_untested`) or `refused` (a cached
+seen for the harness and resolved program path, or `null`;
+`version_status` is `tested` (in the adapter's `checked` set), `untested`
+(not yet checked by the maintainers, warning `vendor_version_untested`) or
+`refused` (a cached
 handshake-check failure on something VIA relies on). Every vendor version is
 supported by default (P13, C2 §5). Errors: `unknown_model`,
 `harness_unavailable`, `invalid_params`.

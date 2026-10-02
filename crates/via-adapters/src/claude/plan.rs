@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use super::{ClaudeAdapter, launch};
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
 use crate::harness::Harness;
-use crate::instance::BinaryIdentity;
 use crate::plan::{
     Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritState,
     ModelChoice, ParamSizes, Refusal, RefusalKind, RoutePlan, Switch, TurnParams, VendorOptions,
@@ -151,18 +150,20 @@ impl ClaudeAdapter {
         Err(refusal)
     }
 
-    /// The last version an init reported for this binary identity, and a
-    /// live cached handshake refusal for `requested`'s recipe (C2 §5).
-    fn version(&self, requested: Inherit, schema: bool) -> (Option<String>, VersionStatus) {
-        // A binary that cannot be `stat`ed has no identity: nothing seen.
-        let Ok(identity) = BinaryIdentity::of(&self.binary) else {
-            return (None, VersionStatus::Untested);
-        };
-        let version = self.instances.last_version(&identity);
+    /// The last version an init reported for `harness` run from this
+    /// program path, and a live cached handshake refusal for `requested`'s
+    /// recipe (C2 §5).
+    fn version(
+        &self,
+        harness: Harness,
+        requested: Inherit,
+        schema: bool,
+    ) -> (Option<String>, VersionStatus) {
+        let version = self.instances.last_version(harness.name(), &self.binary);
         let recipe = launch::recipe_key(requested, schema);
         let status = if self
             .instances
-            .refusal(&identity, &recipe, std::time::Instant::now())
+            .refusal(&self.binary, &recipe, std::time::Instant::now())
             .is_some()
         {
             VersionStatus::Refused
@@ -205,7 +206,8 @@ impl ClaudeAdapter {
                 ),
             ));
         }
-        let (vendor_version, version_status) = self.version(requested, req.sizes.output_schema > 0);
+        let (vendor_version, version_status) =
+            self.version(harness, requested, req.sizes.output_schema > 0);
         if version_status == VersionStatus::Refused {
             let mut refusal = Refusal::new(
                 RefusalKind::VersionRefused,
@@ -527,13 +529,20 @@ mod tests {
         );
         let requested = Inherit::OD2_DEFAULT;
         instances.record_refusal(
-            BinaryIdentity::of(&binary).unwrap(),
+            &binary,
             launch::recipe_key(requested, true),
             crate::instance::Incompatibility::ReadbackDiffers("tools"),
             std::time::Instant::now(),
         );
-        assert_eq!(adapter.version(requested, true).1, VersionStatus::Refused);
-        assert_ne!(adapter.version(requested, false).1, VersionStatus::Refused);
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        assert_eq!(
+            adapter.version(harness, requested, true).1,
+            VersionStatus::Refused
+        );
+        assert_ne!(
+            adapter.version(harness, requested, false).1,
+            VersionStatus::Refused
+        );
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument

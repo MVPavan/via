@@ -54,7 +54,7 @@ FIFO, deadlines, retries, state and final envelope. No new crate or SDK route.
 | C1 surface | Mapping / owner |
 |---|---|
 | `hello`, `daemon/status`, `daemon/stop` | Existing Core/daemon behavior; force/drain reaches Claude through C2 controls |
-| `describe` | Pure adapter plan, no vendor process or file write; bundled catalog; the last version seen from an init for this binary identity, else `null`/`untested` (§3) |
+| `describe` | Pure adapter plan, no vendor process or file write; bundled catalog; the last version seen from an init for this program path, else `null`/`untested` (§3) |
 | `models` | Bundled versioned catalog with `source: bundled`; explicit Claude model identifiers pass as vendor identifiers, never claim account entitlement |
 | `spawn` | Core durable receipt then submission intent; allocate expected UUID; launch private Claude and send one prompt |
 | `resume` | Core FIFO; next process uses exact stored UUID with `--resume`; never `--continue`, name search, fork, or replacement session |
@@ -143,7 +143,7 @@ executable identity: a binary changed between turns is not refused, and each
 launch reports its own version.
 
 `describe` starts nothing: it reports the last version seen from an init for
-this binary identity, or `vendor_version:null` and `version_status:untested`.
+this program path, or `vendor_version:null` and `version_status:untested`.
 There is no HostProbe `--version` discovery; the bundled catalog is kept.
 
 ## 4. Launch and canonical parameters

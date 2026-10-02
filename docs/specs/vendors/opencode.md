@@ -83,8 +83,8 @@ vendor-owned storage, never a second writer to VIA's Store.
 Server key, persisted with each session:
 
 ```text
-(route_revision, resolved_binary_identity, exact_vendor_version,
- canonical_cwd, provider_profile_id, provider_profile_epoch,
+(route_revision, resolved_program_path, canonical_cwd,
+ provider_profile_id, provider_profile_epoch,
  generated_config_digest, environment_policy_revision,
  full_effective_bound, owning_via_session_id, private_storage_namespace)
 ```
@@ -371,11 +371,11 @@ health reports the running server's version; a version outside the adapter's
 `checked` set is `untested` and warns; only a demonstrated handshake breakage
 (for example a permission readback that differs from the value VIA sent)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
-cached per C2 §5. The server key keeps `exact_vendor_version`, so a new
-version starts a new server. No-model protocol evidence alone does not make
-the complete adapter tested. `describe` stays process-free: it reads
-installed/catalog metadata and the last version seen for this binary
-identity, without starting a process, server or writing files. No hidden
+cached per C2 §5. The observed version is reported, not keyed. No-model
+protocol evidence alone does not make the complete adapter tested.
+`describe` stays process-free: it reads installed/catalog metadata and the
+last version seen for this program path, without starting a process, server
+or writing files. No hidden
 `--version` subprocess inside the no-process `describe` path.
 `allow_untested` is accepted and stored but has no effect; it never bypasses
 credential, never-ask or unsupported-bound validation.
