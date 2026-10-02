@@ -1263,7 +1263,8 @@ pub struct WireMessages {
     finished: bool,
     /// A message [`Self::next_message`] dequeued, then withheld because a
     /// failure latched meanwhile: admitted before the seal, it is the
-    /// drain's first ([`Self::drain_admitted`]).
+    /// drain's first ([`Self::drain_admitted`]). Test builds also keep a
+    /// message here across the `wire.messages.received` pause.
     held: Option<VendorMessage>,
 }
 
@@ -1278,14 +1279,26 @@ impl WireMessages {
         if let Some(cause) = self.shared.failure() {
             return Err(cause.error());
         }
+        // Test builds: a message an earlier call dequeued and was dropped
+        // at `wire.messages.received` holding comes first.
+        #[cfg(feature = "test-failpoints")]
+        if let Some(message) = self.held.take() {
+            return Ok(Some(message));
+        }
         tokio::select! {
             biased;
             () = cancelled(&mut self.force) => Err(WireError::Cancelled),
             () = woken(&mut self.wake) => Err(WireError::Woken),
             message = self.queue.recv() => {
-                // Test builds: a message is dequeued, not yet returned.
+                // Test builds: a message is dequeued, not yet returned. It
+                // waits in `held`, so a call dropped at the pause loses
+                // nothing.
                 #[cfg(feature = "test-failpoints")]
-                let _ = via_store::failpoint::hit_async("wire.messages.received").await;
+                let message = {
+                    self.held = message;
+                    let _ = via_store::failpoint::hit_async("wire.messages.received").await;
+                    self.held.take()
+                };
                 self.received(message)
             }
             cause = latched(&mut self.latch) => Err(cause.error()),

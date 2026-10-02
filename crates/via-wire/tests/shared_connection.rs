@@ -646,3 +646,38 @@ async fn unpolled_drain_loses_nothing() -> TestResult {
     end(messages, &input).await;
     Ok(())
 }
+
+/// Item 13.1 (test builds): `next_message` dropped by an outer timeout
+/// while paused after its dequeue (`wire.messages.received`) loses no
+/// message: the drain still yields it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_message_dropped_after_its_dequeue_keeps_its_message() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "x2-wire-received-dropped-token";
+    let points = Scratch::new("dropped-points")?;
+    std::fs::set_permissions(&points.0, std::fs::Permissions::from_mode(0o700))?;
+    via_store::failpoint::activate(&points.0, TOKEN)?;
+    std::fs::write(
+        points.0.join("wire.messages.received.json"),
+        format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause"}}"#),
+    )?;
+    let folder = Scratch::new("dropped")?;
+    let (stdout, mut vendor) = tokio::io::duplex(1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes(stdout, stdin, folder.0.clone());
+    vendor.write_all(b"terminal\n").await?;
+    queued(&input, 9).await;
+    let next = tokio::time::timeout(Duration::from_millis(300), messages.next_message()).await;
+    assert!(next.is_err(), "next_message was not held at its pause");
+    assert!(points.0.join("wire.messages.received.1.ack").exists());
+    std::fs::write(points.0.join("wire.messages.received.1.release"), b"")?;
+    input.seal();
+    assert_eq!(drained(&mut messages).await, Ok(b"terminal\n".to_vec()));
+    assert_eq!(drained(&mut messages).await, Err(0));
+    drop(vendor);
+    end(messages, &input).await;
+    Ok(())
+}
