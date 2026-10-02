@@ -236,6 +236,10 @@ pub struct Lane {
     /// Set, for good, when the lane overflowed: observable at once,
     /// whether or not anything takes the lane (x.3.2 X3 fix r2 #1).
     overflow: watch::Sender<bool>,
+    /// The last accepting `turn/start` reply on the lane's thread: when
+    /// the connection read it and its position under the fence (x.3.2 X3
+    /// fix r2 #10), until the driver takes it.
+    accepted: Mutex<Option<(Instant, Option<Mark>)>>,
 }
 
 impl Lane {
@@ -253,6 +257,29 @@ impl Lane {
         fence.count = fence.count.saturating_add(1);
         fence.decoded = Some(decoded);
         fence.count
+    }
+
+    /// Counts the accepting `turn/start` reply the connection read at `at`
+    /// under the running turn's decode fence, as a message the lane took
+    /// (x.3.2 X3 fix r2 #10): the turn's acceptance is outstanding until
+    /// its normalizer delivered it.
+    pub(super) fn read_acceptance(&self, at: Instant) {
+        let mark = {
+            let fence = self.fence.lock().unwrap_or_else(PoisonError::into_inner);
+            fence.decoded.as_ref().map(|decoded| Mark {
+                fence: fence.count,
+                seq: decoded.advance(),
+            })
+        };
+        *self.accepted.lock().unwrap_or_else(PoisonError::into_inner) = Some((at, mark));
+    }
+
+    /// The last accepting reply's read instant and fence position, once.
+    pub fn take_acceptance(&self) -> Option<(Instant, Option<Mark>)> {
+        self.accepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Routes `item`, charged `bytes`. A lane already ended drops it

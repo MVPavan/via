@@ -159,6 +159,11 @@ impl ThreadTable {
         Ok(())
     }
 
+    /// Lane `id`, while open.
+    pub(super) fn lane(&self, id: u64) -> Option<&Arc<Lane>> {
+        self.lanes.get(&id).map(|entry| &entry.lane)
+    }
+
     /// The thread lane `id` is registered for, if any.
     pub(super) fn thread(&self, id: u64) -> Option<&str> {
         self.lanes.get(&id)?.thread.as_deref()

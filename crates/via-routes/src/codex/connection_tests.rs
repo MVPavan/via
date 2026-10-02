@@ -1051,3 +1051,37 @@ async fn correlation_bytes_count_turn_ids() {
         Some(ConnectionFailure::Overflow)
     );
 }
+
+/// Runtime §8 (x.3.2 X3 fix r2 #10): a successful `turn/start` reply is
+/// the turn's acceptance, a message of its decode fence: pairing it
+/// advances the fenced lane's watermark and keeps when the connection
+/// read it and its position, once, for the acceptance's delivery.
+#[tokio::test]
+async fn start_reply_counts_under_the_fence() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let decoded = crate::DecodeWatermark::default();
+    let fence = lane.lane().fence(decoded.clone());
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            None,
+        )
+        .unwrap();
+    vendor.read().await;
+    let before = tokio::time::Instant::now();
+    vendor.emit(&start_reply(start.id.get(), "u1")).await;
+    start.reply.await.unwrap();
+    let after = tokio::time::Instant::now();
+    assert_eq!(decoded.get(), 1);
+    let (at, mark) = lane.lane().take_acceptance().unwrap();
+    assert_eq!(mark, Some(Mark { fence, seq: 1 }));
+    assert!(before <= at && at <= after);
+    assert!(lane.lane().take_acceptance().is_none(), "taken once");
+}

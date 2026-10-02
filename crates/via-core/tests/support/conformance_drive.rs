@@ -71,6 +71,13 @@ pub(crate) struct Pure {
     /// decode watermark and the position the Adapter delivered through
     /// (runtime §8; x.3.2 critical r2 #2).
     pub(crate) fences: std::cell::RefCell<BTreeMap<usize, (u64, u64)>>,
+    /// Each late observation (C1 §6.1 AD4, as Core attributes it): one
+    /// naming the vendor turn an earlier turn of its session accepted,
+    /// with that turn's index, in its checker shape.
+    pub(crate) late: std::cell::RefCell<Vec<(usize, Value)>>,
+    /// At each gate, in the order taken: the turn's decode watermark and
+    /// the position the Adapter delivered through.
+    pub(crate) gate_fences: std::cell::RefCell<Vec<(u64, u64)>>,
     /// The fixture directory, listed with the case and state directories.
     fixtures: PathBuf,
     /// The listing before the pure steps: where `pure_writes` starts.
@@ -109,6 +116,8 @@ impl Pure {
             name: name.to_owned(),
             before: Listing::new(),
             fences: std::cell::RefCell::default(),
+            late: std::cell::RefCell::default(),
+            gate_fences: std::cell::RefCell::default(),
             fixtures,
         };
         pure.before = pure.listing()?;

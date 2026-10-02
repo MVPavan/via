@@ -401,6 +401,26 @@ impl TurnNormalizer {
         Ok(())
     }
 
+    /// An earlier turn's notification (x.3.2 X3 fix r2 #3): the denial
+    /// of a tool item it completed declined, unless VIA declined the item
+    /// or it was reported; the running turn's state is untouched but for
+    /// that record. An ID past the bounds is an overflow, as in
+    /// [`Self::observe`].
+    pub(crate) fn late_denial(
+        &mut self,
+        notification: &Notification,
+    ) -> Result<Option<Denial>, NormalizeError> {
+        if self.overflowed {
+            return Err(NormalizeError::Overflow);
+        }
+        let Notification::ItemCompleted(event) = notification else {
+            return Ok(None);
+        };
+        let denial = self.denial(&event.item);
+        self.overflowed = denial.is_err();
+        denial
+    }
+
     /// Whether a tool item started and has not completed.
     pub(crate) fn tools_open(&self) -> bool {
         !self.open_tools.ids.is_empty()

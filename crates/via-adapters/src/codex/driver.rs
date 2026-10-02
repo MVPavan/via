@@ -31,9 +31,9 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionLoss, FINISH_BY,
-    LOSS_EVIDENCE, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Purpose, RequestError,
-    Response, RpcError, SandboxMode, ServerKey, ServerPin, Subscription, ThreadResult,
-    ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds,
+    LOSS_EVIDENCE, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Mark, Purpose,
+    RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin, Subscription,
+    ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds,
     crash_on_panic, data, result, thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
@@ -1531,7 +1531,20 @@ async fn run_started(
         vendor_turn_id: VendorTurnId::try_from(accepted.clone()).ok(),
         instance: facts.instance.clone(),
     };
-    let delivery = normalize_on_tracker(facts, start, (&accepted, acceptance), (activity, fence));
+    // When the connection read the reply, and its fence position (x.3.2
+    // X3 fix r2 #10).
+    let (read, mark) = start
+        .thread
+        .lease
+        .lane()
+        .take_acceptance()
+        .unwrap_or_else(|| (Instant::now(), None));
+    let delivery = normalize_on_tracker(
+        facts,
+        start,
+        (&accepted, (acceptance, read, mark)),
+        (activity, fence),
+    );
     let accepted_turn = Accepted {
         id: accepted,
         start: start_id,
@@ -1548,7 +1561,7 @@ async fn run_started(
 fn normalize_on_tracker(
     facts: &Turn<'_>,
     start: &Started<'_>,
-    (accepted, acceptance): (&str, Acceptance),
+    (accepted, acceptance): (&str, (Acceptance, Instant, Option<Mark>)),
     (activity, fence): (&crate::TurnActivity, u64),
 ) -> Arc<Delivery> {
     let driver = facts.driver;
@@ -1567,6 +1580,7 @@ fn normalize_on_tracker(
             turn: facts.number,
             accepted: accepted.to_owned(),
             acceptance: Some(acceptance),
+            pending: None,
             evidence: Evidence {
                 folder: Arc::clone(start.folder),
                 connection: Arc::clone(start.connection),

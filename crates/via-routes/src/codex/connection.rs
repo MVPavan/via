@@ -698,9 +698,10 @@ impl Connection {
     /// Pairs one reply with its record (item 9.1): an ID that is not one
     /// of this connection's outstanding requests is an unattributable
     /// failure. A thread open's reply registers its lane only for a waiter
-    /// still waiting; a `turn/start` reply maps its turn and releases a
+    /// still waiting; a `turn/start` reply maps its turn, counts its
+    /// acceptance, read at `at`, under the lane's fence and releases a
     /// delayed interrupt.
-    fn pair(&self, id: i64, response: Response) -> Result<(), ConnectionFailure> {
+    fn pair(&self, id: i64, response: Response, at: Instant) -> Result<(), ConnectionFailure> {
         let (waiter, interrupt) = {
             let mut state = self.state();
             let state = &mut *state;
@@ -749,6 +750,11 @@ impl Connection {
                                 Ok(false) => return Err(ConnectionFailure::Overflow),
                                 Err(()) => return Err(ConnectionFailure::Protocol),
                             }
+                        }
+                        // The acceptance is a message of the turn's fence,
+                        // read now (x.3.2 X3 fix r2 #10).
+                        if let Some(lane) = state.threads.lane(lane) {
+                            lane.read_acceptance(at);
                         }
                         interrupt = delayed.map(|by| (thread, accepted.turn.id, by));
                     }
@@ -818,7 +824,7 @@ impl Connection {
         match peek(message.bytes()) {
             Ok(Routing::Response(id)) => {
                 let paired = match decode(message.bytes()) {
-                    Ok(Incoming::Response(response)) => self.pair(id, response),
+                    Ok(Incoming::Response(response)) => self.pair(id, response, at),
                     Ok(Incoming::Request(_) | Incoming::Notification(_)) | Err(_) => {
                         Err(ConnectionFailure::Protocol)
                     }

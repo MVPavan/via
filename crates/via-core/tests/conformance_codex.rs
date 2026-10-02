@@ -1967,10 +1967,14 @@ fn codex_malformed_evidence_owner() {
     }
 }
 
-/// X0 items 5 and 11 (x.3.2 X3 fix r1, finding 11): a declined request
-/// belongs to the turn it names. While turn 2 runs, the connection
-/// answers requests naming turn 1 and an unknown turn as it answers turn
-/// 2's own, but only turn 2's is reported to turn 2.
+/// X0 items 5 and 11 (x.3.2 X3 fix r1, finding 11; fix r2 #3): a
+/// declined request belongs to the turn it names. While turn 2 runs, the
+/// connection answers requests naming turn 1, an unknown turn and turn 2
+/// alike. Only turn 2's is turn 2's; turn 1's is turn 1's late
+/// observation (Core records it `late` on turn 1, whose envelope stays
+/// unchanged), as is the vendor's denial of one of turn 1's items, but not
+/// the declined status of the item VIA declined; the unknown turn's is no
+/// turn's.
 #[test]
 fn codex_decline_owner() {
     let name = "codex_decline_owner";
@@ -1988,13 +1992,42 @@ fn codex_decline_owner() {
             "absent": ["/error"],
             "within_ms": 5250,
         }}));
+        // Turn 1's items complete declined right after its request: one
+        // VIA declined, one the vendor did. Kept apart from the burst
+        // after the last decline, so the lane's bound is not the test's.
+        if n == 0 {
+            for item in ["item-0", "item-7"] {
+                inserted.push(emit(&json!({"method": "item/completed", "params": {
+                    "threadId": THREAD, "turnId": TURN,
+                    "item": {"type": "commandExecution", "id": item, "command": "rm -rf build",
+                        "cwd": "/work/project", "commandActions": [], "status": "declined"}}})));
+            }
+        }
     }
     let (replay, mut expect) = c1_turn2_with(name, &inserted, &[]).unwrap();
     turn_mut(&mut expect, 1)["expect"]["observation_counts"] =
-        json!({"turn.accepted": 1, "vendor.request_declined": 1});
+        json!({"turn.accepted": 1, "vendor.request_declined": 1, "action.denied": 0});
     turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
         json!({"turn.accepted": 1, "vendor.request_declined": 0});
-    variant(name, &replay, &expect).unwrap();
+    check_variant_then(name, &replay, &expect, |pure| {
+        let late: Vec<(usize, Value)> = pure
+            .late
+            .borrow()
+            .iter()
+            .map(|(turn, shaped)| (*turn, shaped["kind"].clone()))
+            .collect();
+        if late
+            == [
+                (0, json!("vendor.request_declined")),
+                (0, json!("action.denied")),
+            ]
+        {
+            Ok(())
+        } else {
+            Err(format!("late observations: {:?}", pure.late.borrow()))
+        }
+    })
+    .unwrap();
 }
 
 /// F8 remainder (packet §8 `codex_bound_gate`; the pure refusals are
@@ -2128,7 +2161,7 @@ fn codex_turns_keep_a_decode_fence() {
         let fences = pure.fences.borrow();
         match (fences.get(&0), fences.get(&1)) {
             (Some(&(first, through)), Some(&second))
-                if (10..=11).contains(&first) && through == first && second == (10, 10) =>
+                if (11..=12).contains(&first) && through == first && second == (11, 11) =>
             {
                 Ok(())
             }
@@ -2159,7 +2192,7 @@ fn codex_stale_fence_counts_nothing() {
     check_variant_then(name, &replay, &expect, |pure| {
         let fences = pure.fences.borrow();
         match (fences.get(&0), fences.get(&1)) {
-            (Some(&(first, through)), Some(&second)) if through <= first && second == (10, 10) => {
+            (Some(&(first, through)), Some(&second)) if through <= first && second == (11, 11) => {
                 Ok(())
             }
             _ => Err(format!(
@@ -2520,4 +2553,54 @@ fn codex_abandoned_turn_detaches() {
         ..conformance_run::Knobs::default()
     };
     check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// Runtime §8 (x.3.2 X3 fix r2 #10): the paired `turn/start` reply is the
+/// turn's acceptance, a message of its decode fence. A resumed turn (no
+/// thread message precedes its fence) is held at a gate right after its
+/// reply while its normalizer is held delivering the acceptance: the
+/// watermark counts the reply and nothing is delivered through it, so
+/// Core's idle frontier sees an outstanding message and decides no idle
+/// cancellation (the turn is not cancelled; it completes as recorded).
+/// At a second gate, past the hold with the vendor still silent, the
+/// delivered acceptance counts: nothing is outstanding. Once the turn
+/// settled, delivery caught up with every message.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_acceptance_is_in_the_decode_fence() {
+    let name = "codex_acceptance_is_in_the_decode_fence";
+    // Occurrence 1 is the resumed identity's send, 2 the acceptance's.
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 2, "action": "delay", "value": 2000}),
+    )
+    .unwrap();
+    let mut replay = replay_of("c5_resume").unwrap();
+    let mut expect = expect_of("c5_resume").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c5_resume"));
+    expect["source"] = replay["source"].clone();
+    let answer = step_with(&replay, "\"result\":{\"turn\"").unwrap();
+    for offset in 1..=2 {
+        steps(&mut replay).unwrap().insert(
+            answer + offset,
+            json!({"await_signal": {"signal": "SIGUSR1"}}),
+        );
+    }
+    // Steps count from 1: the gates are the two steps after the reply.
+    let gate = json!({"accepted": true, "terminal": null, "error": null});
+    turn_mut(&mut expect, 0)["gates"] = json!([
+        {"step": answer + 2, "expect": gate},
+        {"step": answer + 3, "advance_ms": 2500, "expect": gate},
+    ]);
+    check_variant_then(name, &replay, &expect, |pure| {
+        let held = pure.gate_fences.borrow().clone();
+        let settled = pure.fences.borrow().get(&0).copied();
+        match (held.as_slice(), settled) {
+            ([(1, 0), (1, 1)], Some((decoded, delivered))) if decoded == delivered => Ok(()),
+            _ => Err(format!(
+                "decode fences (watermark, delivered) at the gate {held:?}, settled {settled:?}"
+            )),
+        }
+    })
+    .unwrap();
 }

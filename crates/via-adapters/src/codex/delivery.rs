@@ -8,10 +8,12 @@
 //! until then. A message of the turn is normalized and its observations
 //! are handed to the C2 sink; the turn's terminal is retained in the
 //! seal's slot, never sent. A message of another turn, or of none, gives
-//! nothing to the turn; one that does not decode keeps its evidence in the
-//! folder of the turn its correlation names, else in the server's, and
-//! fails the generation `protocol`. A decline is reported only for the
-//! turn it names, once its reply was written whole.
+//! nothing to the turn, but an earlier turn's denial or decline is that
+//! turn's late observation, named by its vendor turn; one that does not
+//! decode keeps its evidence in the folder of the turn its correlation
+//! names, else in the server's, and fails the generation `protocol`. A
+//! decline is reported only for the turn it names, once its reply was
+//! written whole.
 //!
 //! The running turn never waits on the normalizer. It waits for the
 //! seal's decision (the retained terminal, or why delivery stopped)
@@ -27,7 +29,7 @@ use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use via_routes::codex::{
-    Connection, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem, Notification,
+    Connection, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem, Mark, Notification,
     Routed, ServerRequest, TurnFolder, decode,
 };
 
@@ -322,7 +324,12 @@ pub(crate) struct Normalizing {
     pub(crate) normalizer: TurnNormalizer,
     pub(crate) turn: TurnNumber,
     pub(crate) accepted: String,
-    pub(crate) acceptance: Option<Acceptance>,
+    /// The acceptance, with when the connection read its reply and the
+    /// reply's position under the turn's fence (x.3.2 X3 fix r2 #10).
+    pub(crate) acceptance: Option<(Acceptance, Instant, Option<Mark>)>,
+    /// The acceptance's fence position while lane messages before it are
+    /// still undelivered: it counts delivered once they are.
+    pub(crate) pending: Option<u64>,
     pub(crate) evidence: Evidence,
     pub(crate) activity: TurnActivity,
     /// The turn's fence on the lane ([`Lane::fence`]): a message counted
@@ -336,12 +343,22 @@ impl Normalizing {
     /// Delivers the acceptance, then the lane, until the turn's terminal,
     /// the seal, the lane's end or the session's cancellation.
     pub(crate) async fn run(mut self) {
-        if let Some(acceptance) = self.acceptance.take()
-            && !self
-                .output(Observation::Accepted(acceptance), None, Instant::now())
+        if let Some((acceptance, at, mark)) = self.acceptance.take() {
+            if !self
+                .output(Observation::Accepted(acceptance), None, at)
                 .await
-        {
-            return;
+            {
+                return;
+            }
+            // Messages of the fence read before the reply go out after it:
+            // its position counts once they did.
+            if let Some(mark) = mark.filter(|mark| mark.fence == self.fence) {
+                if mark.seq <= 1 {
+                    self.activity.delivered_through(mark.seq);
+                } else {
+                    self.pending = Some(mark.seq);
+                }
+            }
         }
         loop {
             let event = tokio::select! {
@@ -383,7 +400,12 @@ impl Normalizing {
             && mark.fence == self.fence
             && self.delivery.whole(seq)
         {
-            self.activity.delivered_through(mark.seq);
+            let through = if self.pending == mark.seq.checked_add(1) {
+                self.pending.take().unwrap_or(mark.seq)
+            } else {
+                mark.seq
+            };
+            self.activity.delivered_through(through);
         }
         flow
     }
@@ -404,7 +426,11 @@ impl Normalizing {
                         return self.malformed(owner, routed.staged.bytes()).await;
                     }
                 };
-                drop(routed);
+                let named = routed.turn;
+                drop(routed.staged);
+                if let (Owner::Earlier(_), Some(turn)) = (owner, named) {
+                    return self.late(&notification, &turn, at).await;
+                }
                 self.notification(owner, &notification, at).await
             }
             LaneItem::Declined {
@@ -522,9 +548,29 @@ impl Normalizing {
         }
     }
 
+    /// An earlier turn's notification (x.3.2 X3 fix r2 #3): a denial of
+    /// one of its items is that turn's late observation, named by its
+    /// vendor turn `turn` (Core records it `late`, the turn's envelope
+    /// unchanged); anything else of it gives nothing.
+    async fn late(&mut self, notification: &Notification, turn: &str, at: Instant) -> Flow {
+        let Ok(denial) = self.normalizer.late_denial(notification) else {
+            self.delivery.stop(Stop::Overflow);
+            return Flow::Done;
+        };
+        let tools_open = self.normalizer.tools_open();
+        match denial {
+            Some(denial) => {
+                let denied = Observation::ActionDenied(denial);
+                flow(self.output_as(turn, denied, Some(tools_open), at).await)
+            }
+            None => flow(self.delivery.complete(tools_open)),
+        }
+    }
+
     /// X0 item 11: a placeholder of the turn is reported once its reply
-    /// was written whole by `decoded_at + 5 s`; another turn's, or one
-    /// naming none, gives the turn nothing.
+    /// was written whole by `decoded_at + 5 s`; an earlier turn's likewise,
+    /// as that turn's late observation (x.3.2 X3 fix r2 #3); one naming
+    /// another turn, or none, gives the turn nothing.
     async fn declined(
         &mut self,
         owner: Owner,
@@ -532,10 +578,16 @@ impl Normalizing {
         decoded_at: Instant,
         mut written: watch::Receiver<Option<bool>>,
     ) -> Flow {
-        if owner != Owner::This {
-            return flow(self.delivery.complete(self.normalizer.tools_open()));
+        let named = match (owner, request.turn_id.as_deref()) {
+            (Owner::This, _) => self.accepted.clone(),
+            (Owner::Earlier(_), Some(turn)) => turn.to_owned(),
+            (Owner::Earlier(_) | Owner::Unknown | Owner::Thread, _) => {
+                return flow(self.delivery.complete(self.normalizer.tools_open()));
+            }
+        };
+        if owner == Owner::This {
+            self.activity.record(decoded_at);
         }
-        self.activity.record(decoded_at);
         if self.normalizer.note_decline(request).is_err() {
             self.delivery.stop(Stop::Overflow);
             return Flow::Done;
@@ -553,11 +605,10 @@ impl Normalizing {
             return flow(self.delivery.complete(tools_open));
         }
         let declined = Observation::RequestDeclined(normalize::decline(request));
-        if self.output(declined, Some(tools_open), decoded_at).await {
-            Flow::Next
-        } else {
-            Flow::Done
-        }
+        flow(
+            self.output_as(&named, declined, Some(tools_open), decoded_at)
+                .await,
+        )
     }
 
     /// Hands one observation of the turn to the sink: its room reserved
@@ -565,9 +616,21 @@ impl Normalizing {
     /// tools) completes the message. A stall latches the observation
     /// overflow and stops delivery; false once nothing more goes out.
     async fn output(&self, observation: Observation, last: Option<bool>, at: Instant) -> bool {
+        self.output_as(&self.accepted, observation, last, at).await
+    }
+
+    /// [`Self::output`] naming vendor turn `turn`: the running turn's, or
+    /// an earlier turn's for its late observation.
+    async fn output_as(
+        &self,
+        turn: &str,
+        observation: Observation,
+        last: Option<bool>,
+        at: Instant,
+    ) -> bool {
         let item = ObservationItem {
             at,
-            vendor_turn: VendorTurnId::try_from(self.accepted.clone()).ok(),
+            vendor_turn: VendorTurnId::try_from(turn.to_owned()).ok(),
             observation,
         };
         let reserved = tokio::select! {

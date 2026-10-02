@@ -157,6 +157,8 @@ struct Session {
     sizes: (Option<usize>, usize),
     /// The turns committed so far.
     turns: RefCell<u32>,
+    /// Each vendor turn an accepted turn named, with the turn's index.
+    vendor_turns: RefCell<Vec<(String, usize)>>,
 }
 
 /// The shared state of one case's run.
@@ -331,6 +333,7 @@ impl<'a> Run<'a> {
                     plan: plan.clone(),
                     sizes,
                     turns: RefCell::new(0),
+                    vendor_turns: RefCell::default(),
                 },
             );
         }
@@ -616,7 +619,7 @@ impl<'a> Run<'a> {
                         Some(admitted) = receiver.recv(),
                             if released.is_some() && !self.knobs.stall_consumer => {
                             tools.borrow_mut().track(&admitted.item);
-                            self.observe(&admitted.item.observation, seen, &observed);
+                            self.observe(&admitted.item, (session, index), seen, &observed);
                             if self.knobs.abandon_on_accept == Some(index)
                                 && matches!(admitted.item.observation, Observation::Accepted(_))
                             {
@@ -637,14 +640,14 @@ impl<'a> Run<'a> {
             };
             while let Ok(admitted) = receiver.try_recv() {
                 tools.borrow_mut().track(&admitted.item);
-                self.observe(&admitted.item.observation, seen, &observed);
+                self.observe(&admitted.item, (session, index), seen, &observed);
             }
             ended_tx.send_replace(true);
             released.map(|()| end)
         };
         let side = self.side(
             turn,
-            (session, number),
+            (session, number, &activity),
             (seen, ended.clone()),
             (&stop, &observed),
         );
@@ -754,12 +757,40 @@ impl<'a> Run<'a> {
     }
 
     /// Takes one observation: its checker shape, and the turn's events.
+    /// One naming the vendor turn an earlier turn of the session accepted
+    /// is that turn's late observation, as Core attributes it (C1 §6.1
+    /// AD4): kept in [`Pure::late`], not the turn's.
     fn observe(
         &self,
-        observation: &Observation,
+        item: &ObservationItem,
+        (session, index): (&Session, usize),
         seen: &watch::Sender<Seen>,
         observed: &Rc<RefCell<Vec<Value>>>,
     ) {
+        let observation = &item.observation;
+        let named = item
+            .vendor_turn
+            .as_ref()
+            .map(|turn| turn.as_str().to_owned());
+        if let (Observation::Accepted(_), Some(named)) = (observation, &named) {
+            session
+                .vendor_turns
+                .borrow_mut()
+                .push((named.clone(), index));
+        } else if let Some(earlier) = named
+            .and_then(|named| {
+                let turns = session.vendor_turns.borrow();
+                turns
+                    .iter()
+                    .find(|(known, _)| *known == named)
+                    .map(|(_, at)| *at)
+            })
+            .filter(|earlier| *earlier != index)
+        {
+            let shaped = self.shape(observation);
+            self.pure.late.borrow_mut().push((earlier, shaped));
+            return;
+        }
         seen.send_modify(|seen| match observation {
             Observation::Accepted(_) => {
                 seen.accepted = true;
@@ -836,7 +867,7 @@ impl<'a> Run<'a> {
     async fn side(
         &self,
         turn: &Value,
-        (session, number): (&Session, TurnNumber),
+        (session, number, activity): (&Session, TurnNumber, &TurnActivity),
         (seen, ended): (&watch::Sender<Seen>, watch::Receiver<bool>),
         (stop_order, observed): (&watch::Sender<Option<StopOrder>>, &Rc<RefCell<Vec<Value>>>),
     ) -> (Vec<String>, Result<Vec<TurnOutcome>, String>) {
@@ -918,6 +949,8 @@ impl<'a> Run<'a> {
                 if let Some(ms) = gate["advance_ms"].as_u64() {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
+                let sample = (activity.decoded(), activity.delivered());
+                self.pure.gate_fences.borrow_mut().push(sample);
                 snapshots.push(snapshot(&observed.borrow(), &session.plan));
                 self.signal(launch)?;
                 self.until_progress(&format!("signalled {step} launch {launch}"))
