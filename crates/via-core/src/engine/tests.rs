@@ -3314,6 +3314,63 @@ fn a_recovered_envelope_reads_the_turns_own_frozen_values() {
     });
 }
 
+/// Critical r1 #10 (design §7.3): a running turn's frozen values that do
+/// not decode are corrupt evidence, never absence. Recovery treats them as
+/// it treats Store's other corrupt evidence of an unfinished turn (an
+/// unknown `version_status`): startup fails `store_error`, and nothing is
+/// committed in their place, so the turn stays `running` with no
+/// fallback envelope. Each case: malformed JSON, valid JSON of the wrong
+/// shape, and the session's frozen parameters of the wrong shape.
+#[test]
+fn recovery_refuses_malformed_frozen_turn_values() {
+    let Some(root) = child("recovery_refuses_malformed_frozen_turn_values") else {
+        return;
+    };
+    let cases = [
+        "UPDATE turns SET effective='{\"model\":' WHERE session_id=?1",
+        "UPDATE turns SET effective='{\"model\":7}' WHERE session_id=?1",
+        "UPDATE sessions SET params=json_set(params,'$.allow_untested','yes') WHERE id=?1",
+    ];
+    for (index, corruption) in cases.into_iter().enumerate() {
+        let case = root.join(format!("case-{index}"));
+        for part in ["state", "runtime", "runtime/anchors"] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(case.join(part))
+                .unwrap();
+        }
+        let session = run(async {
+            let earlier = open(&case);
+            let session = new_session(&earlier).await;
+            end_turn_one(&earlier, &session, None).await;
+            session
+        });
+        let db = rusqlite::Connection::open(case.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            db.execute(corruption, [session.as_str()]).unwrap(),
+            1,
+            "{corruption}"
+        );
+        let recovered = run(async { open(&case).recover().await });
+        let error = recovered.expect_err(corruption);
+        assert!(error.starts_with("store_error"), "{corruption}: {error}");
+        let (state, envelope): (String, Option<String>) = db
+            .query_row(
+                "SELECT state, envelope FROM turns WHERE session_id=?1 AND number=1",
+                [session.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), envelope),
+            ("running", None),
+            "{corruption}"
+        );
+    }
+}
+
 /// Sol r1 F2, F13, Sol r2 F13 (C2 §2 health, `TurnAbandoned`): a turn
 /// whose run is dropped while pending abandons its `run_turn`, which fails
 /// the driver's health. Under the lane actor only a test drops a turn's

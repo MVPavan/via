@@ -681,9 +681,10 @@ pub struct UnfinishedTurn {
     pub submitted_at: String,
     /// Recorded vendor acceptance correlation, if acceptance committed.
     pub correlation: Option<String>,
-    /// The turn's frozen effective values, as stored; `None` when the
-    /// stored text is not JSON (a recovered envelope then omits them).
-    pub effective: Option<Value>,
+    /// The turn's frozen effective values, as stored. Text that is not
+    /// JSON is corrupt evidence: the list fails `CorruptEvidence`
+    /// (critical r1 #10), as for an unknown `version_status`.
+    pub effective: Value,
     /// The recorded `vendor_version` and `version_status` of the instance
     /// that accepted the turn (C1 §3.7); `None` before an acceptance
     /// recorded one.

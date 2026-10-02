@@ -371,14 +371,18 @@ impl Engine {
         &self,
         session: &SessionId,
     ) -> Result<(Option<String>, Option<Identity>, TurnPlan), StoreError> {
-        Ok(self.store.session_snapshot(session).await?.map_or(
-            (None, None, TurnPlan::default()),
-            |snapshot| {
-                // The turn's own frozen values are not read back here.
-                let plan = TurnPlan::of(&snapshot.route, None);
-                (snapshot.cwd, Identity::stored(&snapshot.route), plan)
-            },
-        ))
+        let Some(snapshot) = self.store.session_snapshot(session).await? else {
+            return Ok((None, None, TurnPlan::default()));
+        };
+        // Critical r1 #10: the session's frozen parameters or capabilities
+        // that do not decode are corrupt evidence, never absence.
+        let frozen = Frozen::decode(&snapshot.route).ok_or(StoreError::CorruptEvidence)?;
+        // The turn's own frozen values are not read back here.
+        let plan = TurnPlan {
+            frozen,
+            effective: None,
+        };
+        Ok((snapshot.cwd, Identity::stored(&snapshot.route), plan))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -562,7 +566,11 @@ impl Engine {
         self.hold(&self.faults.hold_after_history).await;
         let (cwd, identity, mut plan) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
         // Sol r1 #12: the envelope reports this turn's own frozen values.
-        plan.effective = effective.and_then(|effective| serde_json::from_value(effective).ok());
+        // Critical r1 #10: values that do not decode are corrupt evidence,
+        // which fails recovery, and so startup, as Store's own corrupt
+        // evidence of an unfinished turn does: nothing is committed in
+        // their place.
+        plan.effective = Some(serde_json::from_value(effective).map_err(|_| ApiError::STORE)?);
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));

@@ -2079,7 +2079,7 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
                 row.get::<_, u32>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
             ))
@@ -2105,7 +2105,9 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             // A running turn always has its submission time.
             submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
             correlation,
-            effective: effective.and_then(|text| serde_json::from_str(&text).ok()),
+            // Critical r1 #10: frozen values that do not decode are
+            // corrupt evidence, never absence.
+            effective: serde_json::from_str(&effective).map_err(|_| StoreError::CorruptEvidence)?,
             instance,
         });
     }
