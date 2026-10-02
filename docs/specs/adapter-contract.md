@@ -409,11 +409,13 @@ terminal is not an observation: it is retained in the turn's `TurnEnd`
 | `progress` | `at`, `model: bool`, `tools_started: [(id, name)]`, `tools_ended: [id]`, `usage?: UsageSample` | no commit: Core folds it into the running turn's progress snapshot and commits a `steps` row when a step ends (C1 §3.7). `model` marks model output (text, reasoning or a tool request); `usage` is a per-model-call sample, never a cumulative total. A message with no mark sends no item |
 | `final_text` | `text` | no commit: Core appends the text to the turn's final text, inline up to 256 KiB encoded, else in the turn's `final_text.txt` (C1 §5). The adapter sends completed text only, cut so that the whole encoded observation, escaping included, is at most 256 KiB |
 
-Each observation carries `at: Instant` (Core records wall time).
-Ordering (D4): per session, the order the driver
-decoded them, across all of the driver's producers, with `at` never
-earlier than the previous observation's (Core times idle progress by it,
-runtime §8); none across sessions. `class_hint` is a suggestion from the
+Each observation carries `at: Instant`, when the driver decoded it (Core
+records wall time); Core times idle progress and step boundaries by it
+(runtime §8). Ordering (D4): per session, in channel order; `at` never
+decreases within one producer, while items of concurrent producers of one
+session may be admitted out of `at` order, so Core never moves an idle
+deadline back and never ends a step before it started. None across
+sessions. `class_hint` is a suggestion from the
 vendor code table (§6); Core applies C1 §7.6 precedence (cancel evidence
 before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure

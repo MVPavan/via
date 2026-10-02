@@ -6903,6 +6903,247 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
     });
 }
 
+/// Bead via-mnx (runtime §8, C2 §4): the turn's progress moves its idle
+/// deadline by the progress's own decode time, even when the session
+/// channel admits an item another producer stamped later ahead of it (a
+/// retirement's, beside a pinned next turn); the channel never rewrites
+/// `at`. The progress decoded at 0.0
+/// is read after an item stamped at 0.8, both before the deadline at 1.0;
+/// the deadline moves to 1.0 + ε, not to 1.8, so the turn expires by 1.5.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn progress_admitted_behind_a_later_stamp_keeps_its_decode_time() {
+    let Some(root) = child("progress_admitted_behind_a_later_stamp_keeps_its_decode_time") else {
+        return;
+    };
+    let intent = "store.journal.anchor_intent";
+    let points = count_points(&root, &[intent]);
+    run(async {
+        use via_adapters::{Observation, ObservationItem, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let (sink, receiver) =
+            via_adapters::observation_channel_in(&via_adapters::ObservationBudget::new());
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let stall = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let (expired, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // The turn's own progress, decoded now; its sender is slow.
+                let progress = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::Progress(ProgressMarks {
+                        model: true,
+                        ..ProgressMarks::default()
+                    }),
+                };
+                tokio::time::sleep_until(at(8)).await;
+                // Another producer's item, stamped at 0.8, is admitted first.
+                let other = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::FinalText("t".to_owned()),
+                };
+                assert!(sink.clone().deliver(other, stall).await);
+                assert!(sink.deliver(progress, stall).await);
+                tokio::time::sleep_until(at(15)).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                expired
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(
+            matches!(expired, Some(via_adapters::StopCause::IdleDeadline)),
+            "the idle deadline did not expire by its decode time: {expired:?}"
+        );
+    });
+}
+
+/// Bead via-mnx (C2 §4, runtime §8): concurrent producers' items may be
+/// admitted out of `at` order. The turn's progress decoded at 0.6 moves
+/// the idle deadline to 1.6; progress decoded at 0.2, admitted after it,
+/// leaves it there: the turn is live at 1.4 and expired by 2.0.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn older_progress_admitted_after_newer_leaves_the_idle_deadline() {
+    let Some(root) = child("older_progress_admitted_after_newer_leaves_the_idle_deadline") else {
+        return;
+    };
+    let intent = "store.journal.anchor_intent";
+    let points = count_points(&root, &[intent]);
+    run(async {
+        use via_adapters::{Observation, ObservationItem, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let (sink, receiver) =
+            via_adapters::observation_channel_in(&via_adapters::ObservationBudget::new());
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let stall = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let progress = || ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
+            observation: Observation::Progress(ProgressMarks {
+                model: true,
+                ..ProgressMarks::default()
+            }),
+        };
+        let ((live, expired), ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                tokio::time::sleep_until(at(2)).await;
+                let older = progress();
+                tokio::time::sleep_until(at(6)).await;
+                assert!(sink.clone().deliver(progress(), stall).await);
+                assert!(sink.deliver(older, stall).await);
+                tokio::time::sleep_until(at(14)).await;
+                let live = probe.borrow().is_none();
+                tokio::time::sleep_until(at(20)).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                (live, expired)
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(live, "the older progress moved the idle deadline back");
+        assert!(
+            matches!(expired, Some(via_adapters::StopCause::IdleDeadline)),
+            "the idle deadline moved past the newer progress's: {expired:?}"
+        );
+    });
+}
+
+/// Bead via-mnx r3 (C2 §4, runtime §8): concurrent producers' items may
+/// be admitted out of `at` order, so an item decoded after the deadline
+/// at the head of the channel does not prove the turn idle. Core is held
+/// across the deadline (1.0) while another producer's item stamped 1.1
+/// is queued ahead of the turn's progress decoded at 0.8; once released,
+/// that progress moves the deadline to 1.8 before any idle order.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn timely_progress_behind_a_late_stamp_keeps_the_turn() {
+    let Some(root) = child("timely_progress_behind_a_late_stamp_keeps_the_turn") else {
+        return;
+    };
+    let (intent, pause) = ("store.journal.anchor_intent", "core.observations.pause");
+    let points = count_points(&root, &[intent, pause]);
+    run(async {
+        use via_adapters::{Observation, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let held_item = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let admitted = |observation: Observation| via_adapters::Admitted {
+            item: via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: None,
+                observation,
+            },
+            permit: std::sync::Arc::clone(&budget)
+                .try_acquire_many_owned(10)
+                .unwrap(),
+        };
+        let (live, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // A final text piece holds Core across the deadline.
+                sender
+                    .send(admitted(Observation::FinalText("a".to_owned())))
+                    .await
+                    .unwrap();
+                until(|| acked(&points, pause, held_item)).await;
+                // The turn's progress, decoded at 0.8; its sender is slow.
+                tokio::time::sleep_until(at(8)).await;
+                let progress = admitted(Observation::Progress(ProgressMarks {
+                    model: true,
+                    ..ProgressMarks::default()
+                }));
+                // Another producer's item, stamped at 1.1, is admitted first.
+                tokio::time::sleep_until(at(11)).await;
+                sender
+                    .send(admitted(Observation::FinalText("r".to_owned())))
+                    .await
+                    .unwrap();
+                sender.send(progress).await.unwrap();
+                tokio::time::sleep_until(at(12)).await;
+                release_point(&points, pause, held_item);
+                tokio::time::sleep_until(at(15)).await;
+                let live = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                live
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(live.is_none(), "the idle deadline expired: {live:?}");
+    });
+}
+
 /// Critical r3 #1 (Task 4 design §5, runtime §8): idle expiry is decided
 /// at the item frontier. Reconciliation at the fired deadline is itself
 /// held in an item's handling while more of the turn's progress, decoded
