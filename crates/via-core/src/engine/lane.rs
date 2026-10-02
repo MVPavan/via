@@ -1266,8 +1266,9 @@ impl Engine {
     }
 
     /// The session's lane for its submitted turn, which found none to
-    /// claim, opened for the turn's frozen values in `cwd` (C2 §2
-    /// `open_session`, logical: no vendor I/O) from the session's stored
+    /// claim, opened for the turn's frozen values and the session's frozen
+    /// `inherit` in `cwd` (C2 §2 `open_session`, logical: no vendor I/O;
+    /// critical r1 #2) from the session's stored
     /// route identity `route` (Sol r1 F12, decision H3), and claimed. A
     /// route identity the Store does not hold is not invented: the driver
     /// then has no adapter and refuses the turn. A lane it replaces stays
@@ -1278,7 +1279,7 @@ impl Engine {
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
-        (route, effective, cwd): (&SessionRoute, &Effective, PathBuf),
+        ((route, effective, inherit), cwd): ((&SessionRoute, &Effective, Inherit), PathBuf),
         resident: OwnedSemaphorePermit,
     ) -> LaneClaim {
         let replaced = lock(&self.lanes).get(session).cloned();
@@ -1300,7 +1301,7 @@ impl Engine {
             initial_bound: effective.bound().cloned(),
             cwd,
             vendor: frozen.vendor,
-            inherit: Inherit::OD2_DEFAULT,
+            inherit,
             confirmed_vendor_session_id: state
                 .identity
                 .as_ref()

@@ -8,9 +8,9 @@ use std::{
 
 use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, Admitted, Decline, Denial, DenialKind, Observation, ObservationItem, Prepared,
-    RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd, TurnEvidence,
-    TurnSpec, VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
+    AdapterError, Admitted, Decline, Denial, DenialKind, Inherit, Observation, ObservationItem,
+    Prepared, RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd,
+    TurnEvidence, TurnSpec, VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
@@ -61,6 +61,9 @@ pub(super) struct Submission {
     queued: QueuedTurn,
     prompt: String,
     effective: Effective,
+    /// The session's frozen effective `inherit`, which its driver opens
+    /// with (critical r1 #2).
+    inherit: Inherit,
     submitted: SystemTime,
     clock: Instant,
 }
@@ -479,8 +482,8 @@ impl Engine {
         let claim = match claim {
             Ok(claim) => claim,
             Err(resident) => {
-                self.open_lane(session, (&route, &submission.effective, cwd), resident)
-                    .await
+                let frozen = (&route, &submission.effective, submission.inherit);
+                self.open_lane(session, (frozen, cwd), resident).await
             }
         };
         self.queued.fetch_sub(1, Ordering::AcqRel);
@@ -808,6 +811,7 @@ impl Engine {
             effective,
             submitted,
             clock,
+            ..
         } = submission;
         let started = self.started((&session, turn), (queued, &effective), (submitted, clock));
         // Design §2 [r1.11]: both deadlines run from the submission clock.
@@ -2476,10 +2480,11 @@ impl Engine {
         let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
             return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
         };
-        // Sol r1 #14: so does a session's frozen parameters or capabilities.
-        if Frozen::decode(&queued.route).is_none() {
+        // Sol r1 #14: so does a session's frozen parameters or capabilities,
+        // and critical r1 #2 a frozen `inherit` that is not there to read.
+        let Some(inherit) = Frozen::decode(&queued.route).and_then(|frozen| frozen.inherit) else {
             return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
-        }
+        };
         // Design §6.5: a blob prompt is loaded into one exact `String` with
         // its SHA-256 and UTF-8 checks; a blob that differs from its record
         // fails the turn as corrupt evidence, before anything is sent.
@@ -2543,6 +2548,7 @@ impl Engine {
             queued,
             prompt,
             effective,
+            inherit,
             submitted,
             clock,
         })

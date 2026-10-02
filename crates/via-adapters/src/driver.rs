@@ -324,6 +324,11 @@ impl SessionDriver {
             .map(|adapter| adapter.profile().adapter_version.clone())
     }
 
+    /// The `SessionSpec` the driver was opened with.
+    pub fn spec(&self) -> &SessionSpec {
+        &self.spec
+    }
+
     /// The ID identity confirmations name for the driver's current
     /// connection generation, the latest it opened (C2 §2 delayed identity:
     /// Core checks the current generation); `None` before the first.

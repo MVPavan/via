@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use via_adapters::{Bound, Capabilities, SessionRef, Support, VendorOptions, Verb};
+use via_adapters::{Bound, Capabilities, Inherit, SessionRef, Support, VendorOptions, Verb};
 use via_store::SessionRoute;
 
 use super::{Effective, Planned, SessionMembers};
@@ -36,9 +36,9 @@ struct Params {
     cwd: Option<String>,
     #[serde(default)]
     allow_untested: bool,
-    /// The effective inherited-configuration states (AD13).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inherit: Option<Value>,
+    /// The effective inherited-configuration states (AD13), which the
+    /// session's driver opens with (C2 §6.2): required, never defaulted.
+    inherit: Inherit,
     /// The categories whose effective state is not the requested one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     inherit_unverified: Option<Value>,
@@ -67,7 +67,7 @@ pub(crate) fn frozen_params(
         model: params.model.clone(),
         cwd: Some(cwd.to_owned()),
         allow_untested: params.allow_untested,
-        inherit: Some(serde_json::to_value(planned.plan.inherit).map_err(|_| ApiError::STORE)?),
+        inherit: planned.plan.inherit,
         inherit_unverified: unverified,
         instructions: members.instructions.clone(),
         vendor: planned.effective.vendor.clone(),
@@ -88,7 +88,9 @@ pub(crate) struct Frozen {
     pub(crate) instructions: Option<String>,
     pub(crate) vendor: VendorOptions,
     pub(crate) allow_untested: bool,
-    pub(crate) inherit: Option<Value>,
+    /// The frozen effective `inherit`; `None` only where the row's
+    /// parameters were not read.
+    pub(crate) inherit: Option<Inherit>,
     unverified: Option<Value>,
     capabilities: Option<Capabilities>,
 }
@@ -140,7 +142,7 @@ impl Frozen {
             frozen.instructions = params.instructions;
             frozen.vendor = params.vendor;
             frozen.allow_untested = params.allow_untested;
-            frozen.inherit = params.inherit;
+            frozen.inherit = Some(params.inherit);
             frozen.unverified = params.inherit_unverified;
         }
         frozen
@@ -254,5 +256,46 @@ impl TurnPlan {
             .as_ref()
             .and_then(|effective| serde_json::to_value(&effective.vendor).ok())
             .unwrap_or_else(|| json!({}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use via_store::SessionRoute;
+
+    use super::Frozen;
+
+    fn route(params: &serde_json::Value) -> SessionRoute {
+        SessionRoute {
+            harness: "fake".to_owned(),
+            params: Some(params.to_string()),
+            ..SessionRoute::default()
+        }
+    }
+
+    /// Critical r1 #2: the frozen `inherit` decodes into the typed C2
+    /// value; one that is absent, misnamed, incomplete or not a state is
+    /// corrupt, never a default.
+    #[test]
+    fn the_frozen_inherit_is_typed_and_required() {
+        let inherit = json!({"hooks":"unknown","mcp_servers":"off","plugins":"on",
+                             "skills":"on","agents":"off","instruction_files":"on"});
+        let params = json!({"harness":"fake","model":"fake","cwd":"/w","inherit":inherit});
+        let frozen = Frozen::decode(&route(&params)).unwrap();
+        assert_eq!(serde_json::to_value(frozen.inherit).unwrap(), inherit);
+        let mut absent = params.clone();
+        absent.as_object_mut().unwrap().remove("inherit");
+        let mut unknown_state = params.clone();
+        unknown_state["inherit"]["hooks"] = json!("maybe");
+        let mut missing = params.clone();
+        missing["inherit"].as_object_mut().unwrap().remove("skills");
+        let mut extra = params.clone();
+        extra["inherit"]["themes"] = json!("on");
+        let mut shape = params;
+        shape["inherit"] = json!(["on"]);
+        for case in [absent, unknown_state, missing, extra, shape] {
+            assert!(Frozen::decode(&route(&case)).is_none(), "{case}");
+        }
     }
 }

@@ -59,12 +59,12 @@ fn child(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn run(body: impl Future<Output = ()>) {
+fn run<T>(body: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(body);
+        .block_on(body)
 }
 
 fn open(root: &Path) -> std::sync::Arc<Engine> {
@@ -2840,7 +2840,10 @@ async fn running_turn_2_with(
     let lane = engine
         .open_lane(
             &session,
-            (&route, &plain_effective(), root.to_path_buf()),
+            (
+                (&route, &plain_effective(), frozen_inherit(&route)),
+                root.to_path_buf(),
+            ),
             resident(engine),
         )
         .await;
@@ -3120,6 +3123,61 @@ fn a_lane_opens_from_the_sessions_stored_route_identity() {
             ),
             ("fake", "fake", env!("CARGO_PKG_VERSION"))
         );
+    });
+}
+
+/// Critical r1 #2 (C2 §2 `SessionSpec`, §6.2, AD13): the driver opens
+/// with the session's frozen effective `inherit`: a session's first lane,
+/// and the lane a later daemon reopens for a session spawned before the
+/// restart, though that daemon's own plan would differ. (A dispatched
+/// turn here ends `unknown`, since no anchor exists, which would cancel
+/// its successors, so the reopened session's turn 1 ends `failed`.)
+#[test]
+fn a_lane_opens_with_the_sessions_frozen_inherit() {
+    let Some(root) = child("a_lane_opens_with_the_sessions_frozen_inherit") else {
+        return;
+    };
+    let scenario = |profile: Value| {
+        let path = env::var_os("VIA_FAKE_SCENARIO").unwrap();
+        fs::write(path, json!({"profile": profile, "scripts": []}).to_string()).unwrap();
+    };
+    // Spawned under a profile whose switches leave hooks and plugins
+    // `unknown` and agents `off`.
+    scenario(json!({"categories": {
+        "hooks": {"off": "unverified"},
+        "plugins": {"on": "none"},
+        "agents": {"on": "none", "observed": "off"},
+    }}));
+    let frozen = json!({"hooks":"unknown","mcp_servers":"off","plugins":"unknown",
+                        "skills":"on","agents":"off","instruction_files":"on"});
+    let spec_inherit = |engine: &Engine, session: &SessionId| {
+        let lane = super::lock(&engine.lanes).get(session).cloned();
+        serde_json::to_value(lane.expect("the session's lane").driver.spec().inherit).unwrap()
+    };
+    let reopened = run(async {
+        let engine = open(&root);
+        let opened = new_session(&engine).await;
+        dispatch(&engine, &opened).await;
+        assert_eq!(spec_inherit(&engine, &opened), frozen);
+        let reopened = new_session(&engine).await;
+        end_turn_one(&engine, &reopened, Some("failed")).await;
+        shutdown(&engine).await;
+        reopened
+    });
+    // The next daemon's plan would request the OD2 default with every
+    // switch verified: its lane still takes the frozen states.
+    let both = json!({"on": "verified", "off": "verified"});
+    scenario(
+        json!({"categories": {"hooks": both, "mcp_servers": both, "plugins": both,
+        "skills": both, "agents": both, "instruction_files": both}}),
+    );
+    run(async {
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        resume(&engine, &reopened, None).await;
+        dispatch(&engine, &reopened).await;
+        assert_eq!(spec_inherit(&engine, &reopened), frozen);
+        shutdown(&engine).await;
     });
 }
 
@@ -3429,6 +3487,11 @@ async fn open_test_driver(
         },
     );
     (driver, reference, route)
+}
+
+/// The session's frozen `inherit`, read from its stored route.
+fn frozen_inherit(route: &via_store::SessionRoute) -> via_adapters::Inherit {
+    crate::intake::Frozen::of(route).inherit.unwrap()
 }
 
 /// Sends `observation`, naming `vendor_turn`, into a test lane's channel
@@ -4025,7 +4088,10 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
         let successor = engine
             .open_lane(
                 &session,
-                (&route, &plain_effective(), root.clone()),
+                (
+                    (&route, &plain_effective(), frozen_inherit(&route)),
+                    root.clone(),
+                ),
                 resident(&engine),
             )
             .await;
@@ -4247,7 +4313,10 @@ fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
         let successor = engine
             .open_lane(
                 &session,
-                (&route, &plain_effective(), root.clone()),
+                (
+                    (&route, &plain_effective(), frozen_inherit(&route)),
+                    root.clone(),
+                ),
                 resident(&engine),
             )
             .await;
@@ -4625,7 +4694,7 @@ fn a_dropped_replacement_leaves_the_old_lane_owning_its_work() {
         {
             let replacing = engine.open_lane(
                 &session,
-                (&route, &effective, root.clone()),
+                ((&route, &effective, frozen_inherit(&route)), root.clone()),
                 resident(&engine),
             );
             assert!(

@@ -320,6 +320,24 @@ impl Serialize for Inherit {
     }
 }
 
+/// The `Serialize` form back: every category exactly once, each a state;
+/// anything else is refused, never completed with a default.
+impl<'de> Deserialize<'de> for Inherit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let states = BTreeMap::<Category, InheritState>::deserialize(deserializer)?;
+        if states.len() != Category::ALL.len() {
+            return Err(serde::de::Error::custom(
+                "inherit names every category once",
+            ));
+        }
+        let mut inherit = Self::OD2_DEFAULT;
+        for (category, state) in states {
+            inherit.set(category, state);
+        }
+        Ok(inherit)
+    }
+}
+
 /// Whether VIA can apply one direction of a category (AD13).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
