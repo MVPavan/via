@@ -924,3 +924,50 @@ async fn s1_wire_control_messages_are_distinct_and_bounded()
     assert_eq!(fallback_drops(), 0);
     Ok(())
 }
+
+/// x.3.2 J0 (shared connections): a control message's deadline bounds only
+/// the wait for its first byte. One cut before any byte is refused
+/// `NotWritten` and stdin stays open; one already started is written whole,
+/// so no deadline leaves a partial line or closes a shared stdin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_control_deadline_never_closes_stdin() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control-deadline")?;
+    let control = |bytes: &[u8]| OutboundMessage::Control(bytes.to_vec());
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let long = after(Duration::from_secs(10));
+
+    // The pipe is full: the next control's deadline passes before any byte.
+    let fill = input.write(control(&[b'a'; 16]), long).await?;
+    assert_eq!(fill, SendOutcome::Written);
+    let cut = input
+        .write(control(b"cut\n"), after(Duration::from_millis(100)))
+        .await?;
+    assert_eq!(cut, SendOutcome::NotWritten, "nothing of it was written");
+
+    // Started, then held past its deadline: it completes once the vendor reads.
+    let mut filled = [0_u8; 16];
+    vendor_stdin.read_exact(&mut filled).await?;
+    assert_eq!(filled, [b'a'; 16]);
+    let mut started = [input.write(control(&[b'b'; 48]), after(Duration::from_millis(100)))];
+    enqueue_all(&mut started).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reading = tokio::spawn(async move {
+        let mut bytes = vec![0_u8; 48 + 5];
+        vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
+    });
+    let [started] = started;
+    assert_eq!(started.await?, SendOutcome::Written, "written whole");
+    let next = input.write(control(b"next\n"), long).await?;
+    assert_eq!(next, SendOutcome::Written, "stdin stayed open");
+    let read = reading.await??;
+    let mut expected = vec![b'b'; 48];
+    expected.extend(b"next\n");
+    assert_eq!(read, expected);
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    Ok(())
+}

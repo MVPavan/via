@@ -101,9 +101,13 @@ pub enum OutboundMessage {
     /// `NotWritten`.
     Interrupt(Vec<u8>),
     /// A distinct control message, written whole between messages and
-    /// never coalesced (runtime §8, C2 §2). At most [`CONTROL_MESSAGES`]
-    /// are outstanding, [`CONTROL_BYTES`] in total; one past either is
-    /// refused at once with `NotWritten`, nothing written.
+    /// never coalesced (runtime §8, C2 §2). At most eight are outstanding,
+    /// 64 KiB in total; one past either is refused at once with
+    /// `NotWritten`, nothing written. Its deadline bounds only the wait for
+    /// its first byte: one cut before it answers `NotWritten` and stdin
+    /// stays open; one started is written whole, cut only by the
+    /// connection's stop. A deadline thus never closes a stdin other
+    /// sessions may share.
     Control(Vec<u8>),
 }
 
@@ -396,7 +400,9 @@ struct Process {
 impl WireSender {
     /// Enqueues one input message; the returned write resolves once the
     /// writer answered. `deadline` bounds the write itself: a message cut
-    /// short by it closes stdin and answers `Indeterminate`.
+    /// short by it closes stdin and answers `Indeterminate`, or `NotWritten`
+    /// when nothing of it was written. A `Control` message differs: see
+    /// [`OutboundMessage::Control`].
     pub fn write(&self, message: OutboundMessage, deadline: Deadline) -> PendingWrite {
         self.io.write(message, deadline)
     }
@@ -977,10 +983,12 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
             stdin: &mut stdin,
             stop: &mut stop,
             deadline: job.deadline,
+            whole: job.budgeted.is_some(),
             written: false,
+            timed_out: false,
         };
         let outcome = writing.message(&job.message, &mut piece).await;
-        let written = writing.written;
+        let (written, timed_out) = (writing.written, writing.timed_out);
         // Resolved, whatever the outcome: its share returns before the
         // answer, so a caller answered may enqueue the next at once.
         if let Some(length) = job.budgeted {
@@ -1001,6 +1009,11 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                 let _ = job.start;
                 let _ = job.reply.send(Ok(SendOutcome::Written));
             }
+            // A control message's deadline passed before its first byte:
+            // refused, and stdin stays open for the messages after it.
+            Ok(false) if job.budgeted.is_some() && timed_out && !written => {
+                let _ = job.reply.send(Ok(SendOutcome::NotWritten));
+            }
             Ok(false) => {
                 let _ = job.reply.send(Ok(if written {
                     SendOutcome::Indeterminate
@@ -1017,7 +1030,13 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
         }
     }
     drop(stdin);
-    // Nothing queued after the end is written.
+    refuse_queued(&shared, &mut queues);
+    closed.send_replace(true);
+}
+
+/// The writer's end: nothing queued after it is written, so each queued
+/// write answers `NotWritten` and a control message returns its share.
+fn refuse_queued(shared: &Shared, queues: &mut Queues) {
     queues.control.close();
     queues.data.close();
     while let Ok(control) = queues.control.try_recv() {
@@ -1035,7 +1054,6 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
     while let Ok(data) = queues.data.try_recv() {
         let _ = data.reply.send(Ok(SendOutcome::NotWritten));
     }
-    closed.send_replace(true);
 }
 
 /// One message being written.
@@ -1043,8 +1061,14 @@ struct Writing<'a, W> {
     stdin: &'a mut W,
     stop: &'a mut watch::Receiver<bool>,
     deadline: Deadline,
+    /// A control message: the deadline bounds only the wait for its first
+    /// byte, and one started is written whole, so a deadline never leaves a
+    /// partial line nor closes a stdin other sessions may share.
+    whole: bool,
     /// Some byte of the message was written.
     written: bool,
+    /// The deadline cut the message.
+    timed_out: bool,
 }
 
 impl<W: AsyncWrite + Unpin> Writing<'_, W> {
@@ -1090,13 +1114,26 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
         let mut offset = 0;
         while offset < bytes.len() {
             // A pipe write is cancel-safe: a cancelled one wrote nothing.
+            let bounded = !(self.whole && self.written);
+            let (deadline, pending) = (self.deadline.instant(), self.stdin.write(&bytes[offset..]));
+            let pending = async move {
+                if bounded {
+                    timeout_at(deadline, pending).await
+                } else {
+                    Ok(pending.await)
+                }
+            };
             let write = tokio::select! {
                 biased;
                 () = stopped(self.stop) => return Ok(false),
-                write = timeout_at(self.deadline.instant(), self.stdin.write(&bytes[offset..])) => write,
+                write = pending => write,
             };
             match write {
-                Err(_) | Ok(Ok(0)) => return Ok(false),
+                Err(_) => {
+                    self.timed_out = true;
+                    return Ok(false);
+                }
+                Ok(Ok(0)) => return Ok(false),
                 Ok(Ok(count)) => {
                     self.written = true;
                     offset += count;
