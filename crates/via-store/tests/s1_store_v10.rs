@@ -1,6 +1,6 @@
 //! Task 4 design §6.6, runtime §6: the schema, v10 since keyed `steer`
-//! operation rows (v9: server-owned anchors and the turn → server-anchor
-//! link), is frozen by a golden DDL.
+//! operation rows and the partial index on the open ones (v9: server-owned
+//! anchors and the turn → server-anchor link), is frozen by a golden DDL.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -31,6 +31,12 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
         "events_turn",
         "events",
         "CREATE INDEX events_turn ON events(session_id,turn,seq)",
+    ),
+    (
+        "index",
+        "operations_open_steers",
+        "operations",
+        "CREATE INDEX operations_open_steers ON operations(session_id,op_key) WHERE verb='steer' AND result IS NULL",
     ),
     (
         "index",

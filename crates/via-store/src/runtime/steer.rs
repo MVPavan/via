@@ -6,7 +6,7 @@
 use super::{
     Connection, OptionalExtension, SessionId, SteerIntent, SteerOutcome, StoreError,
     TransactionBehavior, Value, params,
-    sql::{commit, identity_len, json, sql_error},
+    sql::{before_commit, commit, identity_len, json, sql_error},
 };
 
 /// Inserts a keyed steer's intent row with no result. A key the session
@@ -39,54 +39,51 @@ pub(super) fn commit_steer_intent(
         ],
     )
     .map_err(sql_error)?;
+    before_commit!("store.commit.steer_intent");
     commit(tx)
 }
 
-/// Records `outcome` on the session's steer intent row in `tx`, unless an
-/// outcome is recorded already; the caller's transaction makes it atomic
-/// with what it commits, such as the `steer.delivered` event.
+/// Records `outcome` on the session's open steer intent row in `tx`; the
+/// caller's transaction makes it atomic with what it commits, such as the
+/// `steer.delivered` event. Exactly that one row is updated: a missing
+/// key, another verb's key or a resolved intent is refused, and the
+/// caller's transaction rolls back (K2 r1 #2).
 pub(super) fn record_steer_outcome(
     tx: &rusqlite::Transaction<'_>,
     session: &SessionId,
     outcome: &SteerOutcome,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "UPDATE operations SET result=?3 WHERE session_id=?1 AND op_key=?2 AND verb='steer' AND result IS NULL",
-        params![session.as_str(), outcome.op_key, json(&outcome.result)?],
-    )
-    .map_err(sql_error)?;
+    let updated = tx
+        .execute(
+            "UPDATE operations SET result=?3 WHERE session_id=?1 AND op_key=?2 AND verb='steer' AND result IS NULL",
+            params![session.as_str(), outcome.op_key, json(&outcome.result)?],
+        )
+        .map_err(sql_error)?;
+    if updated != 1 {
+        return Err(StoreError::Constraint("no open steer intent under the key"));
+    }
     Ok(())
 }
 
-/// Records a keyed steer's outcome alone, unless one is recorded already,
-/// and returns the stored one. A key with no steer row is refused.
+/// Records a keyed steer's outcome alone, on its open intent row
+/// ([`record_steer_outcome`]).
 pub(super) fn commit_steer_outcome(
     conn: &mut Connection,
     session: &SessionId,
     outcome: &SteerOutcome,
-) -> Result<Value, StoreError> {
+) -> Result<(), StoreError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
     record_steer_outcome(&tx, session, outcome)?;
-    let stored: Option<Option<String>> = tx
-        .query_row(
-            "SELECT result FROM operations WHERE session_id=?1 AND op_key=?2 AND verb='steer'",
-            params![session.as_str(), outcome.op_key],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    let stored = stored
-        .ok_or(StoreError::Constraint("no steer intent under the key"))?
-        .ok_or(StoreError::CorruptEvidence)?;
-    let stored = serde_json::from_str(&stored).map_err(|_| StoreError::CorruptEvidence)?;
-    commit(tx)?;
-    Ok(stored)
+    before_commit!("store.commit.steer_outcome");
+    commit(tx)
 }
 
 /// Records `result` as the outcome of every steer intent row without one,
-/// in one transaction; returns how many.
+/// in one transaction; returns how many. Restart recovery's, before
+/// admission, when no attempt can still record an outcome; the partial
+/// index `operations_open_steers` finds the rows.
 pub(super) fn resolve_steer_intents(
     conn: &mut Connection,
     result: &Value,

@@ -197,6 +197,8 @@ const SCHEMA_V10: &str = "CREATE TABLE sessions (
     turn INTEGER, result TEXT, PRIMARY KEY(session_id,op_key),
     CHECK(verb IN ('close','steer') OR (turn IS NOT NULL AND result IS NOT NULL)),
     FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number));
+ CREATE INDEX operations_open_steers ON operations(session_id,op_key)
+    WHERE verb='steer' AND result IS NULL;
  CREATE TABLE events (
     session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
     turn INTEGER, type TEXT NOT NULL, event TEXT NOT NULL,

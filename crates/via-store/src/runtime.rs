@@ -1204,7 +1204,7 @@ pub(crate) enum Command {
     SteerOutcome(
         SessionId,
         SteerOutcome,
-        oneshot::Sender<Result<Value, StoreError>>,
+        oneshot::Sender<Result<(), StoreError>>,
     ),
     SteerIntentsResolved(Value, oneshot::Sender<Result<u64, StoreError>>),
     SubmitFailed(SubmitFailedRecord, oneshot::Sender<Result<(), StoreError>>),
@@ -2336,15 +2336,14 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
-    /// Records a keyed steer's outcome on its intent row unless one is
-    /// recorded already, and returns the stored outcome, the first one
-    /// recorded (C1 §3.4). A key with no steer intent row is refused
-    /// ([`StoreError::Constraint`]).
+    /// Records a keyed steer's outcome alone on its open intent row (C1
+    /// §3.4). A key with no steer intent row, or one already resolved, is
+    /// refused ([`StoreError::Constraint`]) and nothing is written.
     pub async fn commit_steer_outcome(
         &self,
         session_id: &SessionId,
         outcome: SteerOutcome,
-    ) -> Result<Value, StoreError> {
+    ) -> Result<(), StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::SteerOutcome(session_id.clone(), outcome, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?

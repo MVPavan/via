@@ -201,20 +201,19 @@ impl Engine {
         }
     }
 
-    /// Records `outcome` under `key` unless one is recorded already, and
-    /// returns the stored one.
+    /// Records `outcome` under `key`, on its open intent, and returns it.
     async fn record_outcome(
         &self,
         (session, op_key): &(SessionId, String),
         outcome: Value,
         admission: Option<&Admission<'_>>,
     ) -> Result<Value, ApiError> {
-        let outcome = SteerOutcome {
+        let record = SteerOutcome {
             op_key: op_key.clone(),
-            result: outcome,
+            result: outcome.clone(),
         };
-        match self.store.commit_steer_outcome(session, outcome).await {
-            Ok(stored) => Ok(stored),
+        match self.store.commit_steer_outcome(session, record).await {
+            Ok(()) => Ok(outcome),
             Err(error) => Err(self.steer_write_failed(&error, admission).await),
         }
     }

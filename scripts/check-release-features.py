@@ -49,6 +49,8 @@ POINTS = [
     "store.commit.session_closed",
     "store.commit.closing",
     "store.commit.closed",
+    "store.commit.steer_intent",
+    "store.commit.steer_outcome",
     "store.commit.fail_persistent",
     "store.journal.anchor_intent",
     "store.journal.identified",

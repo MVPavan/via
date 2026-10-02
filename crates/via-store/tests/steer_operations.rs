@@ -102,8 +102,9 @@ async fn row(client: &StoreClient, key: &str) -> Option<(OperationVerb, Identity
 }
 
 /// An intent row reads as a steer with no result. Its outcome is recorded
-/// once: a second outcome keeps and returns the first. A key already held
-/// refuses a second intent, and an outcome needs an intent.
+/// once: a second outcome is refused and leaves the first (K2 r1 #2). A
+/// key already held refuses a second intent, and an outcome needs an
+/// intent.
 #[test]
 fn a_steer_intent_takes_one_outcome() {
     let root = private_dir();
@@ -120,16 +121,17 @@ fn a_steer_intent_takes_one_outcome() {
             Some((OperationVerb::Steer, Identity::of(b"one"), None))
         );
         let first = json!({"refused":"no_active_turn"});
-        let stored = client
+        client
             .commit_steer_outcome(&session(), outcome("k-1", &first))
             .await
             .unwrap();
-        assert_eq!(stored, first);
-        let stored = client
+        let second = client
             .commit_steer_outcome(&session(), outcome("k-1", &json!({"other":true})))
-            .await
-            .unwrap();
-        assert_eq!(stored, first, "the first outcome stays");
+            .await;
+        assert!(
+            matches!(second, Err(StoreError::Constraint(_))),
+            "a resolved intent takes no second outcome: {second:?}"
+        );
         assert_eq!(
             row(&client, "k-1").await,
             Some((OperationVerb::Steer, Identity::of(b"one"), Some(first)))
@@ -276,4 +278,107 @@ fn recovery_resolves_only_open_steer_intents() {
         );
         assert_eq!(client.resolve_steer_intents(uncertain).await.unwrap(), 0);
     });
+}
+
+/// K2 r1 #2 (C1 §3.4): an outcome is recorded only on its key's open steer
+/// intent, exactly one row. A missing key, a close's key and a resolved
+/// steer's key refuse it, alone or with the `steer.delivered` event that
+/// carries it; refused, the event is not committed either, and every row
+/// is left as it was.
+#[test]
+fn a_steer_outcome_needs_its_open_steer_intent() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        spawn(&client).await;
+        submit(&client).await;
+        client
+            .commit_closing(ClosingRecord {
+                session_id: session(),
+                operation: Some(CloseIntent {
+                    op_key: "close".to_owned(),
+                    identity: Identity::of(b"close"),
+                }),
+            })
+            .await
+            .unwrap();
+        client
+            .commit_steer_intent(intent("done", b"done"))
+            .await
+            .unwrap();
+        let done = json!({"refused":"no_active_turn"});
+        client
+            .commit_steer_outcome(&session(), outcome("done", &done))
+            .await
+            .unwrap();
+        let delivered = json!({"turn":format!("{SESSION}/1"),"delivery":"injected"});
+        for key in ["missing", "close", "done"] {
+            let alone = client
+                .commit_steer_outcome(&session(), outcome(key, &delivered))
+                .await;
+            assert!(
+                matches!(alone, Err(StoreError::Constraint(_))),
+                "{key}: {alone:?}"
+            );
+            let with_event = client
+                .commit_event(EventRecord {
+                    session_id: session(),
+                    turn: turn(),
+                    event: event("steer.delivered", 3),
+                    steer: Some(outcome(key, &delivered)),
+                })
+                .await;
+            assert!(
+                matches!(with_event, Err(StoreError::Constraint(_))),
+                "{key}: {with_event:?}"
+            );
+            let session_event = client
+                .commit_session_event(SessionEventRecord {
+                    session_id: session(),
+                    event: Some(event("steer.delivered", 3)),
+                    identity: None,
+                    steer: Some(outcome(key, &delivered)),
+                })
+                .await;
+            assert!(
+                matches!(session_event, Err(StoreError::Constraint(_))),
+                "{key}: {session_event:?}"
+            );
+        }
+        assert_eq!(
+            client.next_seq(&session()).await.unwrap(),
+            Some(3),
+            "no refused event committed"
+        );
+        assert_eq!(row(&client, "missing").await, None);
+        assert_eq!(
+            row(&client, "close").await,
+            Some((OperationVerb::Close, Identity::of(b"close"), None))
+        );
+        assert_eq!(row(&client, "done").await.unwrap().2, Some(done));
+    });
+}
+
+/// K2 r1 #8: restart recovery finds the open steer intents through the
+/// partial index on them, not by scanning the retained operations table.
+#[test]
+fn open_steer_intents_are_found_by_their_index() {
+    let root = private_dir();
+    drop(Store::open(root.path()).unwrap());
+    let db = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
+    let plan: Vec<String> = db
+        .prepare("EXPLAIN QUERY PLAN UPDATE operations SET result=?1 WHERE verb='steer' AND result IS NULL")
+        .unwrap()
+        .query_map([""], |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // The partial index holds only the open steer rows, so its scan reads
+    // none of the retained history.
+    assert_eq!(
+        plan,
+        ["SCAN operations USING INDEX operations_open_steers"],
+        "{plan:?}"
+    );
 }
