@@ -30,7 +30,7 @@ use via_routes::codex::{
     TurnStart, TurnStartResult, WriteBounds, data, result, thread_resume, thread_start,
     thread_unsubscribe, turn_interrupt, turn_start,
 };
-use via_routes::{OutboundMessage, SendOutcome, StoreFailure};
+use via_routes::{OutboundMessage, SendOutcome, StoreFailure, WireCleanup};
 
 use super::normalize::{self, DiscoveredModel, Step, StructuredOutput, TurnNormalizer};
 use super::plan::{self as codex_plan, Sandbox};
@@ -335,7 +335,20 @@ struct Turn<'a> {
 impl Turn<'_> {
     /// The turn's end with `cause`, latched in the health lane as C2 §2
     /// latches a route failure.
+    /// While the server lives, the cleanup is the turn's reported tool
+    /// items (C2 §2 server-route evidence): none were reported here.
     fn failed(&self, cause: RouteError, loss: Option<ConnectionLoss>) -> TurnEnd {
+        self.failure(cause, loss, Some(WireCleanup::Quiescent))
+    }
+
+    /// [`Self::failed`] with the cleanup a live server's turn reports:
+    /// `None` leaves it unproven (a stop, whose cleanup is P7's).
+    fn failure(
+        &self,
+        cause: RouteError,
+        loss: Option<ConnectionLoss>,
+        live: Option<WireCleanup>,
+    ) -> TurnEnd {
         if let Some(failure) = health_cause(&cause) {
             self.driver.fail(failure);
         }
@@ -347,9 +360,10 @@ impl Turn<'_> {
             outcome: Err(AdapterError::Route(RouteFailure {
                 cause,
                 undecoded: None,
-                exit: loss.and_then(|loss| loss.exit),
+                // A server route's turn has no exit of its own (C2 §2).
+                exit: None,
                 launched: self.launched,
-                cleanup: loss.map(|loss| loss.cleanup),
+                cleanup: loss.map_or(live, |loss| Some(loss.cleanup)),
                 forced: false,
                 journal_uncertain,
                 acknowledged: false,
@@ -858,7 +872,7 @@ async fn open_thread(
         id: opened.thread.id.clone(),
         lane,
     };
-    confirm(facts, ids, (&opened, mode), resume, &thread)?;
+    confirm(facts, ids, (&opened, mode), resume, &thread).await?;
     facts.session.opened(ids.connection, &thread);
     driver.state().identity = Some(thread.id.clone());
     let identity = Identity {
@@ -882,7 +896,7 @@ async fn open_thread(
 
 /// Checks an opened thread before its identity is confirmed: the echoed
 /// policy, a resume's thread ID, and its registration on the connection.
-fn confirm(
+async fn confirm(
     facts: &Turn<'_>,
     ids: &Ids<'_>,
     (opened, mode): (&ThreadResult, SandboxMode),
@@ -914,6 +928,13 @@ fn confirm(
     {
         ids.connection.unregister(&thread.id, &thread.lane);
         driver.fail(DriverFailure::ResumeMismatch);
+        // C2 §4 identity: the mismatch is reported; an undelivered report
+        // latches the observation overflow after the mismatch.
+        let mismatch = Observation::ResumeMismatch {
+            requested,
+            returned: thread.id.clone(),
+        };
+        let _undelivered = facts.emit(mismatch, None).await;
         return Err(Box::new(TurnEnd {
             terminal: None,
             instance: facts.instance.clone(),
@@ -1192,7 +1213,12 @@ impl Running {
                 }
             }
         };
-        let uncertain = |cause| facts.failed(cause, None);
+        let uncertain = |cause| facts.failure(cause, None, None);
+        let reported = Some(if self.normalizer.tools_open() {
+            WireCleanup::Uncertain
+        } else {
+            WireCleanup::Quiescent
+        });
         match ended {
             Ended::Terminal => TurnEnd {
                 terminal: self.terminal.take(),
@@ -1209,12 +1235,12 @@ impl Running {
                 }),
             },
             Ended::Failed(cause, loss) => {
-                let mut end = facts.failed(cause, loss);
+                let mut end = facts.failure(cause, loss, reported);
                 end.terminal = self.terminal.take();
                 end
             }
             Ended::Undecoded(detail) => {
-                let mut end = facts.failed(RouteError::Protocol { turn, detail }, None);
+                let mut end = facts.failure(RouteError::Protocol { turn, detail }, None, reported);
                 if let Err(AdapterError::Route(failure)) = &mut end.outcome {
                     failure.undecoded = start.folder.take_undecoded();
                 }

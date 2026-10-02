@@ -1090,3 +1090,627 @@ fn conformance_codex_replay_exit_is_judged() {
     let checked = conformance_expect::replay_exit_self_check(&fixtures()).unwrap();
     assert!(checked > 0, "no replay lifetimes checked");
 }
+
+// Packet §8's named tests (`test(/^codex_/)` selects them), x.3.2 X3's
+// part. Each runs variants of a recorded fixture, built here and written
+// only to a scratch directory, never under the fixtures.
+
+/// The base of most variants: c6 without its gate, so the cold handshake
+/// is answered at once and one turn completes.
+const PLAIN: &str = "c6_cold_initialize";
+
+/// The base's thread and turn IDs.
+const THREAD: &str = "019a0000-0000-7000-8000-000000100001";
+const TURN: &str = "019a0000-0000-7000-8000-000000200001";
+
+/// Loads fixture `name`'s replay.
+fn replay_of(name: &str) -> Result<Value, String> {
+    let text = std::fs::read(fixtures().join(format!("{name}.replay.json")))
+        .map_err(|e| format!("{name}: {e}"))?;
+    serde_json::from_slice(&text).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Loads fixture `name`'s expectation.
+fn expect_of(name: &str) -> Result<Value, String> {
+    conformance_expect::load(&fixtures(), name)
+}
+
+/// [`PLAIN`] with its gate removed: the replay without the `await_signal`
+/// step (its `after_emit` renumbered) and the expectation without gates.
+fn plain(variant: &str) -> Result<(Value, Value), String> {
+    let mut replay = replay_of(PLAIN)?;
+    let all = steps(&mut replay)?;
+    if all
+        .get(1)
+        .and_then(|step| step.get("await_signal"))
+        .is_none()
+    {
+        return Err(format!("{PLAIN}: step 2 is not its gate"));
+    }
+    all.remove(1);
+    for step in all.iter_mut() {
+        if let Some(after) = step["expect"]["after_emit"].as_u64() {
+            step["expect"]["after_emit"] = json!(after - 1);
+        }
+    }
+    replay["source"] = json!(format!("{variant}: a variant of {PLAIN} without its gate"));
+    replay["notes"] = json!(
+        "Step 10 (turn/start) names step 8, the thread/start reply, as its causal \
+         predecessor (after_emit)."
+    );
+    replay["deadline_ms"] = json!(20000);
+    let mut expect = expect_of(PLAIN)?;
+    expect["source"] = replay["source"].clone();
+    let turn = &mut expect["turns"][0];
+    if let Some(turn) = turn.as_object_mut() {
+        turn.remove("gates");
+    }
+    turn["expect"]["notes"] = json!(format!("{variant}; see its test"));
+    Ok((replay, expect))
+}
+
+/// Turn `index` of an expectation.
+fn turn_mut(expect: &mut Value, index: usize) -> &mut Value {
+    &mut expect["turns"][index]
+}
+
+/// The steps of a replay.
+fn steps(replay: &mut Value) -> Result<&mut Vec<Value>, String> {
+    replay["steps"]
+        .as_array_mut()
+        .ok_or_else(|| "no steps".to_owned())
+}
+
+/// The index of the first step whose emitted line, or else whose JSON
+/// text, contains `marker`.
+fn step_with(replay: &Value, marker: &str) -> Result<usize, String> {
+    replay["steps"]
+        .as_array()
+        .ok_or("no steps")?
+        .iter()
+        .position(|step| match step["emit"]["line"].as_str() {
+            Some(line) => line.contains(marker),
+            None => step.to_string().contains(marker),
+        })
+        .ok_or_else(|| format!("no step with {marker}"))
+}
+
+/// The line of emit step `at`.
+fn line_of(replay: &Value, at: usize) -> Result<String, String> {
+    replay["steps"][at]["emit"]["line"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("step {at} is no emit"))
+}
+
+/// An emit step of `line`.
+fn emit(line: &Value) -> Value {
+    json!({"emit": {"line": line.to_string()}})
+}
+
+/// Replaces `from` with `to` in the line of emit step `at`.
+fn edit_emit(replay: &mut Value, at: usize, from: &str, to: &str) -> Result<(), String> {
+    let line = line_of(replay, at)?;
+    if !line.contains(from) {
+        return Err(format!("step {at}: no {from}"));
+    }
+    replay["steps"][at]["emit"]["line"] = json!(line.replace(from, to));
+    Ok(())
+}
+
+/// Cuts the replay after step `at` and ends it with `tail`.
+fn cut_after(replay: &mut Value, at: usize, tail: &[Value]) -> Result<(), String> {
+    let steps = steps(replay)?;
+    steps.truncate(at + 1);
+    steps.extend(tail.iter().cloned());
+    Ok(())
+}
+
+/// The expectation of a turn that failed before acceptance: nothing
+/// observed but what the caller adds.
+fn unaccepted(expect: &mut Value, error: &str, instance: Value) {
+    let turn = &mut expect["turns"][0]["expect"];
+    turn["accepted"] = json!(false);
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["error"] = json!(error);
+    turn["instance"] = instance;
+    turn["observations_include"] = json!([]);
+    turn["observations_exclude"] = json!(["turn.accepted", "final_text"]);
+    turn["observation_counts"] = json!({"turn.accepted": 0});
+    turn["observations_order"] = json!([]);
+}
+
+/// The base's instance.
+fn tested() -> Value {
+    json!({"vendor_version": "0.159.2", "version_status": "tested"})
+}
+
+/// Runs a variant: `replay` and `expect` as the test built them, from a
+/// scratch directory.
+fn check_variant(
+    name: &str,
+    replay: &Value,
+    expect: &Value,
+    knobs: conformance_run::Knobs,
+) -> Result<(), String> {
+    conformance_expect::validate(expect).map_err(|e| format!("{name}: {e}"))?;
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join(format!("{name}.replay.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(replay).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let outcome = conformance_drive::Pure::run("codex", name, expect, &path)?
+        .drive(expect, &path, knobs)
+        .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))?;
+    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+}
+
+/// [`check_variant`] with the default knobs.
+fn variant(name: &str, replay: &Value, expect: &Value) -> Result<(), String> {
+    check_variant(name, replay, expect, conformance_run::Knobs::default())
+}
+
+/// The step that seals a force-closed server's run: Host's close sends
+/// the group `SIGTERM`, which the fake takes and then exits on its own.
+fn sigterm() -> Value {
+    json!({"await_signal": {"signal": "SIGTERM"}})
+}
+
+/// F13 (packet §8 `codex_pin_handshake`): one initialize/initialized per
+/// connection, with neither an experimental capability nor an opt-out
+/// (every fixture's first step pins their absence); the version comes
+/// from `userAgent`, and one outside `checked` proceeds as untested; a
+/// malformed handshake and a policy or sandbox echo mismatch refuse the
+/// turn (`protocol`) before any `turn/start`; a `model/list` cursor left at
+/// the page bound or past the byte bound fails discovery as `protocol`.
+#[test]
+fn codex_pin_handshake() {
+    let first = &replay_of(PLAIN).unwrap()["steps"][0]["expect"];
+    assert_eq!(first["line"]["method"], "initialize");
+    assert_eq!(
+        first["absent"],
+        json!([
+            "/params/capabilities/experimentalApi",
+            "/params/capabilities/optOutNotificationMethods"
+        ])
+    );
+
+    // An untested version proceeds, reported as such.
+    let (mut replay, mut expect) = plain("codex_pin_handshake_untested").unwrap();
+    edit_emit(&mut replay, 1, "via/0.159.2", "via/0.160.0").unwrap();
+    turn_mut(&mut expect, 0)["expect"]["instance"] =
+        json!({"vendor_version": "0.160.0", "version_status": "untested"});
+    variant("codex_pin_handshake_untested", &replay, &expect).unwrap();
+
+    // A malformed initialize reply: no userAgent.
+    let (mut replay, mut expect) = plain("codex_pin_handshake_malformed").unwrap();
+    steps(&mut replay).unwrap()[1] = json!({"emit": {"line":
+        "{\"id\":${init},\"result\":{\"codexHome\":\"/state/codex-home\"}}"}});
+    cut_after(&mut replay, 1, &[sigterm()]).unwrap();
+    unaccepted(&mut expect, "protocol", Value::Null);
+    variant("codex_pin_handshake_malformed", &replay, &expect).unwrap();
+
+    // A policy, then a sandbox, echo that is not the one requested.
+    for (name, from, to) in [
+        (
+            "codex_pin_handshake_policy_echo",
+            "\"approvalPolicy\":\"never\"",
+            "\"approvalPolicy\":\"on-request\"",
+        ),
+        (
+            "codex_pin_handshake_sandbox_echo",
+            "\"sandbox\":{\"type\":\"dangerFullAccess\"}",
+            "\"sandbox\":{\"type\":\"readOnly\"}",
+        ),
+    ] {
+        let (mut replay, mut expect) = plain(name).unwrap();
+        let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
+        edit_emit(&mut replay, answer, from, to).unwrap();
+        cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
+        unaccepted(&mut expect, "protocol", tested());
+        variant(name, &replay, &expect).unwrap();
+    }
+
+    // model/list: a cursor left at the page bound, then a catalog past
+    // the byte bound.
+    let (mut replay, mut expect) = plain("codex_pin_handshake_page_bound").unwrap();
+    let models = step_with(&replay, "\"result\":{\"data\"").unwrap();
+    let page = replay["steps"][models]["emit"]["line"]
+        .as_str()
+        .unwrap()
+        .replace("\"nextCursor\":null", "\"nextCursor\":\"next\"");
+    assert!(page.contains("\"nextCursor\":\"next\""));
+    let mut pages = Vec::new();
+    for n in 0..16 {
+        if n > 0 {
+            pages.push(json!({"expect": {
+                "line": {"method": "model/list", "params": {"cursor": "next"}},
+                "capture": {"models": "/id"},
+            }}));
+        }
+        pages.push(json!({"emit": {"line": page}}));
+    }
+    let tail: Vec<Value> = pages.into_iter().chain([sigterm()]).collect();
+    cut_after(&mut replay, models - 1, &tail).unwrap();
+    unaccepted(&mut expect, "protocol", Value::Null);
+    variant("codex_pin_handshake_page_bound", &replay, &expect).unwrap();
+
+    let (mut replay, _) = plain("codex_pin_handshake_byte_bound").unwrap();
+    let big = "x".repeat(600 * 1024);
+    let mut huge: Value = serde_json::from_str(&page.replace("${models}", "0")).unwrap();
+    huge["result"]["data"][0]["description"] = json!(big);
+    let huge = huge.to_string().replacen("\"id\":0", "\"id\":${models}", 1);
+    let tail = [
+        json!({"emit": {"line": huge}}),
+        json!({"expect": {
+            "line": {"method": "model/list", "params": {"cursor": "next"}},
+            "capture": {"models": "/id"},
+        }}),
+        json!({"emit": {"line": huge}}),
+        sigterm(),
+    ];
+    cut_after(&mut replay, models - 1, &tail).unwrap();
+    let mut expect = expect.clone();
+    expect["source"] = replay["source"].clone();
+    variant("codex_pin_handshake_byte_bound", &replay, &expect).unwrap();
+}
+
+/// The expectation of a turn accepted and then failed with `error`, before
+/// any terminal.
+fn failed_after_acceptance(expect: &mut Value, error: &str, cleanup: &str) {
+    let turn = &mut turn_mut(expect, 0)["expect"];
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["error"] = json!(error);
+    turn["cleanup"] = json!(cleanup);
+    turn["observations_include"] = json!([
+        {"kind": "turn.accepted", "vendor_turn_id": TURN},
+    ]);
+    turn["observations_exclude"] = json!(["final_text"]);
+    turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+}
+
+/// F18 (packet §8 `codex_start_order`): a notification before the paired
+/// `turn/start` reply is buffered and the reply accepts once; a reply under
+/// an unknown, a duplicate or a mismatched (string) ID fails the connection
+/// `protocol`; a start the server never answered is no acceptance; a
+/// malformed known notification of the turn fails it `protocol`; a second,
+/// contradictory `turn/completed` never replaces the retained terminal.
+#[test]
+fn codex_start_order() {
+    let reply_marker = "\"result\":{\"turn\"";
+    let started_marker = "\"method\":\"turn/started\"";
+    let completed_marker = "\"method\":\"turn/completed\"";
+
+    // turn/started (and the status change) before the paired reply.
+    let (mut replay, expect) = plain("codex_start_order_early").unwrap();
+    let answer = step_with(&replay, reply_marker).unwrap();
+    let started = step_with(&replay, started_marker).unwrap();
+    let moved: Vec<Value> = steps(&mut replay)
+        .unwrap()
+        .drain(answer + 1..=started)
+        .collect();
+    for (offset, step) in moved.into_iter().enumerate() {
+        steps(&mut replay).unwrap().insert(answer + offset, step);
+    }
+    assert!(
+        step_with(&replay, started_marker).unwrap() < step_with(&replay, reply_marker).unwrap()
+    );
+    variant("codex_start_order_early", &replay, &expect).unwrap();
+
+    // Replies the connection cannot pair, mid-turn.
+    for (name, line) in [
+        (
+            "codex_start_order_unknown_id",
+            "{\"id\":9999,\"result\":{}}".to_owned(),
+        ),
+        ("codex_start_order_duplicate_id", {
+            let base = replay_of(PLAIN).unwrap();
+            let at = step_with(&base, "\"result\":{\"thread\"").unwrap();
+            base["steps"][at]["emit"]["line"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }),
+    ] {
+        let (mut replay, mut expect) = plain(name).unwrap();
+        let started = step_with(&replay, started_marker).unwrap();
+        cut_after(
+            &mut replay,
+            started,
+            &[json!({"emit": {"line": line}}), sigterm()],
+        )
+        .unwrap();
+        failed_after_acceptance(&mut expect, "protocol", "quiescent");
+        variant(name, &replay, &expect).unwrap();
+    }
+
+    // The turn/start reply under a string ID: never paired.
+    let (mut replay, mut expect) = plain("codex_start_order_mismatched_id").unwrap();
+    let answer = step_with(&replay, reply_marker).unwrap();
+    edit_emit(
+        &mut replay,
+        answer,
+        "{\"id\":${turn},",
+        "{\"id\":\"${turn}\",",
+    )
+    .unwrap();
+    cut_after(&mut replay, answer, &[sigterm()]).unwrap();
+    unaccepted(&mut expect, "protocol", tested());
+    turn_mut(&mut expect, 0)["expect"]["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    variant("codex_start_order_mismatched_id", &replay, &expect).unwrap();
+
+    // The start is written once and never answered: the server exits.
+    let (mut replay, mut expect) = plain("codex_start_order_lost_start").unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    cut_after(
+        &mut replay,
+        start,
+        &[json!({"exit": {"code": 0, "stderr": ""}})],
+    )
+    .unwrap();
+    unaccepted(&mut expect, "server_lost", tested());
+    variant("codex_start_order_lost_start", &replay, &expect).unwrap();
+
+    // A malformed turn/completed of the turn.
+    let (mut replay, mut expect) = plain("codex_start_order_malformed").unwrap();
+    let completed = step_with(&replay, completed_marker).unwrap();
+    steps(&mut replay).unwrap()[completed] = emit(&json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": "not a turn"},
+    }));
+    cut_after(&mut replay, completed, &[json!({"await_eof": {}})]).unwrap();
+    let base = turn_mut(&mut expect, 0)["expect"].clone();
+    failed_after_acceptance(&mut expect, "protocol", "quiescent");
+    // What the turn delivered before the malformed message stays.
+    turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
+    turn_mut(&mut expect, 0)["expect"]["final_text"] = base["final_text"].clone();
+    turn_mut(&mut expect, 0)["expect"]["observations_include"] = json!([
+        {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
+    ]);
+    turn_mut(&mut expect, 0)["expect"]["observations_exclude"] = json!([]);
+    variant("codex_start_order_malformed", &replay, &expect).unwrap();
+
+    // A second, contradictory turn/completed after the terminal.
+    let (mut replay, mut expect) = plain("codex_start_order_second_terminal").unwrap();
+    let completed = step_with(&replay, completed_marker).unwrap();
+    let second = replay["steps"][completed]["emit"]["line"]
+        .as_str()
+        .unwrap()
+        .replace("\"status\":\"completed\"", "\"status\":\"failed\"");
+    steps(&mut replay)
+        .unwrap()
+        .insert(completed + 1, json!({"emit": {"line": second}}));
+    turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "turn.late_terminal": 0});
+    variant("codex_start_order_second_terminal", &replay, &expect).unwrap();
+}
+
+/// Packet §8 `codex_resume_identity`: the persistent thread is reopened
+/// under its exact ID with `excludeTurns` (`c5_resume`), a thread the vendor
+/// no longer has is gone (`c5_resume_missing`), and a reply naming another
+/// thread fails `resume_mismatch` before acceptance, with
+/// `resume.mismatch`, no fallback `thread/start` and the session failed.
+#[test]
+fn codex_resume_identity() {
+    let resume = &replay_of("c5_resume").unwrap()["steps"];
+    let at = step_with(
+        &replay_of("c5_resume").unwrap(),
+        "\"method\":\"thread/resume\"",
+    )
+    .unwrap();
+    assert_eq!(resume[at]["expect"]["line"]["params"]["threadId"], THREAD);
+    assert_eq!(resume[at]["expect"]["line"]["params"]["excludeTurns"], true);
+    check("c5_resume").unwrap();
+    check("c5_resume_missing").unwrap();
+
+    let name = "codex_resume_identity_mismatch";
+    let other = "019a0000-0000-7000-8000-000000100009";
+    let mut replay = replay_of("c5_resume").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c5_resume"));
+    let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
+    let line = replay["steps"][answer]["emit"]["line"]
+        .as_str()
+        .unwrap()
+        .replace(THREAD, other);
+    steps(&mut replay).unwrap()[answer] = json!({"emit": {"line": line}});
+    cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
+    let mut expect = expect_of("c5_resume").unwrap();
+    expect["source"] = replay["source"].clone();
+    // Not closed, so its health shows the failure.
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] =
+        json!({"state": "failed", "first_cause": "resume_mismatch"});
+    unaccepted(&mut expect, "resume_mismatch", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["observations_include"] = json!([
+        {"kind": "resume.mismatch", "requested": THREAD, "returned": other},
+    ]);
+    turn["observations_exclude"] = json!([
+        "session.vendor_identity_confirmed",
+        "turn.accepted",
+        "final_text",
+    ]);
+    turn["notes"] = json!(name);
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// F14 (packet §8 `codex_never_ask`): each server request is answered
+/// under its exact incoming ID (integer or string) within 5 s of its
+/// decode (the replay allows 5,250 ms for the pipes): the six declined
+/// methods with their no-grant bodies (validated against the pinned
+/// schemas by the adapter's unit test), and auth refresh, attestation,
+/// the legacy approvals and an unknown method with `-32601`. Core takes no
+/// observation until the fake has read the last reply, so the replies
+/// wait on neither the driver's delivery nor Core. Each written reply is
+/// reported `vendor.request_declined` once.
+#[test]
+fn codex_never_ask() {
+    let declined = [
+        (
+            "item/commandExecution/requestApproval",
+            json!({"decision": "decline"}),
+        ),
+        (
+            "item/fileChange/requestApproval",
+            json!({"decision": "decline"}),
+        ),
+        (
+            "item/permissions/requestApproval",
+            json!({"permissions": {}}),
+        ),
+        ("item/tool/requestUserInput", json!({"answers": {}})),
+        (
+            "mcpServer/elicitation/request",
+            json!({"action": "decline", "content": null}),
+        ),
+        (
+            "item/tool/call",
+            json!({"contentItems": [], "success": false}),
+        ),
+    ];
+    let refused = [
+        "account/chatgptAuthTokens/refresh",
+        "attestation/generate",
+        "applyPatchApproval",
+        "execCommandApproval",
+        "item/unknown/request",
+    ];
+    let (mut replay, mut expect) = plain("codex_never_ask").unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let mut injected = Vec::new();
+    for (n, (method, body)) in declined.iter().enumerate() {
+        let id = json!(70 + n);
+        injected.push(emit(&json!({"id": id, "method": method, "params": {
+            "threadId": THREAD, "turnId": TURN, "itemId": format!("item-{n}"),
+        }})));
+        injected.push(json!({"expect": {
+            "line": {"id": id, "result": body},
+            "absent": ["/error"],
+            "within_ms": 5250,
+        }}));
+    }
+    for (n, method) in refused.iter().enumerate() {
+        let id = json!(format!("s-{n}"));
+        injected.push(emit(&json!({"id": id, "method": method, "params": {
+            "threadId": THREAD, "turnId": TURN,
+        }})));
+        injected.push(json!({"expect": {
+            "line": {"id": id, "error": {"code": -32601,
+                "message": "Method not supported by VIA"}},
+            "absent": ["/result"],
+            "within_ms": 5250,
+        }}));
+    }
+    let count = injected.len() / 2;
+    for (offset, step) in injected.into_iter().enumerate() {
+        steps(&mut replay)
+            .unwrap()
+            .insert(started + 1 + offset, step);
+    }
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["observation_counts"] = json!({"turn.accepted": 1, "vendor.request_declined": count});
+    turn["observations_include"] = json!([
+        {"kind": "vendor.request_declined",
+            "vendor_method": "item/commandExecution/requestApproval", "blocking": true},
+        {"kind": "vendor.request_declined", "vendor_method": "item/unknown/request"},
+    ]);
+    // initialize, initialized, model/list, thread/start, turn/start, then
+    // the replies.
+    let knobs = conformance_run::Knobs {
+        hold_until_read: Some(5 + count),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant("codex_never_ask", &replay, &expect, knobs).unwrap();
+}
+
+/// F8 remainder (packet §8 `codex_bound_gate`; the pure refusals are
+/// `codex_bound_gate_refusals`, c10 and c4b): every admitted start carries
+/// `never`, the user reviewer and the current bound, a turn naming none
+/// inheriting the session's (c1's second turn); the frozen instructions go
+/// byte for byte as `developerInstructions` on `thread/start` and on
+/// `thread/resume`, and null instructions send none (every other fixture
+/// pins its absence).
+#[test]
+fn codex_bound_gate() {
+    let c1 = replay_of("c1_commentary_usage").unwrap();
+    let starts: Vec<&Value> = c1["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| step["expect"]["line"]["method"] == "turn/start")
+        .collect();
+    assert_eq!(starts.len(), 2);
+    for start in starts {
+        let params = &start["expect"]["line"]["params"];
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["approvalsReviewer"], "user");
+        assert_eq!(params["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
+    }
+    let c1_expect = expect_of("c1_commentary_usage").unwrap();
+    assert!(c1_expect["turns"][1]["params"].get("bound").is_none());
+    check("c1_commentary_usage").unwrap();
+
+    let instructions = "Answer tersely.\n\tKeep \"quotes\", tabs and \u{2713} as written.\n";
+    // On thread/start.
+    let (mut replay, mut expect) = plain("codex_bound_gate_instructions_start").unwrap();
+    let open = step_with(&replay, "\"method\":\"thread/start\"").unwrap();
+    let start = &mut steps(&mut replay).unwrap()[open]["expect"];
+    start["line"]["params"]["developerInstructions"] = json!(instructions);
+    start.as_object_mut().unwrap().remove("absent");
+    expect["sessions"]["main"]["instructions"] = json!(instructions);
+    variant("codex_bound_gate_instructions_start", &replay, &expect).unwrap();
+
+    // On thread/resume.
+    let name = "codex_bound_gate_instructions_resume";
+    let mut replay = replay_of("c5_resume").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c5_resume"));
+    let open = step_with(&replay, "\"method\":\"thread/resume\"").unwrap();
+    let resume = &mut steps(&mut replay).unwrap()[open]["expect"];
+    resume["line"]["params"]["developerInstructions"] = json!(instructions);
+    resume.as_object_mut().unwrap().remove("absent");
+    let mut expect = expect_of("c5_resume").unwrap();
+    expect["source"] = replay["source"].clone();
+    expect["sessions"]["main"]["instructions"] = json!(instructions);
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// Packet §8 `codex_usage_snapshot`: keyless `last` samples sum to the
+/// turn's usage with scope `turn` (c1: 20522 + 20613 total tokens in its
+/// first turn), a sample naming another turn of the thread never attaches,
+/// and the cost stays unavailable. (`total` and the cache-write count
+/// going to `vendor` are the normalizer's unit tests.)
+#[test]
+fn codex_usage_snapshot() {
+    let c1 = expect_of("c1_commentary_usage").unwrap();
+    assert_eq!(
+        c1["turns"][0]["expect"]["usage"]["total_tokens"],
+        20522 + 20613
+    );
+    assert_eq!(c1["turns"][0]["expect"]["usage"]["scope"], "turn");
+    check("c1_commentary_usage").unwrap();
+
+    let (mut replay, expect) = plain("codex_usage_snapshot_other_turn").unwrap();
+    let sample = step_with(&replay, "\"method\":\"thread/tokenUsage/updated\"").unwrap();
+    let other = replay["steps"][sample]["emit"]["line"]
+        .as_str()
+        .unwrap()
+        .replace(TURN, "019a0000-0000-7000-8000-000000200099")
+        .replace("\"totalTokens\":22007", "\"totalTokens\":900000");
+    steps(&mut replay)
+        .unwrap()
+        .insert(sample, json!({"emit": {"line": other}}));
+    assert_eq!(
+        expect["turns"][0]["expect"]["terminal"]["cost"],
+        json!({"usd": null, "provenance": "unavailable"})
+    );
+    variant("codex_usage_snapshot_other_turn", &replay, &expect).unwrap();
+}

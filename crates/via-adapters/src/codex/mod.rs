@@ -128,16 +128,8 @@ impl CodexAdapter {
         requested: Inherit,
     ) -> Result<RoutePlan, Refusal> {
         let route = harness.route();
-        let model = match req.model.clone().filter(|model| !model.is_empty()) {
-            Some(model) => Some(model),
-            None => self.catalog().and_then(|catalog| {
-                catalog
-                    .iter()
-                    .find(|model| model.default)
-                    .map(|model| model.model.clone())
-            }),
-        }
-        .ok_or_else(|| {
+        let catalog = self.catalog();
+        let model = resolved_model(req.model.as_deref(), catalog.as_deref()).ok_or_else(|| {
             Refusal::new(
                 RefusalKind::UnknownModel,
                 Some(route),
@@ -275,4 +267,18 @@ fn refusals(route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
         None => {}
     }
     refusals
+}
+
+/// The model a plan resolves (ruling Q1): the named one, taken as given
+/// (discovery judges it at the first turn); with none named, the
+/// discovered catalog's default once a server reported one, else none
+/// (`unknown_model`).
+fn resolved_model(named: Option<&str>, catalog: Option<&[DiscoveredModel]>) -> Option<String> {
+    match named.filter(|model| !model.is_empty()) {
+        Some(model) => Some(model.to_owned()),
+        None => catalog?
+            .iter()
+            .find(|model| model.default)
+            .map(|model| model.model.clone()),
+    }
 }

@@ -998,3 +998,36 @@ fn id_tracking_overflows_explicitly() {
         NormalizeError::Overflow
     );
 }
+
+/// Ruling Q1: a named model is taken as given; with none named, the plan
+/// resolves the discovered catalog's default, and before any discovery
+/// (or with a catalog naming no default) nothing, which is
+/// `unknown_model`.
+#[test]
+fn the_plan_model_is_the_named_or_the_discovered_default() {
+    use super::normalize::DiscoveredModel;
+    use super::resolved_model;
+
+    let model = |name: &str, default: bool| DiscoveredModel {
+        model: name.to_owned(),
+        efforts: vec!["low".to_owned()],
+        hidden: false,
+        default,
+    };
+    let catalog = [model("gpt-6.1-sol", false), model("gpt-6-sol", true)];
+    assert_eq!(
+        resolved_model(Some("named"), None).as_deref(),
+        Some("named")
+    );
+    assert_eq!(
+        resolved_model(Some("named"), Some(&catalog)).as_deref(),
+        Some("named")
+    );
+    assert_eq!(resolved_model(None, None), None);
+    assert_eq!(resolved_model(Some(""), None), None);
+    assert_eq!(
+        resolved_model(None, Some(&catalog)).as_deref(),
+        Some("gpt-6-sol")
+    );
+    assert_eq!(resolved_model(None, Some(&catalog[..1])), None);
+}
