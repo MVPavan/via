@@ -25,6 +25,12 @@ pub(crate) struct Roots {
     // a document is held to, when set, and the patterns that census built.
     pub(crate) limits: Option<(usize, usize)>,
     pub(crate) patterns: RefCell<HashMap<String, Pattern>>,
+    // VIA patch (critical r2 #4): each document's census tally, by the
+    // document's address (the loader keeps every document in place): its
+    // counted schema positions, by address, and its pattern count. The
+    // document's census and each reference target promoted in it share
+    // it, so no position counts twice.
+    tallies: RefCell<HashMap<usize, Tally>>,
     map: HashMap<Url, Root>,
     pub(crate) loader: DefaultUrlLoader,
 }
@@ -37,6 +43,7 @@ impl Roots {
             meta_budget: None,
             limits: None,
             patterns: Default::default(),
+            tallies: Default::default(),
             map: Default::default(),
             loader: DefaultUrlLoader::new(),
         }
@@ -64,16 +71,25 @@ impl Roots {
 
     pub(crate) fn ensure_subschema(&mut self, up: &UrlPtr) -> Result<(), CompileError> {
         self.or_load(up.url.clone())?;
-        let Some(root) = self.map.get_mut(&up.url) else {
+        let Some(root) = self.map.get(&up.url) else {
             return Err(CompileError::Bug("or_load didn't add".into()));
         };
-        if !root.draft.is_subschema(up.ptr.as_str()) {
+        let draft = root.draft;
+        if !draft.is_subschema(up.ptr.as_str()) {
             let doc = self.loader.load(&root.url)?;
             let v = up.ptr.lookup(doc, &up.url)?;
             if let Some(required) = self.required_draft {
                 required.require(v)?;
             }
-            root.draft.validate(up, v, self.meta_budget.as_ref())?;
+            draft.validate(up, v, self.meta_budget.as_ref())?;
+            // VIA patch (critical r2 #4): the promoted target's positions
+            // join its document's census.
+            if let Some(limits) = self.limits {
+                self.census(draft, doc, v, &up.url, limits)?;
+            }
+            let Some(root) = self.map.get_mut(&up.url) else {
+                return Err(CompileError::Bug("or_load didn't add".into()));
+            };
             root.add_subschema(doc, &up.ptr)?;
         }
         Ok(())
@@ -106,7 +122,7 @@ impl Roots {
             required.require(doc)?;
         }
         if let Some(limits) = self.limits {
-            self.census(draft, doc, &url, limits)?;
+            self.census(draft, doc, doc, &url, limits)?;
         }
         let vocabs = self.loader.get_meta_vocabs(doc, draft)?;
         let resources = {
@@ -138,17 +154,27 @@ impl Roots {
     // `(schemas, patterns)`, and builds each `pattern` and
     // `patternProperties` expression, so the regex program limit and the
     // compile budget apply to them all; the compile reuses what it built.
+    // `sub` is `doc` itself or a reference target in it that compiling
+    // promotes to a schema (critical r2 #4); a position already counted
+    // in `doc` is not counted again.
     fn census(
         &self,
         draft: &Draft,
         doc: &Value,
+        sub: &Value,
         url: &Url,
         (max_schemas, max_patterns): (usize, usize),
     ) -> Result<(), CompileError> {
-        let (mut schemas, mut patterns) = (0usize, 0usize);
-        draft.each_schema(doc, &mut |sch| {
-            schemas += 1;
-            if schemas > max_schemas {
+        let mut tallies = self.tallies.borrow_mut();
+        let Tally {
+            positions,
+            patterns,
+        } = tallies.entry(doc as *const Value as usize).or_default();
+        draft.each_schema(sub, &mut |sch| {
+            if !positions.insert(sch as *const Value as usize) {
+                return Ok(());
+            }
+            if positions.len() > max_schemas {
                 return Err(CompileError::LimitExceeded { what: "subschemas" });
             }
             let Value::Object(obj) = sch else {
@@ -160,8 +186,8 @@ impl Roots {
                 _ => None,
             };
             for p in pattern.into_iter().chain(names.into_iter().flatten()) {
-                patterns += 1;
-                if patterns > max_patterns {
+                *patterns += 1;
+                if *patterns > max_patterns {
                     return Err(CompileError::LimitExceeded { what: "patterns" });
                 }
                 if self.patterns.borrow().contains_key(p) {
@@ -177,4 +203,11 @@ impl Roots {
     pub(crate) fn insert(&mut self, roots: &mut HashMap<Url, Root>) {
         self.map.extend(roots.drain());
     }
+}
+
+// VIA patch (critical r2 #4): one document's census so far.
+#[derive(Default)]
+struct Tally {
+    positions: HashSet<usize>,
+    patterns: usize,
 }

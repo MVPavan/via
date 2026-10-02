@@ -121,7 +121,12 @@ commit that vendored the unchanged copy shows the whole patch.
    a regular expression, and each expression is built, so the program
    limit and the compile budget apply to it; the compile reuses the
    expressions built. A pattern that does not compile is therefore refused
-   in any schema position, reached or not.
+   in any schema position, reached or not. A reference target outside the
+   schema keywords (`{"$ref":"#/x","x":…}`), which compiling promotes to a
+   schema, joins its document's census the same way, over every position
+   under it; the document's census and its promoted targets share one
+   tally of positions, so a position counts once, whichever reaches it
+   first.
 6. **Exact numbers** (`util.rs`, `validator.rs`): a behaviour fix
    against upstream, which computed through `f64`.
    - `minimum`, `maximum`, `exclusiveMinimum` and `exclusiveMaximum`

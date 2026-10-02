@@ -531,6 +531,55 @@ mod tests {
         assert!(compiles(&json!({"$defs": defs})), "64 unused patterns");
     }
 
+    /// Critical r2 #4 (C1 §4): a reference target outside the schema
+    /// keywords, which compiling promotes to a schema, is held to the same
+    /// limits over every position under it: 2,050 booleans, 65 patterns,
+    /// and one unused pattern over the program limit, each under
+    /// `{"$ref":"#/x","x":…}`, are refused.
+    #[test]
+    fn limits_count_promoted_reference_targets() {
+        let booleans: serde_json::Map<String, Value> =
+            (0..2050).map(|i| (format!("d{i}"), json!(true))).collect();
+        let patterns: serde_json::Map<String, Value> = (0..65)
+            .map(|i| (format!("d{i}"), json!({"pattern": format!("^a{i}$")})))
+            .collect();
+        let big = json!({"big": {"pattern": "(?:a{1000}){1000}"}});
+        let admitted: Vec<&str> = [
+            ("2,050 booleans", Value::Object(booleans)),
+            ("65 patterns", Value::Object(patterns)),
+            ("a pattern over the program limit", big),
+        ]
+        .into_iter()
+        .filter(|(_, defs)| compiles(&json!({"$ref": "#/x", "x": {"$defs": defs}})))
+        .map(|(probe, _)| probe)
+        .collect();
+        assert!(admitted.is_empty(), "admitted: {admitted:?}");
+    }
+
+    /// Critical r2 #4: each schema position counts once. 2,048 positions
+    /// compile, whether a `$defs` entry is referenced or a promoted
+    /// target is reached both inside and whole; 2,049 do not.
+    #[test]
+    fn each_position_counts_once() {
+        let defs = |n: usize| -> serde_json::Map<String, Value> {
+            (0..n).map(|i| (format!("d{i}"), json!(true))).collect()
+        };
+        // The root, its `$defs` entries.
+        let referenced = |n| json!({"$ref": "#/$defs/d0", "$defs": defs(n)});
+        assert!(compiles(&referenced(2047)), "a referenced $defs entry");
+        assert!(!compiles(&referenced(2048)), "2,049 positions");
+        // The root, two `allOf` items, `x`, its `$defs` entries.
+        let promoted = |n| {
+            json!({"allOf": [{"$ref": "#/x/$defs/d0"}, {"$ref": "#/x"}],
+                   "x": {"$defs": defs(n)}})
+        };
+        assert!(
+            compiles(&promoted(2044)),
+            "a target inside a promoted target"
+        );
+        assert!(!compiles(&promoted(2045)), "2,049 positions with a target");
+    }
+
     /// Critical r1 #1: converting a pattern's ECMA escapes is linear. A
     /// 24 KiB pattern of `\d` took over 8 s to compile before (release);
     /// it now compiles at once.
