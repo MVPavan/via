@@ -180,6 +180,18 @@ fn check_variant(
     expect: &Value,
     knobs: conformance_run::Knobs,
 ) -> Result<(), String> {
+    let outcome = drive_variant(name, replay, expect, knobs)?;
+    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+}
+
+/// [`check_variant`]'s outcome, unchecked: for what the schema cannot
+/// state.
+fn drive_variant(
+    name: &str,
+    replay: &Value,
+    expect: &Value,
+    knobs: conformance_run::Knobs,
+) -> Result<Outcome, String> {
     conformance_expect::validate(expect).map_err(|e| format!("{name}: {e}"))?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = dir.path().join(format!("{name}.replay.json"));
@@ -188,10 +200,31 @@ fn check_variant(
         serde_json::to_vec_pretty(replay).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let outcome = conformance_drive::Pure::run("claude", name, expect, &path)?
+    conformance_drive::Pure::run("claude", name, expect, &path)?
         .drive(expect, &path, knobs)
-        .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))?;
-    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+        .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))
+}
+
+/// The emit step of `replay`'s lifetime `lifetime` (0-based; the file
+/// itself when it has none) whose line contains `marker`, by index.
+fn emit_step(
+    replay: &mut Value,
+    lifetime: Option<usize>,
+    marker: &str,
+) -> Result<(usize, String), String> {
+    let fixture = match lifetime {
+        Some(at) => &mut replay["lifetimes"][at],
+        None => replay,
+    };
+    let steps = fixture["steps"].as_array().ok_or("no steps")?;
+    steps
+        .iter()
+        .enumerate()
+        .find_map(|(at, step)| {
+            let line = step["emit"]["line"].as_str()?;
+            line.contains(marker).then(|| (at, line.to_owned()))
+        })
+        .ok_or_else(|| format!("no emit step with {marker}"))
 }
 
 /// An emit step of `line`.
@@ -526,6 +559,207 @@ fn claude_preflight_pure_version() {
             .unwrap();
         conformance_expect::check(&expect, &outcome).unwrap_or_else(|e| panic!("{name}:\n{e}"));
     }
+}
+
+/// Carry-item 1 (Claude ruling C1, packet §5): a session-cumulative cost
+/// lower than the session's last one is an unexpected counter reset: the
+/// turn warns `cost_counter_reset` (outside C1 §5's closed list, so the
+/// checker's schema cannot state it: Core keeps it as a durable `warning`
+/// event only) and reports the vendor's value, never a negative delta. A
+/// rising cost warns nothing.
+#[test]
+fn claude_cost_counter_reset_warns() {
+    let name = "claude_fifo_busy_input";
+    let reset = |outcome: &Outcome, turn: usize| {
+        outcome.turns[turn].observations.iter().any(|observation| {
+            observation["kind"] == "warning" && observation["code"] == "cost_counter_reset"
+        })
+    };
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let rising = drive(name, &expect).unwrap();
+    assert!(
+        !reset(&rising, 0) && !reset(&rising, 1),
+        "a rising cost warned"
+    );
+    let mut replay = replay_of(name).unwrap();
+    let (at, line) = emit_step(&mut replay, Some(1), "\"type\":\"result\"").unwrap();
+    let lowered = line.replace("\"total_cost_usd\":0.002", "\"total_cost_usd\":0.0005");
+    assert_ne!(lowered, line);
+    replay["lifetimes"][1]["steps"][at] = json!({"emit": {"line": lowered}});
+    let mut expect = expect;
+    let wanted = &mut expect["turns"][1]["expect"];
+    wanted["terminal"]["cost"]["usd"] = json!(0.0005);
+    // The warning is the adapter's: the checker's closed set refuses it.
+    wanted.as_object_mut().unwrap().remove("warnings");
+    let outcome = drive_variant(
+        "claude_cost_reset",
+        &replay,
+        &expect,
+        conformance_run::Knobs::default(),
+    )
+    .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    assert!(!reset(&outcome, 0), "turn 0 warned");
+    assert!(
+        reset(&outcome, 1),
+        "turn 1 did not warn: {:?}",
+        outcome.turns[1].observations
+    );
+    assert_eq!(
+        outcome.turns[1].warnings,
+        ["config_switch_unverified", "cost_counter_reset"]
+    );
+}
+
+/// Carry-item 2 (Q9): `vendor.request_declined` is reported only once the
+/// whole decline was written. With the decline's write failed (failpoint
+/// `routes.claude.decline`, `fail_io`), c11b's request is unanswered: no
+/// decline is reported, no denial is suppressed for it, and the turn
+/// fails closed (`protocol`, the group force-closed: the fake takes the
+/// anchor's SIGTERM and exits on its own).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn claude_decline_reported_after_write() {
+    use std::os::unix::fs::DirBuilderExt;
+    let points = tempfile::tempdir().unwrap();
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let token = "c2-decline-token";
+    std::fs::write(
+        dir.join("routes.claude.decline.json"),
+        json!({"token": token, "occurrence": 1, "action": "fail_io"}).to_string(),
+    )
+    .unwrap();
+    via_store::failpoint::activate(&dir, token).unwrap();
+    let name = "c11b_stdio_prompt";
+    let mut replay = replay_of(name).unwrap();
+    let (at, _) = emit_step(&mut replay, None, "\"control_request\"").unwrap();
+    let steps = replay["steps"].as_array_mut().unwrap();
+    steps.truncate(at + 1);
+    steps.push(json!({"await_signal": {"signal": "SIGTERM"}}));
+    steps.push(json!({"exit": {"code": 143, "stderr": ""}}));
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
+    let wanted = &mut expect["turns"][0]["expect"];
+    for (field, value) in [
+        ("terminal", Value::Null),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("error", json!("protocol")),
+        ("exit", json!({"code": 143, "signal": null})),
+        (
+            "observations_include",
+            json!([{"kind": "session.vendor_identity_confirmed", "generation": 1}, "turn.accepted"]),
+        ),
+        (
+            "observations_exclude",
+            json!(["vendor.request_declined", "action.denied"]),
+        ),
+        (
+            "observation_counts",
+            json!({"turn.accepted": 1, "vendor.request_declined": 0, "action.denied": 0}),
+        ),
+    ] {
+        wanted[field] = value;
+    }
+    let knobs = conformance_run::Knobs::default();
+    check_variant("claude_decline_unwritten", &replay, &expect, knobs).unwrap();
+    assert!(
+        dir.join("routes.claude.decline.1.ack").exists(),
+        "the failpoint never hit"
+    );
+}
+
+/// The `permission_denials` of a result past the normalizer's tracked
+/// bytes (256 KiB): 300 distinct 1000-byte call IDs.
+fn overflowing_denials() -> Value {
+    (0..300)
+        .map(|n| json!({"tool_name": "Edit", "tool_use_id": format!("toolu_{n:04}_{}", "x".repeat(990))}))
+        .collect()
+}
+
+/// Carry-items 4 and 5: a tracking overflow (C1's sticky `Overflow`)
+/// reaches the driver's health (`failed`, `overflow`) and the turn's
+/// failure class (`overflow`); a terminal already read stays beside the
+/// failure (AD4), with the result's text. The overflow is at the result
+/// itself: its denials pass the tracked bytes, so only those admitted
+/// before it are reported.
+#[test]
+fn claude_overflow_keeps_terminal() {
+    let name = "claude_lazy_init_acceptance_result_only";
+    let mut replay = replay_of(name).unwrap();
+    let (at, line) = emit_step(&mut replay, None, "\"type\":\"result\"").unwrap();
+    let mut result: Value = serde_json::from_str(&line).unwrap();
+    result["permission_denials"] = overflowing_denials();
+    replay["steps"][at] = emit(&result);
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let wanted = &mut expect["turns"][0]["expect"];
+    wanted["error"] = json!("overflow");
+    wanted["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "generation": 1},
+        "turn.accepted",
+        "action.denied",
+        "final_text",
+    ]);
+    let knobs = conformance_run::Knobs::default();
+    check_variant("claude_overflow_terminal", &replay, &expect, knobs).unwrap();
+}
+
+/// Carry-item 4 before any terminal: tool calls past the tracked bytes
+/// end the turn `overflow` with health latched, and the adapter stops the
+/// vendor with the AD19 sequence (the interrupt, the result, stdin EOF).
+#[test]
+fn claude_overflow_before_terminal() {
+    let name = "claude_lazy_init_acceptance_result_only";
+    let base = replay_of(name).unwrap();
+    let mut steps = base["steps"].as_array().unwrap()[..2].to_vec();
+    steps.push(replay_of("claude_lazy_init_acceptance").unwrap()["steps"][2].clone());
+    for n in 0..300 {
+        steps.push(emit(&json!({
+            "type": "assistant",
+            "message": {"id": format!("msg_{n}"), "role": "assistant", "content": [{
+                "type": "tool_use", "id": format!("toolu_{n:04}"), "name": "Read",
+                "input": {"file_path": format!("/work/{n:04}/{}", "p".repeat(990))},
+            }]},
+            "session_id": "${sid}",
+        })));
+    }
+    steps.push(json!({"expect": {
+        "line": {"type": "control_request", "request": {"subtype": "interrupt"}},
+        "capture": {"rid": "/request_id"},
+    }}));
+    steps.push(json!({"emit": {"line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"}}));
+    steps.push(emit(&json!({
+        "type": "result", "subtype": "error_during_execution", "is_error": true,
+        "session_id": "${sid}", "stop_reason": "tool_use", "terminal_reason": "aborted_tools",
+    })));
+    steps.push(json!({"await_eof": {}}));
+    let mut replay = base;
+    replay["steps"] = json!(steps);
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let wanted = &mut expect["turns"][0]["expect"];
+    for (field, value) in [
+        ("error", json!("overflow")),
+        ("final_text", Value::Null),
+        ("usage", Value::Null),
+        (
+            "instance",
+            json!({"vendor_version": "2.1.285", "version_status": "tested"}),
+        ),
+        (
+            "observations_include",
+            json!([{"kind": "session.vendor_identity_confirmed", "generation": 1}, "turn.accepted"]),
+        ),
+        ("observations_exclude", json!(["final_text"])),
+    ] {
+        wanted[field] = value;
+    }
+    wanted.as_object_mut().unwrap().remove("terminal");
+    wanted["unasserted"] = json!([{"field": "terminal", "why": "read after the overflow: the route's retained result (AD4), pinned by claude_overflow_keeps_terminal's at-result case"}]);
+    let knobs = conformance_run::Knobs::default();
+    check_variant("claude_overflow_early", &replay, &expect, knobs).unwrap();
 }
 
 /// x.3.2 G8 (C2 §2 `ParamSizes`, ruling Q3): instructions or an

@@ -244,6 +244,9 @@ pub(crate) struct DriverState {
     pub(crate) identity: Option<String>,
     /// The vendor reported that it closed the session.
     pub(crate) vendor_closed: bool,
+    /// The last session-cumulative cost a terminal reported (Claude,
+    /// packet §5): a lower one warns.
+    pub(crate) cost: Option<f64>,
     /// The session was closed.
     pub(crate) closed: bool,
     /// The generation a turn holds and may still deliver on

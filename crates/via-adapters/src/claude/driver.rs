@@ -29,7 +29,7 @@ use crate::instance::Incompatibility;
 use crate::observation::{
     AdapterError, Observation, ObservationItem, TurnEnd, TurnEvidence, VendorTerminal,
 };
-use crate::plan::{Category, InheritState, ParamSizes, Refusal, RefusalKind, TurnParams};
+use crate::plan::{Category, InheritState, ParamSizes, Refusal, RefusalKind, TurnParams, Warning};
 use crate::runtime::cleanup;
 use crate::{
     AcceptanceToken, Deadline, DriverFailure, DriverHealth, ProcessOwner, RouteError, RouteFailure,
@@ -39,6 +39,12 @@ use via_routes::StopSources;
 use via_routes::claude::{
     ClaudeItem, ClaudeRoute, ClaudeRouteResult, ClaudeStart, ClaudeTurn, Message,
 };
+
+/// The warning a session-cumulative cost lower than the session's last
+/// one gives (packet §5: an unexpected counter reset warns and keeps the
+/// reported value). Not in C1 §5's closed list: Core keeps it as a durable
+/// `warning` event, and no envelope carries it.
+pub(crate) const COST_COUNTER_RESET: &str = "cost_counter_reset";
 
 /// The ID identity confirmations name for connection `generation`.
 pub(crate) fn connection_id(generation: u64) -> String {
@@ -357,10 +363,10 @@ impl Normalize for Delivery<'_> {
 
 impl Delivery<'_> {
     /// Takes one batch's facts: the instance's version, a confirmed
-    /// identity, the terminal, and an end.
+    /// identity, the terminal (with the cost check), and an end.
     fn absorb(&mut self, batch: Batch) -> Vec<Observation> {
         let Batch {
-            observations,
+            mut observations,
             decline: _,
             terminal,
             end,
@@ -383,6 +389,7 @@ impl Delivery<'_> {
             }
         }
         if let Some(terminal) = terminal {
+            observations.extend(self.cost_reset(&terminal));
             self.terminal = Some(terminal);
         }
         match end {
@@ -403,6 +410,23 @@ impl Delivery<'_> {
             Some(End::Overflow) => self.fail(Verdict::Overflow),
         }
         observations
+    }
+
+    /// Packet §5: a session-cumulative cost below the session's last one
+    /// warns; the reported value stands, and is the session's last.
+    fn cost_reset(&self, terminal: &VendorTerminal) -> Option<Observation> {
+        let usd = terminal.cost.as_ref()?.usd;
+        let last = lock(self.reports.state).cost.replace(usd);
+        last.filter(|last| usd < *last).map(|last| {
+            Observation::Warning(Warning {
+                code: COST_COUNTER_RESET,
+                message: format!(
+                    "the vendor's session-cumulative cost went down from {last} to {usd} USD; \
+                     the reported value is kept"
+                ),
+                data: None,
+            })
+        })
     }
 
     /// A verdict before or beside the terminal: health latches at once

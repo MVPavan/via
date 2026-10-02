@@ -161,17 +161,30 @@ impl ClaudeLane {
         request: ControlRequest,
     ) -> Result<Option<ClaudeItem>, Failed> {
         let turn = serving.turn;
+        // Test builds: `fail_io` stands for a decline that wrote no byte
+        // (Q9: nothing is reported for it).
+        #[cfg(feature = "test-failpoints")]
+        let unwritten = crate::failpoint::hit_async("routes.claude.decline")
+            .await
+            .is_err();
+        #[cfg(not(feature = "test-failpoints"))]
+        let unwritten = false;
         let by = Deadline::at(
             serving
                 .deadline
                 .instant()
                 .min(tokio::time::Instant::now() + DECLINE_WITHIN),
         );
-        let write = serving.sender.write(
-            OutboundMessage::Control(control_decline(&request.request_id)),
-            by,
-        );
-        match serving.serve(write).await? {
+        let written = if unwritten {
+            Ok(SendOutcome::NotWritten)
+        } else {
+            let write = serving.sender.write(
+                OutboundMessage::Control(control_decline(&request.request_id)),
+                by,
+            );
+            serving.serve(write).await?
+        };
+        match written {
             Ok(SendOutcome::Written) => Ok(Some(ClaudeItem::Declined(request))),
             Ok(_) | Err(_) => Err(protocol(turn, UNANSWERED).into()),
         }
