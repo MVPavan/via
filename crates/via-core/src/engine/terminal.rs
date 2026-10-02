@@ -449,7 +449,8 @@ fn stopped(
     }
     if !by_order {
         // Deadline before the order's force, process exit, transport loss
-        // and other failures keep their own row.
+        // and other failures keep their own row: the order did not stop
+        // the turn, so it is no cause of it (C1 §7.6, fix r2 #3).
         return Disposed {
             terminal,
             stop: Some((outcome, cleanup)),
@@ -485,7 +486,8 @@ fn stopped(
                 (if shared { "unknown" } else { outcome }, cleanup)
             };
             Disposed {
-                cancel_cause: requested.filter(|_| terminal.state == "cancelled"),
+                cancel_cause: requested
+                    .filter(|_| matches!(terminal.state, "cancelled" | "unknown")),
                 terminal,
                 stop: Some(stop),
             }
@@ -829,6 +831,7 @@ pub fn envelope_at_maximum(
 mod tests {
     use super::{FailureClass, TurnNumber};
     use via_adapters::{AdapterError, RouteError, RouteFailure};
+    use via_store::CancelCause;
 
     #[expect(
         clippy::needless_pass_by_value,
@@ -969,6 +972,59 @@ mod tests {
             assert_ne!(failure.message, super::TOKENS_STOP);
             assert_eq!(failure.message, super::PROTOCOL_STOP);
         }
+    }
+
+    /// Fix round 1 #3, #5 (runtime §6, C1 §7.6): a caller `cancel` or
+    /// `close` that stopped a turn ending `unknown` is recorded as its
+    /// cause, whether the force passed unanswered on a shared server or the
+    /// transport was lost under the order; a Core deadline's order is no
+    /// caller's, so an idle stop followed by transport loss records none.
+    #[test]
+    fn an_unknown_turn_records_the_callers_stop() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        let now = tokio::time::Instant::now();
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let order = |spec: crate::engine::queue::StopSpec| spec.order(at.clone(), now, None);
+        let cancel = order(crate::engine::queue::StopSpec::Cancel {
+            force_after: std::time::Duration::ZERO,
+        });
+        let close = order(crate::engine::queue::StopSpec::Close {
+            mode: crate::CloseMode::Graceful,
+            deadline: now,
+        });
+        let idle = order(crate::engine::queue::StopSpec::Idle);
+        let unanswered = || {
+            AdapterError::Route(RouteFailure {
+                launched: true,
+                shared: true,
+                ..route_failure(RouteError::Stopped { turn })
+            })
+        };
+        let lost = || {
+            AdapterError::Route(RouteFailure {
+                launched: true,
+                ..route_failure(RouteError::TransportLost { turn })
+            })
+        };
+        for (outcome, order, cause) in [
+            (unanswered(), &cancel, Some(CancelCause::Cancel)),
+            (unanswered(), &close, Some(CancelCause::Close)),
+            // Fix round 2 #3: an order in force that did not stop the turn
+            // is not its cause.
+            (lost(), &cancel, None),
+            (lost(), &idle, None),
+        ] {
+            let disposed = super::dispose(true, (None, Err(outcome)), Some(order), now);
+            assert_eq!(disposed.terminal.state, "unknown");
+            assert_eq!(disposed.cancel_cause, cause, "{:?}", order.cause);
+        }
+    }
+
+    fn route_failure(cause: RouteError) -> RouteFailure {
+        let AdapterError::Route(failure) = route(cause, None) else {
+            unreachable!("a route failure")
+        };
+        failure
     }
 
     /// C1 §5 (spill amendment): a warning keeps a `message` of at most

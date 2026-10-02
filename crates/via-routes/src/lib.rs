@@ -226,9 +226,9 @@ mod runtime;
 pub mod steer;
 
 pub use fake::{
-    FakeClassHint, FakeCost, FakeDenialKind, FakeMessage, FakeRoute, FakeRouteResult, FakeTerminal,
-    FakeTurn, FakeUsage, Handshake, Lane, RouteMessage, TerminalDetails, TerminalStatus, TurnStart,
-    VENDOR_DATA_MAX,
+    FakeClassHint, FakeCost, FakeDenialKind, FakeLateTerminal, FakeMessage, FakeRetired,
+    FakeRetiredItem, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake,
+    Lane, RouteMessage, TerminalDetails, TerminalStatus, TurnStart, VENDOR_DATA_MAX,
 };
 pub use runtime::{Retirement, RouteRuntime};
 pub use steer::{

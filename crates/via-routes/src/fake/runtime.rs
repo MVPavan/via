@@ -18,7 +18,7 @@ use via_wire::{
 
 mod lane;
 
-pub use lane::{FakeTerminal, FakeTurn, Lane};
+pub use lane::{FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeTerminal, FakeTurn, Lane};
 
 /// Final fake protocol evidence, including independently confirmed process exit.
 #[derive(Clone, Debug)]
@@ -268,7 +268,9 @@ impl FakeRoute {
                     journal_uncertain: false,
                     forced: false,
                 }));
-                let report = serving.retire(sender, messages, cleanup_deadline()).await;
+                let report = serving
+                    .retire(sender, messages, (None, cleanup_deadline()))
+                    .await;
                 let exit = report.vendor_exit.unwrap_or(ExitReport {
                     code: None,
                     signal: None,
@@ -303,7 +305,9 @@ impl FakeRoute {
                 serving.soft_stop(&mut messages, cleanup).await;
             }
             serving.send_logical(Err(serving.kept_failure(failed.cause.clone())));
-            let report = serving.retire(sender, messages, cleanup).await;
+            let report = serving
+                .retire(sender, messages, (failed.exit, cleanup))
+                .await;
             return Err(RouteFailure {
                 cause: failed.cause,
                 undecoded: sender.take_undecoded(),

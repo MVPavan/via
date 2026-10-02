@@ -16,8 +16,8 @@ use super::super::{
 use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
 use crate::steer::{ControlPermit, SteerProgress, SteerRefused, SteerRequest};
 use crate::{
-    CloseRequest, Deadline, OutboundMessage, Retirement, RouteError, RouteFailure, SendOutcome,
-    StopCause, WireCleanup,
+    CloseRequest, Deadline, ExitReport, OutboundMessage, Retirement, RouteError, RouteFailure,
+    SendOutcome, StopCause, TurnNumber, WireCleanup,
 };
 use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 
@@ -61,6 +61,45 @@ pub struct Lane {
     /// The turn's effort: an instance whose handshake reports its catalog
     /// must list it (AD18).
     pub effort: Option<String>,
+    /// Where the persistent profile's retirement streams what its helper
+    /// reports meanwhile ([`FakeRetired`]); `None` reads nothing.
+    pub retired: Option<FakeRetired>,
+}
+
+/// Where the persistent profile's retirement sends what its helper
+/// reports while it is retired (C2 §4.1 late observations, §4
+/// `turn.late_terminal`).
+pub struct FakeRetired {
+    /// Each forwarded message in decode order, one at a time, as the
+    /// turn's own hop takes them: Route reads no further message while it
+    /// is full. A closed receiver ends the forwarding.
+    pub items: mpsc::Sender<FakeRetiredItem>,
+    /// The failure that ended the reading: a message that does not decode,
+    /// kept in `undecoded.bin` as the turn's own reader keeps one, one out
+    /// of the connection's protocol phase, or a failed read. The
+    /// connection failed.
+    pub failure: oneshot::Sender<RouteError>,
+    /// The retirement's facts, sent as soon as Host's close of the helper
+    /// ended, whatever the reading is doing (fix r3 #3).
+    pub cleaned: oneshot::Sender<Retirement>,
+}
+
+/// One message [`FakeRetired`] forwards.
+pub enum FakeRetiredItem {
+    /// A durable message, to be normalized as the turn's own are.
+    Durable(super::super::RouteMessage),
+    /// The terminal of a logical turn that retained none.
+    Terminal(FakeLateTerminal),
+}
+
+/// A terminal the persistent profile's helper reported while it was
+/// retired, after its logical turn ended with no terminal (C2 §4
+/// `turn.late_terminal`).
+pub struct FakeLateTerminal {
+    /// The vendor turn it names, the turn's own.
+    pub vendor_turn_id: String,
+    /// The decoded terminal.
+    pub terminal: FakeTerminal,
 }
 
 /// The steer awaiting its write and the vendor's delivery report.
@@ -200,6 +239,8 @@ pub(super) struct LaneState {
     ack_evidence: bool,
     identity: Option<String>,
     effort: Option<String>,
+    /// Where the retirement's messages go ([`Lane::retired`]).
+    retired: Option<FakeRetired>,
 }
 
 impl LaneState {
@@ -226,6 +267,7 @@ impl LaneState {
             ack_evidence: false,
             identity: lane.identity,
             effort: lane.effort,
+            retired: lane.retired,
         }
     }
 
@@ -654,12 +696,15 @@ impl Serving<'_> {
 
     /// Retires the persistent profile's helper apart from the logical turn
     /// (decision H1): input closed, then Host's close under `by`, forced at
-    /// once for a session close, then the drain.
+    /// once for a session close, then the drain. Meanwhile the helper's
+    /// output is read ([`read_retired`]) and its messages go on the lane's
+    /// `retired`. The retirement's facts, with the `exit` the turn saw, go
+    /// there as soon as Host's close ended, apart from the reading.
     pub(super) async fn retire(
         &mut self,
         sender: &WireSender,
-        messages: WireMessages,
-        by: Deadline,
+        mut messages: WireMessages,
+        (exit, by): (Option<ExitReport>, Deadline),
     ) -> WireCloseReport {
         let closing = self
             .signals
@@ -672,11 +717,122 @@ impl Serving<'_> {
         } else {
             CloseMode::Graceful
         };
+        // Test builds: the logical turn ended and its helper's retirement
+        // begins.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_wire::failpoint::hit_async("routes.fake.retiring").await;
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
-        let report = sender.close(CloseRequest { mode, deadline: by }).await;
+        let (reader, cleaned) = match self.lane.retired.take() {
+            Some(FakeRetired {
+                items,
+                failure,
+                cleaned,
+            }) => (Some((items, failure)), Some(cleaned)),
+            None => (None, None),
+        };
+        let interrupted = self.lane.interrupt != Interrupt::NotSent;
+        let reading = (self.turn, &mut self.phase, interrupted);
+        let close = async {
+            let report = sender.close(CloseRequest { mode, deadline: by }).await;
+            if let Some(cleaned) = cleaned {
+                // The driver's turn task is gone: nobody takes the facts.
+                let _unread = cleaned.send(Retirement::closed(exit, &report));
+            }
+            report
+        };
+        let read = async {
+            if let Some(reader) = reader {
+                read_retired(&mut messages, sender, reading, reader, by).await;
+            }
+        };
+        let (report, ()) = tokio::join!(close, read);
         messages.finish(by).await;
         report
+    }
+}
+
+/// Reads a retired helper's output for `turn` in decode order until it
+/// ends, a failure, `by`, or the driver no longer takes what it forwards
+/// (its lane closed). Each message is checked against the connection's
+/// `phase` as the turn's own are; the durable ones (denials, declines)
+/// and the first terminal, when the logical turn retained none (the only
+/// one the phase admits), go on `items`; everything else is
+/// dropped, as the logical turn already ended. A message that does not
+/// decode is kept in `undecoded.bin`; it, a phase violation and a failed
+/// read end the reading with their cause on `failure`. A stop
+/// order's wake, the daemon force and `by` end it quietly.
+async fn read_retired(
+    messages: &mut WireMessages,
+    sender: &WireSender,
+    (turn, phase, interrupted): (TurnNumber, &mut super::Phase, bool),
+    (items, failure): (mpsc::Sender<FakeRetiredItem>, oneshot::Sender<RouteError>),
+    by: Deadline,
+) {
+    let read = async {
+        loop {
+            let message = match messages.next_message().await {
+                Ok(Some(message)) => message,
+                Err(via_wire::WireError::Woken) => continue,
+                Ok(None) | Err(via_wire::WireError::Cancelled | via_wire::WireError::Deadline) => {
+                    return None;
+                }
+                Err(error) => return Some(super::wire_cause(turn, &error)),
+            };
+            let payload = match FakeMessage::decode(message.bytes(), turn) {
+                Ok(payload) => payload,
+                Err(cause) => {
+                    let what = format!(
+                        "undecodable vendor message: {} bytes",
+                        message.bytes().len()
+                    );
+                    sender.keep_undecoded(message.bytes(), &what).await;
+                    return Some(cause);
+                }
+            };
+            if let Err(cause) = phase.advance(&payload, turn, interrupted) {
+                return Some(cause);
+            }
+            let message = super::super::RouteMessage {
+                payload,
+                steer: None,
+            };
+            let item = match &message.payload {
+                FakeMessage::Denial { .. } | FakeMessage::Decline { .. } => {
+                    FakeRetiredItem::Durable(message)
+                }
+                FakeMessage::Terminal { vendor_turn_id, .. } => {
+                    let vendor_turn_id = vendor_turn_id.clone();
+                    let Some(terminal) = super::terminal_evidence(&message) else {
+                        continue;
+                    };
+                    FakeRetiredItem::Terminal(FakeLateTerminal {
+                        vendor_turn_id,
+                        terminal,
+                    })
+                }
+                // Not durable: the logical turn already ended.
+                FakeMessage::Accepted { .. }
+                | FakeMessage::Text { .. }
+                | FakeMessage::ToolStarted { .. }
+                | FakeMessage::ToolEnded { .. }
+                | FakeMessage::Usage { .. }
+                | FakeMessage::Hello(_)
+                | FakeMessage::Identity { .. }
+                | FakeMessage::SteerDelivered { .. }
+                | FakeMessage::VendorClosed { .. }
+                | FakeMessage::InterruptAck { .. }
+                | FakeMessage::Unknown { .. } => continue,
+            };
+            if items.send(item).await.is_err() {
+                // The lane closed: nothing more is delivered (ruling G1).
+                return None;
+            }
+        }
+    };
+    if let Ok(Some(cause)) = tokio::time::timeout_at(by.instant(), read).await {
+        // The driver's turn task is gone: nobody takes the failure.
+        let _unread = failure.send(cause);
     }
 }
 

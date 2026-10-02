@@ -35,6 +35,7 @@ mod receipt;
 mod recovery;
 mod reprobe;
 mod resolve;
+mod revision;
 mod slots;
 mod status;
 mod stop;
@@ -576,17 +577,7 @@ impl SessionWriter {
         {
             return journal::SessionWrite::Refused;
         }
-        let (slot, made) = {
-            let mut sessions = lock(&self.sessions);
-            if let Some(slot) = sessions.get(&self.session) {
-                (Arc::clone(slot), false)
-            } else {
-                // Write-only: no turn meets it, so it bounds no lane.
-                let slot = Slot::new(Head::new(None), Weak::new());
-                sessions.insert(self.session.clone(), Arc::clone(&slot));
-                (slot, true)
-            }
-        };
+        let (slot, made) = write_slot(&self.sessions, &self.session);
         let head = Arc::clone(&slot.head);
         let written = journal::commit_session_event(
             &self.store,
@@ -596,17 +587,7 @@ impl SessionWriter {
         )
         .await;
         drop(head);
-        if made {
-            let mut sessions = lock(&self.sessions);
-            if slot.idle()
-                && slot.unleased()
-                && sessions
-                    .get(&self.session)
-                    .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
-            {
-                sessions.remove(&self.session);
-            }
-        }
+        release_write_slot(&self.sessions, &self.session, &slot, made);
         self.report(&written);
         written
     }
@@ -665,6 +646,46 @@ impl SessionWriter {
         {
             // Phase two, under the `admission` held (design §7.4).
             self.store_failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// The session's slot, for a write outside its turns: one made for the
+/// write when the session has none, and whether it was made, so
+/// [`release_write_slot`] removes it after the write and no receipt or
+/// dispatcher meets it. The caller holds `admission`.
+fn write_slot(
+    sessions: &StdMutex<HashMap<SessionId, Arc<Slot>>>,
+    session: &SessionId,
+) -> (Arc<Slot>, bool) {
+    let mut sessions = lock(sessions);
+    if let Some(slot) = sessions.get(session) {
+        (Arc::clone(slot), false)
+    } else {
+        // Write-only: no turn meets it, so it bounds no lane.
+        let slot = Slot::new(Head::new(None), Weak::new());
+        sessions.insert(session.clone(), Arc::clone(&slot));
+        (slot, true)
+    }
+}
+
+/// Removes the slot [`write_slot`] made for a write, unless a turn or a
+/// writer lease took it meanwhile. The caller holds `admission`.
+fn release_write_slot(
+    sessions: &StdMutex<HashMap<SessionId, Arc<Slot>>>,
+    session: &SessionId,
+    slot: &Arc<Slot>,
+    made: bool,
+) {
+    if made {
+        let mut sessions = lock(sessions);
+        if slot.idle()
+            && slot.unleased()
+            && sessions
+                .get(session)
+                .is_some_and(|mapped| Arc::ptr_eq(mapped, slot))
+        {
+            sessions.remove(session);
         }
     }
 }

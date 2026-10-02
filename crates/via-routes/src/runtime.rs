@@ -3,7 +3,7 @@
 //! shutdown, recovery and held capacity. It runs no protocol itself.
 
 use tokio::sync::watch;
-use via_wire::{WireCleanup, WireRuntime};
+use via_wire::{WireCleanup, WireCloseReport, WireRuntime};
 
 use crate::{
     Deadline, ExitReport, ReprobeReport, RuntimeConfig, RuntimeResources, WireError, WireRecovery,
@@ -124,4 +124,22 @@ pub struct Retirement {
     pub forced: bool,
     /// A Host journal write had an uncertain outcome.
     pub journal_uncertain: bool,
+}
+
+impl Retirement {
+    /// The facts of a launched helper's close `report`, with the `exit`
+    /// its turn already saw (K1: a persistent connection's retirement
+    /// reports them as soon as Host's close ended).
+    pub(crate) fn closed(exit: Option<ExitReport>, report: &WireCloseReport) -> Self {
+        let reported = report
+            .vendor_exit
+            .filter(|exit| exit.code.is_some() || exit.signal.is_some());
+        Self {
+            launched: true,
+            exit: exit.or(reported),
+            cleanup: Some(report.cleanup),
+            forced: report.forced,
+            journal_uncertain: report.journal_uncertain,
+        }
+    }
 }

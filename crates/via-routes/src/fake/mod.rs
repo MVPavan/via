@@ -11,7 +11,10 @@ use crate::{
 
 mod runtime;
 
-pub use runtime::{FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane};
+pub use runtime::{
+    FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, Lane,
+};
 
 /// The one prompt submission of a private fake connection. Wire streams it
 /// without a second whole copy of the prompt (Task 4 design §8.3).

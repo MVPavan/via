@@ -69,6 +69,9 @@ pub(super) enum FailureSite {
     SessionEvent,
     /// A running turn's natural terminal, which is retried once (row 7).
     Terminal,
+    /// The revision of an `unknown` turn by late evidence (C1 §7.6),
+    /// which is retried once; not committed after that, it is not made.
+    Revision,
     /// A turn's one resolution write after its first failure, or the one
     /// retry of rows 7 and 9 (design §7.2 escalation).
     Resolution,
@@ -116,6 +119,7 @@ impl FailureSite {
             | Self::Event
             | Self::SessionEvent
             | Self::Terminal
+            | Self::Revision
             | Self::QueuedCancel
             | Self::Evidence
             | Self::Journal
@@ -138,6 +142,7 @@ impl FailureSite {
             Self::Submission
             | Self::Event
             | Self::Terminal
+            | Self::Revision
             | Self::Resolution
             | Self::QueuedCancel
             | Self::ForcedTerminal
@@ -265,6 +270,7 @@ fn failure_kind(site: FailureSite, outcome: WriteOutcome) -> &'static str {
             | FailureSite::Event
             | FailureSite::SessionEvent
             | FailureSite::Terminal
+            | FailureSite::Revision
             | FailureSite::Resolution
             | FailureSite::RequestCancel
             | FailureSite::QueuedCancel
