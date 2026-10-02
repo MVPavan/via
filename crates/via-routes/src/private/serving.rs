@@ -155,6 +155,10 @@ pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) latch: watch::Receiver<LatchState>,
     /// The start's write began: a stop order now sends the interrupt.
     pub(crate) submitted: bool,
+    /// The start was written whole: the Adapter's stall now interrupts
+    /// the vendor ([`Stall`]); before, it fails the turn at once and the
+    /// start, if not yet enqueued, is never written.
+    pub(crate) written: bool,
     /// The terminal was read: a stop order no longer acts.
     pub(crate) terminated: bool,
     /// The one interrupt's write.
@@ -186,6 +190,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             latch: sender.latch(),
             signals,
             submitted: false,
+            written: false,
             terminated: false,
             interrupt: Interrupt::NotSent,
             pending: None,
@@ -435,12 +440,12 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         }
     }
 
-    /// The hop closed: before the terminal of a submitted turn whose
-    /// protocol interrupts on it, the Adapter's stall ([`Stall`]): the
-    /// held messages are discarded and the one interrupt is sent;
-    /// otherwise [`Self::hop_closed`].
+    /// The hop closed: before the terminal of a turn whose start was written
+    /// whole and whose protocol interrupts on it, the Adapter's stall
+    /// ([`Stall`]): the held messages are discarded and the one interrupt is
+    /// sent; otherwise [`Self::hop_closed`].
     fn on_hop_closed(&mut self) -> Result<(), Failed> {
-        let stalls = self.submitted
+        let stalls = self.written
             && !self.terminated
             && self.signals.force.borrow().is_none()
             && self.lane.interrupts_on_stall();

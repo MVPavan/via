@@ -390,13 +390,18 @@ async fn serve_turn<P: PrivateProtocol>(
     // discards it, so it never blocks. The original failure stays
     // authoritative.
     messages.finish(cleanup).await;
-    // After the Adapter's stall the turn's cause is `overflow`, unless the
-    // daemon force or a stop order's own escalation governs (S1 rule 4).
-    let governs = matches!(
-        failed.cause,
-        RouteError::ForceStopped { .. } | RouteError::Stopped { .. }
-    );
-    let cause = if serving.stall.is_some() && !governs {
+    // Decided once cleanup ended (review r3 #1): the daemon force, set at
+    // any point before this return, decides the outcome (S1 rule 4); after
+    // the Adapter's stall the cause is `overflow` unless a stop order's own
+    // escalation governs.
+    let cause = if serving.signals.force.borrow().is_some() {
+        RouteError::ForceStopped { turn: serving.turn }
+    } else if serving.stall.is_some()
+        && !matches!(
+            failed.cause,
+            RouteError::ForceStopped { .. } | RouteError::Stopped { .. }
+        )
+    {
         RouteError::Overflow { turn: serving.turn }
     } else {
         failed.cause
@@ -503,6 +508,9 @@ async fn drive<P: PrivateProtocol>(
     if sent != SendOutcome::Written {
         return Err(transport(turn).into());
     }
+    // The vendor has the whole prompt: from here the Adapter's stall
+    // interrupts it (review r3 #2).
+    serving.written = true;
     let terminal = loop {
         let message = match serving.next(messages).await? {
             Next::Message(message) => message,

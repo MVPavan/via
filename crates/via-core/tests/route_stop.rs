@@ -657,6 +657,9 @@ enum StallAct {
     Force,
     /// The session's `close(Force)`.
     Close,
+    /// The daemon force, once the stall's own escalation's `Stop` reached
+    /// the anchor (paused at `host.anchor.stop_received`).
+    ForceInCleanup,
 }
 
 /// The acceptance and 1,023 texts, then, once `rest` exists, three texts,
@@ -727,6 +730,22 @@ fn stalled_turn(child: &Child, act: StallAct) -> (Outcome, Duration) {
                 let by = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(2));
                 let close = driver.close(via_adapters::CloseMode::Force, by);
                 tokio::join!(execute, close).0
+            }
+            StallAct::ForceInCleanup => {
+                let points = child.root.join("points");
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {
+                            if points.join("host.anchor.stop_received.1.ack").exists() {
+                                break;
+                            }
+                        }
+                        outcome = &mut execute => panic!("ended before its cleanup's Stop: {:?}", outcome.outcome.map(|_| ())),
+                    }
+                }
+                forcing.send_replace(Some(tokio::time::Instant::now()));
+                fs::write(points.join("host.anchor.stop_received.1.release"), b"").unwrap();
+                execute.await
             }
         };
         (outcome, acted.elapsed())
@@ -808,6 +827,73 @@ fn a_close_during_a_stall_stops_at_its_force_at() {
         elapsed < Duration::from_millis(1500),
         "close took {elapsed:?}"
     );
+}
+
+/// Review r3 #1 (S1 rule 4): the stalled vendor withholds its terminal,
+/// so the stall escalates at its `force_at` (`Overflow`) and Host's force
+/// close begins; the daemon force, raised while that close's `Stop` is
+/// held at the anchor, still decides the outcome: `ForceStopped`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_force_during_stall_cleanup_is_force_stopped() {
+    let name = "a_force_during_stall_cleanup_is_force_stopped";
+    let Some(root) = child_root() else {
+        return run_child_with(name, &stall_script("exec sleep 60\n"), STALL_ENV);
+    };
+    let child = Child::open(&root);
+    child.arm("host.anchor.stop_received", "pause");
+    let (outcome, _) = stalled_turn(&child, StallAct::ForceInCleanup);
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
+        "{failure:?}"
+    );
+}
+
+/// Review r3 #2: the turn is dropped once its route work was spawned but
+/// before the start is written (the launch is held at
+/// `host.anchor.arm_received`): the closed hop fails the turn at once, as
+/// before the stall branch, so the vendor reads neither the start nor an
+/// interrupt.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_turn_dropped_before_its_start_writes_nothing() {
+    let name = "a_turn_dropped_before_its_start_writes_nothing";
+    let Some(root) = child_root() else {
+        return run_child_with(
+            name,
+            "touch \"$VIA_FAKE_SYNC_DIR/launched\"\n\
+             while read -r line; do printf '%s\\n' \"$line\" >> \"$VIA_FAKE_SYNC_DIR/input\"; done\n",
+            STALL_ENV,
+        );
+    };
+    let child = Child::open(&root);
+    child.arm("host.anchor.arm_received", "pause");
+    let points = child.root.join("points");
+    let (driver, _receiver) = child.adapter.session(SESSION, &child.root);
+    let wall = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
+    let (_force, forced) = watch::channel(None);
+    let (_order, orders) = watch::channel(None);
+    child.runtime.block_on(async {
+        let cx = one_turn::turn_cx(driver.prepare(), wall, forced, orders);
+        let mut execute = Box::pin(driver.run_turn(one_turn::hello(), cx));
+        // Polled until the launch is held: the route work runs on its own.
+        while !points.join("host.anchor.arm_received.1.ack").exists() {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), &mut execute)
+                    .await
+                    .is_err(),
+                "the turn ended before its launch"
+            );
+        }
+        drop(execute);
+        fs::write(points.join("host.anchor.arm_received.1.release"), b"").unwrap();
+        child.adapter.tracker.close();
+        child.adapter.tracker.wait().await;
+    });
+    assert!(child.sync("launched").exists(), "the vendor never started");
+    let input = fs::read_to_string(child.sync("input")).unwrap_or_default();
+    assert_eq!(input, "", "the abandoned turn wrote to the vendor");
 }
 
 /// Design §7.2 row 3: an anchor intent that is not committed starts no

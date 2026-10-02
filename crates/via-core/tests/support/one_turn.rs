@@ -21,7 +21,8 @@ const TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 /// fixture this process's environment names.
 pub(crate) struct OneTurn {
     pub(crate) set: AdapterSet,
-    tracker: TaskTracker,
+    /// Owns every task the sessions' drivers spawn, such as a turn's route work.
+    pub(crate) tracker: TaskTracker,
     cancel: CancellationToken,
 }
 
